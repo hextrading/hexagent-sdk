@@ -1,0 +1,29 @@
+[package]
+name = "hexagent-engine"
+version = "0.1.0"
+edition = "2021"
+description = "hexagent-sdk: the engine runtime — drives strategies in live / paper / backtest."
+
+[dependencies]
+hexagent-types = { path = "../hexagent-types" }
+hexagent-config = { path = "../hexagent-config" }
+hexagent-account = { path = "../hexagent-account" }
+hexagent-exchange = { path = "../hexagent-exchange" }
+hexagent-strategy = { path = "../hexagent-strategy" }
+hexagent-runtime = { path = "../hexagent-runtime" }
+
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+log = "0.4"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+parquet = "54"
+hex = "0.4"
+signal-hook = "0.3"
+rand = "0.8"

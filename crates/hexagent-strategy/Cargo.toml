@@ -1,0 +1,13 @@
+[package]
+name = "hexagent-strategy"
+version = "0.1.0"
+edition = "2021"
+description = "hexagent-sdk: the Strategy trait + StrategyFactory/Registry — the contract between the SDK engine and strategy crates."
+
+[dependencies]
+hexagent-types = { path = "../hexagent-types" }
+hexagent-config = { path = "../hexagent-config" }
+hexagent-exchange = { path = "../hexagent-exchange" }
+tracing = "0.1"
+log = "0.4"
+crossbeam-channel = "0.5"

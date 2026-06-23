@@ -1,0 +1,20 @@
+# hexagent-sdk — the reusable trading-system SDK (Rust).
+#
+# A library workspace: market events / signals / instruments, layered config,
+# the `Strategy` trait + factory registry, account bookkeeping, exchange
+# adapters (market-data + execution traits) with a first-principles backtest
+# simulator, and the engine runtime (live / paper / backtest).
+#
+# Strategies live OUTSIDE this repo (e.g. the `polymaker` example in the hexbot
+# repo) and depend on these crates. A Python SDK is planned on top of the same
+# `Strategy` boundary.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Release profile tuned for the latency-sensitive trading workload. Applies when
+# a consumer builds this workspace directly; binaries that depend on the SDK set
+# their own profile.
+[profile.release]
+lto = "fat"
+codegen-units = 1

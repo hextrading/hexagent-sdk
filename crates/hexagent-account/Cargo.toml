@@ -1,0 +1,11 @@
+[package]
+name = "hexagent-account"
+version = "0.1.0"
+edition = "2021"
+description = "hexagent-sdk: strategy-facing account bookkeeping — order manager, position manager, local orderbook."
+
+[dependencies]
+hexagent-types = { path = "../hexagent-types" }
+hexagent-runtime = { path = "../hexagent-runtime" }
+serde = { version = "1", features = ["derive"] }
+log = "0.4"

@@ -1,0 +1,48 @@
+[package]
+name = "hexagent-exchange"
+version = "0.1.0"
+edition = "2021"
+description = "hexagent-sdk: exchange adapters (market-data + execution traits), backtest sim (v2), market-data record/replay, and the cross-venue index price."
+
+[dependencies]
+hexagent-types = { path = "../hexagent-types" }
+hexagent-config = { path = "../hexagent-config" }
+hexagent-account = { path = "../hexagent-account" }
+hexagent-runtime = { path = "../hexagent-runtime" }
+
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+anyhow = "1"
+log = "0.4"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+parquet = "54"
+arrow = { version = "54", default-features = false }
+rustc-hash = "2"
+rust_decimal = "1"
+ed25519-dalek = "2"
+bs58 = "0.5"
+bip39 = "2"
+prost = "0.13"
+hmac = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa-core", "ecdsa"] }
+base64 = "0.22"
+quanta = "0.12"
+libc = "0.2"
+rand = "0.8"
+simd-json = { version = "0.14", features = ["serde_impl"] }
+
+[dev-dependencies]
+tempfile = "3"

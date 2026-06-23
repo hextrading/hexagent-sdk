@@ -1,0 +1,19 @@
+[package]
+name = "hexagent-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "hexagent-sdk: low-level runtime utilities — OS tuning, async runtime helper, latency instrumentation + record/replay."
+
+[dependencies]
+hexagent-config = { path = "../hexagent-config" }
+anyhow = "1"
+log = "0.4"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+futures-util = "0.3"
+hdrhistogram = { version = "7", default-features = false }
+quanta = "0.12"
+core_affinity = "0.8"
+libc = "0.2"
