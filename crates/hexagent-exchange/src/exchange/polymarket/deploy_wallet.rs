@@ -827,7 +827,7 @@ pub fn eth_call(to: &str, data: &str) -> Option<String> {
 }
 
 /// Check if ERC20 allowance(owner, spender) > 0.
-pub fn check_erc20_allowance(owner: &str, token: &str, spender: &str) -> bool {
+pub(crate) fn check_erc20_allowance(owner: &str, token: &str, spender: &str) -> bool {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&ERC20_ALLOWANCE_SELECTOR);
     data.extend_from_slice(&address_to_bytes32(owner));
@@ -850,7 +850,7 @@ pub fn check_erc20_allowance(owner: &str, token: &str, spender: &str) -> bool {
 }
 
 /// Check if ERC1155 isApprovedForAll(owner, operator) returns true.
-pub fn check_erc1155_approval(owner: &str, token: &str, operator: &str) -> bool {
+pub(crate) fn check_erc1155_approval(owner: &str, token: &str, operator: &str) -> bool {
     let mut data = Vec::with_capacity(4 + 32 + 32);
     data.extend_from_slice(&ERC1155_IS_APPROVED_SELECTOR);
     data.extend_from_slice(&address_to_bytes32(owner));
@@ -933,7 +933,7 @@ pub fn decode_address(addr: &str) -> [u8; 20] {
 
 /// One instance's Polymarket credentials, ready to serialise into the
 /// `[poly.<instance_id>]` block. Mirrors `config::PolymarketSecrets`.
-pub struct PolySecretsWrite<'a> {
+pub(crate) struct PolySecretsWrite<'a> {
     pub api_key: &'a str,
     pub api_secret: &'a str,
     pub api_passphrase: &'a str,
@@ -948,7 +948,7 @@ pub struct PolySecretsWrite<'a> {
 /// Parses the RAW file (no `${VAR}` expansion) so it works regardless of
 /// whether other blocks use env placeholders. `None` = file missing,
 /// unparseable, or block absent.
-pub fn peek_poly_api_key(path: &std::path::Path, instance_id: &str) -> Option<String> {
+pub(crate) fn peek_poly_api_key(path: &std::path::Path, instance_id: &str) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let doc = raw.parse::<toml_edit::DocumentMut>().ok()?;
     doc.get("poly")?
@@ -963,7 +963,7 @@ pub fn peek_poly_api_key(path: &std::path::Path, instance_id: &str) -> Option<St
 /// `${VAR}` placeholders. Atomic (temp file + rename in the same dir),
 /// file mode 0600, creates parent dirs. Returns whether the block already
 /// existed (true = overwritten).
-pub fn write_poly_secrets(
+pub(crate) fn write_poly_secrets(
     path: &std::path::Path,
     instance_id: &str,
     w: &PolySecretsWrite,

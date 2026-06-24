@@ -257,7 +257,7 @@ fn print_usage() {
 
 /// Derive the EOA address from private key (used as `POLY_ADDRESS`
 /// header — auth always keys on the EOA, even for Safe accounts).
-pub fn auth_address(private_key: &str) -> Result<String> {
+pub(crate) fn auth_address(private_key: &str) -> Result<String> {
     let clean = private_key.strip_prefix("0x").unwrap_or(private_key);
     let bytes = hex::decode(clean).map_err(|e| anyhow!("private key: {}", e))?;
     let key = k256::ecdsa::SigningKey::from_bytes(bytes.as_slice().into())
@@ -267,7 +267,7 @@ pub fn auth_address(private_key: &str) -> Result<String> {
 
 /// v1 sign + body. `fee_rate_bps` is signed into the order and must
 /// match the market's `takerBaseFee` or the server rejects.
-pub fn build_v1(
+pub(crate) fn build_v1(
     token_id: &str,
     price: f64, size: f64, side: crate::types::Side,
     private_key: &str, neg_risk: bool, sig_type: SignatureType,
@@ -306,7 +306,7 @@ pub fn build_v1(
 /// + wire-only `taker` (zero) and `expiration` ("0"). NO `nonce`,
 /// NO `feeRateBps` — both removed in v2. Fee rate is left unused
 /// (server computes fees protocol-side at match time).
-pub fn build_v2(
+pub(crate) fn build_v2(
     token_id: &str,
     price: f64, size: f64, side: crate::types::Side,
     private_key: &str, neg_risk: bool, sig_type: SignatureType,

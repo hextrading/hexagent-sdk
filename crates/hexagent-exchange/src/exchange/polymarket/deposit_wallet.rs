@@ -698,7 +698,7 @@ fn redeem_calldata(collateral: &str, condition_id: &str) -> String {
 /// Split `amount_wei` pUSD → Up+Down shares FROM the deposit wallet, via a
 /// `splitPosition` on the CTF in a relayer WALLET batch. Blocks until the
 /// tx confirms; returns the tx id (Err on submit/confirm failure).
-pub fn dw_split(
+pub(crate) fn dw_split(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
@@ -722,7 +722,7 @@ pub fn dw_split(
 /// on the CtfCollateralAdapter in a relayer WALLET batch. The adapter burns the
 /// DW's USDC.e-space outcome tokens (minted by the adapter split) and pays the
 /// proceeds back as pUSD. Requires `setApprovalForAll(CTF→adapter)`.
-pub fn dw_redeem(
+pub(crate) fn dw_redeem(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
@@ -771,7 +771,7 @@ fn erc20_transfer_calldata(to: &str, amount_wei: u128) -> String {
 /// via the CtfCollateralAdapter so it burns the DW's USDC.e-space outcome tokens
 /// (the ones the adapter split minted) and returns pUSD. Requires
 /// `setApprovalForAll(CTF→adapter)`.
-pub fn dw_merge(
+pub(crate) fn dw_merge(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
     condition_id: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
@@ -791,7 +791,7 @@ pub fn dw_merge(
 ///                            outcome tokens for SELL orders)
 ///   - CTF  → CtfCollateralAdapter (setApprovalForAll: adapter merge/redeem
 ///                            burns the DW's outcome tokens)
-pub fn dw_approvals(
+pub(crate) fn dw_approvals(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth, dry_run: bool,
 ) -> Result<String> {
     let calls = vec![
@@ -806,7 +806,7 @@ pub fn dw_approvals(
 
 /// Wrap `amount_wei` of the DW's USDC.e → pUSD (approve Onramp + wrap) in
 /// one WALLET batch.
-pub fn dw_onramp(
+pub(crate) fn dw_onramp(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
     let calls = vec![
@@ -823,7 +823,7 @@ pub fn dw_onramp(
 /// three calls run sequentially in a single relayer tx. pUSD↔USDC.e is 1:1
 /// (both 6-decimal), so `amount_wei` is the pUSD burned == USDC.e sent. The
 /// approve is unconditional (idempotent ∞-approval, same as `dw_onramp`).
-pub fn dw_offramp_withdraw(
+pub(crate) fn dw_offramp_withdraw(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
     recipient: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
@@ -837,7 +837,7 @@ pub fn dw_offramp_withdraw(
 
 /// Transfer `amount_wei` of an ERC-20 (`token`) FROM the DW to `to`
 /// (WALLET batch). Used by `withdraw` for pUSD/USDC.e.
-pub fn dw_transfer_erc20(
+pub(crate) fn dw_transfer_erc20(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
     token: &str, to: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
@@ -847,7 +847,7 @@ pub fn dw_transfer_erc20(
 
 /// Resolve the deposit-wallet address for `eoa`: prefer the configured
 /// `POLY_FUNDER`, else scan `WalletDeployed` logs on-chain.
-pub fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
+pub(crate) fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
     let env = std::env::var("POLY_FUNDER").unwrap_or_default();
     if !env.trim().is_empty() {
         return Ok(to_checksum_address(env.trim()));
@@ -857,7 +857,7 @@ pub fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
 
 /// Resolve the deposit wallet for `eoa`, deploying it (relayer
 /// `WALLET-CREATE`) if it doesn't exist yet. Used by `deploy_wallet`.
-pub fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Result<String> {
+pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Result<String> {
     if let Ok(dw) = find_existing_deposit_wallet(eoa) {
         return Ok(dw);
     }

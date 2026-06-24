@@ -1098,7 +1098,7 @@ fn is_ny_saturday(line: &str) -> Option<bool> {
 /// Same chrono path as `is_ny_saturday(&str)` above but skips the log-
 /// line parse step — feed the engine's `sim_clock_ns()` directly.
 #[inline]
-pub fn is_ny_saturday_ns(now_ns: u64) -> bool {
+pub(crate) fn is_ny_saturday_ns(now_ns: u64) -> bool {
     use chrono::{DateTime, Datelike, Utc, Weekday};
     use chrono_tz::America::New_York;
     let utc = DateTime::<Utc>::from_timestamp_nanos(now_ns as i64);
@@ -2790,7 +2790,7 @@ impl CoupledLatencySamplers {
 /// Standard-normal variate via Box-Muller. Avoids an extra crate (rand
 /// 0.8 bundles uniforms but not Normal; rand_distr would be an extra
 /// dep for ~20 lines of code).
-pub fn standard_normal(rng: &mut StdRng) -> f64 {
+pub(crate) fn standard_normal(rng: &mut StdRng) -> f64 {
     let u1: f64 = loop {
         let v: f64 = rng.gen();
         if v > 0.0 { break v; }
@@ -2800,7 +2800,7 @@ pub fn standard_normal(rng: &mut StdRng) -> f64 {
 }
 
 /// Standard-normal CDF. Abramowitz & Stegun 26.2.17 approximation.
-pub fn norm_cdf(x: f64) -> f64 {
+pub(crate) fn norm_cdf(x: f64) -> f64 {
     if x >= 8.0 { return 1.0; }
     if x <= -8.0 { return 0.0; }
     let t = 1.0 / (1.0 + 0.2316419 * x.abs());

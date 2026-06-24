@@ -326,7 +326,7 @@ impl ChainlinkStreamMarket {
     ///   [6]  benchmarkPrice (int192)
     ///   [7]  bid (int192)
     ///   [8]  ask (int192)
-    pub fn decode_benchmark_price(full_report_hex: &str) -> Result<f64> {
+    pub(crate) fn decode_benchmark_price(full_report_hex: &str) -> Result<f64> {
         let hex_str = full_report_hex.strip_prefix("0x").unwrap_or(full_report_hex);
         let bytes = hex::decode(hex_str)?;
 

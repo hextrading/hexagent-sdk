@@ -116,7 +116,7 @@ pub fn run_active_event() -> Result<()> {
 ///
 /// `pub(crate)` so `hexbot probe` can resolve the same series slug it
 /// would quote on without duplicating the `--slug` / config cascade.
-pub fn resolve_series_slug(args: &[String]) -> Result<String> {
+pub(crate) fn resolve_series_slug(args: &[String]) -> Result<String> {
     // --slug <s>
     if let Some(pos) = args.iter().position(|a| a == "--slug" || a == "-s") {
         if let Some(s) = args.get(pos + 1) {

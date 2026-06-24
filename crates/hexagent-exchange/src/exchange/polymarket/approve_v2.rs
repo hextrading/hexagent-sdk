@@ -93,26 +93,26 @@ const CONFIRM_POLL_INTERVAL_SECS: u64 = 3;
 /// as part of its setup flow (shared single source of truth for the
 /// contract set).
 #[derive(Clone)]
-pub struct ApprovalStep {
+pub(crate) struct ApprovalStep {
     /// Human label printed in the plan / progress output.
-    pub label: &'static str,
+    pub(crate) label: &'static str,
     /// Contract the Safe sends the tx TO (pUSD for approve, CTF for setApprovalForAll).
-    pub token: &'static str,
+    pub(crate) token: &'static str,
     /// Who we're granting the allowance to (Exchange / Adapter).
-    pub spender: &'static str,
+    pub(crate) spender: &'static str,
     /// `Erc20Approve` = approve(spender, ∞); `Erc1155Set` = setApprovalForAll(spender, true).
-    pub kind: ApprovalKind,
+    pub(crate) kind: ApprovalKind,
 }
 
 #[derive(Clone, Copy)]
-pub enum ApprovalKind {
+pub(crate) enum ApprovalKind {
     /// approve(spender, ∞) on an ERC-20.
     Erc20Approve,
     /// setApprovalForAll(spender, true) on an ERC-1155.
     Erc1155Set,
 }
 
-pub fn v2_approval_steps() -> Vec<ApprovalStep> {
+pub(crate) fn v2_approval_steps() -> Vec<ApprovalStep> {
     vec![
         ApprovalStep { label: "pUSD → CTFExchange v2",            token: PUSD_ADDRESS, spender: CTF_EXCHANGE_V2,           kind: ApprovalKind::Erc20Approve },
         ApprovalStep { label: "pUSD → NegRisk CTFExchange v2",    token: PUSD_ADDRESS, spender: NEG_RISK_CTF_EXCHANGE_V2,  kind: ApprovalKind::Erc20Approve },
@@ -356,7 +356,7 @@ impl ApproveWallet {
 // ════════════════════════════════════════════════════════════════
 
 /// `approve(spender, type(uint256).max)`.
-pub fn build_approve_calldata(spender: &str) -> String {
+pub(crate) fn build_approve_calldata(spender: &str) -> String {
     let mut buf = Vec::with_capacity(4 + 64);
     buf.extend_from_slice(&APPROVE_SELECTOR);
     buf.extend_from_slice(&address_to_bytes32(spender));
@@ -365,7 +365,7 @@ pub fn build_approve_calldata(spender: &str) -> String {
 }
 
 /// `setApprovalForAll(operator, true)`.
-pub fn build_set_approval_for_all_calldata(operator: &str) -> String {
+pub(crate) fn build_set_approval_for_all_calldata(operator: &str) -> String {
     let mut buf = Vec::with_capacity(4 + 64);
     buf.extend_from_slice(&SET_APPROVAL_FOR_ALL_SELECTOR);
     buf.extend_from_slice(&address_to_bytes32(operator));

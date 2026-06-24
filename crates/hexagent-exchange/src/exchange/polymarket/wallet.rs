@@ -45,7 +45,7 @@ const U256_MAX_BYTES: [u8; 32] = [0xff; 32];
 ///
 /// Parse is best-effort — any error returns false so a malformed config
 /// never blocks a redeem/split invocation.
-pub fn read_gas_via_signer_wallet_flag() -> bool {
+pub(crate) fn read_gas_via_signer_wallet_flag() -> bool {
     let paths = [
         crate::exchange::polymarket::cli_account::config_path(),
         std::env::var("HEXBOT_CONFIG").ok(),
@@ -208,7 +208,7 @@ fn unauth_get_json(url: &str) -> serde_json::Value {
 // Shared helpers
 // ════════════════════════════════════════════════════════════════
 
-pub struct WalletInfo {
+pub(crate) struct WalletInfo {
     pub signer_address: String,
     pub safe_address: String,
     pub signing_key: k256::ecdsa::SigningKey,
@@ -318,7 +318,7 @@ pub fn new_maintenance_status_handle() -> MaintenanceStatusHandle {
 /// Standard "no wallet credentials" error. Credentials are sourced ONLY
 /// from the secrets file (per-instance `[poly.<id>]`); `.env` is no longer
 /// a credential source.
-pub fn no_wallet_creds_err() -> anyhow::Error {
+pub(crate) fn no_wallet_creds_err() -> anyhow::Error {
     anyhow!(
         "no wallet credentials resolved from the secrets file.\n  \
          Pass --instance <id> --config <cfg> (or --config <cfg> with a single \
@@ -329,7 +329,7 @@ pub fn no_wallet_creds_err() -> anyhow::Error {
     )
 }
 
-pub fn load_wallet() -> Result<WalletInfo> {
+pub(crate) fn load_wallet() -> Result<WalletInfo> {
     let private_key = std::env::var("POLY_PRIVATE_KEY").unwrap_or_default();
     if private_key.is_empty() {
         return Err(no_wallet_creds_err());
@@ -424,7 +424,7 @@ fn fetch_erc20_balance_6dec(token: &str, owner: &str) -> f64 {
 /// latter is the live-engine startup check's main false-positive
 /// concern, since the original incident was a node falsely reporting
 /// `balance 0`).
-pub fn fetch_pol_balance(address: &str) -> Result<f64> {
+pub(crate) fn fetch_pol_balance(address: &str) -> Result<f64> {
     let params = serde_json::json!([address, "latest"]);
     let v = super::onchain_tx::rpc_call("eth_getBalance", params)
         .map_err(|e| anyhow!("eth_getBalance({}) failed: {}", &address[..10.min(address.len())], e))?;
@@ -1132,7 +1132,7 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
 /// from its balance). The returned `transactionID` is then the Polygon
 /// tx hash, and `poll_transaction` routes the poll to the chain instead
 /// of the relayer's `/transaction?id=...` endpoint.
-pub fn submit_safe_tx_with_id(
+pub(crate) fn submit_safe_tx_with_id(
     auth: &PolyAuth, key: &k256::ecdsa::SigningKey,
     signer: &str, safe: &str, to: &str, data: &str,
     gas_via_signer: bool,
@@ -1255,7 +1255,7 @@ fn sign_safe_tx(domain_sep: &[u8; 32], struct_hash: &[u8; 32], key: &k256::ecdsa
 /// The on-chain path kicks in whenever `tx_id` looks like a 32-byte
 /// hash — the on-chain submit path always returns that form, the
 /// relayer's form is a UUID without `0x` prefix.
-pub fn poll_transaction(auth: &PolyAuth, tx_id: &str) -> Result<(String, String)> {
+pub(crate) fn poll_transaction(auth: &PolyAuth, tx_id: &str) -> Result<(String, String)> {
     if tx_id.starts_with("0x") && tx_id.len() == 66 {
         return super::onchain_tx::poll_onchain_tx(tx_id);
     }
@@ -1309,7 +1309,7 @@ const NEG_RISK_CTF_COLLATERAL_ADAPTER_V2: &str = "0xadA2005600Dec949baf300f4C612
 /// explicit `v1` / `1` selects v1; everything else — `v2`, `2`, empty,
 /// unknown — resolves to v2. (Pre-2026-06 this was inverted, defaulting
 /// to v1; the cutover is complete so the legacy chain is opt-in only.)
-pub fn is_v2_from_str(s: &str) -> bool {
+pub(crate) fn is_v2_from_str(s: &str) -> bool {
     !matches!(s.trim().to_ascii_lowercase().as_str(), "v1" | "1")
 }
 
@@ -1322,7 +1322,7 @@ pub fn is_v2_from_str(s: &str) -> bool {
 /// Mirrors `read_gas_via_signer_wallet_flag`'s "CLI inherits config"
 /// pattern so operators don't have to pass the flag on every
 /// `hexbot redeem` / `hexbot split` invocation.
-pub fn read_clob_v2_flag() -> bool {
+pub(crate) fn read_clob_v2_flag() -> bool {
     let path = crate::exchange::polymarket::cli_account::config_path()
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
     let cfg = match crate::config::Config::load(std::path::Path::new(&path)) {
@@ -1341,7 +1341,7 @@ pub fn read_clob_v2_flag() -> bool {
 ///   v1: → (CTF contract, USDC.e)
 ///   v2 std: → (CtfCollateralAdapter, pUSD)
 ///   v2 neg-risk: → (NegRiskCtfCollateralAdapter, pUSD)
-pub fn ctf_target(is_v2: bool, neg_risk: bool) -> (&'static str, &'static str) {
+pub(crate) fn ctf_target(is_v2: bool, neg_risk: bool) -> (&'static str, &'static str) {
     if is_v2 {
         let target = if neg_risk { NEG_RISK_CTF_COLLATERAL_ADAPTER_V2 } else { CTF_COLLATERAL_ADAPTER_V2 };
         (target, PUSD_ADDRESS)

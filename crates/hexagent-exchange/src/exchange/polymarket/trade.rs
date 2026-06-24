@@ -56,7 +56,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Internal HTTP error discriminator for callers that need to map errors
 /// to specific `OrderStatus` variants (Timeout vs server Status vs Other).
 #[derive(Debug)]
-pub enum HttpErr {
+pub(crate) enum HttpErr {
     Timeout,
     Status(u16, String),
     Other(String),
@@ -97,7 +97,7 @@ impl HttpErr {
     /// also gates the call site's WARN behind the 425-storm dedup
     /// (see `should_warn_unknown_state`), preventing 15k+ near-identical
     /// log lines per outage.
-    pub fn is_unknown_state(&self) -> bool {
+    pub(crate) fn is_unknown_state(&self) -> bool {
         match self {
             HttpErr::Timeout => true,
             HttpErr::Status(code, _) => *code >= 500 || *code == 425,
@@ -220,7 +220,7 @@ fn format_order_brief(o: &OrderRequest) -> String {
 
 /// Tracked order for state reconciliation.
 #[derive(Debug, Clone)]
-pub struct TrackedOrder {
+pub(crate) struct TrackedOrder {
     pub symbol: String,
     pub side: Side,
 }
@@ -448,7 +448,7 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
 /// The hedge skips its own send if the primary already won by then
 /// (channel-full check), so on the healthy path it costs only one
 /// wakeup of the tokio sleep.
-pub const HEDGE_DELAY_MS_CANCEL: u64 = 120;
+pub(crate) const HEDGE_DELAY_MS_CANCEL: u64 = 120;
 
 /// Hedge delay (ms) for place paths. p50 place RTT in 2026-05-04 live
 /// = 29 ms, p95 = 236 ms; the long tail keeps p95 pinned to the 500 ms
@@ -462,7 +462,7 @@ pub const HEDGE_DELAY_MS_CANCEL: u64 = 120;
 /// we trade one extra request for an ack 100-300 ms sooner, and we
 /// avoid the orphan-reconcile cycle that timeout would otherwise
 /// incur.
-pub const HEDGE_DELAY_MS_PLACE: u64 = 250;
+pub(crate) const HEDGE_DELAY_MS_PLACE: u64 = 250;
 
 /// If `(method, path)` is a hedge-eligible endpoint, return the delay
 /// (ms) the hedge leg should sleep before firing; otherwise `None`.
@@ -579,9 +579,9 @@ pub struct SharedState {
     /// Strategy instance identifier (the `[poly.<id>]` key). Tags each
     /// row in the per-request latency CSV so a single file can hold
     /// multiple instances. `"cli"` for one-off CLI subcommands.
-    pub instance_id: String,
+    pub(crate) instance_id: String,
     /// Local order tracking: client_order_id → TrackedOrder
-    pub open_orders: Mutex<HashMap<String, TrackedOrder>>,
+    pub(crate) open_orders: Mutex<HashMap<String, TrackedOrder>>,
     /// client_order_id → Polymarket orderID (hex hash)
     pub coid_to_oid: Mutex<HashMap<String, String>>,
     /// Polymarket orderID → client_order_id
@@ -654,7 +654,7 @@ pub struct SharedState {
     /// hammering the server with doomed submits. Read/write with Relaxed
     /// — the ordering vs. other fields doesn't matter, only the
     /// eventual-consistency of the deadline itself.
-    pub balance_backoff_until_ns: std::sync::atomic::AtomicU64,
+    pub(crate) balance_backoff_until_ns: std::sync::atomic::AtomicU64,
     /// Per-token (asset_id) `invalid token id` backoff. The CLOB rejects an
     /// order with `invalid token id` when the token isn't registered on the
     /// orderbook — e.g. Gamma lists a 5-min event before its CLOB book is
@@ -665,7 +665,7 @@ pub struct SharedState {
     /// balance backoff, this is PER-TOKEN: only the bad token is gated, other
     /// events quote normally. `token → (consecutive_strikes, block_until_ns)`;
     /// cleared on any accepted order for the token.
-    pub invalid_token_backoff: Mutex<HashMap<String, (u32, u64)>>,
+    pub(crate) invalid_token_backoff: Mutex<HashMap<String, (u32, u64)>>,
     /// Wall-clock ns until which HTTP 425 "service not ready" backpressure
     /// WARNs are suppressed across BOTH cancel and place paths. Set to
     /// `now + 5min` on the first 425 of each window; subsequent 425s are
@@ -677,7 +677,7 @@ pub struct SharedState {
     /// per-endpoint) — observed 2026-05-06 21:00–21:35 with 15,045 place
     /// 425s + cancel 425s in the same 30 min. One operator alert per
     /// 5 min is more useful than 15k near-identical log lines.
-    pub http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64,
+    pub(crate) http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64,
     /// Wall-clock ns until which `reconcile_orphans` short-circuits (returns
     /// empty updates without hitting HTTP) because the server is in a 425
     /// "service not ready" storm. Set by the cancel-reply / reconcile-DELETE
@@ -689,7 +689,7 @@ pub struct SharedState {
     /// During backoff we keep the orphan parked but skip HTTP roundtrips
     /// — the reconciler will naturally re-try after the deadline expires.
     /// Read/write Relaxed.
-    pub http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64,
+    pub(crate) http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64,
     /// Per-coid counter for `reconcile_orphans` placement queries that
     /// returned `not_found` from the server. Real Polymarket is
     /// eventually-consistent across CLOB shards: a brand-new order can
@@ -701,7 +701,7 @@ pub struct SharedState {
     /// orphaned and the next `Signal::ReconcilePolymarket` will retry.
     /// Cleared on any conclusive resolution (MATCHED / FILLED /
     /// CANCELED) so a subsequent unrelated 404 starts fresh.
-    pub reconcile_not_found_attempts: Mutex<HashMap<String, u32>>,
+    pub(crate) reconcile_not_found_attempts: Mutex<HashMap<String, u32>>,
 }
 
 /// Number of consecutive `not_found` GETs we tolerate from the server
@@ -709,7 +709,7 @@ pub struct SharedState {
 /// Sized for Polymarket's read-replica lag — 5 attempts at ≥1.5 s
 /// retry interval (= `IN_FLIGHT_TTL_NS`) gives ~7.5 s for the write to
 /// propagate, well past the observed 100-300 ms convergence window.
-pub const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
+pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
 /// ready" is observed. 10 s gives the upstream service a chance to drain
@@ -717,7 +717,7 @@ pub const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 /// `Signal::ReconcilePolymarket` after the deadline. Observed 425 storms
 /// (2026-05-12 13:14–13:21, ~7 min) recover in single-digit minutes, so
 /// 10 s × extending-on-repeat reaches a healthy steady state.
-pub const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
+pub(crate) const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
 
 impl SharedState {
     /// Register a bidirectional order ID mapping.
@@ -788,12 +788,12 @@ impl SharedState {
     ///
     /// (A future refinement would be a per-token map so unrelated
     /// markets keep quoting; tracked separately.)
-    pub const BALANCE_BACKOFF_NS: u64 = 1_000_000_000;
+    pub(crate) const BALANCE_BACKOFF_NS: u64 = 1_000_000_000;
 
     /// True if wall-clock is still within the last balance-error's backoff
     /// window. Hot path — single `AtomicU64::load`.
     #[inline]
-    pub fn in_balance_backoff(&self) -> bool {
+    pub(crate) fn in_balance_backoff(&self) -> bool {
         let until = self.balance_backoff_until_ns
             .load(std::sync::atomic::Ordering::Relaxed);
         until != 0 && crate::types::now_ns() < until
@@ -804,7 +804,7 @@ impl SharedState {
     /// (i.e. we were not already in it). Callers use that signal to fire
     /// exactly one targeted-cancel batch on the edge, not on every
     /// subsequent reject that lands during the same window.
-    pub fn record_balance_error(&self) -> bool {
+    pub(crate) fn record_balance_error(&self) -> bool {
         let now = crate::types::now_ns();
         let prev = self.balance_backoff_until_ns
             .swap(now + Self::BALANCE_BACKOFF_NS, std::sync::atomic::Ordering::Relaxed);
@@ -816,25 +816,25 @@ impl SharedState {
     /// body text (`HttpErr::Status`) or the per-order `errorMsg` field of
     /// a 200 response. Case-insensitive substring match — keeps working
     /// if the server tweaks wording.
-    pub fn is_balance_error(text: &str) -> bool {
+    pub(crate) fn is_balance_error(text: &str) -> bool {
         let l = text.to_ascii_lowercase();
         l.contains("not enough balance") || l.contains("allowance")
     }
 
     /// Consecutive `invalid token id` rejects for a token before its submits
     /// are blocked, and the per-token block window (re-probed afterwards).
-    pub const INVALID_TOKEN_STRIKES: u32 = 3;
-    pub const INVALID_TOKEN_BACKOFF_NS: u64 = 30_000_000_000; // 30 s
+    pub(crate) const INVALID_TOKEN_STRIKES: u32 = 3;
+    pub(crate) const INVALID_TOKEN_BACKOFF_NS: u64 = 30_000_000_000; // 30 s
 
     /// Detect the CLOB `invalid token id` rejection (token not registered on
     /// the orderbook). Case-insensitive substring — robust to wording tweaks.
-    pub fn is_invalid_token_error(text: &str) -> bool {
+    pub(crate) fn is_invalid_token_error(text: &str) -> bool {
         text.to_ascii_lowercase().contains("invalid token id")
     }
 
     /// True iff `token` is in an active invalid-token backoff window; submits
     /// for it should be pre-rejected. Hot path — single map lookup.
-    pub fn in_invalid_token_backoff(&self, token: &str) -> bool {
+    pub(crate) fn in_invalid_token_backoff(&self, token: &str) -> bool {
         let now = crate::types::now_ns();
         self.invalid_token_backoff.lock().unwrap()
             .get(token).is_some_and(|(_, until)| *until > now)
@@ -844,7 +844,7 @@ impl SharedState {
     /// and, once it reaches `INVALID_TOKEN_STRIKES`, (re)arm the block window.
     /// Returns `true` on the edge (window armed from a non-active state) so the
     /// caller logs exactly once per window.
-    pub fn record_invalid_token(&self, token: &str) -> bool {
+    pub(crate) fn record_invalid_token(&self, token: &str) -> bool {
         let now = crate::types::now_ns();
         let mut map = self.invalid_token_backoff.lock().unwrap();
         let e = map.entry(token.to_string()).or_insert((0, 0));
@@ -857,7 +857,7 @@ impl SharedState {
 
     /// Clear a token's invalid-token state — an order for it was accepted, so
     /// it's registered and tradeable again.
-    pub fn clear_invalid_token(&self, token: &str) {
+    pub(crate) fn clear_invalid_token(&self, token: &str) {
         let mut map = self.invalid_token_backoff.lock().unwrap();
         if map.remove(token).is_some() && map.len() > 256 {
             // Opportunistic prune: drop long-expired entries so a long-lived
@@ -880,7 +880,7 @@ impl SharedState {
     ///
     /// Returns `true` if the caller should emit its WARN; `false` if the
     /// 425 was suppressed under the dedup window.
-    pub fn should_warn_unknown_state(&self, e: &HttpErr) -> bool {
+    pub(crate) fn should_warn_unknown_state(&self, e: &HttpErr) -> bool {
         if !matches!(e, HttpErr::Status(425, _)) {
             return true;
         }
@@ -903,7 +903,7 @@ impl SharedState {
     /// to `now + HTTP_425_BACKOFF_NS`. Used to gate `reconcile_orphans` so
     /// the bot doesn't hammer the upstream service while it's still
     /// recovering. Idempotent — only advances the deadline, never shortens.
-    pub fn note_http_425_backoff(&self) {
+    pub(crate) fn note_http_425_backoff(&self) {
         let now = crate::types::now_ns();
         let new_deadline = now.saturating_add(HTTP_425_BACKOFF_NS);
         // Use a CAS-like fetch_max to ensure we only advance the deadline
@@ -920,7 +920,7 @@ impl SharedState {
     /// True iff a 425 backoff is currently active (set by
     /// `note_http_425_backoff` and not yet expired). When true,
     /// `reconcile_orphans` short-circuits without making HTTP calls.
-    pub fn in_http_425_backoff(&self) -> bool {
+    pub(crate) fn in_http_425_backoff(&self) -> bool {
         let until = self.http_425_reconcile_backoff_until_ns
             .load(std::sync::atomic::Ordering::Relaxed);
         if until == 0 {
@@ -956,7 +956,7 @@ impl SharedState {
     /// `/cancel-all` is intentionally **not** hedged — it's a
     /// session-shutdown / balance-error escape hatch and the heavier
     /// payload doesn't benefit from racing.
-    pub fn http_call_async(
+    pub(crate) fn http_call_async(
         &self,
         method: &str,
         path: &str,
@@ -1106,7 +1106,7 @@ impl SharedState {
     /// request, in the same order. h2 still multiplexes streams server-side, so
     /// this makes the cancel→place arrival order deterministic but the server's
     /// *processing* order best-effort.
-    pub fn http_call_async_serial(
+    pub(crate) fn http_call_async_serial(
         &self,
         client: std::sync::Arc<reqwest::Client>,
         requests: Vec<(reqwest::Method, String, String)>,
@@ -1152,7 +1152,7 @@ impl SharedState {
     /// single-op paths (POST /order, DELETE /order). Blocks the calling
     /// thread on a crossbeam recv; the actual I/O work happens on the
     /// tokio runtime thread.
-    pub fn http_call_sync(
+    pub(crate) fn http_call_sync(
         &self,
         method: &str,
         path: &str,
@@ -2359,7 +2359,7 @@ impl PolymarketTrade {
 /// Context captured at cancel-kickoff time, threaded into
 /// `handle_cancel_reply` so it can build the OrderUpdate without
 /// re-querying internal maps after the recv races.
-pub struct CancelCtx {
+pub(crate) struct CancelCtx {
     pub local_oid: Option<String>,
     pub symbol: String,
     pub side: Side,
@@ -2376,7 +2376,7 @@ impl PolymarketTrade {
     /// Used by both `submit_order` (recv inline) and the parallel
     /// fan-out path in `batch_submit_orders` when
     /// `use_batch_orders=false`.
-    pub fn submit_kickoff(
+    pub(crate) fn submit_kickoff(
         &mut self,
         order: &OrderRequest,
     ) -> std::result::Result<
@@ -2393,7 +2393,7 @@ impl PolymarketTrade {
     /// Split out of `submit_kickoff` so the kickoff path can prep then
     /// dispatch separately. Returns the synthetic `OrderUpdate` on a
     /// pre-flight reject (rate-limit / backoff / sign).
-    pub fn submit_prep(
+    pub(crate) fn submit_prep(
         &mut self,
         order: &OrderRequest,
     ) -> std::result::Result<(String, String), OrderUpdate> {
@@ -2443,7 +2443,7 @@ impl PolymarketTrade {
     /// Parse the `POST /order` reply and produce an `OrderUpdate`.
     /// Side effects: open_orders insert on success, balance-backoff
     /// trigger on a balance reject, orderID re-register on mismatch.
-    pub fn handle_submit_reply(
+    pub(crate) fn handle_submit_reply(
         &mut self,
         order: &OrderRequest,
         local_oid: &str,
@@ -2587,7 +2587,7 @@ impl PolymarketTrade {
     /// none if no orderID is mapped), and return:
     ///   * `(ctx, Some(rx))` — request in flight
     ///   * `(ctx, None)`     — nothing to send; emit Cancelled directly.
-    pub fn cancel_kickoff(
+    pub(crate) fn cancel_kickoff(
         &mut self,
         client_order_id: &str,
     ) -> (CancelCtx, Option<crossbeam_channel::Receiver<HttpReply>>) {
@@ -2606,7 +2606,7 @@ impl PolymarketTrade {
     /// (or `None` when the coid has no local orderID → nothing to send).
     /// Split out of `cancel_kickoff` so the serial-replace path can prep a
     /// cancel and dispatch it inside the combined cancel→place task.
-    pub fn cancel_prep(&mut self, client_order_id: &str) -> (CancelCtx, Option<String>) {
+    pub(crate) fn cancel_prep(&mut self, client_order_id: &str) -> (CancelCtx, Option<String>) {
         let order_id = self.shared.coid_to_oid.lock().unwrap()
             .get(client_order_id).cloned();
         let tracked = self.shared.open_orders.lock().unwrap()
@@ -2637,7 +2637,7 @@ impl PolymarketTrade {
     /// sends are combined into the ordered task. Replies are drained and run
     /// through the same `handle_cancel_reply` / `handle_submit_reply` as the
     /// parallel path, so all downstream bookkeeping is identical.
-    pub fn dispatch_single_endpoint_serial(
+    pub(crate) fn dispatch_single_endpoint_serial(
         &mut self,
         exchange: Exchange,
         cancel_client_order_ids: &[String],
@@ -2717,7 +2717,7 @@ impl PolymarketTrade {
 
     /// Parse the `DELETE /order` reply (or absence thereof) and build
     /// an OrderUpdate. Drops local tracking on terminal outcomes.
-    pub fn handle_cancel_reply(
+    pub(crate) fn handle_cancel_reply(
         &mut self,
         exchange: Exchange,
         client_order_id: &str,
