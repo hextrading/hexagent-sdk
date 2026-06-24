@@ -67,6 +67,8 @@ pub struct StrategyCapabilities {
     pub needs_sim_wallet: bool,
     /// Engine builds a Polymarket SharedState + user-feed for this strategy. (polymaker)
     pub needs_poly_user_feed: bool,
+    /// Engine spawns per-instance Hexmarket execution workers. (hexmaker)
+    pub needs_hex_workers: bool,
 }
 
 /// Constructs one kind of strategy (by config `name`) from [`StrategyBuildDeps`].

@@ -3024,6 +3024,12 @@ impl Engine {
             .find(|e| e.name == "hexmarket")
             .map(|e| e.max_connections)
             .unwrap_or(4);
+        // Pre-compute (with the registry, before the `move`) which strategies
+        // need Hexmarket execution workers, so the spawned thread — which only
+        // captures a `config` clone — gates on a capability, not a strategy name.
+        let hex_worker_flags: Vec<bool> = config.strategies.iter()
+            .map(|s| self.registry.capabilities(&s.name).needs_hex_workers)
+            .collect();
 
         thread::Builder::new()
             .name("execution".into())
@@ -3032,12 +3038,10 @@ impl Engine {
                 let hex_cfg = config.exchanges.iter().find(|e| e.name == "hexmarket");
                 let mut instance_pools: HashMap<String, Vec<Sender<(Signal, Sender<OrderUpdate>)>>> = HashMap::new();
 
-                // NOTE: the sole residual strategy-name check. This runs inside
-                // a spawned executor thread that only captured a `config` clone
-                // (not `self`/`registry`), so a capability query isn't available
-                // here; it gates Hexmarket execution workers (live-only).
+                // Gate Hexmarket execution workers via the pre-computed
+                // capability flags (needs_hex_workers), not a strategy name.
                 for (idx, strategy_cfg) in config.strategies.iter().enumerate() {
-                    if strategy_cfg.name != "hexmaker" || !strategy_cfg.enabled {
+                    if !hex_worker_flags[idx] || !strategy_cfg.enabled {
                         continue;
                     }
                     let instance_id = if strategy_cfg.instance_id.is_empty() {
