@@ -37,68 +37,13 @@ pub struct Engine {
 impl Engine {
     pub fn new(mut config: Config, registry: StrategyRegistry) -> Self {
         crate::account::order_manager::init_global_order_id();
-        Self::inject_hexmaker_symbols(&mut config);
-        Self::inject_polymaker_symbols(&mut config);
+        // Each registered strategy injects its own required market-data symbols
+        // (replaces the engine's old per-strategy-name inject_*_symbols).
+        registry.inject_all_config(&mut config);
         Self { config, registry }
     }
 
-    /// Extract event pairs from hexmaker strategy config and inject hex/poly slugs
-    /// into the corresponding exchange configs' symbols lists.
-    fn inject_hexmaker_symbols(config: &mut Config) {
-        for strategy_cfg in &config.strategies {
-            if strategy_cfg.name != "hexmaker" || !strategy_cfg.enabled {
-                continue;
-            }
-            let events = strategy_cfg.params
-                .get("events")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-
-            let mut hex_slugs = Vec::new();
-            let mut poly_slugs = Vec::new();
-            for item in &events {
-                if let Some(table) = item.as_table() {
-                    if let Some(hex) = table.get("hex").and_then(|v| v.as_str()) {
-                        hex_slugs.push(hex.to_string());
-                    }
-                    if let Some(poly) = table.get("poly").and_then(|v| v.as_str()) {
-                        poly_slugs.push(poly.to_string());
-                    }
-                }
-            }
-
-            for exchange_cfg in &mut config.exchanges {
-                match exchange_cfg.name.as_str() {
-                    "hexmarket" => {
-                        for slug in &hex_slugs {
-                            if !exchange_cfg.symbols.contains(slug) {
-                                exchange_cfg.symbols.push(slug.clone());
-                            }
-                        }
-                    }
-                    "polymarket" => {
-                        for slug in &poly_slugs {
-                            if !exchange_cfg.symbols.contains(slug) {
-                                exchange_cfg.symbols.push(slug.clone());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !hex_slugs.is_empty() || !poly_slugs.is_empty() {
-                info!(
-                    "[Engine] Injected hexmaker symbols: hex={:?}, poly={:?}",
-                    hex_slugs, poly_slugs
-                );
-            }
-        }
-    }
-
-    /// Inject polymaker's binance_symbol into the binance exchange config
-    /// so the engine subscribes to the 1m kline feed automatically.
+    /// Backtest start timestamp (ns since epoch); 0 outside backtest mode.
     fn parse_backtest_start_ns(&self) -> u64 {
         if self.config.general.mode != RunMode::Backtest { return 0; }
         chrono::DateTime::parse_from_rfc3339(&self.config.backtest.start_date)
@@ -106,83 +51,6 @@ impl Engine {
                 .map(|ndt| ndt.and_utc().fixed_offset()))
             .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_nanos_opt().unwrap_or(0) as u64)
             .unwrap_or(0)
-    }
-
-    fn inject_polymaker_symbols(config: &mut Config) {
-        // Only inject in live mode — backtest uses explicitly configured data sources
-        if config.general.mode != RunMode::Live { return; }
-
-        // Collect symbols to inject (avoids borrowing config.strategies while mutating config)
-        let mut injections: Vec<(String, String, String, String)> = Vec::new(); // (binance, coinbase, kraken, okx)
-        for strategy_cfg in &config.strategies {
-            if !strategy_cfg.enabled { continue; }
-            if strategy_cfg.name != "polymaker" && strategy_cfg.name != "index_price" {
-                continue;
-            }
-            let binance_symbol = strategy_cfg.params.get("binance_symbol")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if binance_symbol.is_empty() {
-                continue;
-            }
-            let base = binance_symbol.strip_suffix("USDT").unwrap_or(&binance_symbol).to_string();
-            injections.push((binance_symbol, format!("{}-USD", base), format!("{}/USD", base), format!("{}-USDT", base)));
-        }
-
-        for (binance_symbol, coinbase_symbol, kraken_symbol, okx_symbol) in injections {
-            // Ensure binance exchange exists in config
-            let has_binance = config.exchanges.iter().any(|e| e.name == "binance");
-            if !has_binance {
-                config.exchanges.push(crate::config::ExchangeConfig {
-                    name: "binance".to_string(),
-                    enabled: true,
-                    symbols: vec![binance_symbol.clone()],
-                    api_key: String::new(),
-                    api_secret: String::new(),
-                    api_passphrase: String::new(),
-                    private_key: String::new(),
-                    mnemonic: String::new(),
-                    api_url_prefix: String::new(),
-                    wss_url: String::new(),
-                    max_connections: 1,
-                    rate_limit_per_second: 10,
-                    source: String::new(),
-                    btc_feed_id: String::new(),
-                    signature_type: String::new(),
-                    clob_version: String::new(),
-                    builder_code: String::new(),
-                    market_info_v2_path: String::new(),
-                    use_batch_orders: true,
-                    // Non-polymarket exchanges ignore this field; the
-                    // inert 0 here is replaced by `init_http_timeout`
-                    // when the polymarket SharedState map is built.
-                    http_timeout_ms: 0,
-                    // Polymarket-only gap-replay knobs; inert for binance.
-                    gap_replay_interval_ms: 2000,
-                    gap_replay_periodic_rewind_ms: 5000,
-                    gap_replay_reconnect_rewind_ms: 5000,
-                    executor_workers: 8, // Polymarket-only; inert for binance.
-                });
-            } else {
-                Self::inject_exchange_symbol(config, "binance", &binance_symbol);
-            }
-
-            // Inject symbols for other exchanges if they are configured
-            Self::inject_exchange_symbol(config, "bybit", &binance_symbol); // Bybit uses same format as Binance
-            Self::inject_exchange_symbol(config, "coinbase", &coinbase_symbol);
-            Self::inject_exchange_symbol(config, "kraken", &kraken_symbol);
-            Self::inject_exchange_symbol(config, "okx", &okx_symbol);
-        }
-    }
-
-    fn inject_exchange_symbol(config: &mut Config, exchange_name: &str, symbol: &str) {
-        for exchange_cfg in &mut config.exchanges {
-            if exchange_cfg.name == exchange_name && exchange_cfg.enabled {
-                let sym = symbol.to_string();
-                if !exchange_cfg.symbols.contains(&sym) {
-                    exchange_cfg.symbols.push(sym);
-                }
-            }
-        }
     }
 
     // ── Mode Execution (called from main.rs) ───────────────────────────
@@ -484,7 +352,7 @@ impl Engine {
         let stale_threshold_handles: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>> = {
             let mut m = HashMap::new();
             for sc in &self.config.strategies {
-                if !sc.enabled || sc.name != "polymaker" { continue; }
+                if !sc.enabled || !self.registry.capabilities(&sc.name).needs_rtt_probe { continue; }
                 if sc.instance_id.is_empty() { continue; }
                 let iid = sc.instance_id.clone();
                 let init_ms: u64 = sc.params.get("quote_interval_ms")
@@ -538,7 +406,7 @@ impl Engine {
                 // may set its own `rtt_gate_probe_interval_secs`.
                 let interval_secs = self.config.strategies.iter()
                     .find(|s| {
-                        s.name == "polymaker"
+                        self.registry.capabilities(&s.name).needs_rtt_probe
                             && s.enabled
                             && s.instance_id == *id
                     })
@@ -717,7 +585,7 @@ impl Engine {
             for id in keys {
                 let ps = match poly_states.get(id) { Some(s) => s.clone(), None => continue };
                 let interval_secs = self.config.strategies.iter()
-                    .find(|s| s.name == "polymaker" && s.enabled && s.instance_id == *id)
+                    .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe && s.enabled && s.instance_id == *id)
                     .and_then(|s| s.params.get("adaptive_params_v2_probe_interval_secs").or_else(|| s.params.get("rtt_gate_probe_interval_secs")))
                     .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                     .unwrap_or(2.0)
@@ -1054,11 +922,11 @@ impl Engine {
         }
 
         // ── Hist bars (binance) — verbatim from v1 ──
-        let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && s.name == "polymaker");
+        let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
         let mut bar_events: Vec<(u64, MarketEvent)> = Vec::new();
         if needs_hist_bars {
             let hist_bar_interval: String = self.config.strategies.iter()
-                .find(|s| s.enabled && s.name == "polymaker")
+                .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
                 .and_then(|s| s.params.get("hist_bar_interval"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("1m")
@@ -1101,7 +969,7 @@ impl Engine {
         let bt_probe_enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bt_probe_interval_ns: u64 = {
             let secs = self.config.strategies.iter()
-                .find(|s| s.name == "polymaker")
+                .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe)
                 .and_then(|s| s.params.get("adaptive_params_v2_probe_interval_secs").or_else(|| s.params.get("rtt_gate_probe_interval_secs")))
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(2.0)
@@ -1119,7 +987,7 @@ impl Engine {
                 crate::exchange::polymarket::rtt_probe::ActiveTokenHandle,
             ),
         > = self.config.strategies.iter()
-            .find(|s| s.name == "polymaker" && s.enabled && !s.instance_id.is_empty())
+            .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe && s.enabled && !s.instance_id.is_empty())
             .map(|s| {
                 let mut m = HashMap::new();
                 m.insert(s.instance_id.clone(), (bt_probe_rx, bt_probe_enable.clone(), bt_probe_active_token));
@@ -1233,7 +1101,7 @@ impl Engine {
         let mut sim_wallet_usdc_by_iid: HashMap<String, f64> = HashMap::new();
         let mut sim_split_by_iid: HashMap<String, f64> = HashMap::new();
         for s in &self.config.strategies {
-            if !s.enabled || s.name != "polymaker" || s.instance_id.is_empty() { continue; }
+            if !s.enabled || !self.registry.capabilities(&s.name).needs_sim_wallet || s.instance_id.is_empty() { continue; }
             let bal = s.params.get("init_balance")
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(0.0);
@@ -1678,7 +1546,7 @@ impl Engine {
             rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short,
             if rj_rs > 0 { rj_rs_short / rj_rs as f64 } else { 0.0 });
         for s in &self.config.strategies {
-            if s.enabled && s.name == "polymaker" && !s.instance_id.is_empty() {
+            if s.enabled && self.registry.capabilities(&s.name).needs_sim_wallet && !s.instance_id.is_empty() {
                 if let Some(bal) = sim.wallet_usdc(&s.instance_id) {
                     let seed = s.params.get("init_balance")
                         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
@@ -2553,7 +2421,7 @@ impl Engine {
             // feed thread — `self` (or its &refs) can't escape the
             // method into the thread closure's 'static bound.
             let spot_kline_interval: String = self.config.strategies.iter()
-                .find(|s| s.enabled && s.name == "polymaker")
+                .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
                 .and_then(|s| s.params.get("hist_bar_interval"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("1m")
@@ -2901,7 +2769,7 @@ impl Engine {
         // two strategy entries) collapse to the first one's SharedState
         // — second entry logs WARN and shares.
         for sc in &self.config.strategies {
-            if !sc.enabled || sc.name != "polymaker" { continue; }
+            if !sc.enabled || !self.registry.capabilities(&sc.name).needs_poly_user_feed { continue; }
             let instance_id = if sc.instance_id.is_empty() {
                 warn!(
                     "[Engine] Polymaker strategy missing required `instance_id` \
@@ -3164,6 +3032,10 @@ impl Engine {
                 let hex_cfg = config.exchanges.iter().find(|e| e.name == "hexmarket");
                 let mut instance_pools: HashMap<String, Vec<Sender<(Signal, Sender<OrderUpdate>)>>> = HashMap::new();
 
+                // NOTE: the sole residual strategy-name check. This runs inside
+                // a spawned executor thread that only captured a `config` clone
+                // (not `self`/`registry`), so a capability query isn't available
+                // here; it gates Hexmarket execution workers (live-only).
                 for (idx, strategy_cfg) in config.strategies.iter().enumerate() {
                     if strategy_cfg.name != "hexmaker" || !strategy_cfg.enabled {
                         continue;
