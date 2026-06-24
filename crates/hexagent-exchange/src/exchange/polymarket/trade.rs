@@ -139,10 +139,15 @@ enum CancelReasonOutcome {
     /// Server explicitly says the order matched. The accompanying
     /// trade will arrive on user-feed and update inventory.
     Filled,
-    /// Reason is the ambiguous "order can't be found - already
-    /// canceled or matched" — server is telling us the orderID is no
-    /// longer findable but it cannot disambiguate between cancelled
-    /// and matched. Defer to a `GET /data/order/{oid}` reconcile.
+    /// The order's terminal state is not yet decided — defer to a
+    /// `GET /data/order/{oid}` reconcile. Two reasons route here:
+    ///   * "order can't be found - already canceled or matched" — server
+    ///     can't disambiguate between cancelled and matched.
+    ///   * "can't be canceled because it is pending/delayed" — the cancel
+    ///     raced ahead of the placement; the order is still being
+    ///     processed and will shortly be LIVE (the reconcile then
+    ///     re-issues the DELETE). Committing to Cancelled here would drop
+    ///     tracking on a still-live order.
     Uncertain,
 }
 
@@ -172,6 +177,14 @@ enum CancelReasonOutcome {
 ///   * `"the order is already canceled"` (3×) → **Cancelled**
 ///     Server confirms cancelled, no ambiguity.
 ///
+///   * `"can't be canceled because it is pending/delayed"` → **Uncertain**
+///     The cancel raced ahead of the placement ack — the order is still
+///     being processed and is neither cancelled nor matched. It becomes
+///     LIVE moments later. Route to the orphan reconcile (GET → re-DELETE)
+///     instead of dropping it. Previously fell through to the Cancelled
+///     fallback, which abandoned a still-live order on the book → it rode
+///     unmanaged to settlement (live.log 2026-06-24: 9 forgotten orders).
+///
 ///   * Other / unrecognised → **Cancelled** (conservative fallback).
 fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     let r = reason.to_ascii_lowercase();
@@ -194,6 +207,18 @@ fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     // commit to Cancelled — there's no fill in flight to wait for.
     if not_found {
         return CancelReasonOutcome::Cancelled;
+    }
+    // "can't be canceled because it is pending/delayed" — the cancel raced
+    // ahead of the placement: the order is still being processed
+    // server-side and is NOT yet cancelled and NOT matched. It will
+    // shortly become LIVE on the book. Route to the orphan path (same as
+    // Uncertain) so the reconciler GETs /data/order/{oid}, finds it LIVE,
+    // and re-issues the DELETE. The previous behaviour fell through to the
+    // Cancelled fallback below and dropped tracking on a still-live order,
+    // leaving a forgotten resting order that rode to settlement
+    // (live.log 2026-06-24: 9 such orders, all with this reason).
+    if r.contains("pending") || r.contains("delayed") || r.contains("processing") {
+        return CancelReasonOutcome::Uncertain;
     }
     // "already canceled" / unrecognised — conservative.
     CancelReasonOutcome::Cancelled
@@ -1525,6 +1550,54 @@ impl PolymarketTrade {
         self.shared.open_orders.lock().unwrap().clear();
         self.shared.coid_to_oid.lock().unwrap().clear();
         self.shared.oid_to_coid.lock().unwrap().clear();
+    }
+
+    /// Cancel every resting order for ONE market server-side via
+    /// `DELETE /cancel-market-orders`. The endpoint requires BOTH `market`
+    /// (condition_id) and `asset_id` (token_id) — they are both mandatory —
+    /// so a binary market is **two calls**, one per outcome token; pass the
+    /// market's `asset_ids` (e.g. `[up_token, down_token]`).
+    ///
+    /// Unlike `cancel_all(symbol)` — which only re-cancels orders still in
+    /// our local `open_orders` map and therefore MISSES "forgotten" orders
+    /// that were wrongly dropped from tracking — the server cancels by its
+    /// own book, so this also kills orders we lost track of (e.g. a
+    /// `pending/delayed` cancel race or a `matched`-then-FAILED trade) that
+    /// would otherwise rest unmanaged to settlement. Scoped to a single
+    /// `condition_id` so an account trading several markets concurrently
+    /// keeps the others' orders intact — used as the event-expiry backstop.
+    pub fn cancel_market_orders(&self, market_condition_id: &str, asset_ids: &[String]) {
+        for asset_id in asset_ids {
+            if asset_id.is_empty() { continue; }
+            let body = serde_json::json!({
+                "market": market_condition_id,
+                "asset_id": asset_id,
+            }).to_string();
+            match self.shared.http_call_sync("DELETE", "/cancel-market-orders", &body) {
+                Ok(json) => {
+                    let canceled = json.get("canceled").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let not_canceled = json.get("not_canceled").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
+                    info!("[PolymarketTrade] Cancel-market market={} asset={}: {} canceled, {} failed",
+                        market_condition_id, asset_id, canceled.len(), not_canceled);
+                    // Drop local tracking for any canceled order we still
+                    // tracked (forgotten orders have no local entry → no-op).
+                    if !canceled.is_empty() {
+                        let coids: Vec<String> = {
+                            let oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
+                            canceled.iter()
+                                .filter_map(|v| v.as_str())
+                                .filter_map(|oid| oid_to_coid.get(oid).cloned())
+                                .collect()
+                        };
+                        for coid in coids {
+                            self.shared.remove_order(&coid);
+                        }
+                    }
+                }
+                Err(e) => warn!("[PolymarketTrade] Cancel-market market={} asset={} failed: {}",
+                    market_condition_id, asset_id, e),
+            }
+        }
     }
 
     /// React to a `not enough balance / allowance` rejection.
@@ -3953,6 +4026,33 @@ mod tests {
         assert_eq!(
             cancel_not_canceled_outcome(""),
             CancelReasonOutcome::Cancelled,
+        );
+    }
+
+    /// The cancel-raced-ahead-of-placement reason must defer to reconcile,
+    /// NOT drop the order. Before this branch existed the reason fell into
+    /// the Cancelled fallback and abandoned a still-live order on the book
+    /// (live.log 2026-06-24: 9 forgotten orders riding to settlement).
+    #[test]
+    fn cancel_not_canceled_outcome_pending_delayed_defers_to_reconcile() {
+        assert_eq!(
+            cancel_not_canceled_outcome("can't be canceled because it is pending/delayed"),
+            CancelReasonOutcome::Uncertain,
+        );
+        // Case-insensitive + wording variants.
+        assert_eq!(
+            cancel_not_canceled_outcome("order is DELAYED, cannot cancel"),
+            CancelReasonOutcome::Uncertain,
+        );
+        assert_eq!(
+            cancel_not_canceled_outcome("order still processing"),
+            CancelReasonOutcome::Uncertain,
+        );
+        // Must not shadow the definite paths: a "matched" reason that also
+        // happens to mention pending stays Filled (matched wins).
+        assert_eq!(
+            cancel_not_canceled_outcome("matched orders can't be canceled"),
+            CancelReasonOutcome::Filled,
         );
     }
 
