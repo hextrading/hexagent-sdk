@@ -112,17 +112,35 @@ pub enum Signal {
         /// must route this to the matching SharedState's auth.
         instance_id: String,
     },
-    /// Emergency wipe: cancel **every** active maker order across all
-    /// markets via Polymarket's `DELETE /cancel-all` endpoint, then
-    /// clear local executor tracking (open_orders / coid maps). Used
-    /// by polymaker when accumulated orphan count exceeds
-    /// `max_orphans` — at that point local <-> server state has
-    /// diverged enough that the safe move is to wipe the slate and
-    /// let the next quote tick rebuild fresh quotes.
+    /// Cancel resting Polymarket orders server-side, independent of the
+    /// executor's local order tracking — so it catches "forgotten" orders
+    /// that were wrongly dropped from tracking (e.g. a `pending/delayed`
+    /// cancel race or a `matched`-then-FAILED trade) and would otherwise
+    /// rest unmanaged to settlement.
+    ///
+    /// * `market: Some(condition_id)` → `DELETE /cancel-market-orders`
+    ///   scoped to that ONE market. The endpoint requires both `market`
+    ///   AND `asset_id`, so the executor calls it once per `asset_ids`
+    ///   entry (a binary market = both outcome tokens). Used at event
+    ///   expiry: an account may trade several markets concurrently, so a
+    ///   single event ending must NOT wipe the other markets' orders.
+    /// * `market: None` → `DELETE /cancel-all` (whole account; `asset_ids`
+    ///   ignored). Emergency wipe when accumulated orphan count exceeds
+    ///   `max_orphans` and local <-> server state has diverged enough to
+    ///   rebuild from scratch.
+    ///
+    /// Both clear the matching local executor tracking afterwards.
     PolymarketCancelAllOrders {
         reason: String,
-        /// Strategy instance ID — `DELETE /cancel-all` is per-account,
-        /// so the executor routes to the matching SharedState.
+        /// `Some(condition_id)` → market-scoped cancel; `None` → whole
+        /// account. See variant docs.
+        market: Option<String>,
+        /// Outcome token_ids for the market-scoped cancel (the endpoint
+        /// requires `asset_id`; one call per entry). Ignored when
+        /// `market` is `None`.
+        asset_ids: Vec<String>,
+        /// Strategy instance ID — these endpoints are per-account, so the
+        /// executor routes to the matching SharedState.
         instance_id: String,
     },
     Exit,

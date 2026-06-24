@@ -3574,9 +3574,18 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             executor.poly_route_mut(&instance_id)
                 .reconcile_orphans(&pending_places, &pending_cancels)
         }
-        Signal::PolymarketCancelAllOrders { reason, .. } => {
-            warn!("[Executor] PolymarketCancelAllOrders (instance_id={}): reason={}", instance_id, reason);
-            executor.poly_route_mut(&instance_id).cancel_all_orders();
+        Signal::PolymarketCancelAllOrders { reason, market, asset_ids, .. } => {
+            let route = executor.poly_route_mut(&instance_id);
+            match market {
+                Some(cid) => {
+                    warn!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                    route.cancel_market_orders(&cid, &asset_ids);
+                }
+                None => {
+                    warn!("[Executor] PolymarketCancelAllOrders account-wide (instance_id={}): reason={}", instance_id, reason);
+                    route.cancel_all_orders();
+                }
+            }
             vec![]
         }
         _ => vec![],
