@@ -156,6 +156,25 @@ pub trait ExchangeTrade: Send {
         Ok(updates)
     }
 
+    /// Replace order(s) — a reprice dispatched as one operation, parallel to
+    /// `submit_order` (place) and `cancel_order` (cancel). For Polymarket in
+    /// single-endpoint mode this is the serial "all cancels then all places on
+    /// ONE connection, no ack wait between them" path (cancel→place arrival
+    /// order, closing the place-before-cancel double-commit window) that the
+    /// per-leg replace relies on. The default delegates to
+    /// `batch_update_orders`, so behaviour is identical to the pre-existing
+    /// replace path (poly's `batch_update_orders` already routes a
+    /// both-cancels-and-places batch to `dispatch_single_endpoint_serial`).
+    fn replace_order(
+        &mut self,
+        exchange: Exchange,
+        market_id: &str,
+        cancel_client_order_ids: &[String],
+        place_orders: &[OrderRequest],
+    ) -> Result<Vec<OrderUpdate>> {
+        self.batch_update_orders(exchange, market_id, cancel_client_order_ids, place_orders)
+    }
+
     /// Name of this executor
     fn name(&self) -> &str;
 }

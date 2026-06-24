@@ -792,6 +792,12 @@ fn expand_signal(sig: &Signal) -> (Vec<ReachAction>, bool) {
             cancel_client_order_ids,
             place_orders,
             ..
+        }
+        | Signal::ReplaceOrder {
+            exchange,
+            cancel_client_order_ids,
+            place_orders,
+            ..
         } => {
             // Cancel BEFORE place: a same-token reprice must free the old
             // resting order's share/cash lock before the replacement tries to

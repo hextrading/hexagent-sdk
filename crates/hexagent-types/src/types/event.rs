@@ -79,6 +79,21 @@ pub enum Signal {
         /// Strategy instance ID — see [`Signal::BatchNewOrders.instance_id`].
         instance_id: String,
     },
+    /// Replace order(s) — a reprice: cancel-then-place dispatched as one
+    /// operation. First-class peer of `NewOrder` (place) / `CancelOrder`
+    /// (cancel). For Polymarket in single-endpoint mode this routes to the
+    /// serial "all cancels then all places on one connection, no ack wait"
+    /// path (see `ExchangeTrade::replace_order` →
+    /// `dispatch_single_endpoint_serial`). Same field shape as
+    /// `BatchUpdateOrders`; processed identically by the sim fill path.
+    ReplaceOrder {
+        exchange: Exchange,
+        market_id: String,
+        cancel_client_order_ids: Vec<String>,
+        place_orders: Vec<OrderRequest>,
+        timestamp_ns: u64,
+        instance_id: String,
+    },
     /// Request the executor to reconcile orphan Polymarket orders whose
     /// placement or cancel HTTP timed out.
     ///   - `pending_places`: (coid, symbol, side, price, order_hash) where

@@ -1779,11 +1779,14 @@ impl Engine {
                                         updates.push(sim.cancel_order(exchange, id, sim_now));
                                     }
                                 }
-                                Ok(Signal::BatchUpdateOrders { exchange, ref cancel_client_order_ids, ref place_orders, .. }) => {
+                                Ok(Signal::BatchUpdateOrders { exchange, ref cancel_client_order_ids, ref place_orders, .. })
+                                | Ok(Signal::ReplaceOrder { exchange, ref cancel_client_order_ids, ref place_orders, .. }) => {
                                     // Places before cancels — same rationale as the
                                     // BT main-loop branch: gives `submit_order` a
                                     // realistic view of resting orders for queue /
                                     // cascade-cancel / synthetic-balance-error paths.
+                                    // ReplaceOrder is handled identically to
+                                    // BatchUpdateOrders in the sim fill path.
                                     for order in place_orders {
                                         updates.push(sim.submit_order(order, sim_now));
                                     }
@@ -3321,7 +3324,8 @@ fn extract_instance_id(signal: &Signal) -> String {
             orders.first().map(|o| o.instance_id.clone()).unwrap_or_default()
         }
         Signal::BatchCancelOrders { instance_id, .. } => instance_id.clone(),
-        Signal::BatchUpdateOrders { instance_id, place_orders, .. } => {
+        Signal::BatchUpdateOrders { instance_id, place_orders, .. }
+        | Signal::ReplaceOrder { instance_id, place_orders, .. } => {
             if !instance_id.is_empty() { return instance_id.clone(); }
             place_orders.first().map(|o| o.instance_id.clone()).unwrap_or_default()
         }
@@ -3539,6 +3543,31 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             };
             result.unwrap_or_else(|e| {
                 error!("[Executor] Batch update error: {}", e); vec![]
+            })
+        }
+        Signal::ReplaceOrder { exchange, market_id, cancel_client_order_ids, place_orders, timestamp_ns, .. } => {
+            if is_stale(timestamp_ns) {
+                warn!(
+                    "[Executor] Signal stale, dropping ReplaceOrder ({} cancels, {} places)",
+                    cancel_client_order_ids.len(), place_orders.len(),
+                );
+                let mut out: Vec<OrderUpdate> = cancel_client_order_ids.into_iter()
+                    .map(|coid| build_exec_rejected_cancel(coid, exchange))
+                    .collect();
+                out.extend(place_orders.iter().map(build_exec_rejected_place));
+                return out;
+            }
+            let result = if exchange == Exchange::Polymarket {
+                executor.poly_route_mut(&instance_id).replace_order(
+                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                )
+            } else {
+                executor.replace_order(
+                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                )
+            };
+            result.unwrap_or_else(|e| {
+                error!("[Executor] Replace error: {}", e); vec![]
             })
         }
         Signal::ReconcilePolymarket { pending_places, pending_cancels, .. } => {

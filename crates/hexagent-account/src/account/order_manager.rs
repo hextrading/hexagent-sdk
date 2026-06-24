@@ -146,10 +146,6 @@ pub struct OrderManager {
     orders: std::collections::BTreeMap<String, LocalOrder>,
 }
 
-fn price_eq(a: f64, b: f64, tick_size: f64) -> bool {
-    (a - b).abs() < tick_size / 2.0
-}
-
 /// A desired quote level: price + quantity on a given side.
 #[derive(Debug, Clone)]
 pub struct QuoteLevel {
@@ -472,282 +468,151 @@ impl OrderManager {
             .count()
     }
 
-    /// Refresh orders to match the desired quote levels.
-    ///
-    /// Compares each desired level against existing active orders:
-    /// - If an active order exists at the same price+qty → keep it (no action).
-    /// - If an active order exists at a different price → cancel old + submit new.
-    /// - If no active order exists for a desired level → submit new.
-    /// - Any active orders not matched by a desired level → cancel.
-    ///
-    /// Returns signals to execute (CancelOrder / NewOrder).
-    pub fn refresh(&mut self, desired: &[QuoteLevel], ts_event: u64) -> Vec<Signal> {
-        // Default: reconcile both sides (byte-identical to pre-gate behaviour).
-        self.refresh_gated(desired, ts_event, false, false, false, false)
+    /// The token/symbol this OM manages — for strategy-layer reconcile logging.
+    pub fn symbol(&self) -> &str {
+        &self.symbol
     }
 
-    /// `refresh`, but with per-side gating. When `block_buy` (resp.
-    /// `block_sell`) is true the BUY (resp. SELL) side is left completely
-    /// untouched — no place, no cancel, resting orders kept — so the
-    /// strategy's per-leg in-flight gate can pause one exposure leg
-    /// (e.g. BUY-Up / SELL-Down) while the other keeps quoting. With both
-    /// flags false this is identical to the original `refresh`.
-    /// `block_place_buy` / `block_place_sell`: SIDE is reconciled normally for
-    /// KEEP + CANCEL (a stale resting order out of the requote band is still
-    /// cancelled), but placing a NEW order for an unmatched desired level is
-    /// SUPPRESSED. Used by the per-leg in-flight gate: when a reprice is already
-    /// in flight on a leg (`live_count` incl. Cancelling ≥ 2), don't stack a
-    /// second placement — cancel the stale active if needed, but wait for the
-    /// in-flight cancel to drain before placing again. Distinct from
-    /// `block_buy`/`block_sell` which skip the side ENTIRELY (no cancel either).
-    pub fn refresh_gated(
-        &mut self,
-        desired: &[QuoteLevel],
-        ts_event: u64,
-        block_buy: bool,
-        block_sell: bool,
-        block_place_buy: bool,
-        block_place_sell: bool,
-    ) -> Vec<Signal> {
-        let _t = crate::latency::TimedStage::new("order_manager.refresh");
-        let mut signals = Vec::new();
-
-        // Collect active orders by side
-        let active_bids: Vec<LocalOrder> = self.orders.values()
-            .filter(|o| o.side == Side::Buy && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
-            .cloned()
-            .collect();
-        let active_asks: Vec<LocalOrder> = self.orders.values()
-            .filter(|o| o.side == Side::Sell && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
-            .cloned()
-            .collect();
-
-        // Health diagnostic: under normal operation each side has ≤1 order
-        // (one bid + one ask). When we see a cluster of active orders on
-        // one side the cause is either (a) ladder quoting — shouldn't
-        // happen with this quoter, (b) stale Submitted-state leaks where
-        // an ack never arrived, or (c) Rejected/Cancelled updates never
-        // routed back to this OM. Log once per (side, refresh tick) when
-        // the count exceeds the threshold so we can diagnose from log
-        // alone — each active order's {coid, price, status, age_ms} is
-        // dumped so price-ladder vs same-price-leak is visible.
-        const HEALTHY_MAX_PER_SIDE: usize = 2;
-        let now = crate::types::now_ns();
-        for (side_name, active) in [("BID", &active_bids), ("ASK", &active_asks)] {
-            if active.len() > HEALTHY_MAX_PER_SIDE {
-                let details: Vec<String> = active.iter().map(|o| {
-                    let age_ms = now.saturating_sub(o.created_ns) / 1_000_000;
-                    format!("{{coid={} @{:.4} qty={} status={:?} age={}ms}}",
-                        o.client_order_id, o.price, o.quantity, o.status, age_ms)
-                }).collect();
-                log::warn!(
-                    "[OrderManager] {} {} side has {} active orders (healthy≤{}): [{}]",
-                    self.symbol, side_name, active.len(), HEALTHY_MAX_PER_SIDE,
-                    details.join(", "),
-                );
-            }
-        }
-
-        let desired_bids: Vec<&QuoteLevel> = desired.iter().filter(|q| q.side == Side::Buy).collect();
-        let desired_asks: Vec<&QuoteLevel> = desired.iter().filter(|q| q.side == Side::Sell).collect();
-
-        // A blocked side is skipped entirely — resting orders are left in
-        // place and no new place/cancel is emitted for it this tick.
-        if !block_buy {
-            self.reconcile_side(&active_bids, &desired_bids, Side::Buy, ts_event, block_place_buy, &mut signals);
-        }
-        if !block_sell {
-            self.reconcile_side(&active_asks, &desired_asks, Side::Sell, ts_event, block_place_sell, &mut signals);
-        }
-
+    /// Cancel every tracked active order (both sides), marking each
+    /// `Cancelling`. Byte-identical to the legacy `get_signals(None, None, ..)`
+    /// drain (BUY cancels then SELL cancels, BTreeMap order). Used by polymaker
+    /// to pull all resting orders at event expiry / settlement.
+    pub fn cancel_all(&mut self, ts_event: u64) -> Vec<Signal> {
+        let mut signals = self.cancel_orders_by_side(Side::Buy, ts_event);
+        signals.extend(self.cancel_orders_by_side(Side::Sell, ts_event));
         signals
     }
 
-    /// Simple single bid/ask interface (backward compatible).
-    pub fn get_signals(
-        &mut self,
-        bid_price: Option<f64>,
-        ask_price: Option<f64>,
-        quantity: f64,
-        ts_event: u64,
-    ) -> Vec<Signal> {
-        let mut desired = Vec::new();
-        if let Some(p) = bid_price {
-            desired.push(QuoteLevel { side: Side::Buy, price: p, quantity, post_only: true, order_type: OrderType::Limit });
-        }
-        if let Some(p) = ask_price {
-            desired.push(QuoteLevel { side: Side::Sell, price: p, quantity, post_only: true, order_type: OrderType::Limit });
-        }
-        self.refresh(&desired, ts_event)
-    }
-
-    /// Reconcile active orders on one side against desired levels.
-    /// Whether a resting order at price `active` should be kept against a
-    /// desired quote at price `desired` (vs cancelled + replaced). With
-    /// `requote_min_ticks <= 1` this is exact tick-grid equality
-    /// ([`price_eq`]); the default (`0.0`) is therefore bit-identical to the
-    /// pre-knob behaviour. With `requote_min_ticks = N (≥ 2)` a hysteresis
-    /// band of `(N − 0.5)` ticks retains the order until the desired price
-    /// drifts ≥ N ticks away. See the `requote_min_ticks` field doc.
-    fn keep_resting_price(&self, active: f64, desired: f64) -> bool {
-        if self.requote_min_ticks <= 1.0 {
-            price_eq(active, desired, self.tick_size)
-        } else {
-            (active - desired).abs() < (self.requote_min_ticks - 0.5) * self.tick_size
+    /// Snapshot the maker-policy knobs for the reconcile primitive. Lets the
+    /// per-side reconcile policy live outside the OM (strategy layer) while the
+    /// OM stays the order/book store.
+    pub fn reconcile_cfg(&self) -> ReconcileCfg {
+        ReconcileCfg {
+            tick_size: self.tick_size,
+            requote_min_ticks: self.requote_min_ticks,
+            min_order_size: self.min_order_size,
+            min_marketable_notional: self.min_marketable_notional,
         }
     }
 
-    fn reconcile_side(
-        &mut self,
-        active: &[LocalOrder],
-        desired: &[&QuoteLevel],
-        side: Side,
-        ts_event: u64,
-        block_place: bool,
-        signals: &mut Vec<Signal>,
-    ) {
-        // Track which active orders are "matched" (should be kept)
-        let mut matched_active: Vec<bool> = vec![false; active.len()];
+    /// Active (Submitted | Active) orders on one side — the snapshot the
+    /// reconcile primitive diffs against desired levels.
+    pub fn active_by_side(&self, side: Side) -> Vec<LocalOrder> {
+        self.orders.values()
+            .filter(|o| o.side == side
+                && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
+            .cloned()
+            .collect()
+    }
 
-        // For each desired level, try to find a matching active order
-        for desired_level in desired {
-            let mut found = false;
-            for (i, order) in active.iter().enumerate() {
-                if matched_active[i] {
-                    continue; // already matched to another desired level
-                }
-                if self.keep_resting_price(order.price, desired_level.price) {
-                    // Same price (within the requote hysteresis band) → keep
-                    matched_active[i] = true;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                // Drop orders below the exchange's minimum size before
-                // they hit the wire. Polymarket otherwise responds with
-                // `400 "Size (4) lower than the minimum: 5"`, which costs
-                // an HTTP RTT and floods the log — observed 151× in the
-                // 2026-05-04 49-min live run when hard-cap remainder left
-                // 4 shares against a 5-share min. Filter is opt-in (0.0
-                // default = no filter), set via `set_min_order_size` from
-                // the instrument's `order_min_size`.
-                if self.min_order_size > 0.0
-                    && desired_level.quantity < self.min_order_size
-                {
+    /// Apply reconcile decisions to OM state, emitting the matching signals.
+    /// `Place` assigns a fresh monotonic coid, inserts a `Submitted` local
+    /// order, and emits `NewOrder`; `Cancel` emits `CancelOrder` and marks the
+    /// order `Cancelling` (still resting until the exchange confirms). Order is
+    /// preserved (places in decision order, then cancels) so coid assignment +
+    /// signal sequencing match the legacy `reconcile_side`.
+    pub fn apply_reconcile(&mut self, actions: Vec<ReconcileAction>, ts_event: u64) -> Vec<Signal> {
+        let mut signals = Vec::with_capacity(actions.len());
+        for action in actions {
+            match action {
+                ReconcileAction::Place { side, price, quantity, order_type, post_only } => {
+                    let client_order_id = self.next_id();
                     log::debug!(
-                        "[OrderManager] {} drop new {} @ {:.4} qty={} below min_order_size={}",
-                        self.symbol, side, desired_level.price,
-                        desired_level.quantity, self.min_order_size,
+                        "[OrderManager] {} new {} {} @ {:.4} qty={}",
+                        self.symbol, client_order_id, side, price, quantity,
                     );
-                    continue;
+                    self.orders.insert(client_order_id.clone(), LocalOrder {
+                        client_order_id: client_order_id.clone(),
+                        symbol: self.symbol.clone(),
+                        side,
+                        price,
+                        quantity,
+                        status: LocalOrderStatus::Submitted,
+                        created_ns: crate::types::now_ns(),
+                        filled_by_trade: HashMap::new(),
+                    });
+                    signals.push(Signal::NewOrder(OrderRequest {
+                        client_order_id,
+                        exchange: self.exchange,
+                        symbol: self.symbol.clone(),
+                        side,
+                        order_type,
+                        price: Some(price),
+                        quantity,
+                        timestamp_ns: ts_event,
+                        instance_id: self.instance_id.clone(),
+                        fee_rate_bps: self.fee_rate_bps,
+                        post_only,
+                        outcome_label: String::new(),
+                    }));
                 }
-                // Drop marketable BUYs whose notional (price × qty) falls
-                // below the exchange's marketable-min. Polymarket otherwise
-                // returns a 400 "invalid amount for a marketable BUY order
-                // ($X), min size: $1" — observed 14× in the 2026-05-06 8h22m
-                // live run when `adjust_buy` lowered the price below the
-                // notional gate that the strategy's per-tick logic had
-                // checked at the original price. Filter is opt-in (0.0 =
-                // disabled), set via `set_min_marketable_notional`.
-                //
-                // A BUY is "marketable" iff `!post_only` (server allows it
-                // to cross) OR `order_type == Fak` (FAK always crosses).
-                // Resting post-only Limit BUYs at low notional are still
-                // legal and stay through the filter.
-                if self.min_marketable_notional > 0.0
-                    && side == Side::Buy
-                    && (!desired_level.post_only
-                        || matches!(desired_level.order_type, OrderType::Fak))
-                {
-                    let notional = desired_level.price * desired_level.quantity;
-                    if notional < self.min_marketable_notional {
+                ReconcileAction::Cancel { client_order_id } => {
+                    if let Some(o) = self.orders.get(&client_order_id) {
                         log::debug!(
-                            "[OrderManager] {} drop marketable {} @ {:.4} qty={} notional={:.4} below min_marketable_notional={}",
-                            self.symbol, side, desired_level.price,
-                            desired_level.quantity, notional, self.min_marketable_notional,
+                            "[OrderManager] {} cancel {} {} @ {:.4} (no longer desired)",
+                            self.symbol, client_order_id, o.side, o.price,
                         );
-                        continue;
+                    }
+                    signals.push(Signal::CancelOrder {
+                        exchange: self.exchange,
+                        client_order_id: client_order_id.clone(),
+                        instance_id: self.instance_id.clone(),
+                        timestamp_ns: ts_event,
+                    });
+                    if let Some(o) = self.orders.get_mut(&client_order_id) {
+                        o.status = LocalOrderStatus::Cancelling;
                     }
                 }
-                // No matching active order → would submit new. But when this
-                // side's placement is gated (a reprice is already in flight on
-                // the leg), suppress the placement — the stale active above is
-                // still cancelled by the loop below, we just don't stack a
-                // second order until the in-flight cancel drains.
-                if block_place {
-                    continue;
-                }
-                // No matching active order → submit new
-                let client_order_id = self.next_id();
-                log::debug!(
-                    "[OrderManager] {} new {} {} @ {:.4} qty={}",
-                    self.symbol, client_order_id, side, desired_level.price, desired_level.quantity,
-                );
-                let order = LocalOrder {
-                    client_order_id: client_order_id.clone(),
-                    symbol: self.symbol.clone(),
-                    side,
-                    price: desired_level.price,
-                    quantity: desired_level.quantity,
-                    status: LocalOrderStatus::Submitted,
-                    created_ns: crate::types::now_ns(),
-                    filled_by_trade: HashMap::new(),
-                };
-                self.orders.insert(client_order_id.clone(), order);
-                signals.push(Signal::NewOrder(OrderRequest {
-                    client_order_id,
-                    exchange: self.exchange,
-                    symbol: self.symbol.clone(),
-                    side,
-                    order_type: desired_level.order_type,
-                    price: Some(desired_level.price),
-                    quantity: desired_level.quantity,
-                    timestamp_ns: ts_event,
-                    instance_id: self.instance_id.clone(),
-                    fee_rate_bps: self.fee_rate_bps,
-                    post_only: desired_level.post_only,
-                    outcome_label: String::new(),
-                }));
             }
         }
-
-        // Cancel any active orders that weren't matched to a desired level
-        for (i, order) in active.iter().enumerate() {
-            if !matched_active[i] {
-                log::debug!(
-                    "[OrderManager] {} cancel {} {} @ {:.4} (no longer desired)",
-                    self.symbol, order.client_order_id, side, order.price,
-                );
-                signals.push(Signal::CancelOrder {
-                    exchange: self.exchange,
-                    client_order_id: order.client_order_id.clone(),
-                    instance_id: self.instance_id.clone(),
-                    timestamp_ns: ts_event,
-                });
-                if let Some(o) = self.orders.get_mut(&order.client_order_id) {
-                    o.status = LocalOrderStatus::Cancelling;
-                }
-            }
-        }
+        signals
     }
+
 }
+
+/// Maker-policy knobs for `reconcile_side_decide`, snapshotted from an
+/// `OrderManager` via `reconcile_cfg`. Lets the per-side reconcile policy live
+/// in the strategy layer while the OM stays the order/book store.
+#[derive(Clone, Copy, Debug)]
+pub struct ReconcileCfg {
+    pub tick_size: f64,
+    pub requote_min_ticks: f64,
+    pub min_order_size: f64,
+    pub min_marketable_notional: f64,
+}
+
+/// One reconcile decision for a side. Produced by `reconcile_side_decide`
+/// (pure policy), applied to OM state by `OrderManager::apply_reconcile`.
+#[derive(Clone, Debug)]
+pub enum ReconcileAction {
+    /// Submit a new order at this level — coid is assigned at apply time.
+    Place { side: Side, price: f64, quantity: f64, order_type: OrderType, post_only: bool },
+    /// Cancel a resting / placing order by coid.
+    Cancel { client_order_id: String },
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lvl(side: Side, price: f64) -> QuoteLevel {
-        QuoteLevel { side, price, quantity: 5.0, post_only: true, order_type: OrderType::Limit }
-    }
     fn om() -> OrderManager {
         OrderManager::new(Exchange::Polymarket, "TOK".into(), 0.001, "iid".into())
     }
-    fn has_cancel(sigs: &[Signal], coid: &str) -> bool {
-        sigs.iter().any(|s| matches!(s, Signal::CancelOrder { client_order_id, .. } if client_order_id == coid))
+    /// Place a resting order via the OM service; returns its coid. (Reconcile
+    /// policy now lives in the strategy layer; the OM only applies decisions.)
+    fn place(m: &mut OrderManager, side: Side, price: f64, qty: f64) -> String {
+        let sigs = m.apply_reconcile(vec![ReconcileAction::Place {
+            side, price, quantity: qty, order_type: OrderType::Limit, post_only: true,
+        }], 1);
+        sigs.into_iter().find_map(|s| match s {
+            Signal::NewOrder(o) => Some(o.client_order_id),
+            _ => None,
+        }).expect("expected a NewOrder")
     }
-    fn has_new(sigs: &[Signal], side: Side) -> bool {
-        sigs.iter().any(|s| matches!(s, Signal::NewOrder(o) if o.side == side))
+    /// Cancel an order via the OM service (marks it Cancelling).
+    fn cancel(m: &mut OrderManager, coid: &str) {
+        let _ = m.apply_reconcile(vec![ReconcileAction::Cancel { client_order_id: coid.into() }], 1);
     }
     fn upd(coid: &str, side: Side, status: OrderStatus) -> OrderUpdate {
         OrderUpdate {
@@ -777,77 +642,26 @@ mod tests {
         m.inject_open_order("b".into(), Side::Buy, 0.40, 5.0); // Active
         assert_eq!(m.live_count(Side::Buy), 1);
         // Reprice → cancel b (→ Cancelling) + place new (→ Submitted): BOTH count.
-        let _ = m.refresh(&[lvl(Side::Buy, 0.42)], 1);
+        cancel(&mut m, "b");
+        let _ = place(&mut m, Side::Buy, 0.42, 5.0);
         assert_eq!(m.live_count(Side::Buy), 2, "Cancelling old + Submitted new = 2");
         // A Cancelled update on b removes it → back to 1 (just the new order).
         m.on_order_update(&upd("b", Side::Buy, OrderStatus::Cancelled));
         assert_eq!(m.live_count(Side::Buy), 1, "Cancelled removes b → back to 1");
     }
 
-    // block_place: a saturated leg still CANCELS a stale (out-of-band) active,
-    // but SUPPRESSES the replacement placement (cancel-stale-but-don't-place).
-    #[test]
-    fn refresh_gated_block_place_cancels_stale_but_does_not_place() {
-        let mut m = om();
-        m.inject_open_order("b".into(), Side::Buy, 0.40, 5.0); // Active
-        // Desired BUY drifts to 0.41 (out of band) with BUY placement gated.
-        let sigs = m.refresh_gated(&[lvl(Side::Buy, 0.41)], 1, false, false, true, false);
-        assert!(has_cancel(&sigs, "b"), "stale active must still be cancelled");
-        assert!(!has_new(&sigs, Side::Buy), "placement must be suppressed");
-    }
-
-    // block_place: an in-band active is simply KEPT (no cancel, no place) when
-    // its leg is gated.
-    #[test]
-    fn refresh_gated_block_place_keeps_in_band() {
-        let mut m = om();
-        m.inject_open_order("b".into(), Side::Buy, 0.40, 5.0); // Active
-        // Desired == current price → in band → kept regardless of the gate.
-        let sigs = m.refresh_gated(&[lvl(Side::Buy, 0.40)], 1, false, false, true, false);
-        assert!(!has_cancel(&sigs, "b"), "in-band active must be kept (no cancel)");
-        assert!(!has_new(&sigs, Side::Buy), "no placement");
-    }
-
-    // A blocked side is left completely untouched (no cancel, no place),
-    // while the unblocked side reprices normally.
-    #[test]
-    fn refresh_gated_skips_blocked_side_only() {
-        let mut m = om();
-        m.inject_open_order("b".into(), Side::Buy, 0.40, 5.0);
-        m.inject_open_order("s".into(), Side::Sell, 0.60, 5.0);
-        // Reprice both, but block the BUY side.
-        let sigs = m.refresh_gated(&[lvl(Side::Buy, 0.41), lvl(Side::Sell, 0.59)], 1, true, false, false, false);
-        assert!(!has_cancel(&sigs, "b"), "blocked BUY must not be cancelled");
-        assert!(!has_new(&sigs, Side::Buy), "blocked BUY must not place");
-        assert!(has_cancel(&sigs, "s"), "unblocked SELL reprices: cancel old");
-        assert!(has_new(&sigs, Side::Sell), "unblocked SELL reprices: place new");
-    }
-
-    // Both unblocked = identical to the plain `refresh` (reprice = cancel+place).
-    #[test]
-    fn refresh_gated_unblocked_equals_refresh() {
-        let mut m = om();
-        m.inject_open_order("b".into(), Side::Buy, 0.40, 5.0);
-        let sigs = m.refresh_gated(&[lvl(Side::Buy, 0.41)], 1, false, false, false, false);
-        assert!(has_new(&sigs, Side::Buy));
-        assert!(has_cancel(&sigs, "b"));
-        // refresh() delegates to refresh_gated(.., false, false, false, false) → same.
-        let mut m2 = om();
-        m2.inject_open_order("b".into(), Side::Buy, 0.40, 5.0);
-        let sigs2 = m2.refresh(&[lvl(Side::Buy, 0.41)], 1);
-        assert_eq!(sigs.len(), sigs2.len());
-    }
+    // (The per-side reconcile policy tests — block_place / in-band keep /
+    // skip-side — moved with the policy into the strategy layer:
+    // polymaker `leg_manager.rs` + hexmaker. The OM only tests its order
+    // ledger / state-machine / service below.)
 
     // A dropped PLACE (Submitted) is removed entirely — the order never
     // reached the exchange, so nothing rests.
     #[test]
     fn on_signal_dropped_removes_submitted_placement() {
         let mut m = om();
-        // A freshly-placed order is Submitted (reconcile_side inserts it so).
-        let sigs = m.refresh(&[lvl(Side::Buy, 0.41)], 1);
-        let coid = match sigs.iter().find_map(|s| match s {
-            Signal::NewOrder(o) => Some(o.client_order_id.clone()), _ => None,
-        }) { Some(c) => c, None => panic!("expected a NewOrder") };
+        // A freshly-placed order is Submitted.
+        let coid = place(&mut m, Side::Buy, 0.41, 5.0);
         assert_eq!(m.active_count(), 1);
         assert_eq!(m.on_signal_dropped(&coid), DroppedSignalOutcome::PlaceRemoved);
         assert_eq!(m.open_count(), 0, "dropped placement must be removed");
@@ -860,25 +674,22 @@ mod tests {
     fn on_signal_dropped_reverts_cancelling_to_active() {
         let mut m = om();
         m.inject_open_order("C".into(), Side::Buy, 0.40, 5.0);
-        // Reprice to a new price → cancel C (→ Cancelling) + place new P.
-        let _ = m.refresh(&[lvl(Side::Buy, 0.41)], 1);
+        // Reprice → cancel C (→ Cancelling) + place new P.
+        cancel(&mut m, "C");
+        let p_coid = place(&mut m, Side::Buy, 0.41, 5.0);
         // C is now Cancelling (excluded from active set); P is the new active.
         assert!(m.active_bid().map(|o| o.client_order_id != "C").unwrap_or(false));
 
         // The reprice batch is dropped as stale: both legs come back as
         // ExecutorRejected. Place leg P → removed; cancel leg C → reverted.
-        let p_coid = m.active_bid().unwrap().client_order_id.clone();
         assert_eq!(m.on_signal_dropped(&p_coid), DroppedSignalOutcome::PlaceRemoved);
         assert_eq!(m.on_signal_dropped("C"), DroppedSignalOutcome::CancelReverted);
 
         // C is back to Active and is the only live order — invariant restored.
+        // (The "next reconcile re-cancels the reverted order" regression now
+        // lives with the reconcile policy in the strategy layer.)
         assert_eq!(m.active_count(), 1);
         assert_eq!(m.active_bid().unwrap().client_order_id, "C");
-
-        // REGRESSION: the next refresh re-cancels C (pre-fix it was stuck
-        // Cancelling forever and silently rested until settlement).
-        let sigs = m.refresh(&[lvl(Side::Buy, 0.41)], 2);
-        assert!(has_cancel(&sigs, "C"), "reverted order must be re-cancelled");
     }
 
     // An unknown coid (wrong OM / already terminal) is a no-op.
