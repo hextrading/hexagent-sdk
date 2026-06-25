@@ -45,6 +45,18 @@ pub enum LocalOrderStatus {
     /// `refresh()` cycles don't try to cancel it; filtered out of all
     /// active-order / locked-qty queries.
     Rejected,
+    /// Cancel confirmed by the exchange — order is OFF the book. Kept in the
+    /// map (NOT removed) so a late `Accepted` for the same coid can RESURRECT
+    /// it: the pending/delayed cancel/placement race lands the placement on
+    /// the book ~tens of ms AFTER the cancel committed, and the strategy does
+    /// receive that `Accepted` — keeping the Cancelled order here lets
+    /// `on_order_update` flip it back to `Active` instead of dropping the
+    /// (now-live) order to settlement (live.log 2026-06-25: 120/121 forgotten
+    /// orders were this race). Filtered out of ALL active/live/locked queries
+    /// exactly like `Rejected` (they whitelist `Submitted|Active|Cancelling`);
+    /// the whole map is freed when the OM is torn down at event expiry, so
+    /// kept-Cancelled entries are bounded to one event.
+    Cancelled,
 }
 
 /// Outcome of [`OrderManager::on_signal_dropped`] — tells the caller how the
@@ -238,6 +250,18 @@ impl OrderManager {
         };
         match update.status {
             OrderStatus::Accepted => {
+                // RESURRECTION: an Accepted for an order we'd marked Cancelled
+                // means the placement landed on the book AFTER an intervening
+                // cancel committed (the pending/delayed cancel/placement race).
+                // Flip it back to live so `refresh()` reprices it and
+                // `cancel_all()` cancels it at expiry — instead of leaving the
+                // (now-live) order forgotten to settlement.
+                if order.status == LocalOrderStatus::Cancelled {
+                    log::warn!(
+                        "[OrderManager] {} {} {} RESURRECTED — Accepted landed after Cancelled (cancel/placement race); re-activating @ {:.4} x {}",
+                        self.symbol, update.client_order_id, order.side, order.price, order.quantity,
+                    );
+                }
                 order.status = LocalOrderStatus::Active;
             }
             OrderStatus::PartiallyFilled => {
@@ -300,12 +324,25 @@ impl OrderManager {
                 );
                 order.status = LocalOrderStatus::Rejected;
             }
-            OrderStatus::Filled | OrderStatus::Cancelled => {
+            OrderStatus::Filled => {
+                // Terminal & done — a Filled order never receives a later
+                // Accepted, so there's nothing to resurrect; remove it.
                 log::debug!(
-                    "[OrderManager] {} {} {} removed ({:?})",
-                    self.symbol, update.client_order_id, order.side, update.status
+                    "[OrderManager] {} {} {} removed (Filled)",
+                    self.symbol, update.client_order_id, order.side
                 );
                 self.orders.remove(&update.client_order_id);
+            }
+            OrderStatus::Cancelled => {
+                // Do NOT remove — keep as `Cancelled` so a late `Accepted`
+                // (pending/delayed race) can resurrect it via the Accepted arm
+                // above. Excluded from all active/live/locked queries; freed
+                // with the OM at event teardown. (See LocalOrderStatus::Cancelled.)
+                log::debug!(
+                    "[OrderManager] {} {} {} → Cancelled (kept for possible resurrection)",
+                    self.symbol, update.client_order_id, order.side
+                );
+                order.status = LocalOrderStatus::Cancelled;
             }
             _ => {}
         }
@@ -645,9 +682,46 @@ mod tests {
         cancel(&mut m, "b");
         let _ = place(&mut m, Side::Buy, 0.42, 5.0);
         assert_eq!(m.live_count(Side::Buy), 2, "Cancelling old + Submitted new = 2");
-        // A Cancelled update on b removes it → back to 1 (just the new order).
+        // A Cancelled update on b excludes it from live_count → back to 1
+        // (b is now KEPT as Cancelled but filtered out of live/active queries).
         m.on_order_update(&upd("b", Side::Buy, OrderStatus::Cancelled));
-        assert_eq!(m.live_count(Side::Buy), 1, "Cancelled removes b → back to 1");
+        assert_eq!(m.live_count(Side::Buy), 1, "Cancelled excludes b → live back to 1");
+    }
+
+    // Cancelled is KEPT in the map (not removed) and excluded from live/active
+    // queries; a late `Accepted` (the pending/delayed cancel/placement race)
+    // RESURRECTS it to Active, retaining the original price/qty — no
+    // reconstruction needed. Fixes the forgotten-order leak (live.log
+    // 2026-06-25: 120/121 forgotten orders).
+    #[test]
+    fn cancelled_is_kept_and_accepted_resurrects() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0); // live on book
+        assert_eq!(m.live_count(Side::Buy), 1);
+        assert_eq!(m.open_count(), 1);
+        // Cancelled: kept in map but excluded from live/active.
+        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
+        assert_eq!(m.live_count(Side::Buy), 0, "Cancelled excluded from live_count");
+        assert!(m.active_bid().is_none(), "Cancelled excluded from active_bid");
+        assert_eq!(m.open_count(), 1, "but KEPT in the map for resurrection");
+        // Late Accepted resurrects → Active, retaining original price/qty.
+        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Accepted));
+        assert_eq!(m.live_count(Side::Buy), 1, "Accepted resurrects Cancelled → Active");
+        let bid = m.active_bid().expect("resurrected as the active bid");
+        assert_eq!(bid.client_order_id, "x");
+        assert_eq!(bid.status, LocalOrderStatus::Active);
+        assert!((bid.price - 0.40).abs() < 1e-9, "retains original price");
+        assert_eq!(bid.quantity, 5.0, "retains original quantity");
+    }
+
+    // Filled is terminal & done (never gets a later Accepted) → still removed,
+    // never resurrected.
+    #[test]
+    fn filled_is_removed_not_kept() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
+        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
+        assert_eq!(m.open_count(), 0, "Filled is removed");
     }
 
     // (The per-side reconcile policy tests — block_place / in-band keep /

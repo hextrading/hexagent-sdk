@@ -373,6 +373,31 @@ impl PositionManager {
             | OrderStatus::Rejected => {
                 self.pending_orders.remove(coid);
             }
+            OrderStatus::Accepted => {
+                // RESURRECTION re-lock: normally the lock is already present
+                // (the strategy registers it at NewOrder-emit time), so this is
+                // a no-op. But an `Accepted` for a coid we no longer hold a lock
+                // for means the order was dropped by an intervening `Cancelled`
+                // (the pending/delayed cancel/placement race) and then went
+                // live — re-acquire the lock so `available_cash` /
+                // `available_inventory` again reflect the collateral the server
+                // has reserved for this resting order, else the strategy
+                // over-quotes against balance that isn't actually free. The
+                // `Accepted` reply carries the order price in `avg_fill_price`
+                // and the resting size in `remaining_quantity`.
+                // (Live-only in practice: the race can't happen in the sim, and
+                // in normal flow the lock is present so the guard skips — BT
+                // byte-identical.)
+                if !self.pending_orders.contains_key(coid) && update.remaining_quantity > 0.0 {
+                    self.pending_orders.insert(coid.clone(), PendingOrder {
+                        client_order_id: coid.clone(),
+                        symbol: update.symbol.clone(),
+                        side: update.side,
+                        price: update.avg_fill_price,
+                        remaining_quantity: update.remaining_quantity,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -621,6 +646,60 @@ mod tests {
 
     fn upsert(pm: &mut PositionManager, id: &str, status: TradeStatus) -> UpsertResult {
         pm.upsert_trade(id, "TOKEN", Side::Buy, 5.0, 0.4, status, true, 0.0, 0.0, None)
+    }
+
+    fn ou(coid: &str, side: Side, status: OrderStatus, price: f64, qty: f64) -> OrderUpdate {
+        OrderUpdate {
+            client_order_id: coid.into(),
+            exchange: crate::types::Exchange::Polymarket,
+            symbol: "TOK".into(),
+            side,
+            exchange_order_id: None,
+            status,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: qty,
+            avg_fill_price: price,
+            timestamp_ns: 0,
+            trade_id: None,
+            error: None,
+        }
+    }
+
+    // Resurrection re-lock: a `Cancelled` releases the pending lock; a later
+    // `Accepted` (the pending/delayed cancel/placement race put the order live
+    // AFTER the cancel committed) must RE-ACQUIRE it — else available_cash /
+    // available_inventory over-read the collateral the server has reserved.
+    #[test]
+    fn accepted_relocks_after_cancelled_dropped_the_lock() {
+        let mut pm = PositionManager::new();
+        pm.register_pending_order("x", "TOK", Side::Buy, 0.40, 5.0); // lock at NewOrder emit
+        assert_eq!(pm.pending_orders().len(), 1);
+        pm.sync_pending_from_update(&ou("x", Side::Buy, OrderStatus::Cancelled, 0.0, 0.0));
+        assert_eq!(pm.pending_orders().len(), 0, "Cancelled releases the lock");
+        // Delayed place-ack lands, carrying price + resting qty → re-lock.
+        pm.sync_pending_from_update(&ou("x", Side::Buy, OrderStatus::Accepted, 0.40, 5.0));
+        assert_eq!(pm.pending_orders().len(), 1, "Accepted-after-Cancelled re-locks");
+        let po = pm.pending_orders().get("x").expect("re-locked");
+        assert_eq!(po.side, Side::Buy);
+        assert!((po.price - 0.40).abs() < 1e-9);
+        assert_eq!(po.remaining_quantity, 5.0);
+    }
+
+    // Normal path: the lock is already present at `Accepted` (registered at
+    // NewOrder-emit time), so the re-lock guard MUST skip — no double-add, no
+    // overwrite. Guarantees BT byte-identity (the new arm only fires on the
+    // live race where the lock was already released).
+    #[test]
+    fn accepted_normal_path_does_not_touch_existing_lock() {
+        let mut pm = PositionManager::new();
+        pm.register_pending_order("x", "TOK", Side::Sell, 0.60, 5.0);
+        // Bogus price/qty on the Accepted — must NOT overwrite the real lock.
+        pm.sync_pending_from_update(&ou("x", Side::Sell, OrderStatus::Accepted, 0.99, 9.0));
+        assert_eq!(pm.pending_orders().len(), 1);
+        let po = pm.pending_orders().get("x").unwrap();
+        assert!((po.price - 0.60).abs() < 1e-9, "existing lock untouched");
+        assert_eq!(po.remaining_quantity, 5.0);
     }
 
     #[test]
