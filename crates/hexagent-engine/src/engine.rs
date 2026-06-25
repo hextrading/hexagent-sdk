@@ -1060,11 +1060,22 @@ impl Engine {
             if aw_days > 0.0 && !spot_sources.is_empty() {
                 let aw_end_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(start_ns as i64);
                 let aw_start_dt = aw_end_dt - chrono::TimeDelta::seconds((aw_days * 86400.0) as i64);
-                info!("[Backtest v2] apv2 warm-up: {:.1}d chronological spot replay [{} → {}]",
-                    aw_days, aw_start_dt.format("%Y-%m-%d %H:%M"), aw_end_dt.format("%Y-%m-%d %H:%M"));
+                // apv2 warm-up cache: strategies import their cached per-bucket
+                // baseline and narrow the raw replay to the uncached tail gap.
+                // (Live-only by default; a BT strategy returns aw_start ⇒ full
+                // replay ⇒ byte-identical baseline.)
+                let aw_start_ns = aw_start_dt.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
+                let aw_end_ns = aw_end_dt.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
+                let resume_ns = strategies.iter_mut()
+                    .map(|s| s.apv2_warmup_resume_ns(aw_start_ns, aw_end_ns))
+                    .min().unwrap_or(aw_start_ns);
+                let replay_start_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
+                info!("[Backtest v2] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
+                    aw_days, aw_start_dt.format("%Y-%m-%d %H:%M"), aw_end_dt.format("%Y-%m-%d %H:%M"),
+                    replay_start_dt.format("%Y-%m-%d %H:%M"));
                 let mut replayers: Vec<crate::recorder::MarketReplayer> = Vec::new();
                 for (exchange, symbol) in &spot_sources {
-                    match crate::recorder::MarketReplayer::new(&data_path, exchange, symbol, aw_start_dt, aw_end_dt) {
+                    match crate::recorder::MarketReplayer::new(&data_path, exchange, symbol, replay_start_dt, aw_end_dt) {
                         Ok(r) => replayers.push(r),
                         Err(e) => warn!("[Backtest v2] apv2 warm-up: no data for {}/{}: {}", exchange, symbol, e),
                     }
@@ -1091,6 +1102,7 @@ impl Engine {
                     peeked[idx] = replayers[idx].next_event().ok().flatten();
                 }
                 info!("[Backtest v2] apv2 warm-up complete: {} spot events fed", fed);
+                for s in &mut strategies { s.apv2_warmup_finalize_cache(); }
             }
         }
 
@@ -2128,8 +2140,19 @@ impl Engine {
                     chrono::Utc::now()
                 };
                 let aw_start = aw_end - chrono::TimeDelta::seconds((aw_days * 86400.0) as i64);
-                info!("[Strategy] apv2 warm-up: {:.1}d chronological spot replay [{} → {}]",
-                    aw_days, aw_start.format("%Y-%m-%d %H:%M"), aw_end.format("%Y-%m-%d %H:%M"));
+                // apv2 warm-up cache: import cached per-bucket baseline and
+                // narrow the raw replay to the uncached tail gap (skips the
+                // ~7d parquet read on a warm restart). Strategies without a
+                // usable cache return aw_start ⇒ full replay (unchanged).
+                let aw_start_ns = aw_start.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
+                let aw_end_ns = aw_end.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
+                let resume_ns = strategies.iter_mut()
+                    .map(|s| s.apv2_warmup_resume_ns(aw_start_ns, aw_end_ns))
+                    .min().unwrap_or(aw_start_ns);
+                let replay_start = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
+                info!("[Strategy] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
+                    aw_days, aw_start.format("%Y-%m-%d %H:%M"), aw_end.format("%Y-%m-%d %H:%M"),
+                    replay_start.format("%Y-%m-%d %H:%M"));
                 // Per source, pick the first data_dir that actually yields
                 // events (mirrors the prediction warm-up's primary→fallback
                 // selection), priming one buffered event each.
@@ -2137,7 +2160,7 @@ impl Engine {
                 let mut peeked: Vec<Option<(u64, MarketEvent)>> = Vec::new();
                 for (exchange, symbol) in &spot_sources {
                     for dir in &data_dirs {
-                        if let Ok(mut r) = crate::recorder::MarketReplayer::new(dir, exchange, symbol, aw_start, aw_end) {
+                        if let Ok(mut r) = crate::recorder::MarketReplayer::new(dir, exchange, symbol, replay_start, aw_end) {
                             let first = r.next_event().ok().flatten();
                             if first.is_some() {
                                 replayers.push(r);
@@ -2165,6 +2188,7 @@ impl Engine {
                     peeked[idx] = replayers[idx].next_event().ok().flatten();
                 }
                 info!("[Strategy] apv2 warm-up complete: {} spot events fed", fed);
+                for s in &mut strategies { s.apv2_warmup_finalize_cache(); }
             }
         }
 
