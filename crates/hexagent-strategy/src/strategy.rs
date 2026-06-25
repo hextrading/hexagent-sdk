@@ -81,6 +81,24 @@ pub trait Strategy: Send {
     /// As [`on_apv2_warmup_orderbook`], for a spot trade print.
     fn on_apv2_warmup_trade(&mut self, _trade: &TradeTick) {}
 
+    /// **apv2 warm-up cache hook.** Called once by the engine BEFORE the
+    /// chronological apv2 warm-up replay, with the warm-up window
+    /// `[aw_start_ns, aw_end_ns]`. A strategy that caches its per-bucket
+    /// activity baseline loads the cache, imports the buckets it already has,
+    /// and returns the timestamp from which the engine should raw-replay the
+    /// remaining (uncached, tail) gap — so the parquet read is skipped for the
+    /// cached portion. The engine starts the replay at the `min` over strategies.
+    ///
+    /// Default returns `aw_end_ns` ("I impose no lower bound / need no raw
+    /// replay") so a non-apv2 strategy never forces a full replay; an apv2
+    /// strategy with no usable cache returns `aw_start_ns` (full replay).
+    fn apv2_warmup_resume_ns(&mut self, _aw_start_ns: u64, aw_end_ns: u64) -> u64 {
+        aw_end_ns
+    }
+    /// Called once AFTER the apv2 warm-up replay completes; the strategy
+    /// persists its (now fully warmed) per-bucket cache to disk. Default no-op.
+    fn apv2_warmup_finalize_cache(&mut self) {}
+
     fn on_init(&mut self) {}
     fn on_shutdown(&mut self) -> Vec<Signal> { Vec::new() }
 
