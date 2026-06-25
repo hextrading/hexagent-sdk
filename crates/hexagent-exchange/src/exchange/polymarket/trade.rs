@@ -3,7 +3,7 @@
 //! Implements `ExchangeTrade` for submitting and canceling orders via the
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -186,6 +186,19 @@ enum CancelReasonOutcome {
 ///     unmanaged to settlement (live.log 2026-06-24: 9 forgotten orders).
 ///
 ///   * Other / unrecognised → **Cancelled** (conservative fallback).
+/// True if a `not_canceled` reason means the cancel raced ahead of the
+/// placement — the order is still being processed server-side and will
+/// shortly become LIVE (NOT gone, NOT matched). Such an orphan is treated as
+/// **Uncertain** (kept reconciling) rather than committed Cancelled: the
+/// reconcile cancel not-found arm keeps re-GETting until it converges, so a
+/// not-yet-indexed order isn't dropped (live.log 2026-06-25: 120/121 forgotten
+/// orders had a pending/delayed cancel reject). Single source of truth, shared
+/// by `cancel_not_canceled_outcome` and the cancel-reply classification sites.
+fn is_pending_delayed_reason(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("pending") || r.contains("delayed") || r.contains("processing")
+}
+
 fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     let r = reason.to_ascii_lowercase();
     let not_found = r.contains("not found")
@@ -217,7 +230,7 @@ fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     // Cancelled fallback below and dropped tracking on a still-live order,
     // leaving a forgotten resting order that rode to settlement
     // (live.log 2026-06-24: 9 such orders, all with this reason).
-    if r.contains("pending") || r.contains("delayed") || r.contains("processing") {
+    if is_pending_delayed_reason(reason) {
         return CancelReasonOutcome::Uncertain;
     }
     // "already canceled" / unrecognised — conservative.
@@ -727,6 +740,19 @@ pub struct SharedState {
     /// Cleared on any conclusive resolution (MATCHED / FILLED /
     /// CANCELED) so a subsequent unrelated 404 starts fresh.
     pub(crate) reconcile_not_found_attempts: Mutex<HashMap<String, u32>>,
+
+    /// Coids whose cancel was rejected with a `pending/delayed` reason — the
+    /// cancel raced the placement, so the order is still being processed and
+    /// will shortly be LIVE (not gone). The reconcile cancel-orphan `""`
+    /// (not-found) arm treats these as **Uncertain** and keeps retrying the GET
+    /// (bounded) until the order converges (LIVE → re-DELETE / MATCHED → Filled
+    /// / CANCELED → Cancelled), instead of committing Cancelled on a
+    /// not-yet-indexed order. Inserted at the cancel-reply classification sites;
+    /// cleared on conclusive resolution via `remove_order`. (Belt-and-suspenders
+    /// with the OrderManager resurrection: this avoids even a transient
+    /// Cancelled for pending/delayed; resurrection backstops the bounded-retry
+    /// give-up tail.)
+    pub(crate) pending_delayed_orphans: Mutex<HashSet<String>>,
 }
 
 /// Number of consecutive `not_found` GETs we tolerate from the server
@@ -792,6 +818,9 @@ impl SharedState {
     /// `cancel_all_orders` at shutdown.
     pub fn remove_order(&self, client_order_id: &str) {
         self.open_orders.lock().unwrap().remove(client_order_id);
+        // Conclusive resolution — drop any pending/delayed orphan flag so the
+        // set never leaks and a future coid reuse starts fresh.
+        self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
     }
 
     fn check_rate_limit(&self) -> bool {
@@ -1343,6 +1372,7 @@ impl PolymarketTrade {
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
                 reconcile_not_found_attempts: Mutex::new(HashMap::new()),
+                pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
             owner: api_key.to_string(),
         })
@@ -2334,7 +2364,45 @@ impl PolymarketTrade {
                 s if s.starts_with("CANCELED") || s.starts_with("CANCELLED") => {
                     OrderStatus::Cancelled
                 }
-                "" => OrderStatus::Cancelled, // not found → assume gone
+                "" => {
+                    // Not found. Default = assume gone → Cancelled. BUT a
+                    // pending/delayed orphan is treated as UNCERTAIN, not
+                    // cancelled: the cancel raced the placement and
+                    // `GET /data/order` just hasn't indexed the order yet.
+                    // Keep retrying (orphan stays parked; the orphan_reconciler
+                    // re-emits after its in_flight TTL) so a later pass hits the
+                    // "LIVE" arm above and re-DELETEs it — instead of committing
+                    // Cancelled on an order that goes live ~tens of ms later.
+                    // Bounded by RECONCILE_NOT_FOUND_RETRY_LIMIT (≈7.5 s) so a
+                    // never-materialising order can't wedge the orphan-gate; the
+                    // OrderManager resurrection + layer-2 sweep backstop the cap.
+                    // Every other not-found cancel still commits Cancelled
+                    // immediately (unchanged).
+                    if self.shared.pending_delayed_orphans.lock().unwrap().contains(coid) {
+                        let attempts = {
+                            let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
+                            let entry = m.entry(coid.clone()).or_insert(0);
+                            *entry += 1;
+                            *entry
+                        };
+                        if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
+                            warn!(
+                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} pending/delayed not found yet (attempt {}/{}) — uncertain, keeping orphan, retrying",
+                                coid, order_id, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
+                            );
+                            OrderStatus::CancelOrderTimeout
+                        } else {
+                            warn!(
+                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} pending/delayed never materialised (after {} attempts) → Cancelled",
+                                coid, order_id, attempts,
+                            );
+                            self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                            OrderStatus::Cancelled
+                        }
+                    } else {
+                        OrderStatus::Cancelled // not found → assume gone
+                    }
+                }
                 other => {
                     // Unknown status — defensive retry cap so a future
                     // Polymarket-introduced status can't permanently wedge
@@ -2649,7 +2717,19 @@ impl PolymarketTrade {
             liquidity: None,
             filled_quantity,
             remaining_quantity,
-            avg_fill_price: 0.0,
+            // Carry the resting price on an `Accepted` reply so a resurrection
+            // (PositionManager::sync_pending_from_update + OrderManager) can
+            // re-lock / re-track at the right price if a pending/delayed cancel
+            // race already dropped this order. Mirrors the placement-reconcile
+            // "LIVE" arm (which already sets avg_fill_price = price). Harmless
+            // for the normal path: an Accepted has filled_quantity = 0, so the
+            // PM ledger's `filled_quantity > 0` gate ignores it; 0.0 for the
+            // `matched`→Filled placeholder (the WS push books the real price).
+            avg_fill_price: if status == OrderStatus::Accepted {
+                order.price.unwrap_or(0.0)
+            } else {
+                0.0
+            },
             timestamp_ns: now_ns(),
             trade_id: None,
             error: None,
@@ -2833,6 +2913,16 @@ impl PolymarketTrade {
                                         // for an authoritative answer
                                         // before strategy releases the
                                         // pending_orders lock.
+                                        // pending/delayed = cancel raced the
+                                        // placement; flag so the reconcile
+                                        // not-found arm treats it as Uncertain
+                                        // (keeps retrying) instead of committing
+                                        // Cancelled (the forgotten-order race).
+                                        if is_pending_delayed_reason(reason_str) {
+                                            self.shared.pending_delayed_orphans
+                                                .lock().unwrap()
+                                                .insert(client_order_id.to_string());
+                                        }
                                         info!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
                                             reason_str, client_order_id);
                                         should_remove = false;
@@ -3324,7 +3414,13 @@ impl ExchangeTrade for PolymarketTrade {
                                     // server can't disambiguate, ask
                                     // GET /data/order/{oid} before
                                     // releasing pending_orders lock.
-                                    CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                    CancelReasonOutcome::Uncertain => {
+                                        if is_pending_delayed_reason(reason_str) {
+                                            self.shared.pending_delayed_orphans
+                                                .lock().unwrap().insert(coid.clone());
+                                        }
+                                        OrderStatus::CancelOrderTimeout
+                                    }
                                 };
                                 per_coid_outcome.insert(coid, s);
                             }
@@ -3733,7 +3829,13 @@ impl ExchangeTrade for PolymarketTrade {
                                         // single-cancel path — wait for
                                         // GET /data/order/{oid} before
                                         // releasing pending_orders lock.
-                                        CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                        CancelReasonOutcome::Uncertain => {
+                                            if is_pending_delayed_reason(reason_str) {
+                                                self.shared.pending_delayed_orphans
+                                                    .lock().unwrap().insert(coid.clone());
+                                            }
+                                            OrderStatus::CancelOrderTimeout
+                                        }
                                     };
                                     per_coid_outcome.insert(coid, s);
                                 }
@@ -4054,6 +4156,24 @@ mod tests {
             cancel_not_canceled_outcome("matched orders can't be canceled"),
             CancelReasonOutcome::Filled,
         );
+    }
+
+    /// `is_pending_delayed_reason` flags the cancel/placement race so the
+    /// reconcile not-found arm treats the orphan as Uncertain (keeps retrying)
+    /// rather than committing Cancelled — never for genuinely-gone / matched.
+    #[test]
+    fn is_pending_delayed_reason_flags_race_only() {
+        assert!(is_pending_delayed_reason("can't be canceled because it is pending/delayed"));
+        assert!(is_pending_delayed_reason("order is DELAYED, cannot cancel")); // case-insensitive
+        assert!(is_pending_delayed_reason("order still processing"));
+        assert!(!is_pending_delayed_reason("order can't be found - already canceled or matched"));
+        assert!(!is_pending_delayed_reason("matched orders can't be canceled"));
+        assert!(!is_pending_delayed_reason("the order is already canceled"));
+        assert!(!is_pending_delayed_reason(""));
+        // Consistent with the classifier: pending/delayed → Uncertain.
+        for r in ["pending/delayed", "DELAYED", "processing"] {
+            assert_eq!(cancel_not_canceled_outcome(r), CancelReasonOutcome::Uncertain);
+        }
     }
 
     /// `is_unknown_state` must classify HTTP 425 as unknown_state so the
