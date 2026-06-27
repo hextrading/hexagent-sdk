@@ -671,6 +671,63 @@ impl Default for BacktestConfig {
     }
 }
 
+/// Asset identity derived from a Polymarket event-series slug. This is the
+/// single source of truth for all per-asset symbols: the strategy reads one
+/// `event_series_slug` param (e.g. "eth-up-or-down-5m") and everything else —
+/// binance/spot symbols, the polymarket subscription, per-venue prediction
+/// symbols, and the chainlink feed-id lookup key — derives from it.
+#[derive(Debug, Clone)]
+pub struct AssetSymbols {
+    /// Lowercase asset token, e.g. "eth".
+    pub token: String,
+    /// Uppercase asset, e.g. "ETH".
+    pub asset: String,
+    /// Binance kline/spot symbol, e.g. "ETHUSDT".
+    pub binance_symbol: String,
+    /// Chainlink/RTDS spot symbol label, e.g. "eth/usd".
+    pub spot_symbol: String,
+    /// Polymarket market subscription, e.g. "series:eth-up-or-down-5m".
+    pub series_subscription: String,
+}
+
+/// Derive [`AssetSymbols`] from an event-series slug. Accepts an optional
+/// "series:" prefix; the asset token is the first '-'-delimited segment
+/// ("eth-up-or-down-5m" → "eth"). Returns `None` for an empty/degenerate slug.
+pub fn derive_asset_symbols(event_series_slug: &str) -> Option<AssetSymbols> {
+    let slug = event_series_slug
+        .strip_prefix("series:")
+        .unwrap_or(event_series_slug)
+        .trim();
+    if slug.is_empty() {
+        return None;
+    }
+    let token = slug.split('-').next().unwrap_or("").to_ascii_lowercase();
+    if token.is_empty() {
+        return None;
+    }
+    let asset = token.to_ascii_uppercase();
+    Some(AssetSymbols {
+        binance_symbol: format!("{asset}USDT"),
+        spot_symbol: format!("{token}/usd"),
+        series_subscription: format!("series:{slug}"),
+        token,
+        asset,
+    })
+}
+
+/// Per-venue spot / prediction symbol for an asset, by exchange name. Mirrors
+/// the legacy `binance_symbol`-derived venue mapping:
+///   binance/bybit → ASSETUSDT, coinbase → ASSET-USD,
+///   kraken → ASSET/USD, okx → ASSET-USDT, else → ASSETUSDT.
+pub fn venue_symbol(asset: &str, exchange: &str) -> String {
+    match exchange {
+        "coinbase" => format!("{asset}-USD"),
+        "kraken" => format!("{asset}/USD"),
+        "okx" => format!("{asset}-USDT"),
+        _ => format!("{asset}USDT"),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeConfig {
     pub name: String,
@@ -707,9 +764,12 @@ pub struct ExchangeConfig {
     /// Data source variant (e.g. chainlink: "rtds" or "stream"). Default: empty (auto).
     #[serde(default)]
     pub source: String,
-    /// Chainlink BTC/USD feed ID (hex) for REST API historical price fetch.
+    /// Chainlink Data Streams feed IDs (hex) per spot symbol, for the REST
+    /// strike/close fetch. Keyed by the spot symbol label (e.g. "eth/usd").
+    /// The strategy looks up the slug-derived spot symbol here. TOML inline
+    /// table: `feed_ids = { "eth/usd" = "0x…", "btc/usd" = "0x…" }`.
     #[serde(default)]
-    pub btc_feed_id: String,
+    pub feed_ids: HashMap<String, String>,
     /// Polymarket signature type: "eoa" (default) or "gnosis_safe".
     #[serde(default)]
     pub signature_type: String,

@@ -164,39 +164,33 @@ pub fn parse_index_exchanges(cfg: &StrategyConfig) -> Vec<(String, f64)> {
         ])
 }
 
-/// Inject a spot-MM strategy's price-feed symbols (binance + derived
-/// coinbase / kraken / okx / bybit) into the full config so the engine
-/// subscribes to them. LIVE-only — backtest/paper use explicitly configured
-/// data sources. Used by the polymaker + index_price factories' `inject_config`.
-/// Moved verbatim from the engine's old `inject_polymaker_symbols`.
+/// Inject a spot-MM strategy's data-source symbols into the full config so the
+/// engine subscribes to them, ALL derived from the single `event_series_slug`
+/// param (the source of asset identity). Injects: binance + the other spot
+/// venues (coinbase/kraken/okx/bybit), the chainlink spot label, and the
+/// polymarket market subscription. Runs in ALL modes (live + paper + backtest)
+/// so configs never restate per-asset symbols. No-op for strategies without an
+/// `event_series_slug` (e.g. the multi-asset index recorder, which lists its
+/// own symbols explicitly). Used by the polymaker + index_price factories'
+/// `inject_config`.
 pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
-    if full.general.mode != crate::config::RunMode::Live {
-        return;
-    }
-    let binance_symbol = cfg
+    let slug = cfg
         .params
-        .get("binance_symbol")
+        .get("event_series_slug")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if binance_symbol.is_empty() {
+        .unwrap_or("");
+    let Some(sym) = crate::config::derive_asset_symbols(slug) else {
         return;
-    }
-    let base = binance_symbol
-        .strip_suffix("USDT")
-        .unwrap_or(&binance_symbol)
-        .to_string();
-    let coinbase_symbol = format!("{}-USD", base);
-    let kraken_symbol = format!("{}/USD", base);
-    let okx_symbol = format!("{}-USDT", base);
+    };
 
-    // Ensure binance exchange exists in config.
+    // Binance kline/spot feed — create the exchange if absent (paths that
+    // don't list a binance block), else append.
     let has_binance = full.exchanges.iter().any(|e| e.name == "binance");
     if !has_binance {
         full.exchanges.push(crate::config::ExchangeConfig {
             name: "binance".to_string(),
             enabled: true,
-            symbols: vec![binance_symbol.clone()],
+            symbols: vec![sym.binance_symbol.clone()],
             api_key: String::new(),
             api_secret: String::new(),
             api_passphrase: String::new(),
@@ -207,7 +201,7 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             max_connections: 1,
             rate_limit_per_second: 10,
             source: String::new(),
-            btc_feed_id: String::new(),
+            feed_ids: HashMap::new(),
             signature_type: String::new(),
             clob_version: String::new(),
             builder_code: String::new(),
@@ -220,14 +214,18 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             executor_workers: 8,
         });
     } else {
-        inject_exchange_symbol(full, "binance", &binance_symbol);
+        inject_exchange_symbol(full, "binance", &sym.binance_symbol);
     }
 
-    // Inject symbols for the other spot venues if they are configured.
-    inject_exchange_symbol(full, "bybit", &binance_symbol); // bybit uses the binance format
-    inject_exchange_symbol(full, "coinbase", &coinbase_symbol);
-    inject_exchange_symbol(full, "kraken", &kraken_symbol);
-    inject_exchange_symbol(full, "okx", &okx_symbol);
+    // Other spot venues (append only if the exchange block is present).
+    inject_exchange_symbol(full, "bybit", &crate::config::venue_symbol(&sym.asset, "bybit"));
+    inject_exchange_symbol(full, "coinbase", &crate::config::venue_symbol(&sym.asset, "coinbase"));
+    inject_exchange_symbol(full, "kraken", &crate::config::venue_symbol(&sym.asset, "kraken"));
+    inject_exchange_symbol(full, "okx", &crate::config::venue_symbol(&sym.asset, "okx"));
+
+    // Chainlink spot label (streaming subscription) + polymarket market.
+    inject_exchange_symbol(full, "chainlink", &sym.spot_symbol);
+    inject_exchange_symbol(full, "polymarket", &sym.series_subscription);
 }
 
 fn inject_exchange_symbol(full: &mut Config, exchange_name: &str, symbol: &str) {

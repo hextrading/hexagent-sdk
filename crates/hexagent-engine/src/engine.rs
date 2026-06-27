@@ -1839,11 +1839,21 @@ impl Engine {
         let mut max_hours = 0.0_f64;
         for cfg in &self.config.strategies {
             if !cfg.enabled { continue; }
+            // Per-source symbol derives from the strategy's event_series_slug.
+            let asset = cfg.params.get("event_series_slug")
+                .and_then(|v| v.as_str())
+                .and_then(crate::config::derive_asset_symbols)
+                .map(|s| s.asset);
             if let Some(arr) = cfg.params.get("prediction_sources").and_then(|v| v.as_array()) {
                 for item in arr {
                     if let Some(t) = item.as_table() {
                         let ex = t.get("exchange").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let sym = t.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        // Slug-derived (polymaker) if event_series_slug is set;
+                        // else fall back to an explicit `symbol` (hexmaker/legacy).
+                        let sym = match asset.as_deref() {
+                            Some(a) => crate::config::venue_symbol(a, &ex),
+                            None => t.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        };
                         if !ex.is_empty() && !sym.is_empty() {
                             sources.push((ex, sym));
                         }
