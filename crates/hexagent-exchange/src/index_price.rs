@@ -257,11 +257,12 @@ pub struct IndexPrice {
 /// the structured "alpha*B" decomposition on chainlink tracking):
 ///
 ///   1. **Basis** `B = rollmean(ln(bn/cb_aligned), 300 s)` — the measured
-///      USDT/USD basis. SERVER-axis alignment: binance leads coinbase by
-///      ~45 ms in price discovery (exchange-ts axis), and binance's
-///      server stamps run ~50 ms BEHIND coinbase's (transport
-///      asymmetry), so the latest bn pairs causally with cb as-of server
-///      time `T_bn + bn_cb_server_lag` from a short server-ts ring.
+///      USDT/USD basis. LOCAL-axis alignment: on the recorded local-arrival
+///      axis coinbase leads binance (~40 ms BTC / ~20 ms ETH — bn
+///      `@depth10@100ms` is throttled/late vs cb's denser, earlier stream),
+///      so the latest bn pairs with cb as-of local time `bn_local −
+///      cb_lead_bn_local` from a short local-ts ring (look back by the lead
+///      so both legs reflect the same economic instant).
 ///   2. **my0** = the staleness-decayed weighted mean the validated
 ///      quote path uses (config weights x 0.5^(age/halflife), coinbase
 ///      age + optional offset) with the binance leg x e^{-B}.
@@ -294,12 +295,13 @@ pub struct Myindex2 {
     /// Per-feed freshness threshold (ns). Default 2 s.
     pub staleness_threshold_ns: u64,
 
-    /// SERVER-axis content lag of coinbase relative to binance (ns).
-    /// Default 45 ms (offline: bn leads cb ~40-50 ms in exchange-ts
-    /// price discovery). Basis pairs the latest bn with cb as-of
-    /// `T_bn_server + this`; causal because bn server stamps run
-    /// ~50 ms behind cb's. 0 = pair as-of T_bn exactly.
-    pub bn_cb_server_lag_ns: u64,
+    /// LOCAL-axis lead of coinbase over binance (ns) — how much earlier cb's
+    /// price arrives/updates locally than bn's. Offline (recorded local-arrival
+    /// axis): cb leads bn ~40 ms (BTC) / ~20 ms (ETH) — bn `@depth10@100ms` is
+    /// throttled/late vs cb's denser, earlier-stamped stream. Basis pairs the
+    /// latest bn with cb as-of `bn_local − this` (look BACK by the lead so both
+    /// legs reflect the same economic instant). 0 = pair as-of bn_local exactly.
+    pub cb_lead_bn_local_ns: u64,
 
     /// LOCAL-axis lag of chainlink relative to binance (ns). Default
     /// 2370 ms (offline: cl lags bn locally ~2.36-2.38 s). Adjust pairs
@@ -358,7 +360,7 @@ impl Myindex2 {
             basis_window_n: 300,
             adjust_window_n: 900,
             staleness_threshold_ns: 2_000_000_000,
-            bn_cb_server_lag_ns: 45_000_000,
+            cb_lead_bn_local_ns: 30_000_000,
             cl_bn_local_lag_ns: 2_370_000_000,
             bn_staleness_offset_ns: 0,
             cb_hist: VecDeque::new(),
@@ -666,12 +668,11 @@ impl IndexPrice {
         self.myindex2.set_freeze_per_event_enabled(enabled);
     }
 
-    /// Configure the alignment lags (ns): SERVER-axis cb-vs-bn content
-    /// lag (basis pairing) and LOCAL-axis cl-vs-bn lag (adjust pairing).
-    /// Wired from TOML `myindex2_bn_cb_server_lag_ms` /
-    /// `myindex2_cl_bn_local_lag_ms`.
-    pub fn set_myindex2_lags(&mut self, bn_cb_server_lag_ns: u64, cl_bn_local_lag_ns: u64) {
-        self.myindex2.bn_cb_server_lag_ns = bn_cb_server_lag_ns;
+    /// Configure the alignment lags (ns): LOCAL-axis cb-leads-bn lead (basis
+    /// pairing, `bn_local − this`) and LOCAL-axis cl-vs-bn lag (adjust pairing).
+    /// Wired from TOML `myindex2_cb_lead_bn_ms` / `myindex2_cl_bn_local_lag_ms`.
+    pub fn set_myindex2_lags(&mut self, cb_lead_bn_local_ns: u64, cl_bn_local_lag_ns: u64) {
+        self.myindex2.cb_lead_bn_local_ns = cb_lead_bn_local_ns;
         self.myindex2.cl_bn_local_lag_ns = cl_bn_local_lag_ns;
     }
 
@@ -745,10 +746,18 @@ impl IndexPrice {
         };
         if !enabled { return; }
         // ── history feeds (every call) ──
+        // cb history is keyed by coinbase's LOCAL arrival ts (local-axis basis
+        // alignment). Falls back to the exchange ts only if the local ts isn't
+        // populated (never in live/backtest — both set ob.local_timestamp_ns).
+        let cb_local_ts = {
+            let l = self.exchange_local_ts_ns("coinbase");
+            if l > 0 { l } else { self.coinbase_ts_ns }
+        };
         if let Some(p) = self.coinbase_mid.filter(|&p| p > 0.0) {
-            let retain = self.myindex2.bn_cb_server_lag_ns + 2_000_000_000;
-            let ts = self.coinbase_ts_ns;
-            Myindex2::hist_push(&mut self.myindex2.cb_hist, ts, p, retain);
+            if cb_local_ts > 0 {
+                let retain = self.myindex2.cb_lead_bn_local_ns + 2_000_000_000;
+                Myindex2::hist_push(&mut self.myindex2.cb_hist, cb_local_ts, p, retain);
+            }
         }
         {
             let my0 = self.compute_my0_decayed(now_ns);
@@ -758,11 +767,18 @@ impl IndexPrice {
             }
         }
         if now_ns < last_ts.saturating_add(interval) { return; }
-        // ── Stage 1: basis (server-axis aligned) ──
+        // ── Stage 1: basis (LOCAL-axis aligned) ──
+        // Pair the latest bn with cb as-of `bn_local − cb_lead`: cb leads bn
+        // locally, so look back by the lead to compare the same economic instant.
         let bn = match self.binance_mid { Some(p) if p > 0.0 => p, _ => return };
-        if now_ns.saturating_sub(self.binance_ts_ns) > stale { return; }
-        if now_ns.saturating_sub(self.coinbase_ts_ns) > stale { return; }
-        let t_cb = self.binance_ts_ns.saturating_add(self.myindex2.bn_cb_server_lag_ns);
+        let bn_local_ts = {
+            let l = self.exchange_local_ts_ns("binance");
+            if l > 0 { l } else { self.binance_ts_ns }
+        };
+        if bn_local_ts == 0 || cb_local_ts == 0 { return; } // ts not yet known
+        if now_ns.saturating_sub(bn_local_ts) > stale { return; }
+        if now_ns.saturating_sub(cb_local_ts) > stale { return; }
+        let t_cb = bn_local_ts.saturating_sub(self.myindex2.cb_lead_bn_local_ns);
         let cb = match Myindex2::hist_asof(&self.myindex2.cb_hist, t_cb) {
             Some(v) => v,
             None => return, // ring warming up — skip this sample
@@ -814,10 +830,10 @@ impl IndexPrice {
             return "myindex2: off".to_string();
         }
         format!(
-            "myindex2: on  sample={:.2}s  basis_window={}  adjust_window={}  bn_cb_srv_lag={:.0}ms  cl_bn_lag={:.0}ms  staleness={:.2}s  freeze_per_event={}",
+            "myindex2: on  sample={:.2}s  basis_window={}  adjust_window={}  cb_lead_bn(local)={:.0}ms  cl_bn_lag={:.0}ms  staleness={:.2}s  freeze_per_event={}",
             m2.sample_interval_ns as f64 / 1e9,
             m2.basis_window_n, m2.adjust_window_n,
-            m2.bn_cb_server_lag_ns as f64 / 1e6,
+            m2.cb_lead_bn_local_ns as f64 / 1e6,
             m2.cl_bn_local_lag_ns as f64 / 1e6,
             m2.staleness_threshold_ns as f64 / 1e9,
             m2.freeze_per_event_enabled,
@@ -1858,34 +1874,34 @@ mod tests {
         );
     }
 
-    /// Server-axis basis alignment: cb pairs as-of `T_bn_server + lag`.
-    /// bn server stamps run 100 ms behind local, cb 50 ms behind, cb
-    /// ramps +1/s — at lag 1 s the lookup must select the PREVIOUS cb
-    /// entry, not the latest.
+    /// LOCAL-axis basis alignment: cb pairs as-of `bn_local − cb_lead`.
+    /// cb leads bn locally, so with cb_lead = 1 s the lookup must select the
+    /// cb entry from 1 s ago, not the latest. (Here the server-ts fields act
+    /// as the local ts via the fallback when `local_ts` isn't populated.)
     #[test]
-    fn myindex2_basis_uses_server_axis_lagged_cb() {
+    fn myindex2_basis_uses_local_axis_cb_lead() {
         let s = 1_000_000_000_u64;
         let mut ip = fresh(80_000.0, 0, 79_900.0, 0);
         ip.update_chainlink(79_900.0, 0);
         ip.set_myindex2(true, s, 2, 4, 10 * s);
-        ip.set_myindex2_lags(s, 0); // bn_cb_server_lag = 1 s
+        ip.set_myindex2_lags(s, 0); // cb_lead_bn_local = 1 s
         let cb_at = |t: u64| 79_900.0 + (t / s) as f64;
         let mut now = 10 * s;
         for _ in 0..8 {
-            ip.binance_ts_ns = now - 100_000_000;   // bn server ts = now − 100 ms
-            ip.coinbase_ts_ns = now - 50_000_000;   // cb server ts = now − 50 ms
+            ip.binance_ts_ns = now;        // bn local arrival = now
+            ip.coinbase_ts_ns = now;       // cb local arrival = now
             ip.coinbase_mid = Some(cb_at(now));
             ip.chainlink_ts_ns = now;
             ip.maybe_sample_myindex2(now);
             now += s;
         }
         assert!(ip.myindex2.is_warm());
-        // At sample time t: t_cb = (t−0.1s) + 1s = t + 0.9s; the ring has
-        // entries stamped (t−50ms), (t−1s−50ms)… → as-of picks the entry
-        // stamped t−50ms = cb_at(t) (the latest). With LAG 2s it would
-        // pick the previous. Verify against the exact expectation:
-        let expected = ((80_000.0 / cb_at(now - s)).ln()
-            + (80_000.0 / cb_at(now - 2 * s)).ln()) / 2.0;
+        // Sample at time t: t_cb = t − 1s; the ring is keyed by cb local ts
+        // (t, t−1s, …) → as-of(t−1s) = cb_at(t−1s) (the entry from 1 s ago).
+        // With cb_lead 0 it would pick the latest cb_at(t). window=2 keeps the
+        // last two accepted samples (t=16s, 17s → cb_at(15s), cb_at(16s)).
+        let expected = ((80_000.0 / cb_at(now - 2 * s)).ln()
+            + (80_000.0 / cb_at(now - 3 * s)).ln()) / 2.0;
         assert!((ip.myindex2.basis - expected).abs() < 1e-12,
             "basis={} expected={}", ip.myindex2.basis, expected);
     }
