@@ -86,6 +86,12 @@ pub struct CorePlan {
     pub enable_fifo: bool,
     pub async_rt: usize,
     pub strategy: usize,
+    /// Per-instance strategy-worker cores (live/paper multi-instance):
+    /// `instance_id → core`. A polymaker instance whose `instance_id`
+    /// is a key here gets its own dedicated core (so co-hosted BTC/ETH
+    /// instances run on separate cores and never preempt each other).
+    /// Instances absent from this map fall back to `strategy`.
+    pub strategy_cores: HashMap<String, usize>,
     pub execution: usize,
     pub feed_cores: HashMap<String, usize>,
     pub hex_worker_cores: Vec<usize>,
@@ -102,6 +108,7 @@ impl CorePlan {
             enable_fifo: true,
             async_rt: DEFAULT_ASYNC_RT_CORE,
             strategy: DEFAULT_STRATEGY_CORE,
+            strategy_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -123,6 +130,7 @@ impl CorePlan {
             enable_fifo: cfg.enable_fifo,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
+            strategy_cores: cfg.strategy_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
             feed_cores: cfg.feed_cores.clone(),
             hex_worker_cores: cfg.hex_worker_cores.clone(),
@@ -318,6 +326,17 @@ pub fn pin_async_rt(thread_name: &str) {
 pub fn pin_strategy(thread_name: &str) {
     let p = plan();
     pin_current(p.strategy, thread_name);
+    set_fifo(p.fifo_strategy, thread_name);
+}
+
+/// Pin a per-instance strategy worker thread (live/paper
+/// multi-instance fan-out). Resolves `strategy_cores[instance_id]` for
+/// a dedicated core, else falls back to the shared `strategy` core.
+/// Same `PRIO_STRATEGY` FIFO priority as the single-thread path.
+pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
+    let p = plan();
+    let core = p.strategy_cores.get(instance_id).copied().unwrap_or(p.strategy);
+    pin_current(core, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
 }
 

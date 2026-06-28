@@ -13,6 +13,22 @@ pub trait Strategy: Send {
     /// (Polymaker / Hexmaker do).
     fn instance_id(&self) -> &str { "" }
 
+    /// Stable market-data symbols this instance subscribes to, used by
+    /// the live/paper per-instance market router to fan each event only
+    /// to the instances that want it (so e.g. a BTC instance's Binance
+    /// OrderBook drives only the BTC instance's quote cadence, not a
+    /// co-hosted ETH instance's). Includes the spot-venue symbols
+    /// (binance/coinbase/chainlink/...) AND the Polymarket series
+    /// identifiers (bare slug + `series:<slug>`); the router additionally
+    /// learns the dynamic per-event Polymarket token_ids from
+    /// `Instrument` events and attributes them to the instance whose
+    /// subscribed set contains the instrument's slug.
+    ///
+    /// Default empty ⇒ the router broadcasts every event to this
+    /// instance (legacy behaviour: receive-all then filter internally).
+    /// Strategies that co-host with others should override.
+    fn subscribed_symbols(&self) -> Vec<String> { Vec::new() }
+
     fn on_orderbook(&mut self, _ob: &OrderBookSnapshot) {}
     fn on_trade_tick(&mut self, _trade: &TradeTick) {}
     fn on_quote_tick(&mut self, _quote: &QuoteTick) {}
