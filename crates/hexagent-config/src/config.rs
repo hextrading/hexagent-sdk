@@ -36,6 +36,14 @@ pub struct OsTuneConfig {
     pub enable_fifo: bool,
     pub async_rt_core: Option<usize>,
     pub strategy_core: Option<usize>,
+    /// Per-instance strategy-worker cores for live/paper multi-instance
+    /// runs: `instance_id → core`. A polymaker instance listed here gets
+    /// its own dedicated core (co-hosted BTC/ETH never preempt each
+    /// other). Instances not listed fall back to `strategy_core`.
+    /// Example: `{ btc = 10, eth = 11 }`. Single-instance runs can omit
+    /// this entirely (the lone instance uses `strategy_core`).
+    #[serde(default)]
+    pub strategy_cores: HashMap<String, usize>,
     pub execution_core: Option<usize>,
     /// Exchange name → core id. Matched against the suffix of
     /// `feed-<name>` thread names. Missing entries fall back to
@@ -62,6 +70,7 @@ impl Default for OsTuneConfig {
             enable_fifo: true,
             async_rt_core: None,
             strategy_core: None,
+            strategy_cores: HashMap::new(),
             execution_core: None,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -876,6 +885,17 @@ pub struct StrategyConfig {
     /// they share the same params file.
     #[serde(default)]
     pub instance_id: String,
+    /// Account identity — keys into `[poly.<account_id>]` in
+    /// secrets.toml for credentials/signer/funder, and groups
+    /// strategies that share ONE Polymarket wallet (one SharedState,
+    /// one user-feed, one heartbeat, one RTT-probe). Multiple
+    /// strategy instances (distinct `instance_id`, e.g. BTC + ETH)
+    /// may share the same `account_id`. Empty = fall back to
+    /// `instance_id` (legacy: instance == account, one wallet per
+    /// strategy). Distinct from `instance_id`, which still tags every
+    /// outbound Signal and must be unique across enabled strategies.
+    #[serde(default)]
+    pub account_id: String,
     /// Optional path (absolute or relative to the parent config's
     /// directory) to a separate TOML file holding this strategy's
     /// params as top-level keys. Loaded and merged into `params` at
@@ -888,6 +908,20 @@ pub struct StrategyConfig {
     pub params_file: String,
     #[serde(default)]
     pub params: HashMap<String, toml::Value>,
+}
+
+impl StrategyConfig {
+    /// Resolved account identity: explicit `account_id` if set,
+    /// otherwise falls back to `instance_id` (legacy: one wallet per
+    /// strategy). Use this everywhere credentials / SharedState /
+    /// user-feed are keyed.
+    pub fn account_id(&self) -> &str {
+        if self.account_id.is_empty() {
+            &self.instance_id
+        } else {
+            &self.account_id
+        }
+    }
 }
 
 fn default_log_level() -> String {
@@ -1359,6 +1393,35 @@ fn resolve_env_vars(input: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod account_id_tests {
+    use super::*;
+
+    fn strat(instance_id: &str, account_id: &str) -> StrategyConfig {
+        StrategyConfig {
+            name: "polymaker".into(),
+            enabled: true,
+            instance_id: instance_id.into(),
+            account_id: account_id.into(),
+            params_file: String::new(),
+            params: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn account_id_falls_back_to_instance_id_when_unset() {
+        // Legacy single-wallet path: no account_id → account == instance.
+        assert_eq!(strat("btc", "").account_id(), "btc");
+    }
+
+    #[test]
+    fn explicit_account_id_decouples_from_instance_id() {
+        // Two instances (BTC + ETH) sharing one wallet "main".
+        assert_eq!(strat("btc", "main").account_id(), "main");
+        assert_eq!(strat("eth", "main").account_id(), "main");
+    }
 }
 
 #[cfg(test)]

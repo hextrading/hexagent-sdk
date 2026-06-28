@@ -330,12 +330,28 @@ pub(crate) fn no_wallet_creds_err() -> anyhow::Error {
 }
 
 pub(crate) fn load_wallet() -> Result<WalletInfo> {
+    // Single-account / CLI path: read the per-account creds from the
+    // global POLY_* env (set by apply_creds_to_env / apply_account_to_env).
     let private_key = std::env::var("POLY_PRIVATE_KEY").unwrap_or_default();
+    let signature_type = std::env::var("POLY_SIGNATURE_TYPE").unwrap_or_default();
+    let deposit_wallet = std::env::var("POLY_FUNDER").unwrap_or_default();
+    load_wallet_from(&private_key, &signature_type, &deposit_wallet)
+}
+
+/// Build a `WalletInfo` from explicit per-account creds. The builder
+/// (relayer) credentials remain shared across all accounts — sourced
+/// from the `[builder]` secrets block (POLY_BUILDER_*), one attribution
+/// code for the operator's whole wallet set.
+fn load_wallet_from(
+    private_key: &str,
+    signature_type: &str,
+    deposit_wallet: &str,
+) -> Result<WalletInfo> {
     if private_key.is_empty() {
         return Err(no_wallet_creds_err());
     }
 
-    let signing_key = parse_private_key(&private_key)?;
+    let signing_key = parse_private_key(private_key)?;
     let signer_address = to_checksum_address(&derive_eth_address_from_key(&signing_key));
     let safe_address = to_checksum_address(&derive_safe_address(&signer_address));
 
@@ -355,13 +371,64 @@ pub(crate) fn load_wallet() -> Result<WalletInfo> {
 
     let builder_auth = PolyAuth::new(&builder_key, &builder_secret, &builder_passphrase, &signer_address)?;
 
-    let signature_type = std::env::var("POLY_SIGNATURE_TYPE").unwrap_or_default();
-    let deposit_wallet = std::env::var("POLY_FUNDER").unwrap_or_default();
-
     Ok(WalletInfo {
         signer_address, safe_address, signing_key, builder_auth,
-        signature_type, deposit_wallet,
+        signature_type: signature_type.to_string(),
+        deposit_wallet: deposit_wallet.to_string(),
     })
+}
+
+/// Per-account wallet-creds registry for the live multi-account
+/// maintenance path. Keyed by `account_id`, populated once per account
+/// in `build_poly_shared_states_map`. The maintenance thread looks up
+/// ITS account's creds here instead of the global POLY_* env, which a
+/// second account would otherwise overwrite (last-account-wins).
+#[derive(Clone)]
+struct AccountWalletCreds {
+    private_key: String,
+    signature_type: String,
+    funder: String,
+}
+
+static ACCOUNT_WALLETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, AccountWalletCreds>>> =
+    std::sync::OnceLock::new();
+
+/// Register an account's split/redeem creds so the maintenance thread
+/// can resolve the RIGHT wallet under multi-account live (no global-env
+/// clobber). Idempotent; safe to call once per account at startup.
+pub fn register_account_wallet(
+    account_id: &str,
+    private_key: &str,
+    signature_type: &str,
+    funder: &str,
+) {
+    if account_id.is_empty() {
+        return;
+    }
+    let map = ACCOUNT_WALLETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap().insert(
+        account_id.to_string(),
+        AccountWalletCreds {
+            private_key: private_key.to_string(),
+            signature_type: signature_type.to_string(),
+            funder: funder.to_string(),
+        },
+    );
+}
+
+/// Resolve a `WalletInfo` for a specific account. Uses the per-account
+/// registry when populated (multi-account live), else falls back to the
+/// global POLY_* env (`load_wallet`) for single-account / CLI paths.
+pub(crate) fn load_wallet_for_account(account_id: &str) -> Result<WalletInfo> {
+    if !account_id.is_empty() {
+        if let Some(map) = ACCOUNT_WALLETS.get() {
+            let creds = map.lock().unwrap().get(account_id).cloned();
+            if let Some(c) = creds {
+                return load_wallet_from(&c.private_key, &c.signature_type, &c.funder);
+            }
+        }
+    }
+    load_wallet()
 }
 
 // balanceOf(address) selector
@@ -3630,6 +3697,9 @@ pub fn spawn_maintenance_thread(
     // routed through here and always redeems.
     redeem_enabled: bool,
     status: Option<MaintenanceStatusHandle>,
+    // Account whose wallet runs this split/redeem. Resolves per-account
+    // creds from the registry (multi-account safe); empty → global env.
+    account_id: String,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("poly-maintenance".into())
@@ -3646,7 +3716,7 @@ pub fn spawn_maintenance_thread(
                 "[Maintenance] Starting: series_id={:?} split_amount_usdc={} gas_via_signer={} redeem_enabled={}",
                 split_series_id, split_amount_usdc, gas_via_signer, redeem_enabled,
             );
-            let wallet = match load_wallet() {
+            let wallet = match load_wallet_for_account(&account_id) {
                 Ok(w) => w,
                 Err(e) => {
                     log::warn!("[Maintenance] load_wallet failed: {}", e);
@@ -3880,6 +3950,9 @@ pub fn run_split() -> Result<()> {
         amount_usdc, gas_via_signer,
         /*redeem_enabled=*/ true,
         None,
+        // CLI: empty account_id → resolve creds from the global POLY_*
+        // env (set by `apply_account_to_env` for the `--account` flag).
+        String::new(),
     );
     let _ = handle.join();
     println!();
