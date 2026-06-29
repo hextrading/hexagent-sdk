@@ -858,14 +858,69 @@ pub(crate) fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
 /// Resolve the deposit wallet for `eoa`, deploying it (relayer
 /// `WALLET-CREATE`) if it doesn't exist yet. Used by `deploy_wallet`.
 pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Result<String> {
+    // ── Existence pre-check: skip WALLET-CREATE if one already exists ──
+    // Mirrors `scripts/poly_wallet_info.py --resolve`. The authoritative
+    // deposit-wallet signal is the on-chain `WalletDeployed` scan (keyed
+    // by owner EOA); the Polymarket Gamma `/public-profile` API is a
+    // SECONDARY signal — it's keyed by the proxy/wallet address (does NOT
+    // reverse-resolve an EOA), so it only fires when the EOA is itself a
+    // registered Polymarket wallet.
     if let Ok(dw) = find_existing_deposit_wallet(eoa) {
+        println!("  Existing deposit wallet found on-chain (WalletDeployed log): {}", dw);
+        println!("  → already exists; skipping WALLET-CREATE.");
         return Ok(dw);
     }
+    if let Some(proxy) = gamma_public_profile_proxy(eoa) {
+        if !proxy.eq_ignore_ascii_case(eoa) {
+            println!("  Existing wallet found via Polymarket Gamma API (public-profile): {}", proxy);
+            println!("  → already exists; skipping WALLET-CREATE.");
+            return Ok(proxy);
+        }
+    }
+    // ── Not found by either check → deploy ──
+    println!("  No existing wallet found (on-chain scan + Gamma API) — deploying…");
     match deploy_deposit_wallet(builder_auth, eoa) {
         Ok(dw) => Ok(dw),
         // Deployed between the lookup and now (or lookup missed it).
         Err(e) if e.to_string().contains("already deployed") => find_existing_deposit_wallet(eoa),
         Err(e) => Err(e),
+    }
+}
+
+/// Polymarket Gamma public-profile lookup (no auth). Returns the
+/// `proxyWallet` for `address` if Gamma has a profile for it, else None.
+///
+/// ⚠ Gamma is keyed by the PROXY/wallet address, NOT the signer EOA — it
+/// does not reverse-resolve an EOA to its deposit wallet (a fresh EOA
+/// returns `proxyWallet: null`). So this only fires when the queried
+/// address is itself a registered Polymarket wallet; it's a secondary
+/// signal to the on-chain `WalletDeployed` scan (see `--resolve`).
+fn gamma_public_profile_proxy(address: &str) -> Option<String> {
+    const GAMMA_API: &str = "https://gamma-api.polymarket.com";
+    // Browser UA — Gamma sits behind Cloudflare and 403s a default UA.
+    const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    let url = format!("{}/public-profile?address={}", GAMMA_API, address);
+    let client = crate::async_rt::http_client();
+    let res: Result<Option<String>> = crate::async_rt::block_on_runtime(async move {
+        let resp = client.get(&url).header("User-Agent", UA).send().await
+            .map_err(|e| anyhow!("gamma public-profile GET: {}", e))?;
+        if !resp.status().is_success() {
+            return Ok(None); // 404 / error → no profile
+        }
+        let v: serde_json::Value = resp.json().await
+            .map_err(|e| anyhow!("gamma public-profile parse: {}", e))?;
+        Ok(v.get("proxyWallet")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .map(to_checksum_address))
+    });
+    match res {
+        Ok(opt) => opt,
+        Err(e) => {
+            log::debug!("[deploy] gamma public-profile lookup failed (non-fatal): {}", e);
+            None
+        }
     }
 }
 
