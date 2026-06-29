@@ -674,11 +674,6 @@ pub struct SharedState {
     /// signals). See [`UserFeedHealth`]. The user feed writes; the strategy
     /// reads (wired via `set_user_feed_health` in `build_strategies`).
     pub user_feed_health: std::sync::Arc<super::live_position::UserFeedHealth>,
-    /// Active event's condition_id, written by the strategy on each live seed
-    /// and read by the user-feed gap-replay to scope `GET /trades?market=`.
-    /// See [`super::live_position::CurrentMarket`]. Wired via
-    /// `set_current_market` in `build_strategies`.
-    pub current_market: std::sync::Arc<super::live_position::CurrentMarket>,
     /// User-feed gap-replay cadence / rewind tuning (from config).
     pub gap_replay: GapReplayConfig,
     rate_limiter: Mutex<RateLimiter>,
@@ -1364,7 +1359,6 @@ impl PolymarketTrade {
                 live_position: Mutex::new(LivePositionManager::new()),
                 taker_matched: std::sync::Arc::new(super::live_position::TakerMatchedInventory::new()),
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
-                current_market: std::sync::Arc::new(super::live_position::CurrentMarket::new()),
                 gap_replay,
                 rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
                 balance_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),

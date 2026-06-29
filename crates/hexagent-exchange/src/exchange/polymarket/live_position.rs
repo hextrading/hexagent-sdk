@@ -87,38 +87,6 @@ struct TakerMatchedInner {
     ws_seen: HashSet<String>,
 }
 
-// ════════════════════════════════════════════════════════════════
-// Current live market (narrow cross-thread handle)
-// ════════════════════════════════════════════════════════════════
-
-/// The condition_id of the event the strategy is currently trading, shared as
-/// an `Arc<CurrentMarket>` so the user-feed gap-replay can scope its
-/// `GET /trades?market=<condition_id>` to that event. Strategy writes (on each
-/// live seed, [`crate::strategy`]); the user-feed task reads. Empty until the
-/// first event seeds — replay skips while empty.
-///
-/// Mirrors the [`UserFeedHealth`] narrow-handle pattern (the feed must not
-/// reach into the full strategy state). The periodic replay loop also uses a
-/// change in this value as the trigger for a one-shot deep (now−300s) catch-up
-/// of the newly-active market.
-#[derive(Default)]
-pub struct CurrentMarket {
-    condition_id: Mutex<String>,
-}
-
-impl CurrentMarket {
-    pub fn new() -> Self { Self::default() }
-
-    /// Set the active event's condition_id (no-op if unchanged).
-    pub fn set(&self, condition_id: &str) {
-        let mut g = self.condition_id.lock().unwrap();
-        if g.as_str() != condition_id { *g = condition_id.to_string(); }
-    }
-
-    /// Current active condition_id (empty before the first seed).
-    pub fn get(&self) -> String { self.condition_id.lock().unwrap().clone() }
-}
-
 /// Cross-thread temporary inventory buffer shared between the trade executor
 /// (HTTP-reply thread = writer via [`Self::try_add`]) and the strategy
 /// (reader), mirroring the [`UserFeedHealth`] narrow-handle pattern. The WS
