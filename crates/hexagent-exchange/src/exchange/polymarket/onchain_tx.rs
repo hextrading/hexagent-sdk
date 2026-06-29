@@ -20,6 +20,7 @@ use k256::ecdsa::SigningKey;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -445,30 +446,48 @@ pub fn poll_onchain_tx(tx_hash: &str) -> Result<(String, String)> {
 // Internals
 // ════════════════════════════════════════════════════════════════
 
-/// Resolve Polygon RPC endpoints in priority order.
+/// Resolve the Polygon RPC pool.
 ///
-/// `$POLYGON_RPC` is required (primary). `$POLYGON_RPC_2` is optional
-/// (fallback) — when set, `rpc_call` switches to it once on `-32000`
-/// (often a stale-state false "insufficient funds"), `-32603`
-/// ("Internal error"), or any 5xx HTTP status. These error classes are
-/// almost always node-side issues (forked / overloaded / rate-limited
-/// node) rather than the request itself, so retrying on a different
-/// node has no side effect on tx semantics. If the fallback also fails
-/// we propagate the original error.
+/// Preferred source is `$POLYGON_RPC_LIST` — a comma-separated pool built
+/// from `[polygon].rpc_list` in the secrets file. `rpc_call` round-robins
+/// across the pool (spreading load so no single node sees all the
+/// concurrency) and, on a node fault, rotates to the next node before
+/// failing. Falls back to `$POLYGON_RPC` (+ optional `$POLYGON_RPC_2`)
+/// when the list is unset, so the legacy scalar config still works.
 ///
-/// Configure both to paid providers (Alchemy / QuickNode / paid Infura)
+/// A node "fault" is `-32000` (often a stale-state false "insufficient
+/// funds"), `-32603` ("Internal error"), or any 5xx / transport error —
+/// almost always node-side (forked / overloaded / rate-limited) rather
+/// than request-side, so another node is the right fix and has no effect
+/// on tx semantics.
+///
+/// Point the pool at paid providers (Alchemy / QuickNode / paid Infura)
 /// for real HA — public endpoints churn (polygon-rpc.com 401, Blast shut
 /// down, llamarpc DNS gone) and silently cycling through dead providers
-/// is worse than no fallback.
+/// is worse than a short, healthy pool.
 pub(super) fn polygon_rpc_urls() -> Result<Vec<String>> {
+    // Preferred: explicit pool from `[polygon].rpc_list`.
+    if let Ok(list) = std::env::var("POLYGON_RPC_LIST") {
+        let urls: Vec<String> = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !urls.is_empty() {
+            return Ok(urls);
+        }
+    }
+    // Back-compat: single primary (+ optional secondary).
     let primary = std::env::var("POLYGON_RPC")
         .map_err(|_| anyhow!(
-            "POLYGON_RPC not resolved — add a [polygon] section (rpc = \"https://…\") \
-             to the secrets file (required for gas_via_signer_wallet = true). \
-             It is no longer read from .env."
+            "POLYGON_RPC not resolved — add a [polygon] section (rpc_list = [\"https://…\"] \
+             or rpc = \"https://…\") to the secrets file (required for \
+             gas_via_signer_wallet = true). It is no longer read from .env."
         ))?;
     if primary.is_empty() {
-        return Err(anyhow!("POLYGON_RPC is empty — set [polygon].rpc in the secrets file"));
+        return Err(anyhow!(
+            "POLYGON_RPC is empty — set [polygon].rpc_list or [polygon].rpc in the secrets file"
+        ));
     }
     let mut urls = vec![primary];
     if let Ok(secondary) = std::env::var("POLYGON_RPC_2") {
@@ -516,13 +535,17 @@ fn describe_err<E: Error + ?Sized>(e: &E) -> String {
     msg
 }
 
-/// POST a JSON-RPC request, with two layers of retry:
-///   1. Transient transport / 5xx errors: up to 3 attempts per URL with
+/// POST a JSON-RPC request across the RPC pool, with two layers of retry:
+///   1. Transient transport / 5xx errors: up to 3 attempts per node with
 ///      500 ms backoff (same endpoint, same answer expected eventually).
 ///   2. Node-fault classes (`-32000`, `-32603`, or 5xx after retries
-///      exhausted): switch to `$POLYGON_RPC_2` once. These errors are
+///      exhausted): rotate to the next node in the pool. These errors are
 ///      almost always node-side (forked / overloaded / rate-limited),
 ///      not request-side, so a different node is the right fix.
+///
+/// Each call starts at a round-robin offset into the pool, so concurrent
+/// calls fan out across nodes (lower per-node load) while still walking
+/// every node from that offset before failing (full failover).
 ///
 /// Genuine logical RPC errors (e.g. revert reasons, malformed params)
 /// surface immediately — same endpoint will give the same answer, and
@@ -543,10 +566,20 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
     const MAX_TRANSIENT_ATTEMPTS: usize = 3;
     let mut last_err: Option<anyhow::Error> = None;
 
-    'urls: for (url_idx, url) in urls.iter().enumerate() {
-        if url_idx > 0 {
-            warn!("[OnchainTx] RPC {} switching to fallback URL #{} after primary failure: {}",
-                method, url_idx,
+    // Round-robin starting node: each call begins at the next node in the
+    // pool so concurrent calls spread out instead of all hammering node #0.
+    // We still walk the whole pool from that offset, so failover tries
+    // every node before giving up. (`urls` is guaranteed non-empty.)
+    static RR: AtomicUsize = AtomicUsize::new(0);
+    let n = urls.len();
+    let start = RR.fetch_add(1, Ordering::Relaxed) % n;
+
+    'urls: for step in 0..n {
+        let url_idx = (start + step) % n;
+        let url = &urls[url_idx];
+        if step > 0 {
+            warn!("[OnchainTx] RPC {} failing over to pool node #{} (started at #{}, {} nodes) after: {}",
+                method, url_idx, start, n,
                 last_err.as_ref().map(|e| e.to_string()).unwrap_or_default());
         }
         for attempt in 1..=MAX_TRANSIENT_ATTEMPTS {
@@ -584,8 +617,8 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
                         // Genuine logical error — retry won't help on any URL.
                         return Err(anyhow!("rpc error: {}", rpc_err));
                     }
-                    if attempt > 1 || url_idx > 0 {
-                        info!("[OnchainTx] RPC {} succeeded on URL #{} attempt {}",
+                    if attempt > 1 || step > 0 {
+                        info!("[OnchainTx] RPC {} succeeded on pool node #{} attempt {}",
                             method, url_idx, attempt);
                     }
                     return Ok(v);
