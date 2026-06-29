@@ -684,17 +684,16 @@ pub struct SharedState {
     /// User-feed gap-replay cadence / rewind tuning (from config).
     pub gap_replay: GapReplayConfig,
     rate_limiter: Mutex<RateLimiter>,
-    /// Wall-clock ns at which the current "balance-error backoff" window
-    /// expires. 0 = not in backoff. Set when the server returns
-    /// `not enough balance / allowance` on a submit, which in practice
-    /// means a prior cancel hasn't released the server-side allowance yet
-    /// (cancel timed out → orphan → server still reserves funds).
-    /// While in backoff, `submit_order` / `batch_submit_orders` /
-    /// `batch_update_orders` pre-reject new placements so we don't keep
-    /// hammering the server with doomed submits. Read/write with Relaxed
-    /// — the ordering vs. other fields doesn't matter, only the
-    /// eventual-consistency of the deadline itself.
-    pub(crate) balance_backoff_until_ns: std::sync::atomic::AtomicU64,
+    /// Per-INSTANCE balance-error backoff deadlines (wall-clock ns), keyed
+    /// by the placing `instance_id`. A future deadline means that instance's
+    /// `submit_order` / `batch_submit_orders` / `batch_update_orders`
+    /// pre-reject new placements so we stop hammering the server with doomed
+    /// submits while a racing cancel releases the server-side allowance (a
+    /// prior cancel timed out → orphan → server still reserves funds).
+    /// Per-instance (not account-wide) so one strategy hitting `not enough
+    /// balance` never pauses a shared-wallet sibling's submits. Absent or
+    /// past = not in backoff.
+    pub(crate) balance_backoff_until_ns: Mutex<HashMap<String, u64>>,
     /// Per-token (asset_id) `invalid token id` backoff. The CLOB rejects an
     /// order with `invalid token id` when the token isn't registered on the
     /// orderbook — e.g. Gamma lists a 5-min event before its CLOB book is
@@ -846,26 +845,28 @@ impl SharedState {
     /// markets keep quoting; tracked separately.)
     pub(crate) const BALANCE_BACKOFF_NS: u64 = 1_000_000_000;
 
-    /// True if wall-clock is still within the last balance-error's backoff
-    /// window. Hot path — single `AtomicU64::load`.
+    /// True if `instance_id` is still within its last balance-error backoff
+    /// window. Per-instance: a sibling's backoff never gates this caller.
     #[inline]
-    pub(crate) fn in_balance_backoff(&self) -> bool {
-        let until = self.balance_backoff_until_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
-        until != 0 && crate::types::now_ns() < until
+    pub(crate) fn in_balance_backoff(&self, instance_id: &str) -> bool {
+        let map = self.balance_backoff_until_ns.lock().unwrap();
+        match map.get(instance_id) {
+            Some(&until) => crate::types::now_ns() < until,
+            None => false,
+        }
     }
 
-    /// Record a balance-error rejection and enter (or extend) the backoff
-    /// window. Returns `true` iff this transitions us **into** backoff
-    /// (i.e. we were not already in it). Callers use that signal to fire
-    /// exactly one targeted-cancel batch on the edge, not on every
-    /// subsequent reject that lands during the same window.
-    pub(crate) fn record_balance_error(&self) -> bool {
+    /// Record a balance-error rejection for `instance_id` and enter (or
+    /// extend) its backoff window. Returns `true` iff this transitions that
+    /// instance **into** backoff (i.e. it was not already in it). Callers
+    /// use that signal to fire exactly one targeted-cancel batch on the
+    /// edge, not on every subsequent reject during the same window.
+    pub(crate) fn record_balance_error(&self, instance_id: &str) -> bool {
         let now = crate::types::now_ns();
-        let prev = self.balance_backoff_until_ns
-            .swap(now + Self::BALANCE_BACKOFF_NS, std::sync::atomic::Ordering::Relaxed);
-        // Edge = prev deadline already expired (or never set).
-        prev == 0 || prev < now
+        let mut map = self.balance_backoff_until_ns.lock().unwrap();
+        let prev = map.insert(instance_id.to_string(), now + Self::BALANCE_BACKOFF_NS);
+        // Edge = no prior deadline, or the prior one already expired.
+        prev.map_or(true, |p| p < now)
     }
 
     /// Detect a `not enough balance / allowance` error in either HTTP 400
@@ -1373,7 +1374,7 @@ impl PolymarketTrade {
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
                 gap_replay,
                 rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
-                balance_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
+                balance_backoff_until_ns: Mutex::new(HashMap::new()),
                 invalid_token_backoff: Mutex::new(HashMap::new()),
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
@@ -1688,7 +1689,7 @@ impl PolymarketTrade {
     /// Only the first balance reject in a window triggers the cancel
     /// — subsequent rejects extend the deadline but don't re-blast.
     fn handle_balance_error(&self, coid: &str, side: Side, symbol: &str) {
-        if !self.shared.record_balance_error() {
+        if !self.shared.record_balance_error(&self.instance_id) {
             // Already in backoff — deadline extended, nothing more to do.
             return;
         }
@@ -2566,7 +2567,7 @@ impl PolymarketTrade {
         if !self.shared.check_rate_limit() {
             return Err(Self::make_rejected(order, "rate limited"));
         }
-        if self.shared.in_balance_backoff() {
+        if self.shared.in_balance_backoff(&self.instance_id) {
             return Err(Self::make_rejected(order, "balance backoff"));
         }
         if self.shared.in_invalid_token_backoff(&order.symbol) {
@@ -3098,7 +3099,7 @@ impl ExchangeTrade for PolymarketTrade {
 
     fn batch_submit_orders(&mut self, _market_id: &str, orders: &[OrderRequest]) -> Result<Vec<OrderUpdate>> {
         // Balance-backoff short-circuit (see `submit_order` for rationale).
-        if self.shared.in_balance_backoff() {
+        if self.shared.in_balance_backoff(&self.instance_id) {
             return Ok(orders.iter()
                 .map(|o| Self::make_rejected(o, "balance backoff"))
                 .collect());
@@ -3549,7 +3550,7 @@ impl ExchangeTrade for PolymarketTrade {
         // and the server's allowance pool to converge. Pre-reject
         // every place during the 200 ms window so doomed submits
         // don't get hammered while the cancels race to land.
-        if self.shared.in_balance_backoff() && !place_orders.is_empty() {
+        if self.shared.in_balance_backoff(&self.instance_id) && !place_orders.is_empty() {
             let mut pre: Vec<OrderUpdate> = place_orders.iter()
                 .map(|o| Self::make_rejected(o, "balance backoff"))
                 .collect();
