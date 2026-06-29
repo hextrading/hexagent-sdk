@@ -455,7 +455,10 @@ async fn user_feed_loop(
         let shared = shared.clone();
         let update_tx = update_tx.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        // New task → won't inherit the loop's span; re-attach the same
+        // per-account span so gap-recovery logs are tagged too.
+        let gap_span = tracing::info_span!("user_feed", acct = %shared.instance_id);
+        tokio::spawn(tracing::Instrument::instrument(async move {
             let interval = Duration::from_millis(shared.gap_replay.interval_ms.max(1));
             let rewind_ms = shared.gap_replay.periodic_rewind_ms;
             let mut last_market = String::new();
@@ -475,7 +478,7 @@ async fn user_feed_loop(
                 };
                 replay_missed_trades(&shared, &update_tx, &market, after).await;
             }
-        });
+        }, gap_span));
     }
 
     loop {
@@ -649,9 +652,19 @@ pub fn spawn_user_feed(
     let api_secret = api_secret.to_string();
     let passphrase = passphrase.to_string();
 
-    let task_handle = async_rt::handle().spawn(user_feed_loop(
-        api_key, api_secret, passphrase, shared, update_tx, shutdown,
-    ));
+    // Tag every `[PolyUserFeed]` line with the ACCOUNT this feed serves
+    // (`user_feed{acct=<account_id>}:`). The feed is per-account (one
+    // authenticated stream per wallet, shared by all instances on it), so
+    // account is the correct grain — per-fill instance routing happens
+    // downstream via coid→instance. `SharedState.instance_id` holds the
+    // account_id. Async task → `.instrument()` (NOT `.entered()` across
+    // await).
+    use tracing::Instrument as _;
+    let acct = shared.instance_id.clone();
+    let task_handle = async_rt::handle().spawn(
+        user_feed_loop(api_key, api_secret, passphrase, shared, update_tx, shutdown)
+            .instrument(tracing::info_span!("user_feed", acct = %acct)),
+    );
 
     let handle = std::thread::Builder::new()
         .name("poly-user-feed-join".into())
