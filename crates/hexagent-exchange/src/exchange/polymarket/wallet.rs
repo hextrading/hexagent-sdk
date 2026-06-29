@@ -2129,10 +2129,14 @@ fn balance_allowance_update_one(
 /// <https://docs.polymarket.com/trading/deposit-wallets#order-says-not-enough-balance>
 ///
 /// Credentials are CONFIG-sourced (NOT env): loads the live config + secrets
-/// file and `poly_for(instance_id)`. Non-fatal end to end — every failure path
-/// logs and returns, so a sync miss just falls back to the existing reactive
-/// "not enough balance" retry loop. Call off the strategy thread (3 blocking
-/// HTTP GETs).
+/// file and resolves `instance_id` → its strategy's `account_id` (the wallet
+/// key in `[poly.<account>]`), then `poly_for(account_id)`. Balance/allowance
+/// is an ACCOUNT-level resource (one wallet, possibly shared by several
+/// instances), so it must be keyed by account_id — not instance_id — mirroring
+/// the engine's `sc.account_id()` creds path. Non-fatal end to end — every
+/// failure path logs and returns, so a sync miss just falls back to the
+/// existing reactive "not enough balance" retry loop. Call off the strategy
+/// thread (3 blocking HTTP GETs).
 pub fn sync_balance_allowance_for_event(instance_id: &str, up_token_id: &str, down_token_id: &str) {
     let cfg_path = crate::exchange::polymarket::cli_account::config_path()
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
@@ -2147,12 +2151,21 @@ pub fn sync_balance_allowance_for_event(instance_id: &str, up_token_id: &str, do
         Ok(s) => s,
         Err(e) => { log::warn!("[BalanceSync] skipped (secrets load: {})", e); return; }
     };
-    let creds = match secrets.poly_for(instance_id) {
+    // Balance/allowance is an account-level resource: resolve this instance's
+    // `account_id` (falls back to instance_id when unset, i.e. the legacy
+    // one-wallet-per-strategy path) and key creds by it. Under multi-account
+    // live the secrets blocks are `[poly.<account_id>]`, so looking up by
+    // instance_id (e.g. `btc01`) misses and silently skips the sync.
+    let account_id = cfg.strategies.iter()
+        .find(|sc| sc.instance_id == instance_id)
+        .map(|sc| sc.account_id().to_string())
+        .unwrap_or_else(|| instance_id.to_string());
+    let creds = match secrets.poly_for(&account_id) {
         Ok(c) => c,
-        Err(e) => { log::warn!("[BalanceSync] skipped (no creds for {}: {})", instance_id, e); return; }
+        Err(e) => { log::warn!("[BalanceSync] skipped (no creds for account {} (instance {}): {})", account_id, instance_id, e); return; }
     };
     if creds.api_key.is_empty() || creds.api_secret.is_empty() {
-        log::warn!("[BalanceSync] skipped — instance {} has no CLOB L2 creds", instance_id);
+        log::warn!("[BalanceSync] skipped — account {} (instance {}) has no CLOB L2 creds", account_id, instance_id);
         return;
     }
     let signer = match parse_private_key(&creds.private_key) {
