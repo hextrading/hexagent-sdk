@@ -3433,7 +3433,8 @@ impl Engine {
         // same session keep-alive (see `dedup_states_by_account`).
         for (id, shared) in Self::dedup_states_by_account(states) {
             let api_key = shared.auth.api_key.clone();
-            let trade = PolymarketTrade::from_shared(shared, &api_key);
+            // Heartbeat route places no orders → instance_id unused ("").
+            let trade = PolymarketTrade::from_shared(shared, &api_key, "");
             handles.push(trade.spawn_heartbeat(shutdown.clone()));
             info!("[Engine] Polymarket heartbeat started for account (lead instance_id={})", id);
         }
@@ -3450,7 +3451,8 @@ impl Engine {
     ) -> Option<thread::JoinHandle<()>> {
         let shared = shared?;
         let api_key = shared.auth.api_key.clone();
-        let trade = PolymarketTrade::from_shared(shared, &api_key);
+        // Heartbeat route places no orders → instance_id unused ("").
+        let trade = PolymarketTrade::from_shared(shared, &api_key, "");
         Some(trade.spawn_heartbeat(shutdown))
     }
 
@@ -4110,7 +4112,9 @@ impl LiveRouter {
         for id in &keys {
             let shared = states.get(*id).cloned().unwrap();
             let owner = shared.auth.api_key.clone();
-            poly_routes.insert((*id).clone(), PolymarketTrade::from_shared(shared, &owner));
+            // Tag the route with its instance_id so orders placed through it
+            // carry it (TrackedOrder.instance_id) → instance-scoped cancels.
+            poly_routes.insert((*id).clone(), PolymarketTrade::from_shared(shared, &owner, id));
         }
         let poly_default_id = keys.first().map(|s| (*s).clone()).unwrap_or_default();
 
@@ -4131,7 +4135,7 @@ impl LiveRouter {
         let polymarket = if !poly_default_id.is_empty() {
             let shared = states.get(&poly_default_id).cloned().unwrap();
             let owner = shared.auth.api_key.clone();
-            PolymarketTrade::from_shared(shared, &owner)
+            PolymarketTrade::from_shared(shared, &owner, &poly_default_id)
         } else {
             panic!(
                 "LiveRouter: no Polymarket SharedState built. Phase 6 \
