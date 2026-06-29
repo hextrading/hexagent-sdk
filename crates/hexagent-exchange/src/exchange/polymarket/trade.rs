@@ -261,6 +261,13 @@ fn format_order_brief(o: &OrderRequest) -> String {
 pub(crate) struct TrackedOrder {
     pub symbol: String,
     pub side: Side,
+    /// Strategy instance that placed this order. Multiple instances may
+    /// share one wallet (= one `SharedState`/`open_orders` map); this tags
+    /// each row so an instance's bulk cancels (e.g. the balance-error
+    /// USDC-pool sweep) only touch its OWN orders, never a sibling's.
+    /// Empty for single-instance / CLI routes (every order carries the same
+    /// value → filter is a no-op, byte-identical to legacy).
+    pub instance_id: String,
 }
 
 /// Sliding-window rate limiter.
@@ -1222,6 +1229,11 @@ pub struct PolymarketTrade {
     shared: Arc<SharedState>,
     /// Owner UUID for the Polymarket CLOB (same as api_key for user accounts).
     owner: String,
+    /// The strategy instance this route serves. The `SharedState` is shared
+    /// per-ACCOUNT across instances; this per-route id is stamped onto every
+    /// order placed through it (`TrackedOrder.instance_id`) so bulk cancels
+    /// scope to this instance only. Empty for heartbeat/CLI/default routes.
+    instance_id: String,
 }
 
 impl PolymarketTrade {
@@ -1369,6 +1381,9 @@ impl PolymarketTrade {
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
             owner: api_key.to_string(),
+            // CLI / first-build route: per-instance trading routes are
+            // rebuilt via `from_shared(.., instance_id)`.
+            instance_id: String::new(),
         })
     }
 
@@ -1539,10 +1554,15 @@ impl PolymarketTrade {
     }
 
     /// Create from existing SharedState (for LiveRouter inside execution thread).
-    pub fn from_shared(shared: Arc<SharedState>, owner: &str) -> Self {
+    /// Build a per-instance route over a shared (per-account) `SharedState`.
+    /// `instance_id` tags orders placed through this route so bulk cancels
+    /// stay scoped to this instance (siblings on the same wallet untouched).
+    /// Pass `""` for non-trading routes (heartbeat / CLI).
+    pub fn from_shared(shared: Arc<SharedState>, owner: &str, instance_id: &str) -> Self {
         Self {
             shared,
             owner: owner.to_string(),
+            instance_id: instance_id.to_string(),
         }
     }
 
@@ -1554,6 +1574,7 @@ impl PolymarketTrade {
         Self {
             shared: self.shared.clone(),
             owner: self.owner.clone(),
+            instance_id: self.instance_id.clone(),
         }
     }
 
@@ -1681,6 +1702,10 @@ impl PolymarketTrade {
             let coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
             let mut targets = Vec::with_capacity(open.len());
             for (c, t) in open.iter() {
+                // Scope to THIS instance's own orders only — a shared-wallet
+                // sibling's resting orders live in the same `open_orders` map
+                // but must never be cancelled by our balance-error sweep.
+                if t.instance_id != self.instance_id { continue; }
                 let in_scope = match side {
                     Side::Buy  => t.side == Side::Buy,
                     Side::Sell => t.side == Side::Sell && t.symbol == symbol,
@@ -2062,7 +2087,7 @@ impl PolymarketTrade {
                         self.shared.register_order_id(coid, oid);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
-                            TrackedOrder { symbol: symbol.clone(), side: *side },
+                            TrackedOrder { symbol: symbol.clone(), side: *side, instance_id: self.instance_id.clone() },
                         );
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → LIVE",
@@ -2569,6 +2594,7 @@ impl PolymarketTrade {
             TrackedOrder {
                 symbol: order.symbol.clone(),
                 side: order.side,
+                instance_id: self.instance_id.clone(),
             },
         );
 
@@ -3137,6 +3163,7 @@ impl ExchangeTrade for PolymarketTrade {
                             TrackedOrder {
                                 symbol: o.symbol.clone(),
                                 side: o.side,
+                                instance_id: self.instance_id.clone(),
                             },
                         );
                         signed_hashes.push(order_hash);
@@ -3690,6 +3717,7 @@ impl ExchangeTrade for PolymarketTrade {
                         TrackedOrder {
                             symbol: o.symbol.clone(),
                             side: o.side,
+                            instance_id: self.instance_id.clone(),
                         },
                     );
                     place_signed.push(order_hash);
