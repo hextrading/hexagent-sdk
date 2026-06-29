@@ -317,15 +317,15 @@ fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<Order
 async fn replay_missed_trades(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
-    market: &str,
     after_secs: u64,
 ) -> usize {
-    // Scope the catch-up to the event currently being traded
-    // (`?market=<condition_id>`). L2 auth already restricts `/trades` to this
-    // account, so dropping the `maker_address` filter just widens coverage to
-    // BOTH our maker and taker legs in this market. Empty market = no active
-    // event yet → nothing to replay.
-    if market.is_empty() { return 0; }
+    // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
+    // account, so we fetch ALL of the wallet's trades since `after` (no
+    // `?market=` narrowing). This is multi-market correct — two instances
+    // sharing one wallet both recover via the same sweep — and `upsert_trade`
+    // dedups by trade_id + routes by asset_id, so cross-market rows are
+    // harmless. (Previously scoped to a single `CurrentMarket` condition_id,
+    // which a sibling instance could clobber → wrong-market replay.)
     let mut cursor = String::new();
     let mut count = 0usize;
     let client = async_rt::http_client();
@@ -347,10 +347,10 @@ async fn replay_missed_trades(
     for page in 0..MAX_PAGES {
         let headers = shared.auth.sign_request("GET", "/trades", "");
         let url = if cursor.is_empty() {
-            format!("{}/trades?market={}&after={}", CLOB_BASE_URL, market, after_param)
+            format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
-            format!("{}/trades?market={}&after={}&next_cursor={}",
-                CLOB_BASE_URL, market, after_param, cursor)
+            format!("{}/trades?after={}&next_cursor={}",
+                CLOB_BASE_URL, after_param, cursor)
         };
         let mut req = client.get(&url);
         for (k, v) in headers.as_pairs() {
@@ -461,22 +461,25 @@ async fn user_feed_loop(
         tokio::spawn(tracing::Instrument::instrument(async move {
             let interval = Duration::from_millis(shared.gap_replay.interval_ms.max(1));
             let rewind_ms = shared.gap_replay.periodic_rewind_ms;
-            let mut last_market = String::new();
+            // One-shot deep (now−300s) catch-up on the first sweep so a
+            // mid-event (re)start recovers all in-flight fills across EVERY
+            // active market on this wallet at once; subsequent sweeps use the
+            // small rewind. (Was keyed on per-event `CurrentMarket` change,
+            // which a sibling instance sharing the wallet could clobber.)
+            let mut did_startup_deep = false;
             loop {
                 sleep(interval).await;
                 if shutdown.load(Ordering::Relaxed) { break; }
-                let market = shared.current_market.get();
-                if market.is_empty() { continue; }   // no active event yet
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64).unwrap_or(0);
-                let after = if market != last_market {
-                    last_market = market.clone();
-                    (now_ms / 1000).saturating_sub(300)            // new event → deep catch-up
+                let after = if !did_startup_deep {
+                    did_startup_deep = true;
+                    (now_ms / 1000).saturating_sub(300)            // startup → deep catch-up
                 } else {
                     now_ms.saturating_sub(rewind_ms) / 1000        // rewind (ms) → floor to sec
                 };
-                replay_missed_trades(&shared, &update_tx, &market, after).await;
+                replay_missed_trades(&shared, &update_tx, after).await;
             }
         }, gap_span));
     }
@@ -514,21 +517,17 @@ async fn user_feed_loop(
         info!("[PolyUserFeed] Connected and authenticated (async)");
         backoff.reset();
 
-        // Gap recovery on (re)connect — scope to the active market and rewind
+        // Gap recovery on (re)connect — whole-wallet, rewind
         // `gap_replay.reconnect_rewind_ms` (default 5s, quantised up to whole
         // seconds) before the last-seen match_time so a fill that landed right
         // around the disconnect edge isn't skipped by an exact `after=`
         // boundary. Idempotent via the upsert_trade / update_trade status
-        // dedup. Skips when no event is active yet (replay_missed_trades
-        // returns 0 on empty market) — the periodic loop's now−300s deep
-        // catch-up covers the first seed after startup.
-        let market = shared.current_market.get();
+        // dedup. Covers ALL active markets on this wallet at once.
         let rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
         let after_secs = shared.live_position.lock().unwrap()
             .last_match_time_secs().saturating_sub(rewind_secs);
-        let replayed = replay_missed_trades(&shared, &update_tx, &market, after_secs).await;
-        info!("[PolyUserFeed] Gap recovery market={} after={} replayed={} trades",
-            if market.is_empty() { "<none>" } else { &market }, after_secs, replayed);
+        let replayed = replay_missed_trades(&shared, &update_tx, after_secs).await;
+        info!("[PolyUserFeed] Gap recovery after={} replayed={} trades", after_secs, replayed);
         shared.user_feed_health.set_recovering(false);
 
         let mut last_ping = Instant::now();
