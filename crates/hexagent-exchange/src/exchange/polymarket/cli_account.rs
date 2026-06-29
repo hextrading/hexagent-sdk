@@ -416,6 +416,47 @@ pub fn resolve_and_apply() -> Result<Option<String>> {
     auto_resolve_from_config(&cfg_path)
 }
 
+/// Account-only wallet resolution for subcommands that act on a wallet
+/// DIRECTLY and must never be keyed by a strategy instance (`redeem`).
+///
+/// Unlike [`resolve_and_apply`], this:
+///   * REJECTS `--instance` / `$HEXBOT_INSTANCE` — redeem targets a wallet,
+///     not a strategy instance; point the operator at `--account`;
+///   * REQUIRES `--account <id>` (or `$HEXBOT_ACCOUNT`) — there is NO
+///     auto-resolve-from-config fallback, so we can never redeem the wrong
+///     wallet by silently picking the config's single instance.
+///
+/// The chosen `[poly.<id>]` block is loaded into `POLY_*` via
+/// [`apply_account_to_env`] (secrets file resolves `--secrets` →
+/// `$HEXBOT_SECRETS` → [`DEFAULT_SECRETS_PATH`]).
+pub fn resolve_account_only() -> Result<Option<String>> {
+    let mut v: Vec<String> = std::env::args().collect();
+    let cli_account = strip_flag(&mut v, "--account");
+    let cli_instance = strip_flag(&mut v, "--instance");
+
+    let env_instance = std::env::var("HEXBOT_INSTANCE").unwrap_or_default();
+    if !cli_instance.is_empty() || !env_instance.is_empty() {
+        return Err(anyhow!(
+            "redeem does not support --instance — it operates on a wallet \
+             directly. Pass --account <id> (a [poly.<id>] secrets block) instead."
+        ));
+    }
+
+    let account = if !cli_account.is_empty() {
+        cli_account
+    } else {
+        std::env::var("HEXBOT_ACCOUNT").unwrap_or_default()
+    };
+    if account.is_empty() {
+        return Err(anyhow!(
+            "redeem requires --account <id> (a [poly.<id>] secrets block, or \
+             set $HEXBOT_ACCOUNT) — there is no instance / config auto-resolve \
+             for redeem."
+        ));
+    }
+    apply_account_to_env(&account)
+}
+
 /// Auto-resolve the wallet when neither `--instance` nor `--account` was
 /// given. Loads `config_path`, and:
 ///   * exactly ONE enabled strategy instance → apply its `[poly.<id>]`
