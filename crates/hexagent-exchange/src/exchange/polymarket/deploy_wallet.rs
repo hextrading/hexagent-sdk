@@ -81,6 +81,19 @@ pub fn run_deploy_wallet() -> Result<()> {
     let (instance_id, secrets_path) =
         cli_account::resolve_secrets_write_path(&instance_cli, &config_path)?;
 
+    // Push the shared `[builder]`/`[polygon]`/`[chainlink]` secrets into env so
+    // the relayer-auth creds (read just below) + `POLYGON_RPC` resolve. The
+    // `--config` path already did this via `Config::load` (→ apply_shared_to_env),
+    // but the `--account` path resolves only the write-path and skips Config::load,
+    // so the shared blocks would otherwise never reach the env (deploy_wallet then
+    // reports the builder creds "missing" even when `[builder]` is present). The
+    // per-instance `[poly.<id>]` block is intentionally NOT required here —
+    // deploy_wallet CREATES it.
+    // A missing file → Ok(default) (handled inside load); a malformed file →
+    // Err, which we propagate (clearer than the downstream "missing builder
+    // creds" once the shared blocks fail to load).
+    crate::config::SecretsFile::load(&secrets_path)?.apply_shared_to_env();
+
     // ── Builder credentials (relayer auth — required for deploy +
     //    gasless approvals) ──
     let builder_key = std::env::var("POLY_BUILDER_API_KEY").unwrap_or_default();
