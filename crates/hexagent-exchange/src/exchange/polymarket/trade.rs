@@ -1395,7 +1395,13 @@ impl PolymarketTrade {
     ) -> std::thread::JoinHandle<()> {
         let auth = self.shared.auth.clone();
         let base_url = self.shared.clob_base_url.clone();
-        let task_handle = async_rt::handle().spawn(heartbeat_loop(auth, shutdown, base_url));
+        // Tag `[PolyHeartbeat]` lines with the ACCOUNT (`heartbeat{acct=
+        // <account_id>}:`); the heartbeat is per-account. Async task →
+        // `.instrument()`. `SharedState.instance_id` holds the account_id.
+        use tracing::Instrument as _;
+        let hb_span = tracing::info_span!("heartbeat", acct = %self.shared.instance_id);
+        let task_handle = async_rt::handle()
+            .spawn(heartbeat_loop(auth, shutdown, base_url).instrument(hb_span));
         // Return a std JoinHandle so existing engine shutdown code can
         // .join() it. The handle's thread awaits the tokio task to
         // finish via block_on_runtime — no polling loop.
