@@ -3792,6 +3792,10 @@ fn extract_instance_id(signal: &Signal) -> String {
 }
 
 fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderUpdate> {
+    // Tag this Hexmarket worker's `[Executor]` lines with the owning
+    // instance_id (`exec{iid=<id>}:`) — same rationale as
+    // `execute_fallback_signal`.
+    let _iid_span = tracing::info_span!("exec", iid = %extract_instance_id(&signal)).entered();
     match signal {
         Signal::NewOrder(order) => {
             match worker.submit_order(&order) {
@@ -3841,6 +3845,13 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
 }
 
 fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_threshold_ms: u64) -> Vec<OrderUpdate> {
+    // Tag every `[Executor]` line emitted while this signal executes
+    // (place / cancel / reject / trade-layer errors) with the owning
+    // instance_id (`exec{iid=<id>}:`), so multi-instance order logs are
+    // attributable per strategy. Covers BOTH the Polymarket worker pool
+    // and the inline-fallback path (both funnel through here). Live/paper
+    // only — the backtest sim path doesn't call this.
+    let _iid_span = tracing::info_span!("exec", iid = %extract_instance_id(&signal)).entered();
     // Build an ExecutorRejected OrderUpdate for a placement we didn't even send.
     let build_exec_rejected_place = |order: &OrderRequest| -> OrderUpdate {
         OrderUpdate {
