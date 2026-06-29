@@ -1168,7 +1168,12 @@ impl Config {
 //   api_key    = "..."                # → CHAINLINK_STREAM_API_KEY
 //   api_secret = "..."                # → CHAINLINK_STREAM_API_SECRET
 //
-//   [polygon]                         # Polygon JSON-RPC endpoints
+//   [polygon]                         # Polygon JSON-RPC endpoint pool
+//   rpc_list = [                      # preferred: round-robin + failover
+//     "https://node-a...",            #   → POLYGON_RPC_LIST
+//     "https://node-b...",
+//   ]
+//   # legacy scalars (still accepted; rpc_list wins when set):
 //   rpc   = "https://..."             # → POLYGON_RPC   (primary)
 //   rpc_2 = "https://..."             # optional → POLYGON_RPC_2 (failover)
 //
@@ -1235,14 +1240,41 @@ pub struct ChainlinkSecrets {
 }
 
 /// Polygon JSON-RPC endpoints (`[polygon]`). Used for on-chain reads /
-/// `gas_via_signer_wallet` broadcasts. Mirrors `POLYGON_RPC` (primary) and
-/// `POLYGON_RPC_2` (optional failover).
+/// `gas_via_signer_wallet` broadcasts.
+///
+/// Preferred form is a pool: `rpc_list = ["https://a…", "https://b…"]`.
+/// Calls are round-robined across the pool (spreads load, keeps per-node
+/// concurrency down) and fail over to the next node on fault. The legacy
+/// `rpc` (primary) / `rpc_2` (failover) scalars are still accepted and map
+/// to `POLYGON_RPC` / `POLYGON_RPC_2`; `rpc_list`, when non-empty, wins.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PolygonSecrets {
     #[serde(default)]
     pub rpc: String,
     #[serde(default)]
     pub rpc_2: String,
+    /// Pool of JSON-RPC endpoints. Non-empty → supersedes `rpc`/`rpc_2`.
+    #[serde(default)]
+    pub rpc_list: Vec<String>,
+}
+
+impl PolygonSecrets {
+    /// Effective ordered endpoints: `rpc_list` if any, else `[rpc, rpc_2]`.
+    /// Whitespace-trimmed, empties dropped, de-duplicated (first wins),
+    /// order preserved.
+    pub fn endpoints(&self) -> Vec<String> {
+        let raw: Vec<String> = if !self.rpc_list.is_empty() {
+            self.rpc_list.clone()
+        } else {
+            vec![self.rpc.clone(), self.rpc_2.clone()]
+        };
+        let mut seen = std::collections::HashSet::new();
+        raw.into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| seen.insert(s.clone()))
+            .collect()
+    }
 }
 
 /// Container for the whole `secrets.toml`: per-instance `[poly.<id>]`
@@ -1290,8 +1322,17 @@ impl SecretsFile {
             set_if("CHAINLINK_STREAM_API_SECRET", &c.api_secret);
         }
         if let Some(p) = &self.polygon {
-            set_if("POLYGON_RPC", &p.rpc);
-            set_if("POLYGON_RPC_2", &p.rpc_2);
+            let eps = p.endpoints();
+            if !eps.is_empty() {
+                // Full pool, comma-joined — read by `polygon_rpc_urls()`.
+                set_if("POLYGON_RPC_LIST", &eps.join(","));
+                // Back-compat: direct `POLYGON_RPC[_2]` readers (latency
+                // ping, one-off CLI view calls) still resolve a node.
+                set_if("POLYGON_RPC", &eps[0]);
+                if let Some(second) = eps.get(1) {
+                    set_if("POLYGON_RPC_2", second);
+                }
+            }
         }
     }
 }
@@ -1467,7 +1508,39 @@ mod shared_secrets_tests {
         assert_eq!(std::env::var("POLY_BUILDER_PASSPHRASE").unwrap(), "bp-XYZ");
         assert_eq!(std::env::var("POLYGON_RPC").unwrap(), "https://rpc-primary.example");
         assert_eq!(std::env::var("POLYGON_RPC_2").unwrap(), "https://rpc-failover.example");
+        // Scalars also populate the pool list (in order), for the new path.
+        assert_eq!(
+            std::env::var("POLYGON_RPC_LIST").unwrap(),
+            "https://rpc-primary.example,https://rpc-failover.example"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn polygon_endpoints_prefers_rpc_list_and_dedups() {
+        // rpc_list wins over scalars; trimmed, empties dropped, deduped.
+        let p = PolygonSecrets {
+            rpc: "https://ignored.example".into(),
+            rpc_2: "https://ignored2.example".into(),
+            rpc_list: vec![
+                " https://a.example ".into(),
+                "".into(),
+                "https://b.example".into(),
+                "https://a.example".into(), // dup → dropped
+            ],
+        };
+        assert_eq!(
+            p.endpoints(),
+            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+        );
+
+        // Empty rpc_list → fall back to scalars (empties dropped).
+        let p2 = PolygonSecrets {
+            rpc: "https://primary.example".into(),
+            rpc_2: "".into(),
+            rpc_list: vec![],
+        };
+        assert_eq!(p2.endpoints(), vec!["https://primary.example".to_string()]);
     }
 }
