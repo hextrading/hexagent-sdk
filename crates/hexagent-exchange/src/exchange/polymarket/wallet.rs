@@ -1550,14 +1550,21 @@ pub fn ctf_event_outcome_balances(
 }
 
 pub fn run_positions() -> Result<()> {
-    // Config path: accept first positional arg; default to the live
+    // Config path: `--config <path>` (or $HEXBOT_CONFIG) wins, else the
+    // legacy positional `hexbot positions <config.toml>`, else the live
     // polymaker config so `hexbot positions` without args mirrors what the
     // bot would actually run. Only used to label the output — all data we
     // fetch (balances, positions) is data-api / on-chain.
-    let arg: Option<String> = std::env::args()
-        .skip(2)
+    //
+    // Read positionals through `cli_args()` (NOT raw `std::env::args()`) so
+    // the global `--account <id>` / `--instance <id>` flags — and their
+    // *values* — are stripped first; otherwise `hexbot positions --account
+    // zhu02` would mistake the account id `zhu02` for the config path.
+    let positional: Option<String> = crate::exchange::polymarket::cli_account::cli_args()
         .find(|a| !a.starts_with('-'));
-    let config_path = arg.unwrap_or_else(|| "config/live_polymaker.toml".to_string());
+    let config_path = crate::exchange::polymarket::cli_account::config_path()
+        .or(positional)
+        .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
 
     let private_key = std::env::var("POLY_PRIVATE_KEY").unwrap_or_default();
     if private_key.is_empty() {
