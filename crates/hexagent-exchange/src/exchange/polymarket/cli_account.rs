@@ -304,7 +304,8 @@ pub fn apply_account_to_env(account_id: &str) -> Result<Option<String>> {
 ///   * `config_path` empty                  → `--instance` needs `--config`
 ///   * config / secrets file missing        → bad path
 ///   * `instance_id` not a configured strategy → typo; lists known ids
-///   * `[poly.<instance_id>]` block missing  → secrets gap; lists known ids
+///   * `[poly.<account_id>]` block missing  → secrets gap (account_id is the
+///     strategy's account_id, defaulting to instance_id)
 pub fn apply_instance_to_env(instance_id: &str, config_path: &str) -> Result<String> {
     if config_path.is_empty() {
         return Err(anyhow!(
@@ -330,13 +331,20 @@ pub fn apply_instance_to_env(instance_id: &str, config_path: &str) -> Result<Str
         .map(|s| s.instance_id.as_str())
         .filter(|s| !s.is_empty())
         .collect();
-    if !config.strategies.iter().any(|s| s.instance_id == instance_id) {
-        return Err(anyhow!(
+    let strat = match config.strategies.iter().find(|s| s.instance_id == instance_id) {
+        Some(s) => s,
+        None => return Err(anyhow!(
             "config {}: no [[strategies]] block with instance_id = \"{}\". \
              Known instance_ids: {:?}",
             config_path, instance_id, known,
-        ));
-    }
+        )),
+    };
+    // Wallet creds are keyed by account_id (the `[poly.<account>]` secrets
+    // block), which defaults to instance_id but decouples under multi-account
+    // (e.g. instance `btc01` → account `zhu02`). Resolve it so `--instance`
+    // reaches the SAME wallet the running bot uses, mirroring the engine's
+    // `sc.account_id()` creds path; keying by instance_id would miss.
+    let account_id = strat.account_id().to_string();
 
     // Secrets file follows the config's own cascade
     // (general.secrets_file → $HEXBOT_SECRETS → <config_dir>/secrets.toml →
@@ -353,11 +361,11 @@ pub fn apply_instance_to_env(instance_id: &str, config_path: &str) -> Result<Str
         ));
     }
     let secrets = SecretsFile::load(&secrets_path)?;
-    let creds = secrets.poly_for(instance_id)?;
+    let creds = secrets.poly_for(&account_id)?;
     apply_creds_to_env(creds);
     eprintln!(
-        "[cli] instance='{}' (config={}, secrets={})",
-        instance_id, config_path, secrets_path.display(),
+        "[cli] instance='{}' account='{}' (config={}, secrets={})",
+        instance_id, account_id, config_path, secrets_path.display(),
     );
     Ok(instance_id.to_string())
 }
