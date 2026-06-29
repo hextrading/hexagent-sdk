@@ -123,7 +123,7 @@ pub fn run_migrate_usdc() -> Result<()> {
             &wallet.signing_key, &wallet.signer_address, &dw, &wallet.builder_auth, amount_wei, dry_run,
         )?;
         println!(
-            "✅ onramp {} — run `deposit_wallet_setup --sync-balance` to refresh the CLOB cache.",
+            "✅ onramp {} — the CLOB re-reads the deposit wallet's balance on the next order.",
             if dry_run { "(dry-run)" } else { "confirmed" }
         );
         return Ok(());
