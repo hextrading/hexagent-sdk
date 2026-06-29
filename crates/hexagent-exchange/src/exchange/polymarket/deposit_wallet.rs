@@ -877,8 +877,29 @@ pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Resul
             return Ok(proxy);
         }
     }
-    // ── Not found by either check → deploy ──
-    println!("  No existing wallet found (on-chain scan + Gamma API) — deploying…");
+    // ── Not found by either check → confirm before creating ──
+    // Deploying is an on-chain action (relayer WALLET-CREATE), so make the
+    // operator opt in explicitly rather than auto-creating — especially
+    // since the existence check can miss a wallet on a flaky RPC and we
+    // don't want to mint a second one by surprise.
+    use std::io::Write as _;
+    println!("  No existing deposit wallet found for EOA {} (on-chain scan + Gamma API).", eoa);
+    println!("  A new POLY_1271 deposit wallet will be created via the Polymarket");
+    println!("  relayer (on-chain WALLET-CREATE).");
+    print!("  Create it now? [y/N]: ");
+    std::io::stdout().flush().ok();
+    let mut confirm = String::new();
+    std::io::stdin()
+        .read_line(&mut confirm)
+        .map_err(|e| anyhow!("failed to read confirmation: {}", e))?;
+    let c = confirm.trim().to_ascii_lowercase();
+    if c != "y" && c != "yes" {
+        return Err(anyhow!(
+            "deposit-wallet creation not confirmed — aborting (nothing deployed). \
+             If the wallet already exists, re-run with `--deposit-wallet <addr>` to skip creation."
+        ));
+    }
+    println!("  Deploying…");
     match deploy_deposit_wallet(builder_auth, eoa) {
         Ok(dw) => Ok(dw),
         // Deployed between the lookup and now (or lookup missed it).
