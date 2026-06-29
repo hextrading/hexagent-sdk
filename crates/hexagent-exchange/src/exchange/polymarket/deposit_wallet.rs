@@ -1,64 +1,32 @@
-//! `hexbot deposit_wallet_setup` — **Phase-1 SPIKE** for the CLOB v2
-//! deposit-wallet (POLY_1271 / signature_type=3) migration.
+//! CLOB v2 deposit-wallet (POLY_1271 / signature_type=3) infrastructure.
 //!
-//! ## Why this exists
-//!
-//! CLOB v2 rejects orders from our Gnosis-Safe maker with
+//! CLOB v2 rejects orders from a Gnosis-Safe maker with
 //! `"maker address not allowed, please use the deposit wallet flow"`.
-//! The fix is to trade from a **deposit wallet** (a per-user ERC-1967
-//! proxy) with `signatureType=3` (POLY_1271), where `maker == signer ==
-//! deposit wallet` and the order carries an ERC-7739-wrapped ERC-1271
-//! signature.
+//! The fix is to trade from a **deposit wallet** — a per-user ERC-1967
+//! proxy with `signatureType=3` (POLY_1271) where `maker == signer ==
+//! deposit wallet`, signing via the WALLET relayer batch.
 //!
-//! The one genuinely *unproven* piece is **API-key binding**: every
-//! official SDK (py/rs-clob-client-v2) binds the CLOB API key to the
-//! signer **EOA** in its L1 `ClobAuth` (`POLY_ADDRESS = signer.address()`,
-//! raw ECDSA, no ERC-7739 wrap — see
-//! `py_clob_client_v2/headers/headers.py::create_level_1_headers`).
-//! With a deposit-wallet maker that yields
-//! `"order signer address has to be the address of the API KEY"`
-//! (py-clob-client-v2 issue #70). The recommended-but-unshipped fix:
-//! set `POLY_ADDRESS` to the **deposit wallet** and **ERC-7739-wrap**
-//! the L1 `ClobAuth` signature so the CLOB validates it via the wallet's
-//! ERC-1271. Whether the CLOB *server* accepts that is the GO/NO-GO this
-//! spike answers — cheaply, before we build Phases 2-6.
-//!
-//! ## Usage
-//!
-//! ```text
-//! hexbot deposit_wallet_setup --instance zhu01 --deposit-wallet 0xABC… [--dry-run] [--create]
-//! ```
-//!
-//! * `--deposit-wallet 0x…` — an already-deployed deposit wallet (e.g.
-//!   created in the Polymarket UI). The SDKs do **not** derive this
-//!   offline; it comes from the deploy event / UI. If omitted, the spike
-//!   deploys one via the relayer `WALLET-CREATE` and reads the address
-//!   back from the `WalletDeployed` event.
-//! * `--dry-run` — derive nothing on-chain; compute + print the wrapped
-//!   `ClobAuth` digest, signature, and the exact L1 headers, but make
-//!   **no** network calls. Safe to run anytime.
-//! * `--create` — POST `/auth/api-key` (create) in addition to the GET
-//!   `/auth/derive-api-key` (derive) attempt.
-//!
-//! This command is **isolated**: it never touches the live trading path
-//! and writes nothing to the secrets file. It only reports whether the
-//! CLOB will bind a key to the deposit wallet.
+//! This module provides the deposit-wallet primitives consumed by
+//! `hexbot deploy_wallet` (resolve-or-deploy the DW + set allowances) and
+//! by the live maintenance path (split / redeem / merge / onramp via the
+//! relayer `WALLET` batch):
+//!   * [`ensure_deposit_wallet`] — find an existing DW (on-chain
+//!     `WalletDeployed` scan + Gamma `/public-profile`) or, after an
+//!     interactive confirm, deploy one via relayer `WALLET-CREATE`.
+//!   * [`dw_approvals`] / [`dw_split`] / [`dw_redeem`] / [`dw_merge`] /
+//!     [`dw_onramp`] / [`dw_offramp_withdraw`] / [`dw_transfer_erc20`].
 
 use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
 
 use super::auth::PolyAuth;
 use super::deploy_wallet::{address_to_bytes32, keccak256, to_checksum_address, u256_bytes};
-use super::signer::{derive_eth_address_from_key, SignatureType};
-use super::signer_v2::OrderSignerV2;
-use crate::types::Side;
 
 // ════════════════════════════════════════════════════════════════
 // Constants (Polygon mainnet, chain ID 137)
 // ════════════════════════════════════════════════════════════════
 
 const RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
-const CLOB_URL: &str = "https://clob.polymarket.com";
 const CHAIN_ID: u64 = 137;
 
 /// Deposit-wallet factory — the `to` target of a relayer `WALLET-CREATE`
@@ -75,395 +43,21 @@ const DEPOSIT_WALLET_FACTORY_ALT: &str = "0xb6F9C7E68A38c21BeDfD873bC5a378236f7b
 
 // L1 ClobAuth — identical struct to the working type-2 path
 // (py_clob_client_v2/signing/eip712.py + hexbot deploy_wallet).
-const CLOB_AUTH_DOMAIN_NAME: &str = "ClobAuthDomain";
-const CLOB_AUTH_VERSION: &str = "1";
-const CLOB_AUTH_MESSAGE: &str = "This message attests that I control the given wallet";
-const CLOB_AUTH_TYPE_STRING: &str =
-    "ClobAuth(address address,string timestamp,uint256 nonce,string message)";
 
 // ERC-7739 / Solady `TypedDataSign` wrapper (mirrors the order wrap in
 // rs-clob-client-v2 `client.rs::sign_poly1271_order`, but with `ClobAuth`
 // as the wrapped `contents`). The wallet "app domain" is the deposit
 // wallet itself: name="DepositWallet", version="1", zero salt.
-const DEPOSIT_WALLET_NAME: &str = "DepositWallet";
-const DEPOSIT_WALLET_VERSION: &str = "1";
-const SOLADY_CLOB_AUTH_TYPE_STRING: &str = concat!(
-    "TypedDataSign(ClobAuth contents,string name,string version,uint256 chainId,",
-    "address verifyingContract,bytes32 salt)",
-    "ClobAuth(address address,string timestamp,uint256 nonce,string message)",
-);
 
 // `WalletDeployed(address indexed wallet, address indexed owner, bytes32 indexed id, address implementation)`
 const WALLET_DEPLOYED_TOPIC0_PREIMAGE: &[u8] =
     b"WalletDeployed(address,address,bytes32,address)";
 
-// ════════════════════════════════════════════════════════════════
-// CLI entry point
-// ════════════════════════════════════════════════════════════════
-
-pub fn run_deposit_wallet_setup() -> Result<()> {
-    let args: Vec<String> = super::cli_account::cli_args().collect();
-    let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
-    let do_create = args.iter().any(|a| a == "--create");
-    let do_test_order = args.iter().any(|a| a == "--test-order");
-    let do_test_approvals = args.iter().any(|a| a == "--test-approvals");
-    let test_split_amt = flag_value(&args, "--test-split");
-    let test_redeem_cid = flag_value(&args, "--test-redeem");
-    let test_onramp_amt = flag_value(&args, "--test-onramp");
-    let do_sync_balance = args.iter().any(|a| a == "--sync-balance");
-    let slug = flag_value(&args, "--slug").unwrap_or_else(|| "btc-up-or-down-5m".to_string());
-    let deposit_wallet_arg = flag_value(&args, "--deposit-wallet");
-    // test-split routing: `--via-adapter` targets the CtfCollateralAdapter
-    // (→ USDC.e-space tokens), else CTF-direct; `--collateral usdce|pusd`
-    // picks the collateralToken arg (default pUSD).
-    let split_via_adapter = args.iter().any(|a| a == "--via-adapter");
-    let split_collateral = flag_value(&args, "--collateral").unwrap_or_else(|| "pusd".to_string());
-
-    // ── Signer EOA (from the resolved [poly.<id>] private_key) ──
-    let private_key = std::env::var("POLY_PRIVATE_KEY")
-        .map_err(|_| anyhow!("POLY_PRIVATE_KEY not set — run with --instance <id> --config <p> \
-            so cli_account resolves the [poly.<id>] credentials"))?;
-    let signing_key = parse_private_key(&private_key)?;
-    let signer_eoa = to_checksum_address(&derive_eth_address_from_key(&signing_key));
-
-    println!("=== Deposit Wallet Setup — SPIKE (CLOB v2 / POLY_1271) ===");
-    println!();
-    println!("Signer (EOA):   {}", signer_eoa);
-
-    // ── Resolve the deposit wallet address ──
-    let deposit_wallet = match deposit_wallet_arg {
-        Some(addr) => {
-            let cs = to_checksum_address(&addr);
-            println!("Deposit wallet: {}  (provided)", cs);
-            cs
-        }
-        None if dry_run => {
-            // Nothing to deploy in dry-run and none provided — use a
-            // placeholder so we can still show the wrapped-auth shape.
-            println!("Deposit wallet: <none provided> — dry-run will use the signer EOA as a \
-                placeholder address to illustrate the payload shape.");
-            signer_eoa.clone()
-        }
-        None => {
-            // Deploy via relayer WALLET-CREATE, then read the address
-            // from the WalletDeployed event. If the relayer reports the
-            // wallet already exists, look it up on-chain instead.
-            let builder_auth = load_builder_auth(&signer_eoa)?;
-            println!();
-            println!("No --deposit-wallet given → deploying via relayer WALLET-CREATE …");
-            match deploy_deposit_wallet(&builder_auth, &signer_eoa) {
-                Ok(addr) => {
-                    println!("Deployed deposit wallet: {}", addr);
-                    addr
-                }
-                Err(e) if e.to_string().contains("already deployed") => {
-                    println!("  Relayer: wallet already deployed — looking it up on-chain …");
-                    find_existing_deposit_wallet(&signer_eoa).map_err(|le| anyhow!(
-                        "deposit wallet already exists but on-chain lookup failed ({}). \
-                         Grab the deposit address from the Polymarket UI (your account's deposit \
-                         address) and re-run with --deposit-wallet 0x…", le))?
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    };
-
-    // ── --test-order: place ONE unfunded type-3 order to clear the #70
-    //    server check, then return (skips the L1/L2 auth probes) ──
-    if do_test_order {
-        return test_order(&private_key, &signer_eoa, &deposit_wallet, &slug, dry_run);
-    }
-    // ── --test-approvals: set/confirm the DW's v2 allowances via a WALLET
-    //    batch (pUSD→CTF, pUSD→ExchangeV2, CTF→ExchangeV2) ──
-    if do_test_approvals {
-        return test_approvals(&signing_key, &signer_eoa, &deposit_wallet, dry_run);
-    }
-    // ── --test-split <usdc>: ONE splitPosition from the DW (isolated; use
-    //    a tiny amount to confirm the CTF/collateral path before wiring) ──
-    if let Some(amt) = test_split_amt {
-        return test_split(&signing_key, &signer_eoa, &deposit_wallet, &slug, &amt,
-            split_via_adapter, &split_collateral, dry_run);
-    }
-    // ── --test-redeem <conditionId>: ONE redeemPositions from the DW for a
-    //    RESOLVED condition (reuses --via-adapter / --collateral) ──
-    if let Some(cid) = test_redeem_cid {
-        return test_redeem(&signing_key, &signer_eoa, &deposit_wallet, &cid,
-            split_via_adapter, &split_collateral, dry_run);
-    }
-    // ── --test-onramp <usdce>: wrap the DW's USDC.e → pUSD via the Onramp
-    //    (one WALLET batch: approve USDC.e→Onramp + Onramp.wrap) ──
-    if let Some(amt) = test_onramp_amt {
-        return test_onramp(&signing_key, &signer_eoa, &deposit_wallet, &amt, dry_run);
-    }
-    // ── --sync-balance: refresh the CLOB's cached balance/allowance for the
-    //    DW (signature_type=3) so it sees freshly-deposited pUSD ──
-    if do_sync_balance {
-        println!();
-        println!("── CLOB balance-cache sync (GET /balance-allowance/update?signature_type=3) ──");
-        match l2_balance_update(&signer_eoa) {
-            Ok(j) => println!("   updated → {}", j),
-            Err(e) => println!("   update → {}", e),
-        }
-        return Ok(());
-    }
-
-    // ── Build the ERC-7739-wrapped L1 ClobAuth ──
-    let timestamp = current_unix_secs()?;
-    let nonce: u64 = 0;
-    let (digest, wrapped_sig) =
-        wrapped_clob_auth_signature(&signing_key, &deposit_wallet, &timestamp, nonce);
-
-    println!();
-    println!("── ERC-7739-wrapped L1 ClobAuth ──────────────────");
-    println!("POLY_ADDRESS:   {}  (deposit wallet, NOT the EOA)", deposit_wallet);
-    println!("POLY_TIMESTAMP: {}", timestamp);
-    println!("POLY_NONCE:     {}", nonce);
-    println!("digest:         0x{}", hex::encode(digest));
-    println!("POLY_SIGNATURE: {}", wrapped_sig);
-    println!("  (len={} bytes — wrapped, vs 65 for a raw EOA sig)", (wrapped_sig.len() - 2) / 2);
-
-    if dry_run {
-        println!();
-        println!("(dry-run: no network calls made)");
-        return Ok(());
-    }
-
-    // ── L1-auth variant matrix ──
-    // One run, several POLY_ADDRESS/POLY_SIGNATURE constructions, so a
-    // single 401 doesn't leave us guessing. The EOA-standard variant is a
-    // **control**: it's exactly what the working type-2 derive does, so a
-    // 200 there proves the transport is sound and isolates the 401 to the
-    // deposit-wallet / wrapped variants.
-    let eoa_sig = unwrapped_clob_auth_signature(&signing_key, &signer_eoa, &timestamp, nonce);
-    let dw_unwrapped = unwrapped_clob_auth_signature(&signing_key, &deposit_wallet, &timestamp, nonce);
-
-    let variants: [(&str, &str, &str); 3] = [
-        ("EOA standard (CONTROL — must be 200)", &signer_eoa, &eoa_sig),
-        ("DW + ERC-7739 wrapped (the #70 fix)", &deposit_wallet, &wrapped_sig),
-        ("DW + raw EOA sig (no wrap)", &deposit_wallet, &dw_unwrapped),
-    ];
-
-    for (label, poly_address, sig) in variants {
-        println!();
-        println!("── Variant: {} ──", label);
-        println!("   POLY_ADDRESS = {}", poly_address);
-        match call_api_key(poly_address, &timestamp, nonce, sig, /*create=*/ false) {
-            Ok(json) => report_creds("derive", &json, poly_address),
-            Err(e) => println!("   derive → {}", e),
-        }
-        if do_create {
-            match call_api_key(poly_address, &timestamp, nonce, sig, /*create=*/ true) {
-                Ok(json) => report_creds("create", &json, poly_address),
-                Err(e) => println!("   create → {}", e),
-            }
-        }
-    }
-
-    // ── The REAL type-3 auth path ──
-    // The SDK never binds a key to the deposit wallet (the L1 matrix above
-    // is informational). It uses the EOA's L2 key and passes
-    // `signature_type` as a request param; the server resolves the deposit
-    // wallet from the api-key's account. So the actual GO/NO-GO is whether
-    // the existing EOA key + signature_type=3 reaches the deposit wallet.
-    println!();
-    println!("── L2 balance-allowance probe (EOA key + signature_type param) ──");
-    println!("   POLY_ADDRESS (L2) = {}  deposit wallet (server-resolved) = {}",
-        signer_eoa, deposit_wallet);
-    for st in [2u8, 3u8] {
-        match l2_balance_probe(&signer_eoa, st) {
-            Ok(j) => println!("   signature_type={} → 200: {}", st, j),
-            Err(e) => println!("   signature_type={} → {}", st, e),
-        }
-    }
-
-    println!();
-    println!("Read (the L2 probe is the verdict; L1 matrix is informational):");
-    println!("  • sig_type=3 → 200 (balance/allowance, 0 ok if unfunded) → GO: the EOA key");
-    println!("    reaches the deposit wallet. Next: Phase-5 order wrap + a live type-3 order.");
-    println!("  • sig_type=3 → error → the EOA key isn't linked to the DW for type-3; we dig");
-    println!("    into how Polymarket associates api key ↔ deposit wallet (UI-created link?).");
-    Ok(())
-}
-
-/// L2 (HMAC) probe of `GET /balance-allowance?signature_type=<st>` using the
-/// **existing EOA api key** (env `POLY_API_KEY/_API_SECRET/_PASSPHRASE`,
-/// populated by `cli_account::resolve_and_apply`). Mirrors the SDK's
-/// `get_balance_allowance`: the path (no query) is HMAC-signed; params ride
-/// in the URL; the server resolves the deposit wallet from the account.
-fn l2_balance_probe(eoa: &str, signature_type: u8) -> Result<serde_json::Value> {
-    let api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
-    let secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
-    let passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
-    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
-        return Err(anyhow!(
-            "missing L2 creds (POLY_API_KEY/_API_SECRET/_PASSPHRASE) — resolve_and_apply should \
-             set these from the [poly.<id>] block"
-        ));
-    }
-    let auth = PolyAuth::new(&api_key, &secret, &passphrase, eoa)?;
-    let path = "/balance-allowance";
-    let headers = auth.sign_request("GET", path, "");
-    let url = format!(
-        "{}{}?signature_type={}&asset_type=COLLATERAL",
-        CLOB_URL, path, signature_type
-    );
-    let pairs: Vec<(String, String)> = headers
-        .as_pairs()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let client = crate::async_rt::http_client();
-    crate::async_rt::block_on_runtime(async move {
-        let mut req = client.get(&url);
-        for (k, v) in &pairs {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let resp = req.send().await.map_err(|e| anyhow!("request: {}", e))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("HTTP {} — {}", status, text));
-        }
-        serde_json::from_str::<serde_json::Value>(&text)
-            .map_err(|e| anyhow!("parse: {} (body={})", e, text))
-    })
-}
-
-/// L2 GET `/balance-allowance/update?asset_type=COLLATERAL&signature_type=3`
-/// — forces the CLOB to re-read the deposit wallet's on-chain balance into
-/// its cache. Needed after funding, else orders reject on a stale balance=0.
-fn l2_balance_update(eoa: &str) -> Result<serde_json::Value> {
-    let api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
-    let secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
-    let passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
-    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
-        return Err(anyhow!("missing L2 creds (POLY_API_KEY/_API_SECRET/_PASSPHRASE)"));
-    }
-    let auth = PolyAuth::new(&api_key, &secret, &passphrase, eoa)?;
-    let path = "/balance-allowance/update";
-    let headers = auth.sign_request("GET", path, "");
-    let url = format!("{}{}?signature_type=3&asset_type=COLLATERAL", CLOB_URL, path);
-    let pairs: Vec<(String, String)> = headers
-        .as_pairs()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let client = crate::async_rt::http_client();
-    crate::async_rt::block_on_runtime(async move {
-        let mut req = client.get(&url);
-        for (k, v) in &pairs {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let resp = req.send().await.map_err(|e| anyhow!("request: {}", e))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("HTTP {} — {}", status, text));
-        }
-        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| anyhow!("parse: {} ({})", e, text))
-    })
-}
 
 // ════════════════════════════════════════════════════════════════
 // #70 test order — one unfunded type-3 order, observe the verdict
 // ════════════════════════════════════════════════════════════════
 
-/// Place ONE deposit-wallet (POLY_1271) order with the EOA L2 key. The DW
-/// is unfunded (balance 0), so a well-formed order should be rejected for
-/// *balance*, not signer — which clears the #70 "order signer ≠ api key"
-/// risk. postOnly + far-below-market price means it can't take even if the
-/// DW were funded.
-fn test_order(
-    private_key: &str,
-    eoa: &str,
-    deposit_wallet: &str,
-    slug: &str,
-    dry_run: bool,
-) -> Result<()> {
-    println!();
-    println!("── #70 test order (type-3, unfunded, postOnly far-from-market) ──");
-    let (series_id, event) = super::market::fetch_active_event(slug)?;
-    let token_id = event
-        .all_token_ids()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("active event {} has no clob token ids", series_id))?;
-    println!("   series_id={} token={}…", series_id, &token_id[..16.min(token_id.len())]);
-
-    let builder_code = std::env::var("POLY_BUILDER_CODE").unwrap_or_default();
-    let signer = OrderSignerV2::new(private_key, /*neg_risk=*/ false, SignatureType::Poly1271, &builder_code)?;
-    let (price, size) = (0.01_f64, 100.0_f64); // postOnly BUY, ~$1 notional, far below market
-    let signed = signer.build_signed_order_poly1271(deposit_wallet, &token_id, price, size, Side::Buy)?;
-    let o = &signed.order;
-    println!("   maker=signer={} | postOnly BUY {}@{} (~${:.2}) | sigType={}",
-        deposit_wallet, size, price, price * size, o.signature_type);
-
-    let api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
-    let salt_u64 = o.salt.parse::<u128>().map(|v| v as u64).unwrap_or(0);
-    let body = serde_json::json!({
-        "owner": api_key,
-        "orderType": "GTC",
-        "postOnly": true,
-        "deferExec": false,
-        "order": {
-            "salt": salt_u64,
-            "maker": o.maker,
-            "signer": o.signer,
-            "taker": o.taker,
-            "tokenId": o.token_id,
-            "makerAmount": o.maker_amount,
-            "takerAmount": o.taker_amount,
-            "side": "BUY",
-            "signatureType": o.signature_type,
-            "timestamp": o.timestamp,
-            "expiration": o.expiration,
-            "metadata": o.metadata,
-            "builder": o.builder,
-            "signature": signed.signature,
-        }
-    });
-    let body_str = body.to_string();
-
-    if dry_run {
-        println!("   (dry-run) POST /order body: {}", body_str);
-        return Ok(());
-    }
-
-    let secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
-    let passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
-    let auth = PolyAuth::new(&api_key, &secret, &passphrase, eoa)?;
-    let headers = auth.sign_request("POST", "/order", &body_str);
-    let pairs: Vec<(String, String)> = headers
-        .as_pairs()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let url = format!("{}/order", CLOB_URL);
-    let client = crate::async_rt::http_client();
-    let (status, text) = crate::async_rt::block_on_runtime(async move {
-        let mut req = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(body_str);
-        for (k, v) in &pairs {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let resp = req.send().await.map_err(|e| anyhow!("POST /order: {}", e))?;
-        let st = resp.status();
-        let tx = resp.text().await.unwrap_or_default();
-        Ok::<_, anyhow::Error>((st, tx))
-    })?;
-
-    println!("   POST /order → HTTP {} : {}", status, text);
-    println!();
-    println!("Read:");
-    println!("  • 'not enough balance' / insufficient funds → #70 CLEARED (signer accepted);");
-    println!("    remaining work is just funding the DW + wiring. GO for Phases 4+6.");
-    println!("  • 'order signer address has to be the address of the API KEY' → #70 REAL;");
-    println!("    the EOA key can't sign for the DW maker → deeper rework needed.");
-    println!("  • 200/success → it RESTED (cancel it); type-3 fully works end-to-end.");
-    Ok(())
-}
 
 // ════════════════════════════════════════════════════════════════
 // DepositWallet WALLET-batch (approvals / split / redeem FROM the DW)
@@ -945,317 +539,16 @@ fn gamma_public_profile_proxy(address: &str) -> Option<String> {
     }
 }
 
-/// `--test-onramp <usdce>`: wrap the deposit wallet's USDC.e → pUSD in one
-/// WALLET batch — `USDC.e.approve(Onramp, ∞)` then
-/// `Onramp.wrap(USDC.e, DW, amount)` (executed sequentially in the same
-/// tx). The DW must already hold ≥`<usdce>` USDC.e.
-fn test_onramp(
-    key: &SigningKey,
-    eoa: &str,
-    dw: &str,
-    amt_s: &str,
-    dry_run: bool,
-) -> Result<()> {
-    let amount_usdce: f64 = amt_s
-        .parse()
-        .map_err(|_| anyhow!("--test-onramp needs a USDC.e amount, got '{}'", amt_s))?;
-    let amount_wei = (amount_usdce * 1_000_000.0).round().max(0.0) as u128;
-    println!();
-    println!("── DW onramp: wrap {} USDC.e → pUSD via WALLET batch ──", amount_usdce);
-    let builder_auth = load_builder_auth(eoa)?;
-    dw_onramp(key, eoa, dw, &builder_auth, amount_wei, dry_run)?;
-    if !dry_run {
-        println!("   ✅ wrap confirmed — DW should now hold ~{} pUSD (check `hexbot positions` /", amount_usdce);
-        println!("      the L2 balance probe). Ready to --test-split / fund trading.");
-    }
-    Ok(())
-}
-
-/// `--test-approvals`: set/confirm the DW's three v2 allowances via one
-/// WALLET batch. Idempotent (re-approving ∞ is harmless). Also proves the
-/// WALLET-batch mechanism end-to-end before we trust it for split/redeem.
-fn test_approvals(key: &SigningKey, eoa: &str, dw: &str, dry_run: bool) -> Result<()> {
-    println!();
-    println!("── DW approvals via WALLET batch (pUSD→CTF, pUSD→ExchangeV2, CTF→ExchangeV2) ──");
-    let builder_auth = load_builder_auth(eoa)?;
-    dw_approvals(key, eoa, dw, &builder_auth, dry_run)?;
-    if !dry_run {
-        println!("   ✅ approvals batch confirmed — WALLET-batch path works for the DW.");
-    }
-    Ok(())
-}
-
-/// `--test-split <usdc>`: ONE `splitPosition` from the DW for the current
-/// event, isolated, so we confirm the CTF/collateral path on-chain with a
-/// tiny amount BEFORE wiring split into the live maintenance loop.
-fn test_split(
-    key: &SigningKey,
-    eoa: &str,
-    dw: &str,
-    slug: &str,
-    amt_s: &str,
-    via_adapter: bool,
-    collateral_sel: &str,
-    dry_run: bool,
-) -> Result<()> {
-    let amount_usdc: f64 = amt_s
-        .parse()
-        .map_err(|_| anyhow!("--test-split needs a USDC amount, got '{}'", amt_s))?;
-    let amount_wei = (amount_usdc * 1_000_000.0).round().max(0.0) as u128;
-
-    // Routing: --via-adapter targets the CtfCollateralAdapter (mints USDC.e-space
-    // tokens = clob_token_id, sellable); else CTF-direct (mints collateral-space).
-    let (target, target_label) = if via_adapter {
-        (CTF_COLLATERAL_ADAPTER, "CtfCollateralAdapter 0xAdA100")
-    } else {
-        (CTF_TOKEN, "CTF 0x4D97")
-    };
-    let (collateral, collateral_label) = match collateral_sel.to_ascii_lowercase().as_str() {
-        "usdce" | "usdc" | "usdc.e" => (USDCE_TOKEN, "USDC.e"),
-        _ => (PUSD_TOKEN, "pUSD"),
-    };
-    println!();
-    println!("── DW test split {} via WALLET batch (target={}, collateralArg={}) ──",
-        amount_usdc, target_label, collateral_label);
-    if via_adapter {
-        println!("   (requires `approve(pUSD→adapter)` — run `--test-approvals` first if unset)");
-    }
-    let (series_id, event) = super::market::fetch_active_event(slug)?;
-    let market = event.markets.first()
-        .ok_or_else(|| anyhow!("active event {} has no markets", series_id))?;
-    let condition_id = market.condition_id.clone();
-    if condition_id.is_empty() {
-        return Err(anyhow!("active event {} has no condition_id", series_id));
-    }
-    println!("   series_id={} condition_id={}", series_id, condition_id);
-    if !market.clob_token_ids.is_empty() {
-        println!("   clob_token_ids (the SELLable tokens to match):");
-        for (i, t) in market.clob_token_ids.iter().enumerate() {
-            println!("     [{}] {}", i, t);
-        }
-    }
-
-    let builder_auth = load_builder_auth(eoa)?;
-    let calls = vec![Call {
-        target: target.to_string(),
-        data: split_position_calldata(collateral, &condition_id, amount_wei),
-    }];
-    submit_wallet_batch(key, eoa, dw, &builder_auth, &calls, now_secs()?, dry_run)?;
-    println!();
-    println!("Verify which token got minted:");
-    println!("  hexbot token_check {} <up_clob_token_id> <down_clob_token_id>", condition_id);
-    println!("  then check the DW's on-chain ERC1155 balanceOf for each clob_token_id.");
-    println!("  • DW now holds {0} of the clob_token_id → this (target,collateral) is CORRECT;",
-        amount_usdc);
-    println!("    wire it into dw_split. (Sells will then see real balance.)");
-    println!("  • DW holds 0 of clob_token_id (minted a different positionId) or reverted →");
-    println!("    wrong (target,collateral); try the other --collateral / drop --via-adapter.");
-    Ok(())
-}
-
-/// `--test-redeem <conditionId>`: ONE isolated `redeemPositions` FROM the DW for
-/// a RESOLVED condition, to verify redeem-via-adapter before wiring it into the
-/// live maintenance loop. Reuses `--via-adapter` (target adapter vs CTF) and
-/// `--collateral usdce|pusd` (the collateralToken arg).
-fn test_redeem(
-    key: &SigningKey,
-    eoa: &str,
-    dw: &str,
-    cid_arg: &str,
-    via_adapter: bool,
-    collateral_sel: &str,
-    dry_run: bool,
-) -> Result<()> {
-    let condition_id = cid_arg.trim();
-    if !(condition_id.starts_with("0x") && condition_id.len() == 66) {
-        return Err(anyhow!(
-            "--test-redeem needs a 0x conditionId (32 bytes / 66 chars), got '{}'", condition_id
-        ));
-    }
-    let (target, target_label) = if via_adapter {
-        (CTF_COLLATERAL_ADAPTER, "CtfCollateralAdapter 0xAdA100")
-    } else {
-        (CTF_TOKEN, "CTF 0x4D97")
-    };
-    let (collateral, collateral_label) = match collateral_sel.to_ascii_lowercase().as_str() {
-        "usdce" | "usdc" | "usdc.e" => (USDCE_TOKEN, "USDC.e"),
-        _ => (PUSD_TOKEN, "pUSD"),
-    };
-    println!();
-    println!("── DW test redeem cid={} via WALLET batch (target={}, collateralArg={}) ──",
-        condition_id, target_label, collateral_label);
-    if via_adapter {
-        println!("   (adapter redeem burns the DW's outcome tokens → needs");
-        println!("    setApprovalForAll(CTF→adapter); run `--test-approvals` first if unset)");
-    }
-    println!("   NOTE: the condition MUST be RESOLVED on-chain — redeemPositions reverts otherwise.");
-
-    let builder_auth = load_builder_auth(eoa)?;
-    let calls = vec![Call {
-        target: target.to_string(),
-        data: redeem_calldata(collateral, condition_id),
-    }];
-    submit_wallet_batch(key, eoa, dw, &builder_auth, &calls, now_secs()?, dry_run)?;
-    println!();
-    println!("Verify:");
-    println!("  hexbot token_check {} <up_clob> <down_clob> --wallet {}", condition_id, dw);
-    println!("  • CONFIRMED + the DW's clob_token_id balanceOf → 0 + pUSD balance ↑");
-    println!("    → redeem-via-adapter is CORRECT → safe to wire into dw_redeem.");
-    println!("  • reverted / relayer 500 → adapter redeem needs a different approval/collateral;");
-    println!("    report it and we adjust (or fall back to CTF-direct USDC.e redeem).");
-    Ok(())
-}
 
 // ════════════════════════════════════════════════════════════════
 // ERC-7739-wrapped L1 ClobAuth (the #70 candidate fix)
 // ════════════════════════════════════════════════════════════════
 
-/// Returns `(digest, wrapped_signature_hex)`.
-///
-/// Mirrors `sign_poly1271_order` but wraps the L1 `ClobAuth` struct
-/// instead of an `Order`, under the `ClobAuthDomain` app domain:
-///
-/// 1. `contents = ClobAuth{address: depositWallet, timestamp, nonce, message}`
-/// 2. `tdsHash = keccak256(abi.encode(
-///        keccak256(SOLADY_TYPE_STRING), contents_hash,
-///        keccak256("DepositWallet"), keccak256("1"),
-///        chainId, depositWallet /*verifyingContract*/, 0 /*salt*/))`
-/// 3. `digest = keccak256(0x1901 || clobAuthDomainSep || tdsHash)`
-/// 4. `inner = EOA.sign(digest)` (65-byte ECDSA, v=27/28)
-/// 5. `wrapped = 0x || inner || clobAuthDomainSep || contents_hash ||
-///        CLOB_AUTH_TYPE_STRING || uint16(len(CLOB_AUTH_TYPE_STRING))`
-fn wrapped_clob_auth_signature(
-    key: &SigningKey,
-    deposit_wallet: &str,
-    timestamp: &str,
-    nonce: u64,
-) -> ([u8; 32], String) {
-    let contents_hash = clob_auth_contents_hash(deposit_wallet, timestamp, nonce);
-    let app_domain_sep = clob_auth_domain_separator();
-
-    // typed_data_sign struct hash (all 7 fields are static 32-byte words).
-    let tds_hash = keccak256(&abi_encode_words(&[
-        keccak256(SOLADY_CLOB_AUTH_TYPE_STRING.as_bytes()),
-        contents_hash,
-        keccak256(DEPOSIT_WALLET_NAME.as_bytes()),
-        keccak256(DEPOSIT_WALLET_VERSION.as_bytes()),
-        u256_bytes(CHAIN_ID as u128),
-        address_to_bytes32(deposit_wallet),
-        [0u8; 32],
-    ]));
-
-    let digest = eip712_digest(&app_domain_sep, &tds_hash);
-
-    let (sig, recid) = key
-        .sign_prehash_recoverable(&digest)
-        .expect("prehash sign");
-    let mut inner = [0u8; 65];
-    inner[..64].copy_from_slice(&sig.to_bytes());
-    inner[64] = recid.to_byte() + 27;
-
-    let type_string = CLOB_AUTH_TYPE_STRING.as_bytes();
-    let type_len = u16::try_from(type_string.len()).expect("type string fits u16");
-
-    let mut wrapped = String::from("0x");
-    wrapped.push_str(&hex::encode(inner));
-    wrapped.push_str(&hex::encode(app_domain_sep));
-    wrapped.push_str(&hex::encode(contents_hash));
-    wrapped.push_str(&hex::encode(type_string));
-    wrapped.push_str(&hex::encode(type_len.to_be_bytes()));
-
-    (digest, wrapped)
-}
-
-/// Standard (un-wrapped) L1 `ClobAuth` signature — exactly what the
-/// working type-2 `derive_api_credentials` produces: sign the EIP-712
-/// digest directly with the EOA key, v=27/28. `clob_auth_address` is the
-/// value placed in the `ClobAuth.address` field (and should match
-/// `POLY_ADDRESS`).
-fn unwrapped_clob_auth_signature(
-    key: &SigningKey,
-    clob_auth_address: &str,
-    timestamp: &str,
-    nonce: u64,
-) -> String {
-    let struct_hash = clob_auth_contents_hash(clob_auth_address, timestamp, nonce);
-    let digest = eip712_digest(&clob_auth_domain_separator(), &struct_hash);
-    let (sig, recid) = key.sign_prehash_recoverable(&digest).expect("prehash sign");
-    let mut bytes = [0u8; 65];
-    bytes[..64].copy_from_slice(&sig.to_bytes());
-    bytes[64] = recid.to_byte() + 27;
-    format!("0x{}", hex::encode(bytes))
-}
-
-/// EIP-712 struct hash of `ClobAuth{address,timestamp,nonce,message}`.
-/// `address` here is whatever the caller passes (deposit wallet or EOA).
-fn clob_auth_contents_hash(deposit_wallet: &str, timestamp: &str, nonce: u64) -> [u8; 32] {
-    keccak256(&abi_encode_words(&[
-        keccak256(CLOB_AUTH_TYPE_STRING.as_bytes()),
-        address_to_bytes32(deposit_wallet),
-        keccak256(timestamp.as_bytes()),
-        u256_bytes(nonce as u128),
-        keccak256(CLOB_AUTH_MESSAGE.as_bytes()),
-    ]))
-}
-
-/// `ClobAuthDomain` separator: name + version + chainId (no verifyingContract).
-fn clob_auth_domain_separator() -> [u8; 32] {
-    keccak256(&abi_encode_words(&[
-        keccak256(b"EIP712Domain(string name,string version,uint256 chainId)"),
-        keccak256(CLOB_AUTH_DOMAIN_NAME.as_bytes()),
-        keccak256(CLOB_AUTH_VERSION.as_bytes()),
-        u256_bytes(CHAIN_ID as u128),
-    ]))
-}
 
 // ════════════════════════════════════════════════════════════════
 // CLOB auth call (derive / create)
 // ════════════════════════════════════════════════════════════════
 
-fn call_api_key(
-    deposit_wallet: &str,
-    timestamp: &str,
-    nonce: u64,
-    wrapped_sig: &str,
-    create: bool,
-) -> Result<serde_json::Value> {
-    let (method, path) = if create {
-        (reqwest::Method::POST, "/auth/api-key")
-    } else {
-        (reqwest::Method::GET, "/auth/derive-api-key")
-    };
-    let url = format!("{}{}", CLOB_URL, path);
-    let addr = deposit_wallet.to_string();
-    let sig = wrapped_sig.to_string();
-    let ts = timestamp.to_string();
-    let nonce_s = nonce.to_string();
-    let client = crate::async_rt::http_client();
-    crate::async_rt::block_on_runtime(async move {
-        let req = client
-            .request(method, &url)
-            .header("POLY_ADDRESS", addr)
-            .header("POLY_SIGNATURE", sig)
-            .header("POLY_TIMESTAMP", ts)
-            .header("POLY_NONCE", nonce_s);
-        let resp = req.send().await.map_err(|e| anyhow!("request: {}", e))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("HTTP {} — {}", status, text));
-        }
-        serde_json::from_str::<serde_json::Value>(&text)
-            .map_err(|e| anyhow!("parse: {} (body={})", e, text))
-    })
-}
-
-fn report_creds(which: &str, json: &serde_json::Value, poly_address: &str) {
-    let key = json.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
-    if key.is_empty() {
-        println!("   {} → 200 but no apiKey: {}", which, json);
-        return;
-    }
-    println!("   ✅ {} → 200, apiKey={} (bound to POLY_ADDRESS={})", which, key, poly_address);
-}
 
 // ════════════════════════════════════════════════════════════════
 // Relayer WALLET-CREATE deploy
@@ -1405,19 +698,6 @@ fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<String> {
 // Helpers
 // ════════════════════════════════════════════════════════════════
 
-fn load_builder_auth(signer_eoa: &str) -> Result<PolyAuth> {
-    let key = std::env::var("POLY_BUILDER_API_KEY").unwrap_or_default();
-    let secret = std::env::var("POLY_BUILDER_SECRET").unwrap_or_default();
-    let passphrase = std::env::var("POLY_BUILDER_PASSPHRASE").unwrap_or_default();
-    if key.is_empty() || secret.is_empty() || passphrase.is_empty() {
-        return Err(anyhow!(
-            "deploy path needs builder credentials (POLY_BUILDER_API_KEY / _SECRET / \
-             _PASSPHRASE). Either add a [builder] block to the secrets file, or pass an \
-             already-deployed --deposit-wallet <addr> to skip deployment."
-        ));
-    }
-    PolyAuth::new(&key, &secret, &passphrase, signer_eoa)
-}
 
 /// abi.encode of a sequence of pre-formed 32-byte words = plain concat
 /// (every element here is a static type).
@@ -1438,23 +718,6 @@ fn eip712_digest(domain_sep: &[u8; 32], struct_hash: &[u8; 32]) -> [u8; 32] {
     keccak256(&buf)
 }
 
-fn parse_private_key(input: &str) -> Result<SigningKey> {
-    let clean = input.strip_prefix("0x").unwrap_or(input);
-    let bytes = hex::decode(clean).map_err(|e| anyhow!("private key hex: {}", e))?;
-    SigningKey::from_bytes(bytes.as_slice().into()).map_err(|e| anyhow!("private key: {}", e))
-}
-
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
-}
-
-fn current_unix_secs() -> Result<String> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow!("clock: {}", e))?
-        .as_secs()
-        .to_string())
-}
 
 fn relayer_post(
     url: String,
@@ -1475,54 +738,4 @@ fn relayer_post(
         }
         serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} ({})", url, e, text))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Hardhat account #0 — deterministic, widely published.
-    const HARDHAT_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    const DEPOSIT_WALLET: &str = "0x000000000000000000000000000000000000dEaD";
-
-    fn key() -> SigningKey {
-        parse_private_key(HARDHAT_KEY).unwrap()
-    }
-
-    /// The wrapped signature must follow Solady's ERC-7739 layout:
-    /// `inner(65) || appDomainSep(32) || contentsHash(32) || contentsType ||
-    /// uint16(len(contentsType))`, and be deterministic for fixed inputs.
-    #[test]
-    fn wrapped_clob_auth_layout_and_determinism() {
-        let (_d1, s1) = wrapped_clob_auth_signature(&key(), DEPOSIT_WALLET, "1700000000", 0);
-        let (_d2, s2) = wrapped_clob_auth_signature(&key(), DEPOSIT_WALLET, "1700000000", 0);
-        assert_eq!(s1, s2, "deterministic for fixed inputs");
-        assert!(s1.starts_with("0x"));
-
-        let bytes = hex::decode(s1.strip_prefix("0x").unwrap()).unwrap();
-        let type_str = CLOB_AUTH_TYPE_STRING.as_bytes();
-        let expected_len = 65 + 32 + 32 + type_str.len() + 2;
-        assert_eq!(bytes.len(), expected_len, "ERC-7739 wrapped layout length");
-
-        // Trailing uint16 = contentsType length (big-endian).
-        let tail = &bytes[bytes.len() - 2..];
-        assert_eq!(u16::from_be_bytes([tail[0], tail[1]]) as usize, type_str.len());
-
-        // The contentsType string sits just before that uint16.
-        let type_start = 65 + 32 + 32;
-        assert_eq!(&bytes[type_start..type_start + type_str.len()], type_str);
-
-        // The appDomainSep embedded in the wrapper matches our domain fn.
-        assert_eq!(&bytes[65..65 + 32], clob_auth_domain_separator().as_slice());
-    }
-
-    /// `ClobAuth.address` is bound to the deposit wallet (the #70 fix), so
-    /// changing the deposit wallet must change the contents hash + sig.
-    #[test]
-    fn binds_to_deposit_wallet_not_eoa() {
-        let (_d, a) = wrapped_clob_auth_signature(&key(), DEPOSIT_WALLET, "1700000000", 0);
-        let other = "0x0000000000000000000000000000000000001234";
-        let (_d2, b) = wrapped_clob_auth_signature(&key(), other, "1700000000", 0);
-        assert_ne!(a, b, "signature must depend on the deposit wallet address");
-    }
 }

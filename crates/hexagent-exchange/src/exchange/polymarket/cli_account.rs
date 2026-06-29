@@ -79,7 +79,34 @@ pub fn clean_args() -> Vec<String> {
     let _ = strip_flag(&mut v, "--account");
     let _ = strip_flag(&mut v, "--instance");
     let _ = strip_flag(&mut v, "--config");
+    let _ = strip_flag(&mut v, "--secrets");
     v
+}
+
+/// Default secrets file for the `--account` low-level path when neither
+/// `--secrets` nor `$HEXBOT_SECRETS` is given. Operator deployments keep
+/// the file here; dev/local runs override with `--secrets <path>`.
+pub const DEFAULT_SECRETS_PATH: &str = "/etc/secrets/polymaker/secrets.toml";
+
+/// The `--secrets <path>` value (or `--secrets=<path>`), falling back to
+/// `$HEXBOT_SECRETS`. Returns `None` when neither is set (callers then use
+/// [`DEFAULT_SECRETS_PATH`]). A top-level flag stripped by `clean_args`,
+/// so it's position-independent and never reaches positional parsers.
+pub fn secrets_path() -> Option<String> {
+    let mut v: Vec<String> = std::env::args().collect();
+    let from_cli = strip_flag(&mut v, "--secrets");
+    if !from_cli.is_empty() {
+        return Some(from_cli);
+    }
+    std::env::var("HEXBOT_SECRETS").ok().filter(|s| !s.is_empty())
+}
+
+/// Resolve the secrets-file path for the `--account` path:
+/// `--secrets` → `$HEXBOT_SECRETS` → [`DEFAULT_SECRETS_PATH`].
+pub fn resolve_secrets_file() -> std::path::PathBuf {
+    secrets_path()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_SECRETS_PATH))
 }
 
 /// Subcommand-positional iterator: `clean_args().into_iter().skip(2)`.
@@ -138,10 +165,23 @@ pub fn instance_id() -> String {
 ///     (so a single-strategy config needs no `--instance`);
 ///   * empty + zero / multiple instances → error asking for `--instance`.
 pub fn resolve_secrets_write_path(instance_id: &str, config_path: &str) -> Result<(String, std::path::PathBuf)> {
+    // ── Account mode: `--account <id> [--secrets <path>]`, no --config ──
+    // Writes the `[poly.<id>]` block straight into the secrets file
+    // (default /etc/secrets/polymaker/secrets.toml). Preferred for
+    // operator runs that don't have (or need) a live config on the box.
     if config_path.is_empty() {
+        let account = resolve_account_id();
+        if !account.is_empty() {
+            let secrets = resolve_secrets_file();
+            eprintln!("[cli] account='{}' (secrets={})", account, secrets.display());
+            return Ok((account, secrets));
+        }
         return Err(anyhow!(
-            "deploy_wallet requires --config <path> (its general.secrets_file is where \
-             credentials are written). Set --config or $HEXBOT_CONFIG."
+            "deploy_wallet needs a target: either `--account <id> [--secrets <path>]` \
+             (writes [poly.<id>] into the secrets file; default {}), or \
+             `--config <path>` (writes into that config's general.secrets_file). \
+             Set --account/$HEXBOT_ACCOUNT or --config/$HEXBOT_CONFIG.",
+            DEFAULT_SECRETS_PATH,
         ));
     }
     let cfg_path = Path::new(config_path);
@@ -226,21 +266,21 @@ pub fn apply_creds_to_env(creds: &PolymarketSecrets) {
     // `SecretsFile::apply_shared_to_env`).
 }
 
-/// Load `secrets.toml` and apply the chosen `[poly.<account_id>]`
+/// Load the secrets file and apply the chosen `[poly.<account_id>]`
 /// credentials to `POLY_*` env vars. No-op when `account_id` is empty.
-/// Resolves the secrets file via `$HEXBOT_SECRETS` → `./secrets.toml`.
+/// Resolves the secrets file via `--secrets` → `$HEXBOT_SECRETS` →
+/// [`DEFAULT_SECRETS_PATH`] (`/etc/secrets/polymaker/secrets.toml`).
 pub fn apply_account_to_env(account_id: &str) -> Result<Option<String>> {
     if account_id.is_empty() {
         return Ok(None);
     }
-    let path = std::env::var("HEXBOT_SECRETS")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("./secrets.toml"));
+    let path = resolve_secrets_file();
     if !Path::new(&path).exists() {
         return Err(anyhow!(
             "--account {} requested but secrets file not found at {} \
-             (set $HEXBOT_SECRETS or create ./secrets.toml)",
-            account_id, path.display(),
+             (pass --secrets <path>, set $HEXBOT_SECRETS, or place it at the \
+             default {})",
+            account_id, path.display(), DEFAULT_SECRETS_PATH,
         ));
     }
     let secrets = SecretsFile::load(&path)?;
