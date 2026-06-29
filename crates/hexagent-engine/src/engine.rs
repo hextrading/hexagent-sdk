@@ -2199,6 +2199,68 @@ impl Engine {
                 }
                 info!("[Strategy] apv2 warm-up complete: {} spot events fed", fed);
                 for s in &mut strategies { s.apv2_warmup_finalize_cache(); }
+
+                // Drain live events buffered on `market_rx` during the apv2
+                // warm-up replay above. The earlier prediction-warm-up drain
+                // already emptied the buffer, but this apv2 replay runs AFTER
+                // it and can take tens of seconds (a cache-miss full 7-day
+                // replay; ~1s on a warm cache), so a fresh backlog of OBs /
+                // Trades has queued up meanwhile. If we hand off to the live
+                // thread now, the FIRST events it processes are these
+                // seconds-old buffered ticks: myindex's per-component ts is
+                // set to that stale value and the wall-clock staleness gate
+                // (now_ns_for_myindex_gate is wall-clock in live/paper) fires
+                // "component <ex> stale" + pauses quoting until the live loop
+                // grinds through the backlog (observed: ~57s-old binance tick →
+                // ~1.2k "Skipping quote" warns over the first 5m event). Catch
+                // myindex / spot_price up to the freshest buffered tick HERE,
+                // via the real market handlers, so the live thread starts
+                // already-fresh. We feed market handlers only — never on_quote
+                // — so no quoting/signal emission happens during the drain
+                // (mirrors the prediction warm-up drain above).
+                let mut drained = 0u64;
+                while let Ok(event) = market_rx.try_recv() {
+                    if let Some(ref rtx) = recorder_tx {
+                        let _ = rtx.send(event.clone());
+                    }
+                    for strategy in &mut strategies {
+                        match &event {
+                            MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
+                            MarketEvent::Trade(t) => strategy.on_trade_tick(t),
+                            MarketEvent::Quote(q) => strategy.on_quote_tick(q),
+                            MarketEvent::Bar(b) => strategy.on_bar(b),
+                            MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
+                            MarketEvent::Instrument(inst) => {
+                                let ts_event = event.timestamp_ns();
+                                let hist_reqs = strategy.load_hist_data(ts_event);
+                                for req in &hist_reqs {
+                                    for dir in &data_dirs {
+                                        match crate::recorder::load_hist_bars(dir, req) {
+                                            Ok(bars) if !bars.is_empty() => {
+                                                for bar in &bars { strategy.on_hist_bar(bar); }
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                if !hist_reqs.is_empty() {
+                                    strategy.on_hist_data_loaded(ts_event);
+                                }
+                                strategy.on_instrument(inst);
+                            }
+                            MarketEvent::Connected { exchange } => strategy.on_connected(*exchange),
+                            MarketEvent::Disconnected { exchange, reason } => strategy.on_disconnected(*exchange, reason),
+                            MarketEvent::TickSizeChange(tsc) => { let _ = strategy.on_tick_size_change(tsc); }
+                            MarketEvent::EventStart { .. } | MarketEvent::Exit => {}
+                        }
+                    }
+                    drained += 1;
+                    if drained >= 1_000_000 { break; }
+                }
+                if drained > 0 {
+                    info!("[Strategy] Drained {} live events buffered during apv2 warm-up", drained);
+                }
             }
         }
 
