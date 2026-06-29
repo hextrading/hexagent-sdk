@@ -3684,26 +3684,110 @@ fn run_split_one(
 /// (= `split_amount_usdc`) is satisfied. Default is
 /// `split_amount_usdc` itself (no extra margin); strategy / CLI
 /// override to e.g. $50 to gate trading on a healthy wallet reserve.
-pub fn spawn_maintenance_thread(
-    split_series_id: Option<String>,
-    split_end_date_min_secs: u64,
-    split_amount_usdc: f64,
-    min_safety_balance_usdc: f64,
-    gas_via_signer: bool,
-    // When `false`, the redeem step (Step 1) is skipped entirely — the
-    // split-seed step still runs. The live auto-maintenance task passes
-    // its `maintenance_redeem_enabled` config (default off); the `hexbot
-    // split` CLI passes `true`. The separate `hexbot redeem` CLI is NOT
-    // routed through here and always redeems.
-    redeem_enabled: bool,
-    status: Option<MaintenanceStatusHandle>,
-    // Account whose wallet runs this split/redeem. Resolves per-account
-    // creds from the registry (multi-account safe); empty → global env.
-    account_id: String,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("poly-maintenance".into())
-        .spawn(move || {
+/// A queued maintenance job: redeem (optional) + split-seed for ONE
+/// account's next event. Submitted to the global executor, which runs
+/// it on the per-account worker thread.
+pub struct MaintenanceJob {
+    pub split_series_id: Option<String>,
+    pub split_end_date_min_secs: u64,
+    pub split_amount_usdc: f64,
+    pub min_safety_balance_usdc: f64,
+    pub gas_via_signer: bool,
+    /// When `false`, the redeem step (Step 1) is skipped entirely — the
+    /// split-seed step still runs. The live auto-maintenance task passes
+    /// its `maintenance_redeem_enabled` config (default off); the `hexbot
+    /// split` CLI passes `true`. The separate `hexbot redeem` CLI is NOT
+    /// routed through here and always redeems.
+    pub redeem_enabled: bool,
+    pub status: Option<MaintenanceStatusHandle>,
+    /// Account whose wallet runs this split/redeem. Resolves per-account
+    /// creds from the registry (multi-account safe); empty → global env.
+    /// Also the executor key: jobs with the same `account_id` run serially
+    /// on one worker; different accounts run in parallel on their own.
+    pub account_id: String,
+}
+
+// ── Global maintenance executor ──
+// Replaces the old per-call detached thread. One worker thread per
+// `account_id` (lazily spawned) drains that account's queue SERIALLY, so
+// two instances sharing a wallet (e.g. BTC + ETH whose 5-min events end
+// at the same instant) never run split/redeem concurrently on the same
+// wallet — which would race on the shared USDC pool and the signer's
+// on-chain nonce. Different accounts get different workers → parallel.
+type MaintenanceQueueItem = (MaintenanceJob, Option<crossbeam_channel::Sender<()>>);
+
+static MAINTENANCE_QUEUES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>>,
+> = std::sync::OnceLock::new();
+
+/// Enqueue a job onto its account's serial worker, spawning the worker on
+/// first use. Writes `Running` to the status handle IMMEDIATELY (before
+/// the worker may even pick it up) so a job that waits in queue behind a
+/// sibling on the same account still gates that instance's quoting — the
+/// strategy's grace-window poll must not see `NotStarted` and resume early.
+fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Sender<()>>) {
+    if let Some(ref s) = job.status {
+        *s.lock().unwrap() = MaintenanceStatus::Running;
+    }
+    let account = job.account_id.clone();
+    let queues = MAINTENANCE_QUEUES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = queues.lock().unwrap();
+    let tx = map.entry(account.clone()).or_insert_with(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceQueueItem>();
+        let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        std::thread::Builder::new()
+            .name(format!("poly-maint-{}", worker_label))
+            .spawn(move || {
+                // Serial drain: never two on-chain maintenance runs for the
+                // same wallet at once.
+                while let Ok((job, done)) = rx.recv() {
+                    run_maintenance_job(job);
+                    if let Some(d) = done {
+                        let _ = d.send(());
+                    }
+                }
+            })
+            .expect("Failed to spawn maintenance worker");
+        tx
+    });
+    if let Err(e) = tx.send((job, done)) {
+        log::warn!("[Maintenance] enqueue failed (worker gone): {}", e);
+    }
+}
+
+/// Fire-and-forget submit (live strategy). Returns immediately; the
+/// per-account worker runs the job serially and updates `job.status`.
+pub fn submit_maintenance(job: MaintenanceJob) {
+    enqueue_maintenance(job, None);
+}
+
+/// Blocking submit (CLI `hexbot split`): enqueue then wait for the
+/// per-account worker to finish THIS job, preserving the old
+/// `spawn_maintenance_thread(...).join()` semantics so all log output
+/// appears before the command returns.
+pub fn run_maintenance_blocking(job: MaintenanceJob) {
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    enqueue_maintenance(job, Some(done_tx));
+    let _ = done_rx.recv();
+}
+
+/// Run one maintenance job to completion on the calling (worker) thread:
+/// redeem (if enabled) → fetch next event → split-seed → write terminal
+/// status. Body is unchanged from the former `spawn_maintenance_thread`
+/// closure (now driven by the executor instead of a per-call thread).
+fn run_maintenance_job(job: MaintenanceJob) {
+    let MaintenanceJob {
+        split_series_id,
+        split_end_date_min_secs,
+        split_amount_usdc,
+        min_safety_balance_usdc,
+        gas_via_signer,
+        redeem_enabled,
+        status,
+        account_id,
+    } = job;
+    {
             // Write `Running` immediately so the strategy can distinguish
             // "spawn requested but thread hasn't started yet" from
             // "in-progress" — the gap is normally <1ms but worth being
@@ -3852,8 +3936,7 @@ pub fn spawn_maintenance_thread(
             } else {
                 log::info!("[Maintenance] Complete.");
             }
-        })
-        .expect("Failed to spawn maintenance thread")
+    }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3862,16 +3945,17 @@ pub fn spawn_maintenance_thread(
 
 /// CLI entrypoint: `hexbot split <series_slug> <amount_usdc>`.
 ///
-/// Kicks off the same `spawn_maintenance_thread` that the live strategy
-/// would normally fire ~30s before an event ends:
+/// Submits the same maintenance job the live strategy fires ~30s before
+/// an event ends (now via `run_maintenance_blocking` on the global
+/// executor):
 ///   1. redeem all redeemable positions for the wallet
 ///   2. resolve `<series_slug>` → series_id, then query the gamma-api
 ///      for the next upcoming event (end_date_min = now + 60s, earliest
 ///      ascending)
 ///   3. split `<amount_usdc>` of USDC into Up + Down shares on that event
 ///
-/// Runs on the same thread as the CLI (joins the maintenance handle) so
-/// all log output is visible before the command returns.
+/// Blocks until the executor finishes this job so all log output is
+/// visible before the command returns.
 pub fn run_split() -> Result<()> {
     let args: Vec<String> = crate::exchange::polymarket::cli_account::cli_args().collect();
     if args.len() < 2 {
@@ -3945,18 +4029,20 @@ pub fn run_split() -> Result<()> {
     // `hexbot split` is a manual operator action documented to redeem +
     // split, so it always redeems (redeem_enabled=true) — independent of
     // the live maintenance task's `maintenance_redeem_enabled` default-off.
-    let handle = spawn_maintenance_thread(
-        Some(series_id), end_date_min_secs, amount_usdc,
-        amount_usdc, gas_via_signer,
-        /*redeem_enabled=*/ true,
-        None,
+    run_maintenance_blocking(MaintenanceJob {
+        split_series_id: Some(series_id),
+        split_end_date_min_secs: end_date_min_secs,
+        split_amount_usdc: amount_usdc,
+        min_safety_balance_usdc: amount_usdc,
+        gas_via_signer,
+        redeem_enabled: true,
+        status: None,
         // CLI: empty account_id → resolve creds from the global POLY_*
         // env (set by `apply_account_to_env` for the `--account` flag).
-        String::new(),
-    );
-    let _ = handle.join();
+        account_id: String::new(),
+    });
     println!();
-    println!("=== Maintenance thread joined ===");
+    println!("=== Maintenance complete ===");
     Ok(())
 }
 
