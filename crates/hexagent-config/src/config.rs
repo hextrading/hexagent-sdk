@@ -54,6 +54,15 @@ pub struct OsTuneConfig {
     /// `-worker-<i>`). Empty = fall back to `execution_core`.
     #[serde(default)]
     pub hex_worker_cores: Vec<usize>,
+    /// Round-robin pool for the Polymarket order-dispatch worker pool
+    /// (thread names `poly-exec-<i>`). These threads block on the order
+    /// HTTP round-trip (up to the 2 s timeout), so during a venue-latency
+    /// burst they park simultaneously — co-hosting them on the single
+    /// `execution_core` fallback adds SCHED_FIFO scheduling jitter. List
+    /// ≥2 cores here to spread the pool. Empty = fall back to
+    /// `execution_core` (legacy behaviour). Example: `[4, 15]`.
+    #[serde(default)]
+    pub poly_exec_cores: Vec<usize>,
     /// Round-robin pool for non-critical background threads. Empty =
     /// single core 0 (legacy default).
     #[serde(default)]
@@ -74,6 +83,7 @@ impl Default for OsTuneConfig {
             execution_core: None,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
+            poly_exec_cores: Vec::new(),
             background_cores: Vec::new(),
             fifo_async_rt: None,
             fifo_strategy: None,
