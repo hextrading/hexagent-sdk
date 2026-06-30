@@ -95,6 +95,9 @@ pub struct CorePlan {
     pub execution: usize,
     pub feed_cores: HashMap<String, usize>,
     pub hex_worker_cores: Vec<usize>,
+    /// Round-robin pool for Polymarket dispatch workers (`poly-exec-<i>`).
+    /// Empty = fall back to `execution`.
+    pub poly_exec_cores: Vec<usize>,
     pub background_cores: Vec<usize>,
     pub fifo_async_rt: u8,
     pub fifo_strategy: u8,
@@ -112,6 +115,7 @@ impl CorePlan {
             execution: DEFAULT_EXECUTION_CORE,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
+            poly_exec_cores: Vec::new(),
             background_cores: vec![DEFAULT_BACKGROUND_CORE],
             fifo_async_rt: DEFAULT_PRIO_ASYNC_RT,
             fifo_strategy: DEFAULT_PRIO_STRATEGY,
@@ -134,6 +138,7 @@ impl CorePlan {
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
             feed_cores: cfg.feed_cores.clone(),
             hex_worker_cores: cfg.hex_worker_cores.clone(),
+            poly_exec_cores: cfg.poly_exec_cores.clone(),
             background_cores: bg,
             fifo_async_rt: cfg.fifo_async_rt.unwrap_or(DEFAULT_PRIO_ASYNC_RT),
             fifo_strategy: cfg.fifo_strategy.unwrap_or(DEFAULT_PRIO_STRATEGY),
@@ -143,6 +148,7 @@ impl CorePlan {
 
     /// Route an execution-tier thread to its core based on name:
     ///   - `feed-<exchange>`           → `feed_cores[<exchange>]` else execution
+    ///   - `poly-exec-<i>`             → round-robin `poly_exec_cores` else execution
     ///   - `<inst_id>-worker-<i>`      → round-robin `hex_worker_cores` else execution
     ///   - anything else               → execution
     fn route_execution(&self, thread_name: &str) -> usize {
@@ -150,6 +156,10 @@ impl CorePlan {
             if let Some(&core) = self.feed_cores.get(ex) {
                 return core;
             }
+        }
+        if thread_name.starts_with("poly-exec-") && !self.poly_exec_cores.is_empty() {
+            let i = POLY_EXEC_RR.fetch_add(1, Ordering::Relaxed) % self.poly_exec_cores.len();
+            return self.poly_exec_cores[i];
         }
         if thread_name.contains("-worker-") && !self.hex_worker_cores.is_empty() {
             let i = HEX_WORKER_RR.fetch_add(1, Ordering::Relaxed) % self.hex_worker_cores.len();
@@ -170,6 +180,7 @@ impl CorePlan {
 
 static CORE_PLAN: OnceLock<CorePlan> = OnceLock::new();
 static HEX_WORKER_RR: AtomicUsize = AtomicUsize::new(0);
+static POLY_EXEC_RR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_RR: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the CorePlan resolved from the TOML `[os_tune]` block. Must be
@@ -181,9 +192,9 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} strategy={} execution={} feeds={:?} hex_workers={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={}",
+        "[os_tune] core plan: async_rt={} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={}",
         plan.async_rt, plan.strategy, plan.execution,
-        plan.feed_cores, plan.hex_worker_cores, plan.background_cores,
+        plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
         plan.enable_pin, plan.enable_fifo,
     );
@@ -237,6 +248,7 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
     } else if core_id == p.execution
         || p.feed_cores.values().any(|&c| c == core_id)
         || p.hex_worker_cores.iter().any(|&c| c == core_id)
+        || p.poly_exec_cores.iter().any(|&c| c == core_id)
     {
         "HEXBOT_NO_PIN_EXECUTION"
     } else if p.background_cores.iter().any(|&c| c == core_id) {
