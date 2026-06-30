@@ -114,6 +114,18 @@ pub struct OrderManager {
     symbol: String,
     tick_size: f64,
     instance_id: String,
+    /// When true (and `instance_id` is non-empty), `next_id()` prefixes every
+    /// client_order_id with `"{instance_id}-"`. This makes a coid
+    /// self-describing: the multi-instance strategy router can recover the
+    /// PLACING instance from the coid alone — even for late synthetic updates
+    /// (place-timeout orphans, settlement fills, reconcile results) that arrive
+    /// AFTER the coid's `coid_owner` registry entry was freed on its first
+    /// terminal status, which would otherwise hit the broadcast fallback and
+    /// fan a single instance's order out to every instance's PositionManager /
+    /// orphan_reconciler. Default `false` → byte-identical numeric coids
+    /// (backtest determinism + single-instance/tests untouched); the polymaker
+    /// strategy enables it for live/paper only.
+    coid_prefix: bool,
     /// Fee rate in basis points (Polymarket market-specific).
     fee_rate_bps: u32,
     /// Exchange-enforced minimum order size in shares. Desired levels with
@@ -182,6 +194,7 @@ impl OrderManager {
             symbol,
             tick_size,
             instance_id,
+            coid_prefix: false,
             fee_rate_bps: 0,
             min_order_size: 0.0,
             min_marketable_notional: 0.0,
@@ -239,8 +252,24 @@ impl OrderManager {
         self.tick_size = tick_size;
     }
 
+    /// Enable/disable the `"{instance_id}-"` coid prefix (see field doc).
+    /// Pass `false` (the default) for backtest/single-instance to keep
+    /// byte-identical numeric coids; `true` for live/paper multi-account so
+    /// the router can route late updates back to the placing instance.
+    pub fn set_coid_prefix(&mut self, enabled: bool) {
+        self.coid_prefix = enabled;
+    }
+
     fn next_id(&self) -> String {
-        GLOBAL_ORDER_ID.fetch_add(1, Ordering::Relaxed).to_string()
+        let n = GLOBAL_ORDER_ID.fetch_add(1, Ordering::Relaxed);
+        if self.coid_prefix && !self.instance_id.is_empty() {
+            // "{instance_id}-{counter}" — the counter suffix is the unique,
+            // monotonic part (never contains '-'); routers recover the
+            // instance via `rsplit_once('-')`.
+            format!("{}-{}", self.instance_id, n)
+        } else {
+            n.to_string()
+        }
     }
 
     /// Update local order state from an exchange OrderUpdate.
@@ -776,5 +805,29 @@ mod tests {
         // by this path — leave it alone.
         assert_eq!(m.on_signal_dropped("C"), DroppedSignalOutcome::NotTracked);
         assert_eq!(m.active_count(), 1);
+    }
+
+    // coid prefix: default off → bare numeric (BT/single byte-identical);
+    // enabled → "{instance_id}-{counter}" so the router can route by prefix.
+    #[test]
+    fn coid_prefix_gates_on_instance_id() {
+        // Default: no prefix.
+        let mut m = om();
+        let c = place(&mut m, Side::Buy, 0.40, 5.0);
+        assert!(c.parse::<u64>().is_ok(), "default coid is bare numeric, got {c}");
+
+        // Enabled with a non-empty instance_id → "iid-<digits>".
+        let mut m = om();
+        m.set_coid_prefix(true);
+        let c = place(&mut m, Side::Buy, 0.40, 5.0);
+        let (iid, n) = c.rsplit_once('-').expect("prefixed coid has a '-'");
+        assert_eq!(iid, "iid");
+        assert!(n.parse::<u64>().is_ok(), "suffix is the numeric counter, got {n}");
+
+        // Enabled but empty instance_id → still bare numeric (no leading '-').
+        let mut m = OrderManager::new(Exchange::Polymarket, "TOK".into(), 0.001, String::new());
+        m.set_coid_prefix(true);
+        let c = place(&mut m, Side::Buy, 0.40, 5.0);
+        assert!(c.parse::<u64>().is_ok(), "empty instance_id → no prefix, got {c}");
     }
 }

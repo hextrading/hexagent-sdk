@@ -673,9 +673,14 @@ fn parse_iso_ts_ms(line: &str) -> Option<u64> {
 fn parse_coid(line: &str) -> Option<u64> {
     let idx = line.find(" coid=")?;
     let rest = &line[idx + " coid=".len()..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 { return None; }
-    rest[..end].parse().ok()
+    // Token runs until whitespace. Live/paper coids are minted as
+    // "{instance_id}-{counter}" (e.g. "btc01-1779286506589"); the unique,
+    // monotonic counter is the digit run after the last '-'. Legacy coids are
+    // bare digits ("1779286506589") — `rsplit('-')` yields the whole token.
+    let tok_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let digits = rest[..tok_end].rsplit('-').next().unwrap_or("");
+    if digits.is_empty() { return None; }
+    digits.parse().ok()
 }
 
 /// Compute a single quantile at the given probability on a slice of
@@ -749,6 +754,10 @@ mod tests {
         assert_eq!(parse_coid("[...] Submit BUY @ 0.5 coid=1779286506589 oid=0x..."), Some(1779286506589));
         assert_eq!(parse_coid("[...] Order accepted: orderID=0x... status=live coid=42"), Some(42));
         assert_eq!(parse_coid("no coid"), None);
+        // Live/paper prefixed form "{instance_id}-{counter}": the counter
+        // (after the last '-') is the unique numeric key.
+        assert_eq!(parse_coid("[...] Submit BUY @ 0.5 coid=btc01-1779286506589 oid=0x..."), Some(1779286506589));
+        assert_eq!(parse_coid("[...] status=live coid=btc-02-42"), Some(42));
     }
 
     #[test]

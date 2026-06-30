@@ -2533,6 +2533,13 @@ impl Engine {
 
                 // Learned Polymarket token_id → instances (from Instrument).
                 let mut token_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
+                // instance_id → worker index, for recovering the owner of a
+                // coid that's no longer in `coid_owner` (late update after its
+                // registry entry was freed). Coids are minted as
+                // "{instance_id}-{counter}" in live/paper, so the prefix names
+                // the placing instance.
+                let iid_to_idx: HashMap<String, usize> = instance_ids
+                    .iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
                 loop {
                     crossbeam_channel::select! {
                         recv(market_rx) -> msg => match msg {
@@ -2553,8 +2560,18 @@ impl Engine {
                             // P3: route by coid → owning instance. Unknown
                             // coid → broadcast fallback (worker filters).
                             Ok(u) => {
+                                // Primary: coid→instance registry (fast, set
+                                // when the order was placed). Fallback: recover
+                                // the owner from the coid's "{instance_id}-"
+                                // prefix — covers late synthetic updates
+                                // (place-timeout orphans, settlement fills,
+                                // reconcile results) that arrive AFTER the
+                                // registry entry was freed on first terminal
+                                // status. Only truly unresolvable coids (legacy
+                                // un-prefixed, or unknown instance) broadcast.
                                 let owner = coid_owner.lock().unwrap()
-                                    .get(&u.client_order_id).copied();
+                                    .get(&u.client_order_id).copied()
+                                    .or_else(|| owner_from_coid(&u.client_order_id, &iid_to_idx));
                                 match owner {
                                     Some(i) if i < update_txs.len() => {
                                         let _ = update_txs[i].send(u.clone());
@@ -3824,6 +3841,17 @@ impl Engine {
     }
 }
 
+/// Recover the placing instance's worker index from a coid minted as
+/// `"{instance_id}-{counter}"` (live/paper multi-account). The counter suffix
+/// never contains '-', so `rsplit_once('-')` cleanly splits off the
+/// instance_id prefix even when the instance_id itself contains dashes.
+/// Returns `None` for legacy un-prefixed (all-numeric) coids or an unknown
+/// instance — caller then broadcasts, preserving the prior behaviour.
+fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<usize> {
+    let (iid, _counter) = coid.rsplit_once('-')?;
+    iid_to_idx.get(iid).copied()
+}
+
 // ── Signal Execution Helpers ─────────────────────────────────────────────
 
 /// Parse `BinaryOption.event_start_time` (ISO 8601, e.g. `"2026-03-29T06:10:00Z"`)
@@ -4524,6 +4552,23 @@ mod market_router_tests {
         assert_eq!(map.get("c2"), Some(&1));
         assert_eq!(map.get("c3"), Some(&1));
         assert_eq!(map.len(), 3, "cancel-only signal added no entries");
+    }
+
+    #[test]
+    fn owner_from_coid_recovers_instance_from_prefix() {
+        let mut m: HashMap<String, usize> = HashMap::new();
+        m.insert("btc01".into(), 0);
+        m.insert("btc02".into(), 1);
+        m.insert("zhu-03".into(), 2); // instance_id with an internal dash
+        // Prefixed coid → owning instance index.
+        assert_eq!(owner_from_coid("btc01-1782840607342", &m), Some(0));
+        assert_eq!(owner_from_coid("btc02-9", &m), Some(1));
+        // rsplit_once('-') keeps the dash-bearing instance_id intact.
+        assert_eq!(owner_from_coid("zhu-03-42", &m), Some(2));
+        // Legacy bare-numeric coid (backtest/single-instance) → broadcast.
+        assert_eq!(owner_from_coid("1782840607342", &m), None);
+        // Unknown instance → broadcast.
+        assert_eq!(owner_from_coid("eth09-7", &m), None);
     }
 
     #[test]
