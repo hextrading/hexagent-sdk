@@ -546,35 +546,21 @@ fn derive_api_credentials(key: &SigningKey, signer_address: &str) -> Result<ApiC
 
     let signature = sign_eip712(&domain_sep, &struct_hash, key)?;
 
-    // GET /auth/derive-api-key with L1 headers
-    let path = "/auth/derive-api-key";
-    let url = format!("{}{}", CLOB_URL, path);
     let checksum_addr = to_checksum_address(signer_address);
-    eprintln!("[DEBUG] derive-api-key: address={} timestamp={} nonce={} sig={}", checksum_addr, timestamp, nonce, signature);
-    let json: serde_json::Value = {
-        let url_c = url.clone();
-        let addr = checksum_addr.clone();
-        let sig = signature.clone();
-        let ts = timestamp.clone();
-        let nonce_s = nonce.to_string();
-        let client = crate::async_rt::http_client();
-        crate::async_rt::block_on_runtime(async move {
-            let resp = client.get(&url_c)
-                .header("POLY_ADDRESS", addr)
-                .header("POLY_SIGNATURE", sig)
-                .header("POLY_TIMESTAMP", ts)
-                .header("POLY_NONCE", nonce_s)
-                .send().await
-                .map_err(|e| anyhow!("GET /auth/derive-api-key failed: {}", e))?;
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(anyhow!("GET /auth/derive-api-key failed ({}): {}", status, text));
-            }
-            serde_json::from_str::<serde_json::Value>(&text)
-                .map_err(|e| anyhow!("parse derive-api-key: {} (body={})", e, text))
-        })?
-    };
+
+    // Polymarket CLOB exposes two L1 endpoints that take the SAME headers:
+    //   * POST /auth/api-key        — CREATE the key (first-time wallet)
+    //   * GET  /auth/derive-api-key — DERIVE the already-created key
+    // `derive` is deterministic but only succeeds AFTER a key exists; a
+    // brand-new deploy_wallet has never created one, so derive alone 400s
+    // with "Could not derive api key!". Mirror py-clob-client's
+    // create_or_derive: try CREATE first, fall back to DERIVE when the key
+    // already exists (re-running deploy_wallet — CREATE then 400s).
+    let json: serde_json::Value =
+        match clob_create_api_key(&checksum_addr, &signature, &timestamp, nonce) {
+            Ok(j) if has_api_creds(&j) => j,
+            _ => clob_derive_api_key(&checksum_addr, &signature, &timestamp, nonce)?,
+        };
     let api_key = json.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let secret = json.get("secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let passphrase = json.get("passphrase").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -584,6 +570,57 @@ fn derive_api_credentials(key: &SigningKey, signer_address: &str) -> Result<ApiC
     }
 
     Ok(ApiCredentials { api_key, secret, passphrase })
+}
+
+/// True when the body carries a usable api key + secret (CREATE returns the
+/// new pair on success; an "already exists" body lacks them → derive).
+fn has_api_creds(j: &serde_json::Value) -> bool {
+    let nonempty = |k: &str| j.get(k).and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    nonempty("apiKey") && nonempty("secret")
+}
+
+fn clob_create_api_key(address: &str, signature: &str, timestamp: &str, nonce: u64) -> Result<serde_json::Value> {
+    clob_l1_api_key_request(reqwest::Method::POST, "/auth/api-key", address, signature, timestamp, nonce)
+}
+
+fn clob_derive_api_key(address: &str, signature: &str, timestamp: &str, nonce: u64) -> Result<serde_json::Value> {
+    clob_l1_api_key_request(reqwest::Method::GET, "/auth/derive-api-key", address, signature, timestamp, nonce)
+}
+
+/// Send an L1-authenticated CLOB api-key request (POLY_ADDRESS / SIGNATURE /
+/// TIMESTAMP / NONCE headers, no body) and parse the JSON response. The
+/// create and derive paths differ ONLY in method + path, so they share this.
+fn clob_l1_api_key_request(
+    method: reqwest::Method,
+    path: &str,
+    address: &str,
+    signature: &str,
+    timestamp: &str,
+    nonce: u64,
+) -> Result<serde_json::Value> {
+    let url = format!("{}{}", CLOB_URL, path);
+    let addr = address.to_string();
+    let sig = signature.to_string();
+    let ts = timestamp.to_string();
+    let nonce_s = nonce.to_string();
+    let label = format!("{} {}", method, path);
+    let client = crate::async_rt::http_client();
+    crate::async_rt::block_on_runtime(async move {
+        let resp = client.request(method, &url)
+            .header("POLY_ADDRESS", addr)
+            .header("POLY_SIGNATURE", sig)
+            .header("POLY_TIMESTAMP", ts)
+            .header("POLY_NONCE", nonce_s)
+            .send().await
+            .map_err(|e| anyhow!("{} failed: {}", label, e))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("{} failed ({}): {}", label, status, text));
+        }
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|e| anyhow!("parse {}: {} (body={})", label, e, text))
+    })
 }
 
 // ════════════════════════════════════════════════════════════════
