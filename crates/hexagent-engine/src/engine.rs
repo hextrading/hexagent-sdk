@@ -1865,7 +1865,18 @@ impl Engine {
                 .unwrap_or(24.0);
             if hours > max_hours { max_hours = hours; }
         }
-        sources.dedup();
+        // Order-preserving set dedup. `Vec::dedup` only drops ADJACENT
+        // duplicates, but multi-strategy sources are interleaved per-strategy
+        // (two BTC instances → [(bn,BTC),(cb,BTC),(bn,BTC),(cb,BTC)]), so the
+        // adjacent-only pass keeps every duplicate. The warm-up replay would
+        // then build N replayers per (exchange,symbol) and feed each spot event
+        // to every strategy's apv2 N times — inflating the apv2 warm-up activity
+        // baseline N× versus the 1× live path (market-router single-feed). That
+        // scale mismatch biases the run-period z-score / S_C3 negative → over-
+        // skip. Affects multi-instance live only (single-instance / all BT have
+        // one source set, so this is byte-identical for them).
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|s| seen.insert(s.clone()));
         (sources, max_hours)
     }
 
