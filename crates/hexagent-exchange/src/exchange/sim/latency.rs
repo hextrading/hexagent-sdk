@@ -1161,14 +1161,19 @@ fn parse_log_ts_ns(line: &str) -> Option<u64> {
     Some(secs * 1_000_000_000 + ms as u64 * 1_000_000)
 }
 
-/// Extract the value of `coid=<digits>` from a log line. Returns `None`
-/// when the marker is absent or the value isn't all-digits.
+/// Extract the coid token following `coid=` from a log line. Handles both the
+/// legacy bare-digit form (`coid=123`) and the live/paper prefixed form
+/// (`coid={instance_id}-123`). The token runs until whitespace; it's used only
+/// as an opaque key to pair place/ack lines, so the full token (prefix
+/// included) is the correct identity. Returns `None` when the marker is absent
+/// or the token has no digits.
 fn parse_coid_after(line: &str) -> Option<String> {
     let pos = line.find(" coid=")?;
     let rest = &line[pos + 6 ..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 { return None; }
-    Some(rest[..end].to_string())
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let tok = &rest[..end];
+    if tok.is_empty() || !tok.bytes().any(|b| b.is_ascii_digit()) { return None; }
+    Some(tok.to_string())
 }
 
 /// One bucket's worth of per-minute latency rows + sample/timeout
