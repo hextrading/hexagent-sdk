@@ -641,6 +641,15 @@ pub struct SharedState {
     /// `<unmapped>` and broadcasting to every instance. This map lets us
     /// reclaim that memory per-event at settlement rather than never.
     pub coid_to_token: Mutex<HashMap<String, String>>,
+    /// Deferred map-reclaim queue: `(sweep_ns, tokens)` batches recorded at
+    /// each event-expiry sweep. The settling event's FINAL matching fills land
+    /// ~1-2 s AFTER the sweep cancel (observed: sweep 20:05:00.127, settlement
+    /// fills 20:05:01.5), so reclaiming a token's coid↔oid mapping right at the
+    /// sweep loses those fills to `<unmapped>`. Instead each batch waits out
+    /// `RECLAIM_GRACE_NS` before its mappings are dropped (drained on a later
+    /// sweep). Timestamped per-batch so concurrent / back-to-back sweeps of
+    /// different markets never reclaim each other's just-settled tokens early.
+    pub pending_reclaim: Mutex<Vec<(u64, Vec<String>)>>,
     /// Authentication for REST requests
     pub auth: PolyAuth,
     /// EIP-712 order signer (v1 — pre-2026-04-28-cutover).
@@ -780,6 +789,35 @@ pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 /// (2026-05-12 13:14–13:21, ~7 min) recover in single-digit minutes, so
 /// 10 s × extending-on-repeat reaches a healthy steady state.
 pub(crate) const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
+
+/// Grace period a settling event's coid↔oid mappings are kept AFTER its
+/// expiry sweep before being reclaimed. The event's final matching fills land
+/// ~1-2 s after the sweep cancel; 60 s is a generous margin while still
+/// reclaiming within the same event cadence (next same-market sweep is minutes
+/// away). See `pending_reclaim` field doc.
+pub(crate) const RECLAIM_GRACE_NS: u64 = 60_000_000_000;
+
+/// Record this sweep's `tokens` (stamped `now_ns`) and return the token sets of
+/// all batches that have aged past `RECLAIM_GRACE_NS` (removed from `queue`).
+/// Pure so it's unit-testable. The returned batches' mappings are then dropped
+/// via `reclaim_token_mappings`.
+fn drain_matured_reclaims(
+    queue: &mut Vec<(u64, Vec<String>)>,
+    tokens: &[String],
+    now_ns: u64,
+) -> Vec<Vec<String>> {
+    queue.push((now_ns, tokens.to_vec()));
+    let mut due = Vec::new();
+    queue.retain(|(ts, toks)| {
+        if now_ns.saturating_sub(*ts) >= RECLAIM_GRACE_NS {
+            due.push(toks.clone());
+            false
+        } else {
+            true
+        }
+    });
+    due
+}
 
 /// Remove every coid↔oid / coid↔token entry whose token is in `settling`,
 /// keeping all other events' entries. Returns the count reclaimed. Pure (maps
@@ -1390,6 +1428,7 @@ impl PolymarketTrade {
                 coid_to_oid: Mutex::new(HashMap::new()),
                 oid_to_coid: Mutex::new(HashMap::new()),
                 coid_to_token: Mutex::new(HashMap::new()),
+                pending_reclaim: Mutex::new(Vec::new()),
                 auth,
                 signer,
                 signer_v2,
@@ -1631,6 +1670,7 @@ impl PolymarketTrade {
         self.shared.coid_to_oid.lock().unwrap().clear();
         self.shared.oid_to_coid.lock().unwrap().clear();
         self.shared.coid_to_token.lock().unwrap().clear();
+        self.shared.pending_reclaim.lock().unwrap().clear();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -1680,23 +1720,30 @@ impl PolymarketTrade {
             }
         }
 
-        // Event-expiry reclaim: these outcome tokens are settling, so purge
-        // their coid↔oid mappings. We KEEP those mappings across order
-        // rejects/cancels (racy crosses-book-reject / cancel-then-fill can
-        // still produce a late fill that must resolve its coid — see
-        // `coid_to_token` field doc); a settled market can produce no further
-        // fills, so this is the safe point to free the per-event memory.
-        // Holding all three map locks at once is deadlock-free: no other path
-        // in this module ever holds more than one of them simultaneously.
-        let reclaimed = {
+        // Event-expiry reclaim, DEFERRED: enqueue this sweep's settling tokens
+        // and reclaim only batches that have aged past `RECLAIM_GRACE_NS`. The
+        // settling event's final matching fills land ~1-2 s after this sweep
+        // cancel — reclaiming its coid↔oid mappings now would lose them to
+        // `<unmapped>`. We KEEP mappings across rejects/cancels (racy
+        // crosses-book-reject / cancel-then-fill — see `coid_to_token` field
+        // doc); the grace window is the safe point to free the per-event memory.
+        let due = {
+            let mut q = self.shared.pending_reclaim.lock().unwrap();
+            drain_matured_reclaims(&mut q, asset_ids, crate::types::now_ns())
+        };
+        if !due.is_empty() {
+            // Holding all three map locks at once is deadlock-free: no other
+            // path in this module ever holds more than one simultaneously.
             let mut coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
             let mut oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
             let mut coid_to_token = self.shared.coid_to_token.lock().unwrap();
-            reclaim_token_mappings(&mut coid_to_oid, &mut oid_to_coid, &mut coid_to_token, asset_ids)
-        };
-        if reclaimed > 0 {
-            info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} coid↔oid mapping(s) for settled tokens",
-                market_condition_id, reclaimed);
+            let reclaimed: usize = due.iter()
+                .map(|toks| reclaim_token_mappings(&mut coid_to_oid, &mut oid_to_coid, &mut coid_to_token, toks))
+                .sum();
+            if reclaimed > 0 {
+                info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} coid↔oid mapping(s) from {} matured batch(es)",
+                    market_condition_id, reclaimed, due.len());
+            }
         }
     }
 
@@ -4189,6 +4236,31 @@ mod tests {
         assert_eq!(coid_to_oid.get("c3").map(String::as_str), Some("0xb1"));
         assert_eq!(oid_to_coid.get("0xb1").map(String::as_str), Some("c3"));
         assert_eq!(coid_to_token.get("c3").map(String::as_str), Some("BUP"));
+    }
+
+    // Deferral: a token swept now is NOT reclaimed immediately (its settlement
+    // fills are still in flight); it matures only after RECLAIM_GRACE_NS. A
+    // back-to-back sweep of a different market must not reclaim the first
+    // market's just-settled tokens early.
+    #[test]
+    fn drain_matured_reclaims_defers_until_grace() {
+        let mut q: Vec<(u64, Vec<String>)> = Vec::new();
+        let t0 = 1_000_000_000_000u64;
+
+        // Sweep A at t0 → nothing matured yet (A's fills still landing).
+        let due = drain_matured_reclaims(&mut q, &["AUP".into(), "ADN".into()], t0);
+        assert!(due.is_empty(), "A not reclaimed at its own sweep");
+
+        // Sweep B 1s later (concurrent market) → still nothing matured;
+        // A must NOT be reclaimed this soon.
+        let due = drain_matured_reclaims(&mut q, &["BUP".into()], t0 + 1_000_000_000);
+        assert!(due.is_empty(), "A not reclaimed 1s later");
+        assert_eq!(q.len(), 2);
+
+        // Sweep C past A's grace → A matures and drains; B/C still held.
+        let due = drain_matured_reclaims(&mut q, &["CUP".into()], t0 + RECLAIM_GRACE_NS + 1);
+        assert_eq!(due, vec![vec!["AUP".to_string(), "ADN".to_string()]]);
+        assert_eq!(q.len(), 2, "B and C remain pending");
     }
 
     /// Locks the 3-way reason → outcome mapping against the live-observed
