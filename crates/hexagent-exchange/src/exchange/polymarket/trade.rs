@@ -631,6 +631,16 @@ pub struct SharedState {
     pub coid_to_oid: Mutex<HashMap<String, String>>,
     /// Polymarket orderID → client_order_id
     pub oid_to_coid: Mutex<HashMap<String, String>>,
+    /// client_order_id → token_id (outcome asset). Written alongside the
+    /// coid↔oid maps at registration and kept for the SAME lifetime, so the
+    /// event-expiry sweep can purge an event's mappings by its outcome
+    /// tokens. We deliberately KEEP coid↔oid mappings across order-lifecycle
+    /// rejects/cancels (a "post-only crosses book" 400 or a cancel can still
+    /// be followed by a real fill — the racy reject/cancel-then-fill case)
+    /// so a late fill push still resolves its coid instead of arriving
+    /// `<unmapped>` and broadcasting to every instance. This map lets us
+    /// reclaim that memory per-event at settlement rather than never.
+    pub coid_to_token: Mutex<HashMap<String, String>>,
     /// Authentication for REST requests
     pub auth: PolyAuth,
     /// EIP-712 order signer (v1 — pre-2026-04-28-cutover).
@@ -771,36 +781,43 @@ pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 /// 10 s × extending-on-repeat reaches a healthy steady state.
 pub(crate) const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
 
+/// Remove every coid↔oid / coid↔token entry whose token is in `settling`,
+/// keeping all other events' entries. Returns the count reclaimed. Pure (maps
+/// passed in) so it's unit-testable without a live `SharedState`. Callers hold
+/// all three map locks for the duration.
+fn reclaim_token_mappings(
+    coid_to_oid: &mut HashMap<String, String>,
+    oid_to_coid: &mut HashMap<String, String>,
+    coid_to_token: &mut HashMap<String, String>,
+    settling: &[String],
+) -> usize {
+    let settling: std::collections::HashSet<&str> = settling.iter().map(|s| s.as_str()).collect();
+    let stale: Vec<String> = coid_to_token.iter()
+        .filter(|(_, tok)| settling.contains(tok.as_str()))
+        .map(|(coid, _)| coid.clone())
+        .collect();
+    for coid in &stale {
+        if let Some(oid) = coid_to_oid.remove(coid) { oid_to_coid.remove(&oid); }
+        coid_to_token.remove(coid);
+    }
+    stale.len()
+}
+
 impl SharedState {
-    /// Register a bidirectional order ID mapping.
-    pub fn register_order_id(&self, client_order_id: &str, exchange_order_id: &str) {
+    /// Register a bidirectional order ID mapping plus the order's outcome
+    /// token. The token lets `cancel_market_orders` purge this mapping at the
+    /// owning event's expiry sweep (the only place coid↔oid mappings are
+    /// reclaimed now that lifecycle rejects/cancels KEEP them — see
+    /// `coid_to_token` field doc).
+    pub fn register_order_id(&self, client_order_id: &str, exchange_order_id: &str, token: &str) {
         self.coid_to_oid.lock().unwrap()
             .insert(client_order_id.to_string(), exchange_order_id.to_string());
         self.oid_to_coid.lock().unwrap()
             .insert(exchange_order_id.to_string(), client_order_id.to_string());
-    }
-
-    /// Drop the coid↔orderID mapping AND the `open_orders` entry
-    /// entirely. Used when the server has definitively rejected a
-    /// submit (not a timeout) — the orderID was pre-registered at
-    /// signing time and `open_orders` got an entry then too, so a
-    /// timeout's orphan reconciler could recover; an explicit reject
-    /// means the order never existed on the server, so both layers
-    /// of tracking should be cleared symmetrically.
-    ///
-    /// Leaving either map behind would cause:
-    ///   * stale cancel-by-coid (emitted before the Rejected
-    ///     OrderUpdate propagates to the strategy's OrderManager) to
-    ///     fire a DELETE with a phantom orderID — observed
-    ///     2026-04-20T18:08:56;
-    ///   * `handle_balance_error`'s targeted-cancel snapshot to
-    ///     include the just-rejected coid, double-cancelling it.
-    pub fn unregister_order_id(&self, client_order_id: &str) {
-        let oid_opt = self.coid_to_oid.lock().unwrap().remove(client_order_id);
-        if let Some(oid) = oid_opt {
-            self.oid_to_coid.lock().unwrap().remove(&oid);
+        if !token.is_empty() {
+            self.coid_to_token.lock().unwrap()
+                .insert(client_order_id.to_string(), token.to_string());
         }
-        self.open_orders.lock().unwrap().remove(client_order_id);
     }
 
     /// Look up client_order_id from Polymarket orderID.
@@ -810,13 +827,23 @@ impl SharedState {
 
     /// Drop the order from the **active-order** tracker.
     ///
-    /// Deliberately keeps the `coid_to_oid` / `oid_to_coid` maps intact —
-    /// a delayed fill push for a just-cancelled order (cancel-then-fill
-    /// race) can still look up its original coid via `oid_to_coid`, which
-    /// keeps logs readable and downstream trade_id-keyed bookkeeping
-    /// consistent. The maps are bounded by orders-per-session (monotonic
-    /// `GLOBAL_ORDER_ID` — no reuse) and are fully wiped by
-    /// `cancel_all_orders` at shutdown.
+    /// Deliberately KEEPS the `coid_to_oid` / `oid_to_coid` / `coid_to_token`
+    /// maps intact — a delayed fill push for a just-cancelled OR just-rejected
+    /// order (cancel-then-fill / racy "post-only crosses book" reject-then-fill)
+    /// can still resolve its coid via `oid_to_coid`, so the fill is attributed
+    /// to the placing instance instead of arriving `<unmapped>` (empty coid)
+    /// and broadcasting to every instance's PositionManager. The maps are
+    /// reclaimed per-event by `cancel_market_orders` at the event-expiry sweep
+    /// (keyed by `coid_to_token`), and fully wiped by `cancel_all_orders` at
+    /// shutdown / account-wide cancel.
+    ///
+    /// This is now the SINGLE local-tracking teardown used by both cancels and
+    /// rejects (the old `unregister_order_id`, which eagerly dropped the maps
+    /// on reject, is gone — its "an explicit reject means the order never
+    /// existed" assumption is false for crosses-book rejects, which can still
+    /// match). Removing the `open_orders` entry already keeps
+    /// `handle_balance_error`'s (open_orders-based) snapshot from
+    /// double-cancelling a just-rejected coid.
     pub fn remove_order(&self, client_order_id: &str) {
         self.open_orders.lock().unwrap().remove(client_order_id);
         // Conclusive resolution — drop any pending/delayed orphan flag so the
@@ -1362,6 +1389,7 @@ impl PolymarketTrade {
                 open_orders: Mutex::new(HashMap::new()),
                 coid_to_oid: Mutex::new(HashMap::new()),
                 oid_to_coid: Mutex::new(HashMap::new()),
+                coid_to_token: Mutex::new(HashMap::new()),
                 auth,
                 signer,
                 signer_v2,
@@ -1598,10 +1626,11 @@ impl PolymarketTrade {
             }
             Err(e) => warn!("[PolymarketTrade] Cancel-all failed: {}", e),
         }
-        // Clear local tracking
+        // Clear local tracking (account-wide / shutdown → wipe everything).
         self.shared.open_orders.lock().unwrap().clear();
         self.shared.coid_to_oid.lock().unwrap().clear();
         self.shared.oid_to_coid.lock().unwrap().clear();
+        self.shared.coid_to_token.lock().unwrap().clear();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -1649,6 +1678,25 @@ impl PolymarketTrade {
                 Err(e) => warn!("[PolymarketTrade] Cancel-market market={} asset={} failed: {}",
                     market_condition_id, asset_id, e),
             }
+        }
+
+        // Event-expiry reclaim: these outcome tokens are settling, so purge
+        // their coid↔oid mappings. We KEEP those mappings across order
+        // rejects/cancels (racy crosses-book-reject / cancel-then-fill can
+        // still produce a late fill that must resolve its coid — see
+        // `coid_to_token` field doc); a settled market can produce no further
+        // fills, so this is the safe point to free the per-event memory.
+        // Holding all three map locks at once is deadlock-free: no other path
+        // in this module ever holds more than one of them simultaneously.
+        let reclaimed = {
+            let mut coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
+            let mut oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
+            let mut coid_to_token = self.shared.coid_to_token.lock().unwrap();
+            reclaim_token_mappings(&mut coid_to_oid, &mut oid_to_coid, &mut coid_to_token, asset_ids)
+        };
+        if reclaimed > 0 {
+            info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} coid↔oid mapping(s) for settled tokens",
+                market_condition_id, reclaimed);
         }
     }
 
@@ -2085,7 +2133,7 @@ impl PolymarketTrade {
                         // Conclusive answer — clear the not_found counter
                         // so a future unrelated 404 starts fresh.
                         self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        self.shared.register_order_id(coid, oid);
+                        self.shared.register_order_id(coid, oid, symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
                             TrackedOrder { symbol: symbol.clone(), side: *side, instance_id: self.instance_id.clone() },
@@ -2578,15 +2626,16 @@ impl PolymarketTrade {
             Err(e) => return Err(Self::make_rejected(order, &e.to_string())),
         };
         let local_oid = order_hash;
-        self.shared.register_order_id(&order.client_order_id, &local_oid);
+        self.shared.register_order_id(&order.client_order_id, &local_oid, &order.symbol);
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
         // point on the order may already be live on the server (a
         // POST landing but its reply timing out leaves an orphan-place
         // whose collateral the server holds against our allowance).
         // Inserting here makes `open_orders` the single source of truth
         // for "may be on the server" — `handle_balance_error` snapshots
-        // it to issue targeted DELETEs, and `unregister_order_id` is
-        // the symmetric removal on definitive Rejected. Order survives
+        // it to issue targeted DELETEs, and `remove_order` is the
+        // symmetric removal on Rejected (keeps the coid↔oid map for
+        // a possible late fill). Order survives
         // here through Submit success / NewOrderTimeout / orphan
         // reconciliation; only definitive `Rejected` (server explicitly
         // refused, e.g. balance / fee / post-only) removes it.
@@ -2640,7 +2689,7 @@ impl PolymarketTrade {
                 } else if SharedState::is_invalid_token_error(&err_s) {
                     self.handle_invalid_token(&order.symbol);
                 }
-                self.shared.unregister_order_id(&order.client_order_id);
+                self.shared.remove_order(&order.client_order_id);
                 warn!("[PolymarketTrade] Order failed: {} coid={}", e, order.client_order_id);
                 return Self::make_rejected(order, &err_s);
             }
@@ -2652,7 +2701,7 @@ impl PolymarketTrade {
         let error_msg = resp.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
 
         if !success {
-            self.shared.unregister_order_id(&order.client_order_id);
+            self.shared.remove_order(&order.client_order_id);
             if SharedState::is_balance_error(error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
             } else if SharedState::is_invalid_token_error(error_msg) {
@@ -2670,7 +2719,7 @@ impl PolymarketTrade {
                 "[PolymarketTrade] orderID MISMATCH coid={} local={} server={} — local hash is wrong!",
                 order.client_order_id, local_oid, order_id,
             );
-            self.shared.register_order_id(&order.client_order_id, &order_id);
+            self.shared.register_order_id(&order.client_order_id, &order_id, &order.symbol);
         }
 
         // `open_orders` was already populated by `submit_kickoff` at
@@ -3158,7 +3207,7 @@ impl ExchangeTrade for PolymarketTrade {
                         // open_orders insert as `submit_kickoff` —
                         // makes the map the single source of truth
                         // for "may be live on the server".
-                        self.shared.register_order_id(&o.client_order_id, &order_hash);
+                        self.shared.register_order_id(&o.client_order_id, &order_hash, &o.symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             o.client_order_id.clone(),
                             TrackedOrder {
@@ -3232,16 +3281,17 @@ impl ExchangeTrade for PolymarketTrade {
                                     "[PolymarketTrade] orderID MISMATCH coid={} local={} server={}",
                                     order.client_order_id, local_oid, order_id,
                                 );
-                                self.shared.register_order_id(&order.client_order_id, &order_id);
+                                self.shared.register_order_id(&order.client_order_id, &order_id, &order.symbol);
                             }
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            // Drop the coid→orderID mapping pre-registered
-                            // at signing time — the order never existed on
-                            // the server, so a later stale cancel must not
-                            // dispatch a DELETE with its phantom orderID.
-                            self.shared.unregister_order_id(&order.client_order_id);
+                            // Drop local active-order tracking (`open_orders`)
+                            // but KEEP the coid↔orderID mapping: a crosses-book
+                            // reject can still be matched by the server, so a
+                            // late fill must still resolve its coid (the map is
+                            // reclaimed at the event-expiry sweep).
+                            self.shared.remove_order(&order.client_order_id);
                             if SharedState::is_balance_error(error_msg) {
                                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
                             }
@@ -3317,13 +3367,14 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, chunk_coids);
-                    // Clear local tracking for every chunk member —
-                    // we just committed to Rejected semantics for all
-                    // of them, so leaving sign-time `open_orders`
-                    // entries behind would mislead the next
-                    // `handle_balance_error` snapshot.
+                    // Clear local active-order tracking for every chunk
+                    // member — committed to Rejected, so leaving sign-time
+                    // `open_orders` entries behind would mislead the next
+                    // `handle_balance_error` snapshot. `remove_order` KEEPS
+                    // the coid↔oid map: an HTTP error is ambiguous (the
+                    // chunk may have landed) so a late fill must still map.
                     for order in chunk {
-                        self.shared.unregister_order_id(&order.client_order_id);
+                        self.shared.remove_order(&order.client_order_id);
                         all_updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
@@ -3709,7 +3760,7 @@ impl ExchangeTrade for PolymarketTrade {
         for (idx, o) in place_chunk.iter().enumerate() {
             match self.sign_and_build_body(o) {
                 Ok((order_hash, b)) => {
-                    self.shared.register_order_id(&o.client_order_id, &order_hash);
+                    self.shared.register_order_id(&o.client_order_id, &order_hash, &o.symbol);
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share
                     // the "open_orders = may be on server" invariant.
@@ -3949,16 +4000,17 @@ impl ExchangeTrade for PolymarketTrade {
                                     "[PolymarketTrade] orderID MISMATCH coid={} local={} server={}",
                                     order.client_order_id, local_oid, order_id,
                                 );
-                                self.shared.register_order_id(&order.client_order_id, &order_id);
+                                self.shared.register_order_id(&order.client_order_id, &order_id, &order.symbol);
                             }
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            // Drop the coid→orderID mapping pre-registered
-                            // at signing time — the order never existed on
-                            // the server, so a later stale cancel must not
-                            // dispatch a DELETE with its phantom orderID.
-                            self.shared.unregister_order_id(&order.client_order_id);
+                            // Drop local active-order tracking (`open_orders`)
+                            // but KEEP the coid↔orderID mapping: a crosses-book
+                            // reject can still be matched by the server, so a
+                            // late fill must still resolve its coid (the map is
+                            // reclaimed at the event-expiry sweep).
+                            self.shared.remove_order(&order.client_order_id);
                             let is_balance_err = SharedState::is_balance_error(error_msg);
                             if is_balance_err {
                                 // Balance rejects in batch_update_orders
@@ -4071,12 +4123,12 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, place_coids);
                     // Clear sign-time `open_orders` entries — same
-                    // rationale as `batch_submit_orders` HTTP-error
-                    // path: committing to Rejected for all members,
-                    // so symmetrically uninstall server-side tracking.
+                    // rationale as `batch_submit_orders` HTTP-error path.
+                    // `remove_order` KEEPS the coid↔oid map (ambiguous
+                    // HTTP error → orders may be live → late fill must map).
                     for (i, _signed) in place_signed.iter().enumerate() {
                         let order = &place_chunk[place_body_to_chunk[i]];
-                        self.shared.unregister_order_id(&order.client_order_id);
+                        self.shared.remove_order(&order.client_order_id);
                         updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
@@ -4103,6 +4155,41 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Event-expiry reclaim purges only the settling event's tokens, leaving
+    // other concurrent events' coid↔oid mappings intact — and a coid kept
+    // alive past a reject (so a racy late fill still resolves) is reclaimed
+    // exactly when its token settles.
+    #[test]
+    fn reclaim_token_mappings_purges_only_settling_tokens() {
+        let mut coid_to_oid: HashMap<String, String> = HashMap::new();
+        let mut oid_to_coid: HashMap<String, String> = HashMap::new();
+        let mut coid_to_token: HashMap<String, String> = HashMap::new();
+        // Two events: event A tokens {AUP, ADN}, event B token {BUP}.
+        for (coid, oid, tok) in [
+            ("c1", "0xa1", "AUP"), // a rejected-but-kept order on event A
+            ("c2", "0xa2", "ADN"),
+            ("c3", "0xb1", "BUP"), // event B — must survive
+        ] {
+            coid_to_oid.insert(coid.into(), oid.into());
+            oid_to_coid.insert(oid.into(), coid.into());
+            coid_to_token.insert(coid.into(), tok.into());
+        }
+
+        let n = reclaim_token_mappings(
+            &mut coid_to_oid, &mut oid_to_coid, &mut coid_to_token,
+            &["AUP".to_string(), "ADN".to_string()],
+        );
+        assert_eq!(n, 2, "both event-A coids reclaimed");
+        // Event A fully purged from all three maps.
+        assert!(!coid_to_oid.contains_key("c1") && !coid_to_oid.contains_key("c2"));
+        assert!(!oid_to_coid.contains_key("0xa1") && !oid_to_coid.contains_key("0xa2"));
+        assert!(!coid_to_token.contains_key("c1"));
+        // Event B untouched — its late fill can still map.
+        assert_eq!(coid_to_oid.get("c3").map(String::as_str), Some("0xb1"));
+        assert_eq!(oid_to_coid.get("0xb1").map(String::as_str), Some("c3"));
+        assert_eq!(coid_to_token.get("c3").map(String::as_str), Some("BUP"));
+    }
 
     /// Locks the 3-way reason → outcome mapping against the live-observed
     /// strings. If the server changes wording we want this test to fail.
