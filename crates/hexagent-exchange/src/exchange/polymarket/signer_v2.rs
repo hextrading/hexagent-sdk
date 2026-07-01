@@ -30,7 +30,7 @@ use sha3::{Digest, Keccak256};
 use super::signer::{
     SignatureType,
     compute_amounts,
-    random_salt,
+    account_salt,
     derive_addresses,
 };
 
@@ -250,7 +250,7 @@ impl OrderSignerV2 {
             .unwrap_or(0);
 
         let order = OrderV2 {
-            salt: random_salt(),
+            salt: account_salt(&self.maker_address),
             maker: self.maker_address.clone(),
             signer: self.signer_address.clone(),
             token_id: token_id.to_string(),
@@ -295,7 +295,7 @@ impl OrderSignerV2 {
             .unwrap_or(0);
 
         let order = OrderV2 {
-            salt: random_salt(),
+            salt: account_salt(funder),
             maker: funder.to_string(),
             signer: funder.to_string(),
             token_id: token_id.to_string(),
