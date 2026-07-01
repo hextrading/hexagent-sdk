@@ -8,6 +8,8 @@
 use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ════════════════════════════════════════════════════════════════
 // Constants
@@ -200,7 +202,7 @@ impl OrderSigner {
         };
 
         let order = ClobOrder {
-            salt: random_salt(),
+            salt: account_salt(&self.maker_address),
             maker: self.maker_address.clone(),   // Safe proxy or EOA
             signer: self.signer_address.clone(), // always EOA
             taker: ZERO_ADDRESS.to_string(),
@@ -269,15 +271,62 @@ pub fn compute_amounts(price: f64, size: f64, side: crate::types::Side) -> (Stri
     }
 }
 
-/// Generate a random salt as decimal string (fits in u64 for JSON number compatibility).
-pub fn random_salt() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    let salt = nanos ^ (pid << 32);
+/// Process start time in whole Unix seconds, captured once. Occupies the salt's
+/// high 32 bits, so it is directly human-readable (decode a salt → `salt >> 32`
+/// is the run's start second) and distinguishes salts across restarts. Fits in
+/// u32 until year 2106.
+fn startup_secs() -> u32 {
+    static SECS: OnceLock<u32> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    })
+}
+
+/// Per-account monotonic order counters, keyed by lowercased maker address.
+fn salt_counters() -> &'static Mutex<HashMap<String, u64>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-account salt as a decimal string (fits in u64, so the submission layer's
+/// `as u64` downcast is lossless and the server-recomputed EIP-712 hash matches
+/// the locally-signed one).
+///
+/// Layout (64 bits): `[ high 32: startup Unix seconds | low 32: counter ]`
+///   - high 32 = process start second → differs across restarts, and is
+///     directly readable (`salt >> 32` = run start second)
+///   - low 32  = per-account counter, incremented once per order within a run
+///
+/// Guarantees:
+///   - within one run an account never reuses a salt (counter strictly ++),
+///     and its salts increase monotonically;
+///   - two runs started in different seconds produce disjoint salts.
+///
+/// Notes:
+///   - The counter is per-account (keyed by maker), so two accounts in one run
+///     share the same high half and can emit equal salts. That is harmless:
+///     the orderID hashes the full struct including `maker`, so distinct
+///     wallets always get distinct orderIDs.
+///   - Two runs started within the *same* second would overlap salt sequences;
+///     an actual orderID collision would additionally require the same account,
+///     same counter, same order params, and (v2) same ms `timestamp` field —
+///     not reachable in practice.
+///   - The 32-bit counter wraps only after 2^32 (~4.3e9) orders for one account
+///     within one run — never reached in practice.
+pub fn account_salt(maker: &str) -> String {
+    let key = maker.to_ascii_lowercase();
+    let counter = {
+        let mut map = salt_counters().lock().unwrap_or_else(|e| e.into_inner());
+        let c = map.entry(key).or_insert(0);
+        let v = *c;
+        *c = c.wrapping_add(1);
+        v
+    };
+    let salt = ((startup_secs() as u64) << 32) | (counter & 0xFFFF_FFFF);
     salt.to_string()
 }
 
@@ -552,5 +601,38 @@ mod tests {
         let addr = derive_eth_address(&signing_key);
         // This is Hardhat's account #0
         assert_eq!(addr, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    }
+
+    #[test]
+    fn account_salt_layout_and_monotonicity() {
+        let a = "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
+        let b = "0xBbBbBBBbbBBBbbbBbbBbBBbBBBbBbBBBBBbBbBbb";
+
+        // Same account: low 32 bits (counter) strictly increase by 1; high 32
+        // bits (startup seconds) stay constant within a run.
+        let s0: u64 = account_salt(a).parse().unwrap();
+        let s1: u64 = account_salt(a).parse().unwrap();
+        let s2: u64 = account_salt(a).parse().unwrap();
+        assert!(s0 < s1 && s1 < s2, "salts must be monotonic within a run");
+        assert_eq!(s1 - s0, 1, "counter increments by exactly 1");
+        assert_eq!(s2 - s1, 1);
+        assert_eq!(s0 >> 32, s1 >> 32, "high half constant within a run");
+
+        // High half is the readable startup second (matches startup_secs()).
+        assert_eq!(s0 >> 32, startup_secs() as u64);
+
+        // Case-insensitive keying: same maker in different case shares the
+        // counter (no reuse), so it continues the sequence rather than resetting.
+        let s3: u64 = account_salt(&a.to_uppercase()).parse().unwrap();
+        assert_eq!(s3, s2 + 1);
+
+        // Different account: independent counter, but shares the startup-second
+        // high half (harmless — orderID is differentiated by the maker field).
+        let sb: u64 = account_salt(b).parse().unwrap();
+        assert_eq!(sb >> 32, s0 >> 32, "accounts share the startup-second high half");
+        assert_eq!(sb & 0xFFFF_FFFF, 0, "account b's own counter starts at 0");
+
+        // Fits in u64 (the submission layer downcasts salt to u64 — must be lossless).
+        assert!(account_salt(a).parse::<u128>().unwrap() <= u64::MAX as u128);
     }
 }
