@@ -18,7 +18,10 @@ pub fn post_info<T: for<'de> Deserialize<'de> + Send + 'static>(
     body: serde_json::Value,
 ) -> Result<T> {
     let url = info_url.to_string();
-    let client = async_rt::http_client_query();
+    // ALPN-negotiating client: Hyperliquid's REST does NOT support h2 prior
+    // knowledge (the `http_client_query`/`_fast` pools use it for Polymarket's
+    // h2-only hosts), so those clients fail with "error sending request".
+    let client = async_rt::http_client_auto();
     async_rt::block_on_runtime(async move {
         let resp = client
             .post(&url)
