@@ -1237,6 +1237,22 @@ fn default_signature_type() -> String {
     "poly_1271".to_string()
 }
 
+/// Per-account Hyperliquid credentials. Loaded from the
+/// `[hyperliquid.<account_id>]` block in `secrets.toml`; the hypermaker
+/// strategy references it via its `account_id` (falling back to `instance_id`).
+///
+/// `account_address` is the master/owner account (positions/fills/orders are
+/// keyed on it); `private_key` is the agent (approved) or EOA signing key.
+/// Non-secret settings (network, host overrides, symbols) stay in the
+/// `[[exchanges]] hyperliquid` block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HyperliquidSecrets {
+    #[serde(default)]
+    pub account_address: String,
+    #[serde(default)]
+    pub private_key: String,
+}
+
 /// Polymarket Builder relayer credentials (`[builder]`). Drives the
 /// gasless relayer path (deploy / approvals / redeem / split). Mirrors the
 /// `POLY_BUILDER_*` env vars.
@@ -1308,6 +1324,10 @@ impl PolygonSecrets {
 pub struct SecretsFile {
     #[serde(default)]
     pub poly: HashMap<String, PolymarketSecrets>,
+    /// Per-account Hyperliquid credentials, keyed by `account_id`
+    /// (`[hyperliquid.<account_id>]`). Referenced by hypermaker strategies.
+    #[serde(default)]
+    pub hyperliquid: HashMap<String, HyperliquidSecrets>,
     #[serde(default)]
     pub builder: Option<BuilderSecrets>,
     #[serde(default)]
@@ -1375,6 +1395,21 @@ impl SecretsFile {
         let secrets: SecretsFile = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("parse {}: {}", path.display(), e))?;
         Ok(secrets)
+    }
+
+    /// Best-effort load using the same path priority the engine uses:
+    /// `config.general.secrets_file` (already absolute after `Config::load`)
+    /// → `$HEXBOT_SECRETS` → `./secrets.toml`. Returns an empty `SecretsFile`
+    /// on any failure so non-trading paths keep working.
+    pub fn load_from_config(config: &Config) -> SecretsFile {
+        let path = if !config.general.secrets_file.is_empty() {
+            std::path::PathBuf::from(&config.general.secrets_file)
+        } else {
+            std::env::var("HEXBOT_SECRETS")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("./secrets.toml"))
+        };
+        SecretsFile::load(&path).unwrap_or_default()
     }
 
     /// Resolve the on-disk path. Priority:
