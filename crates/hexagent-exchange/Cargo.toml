@@ -38,6 +38,10 @@ sha2 = "0.10"
 sha3 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa-core", "ecdsa"] }
+# Hyperliquid L1-action signing: msgpack the action → keccak → EIP-712 phantom
+# agent. `to_vec_named` packs structs as named maps (field order = declaration
+# order) to match HL's canonical action serialization.
+rmp-serde = "1"
 base64 = "0.22"
 quanta = "0.12"
 libc = "0.2"

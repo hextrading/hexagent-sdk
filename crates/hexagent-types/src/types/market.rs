@@ -18,6 +18,7 @@ pub enum Exchange {
     Mexc,
     Polymarket,
     Hexmarket,
+    Hyperliquid,
 }
 
 impl fmt::Display for Exchange {
@@ -34,6 +35,7 @@ impl fmt::Display for Exchange {
             Exchange::Mexc => write!(f, "mexc"),
             Exchange::Polymarket => write!(f, "polymarket"),
             Exchange::Hexmarket => write!(f, "hexmarket"),
+            Exchange::Hyperliquid => write!(f, "hyperliquid"),
         }
     }
 }
@@ -52,6 +54,7 @@ impl Exchange {
             "mexc" => Some(Exchange::Mexc),
             "polymarket" => Some(Exchange::Polymarket),
             "hexmarket" => Some(Exchange::Hexmarket),
+            "hyperliquid" => Some(Exchange::Hyperliquid),
             _ => None,
         }
     }

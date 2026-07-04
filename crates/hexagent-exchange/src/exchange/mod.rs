@@ -5,6 +5,7 @@ pub mod chainlink;
 pub mod coinbase;
 pub mod gate;
 pub mod hexmarket;
+pub mod hyperliquid;
 pub mod kucoin;
 pub mod mexc;
 pub mod kraken;

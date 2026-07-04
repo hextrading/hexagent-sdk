@@ -212,6 +212,8 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             gap_replay_periodic_rewind_ms: 5000,
             gap_replay_reconnect_rewind_ms: 5000,
             executor_workers: 8,
+            account_address: String::new(),
+            network: String::new(),
         });
     } else {
         inject_exchange_symbol(full, "binance", &sym.binance_symbol);
