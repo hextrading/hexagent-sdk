@@ -4268,40 +4268,61 @@ impl LiveRouter {
             None
         };
 
-        // Build the Hyperliquid executor if an enabled block is present.
-        // Meta (coin→asset index) is fetched once here; failure logs and
-        // leaves the venue disabled rather than aborting the whole engine.
-        let hyperliquid = config
-            .exchanges
-            .iter()
-            .find(|e| e.name == "hyperliquid" && e.enabled)
-            .and_then(|hl| {
-                match crate::exchange::hyperliquid::auth::HlAuth::new(
-                    &hl.private_key,
-                    &hl.account_address,
-                    &hl.network,
-                    &hl.api_url_prefix,
-                    &hl.wss_url,
-                ) {
-                    Ok(auth) => match crate::exchange::hyperliquid::info::fetch_meta(&auth.info_url()) {
-                        Ok(meta) => {
-                            info!(
-                                "[Hyperliquid] executor ready (network={}, account={}, signer={})",
-                                hl.network, auth.account_address, auth.signer_address,
+        // Build the Hyperliquid executor. Credentials come from
+        // `[hyperliquid.<account_id>]` in secrets.toml, keyed by the first
+        // enabled hypermaker strategy's `account_id` (fallback `instance_id`);
+        // non-secret settings (network / host overrides) come from the
+        // `[[exchanges]] hyperliquid` block. Meta (coin→asset index) is fetched
+        // once here; any failure logs and leaves the venue disabled rather than
+        // aborting the engine.
+        let hyperliquid = {
+            let hl_cfg = config.exchanges.iter().find(|e| e.name == "hyperliquid" && e.enabled);
+            let acct = config
+                .strategies
+                .iter()
+                .find(|s| s.enabled && s.name == "hypermaker")
+                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+            match (hl_cfg, acct) {
+                (Some(hl), Some(acct)) if !acct.is_empty() => {
+                    let secrets = crate::config::SecretsFile::load_from_config(config);
+                    match secrets.hyperliquid.get(&acct) {
+                        Some(cred) => match crate::exchange::hyperliquid::auth::HlAuth::new(
+                            &cred.private_key,
+                            &cred.account_address,
+                            &hl.network,
+                            &hl.api_url_prefix,
+                            &hl.wss_url,
+                        ) {
+                            Ok(auth) => match crate::exchange::hyperliquid::info::fetch_meta(&auth.info_url()) {
+                                Ok(meta) => {
+                                    info!(
+                                        "[Hyperliquid] executor ready (account_id={}, network={}, account={}, signer={})",
+                                        acct, hl.network, auth.account_address, auth.signer_address,
+                                    );
+                                    Some(HyperliquidTrade::new(auth, meta, &acct))
+                                }
+                                Err(e) => {
+                                    error!("[Hyperliquid] meta fetch failed, venue disabled: {}", e);
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                error!("[Hyperliquid] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                None
+                            }
+                        },
+                        None => {
+                            error!(
+                                "[Hyperliquid] no `[hyperliquid.{}]` block in secrets — venue disabled",
+                                acct,
                             );
-                            Some(HyperliquidTrade::new(auth, meta, ""))
-                        }
-                        Err(e) => {
-                            error!("[Hyperliquid] meta fetch failed, venue disabled: {}", e);
                             None
                         }
-                    },
-                    Err(e) => {
-                        error!("[Hyperliquid] auth build failed, venue disabled: {}", e);
-                        None
                     }
                 }
-            });
+                _ => None,
+            }
+        };
 
         Self {
             binance: BinanceTrade::new(),
