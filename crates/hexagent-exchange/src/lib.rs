@@ -4,7 +4,12 @@
 //! `ExchangeTrade` (order execution) traits and the per-venue adapters
 //! (Binance, Coinbase, Polymarket, …) plus the first-principles backtest
 //! simulator (`sim_v2`) and paper executor. `recorder` is market-data
-//! record/replay; `index_price` is the cross-venue mid-price aggregator.
+//! record/replay.
+//!
+//! NOTE: the cross-venue index-price aggregator (`myindex2`) used to live
+//! here as `index_price`; it was moved out to the strategy layer (each
+//! strategy crate now owns its own `index_price` module), since it is
+//! strategy logic rather than exchange access.
 //!
 //! Re-exports of the lower SDK crates keep the moved code's `crate::types::…`,
 //! `crate::config::…`, `crate::account::…`, `crate::async_rt::…` etc. paths
@@ -16,5 +21,4 @@ pub use hexagent_account::account;
 pub use hexagent_runtime::{async_rt, latency, latency_record, os_tune};
 
 pub mod exchange;
-pub mod index_price;
 pub mod recorder;

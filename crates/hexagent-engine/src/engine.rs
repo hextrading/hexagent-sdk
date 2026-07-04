@@ -19,6 +19,7 @@ use crate::config::{Config, RunMode};
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::polymarket::{PolymarketMarket, PolymarketTrade};
+use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::{ExchangeMarket, ExchangeTrade};
 use crate::recorder::{MarketRecorder, MarketReplayer};
 use crate::strategy::Strategy;
@@ -2945,6 +2946,7 @@ impl Engine {
                         "pyth" => Exchange::Polymarket, // placeholder; Pyth sends SpotPrice events
                         "polymarket" => Exchange::Polymarket,
                         "hexmarket" => Exchange::Hexmarket,
+                        "hyperliquid" => Exchange::Hyperliquid,
                         other => {
                             error!("Unknown exchange: {}", other);
                             return;
@@ -2999,6 +3001,18 @@ impl Engine {
                             Box::new(pm)
                         }
                         "hexmarket" => Box::new(HexmarketMarket::new(&cfg.api_url_prefix, &cfg.wss_url)),
+                        "hyperliquid" => {
+                            // Resolve WS host: explicit override, else the
+                            // network (mainnet/testnet) default.
+                            let ws = if !cfg.wss_url.is_empty() {
+                                cfg.wss_url.clone()
+                            } else {
+                                crate::exchange::hyperliquid::auth::Network::from_str(&cfg.network)
+                                    .ws_url()
+                                    .to_string()
+                            };
+                            Box::new(crate::exchange::hyperliquid::HyperliquidMarket::new(&ws))
+                        }
                         _ => return,
                     };
 
@@ -3761,8 +3775,11 @@ impl Engine {
                             let ids: Vec<String> = fallback.poly_routes.keys().cloned().collect();
                             if ids.is_empty() {
                                 // No instance map populated (paper / BT
-                                // shim path) — fall back to the default.
-                                fallback.polymarket.cancel_all_orders();
+                                // shim path) — fall back to the default if
+                                // polymarket is configured at all.
+                                if let Some(pm) = fallback.polymarket.as_mut() {
+                                    pm.cancel_all_orders();
+                                }
                             } else {
                                 for id in &ids {
                                     if let Some(trade) = fallback.poly_routes.get_mut(id) {
@@ -4183,9 +4200,14 @@ struct LiveRouter {
     /// Live-mutable back-compat view: returns the default instance's
     /// `PolymarketTrade` for callers that haven't yet been migrated
     /// to per-instance routing. Kept as a separate clone so methods
-    /// taking `&mut self.polymarket` keep compiling.
-    polymarket: PolymarketTrade,
+    /// taking `&mut self.polymarket` keep compiling. `None` when no
+    /// polymaker instances are configured (e.g. a hypermaker-only live
+    /// deployment) — poly routes are never hit in that case.
+    polymarket: Option<PolymarketTrade>,
     hexmarket: HexmarketTrade,
+    /// Hyperliquid executor — `None` unless an enabled `[[exchanges]]`
+    /// `hyperliquid` block is present (and its meta fetch succeeded).
+    hyperliquid: Option<HyperliquidTrade>,
 }
 
 impl LiveRouter {
@@ -4233,19 +4255,53 @@ impl LiveRouter {
         // operator misconfigured the live mode (no polymaker
         // strategies enabled, or all their `instance_id`s missing
         // from secrets.toml). Fail loud.
+        // `None` when no polymaker instances are configured — a valid state
+        // for a hypermaker-only (or other non-poly) live deployment. Poly
+        // routes are only ever hit for `Exchange::Polymarket` signals, which
+        // can't be emitted without a polymaker strategy, so the `None` here
+        // is never dereferenced in that case.
         let polymarket = if !poly_default_id.is_empty() {
             let shared = states.get(&poly_default_id).cloned().unwrap();
             let owner = shared.auth.api_key.clone();
-            PolymarketTrade::from_shared(shared, &owner, &poly_default_id)
+            Some(PolymarketTrade::from_shared(shared, &owner, &poly_default_id))
         } else {
-            panic!(
-                "LiveRouter: no Polymarket SharedState built. Phase 6 \
-                 requires every polymaker strategy's `instance_id` to \
-                 match a `[poly.<id>]` block in secrets.toml. Check the \
-                 enabled `[[strategies]]` blocks' instance_id and the \
-                 secrets file at $HEXBOT_SECRETS / ./secrets.toml."
-            )
+            None
         };
+
+        // Build the Hyperliquid executor if an enabled block is present.
+        // Meta (coin→asset index) is fetched once here; failure logs and
+        // leaves the venue disabled rather than aborting the whole engine.
+        let hyperliquid = config
+            .exchanges
+            .iter()
+            .find(|e| e.name == "hyperliquid" && e.enabled)
+            .and_then(|hl| {
+                match crate::exchange::hyperliquid::auth::HlAuth::new(
+                    &hl.private_key,
+                    &hl.account_address,
+                    &hl.network,
+                    &hl.api_url_prefix,
+                    &hl.wss_url,
+                ) {
+                    Ok(auth) => match crate::exchange::hyperliquid::info::fetch_meta(&auth.info_url()) {
+                        Ok(meta) => {
+                            info!(
+                                "[Hyperliquid] executor ready (network={}, account={}, signer={})",
+                                hl.network, auth.account_address, auth.signer_address,
+                            );
+                            Some(HyperliquidTrade::new(auth, meta, ""))
+                        }
+                        Err(e) => {
+                            error!("[Hyperliquid] meta fetch failed, venue disabled: {}", e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        error!("[Hyperliquid] auth build failed, venue disabled: {}", e);
+                        None
+                    }
+                }
+            });
 
         Self {
             binance: BinanceTrade::new(),
@@ -4254,6 +4310,7 @@ impl LiveRouter {
             polymarket,
             hexmarket: HexmarketTrade::new(hex_private_key, hex_mnemonic, hex_api_host,
                 hex_cfg.map(|e| e.rate_limit_per_second).unwrap_or(10)),
+            hyperliquid,
         }
     }
 
@@ -4276,7 +4333,28 @@ impl LiveRouter {
         // hot path simple at the cost of one extra PolymarketTrade
         // allocation at construction; legacy callsites that never
         // populated an instance_id behave exactly as before.
-        &mut self.polymarket
+        //
+        // Only reached for `Exchange::Polymarket` signals, which imply at
+        // least one polymaker instance → `polymarket` is `Some`.
+        self.polymarket
+            .as_mut()
+            .expect("poly_route_mut called with no PolymarketTrade configured")
+    }
+
+    /// The default `PolymarketTrade`, or a clear error if no polymaker
+    /// instance is configured (a hypermaker-only deployment).
+    fn poly_mut(&mut self) -> Result<&mut PolymarketTrade> {
+        self.polymarket
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("polymarket venue not configured (no polymaker instances)"))
+    }
+
+    /// The Hyperliquid executor, or a clear error if the venue isn't
+    /// configured/enabled.
+    fn hl_mut(&mut self) -> Result<&mut HyperliquidTrade> {
+        self.hyperliquid
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("hyperliquid venue not configured/enabled"))
     }
 }
 
@@ -4284,8 +4362,9 @@ impl ExchangeTrade for LiveRouter {
     fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
         match order.exchange {
             Exchange::Binance => self.binance.submit_order(order),
-            Exchange::Polymarket => self.polymarket.submit_order(order),
+            Exchange::Polymarket => self.poly_mut()?.submit_order(order),
             Exchange::Hexmarket => self.hexmarket.submit_order(order),
+            Exchange::Hyperliquid => self.hl_mut()?.submit_order(order),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", order.exchange)),
         }
     }
@@ -4293,8 +4372,9 @@ impl ExchangeTrade for LiveRouter {
     fn cancel_order(&mut self, exchange: Exchange, client_order_id: &str) -> Result<OrderUpdate> {
         match exchange {
             Exchange::Binance => self.binance.cancel_order(exchange, client_order_id),
-            Exchange::Polymarket => self.polymarket.cancel_order(exchange, client_order_id),
+            Exchange::Polymarket => self.poly_mut()?.cancel_order(exchange, client_order_id),
             Exchange::Hexmarket => self.hexmarket.cancel_order(exchange, client_order_id),
+            Exchange::Hyperliquid => self.hl_mut()?.cancel_order(exchange, client_order_id),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4302,8 +4382,9 @@ impl ExchangeTrade for LiveRouter {
     fn cancel_all(&mut self, exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>> {
         match exchange {
             Exchange::Binance => self.binance.cancel_all(exchange, symbol),
-            Exchange::Polymarket => self.polymarket.cancel_all(exchange, symbol),
+            Exchange::Polymarket => self.poly_mut()?.cancel_all(exchange, symbol),
             Exchange::Hexmarket => self.hexmarket.cancel_all(exchange, symbol),
+            Exchange::Hyperliquid => self.hl_mut()?.cancel_all(exchange, symbol),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4312,7 +4393,8 @@ impl ExchangeTrade for LiveRouter {
         if let Some(first) = orders.first() {
             match first.exchange {
                 Exchange::Hexmarket => self.hexmarket.batch_submit_orders(market_id, orders),
-                Exchange::Polymarket => self.polymarket.batch_submit_orders(market_id, orders),
+                Exchange::Polymarket => self.poly_mut()?.batch_submit_orders(market_id, orders),
+                Exchange::Hyperliquid => self.hl_mut()?.batch_submit_orders(market_id, orders),
                 _ => {
                     let mut updates = Vec::new();
                     for order in orders {
@@ -4329,7 +4411,8 @@ impl ExchangeTrade for LiveRouter {
     fn batch_cancel_orders(&mut self, exchange: Exchange, market_id: &str, client_order_ids: &[String]) -> Result<Vec<OrderUpdate>> {
         match exchange {
             Exchange::Hexmarket => self.hexmarket.batch_cancel_orders(exchange, market_id, client_order_ids),
-            Exchange::Polymarket => self.polymarket.batch_cancel_orders(exchange, market_id, client_order_ids),
+            Exchange::Polymarket => self.poly_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
+            Exchange::Hyperliquid => self.hl_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             _ => {
                 let mut updates = Vec::new();
                 for id in client_order_ids {
@@ -4353,7 +4436,10 @@ impl ExchangeTrade for LiveRouter {
             // (uses DELETE /orders and POST /orders batch endpoints in
             // parallel). Route straight through so we don't fall back to a
             // serial cancel_order → submit_order loop.
-            Exchange::Polymarket => self.polymarket.batch_update_orders(
+            Exchange::Polymarket => self.poly_mut()?.batch_update_orders(
+                exchange, market_id, cancel_client_order_ids, place_orders,
+            ),
+            Exchange::Hyperliquid => self.hl_mut()?.batch_update_orders(
                 exchange, market_id, cancel_client_order_ids, place_orders,
             ),
             _ => {

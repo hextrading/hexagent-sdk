@@ -862,8 +862,22 @@ pub struct ExchangeConfig {
     /// SharedState, so order tracking stays consistent. Default 8.
     #[serde(default = "default_executor_workers")]
     pub executor_workers: usize,
+    /// Hyperliquid-only — the master/owner account address (0x-hex, 20 bytes)
+    /// whose positions and fills are queried and traded. When signing with an
+    /// approved **API agent wallet**, `private_key` is the agent key while
+    /// this stays the master account address (info/clearinghouseState/userFills
+    /// are all keyed on it). For direct EOA signing, this equals the signer's
+    /// own address. Lowercased before use.
+    #[serde(default)]
+    pub account_address: String,
+    /// Hyperliquid-only — network selection: "mainnet" or "testnet".
+    /// Controls the phantom-agent signing `source` ("a"=mainnet / "b"=testnet)
+    /// and the default REST/WS hosts. Default: "testnet".
+    #[serde(default = "default_hl_network")]
+    pub network: String,
 }
 
+fn default_hl_network() -> String { "testnet".to_string() }
 fn default_http_timeout_ms() -> u64 { 1000 }
 fn default_gap_replay_interval_ms() -> u64 { 2000 }
 fn default_gap_replay_rewind_ms() -> u64 { 5000 }
