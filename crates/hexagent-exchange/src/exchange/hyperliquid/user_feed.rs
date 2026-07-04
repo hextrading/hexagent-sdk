@@ -64,13 +64,24 @@ async fn user_feed_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        // Subscribe fills (userFills carries the definitive fill records).
-        let sub = serde_json::json!({
-            "method": "subscribe",
-            "subscription": { "type": "userFills", "user": account },
-        });
-        if let Err(e) = write.send(Message::Text(sub.to_string())).await {
-            warn!("[Hyperliquid] user-feed subscribe failed: {}", e);
+        // Subscribe both: `userFills` (definitive fill records → inventory) and
+        // `orderUpdates` (order-lifecycle status pushes: Open / Canceled /
+        // Filled / Rejected). Fills drive inventory; order-status updates are
+        // informational (emitted with filled_quantity=0 so they never
+        // double-count against userFills).
+        let mut sub_ok = true;
+        for ty in ["userFills", "orderUpdates"] {
+            let sub = serde_json::json!({
+                "method": "subscribe",
+                "subscription": { "type": ty, "user": account },
+            });
+            if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+                warn!("[Hyperliquid] user-feed subscribe {} failed: {}", ty, e);
+                sub_ok = false;
+                break;
+            }
+        }
+        if !sub_ok {
             continue;
         }
 
@@ -98,11 +109,23 @@ async fn user_feed_task(
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            if data.get("channel").and_then(|v| v.as_str()) != Some("userFills") {
+                            let channel = data.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                            let d = match data.get("data") { Some(d) => d, None => continue };
+                            // ── orderUpdates: order-lifecycle status pushes ──
+                            if channel == "orderUpdates" {
+                                if let Some(ups) = d.as_array() {
+                                    for ou in ups {
+                                        if let Some(u) = parse_order_update(ou) {
+                                            if tx.send(u).is_err() { return; }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            if channel != "userFills" {
                                 continue;
                             }
                             // data.data = { isSnapshot, user, fills: [...] }
-                            let d = match data.get("data") { Some(d) => d, None => continue };
                             let is_snapshot = d.get("isSnapshot").and_then(|v| v.as_bool()).unwrap_or(false);
                             // Skip the initial snapshot: those are historical fills
                             // already reflected in the position poll; only stream
@@ -132,6 +155,48 @@ async fn user_feed_task(
         tokio::time::sleep(delay).await;
     }
     info!("[Hyperliquid] user-feed task exiting");
+}
+
+/// Parse one `orderUpdates` entry into an `OrderUpdate` carrying the order's
+/// lifecycle **status** only (`filled_quantity = 0` so it never affects
+/// inventory — userFills is the authoritative fill source).
+///
+/// Shape: `{ order: {coin, side, limitPx, sz, oid, cloid, ...}, status, statusTimestamp }`.
+fn parse_order_update(ou: &serde_json::Value) -> Option<OrderUpdate> {
+    let o = ou.get("order")?;
+    let coin = o.get("coin")?.as_str()?.to_string();
+    let status_raw = ou.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let status = match status_raw {
+        "open" => OrderStatus::Accepted,
+        "filled" => OrderStatus::Filled,
+        "canceled" | "marginCanceled" | "liquidatedCanceled" | "vaultWithdrawalCanceled"
+        | "openInterestCapCanceled" | "selfTradeCanceled" | "reduceOnlyCanceled"
+        | "siblingFilledCanceled" | "delistedCanceled" => OrderStatus::Cancelled,
+        "rejected" => OrderStatus::Rejected,
+        _ => return None, // triggered / scheduled / unknown — ignore
+    };
+    let side = match o.get("side").and_then(|v| v.as_str()) {
+        Some("B") => Side::Buy,
+        _ => Side::Sell,
+    };
+    let oid = o.get("oid").and_then(|v| v.as_u64()).map(|n| n.to_string());
+    let cloid = o.get("cloid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ts = ou.get("statusTimestamp").and_then(|v| v.as_u64()).map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+    Some(OrderUpdate {
+        client_order_id: cloid,
+        exchange: Exchange::Hyperliquid,
+        symbol: coin,
+        side,
+        exchange_order_id: oid,
+        status,
+        liquidity: None,
+        filled_quantity: 0.0, // status-only — inventory comes from userFills
+        remaining_quantity: 0.0,
+        avg_fill_price: 0.0,
+        timestamp_ns: ts,
+        trade_id: None,
+        error: None,
+    })
 }
 
 /// Parse one `userFills` fill record into an `OrderUpdate`.

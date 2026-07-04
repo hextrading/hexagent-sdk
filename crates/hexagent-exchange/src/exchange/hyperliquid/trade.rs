@@ -32,6 +32,10 @@ pub struct HyperliquidTrade {
     instance_id: String,
     /// client_order_id → asset index (populated on submit; used by cancels).
     coid_asset: HashMap<String, u32>,
+    /// Exchange oids of the orders placed by the PREVIOUS `batch_update_orders`
+    /// cycle, per coin. Cancelled (by oid — authoritative, race-free) at the
+    /// start of the next cycle. Replaces fragile per-cloid replace bookkeeping.
+    prev_oids: HashMap<String, Vec<u64>>,
     /// Monotonic nonce (ms) — strictly increasing per process/account.
     last_nonce: u64,
 }
@@ -43,6 +47,7 @@ impl HyperliquidTrade {
             meta,
             instance_id: instance_id.to_string(),
             coid_asset: HashMap::new(),
+            prev_oids: HashMap::new(),
             last_nonce: 0,
         }
     }
@@ -70,7 +75,9 @@ impl HyperliquidTrade {
             "vaultAddress": self.vault(),
         });
         let url = self.auth.exchange_url();
-        let client = async_rt::http_client_fast();
+        // ALPN-negotiating client — see info.rs: HL REST rejects h2 prior
+        // knowledge, so the Polymarket-tuned `http_client_fast` pool fails.
+        let client = async_rt::http_client_auto();
         let text = async_rt::block_on_runtime(async move {
             let resp = client
                 .post(&url)
@@ -95,15 +102,44 @@ impl HyperliquidTrade {
             .asset_index(coin)
             .ok_or_else(|| anyhow!("hyperliquid: unknown coin/asset `{}`", coin))
     }
+
+    /// Aggressive limit price for a market order: cross the current touch by
+    /// `slippage` so an IOC fills immediately. Buy → best ask ×(1+slip),
+    /// sell → best bid ×(1−slip). Fetches a fresh l2Book snapshot.
+    fn market_price(&self, coin: &str, side: Side, slippage: f64) -> Result<f64> {
+        let book = super::info::fetch_l2_book(&self.auth.info_url(), coin)?;
+        if book.levels.len() != 2 {
+            return Err(anyhow!("hyperliquid: malformed l2Book for market order"));
+        }
+        let (bids, asks) = (&book.levels[0], &book.levels[1]);
+        let px = match side {
+            Side::Buy => asks.first().and_then(|l| l.px.parse::<f64>().ok()).map(|a| a * (1.0 + slippage)),
+            Side::Sell => bids.first().and_then(|l| l.px.parse::<f64>().ok()).map(|b| b * (1.0 - slippage)),
+        };
+        px.filter(|p| *p > 0.0)
+            .ok_or_else(|| anyhow!("hyperliquid: empty book for market order on {}", coin))
+    }
 }
+
+/// Market-order slippage (fraction) — cross the touch by this much so the IOC
+/// fills through the top of book. 2% is ample for perps like BTC/ETH.
+const MARKET_SLIPPAGE: f64 = 0.02;
 
 impl super::super::ExchangeTrade for HyperliquidTrade {
     fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
         let coin = order.symbol.clone();
         let asset = self.asset_for(&coin)?;
-        let price = order
-            .price
-            .ok_or_else(|| anyhow!("hyperliquid: limit order without price"))?;
+        // Hyperliquid has no native market order — a `Market` request (price
+        // unset) is emulated as an aggressive IOC limit at the current best
+        // price ± slippage, guaranteeing an immediate cross. Limit/maker orders
+        // still require an explicit price.
+        let price = match order.price {
+            Some(p) => p,
+            None if order.order_type == OrderType::Market => {
+                self.market_price(&coin, order.side, MARKET_SLIPPAGE)?
+            }
+            None => return Err(anyhow!("hyperliquid: limit order without price")),
+        };
         let sz_dec = self.meta.sz_decimals(&coin).unwrap_or(4);
         let px_str = float_to_wire(round_price(price, sz_dec));
         let sz_str = float_to_wire(round_size(order.quantity, sz_dec));
@@ -134,9 +170,17 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
     }
 
     fn cancel_order(&mut self, _exchange: Exchange, client_order_id: &str) -> Result<OrderUpdate> {
-        let asset = self.coid_asset.get(client_order_id).copied().ok_or_else(|| {
-            anyhow!("hyperliquid: cancel for unknown client_order_id `{}`", client_order_id)
-        })?;
+        // Unknown cloid = already gone / never rested. Treat as a benign no-op
+        // (like an "already cancelled" order) rather than erroring — otherwise a
+        // single stale cloid fails the whole cancel+replace batch and orphans
+        // the new quotes. Mirrors polymarket's benign "already canceled" path.
+        let asset = match self.coid_asset.get(client_order_id).copied() {
+            Some(a) => a,
+            None => {
+                debug!("[Hyperliquid] cancel for unknown cloid {} — no-op", client_order_id);
+                return Ok(cancel_update(client_order_id, true, None));
+            }
+        };
         let cloid = coid_to_cloid(client_order_id)
             .ok_or_else(|| anyhow!("hyperliquid: client_order_id not a uuid: {}", client_order_id))?;
         let action = CancelByCloidAction {
@@ -145,11 +189,65 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
         };
         let resp = self.send_signed(&action)?;
         let ok = resp.cancel_ok();
+        // Prune so the map doesn't grow unbounded across replace cycles.
+        self.coid_asset.remove(client_order_id);
         Ok(cancel_update(client_order_id, ok, resp.cancel_error()))
+    }
+
+    /// Race-free replace: place the new quotes first (capturing their oids),
+    /// then cancel the PREVIOUS cycle's oids by oid (authoritative — unlike
+    /// cloid bookkeeping, cancelling a concrete oid can't race a not-yet-placed
+    /// order or silently no-op). The `cancel_client_order_ids` cloid list from
+    /// the strategy is intentionally ignored in favour of this scheme.
+    /// Place-then-cancel briefly doubles the resting set (~one RTT) but never
+    /// leaves a naked book or leaks orders across cycles.
+    fn batch_update_orders(
+        &mut self,
+        _exchange: Exchange,
+        market_id: &str,
+        _cancel_client_order_ids: &[String],
+        place_orders: &[OrderRequest],
+    ) -> Result<Vec<OrderUpdate>> {
+        let coin = place_orders
+            .first()
+            .map(|o| o.symbol.clone())
+            .unwrap_or_else(|| market_id.to_string());
+
+        // 1. place the new quotes, collect their resting oids.
+        let mut updates = Vec::with_capacity(place_orders.len());
+        let mut new_oids = Vec::new();
+        for o in place_orders {
+            let u = self.submit_order(o)?;
+            if let Some(oid) = u.exchange_order_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
+                new_oids.push(oid);
+            }
+            updates.push(u);
+        }
+
+        // 2. cancel the previous cycle's oids (best-effort, single action).
+        let prev = self.prev_oids.remove(&coin).unwrap_or_default();
+        if !prev.is_empty() {
+            if let Ok(asset) = self.asset_for(&coin) {
+                let action = CancelAction {
+                    ty: "cancel".to_string(),
+                    cancels: prev.iter().map(|o| CancelWire { a: asset, o: *o }).collect(),
+                };
+                if let Err(e) = self.send_signed(&action) {
+                    warn!("[Hyperliquid] replace cancel of {} prev oids failed: {}", prev.len(), e);
+                }
+            }
+        }
+
+        // 3. remember this cycle's oids for the next replace.
+        if !new_oids.is_empty() {
+            self.prev_oids.insert(coin, new_oids);
+        }
+        Ok(updates)
     }
 
     fn cancel_all(&mut self, _exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>> {
         let asset = self.asset_for(symbol)?;
+        self.prev_oids.remove(symbol); // authoritative sweep supersedes tracked oids
         // Query open orders for the account, keep this coin's oids.
         let open = fetch_open_oids(&self.auth, symbol)?;
         if open.is_empty() {
