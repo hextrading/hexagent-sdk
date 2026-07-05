@@ -8,6 +8,7 @@ pub mod gate;
 pub mod hexmarket;
 pub mod hyperliquid;
 pub mod kucoin;
+pub mod lighter;
 pub mod mexc;
 pub mod kraken;
 pub mod okx;
