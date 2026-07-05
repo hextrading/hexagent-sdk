@@ -1246,6 +1246,14 @@ pub struct PolymarketTrade {
     /// order placed through it (`TrackedOrder.instance_id`) so bulk cancels
     /// scope to this instance only. Empty for heartbeat/CLI/default routes.
     instance_id: String,
+    /// Correlation hint for the `gen_ns=` field on the cancel log line: the
+    /// strategy-side emission time (ns) of the signal currently being
+    /// dispatched, set by the engine right before it calls a cancel/replace
+    /// method on this route (same `&mut self` borrow ⇒ no interleaving). Lets
+    /// offline log analysis compute the on_quote→dispatch latency for cancels
+    /// (place lines carry `order.timestamp_ns` directly). 0 = unknown
+    /// (heartbeat/CLI/reconcile paths that don't originate from a quote).
+    gen_ns_hint: u64,
 }
 
 impl PolymarketTrade {
@@ -1398,6 +1406,7 @@ impl PolymarketTrade {
             // CLI / first-build route: per-instance trading routes are
             // rebuilt via `from_shared(.., instance_id)`.
             instance_id: String::new(),
+            gen_ns_hint: 0,
         })
     }
 
@@ -1574,11 +1583,21 @@ impl PolymarketTrade {
     /// `instance_id` tags orders placed through this route so bulk cancels
     /// stay scoped to this instance (siblings on the same wallet untouched).
     /// Pass `""` for non-trading routes (heartbeat / CLI).
+    /// Set the `gen_ns` correlation hint used by the next cancel log line.
+    /// The engine calls this on the route immediately before a cancel/replace
+    /// dispatch, in the same `&mut self` borrow, passing the signal's
+    /// strategy-side emission time. See [`PolymarketTrade::gen_ns_hint`].
+    #[inline]
+    pub fn set_gen_ns_hint(&mut self, gen_ns: u64) {
+        self.gen_ns_hint = gen_ns;
+    }
+
     pub fn from_shared(shared: Arc<SharedState>, owner: &str, instance_id: &str) -> Self {
         Self {
             shared,
             owner: owner.to_string(),
             instance_id: instance_id.to_string(),
+            gen_ns_hint: 0,
         }
     }
 
@@ -1591,6 +1610,7 @@ impl PolymarketTrade {
             shared: self.shared.clone(),
             owner: self.owner.clone(),
             instance_id: self.instance_id.clone(),
+            gen_ns_hint: self.gen_ns_hint,
         }
     }
 
@@ -2644,9 +2664,12 @@ impl PolymarketTrade {
         );
 
         let sym_short = if order.symbol.len() > 16 { &order.symbol[..16] } else { &order.symbol };
-        info!("[PolymarketTrade] Submit {} {}... @ {:.3} qty={} coid={} oid={}",
+        // `gen_ns` = strategy on_quote emission time (ns) carried on the
+        // OrderRequest. Pairs this place with its quote for offline
+        // on_quote→dispatch latency analysis (dispatch wall-clock − gen_ns).
+        info!("[PolymarketTrade] Submit {} {}... @ {:.3} qty={} coid={} oid={} gen_ns={}",
             order.side, sym_short, order.price.unwrap_or(0.0), order.quantity,
-            order.client_order_id, &local_oid[..18.min(local_oid.len())]);
+            order.client_order_id, &local_oid[..18.min(local_oid.len())], order.timestamp_ns);
         log::debug!("[PolymarketTrade] Order body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
         Ok((local_oid, body.to_string()))
@@ -2842,7 +2865,13 @@ impl PolymarketTrade {
         match order_id {
             Some(ref oid) => {
                 let oid_short = &oid[..16.min(oid.len())];
-                info!("[PolymarketTrade] Cancel request orderID={}... coid={}", oid_short, client_order_id);
+                // `gen_ns` = strategy on_quote emission time (ns) of the
+                // cancel/replace signal being dispatched (set by the engine on
+                // this route just before the call). Pairs this cancel with its
+                // quote for offline on_quote→dispatch latency analysis
+                // (dispatch wall-clock − gen_ns). 0 = non-quote origin.
+                info!("[PolymarketTrade] Cancel request orderID={}... coid={} gen_ns={}",
+                    oid_short, client_order_id, self.gen_ns_hint);
                 let body_str = serde_json::json!({ "orderID": oid }).to_string();
                 (ctx, Some(body_str))
             }
