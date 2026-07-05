@@ -18,8 +18,9 @@ use crate::types::{
 };
 
 use super::auth::AsterAuth;
-use super::info::{http_request, AsterMeta};
+use super::info::{http_request_async, http_request_role, AsterMeta};
 use super::signer::signed_query;
+use crate::http1_pool::Role;
 
 pub struct AsterTrade {
     auth: AsterAuth,
@@ -48,14 +49,16 @@ impl AsterTrade {
         }
     }
 
-    /// Sign `params` and send `method /fapi/v3/endpoint?params&signature=…`.
-    /// Returns the raw body text on 2xx; the caller parses. Aster rejections
-    /// come back as non-2xx with `{"code":-XXXX,"msg":"…"}` — surfaced in
-    /// the error string.
-    fn send_signed(&self, method: &str, endpoint: &str, params: Vec<(&str, String)>) -> Result<String> {
+    /// Sign `params` and send `method /fapi/v3/endpoint?params&signature=…`
+    /// on the given role pool (placements → Fast, cancels → Cancel, account
+    /// reads → Query — disjoint h1.1 connections, so a burst of replace
+    /// traffic never queues behind anything slower). Returns the raw body
+    /// text on 2xx; the caller parses. Aster rejections come back as non-2xx
+    /// with `{"code":-XXXX,"msg":"…"}` — surfaced in the error string.
+    fn send_signed(&self, role: Role, method: &str, endpoint: &str, params: Vec<(&str, String)>) -> Result<String> {
         let query = signed_query(&self.auth, params)?;
         let url = format!("{}?{}", self.auth.fapi_url(endpoint), query);
-        http_request(method, &url)
+        http_request_role(role, method, &url)
     }
 
     /// Format a price for `symbol`: snap to tickSize, then render with the
@@ -81,18 +84,15 @@ impl AsterTrade {
         let snapped = if step > 0.0 { (qty / step).floor() * step } else { qty };
         trim_decimal(&format!("{:.*}", prec as usize, snapped))
     }
-}
 
-impl super::super::ExchangeTrade for AsterTrade {
-    fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
+    /// Wire params for `POST /fapi/v3/order`.
+    fn order_params(&self, order: &OrderRequest) -> Result<Vec<(&'static str, String)>> {
         let symbol = order.symbol.clone();
-        let is_market = order.order_type == OrderType::Market;
-
-        let mut params: Vec<(&str, String)> = vec![
+        let mut params: Vec<(&'static str, String)> = vec![
             ("symbol", symbol.clone()),
             ("side", order.side.to_string()),
         ];
-        if is_market {
+        if order.order_type == OrderType::Market {
             params.push(("type", "MARKET".to_string()));
         } else {
             let price = order
@@ -107,29 +107,40 @@ impl super::super::ExchangeTrade for AsterTrade {
         // RESULT: MARKET returns the final FILLED state, LIMIT-with-special-
         // TIF the final status — saves a round-trip vs the default ACK.
         params.push(("newOrderRespType", "RESULT".to_string()));
+        Ok(params)
+    }
+}
 
-        self.coid_symbol.insert(order.client_order_id.clone(), symbol);
-
-        match self.send_signed("POST", "order", params) {
-            Ok(text) => {
-                let resp: OrderResponse = serde_json::from_str(&text)
-                    .map_err(|e| anyhow!("parse /order response: {} — body: {}", e, text))?;
-                Ok(resp.into_order_update(order))
-            }
-            // Order-level rejections (filters, post-only cross, balance…)
-            // come back as HTTP 4xx `{"code":…,"msg":…}` — map to a Rejected
-            // update instead of a transport error so the strategy sees a
-            // normal reject, mirroring the HL error-status path.
-            Err(e) => match extract_api_error(&e.to_string()) {
-                Some(msg) => {
-                    // Full error includes the request URL + query — keep it
-                    // at debug for reject forensics without spamming info.
-                    debug!("[Aster] order reject detail: {}", e);
-                    Ok(reject_update(order, msg))
-                }
-                None => Err(e),
-            },
+/// Map a raw place result (body text or transport/API error) to an
+/// `OrderUpdate`. Order-level rejections (filters, post-only cross,
+/// balance…) come back as HTTP 4xx `{"code":…,"msg":…}` — mapped to a
+/// Rejected update instead of a transport error so the strategy sees a
+/// normal reject, mirroring the HL error-status path.
+fn parse_place_result(order: &OrderRequest, result: Result<String>) -> Result<OrderUpdate> {
+    match result {
+        Ok(text) => {
+            let resp: OrderResponse = serde_json::from_str(&text)
+                .map_err(|e| anyhow!("parse /order response: {} — body: {}", e, text))?;
+            Ok(resp.into_order_update(order))
         }
+        Err(e) => match extract_api_error(&e.to_string()) {
+            Some(msg) => {
+                // Full error includes the request URL + query — keep it
+                // at debug for reject forensics without spamming info.
+                debug!("[Aster] order reject detail: {}", e);
+                Ok(reject_update(order, msg))
+            }
+            None => Err(e),
+        },
+    }
+}
+
+impl super::super::ExchangeTrade for AsterTrade {
+    fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
+        let params = self.order_params(order)?;
+        self.coid_symbol.insert(order.client_order_id.clone(), order.symbol.clone());
+        let result = self.send_signed(Role::Fast, "POST", "order", params);
+        parse_place_result(order, result)
     }
 
     fn cancel_order(&mut self, _exchange: Exchange, client_order_id: &str) -> Result<OrderUpdate> {
@@ -146,7 +157,7 @@ impl super::super::ExchangeTrade for AsterTrade {
             ("symbol", symbol),
             ("origClientOrderId", client_order_id.to_string()),
         ];
-        let result = self.send_signed("DELETE", "order", params);
+        let result = self.send_signed(Role::Cancel, "DELETE", "order", params);
         self.coid_symbol.remove(client_order_id);
         match result {
             Ok(_) => Ok(cancel_update(client_order_id, true, None)),
@@ -181,11 +192,32 @@ impl super::super::ExchangeTrade for AsterTrade {
             .map(|o| o.symbol.clone())
             .unwrap_or_else(|| market_id.to_string());
 
-        // 1. place the new quotes, collect their resting orderIds.
+        // 1. place the new quotes CONCURRENTLY — one signed URL per leg,
+        // each POSTed through a distinct round-robin Fast client (h1.1:
+        // one connection per in-flight request, so distinct clients =
+        // truly parallel wire time; a two-leg replace costs ~1 RTT
+        // instead of 2). Signing is sync and cheap; the joined dispatch
+        // runs as a single hop on the shared runtime.
+        let mut prepared = Vec::with_capacity(place_orders.len());
+        for o in place_orders {
+            let params = self.order_params(o)?;
+            let query = signed_query(&self.auth, params)?;
+            let url = format!("{}?{}", self.auth.fapi_url("order"), query);
+            self.coid_symbol.insert(o.client_order_id.clone(), o.symbol.clone());
+            prepared.push(url);
+        }
+        let results: Vec<Result<String>> = crate::async_rt::block_on_runtime(async move {
+            let futs = prepared.into_iter().map(|url| {
+                let client = crate::http1_pool::client(Role::Fast);
+                async move { http_request_async(client, "POST", &url).await }
+            });
+            futures_util::future::join_all(futs).await
+        });
+
         let mut updates = Vec::with_capacity(place_orders.len());
         let mut new_oids = Vec::new();
-        for o in place_orders {
-            let u = self.submit_order(o)?;
+        for (o, result) in place_orders.iter().zip(results) {
+            let u = parse_place_result(o, result)?;
             if u.status == OrderStatus::Accepted || u.status == OrderStatus::PartiallyFilled {
                 if let Some(oid) = u.exchange_order_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
                     new_oids.push(oid);
@@ -205,7 +237,7 @@ impl super::super::ExchangeTrade for AsterTrade {
                 ("symbol", symbol.clone()),
                 ("orderIdList", id_list),
             ];
-            if let Err(e) = self.send_signed("DELETE", "batchOrders", params) {
+            if let Err(e) = self.send_signed(Role::Cancel, "DELETE", "batchOrders", params) {
                 warn!("[Aster] replace cancel of {} prev oids failed: {}", chunk.len(), e);
             }
         }
@@ -221,7 +253,7 @@ impl super::super::ExchangeTrade for AsterTrade {
         self.prev_oids.remove(symbol); // authoritative sweep supersedes tracked oids
         // Snapshot open orders first so we can ack their coids after the sweep.
         let open: Vec<OpenOrder> = match self
-            .send_signed("GET", "openOrders", vec![("symbol", symbol.to_string())])
+            .send_signed(Role::Query, "GET", "openOrders", vec![("symbol", symbol.to_string())])
             .and_then(|t| serde_json::from_str(&t).map_err(|e| anyhow!("parse openOrders: {}", e)))
         {
             Ok(v) => v,
@@ -231,7 +263,7 @@ impl super::super::ExchangeTrade for AsterTrade {
             }
         };
         let params: Vec<(&str, String)> = vec![("symbol", symbol.to_string())];
-        let resp = self.send_signed("DELETE", "allOpenOrders", params);
+        let resp = self.send_signed(Role::Cancel, "DELETE", "allOpenOrders", params);
         let ok = resp.is_ok();
         if let Err(e) = resp {
             warn!("[Aster] cancel_all({}) failed: {}", symbol, e);

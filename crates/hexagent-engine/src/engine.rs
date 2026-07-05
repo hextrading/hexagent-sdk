@@ -1520,7 +1520,7 @@ impl Engine {
                                 let frac = strategy.quote_interval_tolerance_frac().clamp(0.0, 1.0);
                                 let threshold_ns =
                                     ((interval as f64) * 1_000_000.0 * (1.0 - frac)) as u64;
-                                ts - last_quote_ns[i] >= threshold_ns
+                                ts.saturating_sub(last_quote_ns[i]) >= threshold_ns
                             };
                             if fire {
                                 last_quote_ns[i] = ts;
@@ -2399,7 +2399,7 @@ impl Engine {
                                                     let frac = strategy.quote_interval_tolerance_frac().clamp(0.0, 1.0);
                                                     let threshold_ns =
                                                         ((interval as f64) * 1_000_000.0 * (1.0 - frac)) as u64;
-                                                    ts - last_quote_ns[i] >= threshold_ns
+                                                    ts.saturating_sub(last_quote_ns[i]) >= threshold_ns
                                                 };
                                                 if fire {
                                                     last_quote_ns[i] = ts;
@@ -2779,7 +2779,7 @@ impl Engine {
                                     let frac = strategy.quote_interval_tolerance_frac().clamp(0.0, 1.0);
                                     let threshold_ns =
                                         ((interval as f64) * 1_000_000.0 * (1.0 - frac)) as u64;
-                                    ts - last_quote_ns >= threshold_ns
+                                    ts.saturating_sub(last_quote_ns) >= threshold_ns
                                 };
                                 if fire {
                                     last_quote_ns = ts;
@@ -4395,7 +4395,18 @@ impl LiveRouter {
                             &ax.api_url_prefix,
                             &ax.wss_url,
                         ) {
-                            Ok(auth) => match crate::exchange::aster::info::fetch_meta(&auth.rest_base()) {
+                            Ok(auth) => {
+                                // Prewarm the h1.1 pools against the Aster host
+                                // BEFORE the first REST call (exchangeInfo below,
+                                // positionRisk in the strategy factory), then
+                                // keep every pooled connection warm through
+                                // quiet stretches.
+                                hexagent_runtime::http1_pool::spawn_keep_warm(
+                                    "aster",
+                                    format!("{}/fapi/v3/time", auth.rest_base()),
+                                    std::time::Duration::from_secs(20),
+                                );
+                                match crate::exchange::aster::info::fetch_meta(&auth.rest_base()) {
                                 Ok(meta) => {
                                     info!(
                                         "[Aster] executor ready (account_id={}, network={}, user={}, signer={})",
@@ -4407,7 +4418,7 @@ impl LiveRouter {
                                     error!("[Aster] exchangeInfo fetch failed, venue disabled: {}", e);
                                     None
                                 }
-                            },
+                            }},
                             Err(e) => {
                                 error!("[Aster] auth build failed (account_id={}), venue disabled: {}", acct, e);
                                 None

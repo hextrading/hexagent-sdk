@@ -17,10 +17,14 @@
 //!
 //! Shared globals:
 //!   - `RUNTIME_HANDLE`: `OnceLock` of the tokio Handle
-//!   - Four role-specific HTTP/2 client pools, each with its own per-request
-//!     deadline tuned to the endpoint it serves. Role isolation prevents a
-//!     slow query from consuming h2 stream credits / TCP receive windows
-//!     on the hot-path submit connection.
+//!   - Four role-specific HTTP/1.1 client pools (see [`crate::http1_pool`]),
+//!     each with its own per-request deadline tuned to the endpoint it
+//!     serves. h1.1 has no multiplexing, so role isolation — a slow query
+//!     can never occupy the connection an order needs — comes from the
+//!     pools being disjoint sets of TCP connections. (Formerly h2
+//!     prior-knowledge pools; Aster's h2 frontend rejects signed requests
+//!     with spurious -2019s, and splitting transports per venue buys
+//!     nothing, so all REST pools are h1.1 now.)
 //!       * `HTTP_CLIENTS_FAST`    — POST /order, POST /orders. 500 ms
 //!         timeout. Tail requests past 500 ms are almost certainly stale
 //!         (p50 ≈ 30 ms against the CLOB); failing fast lets the orphan
@@ -43,7 +47,6 @@
 //!   - `HTTP_CLIENT_AUTO`: ALPN-negotiating single client for endpoints
 //!     that don't speak h2 prior-knowledge (public Polygon RPCs).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -67,10 +70,7 @@ static RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 // `pool_idle_timeout` below) and pay handshake on the next round-robin
 // pick. The heartbeat loop fans out across ALL pools per tick, so
 // every client stays warm regardless of business traffic.
-const FAST_CLIENT_POOL_SIZE: usize = 2;      // submit /order, /orders
-const CANCEL_CLIENT_POOL_SIZE: usize = 2;    // DELETE /order, /cancel-all
-const RECONCILE_CLIENT_POOL_SIZE: usize = 2; // orphan GET + DELETE retry
-const QUERY_CLIENT_POOL_SIZE: usize = 2;     // snapshots, gap-fill, heartbeats
+// Pool sizes now live in `crate::http1_pool` (config/instance-scaled).
 
 /// Per-role per-request timeouts.
 ///
@@ -104,15 +104,12 @@ const QUERY_CLIENT_POOL_SIZE: usize = 2;     // snapshots, gap-fill, heartbeats
 /// us catch those responses synchronously instead of triggering orphan
 /// reconcile churn.
 const FAST_CLIENT_TIMEOUT_CEILING: Duration = Duration::from_millis(2000);
-const CANCEL_CLIENT_TIMEOUT_CEILING: Duration = Duration::from_millis(2000);
 /// Fallback FAST/CANCEL per-request timeout used before session-aware
 /// values have been initialised (i.e. backtest / paper / tests that never
 /// call `init_http_timeout`). Matches the historical 500 ms behaviour
 /// so anything that hasn't opted in keeps working as before.
 const FAST_DEFAULT_TIMEOUT_MS: u64 = 500;
 const CANCEL_DEFAULT_TIMEOUT_MS: u64 = 500;
-const RECONCILE_TIMEOUT: Duration = Duration::from_millis(2000);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Flat per-request timeout for FAST + CANCEL client pools.
 ///
@@ -179,29 +176,9 @@ pub fn current_cancel_timeout() -> Duration {
     Duration::from_millis(load_timeout_or(CANCEL_DEFAULT_TIMEOUT_MS))
 }
 
-/// Pool of HTTP/2 clients for hot-path order submits (POST /order, /orders).
-static HTTP_CLIENTS_FAST: OnceLock<Vec<Arc<reqwest::Client>>> = OnceLock::new();
-/// Round-robin counter for `http_client_fast()` picks.
-static HTTP_CLIENT_FAST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-/// Pool of HTTP/2 clients dedicated to DELETE (cancel) traffic.
-static HTTP_CLIENTS_CANCEL: OnceLock<Vec<Arc<reqwest::Client>>> = OnceLock::new();
-/// Round-robin counter for `http_client_cancel()` picks.
-static HTTP_CLIENT_CANCEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
-/// Pool of HTTP/2 clients for orphan reconciliation (GET /data/order/{id},
-/// reconcile DELETE retries). Isolated so a slow reconcile can't back up the
-/// fast or cancel submit paths.
-static HTTP_CLIENTS_RECONCILE: OnceLock<Vec<Arc<reqwest::Client>>> = OnceLock::new();
-/// Round-robin counter for `http_client_reconcile()` picks.
-static HTTP_CLIENT_RECONCILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-/// Pool of HTTP/2 clients for non-hot-path queries (data-api /positions,
-/// /trades gap-fill, gamma-api metadata, wallet relayer, heartbeats).
-static HTTP_CLIENTS_QUERY: OnceLock<Vec<Arc<reqwest::Client>>> = OnceLock::new();
-/// Round-robin counter for `http_client()` / `http_client_query()` picks.
-static HTTP_CLIENT_QUERY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Auto-negotiating client (ALPN h2/h1) for endpoints that may not speak
 /// HTTP/2 prior-knowledge (e.g. some public Polygon RPCs).
 static HTTP_CLIENT_AUTO: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
-static HTTP_CLIENT_H1: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 /// Spawn the async runtime on a dedicated OS thread. Idempotent — safe to
 /// call multiple times; only the first call has effect. Must be invoked
@@ -245,50 +222,16 @@ pub fn init() -> Result<()> {
 
     let handle = handle_rx.recv().context("receive runtime handle")?;
 
-    // Build each role's client pool — each client keeps its own connection
-    // pool (and thus its own h2 TCP connection per host) so that TCP-level
-    // HOL on one connection doesn't stall concurrent requests dispatched
-    // through another, AND so that e.g. a slow /positions query can't
-    // freeze the POST /order path.
-    // FAST and CANCEL pools are built with a HIGH ceiling (2 s) so
+    // Role-separated HTTP/1.1 client pools — construction, sizing (config /
+    // instance-count scaled via `http1_pool::set_sizes`), round-robin and
+    // keep-warm all live in `crate::http1_pool`; the getters below delegate.
+    // FAST and CANCEL pools keep a HIGH client-level ceiling (2 s) so
     // per-request `current_fast_timeout()` / `current_cancel_timeout()`
-    // can override DOWN to the session-of-day value. The client-level
-    // timeout only fires if no per-request override is applied (e.g.
-    // backtest / paper paths that don't call `init_http_timeout`),
-    // in which case we want a reasonable upper bound rather than a
-    // permanent stall.
-    let mut fast_clients = Vec::with_capacity(FAST_CLIENT_POOL_SIZE);
-    for _ in 0..FAST_CLIENT_POOL_SIZE {
-        fast_clients.push(Arc::new(build_http_client(FAST_CLIENT_TIMEOUT_CEILING)?));
-    }
-    HTTP_CLIENTS_FAST.set(fast_clients)
-        .map_err(|_| anyhow!("HTTP fast clients already initialised"))?;
-
-    let mut cancel_clients = Vec::with_capacity(CANCEL_CLIENT_POOL_SIZE);
-    for _ in 0..CANCEL_CLIENT_POOL_SIZE {
-        cancel_clients.push(Arc::new(build_http_client(CANCEL_CLIENT_TIMEOUT_CEILING)?));
-    }
-    HTTP_CLIENTS_CANCEL.set(cancel_clients)
-        .map_err(|_| anyhow!("HTTP cancel clients already initialised"))?;
-
-    let mut reconcile_clients = Vec::with_capacity(RECONCILE_CLIENT_POOL_SIZE);
-    for _ in 0..RECONCILE_CLIENT_POOL_SIZE {
-        reconcile_clients.push(Arc::new(build_http_client(RECONCILE_TIMEOUT)?));
-    }
-    HTTP_CLIENTS_RECONCILE.set(reconcile_clients)
-        .map_err(|_| anyhow!("HTTP reconcile clients already initialised"))?;
-
-    let mut query_clients = Vec::with_capacity(QUERY_CLIENT_POOL_SIZE);
-    for _ in 0..QUERY_CLIENT_POOL_SIZE {
-        query_clients.push(Arc::new(build_http_client(QUERY_TIMEOUT)?));
-    }
-    HTTP_CLIENTS_QUERY.set(query_clients)
-        .map_err(|_| anyhow!("HTTP query clients already initialised"))?;
+    // can override DOWN to the configured value.
+    crate::http1_pool::init_pools()?;
 
     HTTP_CLIENT_AUTO.set(Arc::new(build_http_client_auto()?))
         .map_err(|_| anyhow!("auto HTTP client already initialised"))?;
-    HTTP_CLIENT_H1.set(Arc::new(build_http_client_h1()?))
-        .map_err(|_| anyhow!("h1 HTTP client already initialised"))?;
     RUNTIME_HANDLE.set(handle)
         .map_err(|_| anyhow!("runtime handle already initialised"))?;
     Ok(())
@@ -303,18 +246,14 @@ pub fn handle() -> &'static Handle {
 /// the pool. Use for POST /order and POST /orders where a stale response
 /// past 500 ms is actively harmful (a live quote racing the market).
 pub fn http_client_fast() -> Arc<reqwest::Client> {
-    let clients = HTTP_CLIENTS_FAST.get().expect("async_rt::init() not called");
-    let i = HTTP_CLIENT_FAST_COUNTER.fetch_add(1, Ordering::Relaxed) % clients.len();
-    clients[i].clone()
+    crate::http1_pool::client(crate::http1_pool::Role::Fast)
 }
 
 /// Get one of the dedicated cancel HTTP/2 clients, round-robin across the
 /// cancel pool. Use this for `DELETE` requests so cancel traffic can't
 /// share stream credits / flow-control windows with placements.
 pub fn http_client_cancel() -> Arc<reqwest::Client> {
-    let clients = HTTP_CLIENTS_CANCEL.get().expect("async_rt::init() not called");
-    let i = HTTP_CLIENT_CANCEL_COUNTER.fetch_add(1, Ordering::Relaxed) % clients.len();
-    clients[i].clone()
+    crate::http1_pool::client(crate::http1_pool::Role::Cancel)
 }
 
 /// Get one of the reconcile HTTP/2 clients. Used by the orphan reconciler
@@ -322,9 +261,7 @@ pub fn http_client_cancel() -> Arc<reqwest::Client> {
 /// Separate pool so a slow reconcile can't back-pressure the fast submit
 /// path via shared h2 stream credits.
 pub fn http_client_reconcile() -> Arc<reqwest::Client> {
-    let clients = HTTP_CLIENTS_RECONCILE.get().expect("async_rt::init() not called");
-    let i = HTTP_CLIENT_RECONCILE_COUNTER.fetch_add(1, Ordering::Relaxed) % clients.len();
-    clients[i].clone()
+    crate::http1_pool::client(crate::http1_pool::Role::Reconcile)
 }
 
 /// Get one of the query HTTP/2 clients. Default client for non-hot-path
@@ -332,9 +269,7 @@ pub fn http_client_reconcile() -> Arc<reqwest::Client> {
 /// relayer, heartbeats, generic GETs. 5 s timeout tolerates larger
 /// responses.
 pub fn http_client_query() -> Arc<reqwest::Client> {
-    let clients = HTTP_CLIENTS_QUERY.get().expect("async_rt::init() not called");
-    let i = HTTP_CLIENT_QUERY_COUNTER.fetch_add(1, Ordering::Relaxed) % clients.len();
-    clients[i].clone()
+    crate::http1_pool::client(crate::http1_pool::Role::Query)
 }
 
 /// Backwards-compatible alias for `http_client_query()`. Legacy callers
@@ -349,11 +284,7 @@ pub fn http_client() -> Arc<reqwest::Client> {
 /// prewarm paths that need to establish h2 + TLS state on *every* client,
 /// not just one.
 pub fn http_clients_all() -> Vec<Arc<reqwest::Client>> {
-    let mut all = HTTP_CLIENTS_FAST.get().expect("async_rt::init() not called").clone();
-    all.extend(HTTP_CLIENTS_CANCEL.get().expect("async_rt::init() not called").iter().cloned());
-    all.extend(HTTP_CLIENTS_RECONCILE.get().expect("async_rt::init() not called").iter().cloned());
-    all.extend(HTTP_CLIENTS_QUERY.get().expect("async_rt::init() not called").iter().cloned());
-    all
+    crate::http1_pool::clients_all()
 }
 
 /// Get the auto-negotiating (ALPN) HTTP client. Use for endpoints that may
@@ -369,7 +300,7 @@ pub fn http_client_auto() -> Arc<reqwest::Client> {
 /// 2026-07-05). ALPN would happily negotiate h2 there, so this client
 /// disables it outright.
 pub fn http_client_h1() -> Arc<reqwest::Client> {
-    HTTP_CLIENT_H1.get().expect("async_rt::init() not called").clone()
+    crate::http1_pool::client(crate::http1_pool::Role::Query)
 }
 
 /// Sync convenience: GET `url` as text via the shared h2 client and runtime.
@@ -522,44 +453,12 @@ where
 ///     reconcile=1000ms, query=5000ms).
 ///   * `connect_timeout(500ms)` — handshake must complete promptly; we
 ///     prewarm at startup so this is only hit on reconnect / dead pool.
-fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .http2_prior_knowledge()
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Duration::from_secs(5))
-        .http2_keep_alive_timeout(Duration::from_secs(5))
-        .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(Duration::from_secs(300))
-        .pool_max_idle_per_host(4)
-        .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .timeout(timeout)
-        .connect_timeout(Duration::from_millis(500))
-        .build()
-        .context("build reqwest client")
-}
-
 /// Build an ALPN-negotiating HTTP client (h2 or h1 per server support).
 ///
 /// Used for Polygon RPC endpoints — many public RPCs still only speak HTTP/1.1,
 /// so `http2_prior_knowledge` would cause an immediate protocol error. The pool
 /// / timeout config mirrors the primary client so we still get connection reuse
 /// and TLS session caching.
-/// Build an HTTP/1.1-only client (h2 disabled even if the server offers it
-/// via ALPN). See `http_client_h1` for why Aster needs this.
-fn build_http_client_h1() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .http1_only()
-        .pool_idle_timeout(Duration::from_secs(300))
-        .pool_max_idle_per_host(4)
-        .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_millis(800))
-        .build()
-        .context("build h1 reqwest client")
-}
-
 fn build_http_client_auto() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(300))
