@@ -121,7 +121,12 @@ impl super::super::ExchangeTrade for AsterTrade {
             // update instead of a transport error so the strategy sees a
             // normal reject, mirroring the HL error-status path.
             Err(e) => match extract_api_error(&e.to_string()) {
-                Some(msg) => Ok(reject_update(order, msg)),
+                Some(msg) => {
+                    // Full error includes the request URL + query — keep it
+                    // at debug for reject forensics without spamming info.
+                    debug!("[Aster] order reject detail: {}", e);
+                    Ok(reject_update(order, msg))
+                }
                 None => Err(e),
             },
         }

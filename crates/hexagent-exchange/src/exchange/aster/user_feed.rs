@@ -50,7 +50,8 @@ pub fn spawn_user_feed(auth: &AsterAuth) -> (crossbeam_channel::Receiver<OrderUp
 async fn listen_key_request(auth: &AsterAuth, method: &str) -> anyhow::Result<String> {
     let query = signed_query(auth, Vec::new())?;
     let url = format!("{}?{}", auth.fapi_url("listenKey"), query);
-    let client = crate::async_rt::http_client_auto();
+    // h1.1-only — Aster's h2 frontend mishandles signed requests (see info.rs).
+    let client = crate::async_rt::http_client_h1();
     let req = match method {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),

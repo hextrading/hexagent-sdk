@@ -21,9 +21,11 @@ use crate::async_rt;
 pub fn http_request(method: &str, url: &str) -> Result<String> {
     let url = url.to_string();
     let method = method.to_string();
-    // ALPN-negotiating client (h1.1/h2 via TLS handshake) — safe default for
-    // hosts whose h2 support is unknown; see hyperliquid::info for context.
-    let client = async_rt::http_client_auto();
+    // HTTP/1.1-only client — Aster's h2 frontend is broken for signed
+    // requests: byte-identical orders get a spurious `-2019 Margin is
+    // insufficient` over h2 but succeed over h1.1 (curl-verified
+    // 2026-07-05). ALPN would negotiate h2, so it must be disabled.
+    let client = async_rt::http_client_h1();
     async_rt::block_on_runtime(async move {
         let req = match method.as_str() {
             "GET" => client.get(&url),

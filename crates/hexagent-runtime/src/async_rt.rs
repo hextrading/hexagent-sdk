@@ -201,6 +201,7 @@ static HTTP_CLIENT_QUERY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Auto-negotiating client (ALPN h2/h1) for endpoints that may not speak
 /// HTTP/2 prior-knowledge (e.g. some public Polygon RPCs).
 static HTTP_CLIENT_AUTO: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+static HTTP_CLIENT_H1: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 /// Spawn the async runtime on a dedicated OS thread. Idempotent — safe to
 /// call multiple times; only the first call has effect. Must be invoked
@@ -286,6 +287,8 @@ pub fn init() -> Result<()> {
 
     HTTP_CLIENT_AUTO.set(Arc::new(build_http_client_auto()?))
         .map_err(|_| anyhow!("auto HTTP client already initialised"))?;
+    HTTP_CLIENT_H1.set(Arc::new(build_http_client_h1()?))
+        .map_err(|_| anyhow!("h1 HTTP client already initialised"))?;
     RUNTIME_HANDLE.set(handle)
         .map_err(|_| anyhow!("runtime handle already initialised"))?;
     Ok(())
@@ -357,6 +360,16 @@ pub fn http_clients_all() -> Vec<Arc<reqwest::Client>> {
 /// not speak HTTP/2 prior-knowledge (public Polygon RPCs, etc).
 pub fn http_client_auto() -> Arc<reqwest::Client> {
     HTTP_CLIENT_AUTO.get().expect("async_rt::init() not called").clone()
+}
+
+/// Get the HTTP/1.1-only client. Use for endpoints whose HTTP/2 frontend is
+/// broken server-side: Aster's `fapi` returns spurious `-2019 Margin is
+/// insufficient` for signed orders sent over h2 while the byte-identical
+/// request succeeds over h1.1 (verified with curl --http1.1 vs --http2,
+/// 2026-07-05). ALPN would happily negotiate h2 there, so this client
+/// disables it outright.
+pub fn http_client_h1() -> Arc<reqwest::Client> {
+    HTTP_CLIENT_H1.get().expect("async_rt::init() not called").clone()
 }
 
 /// Sync convenience: GET `url` as text via the shared h2 client and runtime.
@@ -532,6 +545,21 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
 /// so `http2_prior_knowledge` would cause an immediate protocol error. The pool
 /// / timeout config mirrors the primary client so we still get connection reuse
 /// and TLS session caching.
+/// Build an HTTP/1.1-only client (h2 disabled even if the server offers it
+/// via ALPN). See `http_client_h1` for why Aster needs this.
+fn build_http_client_h1() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .http1_only()
+        .pool_idle_timeout(Duration::from_secs(300))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(800))
+        .build()
+        .context("build h1 reqwest client")
+}
+
 fn build_http_client_auto() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(300))
