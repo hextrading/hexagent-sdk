@@ -19,6 +19,7 @@ use crate::config::{Config, RunMode};
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::polymarket::{PolymarketMarket, PolymarketTrade};
+use crate::exchange::aster::AsterTrade;
 use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::{ExchangeMarket, ExchangeTrade};
 use crate::recorder::{MarketRecorder, MarketReplayer};
@@ -2947,6 +2948,7 @@ impl Engine {
                         "polymarket" => Exchange::Polymarket,
                         "hexmarket" => Exchange::Hexmarket,
                         "hyperliquid" => Exchange::Hyperliquid,
+                        "aster" => Exchange::Aster,
                         other => {
                             error!("Unknown exchange: {}", other);
                             return;
@@ -3012,6 +3014,18 @@ impl Engine {
                                     .to_string()
                             };
                             Box::new(crate::exchange::hyperliquid::HyperliquidMarket::new(&ws))
+                        }
+                        "aster" => {
+                            // Resolve WS host: explicit override, else the
+                            // network (mainnet/testnet) default.
+                            let ws = if !cfg.wss_url.is_empty() {
+                                cfg.wss_url.clone()
+                            } else {
+                                crate::exchange::aster::auth::Network::from_str(&cfg.network)
+                                    .ws_base()
+                                    .to_string()
+                            };
+                            Box::new(crate::exchange::aster::AsterMarket::new(&ws))
                         }
                         _ => return,
                     };
@@ -4208,6 +4222,9 @@ struct LiveRouter {
     /// Hyperliquid executor — `None` unless an enabled `[[exchanges]]`
     /// `hyperliquid` block is present (and its meta fetch succeeded).
     hyperliquid: Option<HyperliquidTrade>,
+    /// Aster executor — `None` unless an enabled `[[exchanges]]` `aster`
+    /// block is present (and its exchangeInfo fetch succeeded).
+    aster: Option<AsterTrade>,
 }
 
 impl LiveRouter {
@@ -4324,6 +4341,62 @@ impl LiveRouter {
             }
         };
 
+        // Build the Aster executor. Credentials come from
+        // `[aster.<account_id>]` in secrets.toml, keyed by the first enabled
+        // astermaker strategy's `account_id` (fallback `instance_id`);
+        // non-secret settings (network / host overrides) come from the
+        // `[[exchanges]] aster` block. exchangeInfo (tick/step size) is
+        // fetched once here; any failure logs and leaves the venue disabled
+        // rather than aborting the engine.
+        let aster = {
+            let as_cfg = config.exchanges.iter().find(|e| e.name == "aster" && e.enabled);
+            let acct = config
+                .strategies
+                .iter()
+                .find(|s| s.enabled && s.name == "astermaker")
+                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+            match (as_cfg, acct) {
+                (Some(ax), Some(acct)) if !acct.is_empty() => {
+                    let secrets = crate::config::SecretsFile::load_from_config(config);
+                    match secrets.aster.get(&acct) {
+                        Some(cred) => match crate::exchange::aster::auth::AsterAuth::new(
+                            &cred.private_key,
+                            &cred.user_address,
+                            &ax.network,
+                            &ax.api_url_prefix,
+                            &ax.wss_url,
+                        ) {
+                            Ok(auth) => match crate::exchange::aster::info::fetch_meta(&auth.rest_base()) {
+                                Ok(meta) => {
+                                    info!(
+                                        "[Aster] executor ready (account_id={}, network={}, user={}, signer={})",
+                                        acct, ax.network, auth.user_address, auth.signer_address,
+                                    );
+                                    Some(AsterTrade::new(auth, meta, &acct))
+                                }
+                                Err(e) => {
+                                    error!("[Aster] exchangeInfo fetch failed, venue disabled: {}", e);
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                error!("[Aster] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                None
+                            }
+                        },
+                        None => {
+                            error!(
+                                "[Aster] no `[aster.{}]` block in secrets — venue disabled",
+                                acct,
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
         Self {
             binance: BinanceTrade::new(),
             poly_routes,
@@ -4332,6 +4405,7 @@ impl LiveRouter {
             hexmarket: HexmarketTrade::new(hex_private_key, hex_mnemonic, hex_api_host,
                 hex_cfg.map(|e| e.rate_limit_per_second).unwrap_or(10)),
             hyperliquid,
+            aster,
         }
     }
 
@@ -4377,6 +4451,14 @@ impl LiveRouter {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("hyperliquid venue not configured/enabled"))
     }
+
+    /// The Aster executor, or a clear error if the venue isn't
+    /// configured/enabled.
+    fn aster_mut(&mut self) -> Result<&mut AsterTrade> {
+        self.aster
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("aster venue not configured/enabled"))
+    }
 }
 
 impl ExchangeTrade for LiveRouter {
@@ -4386,6 +4468,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Polymarket => self.poly_mut()?.submit_order(order),
             Exchange::Hexmarket => self.hexmarket.submit_order(order),
             Exchange::Hyperliquid => self.hl_mut()?.submit_order(order),
+            Exchange::Aster => self.aster_mut()?.submit_order(order),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", order.exchange)),
         }
     }
@@ -4396,6 +4479,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Polymarket => self.poly_mut()?.cancel_order(exchange, client_order_id),
             Exchange::Hexmarket => self.hexmarket.cancel_order(exchange, client_order_id),
             Exchange::Hyperliquid => self.hl_mut()?.cancel_order(exchange, client_order_id),
+            Exchange::Aster => self.aster_mut()?.cancel_order(exchange, client_order_id),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4406,6 +4490,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Polymarket => self.poly_mut()?.cancel_all(exchange, symbol),
             Exchange::Hexmarket => self.hexmarket.cancel_all(exchange, symbol),
             Exchange::Hyperliquid => self.hl_mut()?.cancel_all(exchange, symbol),
+            Exchange::Aster => self.aster_mut()?.cancel_all(exchange, symbol),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4416,6 +4501,7 @@ impl ExchangeTrade for LiveRouter {
                 Exchange::Hexmarket => self.hexmarket.batch_submit_orders(market_id, orders),
                 Exchange::Polymarket => self.poly_mut()?.batch_submit_orders(market_id, orders),
                 Exchange::Hyperliquid => self.hl_mut()?.batch_submit_orders(market_id, orders),
+                Exchange::Aster => self.aster_mut()?.batch_submit_orders(market_id, orders),
                 _ => {
                     let mut updates = Vec::new();
                     for order in orders {
@@ -4434,6 +4520,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Hexmarket => self.hexmarket.batch_cancel_orders(exchange, market_id, client_order_ids),
             Exchange::Polymarket => self.poly_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             Exchange::Hyperliquid => self.hl_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
+            Exchange::Aster => self.aster_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             _ => {
                 let mut updates = Vec::new();
                 for id in client_order_ids {
@@ -4461,6 +4548,9 @@ impl ExchangeTrade for LiveRouter {
                 exchange, market_id, cancel_client_order_ids, place_orders,
             ),
             Exchange::Hyperliquid => self.hl_mut()?.batch_update_orders(
+                exchange, market_id, cancel_client_order_ids, place_orders,
+            ),
+            Exchange::Aster => self.aster_mut()?.batch_update_orders(
                 exchange, market_id, cancel_client_order_ids, place_orders,
             ),
             _ => {
