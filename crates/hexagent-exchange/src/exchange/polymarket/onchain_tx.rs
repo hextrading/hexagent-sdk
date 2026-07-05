@@ -500,23 +500,16 @@ pub(super) fn polygon_rpc_urls() -> Result<Vec<String>> {
 }
 
 /// Dedicated RPC HTTP client with timeouts bigger than the shared
-/// `http_client_auto`. On Polygon, public RPCs occasionally take
-/// >800 ms just to accept the TCP connection, and a full JSON-RPC
-/// round trip can take 2-3 seconds on contested endpoints. The shared
-/// `http_client_auto` is tuned for internal endpoints with tight SLAs
-/// (connect 800 ms, total 5 s) — too aggressive here.
-fn rpc_http_client() -> &'static reqwest::Client {
+/// h1.1 pools. On Polygon, public RPCs occasionally take >800 ms just
+/// to accept the TCP connection, and a full JSON-RPC round trip can
+/// take 2-3 seconds on contested endpoints — the pool budgets
+/// (connect 2 s, total ≤5 s) are too aggressive here.
+pub(crate) fn rpc_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            // ALPN negotiate (public RPCs vary; some h2, some h1)
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(4)
-            .tcp_keepalive(Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
+        // h1.1-only via the shared pool builder (HTTP/2 is gone from the
+        // codebase; every public RPC speaks h1.1), with RPC-sized budgets.
+        crate::http1_pool::build_client(Duration::from_secs(15), Duration::from_secs(5))
             .expect("build rpc http client")
     })
 }

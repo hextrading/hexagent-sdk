@@ -153,8 +153,8 @@ fn fetch_api_credentials(signing_key: &SigningKey, api_url_prefix: &str) -> Resu
         "signature": api_key_sig,
     }).to_string();
 
-    // Route through the shared runtime + auto-negotiating reqwest client.
-    let client = crate::async_rt::http_client_auto();
+    // Route through the shared runtime + h1.1 Query pool (one-shot call).
+    let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
     let bearer = format!("Bearer {}", auth_token);
     let creds: CreateApiKeyResponse = crate::async_rt::block_on_runtime(async move {
         let resp = client.post(&url)

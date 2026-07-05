@@ -18,10 +18,9 @@ pub fn post_info<T: for<'de> Deserialize<'de> + Send + 'static>(
     body: serde_json::Value,
 ) -> Result<T> {
     let url = info_url.to_string();
-    // ALPN-negotiating client: Hyperliquid's REST does NOT support h2 prior
-    // knowledge (the `http_client_query`/`_fast` pools use it for Polymarket's
-    // h2-only hosts), so those clients fail with "error sending request".
-    let client = async_rt::http_client_auto();
+    // Shared h1.1 Query pool. (Historical: HL rejects h2 prior knowledge —
+    // moot now that the whole codebase is HTTP/1.1-only.)
+    let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
     async_rt::block_on_runtime(async move {
         let resp = client
             .post(&url)

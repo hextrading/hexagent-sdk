@@ -1,12 +1,14 @@
 //! Role-separated **HTTP/1.1** client pools with prewarm + keep-warm.
 //!
-//! Shared transport layer for every REST venue (Polymarket CLOB, Aster
-//! fapi, …). Replaces the former HTTP/2 prior-knowledge pools in
-//! `async_rt` — Aster's h2 frontend is outright broken for signed
-//! requests (spurious `-2019`), and running one venue on h1.1 and
-//! another on h2 splits the transport story for no benefit, so both
-//! venues now share this module (the ALPN `http_client_auto` remains
-//! for Hyperliquid / Polygon RPC).
+//! Shared transport layer for **all** REST traffic (Polymarket CLOB,
+//! Aster fapi, Hyperliquid, Lighter, Hexmarket, Chainlink, …).
+//! Replaces the former HTTP/2 prior-knowledge pools and the ALPN
+//! auto-negotiating client in `async_rt` — Aster's h2 frontend is
+//! outright broken for signed requests (spurious `-2019`), h2 buys
+//! nothing over per-role h1.1 pools, and ALPN could silently negotiate
+//! h2 wherever a server offers it. HTTP/2 is gone from the codebase;
+//! endpoints needing bespoke timeouts (public Polygon RPCs) build a
+//! standalone h1.1 client via [`build_client`].
 //!
 //! ## Model
 //!
@@ -154,6 +156,23 @@ static RR_QUERY: AtomicUsize = AtomicUsize::new(0);
 /// client's primary connection plus one burst spare; the long
 /// `pool_idle_timeout` is a backstop — keep-warm traffic normally touches
 /// every client well inside it.
+/// Build a standalone HTTP/1.1-only client with custom timeouts, for
+/// endpoints whose latency profile doesn't fit the shared pools (e.g.
+/// public Polygon RPCs: multi-second JSON-RPC round trips). Same h1.1 /
+/// keepalive / nodelay stance as the pool clients.
+pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .http1_only()
+        .pool_idle_timeout(Duration::from_secs(300))
+        .pool_max_idle_per_host(2)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .timeout(total_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .context("build custom h1 reqwest client")
+}
+
 fn build_h1_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .http1_only()

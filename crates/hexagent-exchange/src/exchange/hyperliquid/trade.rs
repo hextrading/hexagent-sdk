@@ -63,8 +63,9 @@ impl HyperliquidTrade {
         None // master/EOA account signing; subaccounts/vaults not used
     }
 
-    /// Sign `action` and POST `{action, nonce, signature, vaultAddress}`.
-    fn send_signed<T: serde::Serialize>(&mut self, action: &T) -> Result<ExchangeResponse> {
+    /// Sign `action` and POST `{action, nonce, signature, vaultAddress}` on
+    /// the given role pool (orders → Fast, cancels → Cancel).
+    fn send_signed<T: serde::Serialize>(&mut self, role: crate::http1_pool::Role, action: &T) -> Result<ExchangeResponse> {
         let nonce = self.next_nonce();
         let is_mainnet = self.auth.network.is_mainnet();
         let sig = sign_l1_action(&self.auth.key, action, self.vault(), nonce, None, is_mainnet)?;
@@ -75,9 +76,7 @@ impl HyperliquidTrade {
             "vaultAddress": self.vault(),
         });
         let url = self.auth.exchange_url();
-        // ALPN-negotiating client — see info.rs: HL REST rejects h2 prior
-        // knowledge, so the Polymarket-tuned `http_client_fast` pool fails.
-        let client = async_rt::http_client_auto();
+        let client = crate::http1_pool::client(role);
         let text = async_rt::block_on_runtime(async move {
             let resp = client
                 .post(&url)
@@ -164,7 +163,7 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
             builder: None,
         };
 
-        let resp = self.send_signed(&action)?;
+        let resp = self.send_signed(crate::http1_pool::Role::Fast, &action)?;
         let status = resp.first_status()?;
         Ok(status.into_order_update(order, order.quantity))
     }
@@ -187,7 +186,7 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
             ty: "cancelByCloid".to_string(),
             cancels: vec![CancelCloidWire { asset, cloid }],
         };
-        let resp = self.send_signed(&action)?;
+        let resp = self.send_signed(crate::http1_pool::Role::Cancel, &action)?;
         let ok = resp.cancel_ok();
         // Prune so the map doesn't grow unbounded across replace cycles.
         self.coid_asset.remove(client_order_id);
@@ -232,7 +231,7 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
                     ty: "cancel".to_string(),
                     cancels: prev.iter().map(|o| CancelWire { a: asset, o: *o }).collect(),
                 };
-                if let Err(e) = self.send_signed(&action) {
+                if let Err(e) = self.send_signed(crate::http1_pool::Role::Cancel, &action) {
                     warn!("[Hyperliquid] replace cancel of {} prev oids failed: {}", prev.len(), e);
                 }
             }
@@ -257,7 +256,7 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
             ty: "cancel".to_string(),
             cancels: open.iter().map(|(oid, _)| CancelWire { a: asset, o: *oid }).collect(),
         };
-        let resp = self.send_signed(&action)?;
+        let resp = self.send_signed(crate::http1_pool::Role::Cancel, &action)?;
         let ok = resp.cancel_ok();
         let mut updates = Vec::new();
         for (_oid, cloid) in open {

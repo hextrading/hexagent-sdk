@@ -385,7 +385,7 @@ pub fn fetch_price_at_timestamp(
     let ts_ms_s = ts_ms.clone();
 
     let body = crate::async_rt::block_on_runtime(async move {
-        let client = crate::async_rt::http_client_auto();
+        let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
         let resp = client
             .get(&url)
             .header("Authorization", &api_key_s)

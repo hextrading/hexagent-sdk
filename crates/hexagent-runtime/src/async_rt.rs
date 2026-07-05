@@ -44,8 +44,6 @@
 //!
 //!     Round-robin within each pool spreads concurrent traffic across
 //!     distinct TCP connections so packet loss on one doesn't stall others.
-//!   - `HTTP_CLIENT_AUTO`: ALPN-negotiating single client for endpoints
-//!     that don't speak h2 prior-knowledge (public Polygon RPCs).
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -176,9 +174,6 @@ pub fn current_cancel_timeout() -> Duration {
     Duration::from_millis(load_timeout_or(CANCEL_DEFAULT_TIMEOUT_MS))
 }
 
-/// Auto-negotiating client (ALPN h2/h1) for endpoints that may not speak
-/// HTTP/2 prior-knowledge (e.g. some public Polygon RPCs).
-static HTTP_CLIENT_AUTO: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 /// Spawn the async runtime on a dedicated OS thread. Idempotent — safe to
 /// call multiple times; only the first call has effect. Must be invoked
@@ -230,8 +225,6 @@ pub fn init() -> Result<()> {
     // can override DOWN to the configured value.
     crate::http1_pool::init_pools()?;
 
-    HTTP_CLIENT_AUTO.set(Arc::new(build_http_client_auto()?))
-        .map_err(|_| anyhow!("auto HTTP client already initialised"))?;
     RUNTIME_HANDLE.set(handle)
         .map_err(|_| anyhow!("runtime handle already initialised"))?;
     Ok(())
@@ -285,12 +278,6 @@ pub fn http_client() -> Arc<reqwest::Client> {
 /// not just one.
 pub fn http_clients_all() -> Vec<Arc<reqwest::Client>> {
     crate::http1_pool::clients_all()
-}
-
-/// Get the auto-negotiating (ALPN) HTTP client. Use for endpoints that may
-/// not speak HTTP/2 prior-knowledge (public Polygon RPCs, etc).
-pub fn http_client_auto() -> Arc<reqwest::Client> {
-    HTTP_CLIENT_AUTO.get().expect("async_rt::init() not called").clone()
 }
 
 /// Get the HTTP/1.1-only client. Use for endpoints whose HTTP/2 frontend is
@@ -415,61 +402,6 @@ where
     rx.blocking_recv().expect("async task dropped before sending")
 }
 
-/// Build an HTTP/2 client tuned for CLOB / data-api / gamma-api.
-///
-/// The per-request `timeout` is the only knob that varies across roles;
-/// everything else (TLS, h2 keepalives, connection pool) is identical so
-/// each role's TCP connections behave the same once warm.
-///
-/// Config rationale:
-///   * `http2_prior_knowledge()` — all Polymarket hosts support h2;
-///     skipping ALPN saves one RTT on first connect.
-///   * `http2_adaptive_window(true)` — hyper dynamically enlarges the
-///     stream / connection receive windows under load. Without this,
-///     larger responses (open-order snapshots, book replays) can stall
-///     on flow control even when bandwidth is free.
-///   * `http2_keep_alive_interval(5s)` — PINGs every 5 s so a dead peer
-///     is noticed within the PING-ACK timeout instead of waiting for
-///     the next real request to time out.
-///   * `http2_keep_alive_timeout(5s)` — PING-ACK deadline; exceeding it
-///     kills the connection so the pool reconnects rather than stalling
-///     on a silently-dropped session.
-///   * `http2_keep_alive_while_idle(true)` — PINGs even when no streams
-///     are open, so the pool doesn't let an idle h2 connection rot.
-///   * `pool_idle_timeout(300s)` + `pool_max_idle_per_host(4)` — reqwest
-///     evicts a connection from the pool after this many seconds of no
-///     in-flight requests. h2 PINGs at the protocol layer keep the
-///     socket alive but do NOT reset the pool's idle timer, so during
-///     quiet periods a connection can be alive at the wire but evicted
-///     at the pool. 5 min is comfortably longer than any plausible
-///     trading-quiet stretch within an event; combined with the
-///     heartbeat loop fanning out across every pool every 10 s, no
-///     client should ever pay handshake cost on a real order.
-///   * `tcp_nodelay(true)` — disable Nagle; we send small frames and
-///     want them out immediately.
-///   * `tcp_keepalive(30s)` — NAT / LB friendly.
-///   * `timeout` — per-role; callers pass the deadline that matches the
-///     endpoint's latency budget (fast=500ms, cancel=500ms,
-///     reconcile=1000ms, query=5000ms).
-///   * `connect_timeout(500ms)` — handshake must complete promptly; we
-///     prewarm at startup so this is only hit on reconnect / dead pool.
-/// Build an ALPN-negotiating HTTP client (h2 or h1 per server support).
-///
-/// Used for Polygon RPC endpoints — many public RPCs still only speak HTTP/1.1,
-/// so `http2_prior_knowledge` would cause an immediate protocol error. The pool
-/// / timeout config mirrors the primary client so we still get connection reuse
-/// and TLS session caching.
-fn build_http_client_auto() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(300))
-        .pool_max_idle_per_host(4)
-        .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_millis(800))
-        .build()
-        .context("build auto reqwest client")
-}
 
 #[cfg(test)]
 mod tests {
