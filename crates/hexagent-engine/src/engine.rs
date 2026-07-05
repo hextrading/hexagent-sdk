@@ -4096,7 +4096,9 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 return vec![build_exec_rejected_cancel(client_order_id, exchange)];
             }
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).cancel_order(exchange, &client_order_id)
+                let route = executor.poly_route_mut(&instance_id);
+                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log line
+                route.cancel_order(exchange, &client_order_id)
             } else {
                 executor.cancel_order(exchange, &client_order_id)
             };
@@ -4138,8 +4140,9 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                     .collect();
             }
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id)
-                    .batch_cancel_orders(exchange, &market_id, &client_order_ids)
+                let route = executor.poly_route_mut(&instance_id);
+                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                route.batch_cancel_orders(exchange, &market_id, &client_order_ids)
             } else {
                 executor.batch_cancel_orders(exchange, &market_id, &client_order_ids)
             };
@@ -4160,7 +4163,9 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 return out;
             }
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).batch_update_orders(
+                let route = executor.poly_route_mut(&instance_id);
+                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                route.batch_update_orders(
                     exchange, &market_id, &cancel_client_order_ids, &place_orders,
                 )
             } else {
@@ -4185,7 +4190,9 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 return out;
             }
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).replace_order(
+                let route = executor.poly_route_mut(&instance_id);
+                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                route.replace_order(
                     exchange, &market_id, &cancel_client_order_ids, &place_orders,
                 )
             } else {
