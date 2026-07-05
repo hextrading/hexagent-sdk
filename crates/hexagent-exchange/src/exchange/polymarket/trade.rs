@@ -562,12 +562,10 @@ async fn execute_http(
     path: String,
     headers: super::auth::AuthHeaders,
     body: String,
-    client_override: Option<std::sync::Arc<reqwest::Client>>,
 ) -> HttpReply {
-    // `client_override` forces this request onto a specific connection pool
-    // (used by the serial-replace path to ride the cancel connection); when
-    // None we fall back to the per-(method,path) role-isolated client.
-    let client = client_override.unwrap_or_else(|| pick_client(&method, &path));
+    // Per-(method,path) role-isolated client (FAST for places, CANCEL for
+    // deletes, …) — see `pick_client`.
+    let client = pick_client(&method, &path);
     let req_timeout = per_request_timeout(&method, &path);
     let mut req = client.request(method.clone(), &url)
         .header("Content-Type", "application/json")
@@ -1116,7 +1114,7 @@ impl SharedState {
             let tx_a = reply_tx.clone();
             let iid_a = self.instance_id.clone();
             async_rt::handle().spawn(async move {
-                let reply = execute_http(method_owned.clone(), url_owned, path_owned.clone(), headers, body_owned, None).await;
+                let reply = execute_http(method_owned.clone(), url_owned, path_owned.clone(), headers, body_owned).await;
                 // POST /order dedup guard: if THIS leg lost the race to
                 // server (the hedge created the order first), the server
                 // returned 400 "Duplicated" — never let that reply win
@@ -1180,7 +1178,7 @@ impl SharedState {
                 // the hedge needs its own headers (re-using primary's headers
                 // would risk the server rejecting on stale timestamp).
                 let headers_b = auth.sign_request(method_b.as_str(), &path_b, &body_b);
-                let reply = execute_http(method_b.clone(), url_b, path_b.clone(), headers_b, body_b, None).await;
+                let reply = execute_http(method_b.clone(), url_b, path_b.clone(), headers_b, body_b).await;
                 // POST /order dedup guard (mirror of the primary leg's
                 // check): the hedge can't be allowed to win with a 400
                 // Duplicated, otherwise the strategy mis-classifies an
@@ -1216,58 +1214,6 @@ impl SharedState {
         }
 
         reply_rx
-    }
-
-    /// Serial multi-request dispatch on ONE connection, in order, with **no
-    /// hedge**. `requests` are sent (cancels first, then places — the caller's
-    /// vector order) inside a SINGLE task via `join_all`, which polls the
-    /// futures in order: request[0]'s frame is written to the shared
-    /// connection's send buffer before request[1]'s, so the cancel bytes reach
-    /// the wire before the place bytes — without waiting for any reply (all
-    /// responses are then awaited concurrently). Returns one reply receiver per
-    /// request, in the same order. h2 still multiplexes streams server-side, so
-    /// this makes the cancel→place arrival order deterministic but the server's
-    /// *processing* order best-effort.
-    pub(crate) fn http_call_async_serial(
-        &self,
-        client: std::sync::Arc<reqwest::Client>,
-        requests: Vec<(reqwest::Method, String, String)>,
-    ) -> Vec<crossbeam_channel::Receiver<HttpReply>> {
-        let mut rxs = Vec::with_capacity(requests.len());
-        let mut futs = Vec::with_capacity(requests.len());
-        for (method, path, body) in requests {
-            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-            rxs.push(reply_rx);
-            let stage = http_stage(method.as_str(), &path);
-            let rec_kind = latency_record_kind(method.as_str(), &path);
-            let headers = self.auth.sign_request(method.as_str(), &path, &body);
-            let url = format!("{}{}", self.clob_base_url, path);
-            let iid = self.instance_id.clone();
-            let client_c = client.clone();
-            let t_start = crate::latency::Instant::now();
-            futs.push(async move {
-                let reply = execute_http(method.clone(), url, path.clone(), headers, body, Some(client_c)).await;
-                if is_dedup_reject_post(&method, &path, &reply) {
-                    log::debug!("[PolymarketTrade] (serial) discarded Duplicated 400");
-                    return;
-                }
-                let rec = rec_kind
-                    .filter(|_| crate::latency_record::is_active())
-                    .map(|k| (k, latency_record_status(&reply)));
-                if reply_tx.try_send(reply).is_ok() {
-                    crate::latency::record(stage, t_start);
-                    if let Some((k, status)) = rec {
-                        crate::latency_record::record(
-                            &iid, k, t_start.elapsed().as_secs_f64() * 1000.0, status,
-                        );
-                    }
-                }
-            });
-        }
-        async_rt::handle().spawn(async move {
-            futures_util::future::join_all(futs).await;
-        });
-        rxs
     }
 
     /// Synchronous variant — dispatches and blocks on the reply. Used by
@@ -2880,8 +2826,8 @@ impl PolymarketTrade {
     /// Synchronous prep for a cancel: resolve the server orderID, build the
     /// `CancelCtx` (for reply handling), and return the DELETE body string
     /// (or `None` when the coid has no local orderID → nothing to send).
-    /// Split out of `cancel_kickoff` so the serial-replace path can prep a
-    /// cancel and dispatch it inside the combined cancel→place task.
+    /// Prep half of `cancel_kickoff`: resolve the server orderID + tracked
+    /// symbol/side and build the DELETE body (None = nothing to send).
     pub(crate) fn cancel_prep(&mut self, client_order_id: &str) -> (CancelCtx, Option<String>) {
         let order_id = self.shared.coid_to_oid.lock().unwrap()
             .get(client_order_id).cloned();
@@ -2903,92 +2849,6 @@ impl PolymarketTrade {
                 (ctx, None)
             }
         }
-    }
-
-    /// Serial-replace dispatch (single-endpoint mode): write ALL cancels
-    /// before ALL places on ONE connection, in a single `join_all` task, so
-    /// the server sees cancel→place arrival order — without waiting for any
-    /// cancel ack. Prep (sign / orderID lookup / open_orders) happens
-    /// synchronously here (via `cancel_prep` / `submit_prep`); only the HTTP
-    /// sends are combined into the ordered task. Replies are drained and run
-    /// through the same `handle_cancel_reply` / `handle_submit_reply` as the
-    /// parallel path, so all downstream bookkeeping is identical.
-    pub(crate) fn dispatch_single_endpoint_serial(
-        &mut self,
-        exchange: Exchange,
-        cancel_client_order_ids: &[String],
-        place_orders: &[OrderRequest],
-    ) -> Result<Vec<OrderUpdate>> {
-        let cancel_client = async_rt::http_client_cancel();
-        let mut updates: Vec<OrderUpdate> = Vec::with_capacity(
-            cancel_client_order_ids.len() + place_orders.len(),
-        );
-        // Requests in wire order: cancels first, then places.
-        let mut serial_reqs: Vec<(reqwest::Method, String, String)> = Vec::new();
-
-        // ── Prep cancels: those with a server orderID go on the wire (in
-        //    send order); those without resolve immediately as Cancelled. ──
-        let mut cancel_send: Vec<(usize, CancelCtx)> = Vec::new();
-        let mut cancel_immediate: Vec<(usize, CancelCtx)> = Vec::new();
-        for (idx, coid) in cancel_client_order_ids.iter().enumerate() {
-            let (ctx, body) = self.cancel_prep(coid);
-            match body {
-                Some(b) => {
-                    serial_reqs.push((reqwest::Method::DELETE, "/order".to_string(), b));
-                    cancel_send.push((idx, ctx));
-                }
-                None => cancel_immediate.push((idx, ctx)),
-            }
-        }
-        let n_cancel_send = cancel_send.len();
-
-        // ── Prep places: Ok → on the wire (after the cancels); pre-flight
-        //    reject (rate-limit / backoff / sign) → fill the slot now. ──
-        let mut place_send: Vec<usize> = Vec::new();
-        let mut place_local_oids: Vec<String> = Vec::new();
-        let mut place_slots: Vec<Option<OrderUpdate>> =
-            (0..place_orders.len()).map(|_| None).collect();
-        for (idx, o) in place_orders.iter().enumerate() {
-            match self.submit_prep(o) {
-                Ok((local_oid, body)) => {
-                    serial_reqs.push((reqwest::Method::POST, "/order".to_string(), body));
-                    place_send.push(idx);
-                    place_local_oids.push(local_oid);
-                }
-                Err(rejected) => place_slots[idx] = Some(rejected),
-            }
-        }
-
-        // ── ONE task: cancels' frames written before places' on the cancel
-        //    connection, no ack wait. `rxs` parallels `serial_reqs`. ──
-        let rxs = self.shared.http_call_async_serial(cancel_client, serial_reqs);
-
-        // Drain cancels (first n_cancel_send receivers), then no-orderID
-        // cancels (resolved with no reply), then places.
-        for (i, (idx, ctx)) in cancel_send.into_iter().enumerate() {
-            let reply = rxs[i].recv()
-                .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
-            updates.push(self.handle_cancel_reply(
-                exchange, &cancel_client_order_ids[idx], ctx, Some(reply),
-            ));
-        }
-        for (idx, ctx) in cancel_immediate {
-            updates.push(self.handle_cancel_reply(
-                exchange, &cancel_client_order_ids[idx], ctx, None,
-            ));
-        }
-        for (k, idx) in place_send.into_iter().enumerate() {
-            let reply = rxs[n_cancel_send + k].recv()
-                .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
-            place_slots[idx] = Some(self.handle_submit_reply(
-                &place_orders[idx], &place_local_oids[k], reply,
-            ));
-        }
-        for slot in place_slots {
-            if let Some(u) = slot { updates.push(u); }
-        }
-
-        Ok(updates)
     }
 
     /// Parse the `DELETE /order` reply (or absence thereof) and build
@@ -3681,25 +3541,22 @@ impl ExchangeTrade for PolymarketTrade {
 
         // Single-endpoint mode (`use_batch_orders=false`).
         //
-        // Serial replace: when this batch carries BOTH a cancel and a place
-        // (= a reprice / replace), write all cancels before all places on ONE
-        // http connection in a single task (no ack wait between them) so the
-        // server sees cancel→place arrival order — closing the
-        // place-before-cancel double-commit window that causes SELL
-        // `balance:0` rejects. This is the "same http channel, sequential"
-        // path the strategy's per-leg replace (active==1) relies on.
-        //
-        // Single-leg ops (cancel-only or place-only) take the parallel,
-        // role-isolated path below: cancels on the CANCEL pool, places on the
-        // FAST pool, kicked off concurrently then drained. Critical path ≈
+        // FULLY CONCURRENT dispatch — cancels AND places kicked off together,
+        // no ordering between them: cancels ride the CANCEL pool, places the
+        // FAST pool (disjoint h1.1 connections), so every request of a
+        // two-leg replace is on the wire immediately after signing and the
+        // signal→wire delay is just the per-request prep. Critical path ≈
         // max(single RTT).
+        //
+        // History: until 2026-07 a replace (both cancels and places in one
+        // batch) took a SERIAL path (all cancels written before all places
+        // on one connection) to make cancel→place arrival order
+        // deterministic and close the place-before-cancel double-commit
+        // window (SELL `balance:0` rejects). That ordering was dropped by
+        // operator decision for latency — on h1.1 it cost a full extra RTT
+        // per replace. The double-commit window (~one RTT) is back and is
+        // accepted: balance backoff + the reconciler absorb the fallout.
         if !self.shared.use_batch_orders {
-            if !cancel_client_order_ids.is_empty() && !place_orders.is_empty() {
-                return self.dispatch_single_endpoint_serial(
-                    exchange, cancel_client_order_ids, place_orders,
-                );
-            }
-
             let mut updates: Vec<OrderUpdate> = Vec::with_capacity(
                 cancel_client_order_ids.len() + place_orders.len(),
             );

@@ -79,12 +79,11 @@ pub enum Signal {
         /// Strategy instance ID — see [`Signal::BatchNewOrders.instance_id`].
         instance_id: String,
     },
-    /// Replace order(s) — a reprice: cancel-then-place dispatched as one
+    /// Replace order(s) — a reprice: cancel + place dispatched as one
     /// operation. First-class peer of `NewOrder` (place) / `CancelOrder`
-    /// (cancel). For Polymarket in single-endpoint mode this routes to the
-    /// serial "all cancels then all places on one connection, no ack wait"
-    /// path (see `ExchangeTrade::replace_order` →
-    /// `dispatch_single_endpoint_serial`). Same field shape as
+    /// (cancel). Live venues dispatch the cancels and places fully
+    /// concurrently on disjoint connection pools (no ordering between
+    /// them — see `ExchangeTrade::replace_order`). Same field shape as
     /// `BatchUpdateOrders`; processed identically by the sim fill path.
     ReplaceOrder {
         exchange: Exchange,
