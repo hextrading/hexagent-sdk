@@ -1272,6 +1272,30 @@ pub struct AsterSecrets {
     pub private_key: String,
 }
 
+/// Per-account Lighter (zkLighter) credentials. Loaded from the
+/// `[lighter.<account_id>]` block in `secrets.toml`; the litmaker strategy
+/// references it via its `account_id` (falling back to `instance_id`).
+///
+/// `private_key` is the 40-byte hex **API-key private key** (an ECgFp5
+/// scalar generated and registered via the official Lighter SDKs — NOT an
+/// Ethereum key). `account_index` / `api_key_index` identify the L2 account
+/// and the key slot the pubkey was registered under (slots 0-3 are reserved
+/// for the web/mobile UI; use 4+ for bots). Non-secret settings (network,
+/// host overrides, symbols) stay in the `[[exchanges]] lighter` block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LighterSecrets {
+    #[serde(default)]
+    pub private_key: String,
+    #[serde(default = "default_lighter_account_index")]
+    pub account_index: i64,
+    #[serde(default)]
+    pub api_key_index: u8,
+}
+
+fn default_lighter_account_index() -> i64 {
+    -1 // sentinel: must be set explicitly
+}
+
 /// Polymarket Builder relayer credentials (`[builder]`). Drives the
 /// gasless relayer path (deploy / approvals / redeem / split). Mirrors the
 /// `POLY_BUILDER_*` env vars.
@@ -1351,6 +1375,10 @@ pub struct SecretsFile {
     /// (`[aster.<account_id>]`). Referenced by astermaker strategies.
     #[serde(default)]
     pub aster: HashMap<String, AsterSecrets>,
+    /// Per-account Lighter credentials, keyed by `account_id`
+    /// (`[lighter.<account_id>]`). Referenced by litmaker strategies.
+    #[serde(default)]
+    pub lighter: HashMap<String, LighterSecrets>,
     #[serde(default)]
     pub builder: Option<BuilderSecrets>,
     #[serde(default)]

@@ -20,6 +20,7 @@ pub enum Exchange {
     Hexmarket,
     Hyperliquid,
     Aster,
+    Lighter,
 }
 
 impl fmt::Display for Exchange {
@@ -38,6 +39,7 @@ impl fmt::Display for Exchange {
             Exchange::Hexmarket => write!(f, "hexmarket"),
             Exchange::Hyperliquid => write!(f, "hyperliquid"),
             Exchange::Aster => write!(f, "aster"),
+            Exchange::Lighter => write!(f, "lighter"),
         }
     }
 }
@@ -58,6 +60,7 @@ impl Exchange {
             "hexmarket" => Some(Exchange::Hexmarket),
             "hyperliquid" => Some(Exchange::Hyperliquid),
             "aster" | "asterdex" => Some(Exchange::Aster),
+            "lighter" | "zklighter" => Some(Exchange::Lighter),
             _ => None,
         }
     }

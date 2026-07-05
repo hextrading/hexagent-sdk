@@ -46,6 +46,9 @@ base64 = "0.22"
 quanta = "0.12"
 libc = "0.2"
 rand = "0.8"
+# lighter ECgFp5 scalar arithmetic (vendored crypto module)
+num-bigint = "0.4"
+num-traits = "0.2"
 simd-json = { version = "0.14", features = ["serde_impl"] }
 
 [dev-dependencies]

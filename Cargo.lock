@@ -1107,6 +1107,8 @@ dependencies = [
  "k256",
  "libc",
  "log",
+ "num-bigint",
+ "num-traits",
  "parquet",
  "prost",
  "quanta",

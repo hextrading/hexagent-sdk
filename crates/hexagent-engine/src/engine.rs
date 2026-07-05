@@ -21,6 +21,7 @@ use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::polymarket::{PolymarketMarket, PolymarketTrade};
 use crate::exchange::aster::AsterTrade;
 use crate::exchange::hyperliquid::HyperliquidTrade;
+use crate::exchange::lighter::LighterTrade;
 use crate::exchange::{ExchangeMarket, ExchangeTrade};
 use crate::recorder::{MarketRecorder, MarketReplayer};
 use crate::strategy::Strategy;
@@ -2949,6 +2950,7 @@ impl Engine {
                         "hexmarket" => Exchange::Hexmarket,
                         "hyperliquid" => Exchange::Hyperliquid,
                         "aster" => Exchange::Aster,
+                        "lighter" => Exchange::Lighter,
                         other => {
                             error!("Unknown exchange: {}", other);
                             return;
@@ -3026,6 +3028,30 @@ impl Engine {
                                     .to_string()
                             };
                             Box::new(crate::exchange::aster::AsterMarket::new(&ws))
+                        }
+                        "lighter" => {
+                            // Resolve hosts: explicit override, else the
+                            // network (mainnet/testnet) default. Market ids
+                            // come from a one-shot orderBookDetails fetch.
+                            let net = crate::exchange::lighter::auth::Network::from_str(&cfg.network);
+                            let rest = if !cfg.api_url_prefix.is_empty() {
+                                cfg.api_url_prefix.trim_end_matches('/').to_string()
+                            } else {
+                                net.rest_base().to_string()
+                            };
+                            let ws = if !cfg.wss_url.is_empty() {
+                                cfg.wss_url.clone()
+                            } else {
+                                net.ws_url().to_string()
+                            };
+                            let meta = match crate::exchange::lighter::info::fetch_meta(&rest) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    error!("[Lighter] orderBookDetails fetch failed, feed disabled: {}", e);
+                                    return;
+                                }
+                            };
+                            Box::new(crate::exchange::lighter::LighterMarket::new(&ws, meta))
                         }
                         _ => return,
                     };
@@ -4225,6 +4251,9 @@ struct LiveRouter {
     /// Aster executor — `None` unless an enabled `[[exchanges]]` `aster`
     /// block is present (and its exchangeInfo fetch succeeded).
     aster: Option<AsterTrade>,
+    /// Lighter executor — `None` unless an enabled `[[exchanges]]` `lighter`
+    /// block is present (and its orderBookDetails fetch succeeded).
+    lighter: Option<LighterTrade>,
 }
 
 impl LiveRouter {
@@ -4397,6 +4426,63 @@ impl LiveRouter {
             }
         };
 
+        // Build the Lighter executor. Credentials come from
+        // `[lighter.<account_id>]` in secrets.toml, keyed by the first
+        // enabled litmaker strategy's `account_id` (fallback `instance_id`);
+        // non-secret settings (network / host overrides) come from the
+        // `[[exchanges]] lighter` block. orderBookDetails (market ids +
+        // price/size decimals) is fetched once here; any failure logs and
+        // leaves the venue disabled rather than aborting the engine.
+        let lighter = {
+            let lt_cfg = config.exchanges.iter().find(|e| e.name == "lighter" && e.enabled);
+            let acct = config
+                .strategies
+                .iter()
+                .find(|s| s.enabled && s.name == "litmaker")
+                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+            match (lt_cfg, acct) {
+                (Some(lt), Some(acct)) if !acct.is_empty() => {
+                    let secrets = crate::config::SecretsFile::load_from_config(config);
+                    match secrets.lighter.get(&acct) {
+                        Some(cred) => match crate::exchange::lighter::auth::LighterAuth::new(
+                            &cred.private_key,
+                            cred.account_index,
+                            cred.api_key_index,
+                            &lt.network,
+                            &lt.api_url_prefix,
+                            &lt.wss_url,
+                        ) {
+                            Ok(auth) => match crate::exchange::lighter::info::fetch_meta(&auth.rest_base()) {
+                                Ok(meta) => {
+                                    info!(
+                                        "[Lighter] executor ready (account_id={}, network={}, account_index={}, api_key_index={})",
+                                        acct, lt.network, auth.account_index(), auth.api_key_index(),
+                                    );
+                                    Some(LighterTrade::new(auth, meta, &acct))
+                                }
+                                Err(e) => {
+                                    error!("[Lighter] orderBookDetails fetch failed, venue disabled: {}", e);
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                error!("[Lighter] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                None
+                            }
+                        },
+                        None => {
+                            error!(
+                                "[Lighter] no `[lighter.{}]` block in secrets — venue disabled",
+                                acct,
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
         Self {
             binance: BinanceTrade::new(),
             poly_routes,
@@ -4406,6 +4492,7 @@ impl LiveRouter {
                 hex_cfg.map(|e| e.rate_limit_per_second).unwrap_or(10)),
             hyperliquid,
             aster,
+            lighter,
         }
     }
 
@@ -4459,6 +4546,14 @@ impl LiveRouter {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("aster venue not configured/enabled"))
     }
+
+    /// The Lighter executor, or a clear error if the venue isn't
+    /// configured/enabled.
+    fn lighter_mut(&mut self) -> Result<&mut LighterTrade> {
+        self.lighter
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("lighter venue not configured/enabled"))
+    }
 }
 
 impl ExchangeTrade for LiveRouter {
@@ -4469,6 +4564,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Hexmarket => self.hexmarket.submit_order(order),
             Exchange::Hyperliquid => self.hl_mut()?.submit_order(order),
             Exchange::Aster => self.aster_mut()?.submit_order(order),
+            Exchange::Lighter => self.lighter_mut()?.submit_order(order),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", order.exchange)),
         }
     }
@@ -4480,6 +4576,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Hexmarket => self.hexmarket.cancel_order(exchange, client_order_id),
             Exchange::Hyperliquid => self.hl_mut()?.cancel_order(exchange, client_order_id),
             Exchange::Aster => self.aster_mut()?.cancel_order(exchange, client_order_id),
+            Exchange::Lighter => self.lighter_mut()?.cancel_order(exchange, client_order_id),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4491,6 +4588,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Hexmarket => self.hexmarket.cancel_all(exchange, symbol),
             Exchange::Hyperliquid => self.hl_mut()?.cancel_all(exchange, symbol),
             Exchange::Aster => self.aster_mut()?.cancel_all(exchange, symbol),
+            Exchange::Lighter => self.lighter_mut()?.cancel_all(exchange, symbol),
             _ => Err(anyhow::anyhow!("Trading not supported on {:?}", exchange)),
         }
     }
@@ -4502,6 +4600,7 @@ impl ExchangeTrade for LiveRouter {
                 Exchange::Polymarket => self.poly_mut()?.batch_submit_orders(market_id, orders),
                 Exchange::Hyperliquid => self.hl_mut()?.batch_submit_orders(market_id, orders),
                 Exchange::Aster => self.aster_mut()?.batch_submit_orders(market_id, orders),
+                Exchange::Lighter => self.lighter_mut()?.batch_submit_orders(market_id, orders),
                 _ => {
                     let mut updates = Vec::new();
                     for order in orders {
@@ -4521,6 +4620,7 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Polymarket => self.poly_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             Exchange::Hyperliquid => self.hl_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             Exchange::Aster => self.aster_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
+            Exchange::Lighter => self.lighter_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
             _ => {
                 let mut updates = Vec::new();
                 for id in client_order_ids {
@@ -4551,6 +4651,9 @@ impl ExchangeTrade for LiveRouter {
                 exchange, market_id, cancel_client_order_ids, place_orders,
             ),
             Exchange::Aster => self.aster_mut()?.batch_update_orders(
+                exchange, market_id, cancel_client_order_ids, place_orders,
+            ),
+            Exchange::Lighter => self.lighter_mut()?.batch_update_orders(
                 exchange, market_id, cancel_client_order_ids, place_orders,
             ),
             _ => {
