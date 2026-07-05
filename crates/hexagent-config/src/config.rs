@@ -1253,6 +1253,25 @@ pub struct HyperliquidSecrets {
     pub private_key: String,
 }
 
+/// Per-account Aster (asterdex) credentials. Loaded from the
+/// `[aster.<account_id>]` block in `secrets.toml`; the astermaker strategy
+/// references it via its `account_id` (falling back to `instance_id`).
+///
+/// `user_address` is the main (login) wallet address the account trades
+/// under; `private_key` is the **API agent wallet** key created at
+/// https://www.asterdex.com/en/api-wallet (Pro API). The signer address is
+/// derived from the key; the server maps signer → user from the agent
+/// registration, so requests carry only `signer` + `nonce` + `signature`.
+/// Non-secret settings (network, host overrides, symbols) stay in the
+/// `[[exchanges]] aster` block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AsterSecrets {
+    #[serde(default)]
+    pub user_address: String,
+    #[serde(default)]
+    pub private_key: String,
+}
+
 /// Polymarket Builder relayer credentials (`[builder]`). Drives the
 /// gasless relayer path (deploy / approvals / redeem / split). Mirrors the
 /// `POLY_BUILDER_*` env vars.
@@ -1328,6 +1347,10 @@ pub struct SecretsFile {
     /// (`[hyperliquid.<account_id>]`). Referenced by hypermaker strategies.
     #[serde(default)]
     pub hyperliquid: HashMap<String, HyperliquidSecrets>,
+    /// Per-account Aster credentials, keyed by `account_id`
+    /// (`[aster.<account_id>]`). Referenced by astermaker strategies.
+    #[serde(default)]
+    pub aster: HashMap<String, AsterSecrets>,
     #[serde(default)]
     pub builder: Option<BuilderSecrets>,
     #[serde(default)]
