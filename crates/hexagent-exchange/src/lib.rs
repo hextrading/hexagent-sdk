@@ -18,7 +18,7 @@
 pub use hexagent_types::types;
 pub use hexagent_config::config;
 pub use hexagent_account::account;
-pub use hexagent_runtime::{async_rt, latency, latency_record, os_tune};
+pub use hexagent_runtime::{async_rt, http1_pool, latency, latency_record, os_tune};
 
 pub mod exchange;
 pub mod recorder;

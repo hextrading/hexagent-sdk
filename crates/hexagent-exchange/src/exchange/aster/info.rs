@@ -15,37 +15,52 @@ use serde::Deserialize;
 
 use crate::async_rt;
 
-/// Blocking HTTP request with params already encoded into `url`. Returns the
-/// response body; non-2xx → error with body text (Aster errors are
+/// Async HTTP request through an explicit client (role-picked by the
+/// caller) with params already encoded into `url`. Returns the response
+/// body; non-2xx → error with body text (Aster errors are
 /// `{"code":-XXXX,"msg":"…"}`).
-pub fn http_request(method: &str, url: &str) -> Result<String> {
+///
+/// All Aster REST goes through the shared **HTTP/1.1** role pools
+/// (`http1_pool`) — Aster's h2 frontend is broken for signed requests:
+/// byte-identical orders get a spurious `-2019 Margin is insufficient`
+/// over h2 but succeed over h1.1 (curl-verified 2026-07-05).
+pub async fn http_request_async(
+    client: std::sync::Arc<reqwest::Client>,
+    method: &str,
+    url: &str,
+) -> Result<String> {
+    let req = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        m => return Err(anyhow!("aster: unsupported HTTP method {}", m)),
+    };
+    let resp = req
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await
+        .map_err(|e| anyhow!("{} {}: {}", method, url, e))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| anyhow!("read body: {}", e))?;
+    if !status.is_success() {
+        return Err(anyhow!("{} {} -> {}: {}", method, url, status, text));
+    }
+    Ok(text)
+}
+
+/// Blocking HTTP request on the given role pool.
+pub fn http_request_role(role: crate::http1_pool::Role, method: &str, url: &str) -> Result<String> {
     let url = url.to_string();
     let method = method.to_string();
-    // HTTP/1.1-only client — Aster's h2 frontend is broken for signed
-    // requests: byte-identical orders get a spurious `-2019 Margin is
-    // insufficient` over h2 but succeed over h1.1 (curl-verified
-    // 2026-07-05). ALPN would negotiate h2, so it must be disabled.
-    let client = async_rt::http_client_h1();
-    async_rt::block_on_runtime(async move {
-        let req = match method.as_str() {
-            "GET" => client.get(&url),
-            "POST" => client.post(&url),
-            "PUT" => client.put(&url),
-            "DELETE" => client.delete(&url),
-            m => return Err(anyhow!("aster: unsupported HTTP method {}", m)),
-        };
-        let resp = req
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send()
-            .await
-            .map_err(|e| anyhow!("{} {}: {}", method, url, e))?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| anyhow!("read body: {}", e))?;
-        if !status.is_success() {
-            return Err(anyhow!("{} {} -> {}: {}", method, url, status, text));
-        }
-        Ok::<String, anyhow::Error>(text)
-    })
+    let client = crate::http1_pool::client(role);
+    async_rt::block_on_runtime(async move { http_request_async(client, &method, &url).await })
+}
+
+/// Blocking HTTP request on the Query pool — metadata / snapshots /
+/// account reads (non-hot-path default).
+pub fn http_request(method: &str, url: &str) -> Result<String> {
+    http_request_role(crate::http1_pool::Role::Query, method, url)
 }
 
 /// `http_request` + JSON parse.
