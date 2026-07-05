@@ -133,13 +133,9 @@ impl RestProbeResult {
 async fn probe_rest_liveness(rest_base: &str, futures: bool) -> RestProbeResult {
     let ping_path = if futures { "/fapi/v1/ping" } else { "/api/v3/ping" };
     let url = format!("{}{}", rest_base, ping_path);
-    let client = match reqwest::Client::builder()
-        .timeout(REST_PROBE_TIMEOUT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return RestProbeResult::Failed,
-    };
+    // Shared h1.1 Query pool; the outer tokio timeout enforces the probe
+    // budget (tighter than the pool client's own ceiling).
+    let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
     match tokio::time::timeout(REST_PROBE_TIMEOUT, client.get(&url).send()).await {
         Ok(Ok(resp)) if resp.status().is_success() => RestProbeResult::Ok,
         Ok(Ok(_)) => RestProbeResult::Failed,   // non-2xx

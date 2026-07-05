@@ -16,7 +16,7 @@ use crate::async_rt;
 
 /// Blocking GET returning the parsed JSON body after the `code` check.
 pub fn get_json<T: for<'de> Deserialize<'de> + Send + 'static>(url: String) -> Result<T> {
-    let client = async_rt::http_client_auto();
+    let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
     async_rt::block_on_runtime(async move {
         let resp = client
             .get(&url)

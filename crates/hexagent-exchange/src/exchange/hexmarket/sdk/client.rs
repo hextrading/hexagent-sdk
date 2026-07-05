@@ -121,7 +121,13 @@ impl HexClient {
             None
         };
 
-        let client = crate::async_rt::http_client_auto();
+        // Role by method: places → Fast, cancels → Cancel, reads → Query
+        // (shared h1.1 pools).
+        let client = crate::http1_pool::client(match method {
+            reqwest::Method::POST => crate::http1_pool::Role::Fast,
+            reqwest::Method::DELETE => crate::http1_pool::Role::Cancel,
+            _ => crate::http1_pool::Role::Query,
+        });
         let stage = hex_http_stage(method.as_str(), path);
         let t_start = crate::latency::Instant::now();
         let result = crate::async_rt::block_on_runtime(async move {

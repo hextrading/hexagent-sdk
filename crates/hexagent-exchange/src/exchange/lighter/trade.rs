@@ -104,7 +104,7 @@ impl LighterTrade {
             ("tx_type", tx.tx_type.to_string()),
             ("tx_info", tx.tx_info.clone()),
         ];
-        let client = async_rt::http_client_auto();
+        let client = crate::http1_pool::client(crate::http1_pool::Role::Fast);
         let result = async_rt::block_on_runtime(async move {
             let resp = client
                 .post(&url)

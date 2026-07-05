@@ -327,7 +327,7 @@ async fn heartbeat_loop(
 ) {
     let n_clients = async_rt::http_clients_all().len();
     info!(
-        "[PolyHeartbeat] Started (interval={}s, transport=h2, fan_out={} clients)",
+        "[PolyHeartbeat] Started (interval={}s, transport=h1.1, fan_out={} clients)",
         HEARTBEAT_INTERVAL.as_secs(), n_clients,
     );
     const SUMMARY_TICKS: u32 = 30;
@@ -1459,7 +1459,7 @@ impl PolymarketTrade {
         // gamma-api) plus the Polygon RPC, so TLS + h2 handshakes complete
         // before the first real request.
         let start = std::time::Instant::now();
-        info!("[PolymarketTrade] Pre-warming h2 connections (clob/data-api/gamma-api + polygon-rpc)...");
+        info!("[PolymarketTrade] Pre-warming h1.1 connections (clob/data-api/gamma-api + polygon-rpc)...");
 
         let auth = self.shared.auth.clone();
         let heartbeat_headers = auth.sign_request("POST", "/heartbeats", "");
@@ -1474,7 +1474,9 @@ impl PolymarketTrade {
         let primaries = crate::async_rt::http_clients_all().to_vec();
         let n_primaries = primaries.len();
         async_rt::block_on_runtime(async move {
-            let auto = crate::async_rt::http_client_auto();
+            // Warm the dedicated Polygon RPC client (the one on-chain reads
+            // actually use — formerly this warmed the retired ALPN client).
+            let rpc = super::onchain_tx::rpc_http_client().clone();
             let h = heartbeat_headers;
 
             let mut tasks: Vec<tokio::task::JoinHandle<(std::time::Duration, String, std::result::Result<u16, String>)>> =
@@ -1527,7 +1529,7 @@ impl PolymarketTrade {
                 }));
             }
 
-            // Polygon RPC: tiny eth_chainId call via auto (ALPN) client.
+            // Polygon RPC: tiny eth_chainId call via the dedicated RPC client.
             tasks.push(tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
                 let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
@@ -1535,7 +1537,7 @@ impl PolymarketTrade {
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
-                let r = auto.post(&url)
+                let r = rpc.post(&url)
                     .header("Content-Type", "application/json")
                     .body(body)
                     .send().await;
