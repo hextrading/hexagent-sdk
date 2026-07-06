@@ -59,3 +59,24 @@ pub fn fetch_positions(auth: &AsterAuth) -> Result<HashMap<String, Position>> {
     }
     Ok(positions)
 }
+
+// ── balances ──────────────────────────────────────────────────────
+
+/// One asset's wallet balance from `GET /fapi/v3/balance` (signed).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AsterBalance {
+    pub asset: String,
+    /// Wallet balance (string decimal, exchange precision).
+    pub balance: String,
+    /// Balance available for new orders (margin not locked).
+    #[serde(default, rename = "availableBalance")]
+    pub available_balance: String,
+}
+
+/// Fetch per-asset futures wallet balances for the account behind `auth`.
+pub fn fetch_balances(auth: &AsterAuth) -> Result<Vec<AsterBalance>> {
+    let query = signed_query(auth, Vec::new())?;
+    let url = format!("{}?{}", auth.fapi_url("balance"), query);
+    let text = http_request("GET", &url)?;
+    serde_json::from_str(&text).map_err(|e| anyhow!("parse balance: {} — body: {}", e, text))
+}
