@@ -609,6 +609,7 @@ impl OrderManager {
                         instance_id: self.instance_id.clone(),
                         fee_rate_bps: self.fee_rate_bps,
                         post_only,
+                        reduce_only: false,
                         outcome_label: String::new(),
                     }));
                 }

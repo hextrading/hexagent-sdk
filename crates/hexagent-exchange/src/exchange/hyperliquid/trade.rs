@@ -155,7 +155,7 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
                 b: is_buy,
                 p: px_str,
                 s: sz_str,
-                r: false,
+                r: order.reduce_only,
                 t: OrderTypeWire { limit: LimitWire { tif } },
                 c: cloid,
             }],

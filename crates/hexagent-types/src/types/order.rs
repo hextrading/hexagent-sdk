@@ -88,6 +88,12 @@ pub struct OrderRequest {
     /// If true, order is post-only (maker only, rejected if it would cross spread).
     #[serde(default = "default_true_fn")]
     pub post_only: bool,
+    /// If true, the order may only reduce (never increase or flip) the current
+    /// position — the venue caps/rejects the portion that would open. Used for
+    /// flatten / close-only quotes so they can't overshoot into the opposite
+    /// side. Venues that don't support it ignore the flag. Default false.
+    #[serde(default)]
+    pub reduce_only: bool,
     /// Optional human-readable label for the outcome / token this order
     /// targets (e.g. "Up", "Down"). Populated by the strategy before
     /// emission; empty for exchanges / strategies that don't need it.
@@ -164,6 +170,7 @@ impl OrderRequest {
             instance_id: String::new(),
             fee_rate_bps: 0,
             post_only: true,
+            reduce_only: false,
             outcome_label: String::new(),
         }
     }
@@ -186,6 +193,7 @@ impl OrderRequest {
             instance_id: String::new(),
             fee_rate_bps: 0,
             post_only: false, // market orders are not post-only
+            reduce_only: false,
             outcome_label: String::new(),
         }
     }

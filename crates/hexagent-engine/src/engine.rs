@@ -4833,6 +4833,7 @@ mod market_router_tests {
             instance_id: instance_id.into(),
             fee_rate_bps: 0,
             post_only: true,
+            reduce_only: false,
             outcome_label: "Up".into(),
         }
     }

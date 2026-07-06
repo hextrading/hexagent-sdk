@@ -962,6 +962,7 @@ mod tests {
             instance_id: String::new(),
             fee_rate_bps: 0,
             post_only: true,
+            reduce_only: false,
             outcome_label: String::new(),
         })
     }
