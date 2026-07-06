@@ -1710,6 +1710,7 @@ mod tests {
             instance_id: "iid".into(),
             fee_rate_bps: 0,
             post_only,
+            reduce_only: false,
             outcome_label: String::new(),
         }
     }
