@@ -222,7 +222,7 @@ impl super::super::ExchangeTrade for LighterTrade {
             is_ask: matches!(order.side, Side::Sell),
             order_type,
             time_in_force: tif,
-            reduce_only: false,
+            reduce_only: order.reduce_only,
             trigger_price: 0,
             order_expiry,
             nonce,

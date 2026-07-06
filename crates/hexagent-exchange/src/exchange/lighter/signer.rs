@@ -403,6 +403,19 @@ mod tests {
         assert!(v.get("SignedHash").is_none());
     }
 
+    /// reduce_only passes through to both the signed hash and the JSON wire.
+    #[test]
+    fn reduce_only_in_hash_and_json() {
+        let s = test_signer();
+        let mut p = kat_create_params();
+        let plain = s.sign_create_order(&p).unwrap();
+        p.reduce_only = true;
+        let ro = s.sign_create_order(&p).unwrap();
+        assert_ne!(plain.tx_hash, ro.tx_hash, "reduce_only must be part of the signed hash");
+        let v: serde_json::Value = serde_json::from_str(&ro.tx_info).unwrap();
+        assert_eq!(v["ReduceOnly"].as_i64().unwrap(), 1);
+    }
+
     /// Auth token format: `{deadline}:{account}:{apikey}:{160-hex-sig}`.
     #[test]
     fn auth_token_format() {
