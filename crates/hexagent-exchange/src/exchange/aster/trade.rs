@@ -103,6 +103,13 @@ impl AsterTrade {
             params.push(("price", self.fmt_price(&symbol, price)));
         }
         params.push(("quantity", self.fmt_qty(&symbol, order.quantity)));
+        // Reduce-only: the venue caps/rejects any portion that would open or
+        // flip the position — exchange-side backstop for flatten/close-only
+        // orders. One-way position mode only (hedge mode expresses this via
+        // positionSide, which we don't use).
+        if order.reduce_only {
+            params.push(("reduceOnly", "true".to_string()));
+        }
         params.push(("newClientOrderId", order.client_order_id.clone()));
         // RESULT: MARKET returns the final FILLED state, LIMIT-with-special-
         // TIF the final status — saves a round-trip vs the default ACK.

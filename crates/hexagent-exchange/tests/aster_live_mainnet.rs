@@ -75,4 +75,24 @@ fn mainnet_balance_place_cancel() {
         !open.iter().any(|x| x.get("orderId").and_then(|v| v.as_u64()).map(|n| n.to_string()) == Some(oid.clone())),
         "cancelled order must be gone"
     );
+
+    // ── 4. reduce-only from a FLAT position must be rejected (-2022) —
+    //       proves the flag actually reaches the venue and is enforced. ──
+    // Price must stay inside the ±2% PERCENT_PRICE band or the filter
+    // rejects (-4024) before the reduce-only check is reached.
+    let mut ro = OrderRequest::new_limit(
+        Exchange::Aster, SYMBOL.to_string(), Side::Sell, best_bid * 0.999, SZ,
+    );
+    ro.order_type = OrderType::Fak; // IOC
+    ro.post_only = false;
+    ro.reduce_only = true;
+    ro.instance_id = "livetest".to_string();
+    let u = tr.submit_order(&ro).expect("reduce-only submit");
+    println!("[4] reduce-only from flat -> {:?} err={:?}", u.status, u.error);
+    assert_eq!(u.status, OrderStatus::Rejected, "reduce-only from flat must reject");
+    assert!(
+        u.error.as_deref().unwrap_or("").contains("-2022")
+            || u.error.as_deref().unwrap_or("").to_lowercase().contains("reduceonly"),
+        "expected ReduceOnly rejection, got {:?}", u.error
+    );
 }
