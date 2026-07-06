@@ -30,6 +30,36 @@ struct LighterPosition {
 struct LighterAccount {
     #[serde(default)]
     positions: Vec<LighterPosition>,
+    #[serde(default)]
+    available_balance: String,
+    #[serde(default)]
+    collateral: String,
+}
+
+/// Account balance snapshot (USDC).
+#[derive(Debug, Clone, Default)]
+pub struct Balance {
+    /// Free collateral (not tied up as margin).
+    pub available_balance: f64,
+    /// Total collateral.
+    pub collateral: f64,
+}
+
+/// Fetch the USDC balance for `account_index`.
+pub fn fetch_balance(rest_base: &str, account_index: i64) -> Result<Balance> {
+    let resp: AccountResponse = get_json(format!(
+        "{}/api/v1/account?by=index&value={}",
+        rest_base, account_index
+    ))?;
+    let account = resp
+        .accounts
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("lighter: account {} not found", account_index))?;
+    Ok(Balance {
+        available_balance: account.available_balance.parse().unwrap_or(0.0),
+        collateral: account.collateral.parse().unwrap_or(0.0),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

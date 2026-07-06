@@ -18,4 +18,4 @@ pub mod position;
 
 pub use market::HyperliquidMarket;
 pub use trade::HyperliquidTrade;
-pub use position::fetch_positions;
+pub use position::{fetch_balance, fetch_positions};
