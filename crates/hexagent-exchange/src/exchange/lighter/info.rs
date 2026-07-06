@@ -39,6 +39,36 @@ pub fn get_json<T: for<'de> Deserialize<'de> + Send + 'static>(url: String) -> R
     })
 }
 
+/// Blocking GET with a Lighter auth token (private endpoints, e.g.
+/// `accountActiveOrders`). Token from `LighterSigner::create_auth_token`.
+pub fn get_json_auth<T: for<'de> Deserialize<'de> + Send + 'static>(
+    url: String,
+    auth_token: String,
+) -> Result<T> {
+    let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
+    async_rt::block_on_runtime(async move {
+        let resp = client
+            .get(&url)
+            .header("authorization", &auth_token)
+            .send()
+            .await
+            .map_err(|e| anyhow!("GET {}: {}", url, e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| anyhow!("read body: {}", e))?;
+        if !status.is_success() {
+            return Err(anyhow!("GET {} -> {}: {}", url, status, text));
+        }
+        let code = serde_json::from_str::<ResultCode>(&text)
+            .map(|r| r.code)
+            .unwrap_or(200);
+        if code != 200 {
+            return Err(anyhow!("GET {} -> app code {}: {}", url, code, text));
+        }
+        serde_json::from_str::<T>(&text)
+            .map_err(|e| anyhow!("parse {} response: {} — body: {}", url, e, text))
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ResultCode {
     #[serde(default = "default_code")]
