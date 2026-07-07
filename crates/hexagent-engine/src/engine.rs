@@ -4285,19 +4285,22 @@ fn fire_or_execute(
                     return;
                 }
             };
-            // Fire the cancel (component 3 idle-gated hedge: race a second
-            // reserved Cancel connection only if one is free).
+            // Fire the cancel — NO hedge on the replace path. With Cancel=2 and
+            // two quoting legs (bid+ask) repricing each tick, the two legs' two
+            // primary cancels exactly fill the pool; a replace-cancel that also
+            // grabbed a hedge permit would take BOTH and starve the other leg's
+            // cancel → its stale order never gets pulled (live smoke 2026-07-07:
+            // single coids re-cancel-looped 24-40× → held live → adverse fills /
+            // one-sided inventory). Idle-hedge is kept only for standalone
+            // CancelOrder, which has no paired leg competing for the same tick.
             let cclient = cancel_permit.client().clone();
-            let hedge_permit = try_acquire(&iid, Role::Cancel);
-            let hedge_client = hedge_permit.as_ref().map(|p| p.client().clone());
             let route = worker.poly_route_mut(&iid);
             route.set_gen_ns_hint(timestamp_ns);
-            let cpending = route.cancel_fire(&coid, cclient, hedge_client);
+            let cpending = route.cancel_fire(&coid, cclient, None);
             let iid_c = iid.clone();
             let cf: PolyCompletionFn = Box::new(move |r| {
                 let u = r.poly_route_mut(&iid_c).complete_cancel(exchange, &coid, cpending);
                 drop(cancel_permit);
-                drop(hedge_permit);
                 vec![u]
             });
             let _ = done_tx.send((cf, utx.clone()));
