@@ -3742,28 +3742,29 @@ impl Engine {
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let mut poly_stats_handle: Option<thread::JoinHandle<()>> = None;
                 if !poly_states.is_empty() {
-                    // Per-(instance, role) admission pools. Fast=Cancel=2,
-                    // Reconcile=Query=1 per instance → 18 total for 3 instances,
-                    // matching the former global pool count. Concurrency is now
-                    // bounded by warm connections *per instance* (no cross-
-                    // instance preemption, no cold connection under overlap).
+                    // Per-(instance, role) admission pools. Fast=Cancel=3,
+                    // Reconcile=Query=1 per instance → 24 total for 3 instances
+                    // (up from 2/2=18, tuned 2026-07-07: at 2/2 wave-overlap when
+                    // RTT≳quote_interval skipped ~3% of cancels; a third warm
+                    // connection per side absorbs one extra overlapping wave).
+                    // Concurrency is bounded by warm connections *per instance*
+                    // (no cross-instance preemption, no cold connection).
+                    let sizes = hexagent_runtime::http1_pool::PoolSizes {
+                        fast: 3,
+                        cancel: 3,
+                        reconcile: 1,
+                        query: 1,
+                    };
                     let mut iids: Vec<String> = poly_states.keys().cloned().collect();
                     iids.sort();
-                    if let Err(e) = hexagent_runtime::http1_pool::init_instance_pools(
-                        &iids,
-                        hexagent_runtime::http1_pool::PoolSizes {
-                            fast: 2,
-                            cancel: 2,
-                            reconcile: 1,
-                            query: 1,
-                        },
-                    ) {
+                    if let Err(e) = hexagent_runtime::http1_pool::init_instance_pools(&iids, sizes) {
                         warn!("[Executor] per-instance admission pools not initialised: {}", e);
                     }
                     // One drainer per possible in-flight fired request
                     // (Σ per-instance fast+cancel) + slack, so a fired request
-                    // never waits for a drainer while holding its permit.
-                    let n_drainers = iids.len() * 4 + 4;
+                    // never waits for a drainer while holding its permit. Derived
+                    // from `sizes` so it auto-scales when the pool sizes change.
+                    let n_drainers = iids.len() * (sizes.fast + sizes.cancel) + 4;
                     for i in 0..n_drainers {
                         let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_done_rx.clone();
