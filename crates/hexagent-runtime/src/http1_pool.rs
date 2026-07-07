@@ -49,7 +49,8 @@
 //!   [`clients_all`], so it doubles as this venue's keep-warm — only
 //!   venues without such a loop (Aster) need `spawn_keep_warm`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -244,6 +245,17 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     all.extend(p.cancel.iter().cloned());
     all.extend(p.reconcile.iter().cloned());
     all.extend(p.query.iter().cloned());
+    // Include the per-instance admission-pool connections so prewarm /
+    // keep-warm / heartbeat fan-out holds them open too — they carry real
+    // order traffic but go idle between quote waves, and a cold reserved
+    // connection would defeat the whole point of admission control.
+    if let Some(m) = INSTANCE_POOLS.get() {
+        for inst in m.values() {
+            for rp in [&inst.fast, &inst.cancel, &inst.reconcile, &inst.query] {
+                all.extend(rp.slots.iter().map(|s| s.client.clone()));
+            }
+        }
+    }
     all
 }
 
@@ -316,6 +328,229 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
     });
 }
 
+// ══════════════════════════════════════════════════════════════════
+// Per-instance admission control
+// ══════════════════════════════════════════════════════════════════
+//
+// The role pools above are process-global and shared across strategy
+// instances; a request just round-robins a client and, if that client's
+// warm connection is busy, hyper opens a **cold** TCP+TLS connection.
+// Under wave-overlap or hedge doubling that produces cold-connection
+// storms exactly when the endpoint is already slow.
+//
+// This layer replaces "round-robin + hope" with explicit admission
+// control, per (instance, role):
+//
+//   * Each warm connection is a `Slot` with an exclusive `busy` flag.
+//     `try_acquire` hands out at most one in-flight request per slot, so
+//     a slot's single warm connection is **never double-dispatched** —
+//     no concurrency-driven cold connection is ever opened.
+//   * Pools are **per-instance**: instance A exhausting its Fast pool
+//     cannot starve or preempt instance B. Roles are independent too
+//     (a saturated Cancel pool never blocks a Fast placement).
+//   * When all slots are busy, `try_acquire` returns `None` and the
+//     caller **skips** (holds the quote) rather than cold-connecting.
+//   * `exempt_client` is the escape hatch for must-complete traffic
+//     (heartbeat / keep-warm / cancel-all): it always returns a client
+//     WITHOUT a permit, accepting a possible cold connection because
+//     *completing* the request matters more than avoiding one.
+
+/// One connection slot: a warm h1.1 client + an in-use flag. Held by at
+/// most one in-flight request at a time.
+struct Slot {
+    client: Arc<reqwest::Client>,
+    busy: Arc<AtomicBool>,
+}
+
+/// Admission permit: owns an exclusive slot's client for the duration of
+/// one request. Dropping it frees the slot for the next request.
+pub struct Permit {
+    flag: Arc<AtomicBool>,
+    client: Arc<reqwest::Client>,
+}
+
+impl Permit {
+    /// The reserved client — dispatch the request on this.
+    pub fn client(&self) -> &Arc<reqwest::Client> {
+        &self.client
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        // Release the slot. `Release` pairs with the `Acquire` in the
+        // next `try_acquire`'s successful CAS.
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// A pool of N slots for one (instance, role). Concurrency ceiling = N =
+/// warm-connection count.
+struct RolePool {
+    slots: Vec<Slot>,
+    rr: AtomicUsize, // round-robin cursor for exempt (no-permit) picks
+    acquires: AtomicU64,
+    skips: AtomicU64,
+}
+
+impl RolePool {
+    fn new(n: usize, timeout: Duration) -> Result<Self> {
+        let n = n.max(1);
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            slots.push(Slot {
+                client: Arc::new(build_h1_client(timeout)?),
+                busy: Arc::new(AtomicBool::new(false)),
+            });
+        }
+        Ok(Self {
+            slots,
+            rr: AtomicUsize::new(0),
+            acquires: AtomicU64::new(0),
+            skips: AtomicU64::new(0),
+        })
+    }
+
+    /// Reserve a free slot exclusively, or `None` if all are busy (caller
+    /// SKIPS — no cold connection is opened). Binds permit → slot → warm
+    /// connection so the connection is never used by two requests at once.
+    fn try_acquire(&self) -> Option<Permit> {
+        for s in &self.slots {
+            if s.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.acquires.fetch_add(1, Ordering::Relaxed);
+                return Some(Permit {
+                    flag: s.busy.clone(),
+                    client: s.client.clone(),
+                });
+            }
+        }
+        self.skips.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    /// Exempt path: a client via round-robin WITHOUT a permit. Always
+    /// returns — may cold-connect if every warm connection is busy. For
+    /// heartbeat / keep-warm / cancel-all only.
+    fn exempt_client(&self) -> Arc<reqwest::Client> {
+        let i = self.rr.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        self.slots[i].client.clone()
+    }
+
+    /// (acquires, skips, busy_now) for observability.
+    fn stats(&self) -> (u64, u64, usize) {
+        let busy = self
+            .slots
+            .iter()
+            .filter(|s| s.busy.load(Ordering::Relaxed))
+            .count();
+        (
+            self.acquires.load(Ordering::Relaxed),
+            self.skips.load(Ordering::Relaxed),
+            busy,
+        )
+    }
+}
+
+/// Independent Fast/Cancel/Reconcile/Query pools for one instance.
+struct InstancePools {
+    fast: RolePool,
+    cancel: RolePool,
+    reconcile: RolePool,
+    query: RolePool,
+}
+
+impl InstancePools {
+    fn role(&self, role: Role) -> &RolePool {
+        match role {
+            Role::Fast => &self.fast,
+            Role::Cancel => &self.cancel,
+            Role::Reconcile => &self.reconcile,
+            Role::Query => &self.query,
+        }
+    }
+}
+
+static INSTANCE_POOLS: OnceLock<HashMap<String, InstancePools>> = OnceLock::new();
+
+/// Build per-(instance, role) admission-controlled pools. `sizes` is the
+/// **per-instance** slot count for each role (not the global `2·M`
+/// figure). Each instance gets fully independent pools — no cross-instance
+/// sharing or preemption. Call once before use; later calls are ignored
+/// (first write wins) and return `Err`.
+pub fn init_instance_pools(instances: &[String], sizes: PoolSizes) -> Result<()> {
+    let mut map = HashMap::with_capacity(instances.len());
+    for id in instances {
+        map.insert(
+            id.clone(),
+            InstancePools {
+                fast: RolePool::new(sizes.fast, FAST_TIMEOUT_CEILING)?,
+                cancel: RolePool::new(sizes.cancel, CANCEL_TIMEOUT_CEILING)?,
+                reconcile: RolePool::new(sizes.reconcile, RECONCILE_TIMEOUT)?,
+                query: RolePool::new(sizes.query, QUERY_TIMEOUT)?,
+            },
+        );
+    }
+    INSTANCE_POOLS
+        .set(map)
+        .map_err(|_| anyhow::anyhow!("instance pools already initialised"))?;
+    log::info!(
+        "[http1_pool] per-instance pools initialised: {} instance(s) × (fast={} cancel={} reconcile={} query={})",
+        instances.len(),
+        sizes.fast,
+        sizes.cancel,
+        sizes.reconcile,
+        sizes.query,
+    );
+    Ok(())
+}
+
+/// True once `init_instance_pools` has run (per-instance admission is
+/// active). Callers fall back to the shared global pool when this is
+/// false (e.g. non-poly venues, paper/BT shims).
+pub fn instance_pools_ready() -> bool {
+    INSTANCE_POOLS.get().is_some()
+}
+
+/// Admission control: reserve a warm connection for `(instance, role)`.
+///   * `Some(permit)` → dispatch on `permit.client()`, release on drop.
+///   * `None`         → all warm connections busy OR unknown instance;
+///                      the caller must SKIP (no cold connection).
+pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
+    INSTANCE_POOLS.get()?.get(instance)?.role(role).try_acquire()
+}
+
+/// Exempt dispatch for must-complete traffic (heartbeat / keep-warm /
+/// cancel-all): never blocked by admission, may cold-connect. Falls back
+/// to the shared global pool when the instance is unknown / pools not yet
+/// initialised.
+pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
+    if let Some(p) = INSTANCE_POOLS.get().and_then(|m| m.get(instance)) {
+        return p.role(role).exempt_client();
+    }
+    client(role)
+}
+
+/// Observability snapshot: `(instance, role, acquires, skips, busy_now)`
+/// sorted by instance then role. Empty until `init_instance_pools` runs.
+pub fn admission_stats() -> Vec<(String, Role, u64, u64, usize)> {
+    let mut out = Vec::new();
+    if let Some(m) = INSTANCE_POOLS.get() {
+        let mut ids: Vec<&String> = m.keys().collect();
+        ids.sort();
+        for id in ids {
+            let p = &m[id];
+            for role in [Role::Fast, Role::Cancel, Role::Reconcile, Role::Query] {
+                let (a, s, b) = p.role(role).stats();
+                out.push((id.clone(), role, a, s, b));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +570,100 @@ mod tests {
     fn default_sizes_are_two() {
         let d = PoolSizes::default();
         assert_eq!((d.fast, d.cancel, d.reconcile, d.query), (2, 2, 2, 2));
+    }
+
+    // ── admission control ──────────────────────────────────────────
+
+    fn pool(n: usize) -> RolePool {
+        RolePool::new(n, Duration::from_millis(500)).unwrap()
+    }
+
+    fn inst(n: usize) -> InstancePools {
+        InstancePools {
+            fast: pool(n),
+            cancel: pool(n),
+            reconcile: pool(n),
+            query: pool(n),
+        }
+    }
+
+    #[test]
+    fn admission_acquire_exhaust_release() {
+        let p = pool(2);
+        let a = p.try_acquire();
+        let b = p.try_acquire();
+        assert!(a.is_some() && b.is_some(), "first 2 acquires succeed");
+        assert!(p.try_acquire().is_none(), "3rd acquire on a size-2 pool must skip");
+
+        let (acquires, skips, busy) = p.stats();
+        assert_eq!(busy, 2, "both slots busy");
+        assert_eq!(acquires, 2);
+        assert_eq!(skips, 1, "one skip recorded");
+
+        drop(a); // release one slot
+        assert!(
+            p.try_acquire().is_some(),
+            "a released slot must be reusable — no cold connection needed"
+        );
+    }
+
+    #[test]
+    fn admission_never_double_uses_a_slot() {
+        // The core no-cold-connection guarantee: a size-N pool hands out
+        // at most N concurrent permits, so N warm connections are never
+        // over-subscribed.
+        let p = pool(3);
+        let held: Vec<_> = (0..3).map(|_| p.try_acquire()).collect();
+        assert!(held.iter().all(|x| x.is_some()));
+        for _ in 0..10 {
+            assert!(p.try_acquire().is_none(), "never exceed N in-flight");
+        }
+        assert_eq!(p.stats().2, 3, "exactly N busy");
+    }
+
+    #[test]
+    fn admission_per_instance_isolation() {
+        let a = inst(1);
+        let b = inst(1);
+        let held = a.role(Role::Fast).try_acquire();
+        assert!(held.is_some());
+        assert!(
+            a.role(Role::Fast).try_acquire().is_none(),
+            "instance A's Fast pool is exhausted"
+        );
+        assert!(
+            b.role(Role::Fast).try_acquire().is_some(),
+            "instance B must be unaffected by A's exhaustion — no cross-instance preemption"
+        );
+    }
+
+    #[test]
+    fn admission_role_isolation() {
+        let i = inst(1);
+        let _fast = i.role(Role::Fast).try_acquire().unwrap();
+        assert!(
+            i.role(Role::Fast).try_acquire().is_none(),
+            "Fast exhausted"
+        );
+        assert!(
+            i.role(Role::Cancel).try_acquire().is_some(),
+            "Cancel pool is independent of Fast — a full place pool never blocks a cancel"
+        );
+        assert!(i.role(Role::Reconcile).try_acquire().is_some());
+        assert!(i.role(Role::Query).try_acquire().is_some());
+    }
+
+    #[test]
+    fn exempt_client_never_blocks() {
+        let p = pool(1);
+        let _held = p.try_acquire().unwrap(); // the only slot is busy
+        assert!(p.try_acquire().is_none(), "admission is exhausted");
+        // Exempt traffic (heartbeat / keep-warm / cancel-all) must still
+        // get a client even when every warm connection is busy.
+        let _c1 = p.exempt_client();
+        let _c2 = p.exempt_client();
+        // (returns without panicking is the assertion; may cold-connect
+        //  on actual send, which is the accepted trade for must-complete
+        //  traffic.)
     }
 }

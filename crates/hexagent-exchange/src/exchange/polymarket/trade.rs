@@ -564,8 +564,27 @@ async fn execute_http(
     body: String,
 ) -> HttpReply {
     // Per-(method,path) role-isolated client (FAST for places, CANCEL for
-    // deletes, …) — see `pick_client`.
+    // deletes, …) — see `pick_client`. The admission-control / fire-and-track
+    // path bypasses this round-robin pick and dispatches on a specific
+    // permit-reserved connection via `execute_http_on` instead, so a reserved
+    // warm connection is never skipped for a cold one.
     let client = pick_client(&method, &path);
+    execute_http_on(client, method, url, path, headers, body).await
+}
+
+/// Like [`execute_http`] but dispatches on an explicit `client` — one of a
+/// role pool's connections, typically the one reserved by an admission
+/// [`http1_pool::Permit`]. Threading the exact connection (rather than a
+/// fresh round-robin pick) is what lets the fire-and-track path guarantee a
+/// request runs on its reserved warm connection instead of opening a cold one.
+async fn execute_http_on(
+    client: std::sync::Arc<reqwest::Client>,
+    method: reqwest::Method,
+    url: String,
+    path: String,
+    headers: super::auth::AuthHeaders,
+    body: String,
+) -> HttpReply {
     let req_timeout = per_request_timeout(&method, &path);
     let mut req = client.request(method.clone(), &url)
         .header("Content-Type", "application/json")
@@ -1216,6 +1235,124 @@ impl SharedState {
         reply_rx
     }
 
+    /// Admission-bound, **un-hedged** variant of [`Self::http_call_async`]:
+    /// dispatches the request on the exact `client` reserved by an
+    /// [`crate::http1_pool::Permit`] (via [`execute_http_on`]) instead of a
+    /// round-robin pick. No hedge leg — hedging picks a *second* pool client,
+    /// which is incompatible with permit-bound dispatch and is re-introduced
+    /// (cancel-only, idle-only) at the admission layer. Returns immediately
+    /// with a receiver; the caller completes off-thread (fire-and-track).
+    pub(crate) fn http_call_async_on(
+        &self,
+        client: std::sync::Arc<reqwest::Client>,
+        hedge_client: Option<std::sync::Arc<reqwest::Client>>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> crossbeam_channel::Receiver<HttpReply> {
+        let method = match method {
+            "POST" => reqwest::Method::POST,
+            "DELETE" => reqwest::Method::DELETE,
+            "GET" => reqwest::Method::GET,
+            other => {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let _ = tx.send(Err(HttpErr::Other(format!("unsupported method: {}", other))));
+                return rx;
+            }
+        };
+        let stage = http_stage(method.as_str(), path);
+        let rec_kind = latency_record_kind(method.as_str(), path);
+        let t_start = crate::latency::Instant::now();
+        let url = format!("{}{}", self.clob_base_url, path);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+
+        // Primary leg on the reserved connection.
+        {
+            let headers = self.auth.sign_request(method.as_str(), path, body);
+            let method_a = method.clone();
+            let path_a = path.to_string();
+            let body_a = body.to_string();
+            let url_a = url.clone();
+            let tx_a = reply_tx.clone();
+            let iid_a = self.instance_id.clone();
+            async_rt::handle().spawn(async move {
+                let reply =
+                    execute_http_on(client, method_a.clone(), url_a, path_a.clone(), headers, body_a)
+                        .await;
+                // Mirror the hedged path's dedup guard so a stale server-side
+                // duplicate (e.g. a prior orphan retry) never wins as a Rejected.
+                if is_dedup_reject_post(&method_a, &path_a, &reply) {
+                    return;
+                }
+                let rec = rec_kind
+                    .filter(|_| crate::latency_record::is_active())
+                    .map(|k| (k, latency_record_status(&reply)));
+                if tx_a.try_send(reply).is_ok() {
+                    crate::latency::record(stage, t_start);
+                    if let Some((k, status)) = rec {
+                        crate::latency_record::record(
+                            &iid_a,
+                            k,
+                            t_start.elapsed().as_secs_f64() * 1000.0,
+                            status,
+                        );
+                    }
+                }
+            });
+        }
+
+        // Idle-gated hedge leg (component 3): fire ONLY when the caller
+        // supplied a *second* reserved connection — i.e. a warm connection
+        // was idle at admission time. Cancel-only by construction (only
+        // `cancel_fire` passes a hedge client; `submit_fire` passes `None`).
+        // No cold connection possible: the hedge races on an already-reserved
+        // warm connection, and if none was free the caller passed `None` and
+        // no hedge fires at all.
+        if let Some(hclient) = hedge_client {
+            let auth = self.auth.clone();
+            let method_b = method;
+            let path_b = path.to_string();
+            let body_b = body.to_string();
+            let url_b = url;
+            let tx_b = reply_tx;
+            let iid_b = self.instance_id.clone();
+            async_rt::handle().spawn(async move {
+                tokio::time::sleep(Duration::from_millis(HEDGE_DELAY_MS_CANCEL)).await;
+                // Primary already replied ⇒ skip the hedge round-trip.
+                if tx_b.is_full() {
+                    return;
+                }
+                let headers_b = auth.sign_request(method_b.as_str(), &path_b, &body_b);
+                let reply =
+                    execute_http_on(hclient, method_b.clone(), url_b, path_b.clone(), headers_b, body_b)
+                        .await;
+                if is_dedup_reject_post(&method_b, &path_b, &reply) {
+                    return;
+                }
+                let rec = rec_kind
+                    .filter(|_| crate::latency_record::is_active())
+                    .map(|k| (k, latency_record_status(&reply)));
+                if tx_b.try_send(reply).is_ok() {
+                    crate::latency::record(stage, t_start);
+                    if let Some((k, status)) = rec {
+                        crate::latency_record::record(
+                            &iid_b,
+                            k,
+                            t_start.elapsed().as_secs_f64() * 1000.0,
+                            status,
+                        );
+                    }
+                }
+            });
+        } else {
+            // No hedge: drop the extra sender so `reply_rx` disconnects
+            // promptly if the primary task dies.
+            drop(reply_tx);
+        }
+
+        reply_rx
+    }
+
     /// Synchronous variant — dispatches and blocks on the reply. Used by
     /// single-op paths (POST /order, DELETE /order). Blocks the calling
     /// thread on a crossbeam recv; the actual I/O work happens on the
@@ -1235,6 +1372,24 @@ impl SharedState {
 // ════════════════════════════════════════════════════════════════
 // PolymarketTrade
 // ════════════════════════════════════════════════════════════════
+
+/// Opaque in-flight place: the reply receiver + the pre-computed local
+/// orderID. Produced by [`PolymarketTrade::submit_fire`], consumed by
+/// [`PolymarketTrade::complete_submit`] off-thread. Fields are private so
+/// the engine holds it opaquely (never touching `HttpReply`).
+pub struct PendingSubmit {
+    local_oid: String,
+    rx: crossbeam_channel::Receiver<HttpReply>,
+}
+
+/// Opaque in-flight cancel: the reply-handling context + the reply
+/// receiver (`None` = nothing was sent, complete emits Cancelled directly).
+/// Produced by [`PolymarketTrade::cancel_fire`], consumed by
+/// [`PolymarketTrade::complete_cancel`].
+pub struct PendingCancel {
+    ctx: CancelCtx,
+    rx: Option<crossbeam_channel::Receiver<HttpReply>>,
+}
 
 /// Polymarket CLOB live order executor.
 pub struct PolymarketTrade {
@@ -2616,6 +2771,75 @@ impl PolymarketTrade {
         let (local_oid, body_str) = self.submit_prep(order)?;
         let rx = self.shared.http_call_async("POST", "/order", &body_str);
         Ok((local_oid, rx))
+    }
+
+    // ── Fire-and-track + admission-bound dispatch ──────────────────
+    // These mirror `submit_kickoff` / `cancel_kickoff` but dispatch on the
+    // exact connection reserved by an admission permit (no round-robin, no
+    // cold connection) and return an opaque handle so the reply is awaited
+    // OFF the dispatch thread (the engine's completion drainer), never
+    // block_on-ing a worker for the RTT.
+
+    /// Fire-and-track place: sync prep + dispatch on the permit-bound
+    /// `client`, WITHOUT blocking on the reply. `Ok(pending)` → complete
+    /// off-thread via [`Self::complete_submit`]; `Err(update)` → a pre-flight
+    /// reject (nothing was sent — the caller should release its permit).
+    pub fn submit_fire(
+        &mut self,
+        order: &OrderRequest,
+        client: std::sync::Arc<reqwest::Client>,
+    ) -> std::result::Result<PendingSubmit, OrderUpdate> {
+        let (local_oid, body_str) = self.submit_prep(order)?;
+        // Places never hedge (idempotency + connection-pressure): `None`.
+        let rx = self
+            .shared
+            .http_call_async_on(client, None, "POST", "/order", &body_str);
+        Ok(PendingSubmit { local_oid, rx })
+    }
+
+    /// Complete a fired place: block on its reply, then run the normal reply
+    /// handler (open_orders / coid bookkeeping, balance-error trigger).
+    pub fn complete_submit(&mut self, order: &OrderRequest, pending: PendingSubmit) -> OrderUpdate {
+        let PendingSubmit { local_oid, rx } = pending;
+        let reply = rx
+            .recv()
+            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
+        self.handle_submit_reply(order, &local_oid, reply)
+    }
+
+    /// Fire-and-track cancel: sync prep + dispatch on the permit-bound
+    /// `client`. `hedge_client` is `Some` iff a *second* Cancel connection
+    /// was idle at admission (component 3 idle-gate) — the cancel then races
+    /// a hedge on that reserved connection; `None` = no hedge. `PendingCancel
+    /// .rx == None` when the coid had no local orderID (nothing to send).
+    pub fn cancel_fire(
+        &mut self,
+        client_order_id: &str,
+        client: std::sync::Arc<reqwest::Client>,
+        hedge_client: Option<std::sync::Arc<reqwest::Client>>,
+    ) -> PendingCancel {
+        let (ctx, body) = self.cancel_prep(client_order_id);
+        let rx = body.map(|body_str| {
+            self.shared
+                .http_call_async_on(client, hedge_client, "DELETE", "/order", &body_str)
+        });
+        PendingCancel { ctx, rx }
+    }
+
+    /// Complete a fired cancel: block on its reply (if any), then run the
+    /// normal cancel reply handler (drops local tracking on terminal states).
+    pub fn complete_cancel(
+        &mut self,
+        exchange: Exchange,
+        client_order_id: &str,
+        pending: PendingCancel,
+    ) -> OrderUpdate {
+        let PendingCancel { ctx, rx } = pending;
+        let reply = rx.map(|rx| {
+            rx.recv()
+                .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+        });
+        self.handle_cancel_reply(exchange, client_order_id, ctx, reply)
     }
 
     /// Synchronous prep for a place: rate/balance gate, sign, register the

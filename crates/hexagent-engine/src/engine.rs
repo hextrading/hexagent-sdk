@@ -3727,32 +3727,142 @@ impl Engine {
                     .map(|e| e.executor_workers).unwrap_or(8).max(1);
                 let (poly_pool_tx, poly_pool_rx) =
                     bounded::<(Signal, u64, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
+                // Fire-and-track completion lane: a worker fires (admission
+                // permit + kickoff on the reserved connection) then hands the
+                // "await reply + book it" closure here; a pool of drainers runs
+                // them so no worker `block_on`s the RTT. The permit is captured
+                // by the closure and released when it completes.
+                let (poly_done_tx, poly_done_rx) =
+                    bounded::<(PolyCompletionFn, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
                 let mut poly_worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_drainer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                // Admission-control observability (component 7): a stop flag +
+                // handle for the periodic stats daemon, set/joined at shutdown.
+                let poly_stats_stop =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut poly_stats_handle: Option<thread::JoinHandle<()>> = None;
                 if !poly_states.is_empty() {
+                    // Per-(instance, role) admission pools. Fast=Cancel=2,
+                    // Reconcile=Query=1 per instance → 18 total for 3 instances,
+                    // matching the former global pool count. Concurrency is now
+                    // bounded by warm connections *per instance* (no cross-
+                    // instance preemption, no cold connection under overlap).
+                    let mut iids: Vec<String> = poly_states.keys().cloned().collect();
+                    iids.sort();
+                    if let Err(e) = hexagent_runtime::http1_pool::init_instance_pools(
+                        &iids,
+                        hexagent_runtime::http1_pool::PoolSizes {
+                            fast: 2,
+                            cancel: 2,
+                            reconcile: 1,
+                            query: 1,
+                        },
+                    ) {
+                        warn!("[Executor] per-instance admission pools not initialised: {}", e);
+                    }
+                    // One drainer per possible in-flight fired request
+                    // (Σ per-instance fast+cancel) + slack, so a fired request
+                    // never waits for a drainer while holding its permit.
+                    let n_drainers = iids.len() * 4 + 4;
+                    for i in 0..n_drainers {
+                        let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let rx = poly_done_rx.clone();
+                        let dname = format!("poly-done-{}", i);
+                        let h = thread::Builder::new()
+                            .name(dname.clone())
+                            .spawn(move || {
+                                crate::os_tune::pin_execution(&dname);
+                                while let Ok((complete, utx)) = rx.recv() {
+                                    for update in complete(&mut router) {
+                                        if utx.send(update).is_err() { break; }
+                                    }
+                                }
+                            })
+                            .unwrap();
+                        poly_drainer_handles.push(h);
+                    }
                     for i in 0..poly_worker_n {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_pool_rx.clone();
+                        let done_tx = poly_done_tx.clone();
                         let wname = format!("poly-exec-{}", i);
                         let h = thread::Builder::new()
                             .name(wname.clone())
                             .spawn(move || {
                                 crate::os_tune::pin_execution(&wname);
                                 while let Ok((signal, stale_ms, utx)) = rx.recv() {
-                                    for update in execute_fallback_signal(&mut worker, signal, stale_ms) {
-                                        if utx.send(update).is_err() { break; }
-                                    }
+                                    fire_or_execute(&mut worker, signal, stale_ms, &done_tx, &utx);
                                 }
                             })
                             .unwrap();
                         poly_worker_handles.push(h);
                     }
-                    info!("[Executor] Polymarket dispatch pool: {} workers", poly_worker_n);
+                    info!(
+                        "[Executor] Polymarket dispatch pool: {} workers, {} completion drainers",
+                        poly_worker_n, n_drainers
+                    );
+                    // Admission-control observability daemon: every 30 s log the
+                    // per-(instance,role) delta — acquires, skips (= quotes held
+                    // because a warm connection was busy), and current busy. A
+                    // rising skip count = connection pressure / congestion
+                    // shedding; cross-check against the PM REST RTT window. Cold
+                    // connections should stay ~0 (skips shed load instead).
+                    {
+                        let stop = poly_stats_stop.clone();
+                        let h = thread::Builder::new()
+                            .name("poly-admission-stats".into())
+                            .spawn(move || {
+                                crate::os_tune::pin_background("poly-admission-stats");
+                                let mut prev: HashMap<String, (u64, u64)> = HashMap::new();
+                                loop {
+                                    let mut slept = 0;
+                                    while slept < 30 {
+                                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                            return;
+                                        }
+                                        thread::sleep(std::time::Duration::from_secs(1));
+                                        slept += 1;
+                                    }
+                                    let mut by_inst: std::collections::BTreeMap<String, String> =
+                                        Default::default();
+                                    let mut any_skip = false;
+                                    for (iid, role, acq, sk, busy) in
+                                        hexagent_runtime::http1_pool::admission_stats()
+                                    {
+                                        let key = format!("{}/{:?}", iid, role);
+                                        let (pa, ps) =
+                                            prev.get(&key).copied().unwrap_or((0, 0));
+                                        let dacq = acq.saturating_sub(pa);
+                                        let dsk = sk.saturating_sub(ps);
+                                        prev.insert(key, (acq, sk));
+                                        if dsk > 0 {
+                                            any_skip = true;
+                                        }
+                                        by_inst.entry(iid).or_default().push_str(&format!(
+                                            "{:?}(+{} skip+{} busy{}) ",
+                                            role, dacq, dsk, busy
+                                        ));
+                                    }
+                                    for (iid, line) in by_inst {
+                                        if any_skip {
+                                            warn!("[admission] {} {}", iid, line.trim_end());
+                                        } else {
+                                            info!("[admission] {} {}", iid, line.trim_end());
+                                        }
+                                    }
+                                }
+                            })
+                            .unwrap();
+                        poly_stats_handle = Some(h);
+                    }
                 }
                 drop(poly_pool_rx); // main loop only sends; workers hold their clones
-                // Option so Exit can drop the sender + join workers (drain all
-                // in-flight dispatches) BEFORE the shutdown cancel-all, so no
-                // worker places an order after cancel-all snapshots the book.
+                drop(poly_done_rx); // workers hold their clones of done_tx
+                // Options so Exit can drop senders + join (drain all in-flight
+                // dispatches AND completions) BEFORE the shutdown cancel-all, so
+                // nothing places an order after cancel-all snapshots the book.
                 let mut poly_pool_tx = Some(poly_pool_tx);
+                let mut poly_done_tx = Some(poly_done_tx);
 
                 // Stale-signal threshold — read from the shared
                 // `Arc<AtomicU64>` handle on every signal arrival (Relaxed
@@ -3804,6 +3914,14 @@ impl Engine {
                             // an order after cancel-all snapshots the book).
                             poly_pool_tx = None;
                             for h in std::mem::take(&mut poly_worker_handles) { let _ = h.join(); }
+                            // Then drain the fire-and-track completions: drop the
+                            // sender (workers already joined ⇒ their clones are
+                            // gone) and join the drainers so every fired order's
+                            // reply is booked BEFORE cancel-all.
+                            poly_done_tx = None;
+                            for h in std::mem::take(&mut poly_drainer_handles) { let _ = h.join(); }
+                            poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
                             // Phase 2e-3: walk every per-instance
                             // PolymarketTrade and wipe its book on
                             // shutdown — each instance has its own
@@ -3892,6 +4010,11 @@ impl Engine {
                 // in-flight dispatch finishes before the executor thread exits.
                 drop(poly_pool_tx.take());
                 for h in poly_worker_handles { let _ = h.join(); }
+                // Drain fire-and-track completions after the workers stop.
+                drop(poly_done_tx.take());
+                for h in poly_drainer_handles { let _ = h.join(); }
+                poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
                 info!("[Executor] Thread stopped");
             })
             .unwrap()
@@ -4001,6 +4124,245 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
             })
         }
         _ => vec![],
+    }
+}
+
+/// A fired request's completion: run on a drainer thread, it awaits the
+/// reply and books it, returning the resulting update(s). It captures the
+/// admission permit, so the reserved connection is released when this runs.
+type PolyCompletionFn = Box<dyn FnOnce(&mut LiveRouter) -> Vec<OrderUpdate> + Send>;
+
+/// ExecutorRejected update for a placement we never sent (admission skip /
+/// stale / pre-flight). Free-fn twin of the closure in `execute_fallback_signal`.
+fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
+    OrderUpdate {
+        client_order_id: order.client_order_id.clone(),
+        exchange: order.exchange,
+        symbol: order.symbol.clone(),
+        side: order.side,
+        exchange_order_id: None,
+        status: OrderStatus::ExecutorRejected,
+        liquidity: None,
+        filled_quantity: 0.0,
+        remaining_quantity: order.quantity,
+        avg_fill_price: 0.0,
+        timestamp_ns: now_ns(),
+        trade_id: None,
+        error: None,
+    }
+}
+
+/// ExecutorRejected update for a cancel we never sent (admission skip / stale).
+fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
+    OrderUpdate {
+        client_order_id: coid,
+        exchange,
+        symbol: String::new(),
+        side: Side::Buy,
+        exchange_order_id: None,
+        status: OrderStatus::ExecutorRejected,
+        liquidity: None,
+        filled_quantity: 0.0,
+        remaining_quantity: 0.0,
+        avg_fill_price: 0.0,
+        timestamp_ns: now_ns(),
+        trade_id: None,
+        error: None,
+    }
+}
+
+/// Fire-and-track + admission dispatch for the hot single-leg Polymarket
+/// paths (place / cancel / 1×1 replace). Acquires a per-instance admission
+/// permit, fires on the reserved connection WITHOUT blocking, and hands the
+/// reply-completion closure to a drainer. On no permit it SKIPS (emits
+/// ExecutorRejected — the strategy holds/retries). Everything else (batch,
+/// reconcile, cancel-all, non-poly, empty/unknown instance) falls through to
+/// the synchronous `execute_fallback_signal`, unchanged.
+fn fire_or_execute(
+    worker: &mut LiveRouter,
+    signal: Signal,
+    stale_ms: u64,
+    done_tx: &Sender<(PolyCompletionFn, Sender<OrderUpdate>)>,
+    utx: &Sender<OrderUpdate>,
+) {
+    use hexagent_runtime::http1_pool::{try_acquire, Role};
+    // Same stale semantics as the sync path's `is_stale`.
+    let is_stale = |ts: u64| {
+        ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms
+    };
+    let iid = extract_instance_id(&signal);
+
+    match signal {
+        Signal::NewOrder(order)
+            if order.exchange == Exchange::Polymarket && !order.instance_id.is_empty() =>
+        {
+            if is_stale(order.timestamp_ns) {
+                let _ = utx.send(exec_rejected_place(&order));
+                return;
+            }
+            match try_acquire(&iid, Role::Fast) {
+                None => {
+                    let _ = utx.send(exec_rejected_place(&order)); // skip = hold
+                }
+                Some(permit) => {
+                    let client = permit.client().clone();
+                    match worker.poly_route_mut(&iid).submit_fire(&order, client) {
+                        Ok(pending) => {
+                            let iid2 = iid;
+                            let f: PolyCompletionFn = Box::new(move |r| {
+                                let u = r.poly_route_mut(&iid2).complete_submit(&order, pending);
+                                drop(permit); // release the reserved connection
+                                vec![u]
+                            });
+                            let _ = done_tx.send((f, utx.clone()));
+                        }
+                        Err(update) => {
+                            drop(permit); // pre-flight reject: nothing sent
+                            let _ = utx.send(update);
+                        }
+                    }
+                }
+            }
+        }
+        Signal::CancelOrder { exchange, client_order_id, timestamp_ns, .. }
+            if exchange == Exchange::Polymarket && !iid.is_empty() =>
+        {
+            if is_stale(timestamp_ns) {
+                let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
+                return;
+            }
+            match try_acquire(&iid, Role::Cancel) {
+                None => {
+                    let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
+                }
+                Some(permit) => {
+                    let client = permit.client().clone();
+                    // Component 3 idle-gate: hedge the cancel ONLY if a second
+                    // Cancel connection is free right now (else no hedge).
+                    let hedge_permit = try_acquire(&iid, Role::Cancel);
+                    let hedge_client = hedge_permit.as_ref().map(|p| p.client().clone());
+                    let route = worker.poly_route_mut(&iid);
+                    route.set_gen_ns_hint(timestamp_ns);
+                    let pending = route.cancel_fire(&client_order_id, client, hedge_client);
+                    let iid2 = iid;
+                    let f: PolyCompletionFn = Box::new(move |r| {
+                        let u = r
+                            .poly_route_mut(&iid2)
+                            .complete_cancel(exchange, &client_order_id, pending);
+                        drop(permit);
+                        drop(hedge_permit); // release the hedge connection too
+                        vec![u]
+                    });
+                    let _ = done_tx.send((f, utx.clone()));
+                }
+            }
+        }
+        Signal::ReplaceOrder {
+            exchange,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            ..
+        } if exchange == Exchange::Polymarket
+            && !iid.is_empty()
+            && cancel_client_order_ids.len() == 1
+            && place_orders.len() == 1 =>
+        {
+            if is_stale(timestamp_ns) {
+                let _ = utx.send(exec_rejected_cancel(cancel_client_order_ids[0].clone(), exchange));
+                let _ = utx.send(exec_rejected_place(&place_orders[0]));
+                return;
+            }
+            let coid = cancel_client_order_ids.into_iter().next().unwrap();
+            let place = place_orders.into_iter().next().unwrap();
+            // Rule 4: cancel gates place. Acquire the Cancel permit first; if
+            // none, skip the WHOLE replace (hold the current quote).
+            let cancel_permit = match try_acquire(&iid, Role::Cancel) {
+                Some(p) => p,
+                None => {
+                    let _ = utx.send(exec_rejected_cancel(coid, exchange));
+                    let _ = utx.send(exec_rejected_place(&place));
+                    return;
+                }
+            };
+            // Fire the cancel (component 3 idle-gated hedge: race a second
+            // reserved Cancel connection only if one is free).
+            let cclient = cancel_permit.client().clone();
+            let hedge_permit = try_acquire(&iid, Role::Cancel);
+            let hedge_client = hedge_permit.as_ref().map(|p| p.client().clone());
+            let route = worker.poly_route_mut(&iid);
+            route.set_gen_ns_hint(timestamp_ns);
+            let cpending = route.cancel_fire(&coid, cclient, hedge_client);
+            let iid_c = iid.clone();
+            let cf: PolyCompletionFn = Box::new(move |r| {
+                let u = r.poly_route_mut(&iid_c).complete_cancel(exchange, &coid, cpending);
+                drop(cancel_permit);
+                drop(hedge_permit);
+                vec![u]
+            });
+            let _ = done_tx.send((cf, utx.clone()));
+            // Place: independent Fast permit. If none, skip place only (the
+            // cancel already fired → pull-to-flat on this side, which is safe).
+            match try_acquire(&iid, Role::Fast) {
+                None => {
+                    let _ = utx.send(exec_rejected_place(&place));
+                }
+                Some(ppermit) => {
+                    let pclient = ppermit.client().clone();
+                    match worker.poly_route_mut(&iid).submit_fire(&place, pclient) {
+                        Ok(pending) => {
+                            let iid_p = iid;
+                            let pf: PolyCompletionFn = Box::new(move |r| {
+                                let u = r.poly_route_mut(&iid_p).complete_submit(&place, pending);
+                                drop(ppermit);
+                                vec![u]
+                            });
+                            let _ = done_tx.send((pf, utx.clone()));
+                        }
+                        Err(update) => {
+                            drop(ppermit);
+                            let _ = utx.send(update);
+                        }
+                    }
+                }
+            }
+        }
+        // Reconcile: concurrency gate on the dedicated per-instance Reconcile
+        // pool (NOT full fire-track). Bounds concurrent reconciles per instance
+        // so orphan-retry storms can't fan out and overwhelm the global
+        // Reconcile connections. Skip (drop) when none free — the strategy's
+        // orphan reconciler re-emits on its own throttle, so a dropped
+        // reconcile simply retries next tick. Gating on the Reconcile pool
+        // (disjoint from Fast/Cancel) means it never steals hot-path capacity.
+        s @ Signal::ReconcilePolymarket { .. } if !iid.is_empty() => {
+            match try_acquire(&iid, Role::Reconcile) {
+                None => {} // shed; reconciler re-emits
+                Some(_permit) => {
+                    for update in execute_fallback_signal(worker, s, stale_ms) {
+                        if utx.send(update).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Batch / cancel-all / non-poly / empty-iid → synchronous, global pool.
+        // polymaker's only batch signals are BatchCancelOrders (a leg pulling
+        // >1 accumulated/orphan order with no replace — the `live_count >= 2`
+        // "cancel-stale-don't-place" cleanup) and the rare BatchNewOrders (a
+        // leg seeding both tokens from cold). Both are low-volume edge/cleanup
+        // paths (~6/hr live), NOT the hot reprice churn — that is ReplaceOrder
+        // 1×1 (leg carries a single token in steady state), already fire-
+        // tracked above. Deliberately NOT admission-gated: gating would reserve
+        // a hot-path Fast/Cancel connection they don't even use (their internals
+        // ride the global pool), starving real places/cancels for no benefit.
+        other => {
+            for update in execute_fallback_signal(worker, other, stale_ms) {
+                if utx.send(update).is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 
