@@ -778,6 +778,18 @@ pub struct SharedState {
     /// CANCELED) so a subsequent unrelated 404 starts fresh.
     pub(crate) reconcile_not_found_attempts: Mutex<HashMap<String, u32>>,
 
+    /// Per-coid **exponential backoff** gate for placement not-found GETs:
+    /// wall-clock ns before which the next reconcile GET for this coid is
+    /// skipped. Set after each not-found to `now + 1.5s · 2^(attempt-1)`
+    /// (1.5s → 3s → 6s → 12s across the 5 attempts). Without this the
+    /// reconciler re-hammers the GET every ~1.5s re-emit; during a PM REST
+    /// slowdown that pours ~5 GETs/orphan onto an already-struggling endpoint
+    /// and prolongs the episode. Backing off costs only slower orphan
+    /// cleanup — a real fill still lands via the WS user_feed independent of
+    /// this GET. Cleared alongside `reconcile_not_found_attempts` on any
+    /// conclusive placement resolution.
+    pub(crate) reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
+
     /// Coids whose cancel was rejected with a `pending/delayed` reason — the
     /// cancel raced the placement, so the order is still being processed and
     /// will shortly be LIVE (not gone). The reconcile cancel-orphan `""`
@@ -798,6 +810,13 @@ pub struct SharedState {
 /// retry interval (= `IN_FLIGHT_TTL_NS`) gives ~7.5 s for the write to
 /// propagate, well past the observed 100-300 ms convergence window.
 pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
+
+/// Base interval for the placement not-found retry backoff. The gap before
+/// the Nth GET doubles: 1.5s, 3s, 6s, 12s across attempts 2..5, so the 5
+/// attempts span ~22.5s (was a flat ~1.5s each = ~6s). Longer, but it stops
+/// the reconciler from amplifying a PM REST slowdown; orphans that actually
+/// filled are still booked via the WS user_feed regardless of GET timing.
+pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 1500;
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
 /// ready" is observed. 10 s gives the upstream service a chance to drain
@@ -1555,6 +1574,7 @@ impl PolymarketTrade {
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
                 reconcile_not_found_attempts: Mutex::new(HashMap::new()),
+                reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
             owner: api_key.to_string(),
@@ -2286,6 +2306,14 @@ impl PolymarketTrade {
                         continue;
                     }
                 };
+                // Per-coid exponential backoff: skip the GET until this coid's
+                // next-retry deadline (set on the previous not-found). Keeps the
+                // orphan parked without re-hammering a slow PM REST endpoint.
+                if let Some(&next_ns) = self.shared.reconcile_next_retry_ns.lock().unwrap().get(coid) {
+                    if now_ns() < next_ns {
+                        continue;
+                    }
+                }
                 let fetch_result = self.fetch_order_status_by_id(oid);
                 // 425 mid-iteration: defer this and remaining orphans rather
                 // than commit a false outcome via the `""` (not-found) arm
@@ -2303,6 +2331,7 @@ impl PolymarketTrade {
                         // Conclusive answer — clear the not_found counter
                         // so a future unrelated 404 starts fresh.
                         self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.register_order_id(coid, oid, symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
@@ -2330,6 +2359,7 @@ impl PolymarketTrade {
                     }
                     "MATCHED" | "FILLED" => {
                         self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → Filled",
@@ -2353,6 +2383,7 @@ impl PolymarketTrade {
                     }
                     "CANCELED" | "CANCELLED" => {
                         self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → Cancelled",
@@ -2396,6 +2427,16 @@ impl PolymarketTrade {
                                 "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (attempt {}/{}) — keeping orphan, retrying",
                                 coid, oid, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
                             );
+                            // Exponential backoff before the next GET for this
+                            // coid: 1.5s · 2^(attempt-1) = 1.5s, 3s, 6s, 12s
+                            // across attempts 1..4. The gate at the top of the
+                            // loop skips intervening re-emits until this passes.
+                            let backoff_ms = RECONCILE_BACKOFF_BASE_MS
+                                .saturating_mul(1u64 << (attempts - 1));
+                            self.shared.reconcile_next_retry_ns.lock().unwrap().insert(
+                                coid.clone(),
+                                now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
+                            );
                             // No update emitted — strategy keeps the orphan
                             // and the orphan_reconciler in_flight TTL will
                             // unblock the next dedup'd retry.
@@ -2406,6 +2447,7 @@ impl PolymarketTrade {
                             coid, oid, attempts,
                         );
                         self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         updates.push(OrderUpdate {
                             client_order_id: coid.clone(),
