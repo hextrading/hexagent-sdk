@@ -9,7 +9,7 @@ use super::deploy_wallet::{
     self, check_deployed, derive_safe_address, parse_private_key,
     address_to_bytes32, u256_bytes, to_checksum_address,
 };
-use super::signer::derive_eth_address_from_key;
+use super::signer::{derive_eth_address_from_key, parse_signature_type, SignatureType};
 
 const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 /// Polymarket USD (pUSD) — the v2 collateral token. 6 decimals, same
@@ -210,6 +210,11 @@ fn unauth_get_json(url: &str) -> serde_json::Value {
 
 pub(crate) struct WalletInfo {
     pub signer_address: String,
+    /// The funds/positions wallet for gnosis_safe / poly_proxy (the
+    /// CREATE2-derived Polymarket proxy). For a bare EOA (signatureType=0)
+    /// this is **aliased to `signer_address`** at load time — an EOA has no
+    /// Safe proxy and holds its own collateral. Do NOT feed this to Safe
+    /// `execTransaction` paths without first checking `is_eoa()`.
     pub safe_address: String,
     pub signing_key: k256::ecdsa::SigningKey,
     pub builder_auth: PolyAuth,
@@ -235,16 +240,36 @@ impl WalletInfo {
         }
     }
 
+    /// True iff this is a bare EOA account (signatureType=0) with no
+    /// deposit wallet — funds/positions live at the signer EOA itself, and
+    /// there is no Gnosis Safe proxy. For EOA, `load_wallet_from` sets
+    /// `safe_address == signer_address`, so on-chain balance reads keyed off
+    /// `safe_address`/`primary_address` already hit the right wallet; this
+    /// helper lets the maintenance / display paths branch away from the
+    /// Safe `execTransaction` machinery (which an EOA can't use).
+    pub fn is_eoa(&self) -> bool {
+        self.deposit_wallet_active().is_none()
+            && matches!(parse_signature_type(&self.signature_type), SignatureType::Eoa)
+    }
+
     /// The address that actually holds funds + positions for this account:
-    /// the deposit wallet for POLY_1271, else the Gnosis Safe. Use for
-    /// balance/position reads and deposit/withdraw display.
+    /// the deposit wallet for POLY_1271, the signer EOA for a bare EOA
+    /// (`safe_address` was aliased to the signer at load time), else the
+    /// Gnosis Safe. Use for balance/position reads and deposit/withdraw
+    /// display.
     pub fn primary_address(&self) -> &str {
         self.deposit_wallet_active().unwrap_or(&self.safe_address)
     }
 
     /// Human label for the primary wallet kind.
     pub fn wallet_kind(&self) -> &'static str {
-        if self.deposit_wallet_active().is_some() { "deposit wallet" } else { "Safe" }
+        if self.deposit_wallet_active().is_some() {
+            "deposit wallet"
+        } else if self.is_eoa() {
+            "EOA"
+        } else {
+            "Safe"
+        }
     }
 }
 
@@ -353,7 +378,22 @@ fn load_wallet_from(
 
     let signing_key = parse_private_key(private_key)?;
     let signer_address = to_checksum_address(&derive_eth_address_from_key(&signing_key));
-    let safe_address = to_checksum_address(&derive_safe_address(&signer_address));
+    // Funds/positions wallet resolution is signature-type dependent:
+    //   * EOA (signatureType=0) — the account trades directly from the
+    //     signer EOA, which itself holds USDC + conditional tokens. There
+    //     is NO Gnosis Safe proxy, so the funds wallet IS the signer.
+    //   * gnosis_safe / poly_proxy — funds live in the CREATE2-derived
+    //     Polymarket proxy (Safe). poly_1271 additionally carries the
+    //     deposit wallet in `deposit_wallet` (primary_address prefers it).
+    // Deriving the Safe unconditionally (the prior behaviour) pointed every
+    // balance read + maintenance op at an empty derived-Safe address for a
+    // bare EOA. Gate the Safe derivation on the sig type so gnosis / 1271
+    // stay byte-identical while EOA resolves to the EOA.
+    let safe_address = if matches!(parse_signature_type(signature_type), SignatureType::Eoa) {
+        signer_address.clone()
+    } else {
+        to_checksum_address(&derive_safe_address(&signer_address))
+    };
 
     // Builder credentials for relayer — from the secrets file's [builder]
     // section (pushed to POLY_BUILDER_* on Config::load), never from .env.
@@ -3353,11 +3393,30 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
         calldata.extend_from_slice(&u256_bytes(2));   // indexSets[1] = 2
         let data_hex = format!("0x{}", hex::encode(&calldata));
 
-        // Submit. The on-chain path (`gas_via_signer=true`) uses gas
-        // escalation: 500→700→1000 gwei across 3 attempts. The relayer
-        // path (`gas_via_signer=false`) keeps its single-shot behaviour
-        // — gas is the relayer's problem there.
-        let submit_outcome: std::result::Result<(String, String), String> = if gas_via_signer {
+        // Submit. Dispatch by account kind:
+        //   * EOA (signatureType=0) — the EOA holds the outcome tokens and
+        //     redeems them by calling `target_contract` DIRECTLY (msg.sender
+        //     == EOA), paying its own POL. No Safe execTransaction, no
+        //     relayer. Needs the CTF→adapter approval (`hexbot approve_v2`
+        //     grants it for the EOA). ⚠ EOA auto-redeem is gated behind the
+        //     same default-off maintenance flags as every other account; the
+        //     v2 adapter path here has not been live-validated for a bare
+        //     EOA — verify on a funded test wallet before enabling.
+        //   * on-chain Safe (`gas_via_signer=true`) — gas escalation
+        //     500→700→1000 gwei across 3 attempts.
+        //   * relayer (`gas_via_signer=false`) — single-shot; gas is the
+        //     relayer's problem.
+        let submit_outcome: std::result::Result<(String, String), String> = if wallet.is_eoa() {
+            match super::onchain_tx::submit_eoa_tx_onchain(
+                &wallet.signing_key,
+                &wallet.signer_address,
+                target_contract,
+                &data_hex,
+            ) {
+                Ok(tx_hash) => Ok((tx_hash, "PENDING".to_string())),
+                Err(e) => Err(e.to_string()),
+            }
+        } else if gas_via_signer {
             match super::onchain_tx::broadcast_with_escalation(
                 &wallet.signing_key,
                 &wallet.signer_address,
@@ -3623,7 +3682,23 @@ fn run_split_one(
         cid_short, amount_usdc, balance,
     );
 
-    let submit_outcome: std::result::Result<(String, String), String> = if gas_via_signer {
+    // EOA (signatureType=0) splits by calling `target_contract` DIRECTLY
+    // (msg.sender == EOA holds the collateral), paying its own POL — no
+    // Safe execTransaction, no relayer. Needs the pUSD→adapter approval
+    // (`hexbot approve_v2` grants it for the EOA). ⚠ Same default-off
+    // maintenance gate as every account; the v2 adapter split has not been
+    // live-validated for a bare EOA — verify on a funded test wallet first.
+    let submit_outcome: std::result::Result<(String, String), String> = if wallet.is_eoa() {
+        match super::onchain_tx::submit_eoa_tx_onchain(
+            &wallet.signing_key,
+            &wallet.signer_address,
+            target_contract,
+            &data_hex,
+        ) {
+            Ok(tx_hash) => Ok((tx_hash, "PENDING".to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    } else if gas_via_signer {
         match super::onchain_tx::broadcast_with_escalation(
             &wallet.signing_key,
             &wallet.signer_address,

@@ -44,7 +44,7 @@ use super::deploy_wallet::{
     derive_safe_address, u256_bytes,
 };
 use super::onchain_tx::{poll_onchain_tx, submit_safe_tx_onchain};
-use super::signer::derive_eth_address_from_key;
+use super::signer::{derive_eth_address_from_key, parse_signature_type, SignatureType};
 use super::wallet::{
     load_wallet, poll_transaction, read_gas_via_signer_wallet_flag,
     submit_safe_tx_with_id,
@@ -154,6 +154,16 @@ pub fn run_approve_v2() -> Result<()> {
         )?;
         println!("✅ DW approvals batch {}.", if dry_run { "(dry-run)" } else { "confirmed" });
         return Ok(());
+    }
+
+    // ── EOA (signatureType=0): the account trades directly from the signer
+    //    EOA, which owns the collateral + outcome tokens. Approvals are
+    //    granted BY the EOA (msg.sender == owner == EOA), broadcast as plain
+    //    on-chain txs — the gasless relayer only serves Safe meta-txs, so
+    //    the EOA pays its own POL. The contract set is the SAME v2 checklist
+    //    as the Safe path; only owner + broadcast differ. ──
+    if matches!(parse_signature_type(&sig_type_s), SignatureType::Eoa) {
+        return run_approve_eoa(dry_run);
     }
 
     // Gas-payer dispatch — same flag as redeem/split: when `false`
@@ -394,6 +404,99 @@ fn wait_for_confirm(tx_hash: &str) -> Result<()> {
     }
 }
 
+// ════════════════════════════════════════════════════════════════
+// EOA (signatureType=0) approval flow
+// ════════════════════════════════════════════════════════════════
+
+/// Grant the v2 CLOB allowances for a bare EOA (signatureType=0).
+///
+/// Identical contract checklist to the Safe path ([`v2_approval_steps`]),
+/// but the EOA is the token owner: it signs and broadcasts each
+/// `approve(...)` / `setApprovalForAll(...)` directly (msg.sender == EOA),
+/// paying its own POL gas. There is no Safe `execTransaction` and no
+/// gasless relayer for an EOA. Idempotent — each step is skipped when the
+/// on-chain allowance is already set, so re-running is safe.
+///
+/// Requires: `POLY_PRIVATE_KEY` (the EOA key), a `[polygon]` RPC in the
+/// secrets file (for the allowance reads + broadcast), and POL in the EOA
+/// for gas.
+fn run_approve_eoa(dry_run: bool) -> Result<()> {
+    let private_key = std::env::var("POLY_PRIVATE_KEY")
+        .map_err(|_| super::wallet::no_wallet_creds_err())?;
+    let signing_key = {
+        let clean = private_key.strip_prefix("0x").unwrap_or(&private_key);
+        let bytes = hex::decode(clean).map_err(|e| anyhow!("private key hex: {}", e))?;
+        k256::ecdsa::SigningKey::from_bytes(bytes.as_slice().into())
+            .map_err(|e| anyhow!("private key bytes: {}", e))?
+    };
+    let eoa = to_checksum(&derive_eth_address_from_key(&signing_key));
+
+    println!("── EOA v2 approvals (signatureType=0) ────────────");
+    println!("EOA (owner + signer): {}", eoa);
+    println!("Gas: signer EOA broadcasts directly, pays POL. The gasless");
+    println!("     relayer does not serve EOA approvals — fund the EOA with POL.");
+    println!();
+    println!("── Approval checklist (v2 CLOB) ──────────────────");
+
+    let steps = v2_approval_steps();
+    let mut plan: Vec<(ApprovalStep, bool /*already_set*/)> = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let already = match step.kind {
+            ApprovalKind::Erc20Approve => check_erc20_allowance(&eoa, step.token, step.spender),
+            ApprovalKind::Erc1155Set   => check_erc1155_approval(&eoa, step.token, step.spender),
+        };
+        println!(" {}. {:<36}  {}", i + 1, step.label,
+            if already { "✅ already set" } else { "🔲 NEEDS SET" });
+        plan.push((step.clone(), already));
+    }
+    let missing = plan.iter().filter(|(_, set)| !set).count();
+    println!();
+    println!("Summary: {} missing / {} total — {} EOA tx{} to send",
+        missing, plan.len(), missing, if missing == 1 { "" } else { "s" });
+
+    if missing == 0 {
+        println!();
+        println!("✅ All v2 approvals already set. No action needed.");
+        return Ok(());
+    }
+    println!();
+    if dry_run {
+        println!("(dry-run: not broadcasting)");
+        return Ok(());
+    }
+
+    for (i, (step, already)) in plan.iter().enumerate() {
+        if *already { continue; }
+        let calldata = match step.kind {
+            ApprovalKind::Erc20Approve => build_approve_calldata(step.spender),
+            ApprovalKind::Erc1155Set   => build_set_approval_for_all_calldata(step.spender),
+        };
+        info!("[approve_eoa] {}/{}: {} — broadcasting", i + 1, plan.len(), step.label);
+        println!("  [{}] {} …", i + 1, step.label);
+        let tx = super::onchain_tx::submit_eoa_tx_onchain(
+            &signing_key, &eoa, step.token, &calldata,
+        )?;
+        println!("       tx: {}", tx);
+        wait_for_confirm(&tx)?;
+        println!("       ✅ confirmed");
+    }
+
+    // Post-flight re-check so the operator sees the final state.
+    println!();
+    println!("── Post-flight re-check ──────────────────────────");
+    for (i, step) in steps.iter().enumerate() {
+        let set = match step.kind {
+            ApprovalKind::Erc20Approve => check_erc20_allowance(&eoa, step.token, step.spender),
+            ApprovalKind::Erc1155Set   => check_erc1155_approval(&eoa, step.token, step.spender),
+        };
+        println!(" {}. {:<36}  {}", i + 1, step.label,
+            if set { "✅" } else { "❌ (still missing — inspect above)" });
+    }
+    println!();
+    println!("EOA is ready for v2 CLOB trading + split/merge.");
+    Ok(())
+}
+
 fn to_checksum(addr: &str) -> String {
     use sha3::{Digest, Keccak256};
     let hex_str = addr.strip_prefix("0x").unwrap_or(addr).to_lowercase();
@@ -411,4 +514,58 @@ fn to_checksum(addr: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha3::{Digest, Keccak256};
+
+    fn selector(sig: &[u8]) -> [u8; 4] {
+        let mut h = Keccak256::new();
+        h.update(sig);
+        let out: [u8; 32] = h.finalize().into();
+        [out[0], out[1], out[2], out[3]]
+    }
+
+    /// Lock in the ERC-20 / ERC-1155 function selectors used to build the
+    /// EOA (and Safe) approval calldata. Cross-checked against the ABI
+    /// signatures — if either flips, every approval tx would call the wrong
+    /// function and the operator's wallet would silently stay unapproved.
+    #[test]
+    fn approval_selectors_match_abi() {
+        assert_eq!(selector(b"approve(address,uint256)"), APPROVE_SELECTOR);
+        assert_eq!(selector(b"setApprovalForAll(address,bool)"), SET_APPROVAL_FOR_ALL_SELECTOR);
+        // Well-known canonical values.
+        assert_eq!(APPROVE_SELECTOR, [0x09, 0x5e, 0xa7, 0xb3]);
+        assert_eq!(SET_APPROVAL_FOR_ALL_SELECTOR, [0xa2, 0x2c, 0xb4, 0x65]);
+    }
+
+    #[test]
+    fn approve_calldata_shape() {
+        let spender = "0xE111180000d2663C0091e4f400237545B87B996B"; // CTFExchangeV2
+        let cd = build_approve_calldata(spender);
+        // 0x + selector(4) + address(32) + amount(32) = 2 + (4+32+32)*2 = 138 chars.
+        assert_eq!(cd.len(), 2 + (4 + 32 + 32) * 2);
+        assert!(cd.starts_with("0x095ea7b3"));
+        // Infinite allowance: last 32 bytes are all-0xff.
+        assert!(cd.to_lowercase().ends_with(&"ff".repeat(32)));
+        // Spender is right-aligned in the first arg word (12 zero bytes then
+        // the 20-byte address).
+        assert!(cd.to_lowercase().contains(&format!(
+            "{}{}",
+            "00".repeat(12),
+            spender.trim_start_matches("0x").to_lowercase()
+        )));
+    }
+
+    #[test]
+    fn set_approval_for_all_calldata_shape() {
+        let operator = "0xE111180000d2663C0091e4f400237545B87B996B";
+        let cd = build_set_approval_for_all_calldata(operator);
+        assert_eq!(cd.len(), 2 + (4 + 32 + 32) * 2);
+        assert!(cd.starts_with("0xa22cb465"));
+        // bool true → last 32-byte word is 31 zero bytes then 0x01.
+        assert!(cd.ends_with(&format!("{}01", "00".repeat(31))));
+    }
 }

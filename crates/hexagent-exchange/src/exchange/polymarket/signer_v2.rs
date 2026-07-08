@@ -501,6 +501,80 @@ mod tests {
         assert_eq!(keccak256(ORDER_TYPE_STRING.as_bytes()), order_v2_type_hash());
     }
 
+    /// Lock-in: v2 **EOA (signatureType=0)** signing vectors, cross-checked
+    /// against the official Polymarket v2 order-utils (py-clob-client-v2
+    /// `ctf_exchange_v2_typed_data.py` / `exchange_order_builder_v2.py`).
+    ///
+    /// The values below were computed independently (raw keccak256 over the
+    /// v2 struct/domain, NOT via this code path) so they cross-validate the
+    /// implementation rather than merely pinning it:
+    ///   * v2 Order typehash — keccak256 of the 11-field v2 struct string.
+    ///   * domain separator for `name="Polymarket CTF Exchange"`,
+    ///     `version="2"`, chainId=137, verifyingContract=CTF_EXCHANGE_V2.
+    ///   * struct hash + EIP-712 digest for an EOA order with a FIXED
+    ///     timestamp (build_signed_order stamps live ms, so the fixture
+    ///     builds `OrderV2` directly to keep the digest deterministic).
+    ///
+    /// EOA property: `maker == signer == EOA` and `signatureType == 0`.
+    /// If this ever flips without an intended v2 struct/domain change, the
+    /// server will reject every EOA order — stop and investigate.
+    #[test]
+    fn v2_eoa_signing_vectors_stable() {
+        // Typehash of the v2 Order struct string.
+        assert_eq!(
+            hex::encode(order_v2_type_hash()),
+            "bb86318a2138f5fa8ae32fbe8e659f8fcf13cc6ae4014a707893055433818589",
+        );
+
+        // Hardhat account #0 key → EOA 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266.
+        // CTFExchangeV2 (not neg-risk), no builder code.
+        let signer = OrderSignerV2::new(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            false,
+            SignatureType::Eoa,
+            "",
+        )
+        .unwrap();
+
+        // Domain separator (version "2", CTF_EXCHANGE_V2).
+        assert_eq!(
+            hex::encode(signer.domain_separator()),
+            "3264e159346253e26a64e00b69032db0e7d32f94628de3e6eecb50304d7af3d2",
+        );
+
+        let eoa = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        // Fixed-timestamp EOA order (BUY 100 @ 0.55): maker == signer == EOA,
+        // signatureType 0, metadata/builder zeroed.
+        let order = OrderV2 {
+            salt: "1234567890".to_string(),
+            maker: eoa.to_string(),
+            signer: eoa.to_string(),
+            token_id:
+                "50303916472381649224674364401111317755258653723694532482715411789597335197187"
+                    .to_string(),
+            maker_amount: "55000000".to_string(),
+            taker_amount: "100000000".to_string(),
+            side: 0,             // BUY
+            signature_type: 0,   // EOA
+            timestamp: "1700000000000".to_string(),
+            metadata: format!("0x{}", hex::encode([0u8; 32])),
+            builder: format!("0x{}", hex::encode([0u8; 32])),
+            taker: "0x0000000000000000000000000000000000000000".to_string(),
+            expiration: "0".to_string(),
+        };
+        assert_eq!(order.maker, order.signer, "EOA: maker must equal signer");
+        assert_eq!(order.signature_type, SignatureType::Eoa as u8);
+
+        assert_eq!(
+            hex::encode(order_v2_struct_hash(&order)),
+            "f47f6bdd8279fb7d314db4f7632d7c0ad8b13d86fece1607f16b9f892a3aab82",
+        );
+        assert_eq!(
+            hex::encode(signer.order_digest(&order)),
+            "0f61ee6f1fb96526390b7c70417e7aa72215d532eba63aabf62a06c0b6f18e76",
+        );
+    }
+
     #[test]
     fn poly1271_order_wrap_layout() {
         let signer = OrderSignerV2::new(
