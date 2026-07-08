@@ -46,7 +46,9 @@ async fn chainlink_ws_task(
     event_tx: crossbeam_channel::Sender<MarketEvent>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    // base 0.1s, cap 6.4s → 0.1→0.2→0.4→0.8→1.6→3.2→6.4s (±50% jitter) on
+    // consecutive failures. See the stability-gated reset below.
+    let mut backoff = crate::exchange::ReconnectBackoff::new(100, 6_400);
 
     loop {
         if shutdown.load(Ordering::Relaxed) { break; }
@@ -61,7 +63,12 @@ async fn chainlink_ws_task(
                 continue;
             }
         };
-        backoff.reset();
+        // Do NOT reset the backoff on connect: a successful `connect_async`
+        // only means the WS upgrade was accepted, not that the connection is
+        // healthy. Resetting here let a connect-then-immediate-drop (server-side
+        // rate-limit / 429 flap) hammer reconnect every ~base_ms and never back
+        // off. Reset only after the connection proves stable (≥30s), below.
+        let connected_at = std::time::Instant::now();
         let (mut write, mut read) = stream.split();
 
         let subs: Vec<serde_json::Value> = symbols.iter().map(|sym| {
@@ -179,6 +186,10 @@ async fn chainlink_ws_task(
         }
 
         if shutdown.load(Ordering::Relaxed) { break; }
+        // Reset the exponential backoff only when the connection was stable for
+        // ≥30s; otherwise keep escalating 0.1→0.2→…→6.4s so consecutive fast
+        // drops back off instead of storming the endpoint into HTTP 429.
+        if connected_at.elapsed().as_secs() >= 30 { backoff.reset(); }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
