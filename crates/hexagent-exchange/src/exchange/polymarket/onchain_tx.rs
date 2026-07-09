@@ -245,6 +245,78 @@ pub fn submit_safe_tx_onchain_with_value(
     ).map_err(|e| anyhow!("{}", e))
 }
 
+/// Gas limit for a direct EOA ERC-20 `approve` / ERC-1155
+/// `setApprovalForAll` call. Both cost ~46k gas; 120k gives comfortable
+/// headroom without over-reserving (an EOA pays for the reserved limit's
+/// worst case only on revert).
+const EOA_CALL_GAS_LIMIT: u64 = 120_000;
+
+/// Broadcast a **plain EOA transaction** (no Safe wrapper) on-chain: the
+/// signer EOA calls `to` with `data`, paying its own gas in POL.
+///
+/// Used by the EOA (signatureType=0) approval path — an EOA has no Safe to
+/// `execTransaction` through; it IS the token owner granting the allowance,
+/// so it signs and broadcasts the `approve(...)` / `setApprovalForAll(...)`
+/// call directly. Reuses the shared local nonce manager (so back-to-back
+/// approvals don't collide on a stale chain-pending nonce) and the same
+/// EIP-1559 signer as the Safe path.
+///
+/// Returns the Polygon tx hash (`0x…`); the caller polls
+/// [`poll_onchain_tx`] to follow confirmation. Requires POL in the EOA for
+/// gas (the gasless relayer only serves Safe meta-txs).
+pub fn submit_eoa_tx_onchain(
+    signing_key: &SigningKey,
+    signer: &str,
+    to: &str,
+    data: &str,
+) -> Result<String> {
+    let data_bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data))
+        .map_err(|e| anyhow!("invalid data hex: {}", e))?;
+    let to_bytes = hex::decode(to.strip_prefix("0x").unwrap_or(to))
+        .map_err(|e| anyhow!("invalid to address: {}", e))?;
+    if to_bytes.len() != 20 {
+        return Err(anyhow!("to address must be 20 bytes, got {}", to_bytes.len()));
+    }
+
+    let nonce = next_nonce_for(signer)?;
+    let max_fee_wei: u128 = (MAX_FEE_PER_GAS_GWEI as u128) * 1_000_000_000u128;
+    let tip_wei: u128 = (MAX_PRIORITY_FEE_GWEI as u128) * 1_000_000_000u128;
+
+    let raw_tx = sign_eip1559_tx(
+        signing_key,
+        CHAIN_ID,
+        nonce,
+        tip_wei,
+        max_fee_wei,
+        EOA_CALL_GAS_LIMIT,
+        &to_bytes,
+        0, // no native POL value
+        &data_bytes,
+    )?;
+
+    info!(
+        "[OnchainTx] EOA tx broadcast: signer={} → to={} nonce={} gas_limit={} max_fee={}gwei",
+        &signer[..10.min(signer.len())], &to[..10.min(to.len())],
+        nonce, EOA_CALL_GAS_LIMIT, MAX_FEE_PER_GAS_GWEI,
+    );
+
+    match send_raw_transaction(&raw_tx) {
+        Ok(tx_hash) => {
+            info!("[OnchainTx] EOA tx submitted: {}", tx_hash);
+            Ok(tx_hash)
+        }
+        Err(e) => {
+            // On `nonce too low`, drop the stale local cache so a retry
+            // re-syncs to chain truth (mirrors the Safe path).
+            let classified = BroadcastError::classify(&e.to_string(), nonce);
+            if classified.is_nonce_too_low() {
+                reset_local_nonce(signer);
+            }
+            Err(anyhow!("{}", classified))
+        }
+    }
+}
+
 /// Submit a Safe transaction with caller-controlled gas. Returns
 /// classified `BroadcastError` so callers can retry intelligently
 /// (e.g. bump gas on `Underpriced`, resync nonce on `NonceTooLow`).

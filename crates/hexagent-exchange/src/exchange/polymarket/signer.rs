@@ -592,6 +592,40 @@ mod tests {
         assert_eq!(signed.order_hash.len(), 2 + 64);
     }
 
+    /// EOA (signatureType=0) invariants for the v1 path, cross-checked
+    /// against official python-order-utils / py-clob-client `create_order`:
+    /// for a pure EOA the order `maker == signer == EOA`, `taker` is the
+    /// zero address, and `expiration/nonce/feeRateBps` default to "0". The
+    /// struct-hash / digest values are locked in `test_order_struct_hash_stable`
+    /// / `test_order_digest_stable` (same fixture, signatureType=0).
+    #[test]
+    fn eoa_v1_order_field_invariants() {
+        let signer = fixture_signer();
+        assert!(matches!(signer.signature_type, SignatureType::Eoa));
+        // EOA: maker (funder) == signer (EOA), both the key-derived address.
+        assert_eq!(signer.maker_address, signer.signer_address);
+        assert_eq!(SignatureType::Eoa as u8, 0);
+
+        let signed = signer
+            .build_signed_order(
+                "50303916472381649224674364401111317755258653723694532482715411789597335197187",
+                0.55,
+                100.0,
+                crate::types::Side::Buy,
+                0,
+            )
+            .unwrap();
+        assert_eq!(signed.order.maker, signed.order.signer, "EOA: maker == signer");
+        assert_eq!(signed.order.signature_type, 0);
+        assert_eq!(signed.order.taker, ZERO_ADDRESS);
+        assert_eq!(signed.order.expiration, "0");
+        assert_eq!(signed.order.nonce, "0");
+        assert_eq!(signed.order.fee_rate_bps, "0");
+        // r+s+v signature, 0x + 130 hex chars (65 bytes).
+        assert!(signed.signature.starts_with("0x"));
+        assert_eq!(signed.signature.len(), 132);
+    }
+
     #[test]
     fn test_derive_address_deterministic() {
         // Well-known test private key
