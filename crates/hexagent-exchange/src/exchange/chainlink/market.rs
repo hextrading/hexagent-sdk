@@ -71,14 +71,27 @@ async fn chainlink_ws_task(
         let connected_at = std::time::Instant::now();
         let (mut write, mut read) = stream.split();
 
-        let subs: Vec<serde_json::Value> = symbols.iter().map(|sym| {
-            let filters_json = serde_json::json!({"symbol": sym}).to_string();
-            serde_json::json!({
+        // RTDS honors only ONE subscription per topic per connection: with
+        // several per-symbol filtered entries the server silently keeps the
+        // FIRST and drops the rest (observed 2026-07-11: btc/eth/sol
+        // subscribed → only btc pushed). A filters ARRAY is rejected
+        // outright. So: single symbol → keep the server-side filter;
+        // multiple → subscribe the whole topic unfiltered (only ~7 symbols
+        // at ~1 msg/s each) and rely on the client-side symbol filter in
+        // the read loop below.
+        let subs: Vec<serde_json::Value> = if symbols.len() == 1 {
+            let filters_json = serde_json::json!({"symbol": symbols[0]}).to_string();
+            vec![serde_json::json!({
                 "topic": "crypto_prices_chainlink",
                 "type": "*",
                 "filters": filters_json,
-            })
-        }).collect();
+            })]
+        } else {
+            vec![serde_json::json!({
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+            })]
+        };
 
         let sub_msg = serde_json::json!({
             "action": "subscribe",

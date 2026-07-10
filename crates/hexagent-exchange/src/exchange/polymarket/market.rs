@@ -1031,19 +1031,24 @@ async fn rtds_connect_and_run(
     let (stream, _) = tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL).await?;
     let (mut write, mut read) = stream.split();
 
-    // Build and send subscriptions
+    // Build and send subscriptions. RTDS honors only ONE subscription per
+    // topic per connection — several per-symbol filtered entries on the
+    // same topic silently keep the FIRST and drop the rest, and a filters
+    // ARRAY is rejected (observed 2026-07-11 on crypto_prices_chainlink).
+    // Single filter → keep the server-side filter; multiple → subscribe
+    // the whole topic unfiltered and rely on the client-side `pass`
+    // symbol filter in the read loop.
     let mut subs = Vec::new();
     for rtds in subscriptions {
         let (topic, typ) = rtds.topic_and_type();
-        for filter in &rtds.filters {
-            let filters_json = serde_json::json!({"symbol": filter}).to_string();
+        if rtds.filters.len() == 1 {
+            let filters_json = serde_json::json!({"symbol": rtds.filters[0]}).to_string();
             subs.push(serde_json::json!({
                 "topic": topic,
                 "type": typ,
                 "filters": filters_json,
             }));
-        }
-        if rtds.filters.is_empty() {
+        } else {
             subs.push(serde_json::json!({"topic": topic, "type": typ}));
         }
     }
