@@ -1031,24 +1031,21 @@ async fn rtds_connect_and_run(
     let (stream, _) = tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL).await?;
     let (mut write, mut read) = stream.split();
 
-    // Build and send subscriptions. RTDS honors only ONE subscription per
-    // topic per connection — several per-symbol filtered entries on the
-    // same topic silently keep the FIRST and drop the rest, and a filters
-    // ARRAY is rejected (observed 2026-07-11 on crypto_prices_chainlink).
-    // Single filter → keep the server-side filter; multiple → subscribe
-    // the whole topic unfiltered and rely on the client-side `pass`
-    // symbol filter in the read loop.
+    // Build and send subscriptions — ALWAYS one unfiltered subscription
+    // per topic, symbols filtered client-side by the `pass` check in the
+    // read loop. Server-side `filters` is a trap (observed 2026-07-11 on
+    // crypto_prices_chainlink): only ONE subscription per topic is
+    // honored (per-symbol entries silently keep the first, drop the
+    // rest), and the filtered path itself intermittently goes silently
+    // dead — healthy connection, zero pushes — while unfiltered delivers
+    // normally in the same window. Topic volume is tiny (crypto_prices ~6
+    // symbols, crypto_prices_chainlink ~7, each ~1 msg/s), so client-side
+    // filtering costs nothing.
     let mut subs = Vec::new();
+    let mut seen_topics = std::collections::HashSet::new();
     for rtds in subscriptions {
         let (topic, typ) = rtds.topic_and_type();
-        if rtds.filters.len() == 1 {
-            let filters_json = serde_json::json!({"symbol": rtds.filters[0]}).to_string();
-            subs.push(serde_json::json!({
-                "topic": topic,
-                "type": typ,
-                "filters": filters_json,
-            }));
-        } else {
+        if seen_topics.insert(topic.to_string()) {
             subs.push(serde_json::json!({"topic": topic, "type": typ}));
         }
     }

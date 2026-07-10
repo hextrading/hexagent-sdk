@@ -71,27 +71,26 @@ async fn chainlink_ws_task(
         let connected_at = std::time::Instant::now();
         let (mut write, mut read) = stream.split();
 
-        // RTDS honors only ONE subscription per topic per connection: with
-        // several per-symbol filtered entries the server silently keeps the
-        // FIRST and drops the rest (observed 2026-07-11: btc/eth/sol
-        // subscribed → only btc pushed). A filters ARRAY is rejected
-        // outright. So: single symbol → keep the server-side filter;
-        // multiple → subscribe the whole topic unfiltered (only ~7 symbols
-        // at ~1 msg/s each) and rely on the client-side symbol filter in
-        // the read loop below.
-        let subs: Vec<serde_json::Value> = if symbols.len() == 1 {
-            let filters_json = serde_json::json!({"symbol": symbols[0]}).to_string();
-            vec![serde_json::json!({
-                "topic": "crypto_prices_chainlink",
-                "type": "*",
-                "filters": filters_json,
-            })]
-        } else {
-            vec![serde_json::json!({
-                "topic": "crypto_prices_chainlink",
-                "type": "*",
-            })]
-        };
+        // ALWAYS subscribe the whole topic unfiltered and filter client-side
+        // (read loop below). Server-side `filters` is a trap, twice over
+        // (all observed 2026-07-11):
+        //   1. Only ONE subscription per topic is honored — per-symbol
+        //      filtered entries silently keep the FIRST and drop the rest
+        //      (btc/eth/sol subscribed → only btc pushed). A JSON-array
+        //      filters string `[{"symbol":..},{"symbol":..}]` IS accepted
+        //      when the filter path works; comma-joined symbols are not.
+        //   2. The filtered path itself is FLAKY: in several test windows
+        //      every filtered form (single or array) went silently dead —
+        //      connection healthy, zero pushes — while the unfiltered
+        //      subscription delivered normally in the same window. A 24/7
+        //      recorder reconnecting into such a window would record
+        //      nothing while looking connected.
+        // The unfiltered topic is tiny (~7 symbols × ~1 msg/s), so the
+        // client-side filter costs nothing.
+        let subs: Vec<serde_json::Value> = vec![serde_json::json!({
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+        })];
 
         let sub_msg = serde_json::json!({
             "action": "subscribe",
