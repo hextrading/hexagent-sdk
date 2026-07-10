@@ -2089,6 +2089,8 @@ impl Engine {
                             MarketEvent::Quote(q) => strategy.on_quote_tick(q),
                             MarketEvent::Bar(b) => strategy.on_bar(b),
                             MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
+                            // No strategy hook yet — recorded only.
+                            MarketEvent::AssetCtx(_) => {}
                             MarketEvent::Instrument(inst) => {
                                 // Mirror the live thread's Instrument
                                 // handler — gap-fill hist bars FIRST so
@@ -2247,6 +2249,8 @@ impl Engine {
                             MarketEvent::Quote(q) => strategy.on_quote_tick(q),
                             MarketEvent::Bar(b) => strategy.on_bar(b),
                             MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
+                            // No strategy hook yet — recorded only.
+                            MarketEvent::AssetCtx(_) => {}
                             MarketEvent::Instrument(inst) => {
                                 let ts_event = event.timestamp_ns();
                                 let hist_reqs = strategy.load_hist_data(ts_event);
@@ -2350,6 +2354,8 @@ impl Engine {
                                             MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
                                             MarketEvent::Bar(b) => { strategy.on_bar(b); Vec::new() }
                                             MarketEvent::SpotPrice(sp) => { strategy.on_spot_price(sp); Vec::new() }
+                                            // No strategy hook yet — recorded only.
+                                            MarketEvent::AssetCtx(_) => Vec::new(),
                                             MarketEvent::Instrument(inst) => {
                                                 strategy.on_instrument(inst);
                                                 // Load historical bars after instrument setup
@@ -2663,6 +2669,7 @@ impl Engine {
             MarketEvent::Quote(q) => sym_to_instances.get(&q.symbol.to_ascii_lowercase()).cloned(),
             MarketEvent::Bar(b) => sym_to_instances.get(&b.symbol.to_ascii_lowercase()).cloned(),
             MarketEvent::SpotPrice(sp) => sym_to_instances.get(&sp.symbol.to_ascii_lowercase()).cloned(),
+            MarketEvent::AssetCtx(ac) => sym_to_instances.get(&ac.symbol.to_ascii_lowercase()).cloned(),
             MarketEvent::EventStart { symbol, .. } =>
                 sym_to_instances.get(&symbol.to_ascii_lowercase()).cloned(),
             MarketEvent::Exit => Some(Vec::new()),
@@ -2739,6 +2746,8 @@ impl Engine {
                             MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
                             MarketEvent::Bar(b) => { strategy.on_bar(b); Vec::new() }
                             MarketEvent::SpotPrice(sp) => { strategy.on_spot_price(sp); Vec::new() }
+                            // No strategy hook yet — recorded only.
+                            MarketEvent::AssetCtx(_) => Vec::new(),
                             MarketEvent::Instrument(inst) => {
                                 strategy.on_instrument(inst);
                                 let ts_event = event.timestamp_ns();

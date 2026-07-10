@@ -230,6 +230,30 @@ impl ParquetBuffer {
         self.data_json.push(Some(serde_json::to_string(event).unwrap_or_default()));
     }
 
+    /// Asset-context row (`event_type = "asset_ctx"`): mark px in `price`,
+    /// impact bid/ask in `bid_price`/`ask_price`, remaining ctx fields as
+    /// compact JSON in `data_json`.
+    fn push_asset_ctx(&mut self, ts: u64, local_ts: u64, exchange: &str, ac: &crate::types::AssetCtxTick) {
+        self.timestamp_ns.push(ts);
+        self.local_timestamp_ns.push(local_ts);
+        self.exchange.push(exchange.to_string());
+        self.event_type.push("asset_ctx".to_string());
+        self.symbol.push(ac.symbol.clone());
+        self.side.push(None);
+        self.price.push(Some(ac.mark_px));
+        self.quantity.push(None);
+        self.bid_price.push(Some(ac.impact_bid_px));
+        self.ask_price.push(Some(ac.impact_ask_px));
+        self.bid_qty.push(None);
+        self.ask_qty.push(None);
+        self.bids_json.push(None);
+        self.asks_json.push(None);
+        self.data_json.push(Some(format!(
+            "{{\"oraclePx\":{},\"midPx\":{},\"funding\":{},\"openInterest\":{},\"premium\":{},\"dayNtlVlm\":{},\"prevDayPx\":{}}}",
+            ac.oracle_px, ac.mid_px, ac.funding, ac.open_interest, ac.premium, ac.day_ntl_vlm, ac.prev_day_px,
+        )));
+    }
+
     fn push_spot_price(&mut self, ts: u64, local_ts: u64, sp: &crate::types::SpotPrice) {
         self.timestamp_ns.push(ts);
         self.local_timestamp_ns.push(local_ts);
@@ -561,6 +585,15 @@ impl MarketRecorder {
                     self.rotate_buffer(&file_key);
                     let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
                     buf.push_trade(t.exchange_timestamp_ns, t.local_timestamp_ns, &ex, t);
+                    self.total_event_count += 1;
+                }
+            }
+            MarketEvent::AssetCtx(ac) => {
+                let ex = ac.exchange.to_string();
+                if let Some((file_key, path)) = self.resolve_file(&ex, &ac.symbol, ac.local_timestamp_ns) {
+                    self.rotate_buffer(&file_key);
+                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
+                    buf.push_asset_ctx(ac.local_timestamp_ns, ac.local_timestamp_ns, &ex, ac);
                     self.total_event_count += 1;
                 }
             }

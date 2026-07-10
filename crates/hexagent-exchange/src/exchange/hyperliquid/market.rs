@@ -1,9 +1,14 @@
 //! Hyperliquid market-data feed — the `ExchangeMarket` (WS) impl.
 //!
-//! Subscribes `l2Book` + `trades` per coin. `l2Book` is a full best-first
-//! snapshot each message (`levels = [bids, asks]`), so — unlike Coinbase's
-//! incremental `level2` — there's no local book to maintain: each message
-//! maps straight to an `OrderBookSnapshot`.
+//! Subscribes `l2Book` + `trades` + `activeAssetCtx` per coin. `l2Book` is
+//! a full best-first snapshot each message (`levels = [bids, asks]`), so —
+//! unlike Coinbase's incremental `level2` — there's no local book to
+//! maintain: each message maps straight to an `OrderBookSnapshot`.
+//!
+//! `l2Book` is subscribed with `fast: true`: since the 2026-06 network
+//! upgrade the standard feed is throttled to a 20-level snapshot every
+//! ~5s; `fast` restores ~0.5s cadence at 5 levels. `activeAssetCtx`
+//! (mark/oracle px, funding, OI) pushes ~1 msg/s per coin.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,7 +19,7 @@ use log::{info, warn};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::types::{
-    now_ns, Exchange, MarketEvent, OrderBookSnapshot, PriceLevel, Side, TradeTick,
+    now_ns, AssetCtxTick, Exchange, MarketEvent, OrderBookSnapshot, PriceLevel, Side, TradeTick,
 };
 
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -82,13 +87,18 @@ async fn hyperliquid_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        // Subscribe l2Book + trades per coin.
+        // Subscribe l2Book (fast: 5 levels / ~0.5s vs throttled 20 levels /
+        // ~5s default) + trades + activeAssetCtx per coin.
         let mut sub_ok = true;
         for coin in &coins {
-            for ch in ["l2Book", "trades"] {
+            for ch in ["l2Book", "trades", "activeAssetCtx"] {
+                let mut sub_body = serde_json::json!({ "type": ch, "coin": coin });
+                if ch == "l2Book" {
+                    sub_body["fast"] = serde_json::Value::Bool(true);
+                }
                 let sub = serde_json::json!({
                     "method": "subscribe",
-                    "subscription": { "type": ch, "coin": coin },
+                    "subscription": sub_body,
                 });
                 if let Err(e) = write.send(Message::Text(sub.to_string())).await {
                     warn!("[Hyperliquid] subscribe {} {} failed: {}", ch, coin, e);
@@ -100,7 +110,7 @@ async fn hyperliquid_ws_task(
         if !sub_ok {
             continue;
         }
-        info!("[Hyperliquid] Connected, subscribed l2Book+trades for {:?}", coins);
+        info!("[Hyperliquid] Connected, subscribed l2Book(fast)+trades+activeAssetCtx for {:?}", coins);
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -187,6 +197,41 @@ async fn hyperliquid_ws_task(
                                         });
                                         if event_tx.send(event).is_err() { return; }
                                     }
+                                }
+                                "activeAssetCtx" => {
+                                    let d = match data.get("data") { Some(d) => d, None => continue };
+                                    let coin = d.get("coin").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let ctx = match d.get("ctx") { Some(c) => c, None => continue };
+                                    let f = |key: &str| -> f64 {
+                                        ctx.get(key).and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse().ok()).unwrap_or(0.0)
+                                    };
+                                    // impactPxs = [bid, ask]; midPx can be
+                                    // absent on an empty book.
+                                    let (impact_bid, impact_ask) = ctx.get("impactPxs")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| {
+                                            let p = |i: usize| a.get(i).and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                            (p(0), p(1))
+                                        })
+                                        .unwrap_or((0.0, 0.0));
+                                    let event = MarketEvent::AssetCtx(AssetCtxTick {
+                                        exchange: Exchange::Hyperliquid,
+                                        symbol: coin,
+                                        mark_px: f("markPx"),
+                                        oracle_px: f("oraclePx"),
+                                        mid_px: f("midPx"),
+                                        funding: f("funding"),
+                                        open_interest: f("openInterest"),
+                                        premium: f("premium"),
+                                        impact_bid_px: impact_bid,
+                                        impact_ask_px: impact_ask,
+                                        day_ntl_vlm: f("dayNtlVlm"),
+                                        prev_day_px: f("prevDayPx"),
+                                        local_timestamp_ns: now_ns(),
+                                    });
+                                    if event_tx.send(event).is_err() { return; }
                                 }
                                 // subscriptionResponse / pong / other — ignore.
                                 _ => {}

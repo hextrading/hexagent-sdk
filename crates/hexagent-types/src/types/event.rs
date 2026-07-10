@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::instrument::Instrument;
-use super::market::{BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange, TradeTick};
+use super::market::{AssetCtxTick, BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange, TradeTick};
 use super::order::OrderRequest;
 
 /// Events flowing from market data sources to the strategy engine
@@ -15,6 +15,9 @@ pub enum MarketEvent {
     Bar(BarData),
     TickSizeChange(TickSizeChange),
     SpotPrice(SpotPrice),
+    /// Perp asset context (mark/oracle px, funding, OI) — e.g. Hyperliquid
+    /// `activeAssetCtx`, ~1 msg/s per coin.
+    AssetCtx(AssetCtxTick),
     Instrument(Instrument),
     Connected { exchange: Exchange },
     Disconnected { exchange: Exchange, reason: String },
@@ -154,6 +157,7 @@ impl MarketEvent {
             MarketEvent::Bar(b) => b.local_timestamp_ns,
             MarketEvent::TickSizeChange(ts) => ts.local_timestamp_ns,
             MarketEvent::SpotPrice(sp) => sp.local_timestamp_ns,
+            MarketEvent::AssetCtx(ac) => ac.local_timestamp_ns,
             MarketEvent::EventStart { event_start_ns, .. } => *event_start_ns,
             MarketEvent::Instrument(_)
             | MarketEvent::Connected { .. }
@@ -184,6 +188,7 @@ impl MarketEvent {
             MarketEvent::Bar(b) => b.exchange,
             MarketEvent::TickSizeChange(ts) => ts.exchange,
             MarketEvent::SpotPrice(_) => Exchange::Polymarket,
+            MarketEvent::AssetCtx(ac) => ac.exchange,
             MarketEvent::Instrument(inst) => match inst {
                 Instrument::Spot(s) => s.exchange,
                 Instrument::BinaryOption(bo) => bo.exchange,

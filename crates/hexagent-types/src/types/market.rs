@@ -191,6 +191,31 @@ pub struct SpotPrice {
     pub local_timestamp_ns: u64,
 }
 
+/// Perp asset-context push (e.g. Hyperliquid `activeAssetCtx`): mark /
+/// oracle / mid price, funding, open interest. Pushed ~1 msg/s per coin.
+/// The payload carries no server timestamp — `local_timestamp_ns` is the
+/// only time axis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetCtxTick {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub mark_px: f64,
+    pub oracle_px: f64,
+    pub mid_px: f64,
+    /// Current hourly funding rate.
+    pub funding: f64,
+    /// Open interest in base units.
+    pub open_interest: f64,
+    pub premium: f64,
+    /// Impact bid/ask prices (funding-calc reference).
+    pub impact_bid_px: f64,
+    pub impact_ask_px: f64,
+    /// Rolling 24h notional volume (USD).
+    pub day_ntl_vlm: f64,
+    pub prev_day_px: f64,
+    pub local_timestamp_ns: u64,
+}
+
 /// Request for historical kline data, returned by `Strategy::load_hist_data()`.
 #[derive(Debug, Clone)]
 pub struct HistDataRequest {
