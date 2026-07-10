@@ -16,19 +16,19 @@
 //!     plus `Cancel request + Cancel result` on the cancel side.
 //!     ACK rows that land in the **final 30 s** of an event (the
 //!     close-only / lock-in window) are excluded from the parser's
-//!     bucket, matching live's `RttGate::maybe_lock_in` at T-30 s.
+//!     bucket, matching the live strategy's T-30 s lock-in (apv2 quote_n channel,
+//!     formerly `RttGate::maybe_lock_in`).
 //!   * **Previous event's place-only p60** — what the strategy's
-//!     RTT-gate observed at THIS event's start. Drives the per-event
-//!     RTT-N scaling (`N = ceil(prev_p / 100ms)` clamped to
-//!     `quote_interval_n_max`).
+//!     apv2 quote_n channel observed at THIS event's start. Drives the
+//!     per-event quote_n scaling (`N = ceil(prev_p / rtt_bucket_ms)`
+//!     clamped to `quote_n_max`).
 //!
-//!     Matches BOTH the quantile and source the live gate uses:
+//!     Matches BOTH the quantile and source the live channel uses:
 //!       - quantile = p60 (live's `rtt_percentile = 0.60` config;
 //!         the 0.85 default in code is never used in any deployed
 //!         TOML)
-//!       - source   = place RTTs only (gate's `record_sample()` is
-//!         wired exclusively to the place-side ack path; cancel
-//!         acks bypass the gate — see strategy.rs:6510)
+//!       - source   = place RTTs only (the channel records exclusively
+//!         place-side acks; cancel acks bypass it)
 //!
 //!     A naive carry-over using place p85 would inflate sim's N
 //!     by ~60% (place p85 ≈ 1.6× place p60 in the typical
@@ -42,13 +42,14 @@
 //!     event's empirical anchors into both samplers — the next
 //!     `sample_place` / `sample_cancel` calls draw from the live
 //!     distribution instead of the auto-cal CDF.
-//!   * `RttGate::set_prev_event_p_override(...)` injects the live's
-//!     observed prior-event pooled p60 so the strategy's N calc uses
-//!     the same anchor it actually used in live.
+//!   * `Strategy::set_per_event_prev_p_override(...)` injects the live's
+//!     observed prior-event pooled p60 so the strategy's quote_n calc
+//!     (apv2, formerly rtt_gate) uses the same anchor it actually used
+//!     in live.
 //!
 //! On miss the engine falls back to whatever the latency sampler was
 //! constructed with (auto-cal hourly or pooled empirical), and the
-//! strategy's rtt_gate uses its own internally-tracked
+//! strategy's apv2 quote_n channel uses its own internally-tracked
 //! `last_event_p_ms`.
 //!
 //! **Event bucketing**: each Submit/Cancel-request line's wall-clock
@@ -111,16 +112,15 @@ pub struct EventRttOverride {
     pub cancel_p99_ms: Option<u32>,
     pub cancel_n_samples: usize,
     /// **Previous event's place-only p60** — matches the strategy's
-    /// `RttGate.rtt_percentile = 0.60` configuration AND the gate's
+    /// apv2 `rtt_percentile = 0.60` configuration AND its
     /// place-only sample source.
     ///
     /// Two corrections vs the naive "place-p85 carry-over":
     ///   1. **Quantile**: gate uses p60, not p85. Live configs all set
     ///      `rtt_percentile = 0.60`; the 0.85 in code is just a
     ///      compile-time default.
-    ///   2. **Source**: gate's `record_sample` is wired to the
-    ///      place-side ack path only (see strategy.rs:815 — "the
-    ///      place-only feed"). Cancel acks do NOT feed the gate.
+    ///   2. **Source**: the channel records place-side acks only
+    ///      ("the place-only feed"). Cancel acks do NOT feed it.
     ///
     /// `None` if previous event had `< MIN_SAMPLES` place samples
     /// (or this is the first event in the table).
@@ -179,7 +179,8 @@ const EVENT_PERIOD_SECS: u64 = 300;
 /// 4096 covers any reasonable backlog.
 const MAX_PENDING: usize = 4096;
 
-/// **Lock-in window**: live's `RttGate::maybe_lock_in` fires at
+/// **Lock-in window**: live's T-30 s lock-in (apv2 quote_n channel,
+/// formerly `RttGate::maybe_lock_in`) fires at
 /// `event_start + (EVENT_PERIOD_SECS - LOCKIN_OFFSET_SECS)`, i.e.
 /// 30 s before event end. The lock-in computes p60 from samples
 /// observed up to that point — the final 30 s ("close-only" window)
@@ -356,9 +357,8 @@ pub fn extract_per_event_rtt(
             // **Order failed** (2026-05-21 method B): the
             // place-side ack lands as a server-side rejection
             // (`Order failed: status 400 ... coid=N`). The live
-            // gate's `record_sample` is invoked from
-            // `strategy.rs:6510` for any non-timeout response, so
-            // failed orders DO contribute to the gate's p60. Parser
+            // channel records any non-timeout response, so
+            // failed orders DO contribute to its p60. Parser
             // must include them too for source parity with the
             // live gate. Volume is small (~0.1% of total submits)
             // but the inclusion keeps the distribution shape
@@ -439,10 +439,8 @@ pub fn extract_per_event_rtt(
         // dimensions of the gate's accumulation:
         //   * quantile: gate uses `rtt_percentile = 0.60` in all live
         //     configs (the 0.85 default in code is never used)
-        //   * source: gate's `record_sample()` is wired only to the
-        //     place-side ack path (strategy.rs:6510 inside the
-        //     `place_emit_event_ts` lookup; see strategy.rs:815
-        //     "the place-only feed"). Cancel acks DO NOT feed the gate.
+        //   * source: the channel records only place-side acks (the
+        //     place-only feed). Cancel acks DO NOT feed it.
         let place_p60: Option<u32> = if place.len() >= MIN_SAMPLES {
             Some(quantile_at(place, 0.60))
         } else {
@@ -550,7 +548,7 @@ impl EventRttOverride {
 /// Floor a millisecond timestamp to the nearest event boundary (secs).
 ///
 /// Returns `None` when the timestamp falls within the **final 30 s**
-/// of an event (the close-only / lock-in window). live's RttGate
+/// of an event (the close-only / lock-in window). live's apv2 channel
 /// computes p60 at `event_start + 270s`, so any Submit whose
 /// `ts_offset >= 270s` would never contribute to the gate's prev_p
 /// — parser must drop them to keep the parsed distribution shape
@@ -558,7 +556,7 @@ impl EventRttOverride {
 /// Floor a millisecond timestamp to its event boundary AND return the
 /// submit's offset from event_start in seconds. Returns `None` when
 /// the submit lands in the final 30 s (close-only / lock-in window),
-/// matching live's `RttGate::maybe_lock_in` which drops those samples
+/// matching live's lock-in which drops those samples
 /// from p60.
 ///
 /// Used by the intra-event segment router (2026-05-28) to decide
@@ -779,7 +777,7 @@ mod tests {
 
     /// Lock-in window cut: timestamps in the final 30 s of an event
     /// return `None` (parser drops the sample to match live's
-    /// `RttGate::maybe_lock_in` at T-30 s).
+    /// the live T-30 s lock-in).
     #[test]
     fn submit_ts_to_event_secs_drops_lockin_window() {
         // event_start = 1779286500, lock-in cut at offset 270s.
@@ -959,8 +957,8 @@ mod tests {
     /// **Place-only p60 carry-over verification** (2026-05-21). The
     /// previous-event prev_p carry should be the place-only p60 — NOT
     /// place-only p85 (the original regression) and NOT pooled
-    /// place+cancel p60. The gate's `record_sample` is wired only to
-    /// the place-side ack path (see strategy.rs:6510), so the
+    /// place+cancel p60. The live channel records only place-side
+    /// acks, so the
     /// carry-over must match that source exactly.
     #[test]
     fn prev_event_carry_is_place_only_p60_not_place_p85() {

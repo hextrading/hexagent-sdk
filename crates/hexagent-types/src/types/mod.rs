@@ -41,7 +41,7 @@ pub fn now_ns() -> u64 {
 /// installed (set by the BT engine on every replayed event), otherwise
 /// falls back to wall-clock `now_ns`. This is the canonical clock for
 /// anything that should be deterministic across BT runs — TTL stamping,
-/// rtt_gate timestamps, async-fetch polling, in-flight tracking, etc.
+/// per-event RTT timestamps, async-fetch polling, in-flight tracking, etc.
 ///
 /// **Live / Paper**: sim_clock_ns() returns None → always wall-clock →
 /// behaviour unchanged from a direct `now_ns()` call.

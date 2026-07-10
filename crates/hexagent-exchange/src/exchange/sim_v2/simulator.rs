@@ -931,7 +931,7 @@ mod tests {
             "split: cancel must time out on the cancel RTT, got {statuses:?}",
         );
         // The CancelOrderTimeout must carry a non-None exchange_order_id, else
-        // the strategy's handler silently drops it (see strategy.rs:6979).
+        // the strategy's handler silently drops it.
         assert!(
             oids.iter().any(|(c, oid)| c == "old" && oid.is_some()),
             "cancel timeout must carry exchange_order_id, got {oids:?}",

@@ -406,7 +406,8 @@ impl Engine {
             for id in keys {
                 let ps = match poly_states.get(id) { Some(s) => s.clone(), None => continue };
                 // Probe interval is per-strategy: each polymaker entry
-                // may set its own `rtt_gate_probe_interval_secs`.
+                // may set its own `adaptive_params_v2_probe_interval_secs`
+                // (legacy alias: `rtt_gate_probe_interval_secs`).
                 let interval_secs = self.config.strategies.iter()
                     .find(|s| {
                         self.registry.capabilities(&s.name).needs_rtt_probe
@@ -963,7 +964,7 @@ impl Engine {
         }
         let mut bar_cursor: usize = 0;
 
-        // ── Synthetic RTT-probe wiring — mirrors v1 (engine.rs ~2797): while
+        // ── Synthetic RTT-probe wiring — carried over from the removed v1 sim engine: while
         // the strat gate is in Probe mode it sets `bt_probe_enable`; we feed one
         // place-RTT sample (from the v2 latency sampler) every
         // `bt_probe_interval_ns` of sim clock so the gate recovers Probe→Trade
@@ -1111,7 +1112,7 @@ impl Engine {
 
         let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
 
-        // Per-instance USDC + per-event split shares (mirrors v1's sim wallet
+        // Per-instance USDC + per-event split shares (carried over from the removed v1 sim's wallet
         // seeding). split_amount_usdc → shares of each token credited at event.
         let mut sim_wallet_usdc_by_iid: HashMap<String, f64> = HashMap::new();
         let mut sim_split_by_iid: HashMap<String, f64> = HashMap::new();
@@ -1536,7 +1537,7 @@ impl Engine {
                 }
             }
 
-            // Synthetic RTT-probe emit (gate recovery), mirrors v1.
+            // Synthetic RTT-probe emit (PROBE recovery), carried over from the removed v1 sim engine.
             let now_for_probe = sim_clock_ns.max(strat_clock_ns);
             if bt_probe_enable.load(std::sync::atomic::Ordering::Relaxed)
                 && now_for_probe >= last_bt_probe_emit_sim_ns.saturating_add(bt_probe_interval_ns)
@@ -1970,15 +1971,17 @@ impl Engine {
         // would self-contaminate a freshly-trained prediction model.
         //
         // We now intentionally point both at the same canonical store
-        // (`./data`) so m_dynamic can see live's just-finished events
-        // without a copy step — BT/Live consistency depends on this.
+        // (`./data`) so the adaptive-params warm-up (apv2) can see
+        // live's just-finished events without a copy step — BT/Live
+        // consistency depends on this.
         // The same recordings have always been used in BT replays
         // without issue, so the "self-contamination" risk is the same
         // category as any BT, not a Live-specific hazard.
         //
         // New behaviour: detect the unified case → INFO log + keep the
         // dir. Only flag a WARN when the dirs DIFFER (operator
-        // misconfiguration → Live recordings invisible to m_dynamic).
+        // misconfiguration → Live recordings invisible to the apv2
+        // warm-up).
         if self.config.general.mode == RunMode::Live {
             let recorder_out = PathBuf::from(&self.config.recording.output_dir);
             let recorder_out_canon = std::fs::canonicalize(&recorder_out)
@@ -2090,9 +2093,9 @@ impl Engine {
                                 // Mirror the live thread's Instrument
                                 // handler — gap-fill hist bars FIRST so
                                 // the strategy's vol_model is populated
-                                // before on_instrument's m_dynamic
-                                // compute runs (see live-mode comment
-                                // around line 2165 for the rationale —
+                                // before on_instrument's per-event
+                                // adaptive-params compute runs (same rationale
+                                // as the live-mode Instrument handler —
                                 // first event after restart was getting
                                 // a cold-vol compute_for_event).
                                 let ts_event = event.timestamp_ns();
@@ -2112,8 +2115,8 @@ impl Engine {
                                     strategy.on_hist_data_loaded(ts_event);
                                 }
                                 // vol_model warm → on_instrument can
-                                // run m_dynamic compute against
-                                // populated bars.
+                                // run its per-event adaptive-params
+                                // compute against populated bars.
                                 strategy.on_instrument(inst);
                             }
                             MarketEvent::Connected { exchange } => strategy.on_connected(*exchange),

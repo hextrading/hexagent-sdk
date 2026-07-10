@@ -1,6 +1,7 @@
 //! RTT-probe task — synthetic latency measurement via real signed orders.
 //!
-//! Live partner of `strategy::polymaker::rtt_gate`. While the strategy
+//! Live partner of polymaker's apv2 quote_n/PROBE channel (formerly the
+//! deleted `rtt_gate` module). While the strategy
 //! sits in PROBE mode (no quoting), this task fires `POST /order`
 //! place probes at a fixed cadence (default 2 s) and pushes the
 //! round-trip duration back to the strategy via a crossbeam channel.

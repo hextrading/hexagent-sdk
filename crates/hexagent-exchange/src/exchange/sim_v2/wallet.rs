@@ -1,6 +1,6 @@
 //! Per-instance simulated wallet: USDC balance + per-token share inventory.
 //!
-//! Mirrors v1's `SimWallet` semantics (`src/exchange/sim/mod.rs`). The wallet
+//! Mirrors the removed v1 sim exchange's `SimWallet` semantics. The wallet
 //! stores balances only; "available" (balance − locked-by-resting-orders) is
 //! computed by the exchange core, which owns the resting-order set. USDC is
 //! `Option`: `None` disables lockup/balance gating (a wallet with no seeded

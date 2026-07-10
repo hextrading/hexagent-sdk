@@ -685,9 +685,9 @@ pub struct SharedState {
     /// inventory (CLOB `not enough balance`).
     pub order_maker_address: String,
     /// Which CLOB protocol to use for order placement / signing.
-    /// "v1" (default) = current behaviour; "v2" = new 2026-04-28
-    /// contract & schema. Every `sign_and_build_body` and auth path
-    /// dispatches on this.
+    /// "v2" (default) = 2026-04-28 contract & schema; explicit "v1"
+    /// opts back into the legacy path. Every `sign_and_build_body`
+    /// and auth path dispatches on this.
     pub clob_version: ClobVersion,
     /// Whether the live router may use Polymarket's batch endpoints
     /// (`POST /orders`, `DELETE /orders`). When `false`, every place /
@@ -2472,7 +2472,7 @@ impl PolymarketTrade {
                         // — never going to LIVE/MATCHED. Live evidence
                         // 2026-05-01 06:50: a single INVALID-status coid
                         // looped 2,088 reconcile attempts over 50 min,
-                        // wedging the orphan-gate at strategy.rs:3226 →
+                        // wedging the strategy's orphan-gate →
                         // on_quote early-returned every tick →
                         // poll_pending_snapshots never ran → 11 events
                         // ran with no quoting. Treat exactly like

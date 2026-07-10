@@ -125,7 +125,8 @@ pub trait Strategy: Send {
     ///
     /// Strategies that don't own an RTT gate (or that don't honour the
     /// BT override surface) should leave this as the default no-op.
-    /// PolymakerStrategy overrides it to forward into `RttGate`.
+    /// PolymakerStrategy overrides it to forward into its apv2
+    /// quote_n channel (formerly `RttGate`).
     fn set_per_event_prev_p_override(&mut self, _prev_p_ms: Option<f64>) {}
 }
 

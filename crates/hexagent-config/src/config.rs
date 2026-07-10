@@ -442,11 +442,11 @@ pub struct BacktestConfig {
     /// Strategy warmup window in seconds, measured on the sim clock from
     /// the first on_quote tick. While `sim_clock_now − strategy_start <
     /// this`, the strategy returns no signals (no quotes, no cancels)
-    /// even though the rest of the on_quote pipeline (poll_*, m_dynamic
-    /// init, etc.) keeps running.
+    /// even though the rest of the on_quote pipeline (poll_*, per-event
+    /// adaptive-params init, etc.) keeps running.
     ///
     /// Use case: cold-start parameters that need a few sim seconds to
-    /// stabilise — m_dynamic intensity / vol baselines, prediction
+    /// stabilise — adaptive-params intensity / vol baselines, prediction
     /// model first samples, RTT EWMA — so the BT's first event isn't
     /// quoted off uninitialised internals. Mirrors the empirical
     /// observation that live bots have a 5-15 s "rampup" period after
@@ -505,7 +505,7 @@ pub struct BacktestConfig {
     /// the per-event `prev_p` override** (2026-05-21). Only applies in
     /// `sim_rtt_mode = "exact"`.
     ///
-    /// Live's `RttGate::record_sample` measures RTT as
+    /// Live's RTT sampling (apv2 quote_n channel) measures RTT as
     /// `(ack_arrival_at_strategy - on_quote_entry_ts)`. The numerator
     /// is the entry to `on_quote()` where the strategy decided to
     /// place the order; the denominator is when the OrderUpdate from
@@ -789,11 +789,12 @@ pub struct ExchangeConfig {
     /// table: `feed_ids = { "eth/usd" = "0x…", "btc/usd" = "0x…" }`.
     #[serde(default)]
     pub feed_ids: HashMap<String, String>,
-    /// Polymarket signature type: "eoa" (default) or "gnosis_safe".
+    /// Polymarket signature type: "eoa" (default fallback), "poly_proxy",
+    /// "gnosis_safe" (poly_gnosis_safe), or "poly_1271" (deposit wallet).
     #[serde(default)]
     pub signature_type: String,
-    /// Polymarket CLOB protocol version: "v1" (default, current) or
-    /// "v2" (2026-04-28 cutover). v2 uses a new Exchange contract,
+    /// Polymarket CLOB protocol version: "v2" (default, 2026-04-28
+    /// cutover) or "v1" (legacy pre-cutover wire). v2 uses a new Exchange contract,
     /// new EIP-712 domain version, drops `taker/expiration/nonce/feeRateBps`
     /// from the signed order, adds `timestamp/metadata/builder`, and
     /// removes `POLY_BUILDER_*` auth headers. See `signer_v2.rs`.
