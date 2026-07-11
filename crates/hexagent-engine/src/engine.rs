@@ -925,45 +925,6 @@ impl Engine {
             strat_peeked.push(r.next_event().ok().flatten());
         }
 
-        // ── Hist bars (binance) — verbatim from v1 ──
-        let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
-        let mut bar_events: Vec<(u64, MarketEvent)> = Vec::new();
-        if needs_hist_bars {
-            let hist_bar_interval: String = self.config.strategies.iter()
-                .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
-                .and_then(|s| s.params.get("hist_bar_interval"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("1m")
-                .to_string();
-            let hist_lookback_ns = 30u64 * 24 * 3_600_000_000_000;
-            let hist_start_ns = start_ns.saturating_sub(hist_lookback_ns);
-            for (exchange, symbol) in &replay_sources {
-                if exchange != "binance" { continue; }
-                let req = crate::types::HistDataRequest {
-                    exchange: crate::types::Exchange::Binance,
-                    symbol: symbol.clone(),
-                    interval: hist_bar_interval.clone(),
-                    start_date_ns: hist_start_ns,
-                    end_date_ns: end_ns,
-                };
-                match crate::recorder::load_hist_bars(&data_path, &req) {
-                    Ok(bars) => {
-                        for bar in bars {
-                            let ts = bar.close_time_ns;
-                            bar_events.push((ts, MarketEvent::Bar(bar)));
-                        }
-                    }
-                    Err(e) => {
-                        error!("[Replayer v2] CRITICAL: load_hist_bars failed for {}/{} {}: {}",
-                            exchange, symbol, hist_bar_interval, e);
-                        std::process::exit(2);
-                    }
-                }
-            }
-            bar_events.sort_by_key(|e| e.0);
-        }
-        let mut bar_cursor: usize = 0;
-
         // ── Synthetic RTT-probe wiring — carried over from the removed v1 sim engine: while
         // the strat gate is in Probe mode it sets `bt_probe_enable`; we feed one
         // place-RTT sample (from the v2 latency sampler) every
@@ -1002,6 +963,58 @@ impl Engine {
         let mut strategies = self.build_strategies(bt_probe_map, HashMap::new(), &HashMap::new());
         let hist_data_dir = PathBuf::from(&data_dir);
         for s in &mut strategies { s.on_init(); }
+
+        // ── Hist bars (binance) — the lookback comes from the strategies
+        // themselves via `load_hist_data(start_ns)`, the SAME path live uses
+        // (live: engine.rs run_live → strategy.load_hist_data(ts_event)), so
+        // BT and live train vol models on identically-sized windows.
+        // Strategies that return no request fall back to the legacy 30-day
+        // window. ──
+        let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
+        let mut bar_events: Vec<(u64, MarketEvent)> = Vec::new();
+        if needs_hist_bars {
+            let hist_bar_interval: String = self.config.strategies.iter()
+                .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
+                .and_then(|s| s.params.get("hist_bar_interval"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("1m")
+                .to_string();
+            let fallback_lookback_ns = 30u64 * 24 * 3_600_000_000_000;
+            let strat_start_ns = strategies.iter()
+                .flat_map(|s| s.load_hist_data(start_ns))
+                .map(|r| r.start_date_ns)
+                .min();
+            let hist_start_ns = strat_start_ns
+                .unwrap_or_else(|| start_ns.saturating_sub(fallback_lookback_ns));
+            info!("[Replayer v2] hist-bar window: {:.2}d before backtest start ({})",
+                (start_ns.saturating_sub(hist_start_ns)) as f64 / 86_400e9,
+                if strat_start_ns.is_some() { "strategy-declared" } else { "30d fallback" });
+            for (exchange, symbol) in &replay_sources {
+                if exchange != "binance" { continue; }
+                let req = crate::types::HistDataRequest {
+                    exchange: crate::types::Exchange::Binance,
+                    symbol: symbol.clone(),
+                    interval: hist_bar_interval.clone(),
+                    start_date_ns: hist_start_ns,
+                    end_date_ns: end_ns,
+                };
+                match crate::recorder::load_hist_bars(&data_path, &req) {
+                    Ok(bars) => {
+                        for bar in bars {
+                            let ts = bar.close_time_ns;
+                            bar_events.push((ts, MarketEvent::Bar(bar)));
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Replayer v2] CRITICAL: load_hist_bars failed for {}/{} {}: {}",
+                            exchange, symbol, hist_bar_interval, e);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            bar_events.sort_by_key(|e| e.0);
+        }
+        let mut bar_cursor: usize = 0;
 
         // Split bar_events: pre-backtest bars → on_hist_bar, in-range → loop.
         if !bar_events.is_empty() {
