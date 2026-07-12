@@ -1,4 +1,4 @@
-use crate::types::{BarData, Exchange, HistDataRequest, Instrument, OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick};
+use crate::types::{AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick};
 
 /// Trait for trading strategies.
 pub trait Strategy: Send {
@@ -53,6 +53,10 @@ pub trait Strategy: Send {
     fn cadence_rtt_throttle(&self) -> bool { false }
     fn on_bar(&mut self, _bar: &BarData) {}
     fn on_spot_price(&mut self, _sp: &SpotPrice) {}
+    /// Perp asset-context push (Hyperliquid `activeAssetCtx`: funding rate,
+    /// oracle/mark price, open interest, ...). ~1 s cadence per coin.
+    /// Default no-op — perp makers override to consume funding/oracle.
+    fn on_asset_ctx(&mut self, _ctx: &AssetCtxTick) {}
     fn on_instrument(&mut self, _inst: &Instrument) {}
     fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> { Vec::new() }
     fn on_connected(&mut self, _exchange: Exchange) {}

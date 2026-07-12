@@ -2102,8 +2102,7 @@ impl Engine {
                             MarketEvent::Quote(q) => strategy.on_quote_tick(q),
                             MarketEvent::Bar(b) => strategy.on_bar(b),
                             MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
-                            // No strategy hook yet — recorded only.
-                            MarketEvent::AssetCtx(_) => {}
+                            MarketEvent::AssetCtx(ac) => strategy.on_asset_ctx(ac),
                             MarketEvent::Instrument(inst) => {
                                 // Mirror the live thread's Instrument
                                 // handler — gap-fill hist bars FIRST so
@@ -2262,8 +2261,7 @@ impl Engine {
                             MarketEvent::Quote(q) => strategy.on_quote_tick(q),
                             MarketEvent::Bar(b) => strategy.on_bar(b),
                             MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
-                            // No strategy hook yet — recorded only.
-                            MarketEvent::AssetCtx(_) => {}
+                            MarketEvent::AssetCtx(ac) => strategy.on_asset_ctx(ac),
                             MarketEvent::Instrument(inst) => {
                                 let ts_event = event.timestamp_ns();
                                 let hist_reqs = strategy.load_hist_data(ts_event);
@@ -2367,8 +2365,7 @@ impl Engine {
                                             MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
                                             MarketEvent::Bar(b) => { strategy.on_bar(b); Vec::new() }
                                             MarketEvent::SpotPrice(sp) => { strategy.on_spot_price(sp); Vec::new() }
-                                            // No strategy hook yet — recorded only.
-                                            MarketEvent::AssetCtx(_) => Vec::new(),
+                                            MarketEvent::AssetCtx(ac) => { strategy.on_asset_ctx(ac); Vec::new() }
                                             MarketEvent::Instrument(inst) => {
                                                 strategy.on_instrument(inst);
                                                 // Load historical bars after instrument setup
@@ -2759,8 +2756,7 @@ impl Engine {
                             MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
                             MarketEvent::Bar(b) => { strategy.on_bar(b); Vec::new() }
                             MarketEvent::SpotPrice(sp) => { strategy.on_spot_price(sp); Vec::new() }
-                            // No strategy hook yet — recorded only.
-                            MarketEvent::AssetCtx(_) => Vec::new(),
+                            MarketEvent::AssetCtx(ac) => { strategy.on_asset_ctx(ac); Vec::new() }
                             MarketEvent::Instrument(inst) => {
                                 strategy.on_instrument(inst);
                                 let ts_event = event.timestamp_ns();

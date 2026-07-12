@@ -25,6 +25,8 @@ fn interval_to_ns(interval: &str) -> Result<u64> {
         "1s" => Ok(1_000_000_000),
         "5s" => Ok(5_000_000_000),
         "10s" => Ok(10_000_000_000),
+        "15s" => Ok(15_000_000_000),
+        "30s" => Ok(30_000_000_000),
         "1m" => Ok(60_000_000_000),
         "3m" => Ok(180_000_000_000),
         "5m" => Ok(300_000_000_000),
@@ -412,7 +414,6 @@ fn read_parquet_file(
         };
 
         let open_time_idx  = col_idx("Open time",  "timestamp_ns")?;
-        let close_time_idx = col_idx("Close time", "close_time_ns")?;
         let open_idx       = col_idx("Open",   "open")?;
         let high_idx       = col_idx("High",   "high")?;
         let low_idx        = col_idx("Low",    "low")?;
@@ -420,7 +421,16 @@ fn read_parquet_file(
         let volume_idx     = col_idx("Volume", "volume")?;
 
         let open_times  = as_timestamp_ns(batch.column(open_time_idx),  "open_time",  path)?;
-        let close_times = as_timestamp_ns(batch.column(close_time_idx), "close_time", path)?;
+        // Close-time column is OPTIONAL: bar archives converted from
+        // third-party K-line sources (e.g. Hyperliquid 15s bars) carry only
+        // `timestamp_ns` — synthesize `open_time + interval − 1` for those.
+        let close_times = match col_idx("Close time", "close_time_ns") {
+            Ok(idx) => as_timestamp_ns(batch.column(idx), "close_time", path)?,
+            Err(_) => {
+                let step = interval_to_ns(interval)? as i64;
+                open_times.iter().map(|t| t + step - 1).collect()
+            }
+        };
 
         let opens   = as_f64_array(batch.column(open_idx),   "open",   path)?;
         let highs   = as_f64_array(batch.column(high_idx),   "high",   path)?;
