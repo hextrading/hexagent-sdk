@@ -597,6 +597,9 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                 "bitget" => Exchange::Bitget,
                 "kucoin" => Exchange::Kucoin,
                 "mexc" => Exchange::Mexc,
+                "hyperliquid" => Exchange::Hyperliquid,
+                "aster" => Exchange::Aster,
+                "lighter" => Exchange::Lighter,
                 _ => {
                     // RTDS spot_price events have source as exchange (e.g. "rtds_chainlink")
                     // Pass through for spot_price parsing — exchange field unused for SpotPrice
@@ -691,6 +694,33 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                         symbol: symbol.to_string(),
                         price,
                         timestamp_ns: exchange_ts,
+                        local_timestamp_ns: local_ts,
+                    })
+                }
+                // Perp asset-context rows (Hyperliquid activeAssetCtx):
+                // mark px in `price`, impact bid/ask in `bid_price`/
+                // `ask_price`, the remaining ctx fields as compact JSON in
+                // `data_json` (see writer::push_asset_ctx). Reconstructed so
+                // BT replay delivers funding/oracle to `on_asset_ctx`.
+                "asset_ctx" => {
+                    let j: serde_json::Value = data_json_col
+                        .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) })
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let f = |k: &str| j.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    MarketEvent::AssetCtx(crate::types::AssetCtxTick {
+                        exchange,
+                        symbol: symbol.to_string(),
+                        mark_px: price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                        oracle_px: f("oraclePx"),
+                        mid_px: f("midPx"),
+                        funding: f("funding"),
+                        open_interest: f("openInterest"),
+                        premium: f("premium"),
+                        impact_bid_px: bid_price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                        impact_ask_px: ask_price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                        day_ntl_vlm: f("dayNtlVlm"),
+                        prev_day_px: f("prevDayPx"),
                         local_timestamp_ns: local_ts,
                     })
                 }
