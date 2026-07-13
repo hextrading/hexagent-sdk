@@ -230,7 +230,7 @@ pub fn run_deploy_wallet() -> Result<()> {
 
         // ── Step 2: Deposit-wallet allowances (WALLET batch) ──
         println!();
-        println!("Step 2/3: Approve deposit-wallet allowances (pUSD→CTF/ExchangeV2/Adapter, CTF→ExchangeV2/Adapter)");
+        println!("Step 2/3: Approve deposit-wallet allowances (pUSD→CTF/ExchangeV2/Adapter, CTF→ExchangeV2/Adapter/AutoRedeemer)");
         super::deposit_wallet::dw_approvals(&signing_key, &signer_address, &dw, &builder_auth, /*dry_run=*/ false)?;
         println!("  done.");
         ("poly_1271", dw)

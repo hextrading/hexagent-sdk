@@ -20,7 +20,10 @@ use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
 
 use super::auth::PolyAuth;
-use super::deploy_wallet::{address_to_bytes32, keccak256, to_checksum_address, u256_bytes};
+use super::deploy_wallet::{
+    address_to_bytes32, check_erc1155_approval, check_erc20_allowance, keccak256,
+    to_checksum_address, u256_bytes,
+};
 
 // ════════════════════════════════════════════════════════════════
 // Constants (Polygon mainnet, chain ID 137)
@@ -81,6 +84,12 @@ const EXCHANGE_V2: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 /// sell (`balance: 0`). See `hexbot token_check`.
 const CTF_COLLATERAL_ADAPTER: &str = "0xAdA100Db00Ca00073811820692005400218FcE1f";
 const USDCE_TOKEN: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC.e (6dp)
+/// Official AutoRedeemer (proxy; docs.polymarket.com/resources/contracts).
+/// Granting it `setApprovalForAll` on the CTF is the on-chain opt-in for
+/// Polymarket's auto-redeem: its keeper calls `redeemBinary(froms,
+/// conditionIds)` and the payout goes to the position owner. (The UI
+/// "Auto redeem your wins" toggle grants this same approval.)
+const AUTO_REDEEMER: &str = "0xa1200000d0002264C9a1698e001292D00E1b00af";
 const ONRAMP: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee"; // Collateral Onramp (USDC.e→pUSD)
 const OFFRAMP: &str = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"; // Collateral Offramp (pUSD→USDC.e)
 const WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38]; // wrap(address,address,uint256)
@@ -376,7 +385,9 @@ pub(crate) fn dw_merge(
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
 }
 
-/// Set the DW's v2 allowances in one WALLET batch:
+/// Set the DW's v2 allowances in one WALLET batch. Each allowance already
+/// on-chain is skipped (checked via eth_call, owner = the DW); if all six
+/// are set, no batch is submitted at all. Allowances:
 ///   - pUSD → CTF            (split/merge pUSD-direct on the CTF — legacy path)
 ///   - pUSD → ExchangeV2     (pay pUSD for BUY orders)
 ///   - pUSD → CtfCollateralAdapter (split/merge via the adapter → USDC.e-space
@@ -385,16 +396,52 @@ pub(crate) fn dw_merge(
 ///                            outcome tokens for SELL orders)
 ///   - CTF  → CtfCollateralAdapter (setApprovalForAll: adapter merge/redeem
 ///                            burns the DW's outcome tokens)
+///   - CTF  → AutoRedeemer   (setApprovalForAll: opt-in to Polymarket's
+///                            auto-redeem keeper for resolved positions)
 pub(crate) fn dw_approvals(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth, dry_run: bool,
 ) -> Result<String> {
-    let calls = vec![
-        Call { target: PUSD_TOKEN.to_string(), data: approve_calldata(CTF_TOKEN) },
-        Call { target: PUSD_TOKEN.to_string(), data: approve_calldata(EXCHANGE_V2) },
-        Call { target: PUSD_TOKEN.to_string(), data: approve_calldata(CTF_COLLATERAL_ADAPTER) },
-        Call { target: CTF_TOKEN.to_string(), data: set_approval_for_all_calldata(EXCHANGE_V2) },
-        Call { target: CTF_TOKEN.to_string(), data: set_approval_for_all_calldata(CTF_COLLATERAL_ADAPTER) },
+    // Idempotence: check each allowance on-chain (owner = the DW) and only
+    // batch the ones still missing; skip the relayer round-trip entirely
+    // when everything is already set. An RPC failure reads as "not
+    // approved" — re-approving is a harmless idempotent ∞-approve.
+    struct Step {
+        label: &'static str,
+        target: &'static str,
+        spender: &'static str,
+        erc1155: bool,
+    }
+    let steps = [
+        Step { label: "pUSD → CTF",                  target: PUSD_TOKEN, spender: CTF_TOKEN,              erc1155: false },
+        Step { label: "pUSD → ExchangeV2",           target: PUSD_TOKEN, spender: EXCHANGE_V2,            erc1155: false },
+        Step { label: "pUSD → CtfCollateralAdapter", target: PUSD_TOKEN, spender: CTF_COLLATERAL_ADAPTER, erc1155: false },
+        Step { label: "CTF → ExchangeV2",            target: CTF_TOKEN,  spender: EXCHANGE_V2,            erc1155: true },
+        Step { label: "CTF → CtfCollateralAdapter",  target: CTF_TOKEN,  spender: CTF_COLLATERAL_ADAPTER, erc1155: true },
+        Step { label: "CTF → AutoRedeemer",          target: CTF_TOKEN,  spender: AUTO_REDEEMER,          erc1155: true },
     ];
+    let mut calls = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        let already = if s.erc1155 {
+            check_erc1155_approval(dw, s.target, s.spender)
+        } else {
+            check_erc20_allowance(dw, s.target, s.spender)
+        };
+        if already {
+            println!("  {}/{} {:<28} already approved — skipping.", i + 1, steps.len(), s.label);
+        } else {
+            println!("  {}/{} {:<28} needs approval.", i + 1, steps.len(), s.label);
+            let data = if s.erc1155 {
+                set_approval_for_all_calldata(s.spender)
+            } else {
+                approve_calldata(s.spender)
+            };
+            calls.push(Call { target: s.target.to_string(), data });
+        }
+    }
+    if calls.is_empty() {
+        println!("  All DW allowances already set — skipping WALLET batch.");
+        return Ok(String::new());
+    }
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
 }
 

@@ -146,13 +146,17 @@ pub fn run_approve_v2() -> Result<()> {
     if sig_type_s == "poly_1271" || sig_type_s == "deposit_wallet" {
         let wallet = load_wallet()?;
         let dw = super::deposit_wallet::resolve_deposit_wallet(&wallet.signer_address)?;
-        println!("── Deposit-wallet v2 approvals (pUSD→CTF/ExchangeV2/Adapter, CTF→ExchangeV2/Adapter) ──");
+        println!("── Deposit-wallet v2 approvals (pUSD→CTF/ExchangeV2/Adapter, CTF→ExchangeV2/Adapter/AutoRedeemer) ──");
         println!("Deposit wallet: {}", dw);
         println!("Signer (EOA):   {}", wallet.signer_address);
-        super::deposit_wallet::dw_approvals(
+        let tx = super::deposit_wallet::dw_approvals(
             &wallet.signing_key, &wallet.signer_address, &dw, &wallet.builder_auth, dry_run,
         )?;
-        println!("✅ DW approvals batch {}.", if dry_run { "(dry-run)" } else { "confirmed" });
+        if tx.is_empty() {
+            println!("✅ DW allowances already set — nothing to do.");
+        } else {
+            println!("✅ DW approvals batch {}.", if dry_run { "(dry-run)" } else { "confirmed" });
+        }
         return Ok(());
     }
 
