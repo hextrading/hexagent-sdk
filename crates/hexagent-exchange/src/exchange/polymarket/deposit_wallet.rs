@@ -10,9 +10,11 @@
 //! `hexbot deploy_wallet` (resolve-or-deploy the DW + set allowances) and
 //! by the live maintenance path (split / redeem / merge / onramp via the
 //! relayer `WALLET` batch):
-//!   * [`ensure_deposit_wallet`] — find an existing DW (on-chain
-//!     `WalletDeployed` scan; Gamma `/public-profile` is a hint only) or,
-//!     after an interactive confirm, deploy one via relayer `WALLET-CREATE`.
+//!   * [`ensure_deposit_wallet`] — find an existing DW (deterministic
+//!     CREATE2 derivation verified via `eth_getCode`, with the on-chain
+//!     `WalletDeployed` scan as fallback; Gamma `/public-profile` is a
+//!     hint only) or, after an interactive confirm, deploy one via the
+//!     relayer `WALLET-CREATE`.
 //!   * [`dw_approvals`] / [`dw_split`] / [`dw_redeem`] / [`dw_merge`] /
 //!     [`dw_onramp`] / [`dw_offramp_withdraw`] / [`dw_transfer_erc20`].
 
@@ -43,6 +45,17 @@ const DEPOSIT_WALLET_FACTORY: &str = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07
 /// `WalletDeployed`. Both are tried as the `eth_getLogs` address filter
 /// when resolving an already-deployed wallet.
 const DEPOSIT_WALLET_FACTORY_ALT: &str = "0xb6F9C7E68A38c21BeDfD873bC5a378236f7ba987";
+/// UUPS-era deposit-wallet implementation (wallets created before the
+/// 2026-05-28 BeaconProxy migration). Official builder-relayer-client
+/// `POL.DepositWalletContracts.DepositWalletImplementation` (chain 137).
+const DW_UUPS_IMPLEMENTATION: &str = "0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB";
+/// Current `factory.beacon()` (ERC-1967 BeaconProxy era). Used only when
+/// the live `beacon()` call fails — derivation prefers the on-chain value
+/// so a future beacon rotation keeps deriving NEW wallets correctly.
+const DW_BEACON_FALLBACK: &str = "0x7A18EDfe055488A3128f01F563e5B479D92ffc3a";
+/// `beacon()` selector on the deposit-wallet factory (official client's
+/// `FACTORY_BEACON_SELECTOR`).
+const FACTORY_BEACON_SELECTOR: &str = "0x49493a4d";
 
 // L1 ClobAuth — identical struct to the working type-2 path
 // (py_clob_client_v2/signing/eip712.py + hexbot deploy_wallet).
@@ -510,30 +523,47 @@ pub(crate) fn dw_transfer_erc20(
 }
 
 /// Resolve the deposit-wallet address for `eoa`: prefer the configured
-/// `POLY_FUNDER`, else scan `WalletDeployed` logs on-chain.
+/// `POLY_FUNDER`, else find it on-chain (derivation + WalletDeployed scan).
 pub(crate) fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
     let env = std::env::var("POLY_FUNDER").unwrap_or_default();
     if !env.trim().is_empty() {
         return Ok(to_checksum_address(env.trim()));
     }
-    find_existing_deposit_wallet(eoa)
+    find_existing_deposit_wallet(eoa)?.ok_or_else(|| {
+        anyhow!("no deposit wallet exists for EOA {} — run `hexbot deploy_wallet` first", eoa)
+    })
 }
 
 /// Resolve the deposit wallet for `eoa`, deploying it (relayer
 /// `WALLET-CREATE`) if it doesn't exist yet. Used by `deploy_wallet`.
 pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Result<String> {
     // ── Existence pre-check: skip WALLET-CREATE if one already exists ──
-    // The ONLY authoritative deposit-wallet signal is the on-chain
-    // `WalletDeployed` scan (keyed by owner EOA). The Polymarket Gamma
-    // `/public-profile` API is NOT an existence signal: its `proxyWallet`
-    // is the account's WEBSITE proxy (a Gnosis Safe or magic-link proxy),
-    // never a deposit wallet — treating it as one mis-routed the WALLET
-    // batch to a Safe and the relayer 400'd with "wallet … is not
-    // registered". Gamma is kept below purely as an operator hint.
-    if let Ok(dw) = find_existing_deposit_wallet(eoa) {
-        println!("  Existing deposit wallet found on-chain (WalletDeployed log): {}", dw);
-        println!("  → already exists; skipping WALLET-CREATE.");
-        return Ok(dw);
+    // Authoritative signals are on-chain only: deterministic CREATE2
+    // derivation verified via eth_getCode, with the `WalletDeployed` scan
+    // as fallback (see `find_existing_deposit_wallet`). The Polymarket
+    // Gamma `/public-profile` API is NOT an existence signal: its
+    // `proxyWallet` is the account's WEBSITE proxy (a Gnosis Safe or
+    // magic-link proxy), never a deposit wallet — treating it as one
+    // mis-routed the WALLET batch to a Safe and the relayer 400'd with
+    // "wallet … is not registered". Gamma is kept below purely as an
+    // operator hint.
+    match find_existing_deposit_wallet(eoa) {
+        Ok(Some(dw)) => {
+            println!("  Existing deposit wallet found on-chain: {}", dw);
+            println!("  → already exists; skipping WALLET-CREATE.");
+            return Ok(dw);
+        }
+        Ok(None) => {} // genuinely none — fall through to the create prompt
+        // Existence UNKNOWN (RPC trouble) — refuse to offer creation. A
+        // create on a false "none" dead-ends at the relayer's "already
+        // deployed" and confuses the operator (seen 2026-07-14).
+        Err(e) => {
+            return Err(anyhow!(
+                "cannot determine whether a deposit wallet already exists ({}) — \
+                 not offering to create one. Fix the RPC pool and re-run.",
+                e
+            ));
+        }
     }
     if let Some(proxy) = gamma_public_profile_proxy(eoa) {
         if !proxy.eq_ignore_ascii_case(eoa) {
@@ -574,8 +604,14 @@ pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Resul
     println!("  Deploying…");
     match deploy_deposit_wallet(builder_auth, eoa) {
         Ok(dw) => Ok(dw),
-        // Deployed between the lookup and now (or lookup missed it).
-        Err(e) if e.to_string().contains("already deployed") => find_existing_deposit_wallet(eoa),
+        // Deployed between the lookup and now (or the lookup missed it).
+        Err(e) if e.to_string().contains("already deployed") => {
+            find_existing_deposit_wallet(eoa)?.ok_or_else(|| anyhow!(
+                "relayer reports the wallet already deployed, but none was found \
+                 on-chain for {} — check the RPC pool and re-run",
+                eoa
+            ))
+        }
         Err(e) => Err(e),
     }
 }
@@ -733,11 +769,59 @@ fn wallet_from_receipt(tx_hash: &str, signer_eoa: &str) -> Result<String> {
     ))
 }
 
-/// Find an already-deployed deposit wallet for `owner` by scanning past
-/// `WalletDeployed` logs (topic2 = owner indexed). Best-effort: returns
-/// `Err` if the RPC range query is rejected or no event matches — the
-/// caller then falls through to the interactive create-confirm.
-fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<String> {
+/// Find an already-deployed deposit wallet for `owner_eoa`.
+///
+///   Ok(Some(dw)) — wallet found (code-verified on-chain)
+///   Ok(None)     — no wallet exists (high confidence)
+///   Err          — cannot determine (RPC trouble); callers must NOT
+///                  treat this as "no wallet"
+///
+/// Primary signal: deterministic CREATE2 derivation (official-client
+/// port; UUPS then BeaconProxy era) verified via `eth_getCode`. The owner
+/// is baked into the CREATE2 salt, so code at a candidate address IS this
+/// owner's wallet. Cheap (2-4 point calls) and immune to `eth_getLogs`
+/// range limits (2026-07-14: a pool RPC enforcing "range … exceeds limit
+/// of 10000" broke the fromBlock=earliest scan mid-setup).
+///
+/// Fallback: the full-range `WalletDeployed` scan — catches wallets from
+/// implementation eras the derivation doesn't know. When the scan is ALSO
+/// unavailable (range-limited RPC) the derivation's no-code answer stands:
+/// the official client trusts pure derivation with no scan at all.
+fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<Option<String>> {
+    let mut derive_err: Option<anyhow::Error> = None;
+    for (era, candidate) in derive_dw_candidates(owner_eoa) {
+        match has_code(&candidate) {
+            Ok(true) => {
+                println!("  (resolved via deterministic derivation, {} era)", era);
+                return Ok(Some(candidate));
+            }
+            Ok(false) => {}
+            Err(e) => derive_err = Some(e),
+        }
+    }
+    match scan_wallet_deployed_logs(owner_eoa) {
+        Ok(found) => Ok(found), // scan is authoritative for every era — Some or None
+        Err(scan_err) => {
+            if let Some(e) = derive_err {
+                // getCode failed on a candidate AND the scan failed —
+                // existence is genuinely unknown.
+                return Err(anyhow!("derivation: {} / WalletDeployed scan: {}", e, scan_err));
+            }
+            println!(
+                "  (WalletDeployed scan unavailable [{}] — trusting deterministic \
+                 derivation: no deposit wallet)",
+                scan_err
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Full-range `WalletDeployed` log scan (topic2 = owner indexed; both
+/// factories). Requires an RPC that allows `fromBlock: earliest` getLogs
+/// — range-limited providers reject it, which the derivation-first caller
+/// tolerates. Most recent matching event wins (topic1 = wallet, indexed).
+fn scan_wallet_deployed_logs(owner_eoa: &str) -> Result<Option<String>> {
     let topic0 = format!("0x{}", hex::encode(keccak256(WALLET_DEPLOYED_TOPIC0_PREIMAGE)));
     let owner_topic = format!("0x{}", hex::encode(address_to_bytes32(owner_eoa)));
     let filter = serde_json::json!([{
@@ -752,7 +836,6 @@ fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<String> {
         .get("result")
         .and_then(|r| r.as_array())
         .ok_or_else(|| anyhow!("eth_getLogs returned no result array: {}", resp))?;
-    // Most recent matching event wins (topic1 = wallet, indexed).
     for log in logs.iter().rev() {
         if let Some(t1) = log
             .get("topics")
@@ -762,14 +845,129 @@ fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<String> {
         {
             let bytes = hex::decode(t1.strip_prefix("0x").unwrap_or(t1)).unwrap_or_default();
             if bytes.len() == 32 {
-                return Ok(to_checksum_address(&format!("0x{}", hex::encode(&bytes[12..]))));
+                return Ok(Some(to_checksum_address(&format!("0x{}", hex::encode(&bytes[12..])))));
             }
         }
     }
-    Err(anyhow!(
-        "no WalletDeployed event for owner {} (event sig / factory may differ)",
-        owner_eoa
-    ))
+    Ok(None)
+}
+
+// ════════════════════════════════════════════════════════════════
+// Deterministic deposit-wallet derivation (CREATE2)
+// ════════════════════════════════════════════════════════════════
+//
+// Port of the official builder-relayer-client `src/builder/derive.ts`
+// (Solady v0.1.26 LibClone initcode-hash replicas). Shared pieces:
+//   args = abi.encode(address factory, bytes32(owner))   // 64 bytes
+//   salt = keccak256(args)
+// The two implementation eras differ only in the initcode hash:
+//   UUPS   (pre 2026-05-28): initCodeHashERC1967(implementation, args)
+//   Beacon (since):          initCodeHashERC1967BeaconProxy(beacon, args)
+// Pinned by a unit test against a known mainnet (owner → wallet) pair.
+
+/// `abi.encode(address factory, bytes32 walletId)` where walletId =
+/// `bytes32(owner)` (left-padded).
+fn dw_derive_args(owner: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(64);
+    v.extend_from_slice(&address_to_bytes32(DEPOSIT_WALLET_FACTORY));
+    v.extend_from_slice(&address_to_bytes32(owner));
+    v
+}
+
+/// Solady's 10-byte initcode prefix: `base + (args_len << 56)` big-endian
+/// (folds the immutable-args length into the PUSH2 runtime-size operand).
+fn solady_prefix(base: u128, args_len: usize) -> [u8; 10] {
+    let combined = base + ((args_len as u128) << 56);
+    let be = combined.to_be_bytes();
+    let mut out = [0u8; 10];
+    out.copy_from_slice(&be[6..16]);
+    out
+}
+
+/// Solady `LibClone.initCodeHashERC1967(implementation, args)`.
+fn init_code_hash_erc1967(implementation: &str, args: &[u8]) -> [u8; 32] {
+    const C1: &str = "cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3";
+    const C2: &str = "5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076";
+    let mut buf = Vec::with_capacity(10 + 20 + 2 + 64 + args.len());
+    buf.extend_from_slice(&solady_prefix(0x61003d3d8160233d3973, args.len()));
+    buf.extend_from_slice(&address_to_bytes32(implementation)[12..]);
+    buf.extend_from_slice(&[0x60, 0x09]);
+    buf.extend_from_slice(&hex::decode(C2).unwrap());
+    buf.extend_from_slice(&hex::decode(C1).unwrap());
+    buf.extend_from_slice(args);
+    keccak256(&buf)
+}
+
+/// Solady `LibClone.initCodeHashERC1967BeaconProxy(beacon, args)`.
+fn init_code_hash_erc1967_beacon(beacon: &str, args: &[u8]) -> [u8; 32] {
+    const C1: &str = "b3582b35133d50545afa5036515af43d6000803e604d573d6000fd5b3d6000f3";
+    const C2: &str = "1b60e01b36527fa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6c";
+    const C3: &str = "60195155f3363d3d373d3d363d602036600436635c60da";
+    let mut buf = Vec::with_capacity(10 + 20 + 23 + 64 + args.len());
+    buf.extend_from_slice(&solady_prefix(0x6100523d8160233d3973, args.len()));
+    buf.extend_from_slice(&address_to_bytes32(beacon)[12..]);
+    buf.extend_from_slice(&hex::decode(C3).unwrap());
+    buf.extend_from_slice(&hex::decode(C2).unwrap());
+    buf.extend_from_slice(&hex::decode(C1).unwrap());
+    buf.extend_from_slice(args);
+    keccak256(&buf)
+}
+
+/// `CREATE2(deployer, salt, init_code_hash)` → checksummed address.
+fn create2_address(deployer: &str, salt: &[u8; 32], init_code_hash: &[u8; 32]) -> String {
+    let mut buf = Vec::with_capacity(1 + 20 + 32 + 32);
+    buf.push(0xff);
+    buf.extend_from_slice(&address_to_bytes32(deployer)[12..]);
+    buf.extend_from_slice(salt);
+    buf.extend_from_slice(init_code_hash);
+    let h = keccak256(&buf);
+    to_checksum_address(&format!("0x{}", hex::encode(&h[12..])))
+}
+
+fn derive_dw_uups(owner: &str, implementation: &str) -> String {
+    let args = dw_derive_args(owner);
+    let salt = keccak256(&args);
+    create2_address(DEPOSIT_WALLET_FACTORY, &salt, &init_code_hash_erc1967(implementation, &args))
+}
+
+fn derive_dw_beacon(owner: &str, beacon: &str) -> String {
+    let args = dw_derive_args(owner);
+    let salt = keccak256(&args);
+    create2_address(DEPOSIT_WALLET_FACTORY, &salt, &init_code_hash_erc1967_beacon(beacon, &args))
+}
+
+/// The candidate deposit-wallet addresses for `owner` — UUPS era first
+/// (matches the official client's check order), then BeaconProxy era with
+/// the live `factory.beacon()` (constant fallback on call failure).
+fn derive_dw_candidates(owner: &str) -> Vec<(&'static str, String)> {
+    let beacon = factory_beacon().unwrap_or_else(|| DW_BEACON_FALLBACK.to_string());
+    vec![
+        ("UUPS", derive_dw_uups(owner, DW_UUPS_IMPLEMENTATION)),
+        ("beacon", derive_dw_beacon(owner, &beacon)),
+    ]
+}
+
+/// Live `factory.beacon()` — `None` on call failure / revert / zero
+/// (caller falls back to the pinned constant).
+fn factory_beacon() -> Option<String> {
+    let res = super::deploy_wallet::eth_call(DEPOSIT_WALLET_FACTORY, FACTORY_BEACON_SELECTOR)?;
+    let bytes = hex::decode(res.strip_prefix("0x").unwrap_or(&res)).ok()?;
+    if bytes.len() < 32 || bytes[12..32].iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(to_checksum_address(&format!("0x{}", hex::encode(&bytes[12..32]))))
+}
+
+/// True if `address` has contract code on-chain. RPC failure surfaces as
+/// `Err` — callers must not conflate "RPC down" with "no code".
+fn has_code(address: &str) -> Result<bool> {
+    let v = super::onchain_tx::rpc_call("eth_getCode", serde_json::json!([address, "latest"]))?;
+    let code = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| anyhow!("eth_getCode {}: no result ({})", address, v))?;
+    let t = code.strip_prefix("0x").unwrap_or(code);
+    Ok(!t.is_empty() && t.chars().any(|c| c != '0'))
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -816,4 +1014,33 @@ fn relayer_post(
         }
         serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} ({})", url, e, text))
     })
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+
+    /// Known mainnet pair (relayer WALLET-CREATE tx `0x176477af…`,
+    /// 2026-07-14): owner EOA → BeaconProxy-era deposit wallet. Pins the
+    /// Solady initcode-hash port — if this breaks, derivation is silently
+    /// wrong for every wallet and existence checks degrade to the
+    /// (range-limit-fragile) log scan.
+    #[test]
+    fn beacon_derivation_matches_known_mainnet_wallet() {
+        assert_eq!(
+            derive_dw_beacon("0xd4c118fbd2eb09232fa104b69360b65a634fd0f7", DW_BEACON_FALLBACK),
+            "0xcf578Fe23a0c53ECbe77136065C01a4DcaDB67DF",
+        );
+    }
+
+    /// The UUPS-era path shares `args`/`salt`/CREATE2 with the beacon path
+    /// (both pinned above); this only locks the era-specific initcode-hash
+    /// assembly against accidental edits.
+    #[test]
+    fn uups_initcode_prefix_folds_args_len() {
+        // 64-byte args → PUSH2 0x007d (0x3d runtime + 0x40 args).
+        assert_eq!(solady_prefix(0x61003d3d8160233d3973, 64)[..3], [0x61, 0x00, 0x7d]);
+        // Beacon flavour: 0x52 runtime + 0x40 args = 0x92.
+        assert_eq!(solady_prefix(0x6100523d8160233d3973, 64)[..3], [0x61, 0x00, 0x92]);
+    }
 }
