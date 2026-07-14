@@ -1120,6 +1120,22 @@ impl SharedState {
         path: &str,
         body: &str,
     ) -> crossbeam_channel::Receiver<HttpReply> {
+        self.http_call_async_rec(method, path, body, None)
+    }
+
+    /// [`http_call_async`] with an override for the latency-CSV `kind`
+    /// column. `None` = classify by (method, path) as usual; `Some` is
+    /// for callers whose traffic must stay distinguishable from real
+    /// order flow on the same endpoints (the RTT probe's `probe_place` /
+    /// `probe_cancel`). The override affects ONLY the CSV kind — stage
+    /// histogram, routing and hedging are untouched.
+    pub(crate) fn http_call_async_rec(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        rec_kind_override: Option<&'static str>,
+    ) -> crossbeam_channel::Receiver<HttpReply> {
         let method = match method {
             "POST" => reqwest::Method::POST,
             "DELETE" => reqwest::Method::DELETE,
@@ -1137,7 +1153,8 @@ impl SharedState {
         // Per-request latency CSV: classify place / cancel once up-front
         // (None ⇒ not recorded). Both legs tag the winning reply with
         // this instance's id when recording is active.
-        let rec_kind = latency_record_kind(method.as_str(), path);
+        let rec_kind = rec_kind_override
+            .or_else(|| latency_record_kind(method.as_str(), path));
         let t_start = crate::latency::Instant::now();
         let url = format!("{}{}", self.clob_base_url, path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
@@ -1383,6 +1400,20 @@ impl SharedState {
         body: &str,
     ) -> HttpReply {
         self.http_call_async(method, path, body)
+            .recv()
+            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+    }
+
+    /// [`http_call_sync`] with a latency-CSV kind override — see
+    /// [`http_call_async_rec`](Self::http_call_async_rec).
+    pub(crate) fn http_call_sync_rec(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        rec_kind_override: Option<&'static str>,
+    ) -> HttpReply {
+        self.http_call_async_rec(method, path, body, rec_kind_override)
             .recv()
             .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
     }

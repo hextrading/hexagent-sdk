@@ -69,6 +69,10 @@
 //! ## Failure handling
 //!
 //! * Server responded (200, 400 minSize, 5xx, 425) — RTT recorded.
+//!   A rejected place additionally WARNs with the response body,
+//!   rate-limited to once per minute: rejection means the probe has
+//!   degraded to the reject-RTT shape above and its samples are
+//!   biased low, which is otherwise invisible outside the CSV.
 //! * **Timeout** (HttpErr::Timeout, h2/connect timeout) — recorded
 //!   with the elapsed time as the sample. Timeout IS the primary
 //!   failure mode the gate exists to detect; suppressing it would
@@ -103,6 +107,49 @@ use super::trade::{HttpErr, SharedState};
 /// RTT low — the failure the resting-probe design avoids).
 const FULL_PROBE_PRICE: f64 = 0.01;
 const FULL_PROBE_SIZE: f64 = 100.0;
+
+/// Rate limit for the probe-place-rejected WARN: a healthy probe is
+/// never rejected (the resting design depends on the place being
+/// accepted), so a persistent reject stream means the probe has
+/// degraded to the reject-probe shape and its RTT samples are biased
+/// low. That failure is silent at the gate — surface it, but at most
+/// once per this window (the probe fires every ~2 s; unthrottled this
+/// would WARN 43k×/day, as the 2026-07 poly_1271 signing regression
+/// did at INFO-invisible level).
+const REJECT_WARN_EVERY_SECS: u64 = 60;
+static LAST_REJECT_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REJECTS_SINCE_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// WARN (rate-limited) that a probe place was rejected, with the HTTP
+/// status and (truncated) response body so the reject *reason* lands in
+/// the log — `HttpErr::Status` bodies are otherwise dropped here and
+/// the degradation is only visible in the latency CSV status column.
+fn warn_probe_place_rejected(code: u16, body: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    REJECTS_SINCE_WARN.fetch_add(1, Ordering::Relaxed);
+    let last = LAST_REJECT_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < REJECT_WARN_EVERY_SECS {
+        return;
+    }
+    if LAST_REJECT_WARN_SECS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // another thread just warned
+    }
+    let n = REJECTS_SINCE_WARN.swap(0, Ordering::Relaxed);
+    let body_short: String = body.chars().take(200).collect();
+    warn!(
+        "[RttProbe] place REJECTED http_{} ({} rejects in last {}s) — probe is degraded \
+         to reject-RTT (biased low): {}",
+        code, n, REJECT_WARN_EVERY_SECS, body_short,
+    );
+}
 
 /// Strategy → probe handoff for the current event's probe-target token
 /// (the high-priced binary side; see [`pick_probe_side`]). `Some(token)`
@@ -147,6 +194,9 @@ pub fn pick_probe_side<'a>(
 /// place + cancel). Each leg flows through `SharedState::http_call_*`,
 /// which records the per-request latency to the CSV when recording is
 /// active (`latency_record`), so the probe itself does no recording.
+/// Probe legs are recorded under the dedicated `probe_place` /
+/// `probe_cancel` kinds (the record-replay loader folds them into the
+/// place / cancel pools; offline analysis can tell them apart).
 ///
 /// ## All-probe mode (`all_probe = true`)
 ///
@@ -240,7 +290,14 @@ fn fire_full_probe(
     if token.is_empty() { return None; }
     let signer = shared.signer_v2.as_ref()?;
 
-    let signed = match signer.build_signed_order(
+    // `_dispatch`, NOT the plain `build_signed_order`: poly_1271
+    // accounts need the deposit-wallet maker + ERC-7739 signature wrap,
+    // exactly like a real submit. The plain path produced an unwrapped
+    // EOA signature that the server rejected http_400 on EVERY probe
+    // (2026-07-11..13: 122k rejects, 100% of probes on live poly_1271
+    // accounts), silently degrading the probe to the reject-RTT shape
+    // this module's docs warn about.
+    let signed = match signer.build_signed_order_dispatch(
         &token,
         FULL_PROBE_PRICE,
         FULL_PROBE_SIZE,
@@ -281,9 +338,11 @@ fn fire_full_probe(
     }).to_string();
 
     // ── Place leg ──────────────────────────────────────────────────
-    // (the http layer records this request's latency when active)
+    // The http layer records this request's latency when active, under
+    // the dedicated `probe_place` kind (not `place`) so offline analysis
+    // can separate synthetic probe traffic from real strategy orders.
     let t0 = Instant::now();
-    let res = shared.http_call_sync("POST", "/order", &body);
+    let res = shared.http_call_sync_rec("POST", "/order", &body, Some("probe_place"));
     let place_rtt = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve the resting order's id for the cancel leg. The server's
@@ -307,9 +366,12 @@ fn fire_full_probe(
             // cancel (recorded with status `http_404`, filterable).
             (Some(signed.order_hash.clone()), true)
         }
-        Err(HttpErr::Status(_, _)) => {
+        Err(HttpErr::Status(code, body)) => {
             // Real round-trip but the server rejected it (e.g. balance /
-            // tick / min-size) — there's no resting order to cancel.
+            // tick / min-size / bad signature) — there's no resting order
+            // to cancel. Rejection is NOT a healthy probe outcome: warn
+            // (rate-limited) with the reason.
+            warn_probe_place_rejected(*code, body);
             (None, true)
         }
         Err(e @ HttpErr::Other(_)) => {
@@ -327,7 +389,7 @@ fn fire_full_probe(
     // is recorded at the http layer; we just fire it and log.
     if let Some(oid) = order_id {
         let cbody = serde_json::json!({ "orderID": oid }).to_string();
-        let cres = shared.http_call_sync("DELETE", "/order", &cbody);
+        let cres = shared.http_call_sync_rec("DELETE", "/order", &cbody, Some("probe_cancel"));
         debug!(
             "[RttProbe] probe place={:.1}ms cancel_ok={}",
             place_rtt, cres.is_ok(),

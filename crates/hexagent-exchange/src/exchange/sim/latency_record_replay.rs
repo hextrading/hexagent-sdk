@@ -411,11 +411,20 @@ pub struct RecordReplayData {
 
 impl RecordReplayData {
     /// Load every `*.csv` under `dir` into place/cancel record sets.
-    /// Rows are split on the `kind` column; rows with an unparseable
+    /// Rows are split on the `kind` column (`probe_place`/`probe_cancel`
+    /// fold into place/cancel); rows with an unparseable
     /// `epoch_ms`/`rtt_ms`, a non-finite or out-of-range RTT, or an
     /// unrecognised `kind` are skipped. All `status` values are kept —
     /// `timeout` rows carry the censored ~client-timeout RTT, which is a
     /// real tail sample.
+    ///
+    /// ⚠ Known contamination: live-box CSVs recorded before the probe's
+    /// poly_1271 signing fix (≤ 2026-07-13, instance zhu*) carry the
+    /// probe legs as `kind=place status=http_400` fast-reject rows
+    /// (~36 ms validation short-circuits, ~40% of place rows) that bias
+    /// the replay place distribution low. Record-box CSVs (gnosis_safe
+    /// recorder01) are clean. Prefer recorder CSVs, or pre-filter zhu
+    /// `http_400` rows out of pre-fix live CSVs before replaying them.
     ///
     /// `bucket_secs` sets the tier-3 time-of-day bucket width (e.g. 300 =
     /// 5 min); see [`SideRecords::from_samples_with_bucket`].
@@ -463,9 +472,15 @@ impl RecordReplayData {
                     continue;
                 }
                 let sample = (epoch_ms, rtt_ms as f32);
+                // `probe_place` / `probe_cancel` are the RTT probe's
+                // synthetic resting place + cancel legs — same endpoints
+                // and pools as real order flow, recorded under their own
+                // kind so offline analysis can separate them. For replay
+                // they are valid latency samples: fold into place/cancel
+                // (record-mode CSVs consist of nothing else).
                 match kind {
-                    "place" => place.push(sample),
-                    "cancel" => cancel.push(sample),
+                    "place" | "probe_place" => place.push(sample),
+                    "cancel" | "probe_cancel" => cancel.push(sample),
                     _ => {}
                 }
             }
