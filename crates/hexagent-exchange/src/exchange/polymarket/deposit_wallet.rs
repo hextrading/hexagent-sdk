@@ -194,8 +194,31 @@ fn submit_wallet_batch(
         println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
         return Ok(String::new());
     }
-    let headers = builder_auth.sign_request("POST", "/submit", &body_str);
-    let json = relayer_post(format!("{}/submit", RELAYER_URL), headers, body_str)?;
+    // The relayer's wallet registry can lag WALLET-CREATE by a few seconds
+    // even after the create tx polls STATE_CONFIRMED (observed 2026-07-14:
+    // the first batch for a fresh deposit wallet 400'd "wallet … is not
+    // registered"). That rejection is transient — retry it on a fixed 5s
+    // backoff for up to ~90s, re-signing the auth headers each attempt.
+    // The EIP-712 Batch itself stays valid across retries (nothing landed,
+    // so the nonce is unchanged, and 90s sits well under the 290s
+    // deadline). Any other error is terminal.
+    const REGISTRY_RETRIES: u32 = 18;
+    let mut attempt = 0u32;
+    let json = loop {
+        let headers = builder_auth.sign_request("POST", "/submit", &body_str);
+        match relayer_post(format!("{}/submit", RELAYER_URL), headers, body_str.clone()) {
+            Ok(json) => break json,
+            Err(e) if attempt < REGISTRY_RETRIES && e.to_string().contains("is not registered") => {
+                attempt += 1;
+                println!(
+                    "   relayer wallet registry not ready yet — retry {}/{} in 5s …",
+                    attempt, REGISTRY_RETRIES
+                );
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let tx_id = json
         .get("transactionID")
         .and_then(|v| v.as_str())
@@ -544,7 +567,8 @@ pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Resul
     if c != "y" && c != "yes" {
         return Err(anyhow!(
             "deposit-wallet creation not confirmed — aborting (nothing deployed). \
-             If the wallet already exists, re-run with `--deposit-wallet <addr>` to skip creation."
+             If the wallet already exists, the on-chain WalletDeployed scan missed it \
+             (RPC failure?) — re-run once the RPC is healthy and it will be found."
         ));
     }
     println!("  Deploying…");
@@ -667,8 +691,9 @@ fn poll_relayer_tx(builder_auth: &PolyAuth, tx_id: &str) -> Result<String> {
 }
 
 /// Pull the deployed wallet address out of the `WalletDeployed` log in the
-/// tx receipt (topic1 = wallet, indexed). Falls back to an error with the
-/// receipt so the operator can supply `--deposit-wallet` manually.
+/// tx receipt (topic1 = wallet, indexed). Falls back to an error carrying
+/// the receipt; a deploy_wallet re-run resolves the wallet via the
+/// on-chain `WalletDeployed` scan instead.
 fn wallet_from_receipt(tx_hash: &str, signer_eoa: &str) -> Result<String> {
     let topic0 = format!("0x{}", hex::encode(keccak256(WALLET_DEPLOYED_TOPIC0_PREIMAGE)));
     let owner_topic = format!("0x{}", hex::encode(address_to_bytes32(signer_eoa)));
@@ -702,8 +727,8 @@ fn wallet_from_receipt(tx_hash: &str, signer_eoa: &str) -> Result<String> {
         }
     }
     Err(anyhow!(
-        "WalletDeployed event not found in receipt for {} — re-run with \
-         --deposit-wallet <addr> once you know it. Receipt: {}",
+        "WalletDeployed event not found in receipt for {} — re-run deploy_wallet; \
+         the on-chain WalletDeployed scan will resolve the deployed wallet. Receipt: {}",
         tx_hash, receipt
     ))
 }
@@ -711,8 +736,7 @@ fn wallet_from_receipt(tx_hash: &str, signer_eoa: &str) -> Result<String> {
 /// Find an already-deployed deposit wallet for `owner` by scanning past
 /// `WalletDeployed` logs (topic2 = owner indexed). Best-effort: returns
 /// `Err` if the RPC range query is rejected or no event matches — the
-/// caller then asks the operator to supply `--deposit-wallet` from the
-/// Polymarket UI.
+/// caller then falls through to the interactive create-confirm.
 fn find_existing_deposit_wallet(owner_eoa: &str) -> Result<String> {
     let topic0 = format!("0x{}", hex::encode(keccak256(WALLET_DEPLOYED_TOPIC0_PREIMAGE)));
     let owner_topic = format!("0x{}", hex::encode(address_to_bytes32(owner_eoa)));
