@@ -658,6 +658,14 @@ pub struct SharedState {
     /// `<unmapped>` and broadcasting to every instance. This map lets us
     /// reclaim that memory per-event at settlement rather than never.
     pub coid_to_token: Mutex<HashMap<String, String>>,
+    /// Order IDs (== local EIP-712 order hashes) of the RTT probe's
+    /// synthetic resting orders — ring of the most recent 64. The user
+    /// feed consults this to identify probe placement / cancellation
+    /// pushes: they carry no coid mapping, so without this they'd
+    /// surface as `<unmapped>` (an ops anomaly signal expected to stay
+    /// at zero) and broadcast to every instance. Identified probe
+    /// events are logged at DEBUG and NOT forwarded.
+    pub probe_order_ids: Mutex<std::collections::VecDeque<String>>,
     /// Deferred map-reclaim queue: `(sweep_ns, tokens)` batches recorded at
     /// each event-expiry sweep. The settling event's FINAL matching fills land
     /// ~1-2 s AFTER the sweep cancel (observed: sweep 20:05:00.127, settlement
@@ -1587,6 +1595,7 @@ impl PolymarketTrade {
                 coid_to_oid: Mutex::new(HashMap::new()),
                 oid_to_coid: Mutex::new(HashMap::new()),
                 coid_to_token: Mutex::new(HashMap::new()),
+                probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
                 pending_reclaim: Mutex::new(Vec::new()),
                 auth,
                 signer,

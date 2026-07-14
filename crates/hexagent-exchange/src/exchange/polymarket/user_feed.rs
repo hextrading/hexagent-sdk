@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -567,6 +567,31 @@ async fn user_feed_loop(
 
                                 for event in &events {
                                     for update in parse_user_event(event, &shared) {
+                                        // RTT-probe traffic: the probe's synthetic
+                                        // resting orders have no coid mapping, so
+                                        // their placement / cancellation pushes
+                                        // would log as `<unmapped>` (an ops signal
+                                        // expected to stay at zero) and broadcast
+                                        // to every instance. Identify them by
+                                        // orderID and swallow: DEBUG only.
+                                        if update.client_order_id.is_empty() {
+                                            if let Some(oid) = update.exchange_order_id.as_deref() {
+                                                let is_probe = shared
+                                                    .probe_order_ids
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner())
+                                                    .iter()
+                                                    .any(|p| p == oid);
+                                                if is_probe {
+                                                    debug!(
+                                                        "[PolyUserFeed] probe order push muted: {} {:?} oid={}..",
+                                                        update.symbol, update.status,
+                                                        &oid[..oid.len().min(10)],
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         let coid_str = if update.client_order_id.is_empty() {
                                             match update.exchange_order_id.as_deref() {
                                                 Some(oid) if !oid.is_empty() => {
