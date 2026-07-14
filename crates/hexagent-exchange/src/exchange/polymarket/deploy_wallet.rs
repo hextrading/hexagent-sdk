@@ -116,11 +116,38 @@ pub fn run_deploy_wallet() -> Result<()> {
         return Err(anyhow!("Missing builder credentials"));
     }
 
+    // ── Wallet flavour: `--signature-type poly_1271` (default; deposit
+    //    wallet) or `--signature-type gnosis_safe` (legacy Safe flow for
+    //    accounts not migrating). `--gnosis-safe` is the older spelling of
+    //    the latter. Validated here, before any interactive prompt, so a
+    //    typo fails fast. ──
+    let legacy_flag = std::env::args().any(|a| a == "--gnosis-safe");
+    let legacy_safe = match arg_value("--signature-type").as_deref() {
+        None | Some("") => legacy_flag,
+        Some("poly_1271") | Some("deposit_wallet") => {
+            if legacy_flag {
+                return Err(anyhow!("--signature-type poly_1271 conflicts with --gnosis-safe"));
+            }
+            false
+        }
+        Some("gnosis_safe") => true,
+        Some(other) => {
+            return Err(anyhow!(
+                "unsupported --signature-type '{}' — deploy_wallet supports 'poly_1271' \
+                 (default, deposit wallet) or 'gnosis_safe' (legacy Safe). EOA accounts \
+                 (signature_type=0) have no wallet to deploy: write the [poly.<id>] block \
+                 manually and run `hexbot approve_v2`.",
+                other
+            ));
+        }
+    };
+
     println!("=== Polymarket Safe Wallet Setup (v2) ===");
     println!();
     println!("Instance:  {}", instance_id);
     println!("Config:    {}", config_path);
     println!("Secrets:   {}", secrets_path.display());
+    println!("Sig type:  {}", if legacy_safe { "gnosis_safe (legacy Safe)" } else { "poly_1271 (deposit wallet)" });
 
     // ── Overwrite guard: confirm if the block already exists ──
     if let Some(existing_key) = peek_poly_api_key(&secrets_path, &instance_id) {
@@ -160,10 +187,6 @@ pub fn run_deploy_wallet() -> Result<()> {
     println!("Safe proxy address:   {}", safe_address);
 
     let builder_auth = PolyAuth::new(&builder_key, &builder_secret, &builder_passphrase, &signer_address)?;
-
-    // Wallet flavour: default = deposit wallet (POLY_1271); `--gnosis-safe`
-    // keeps the legacy Safe flow for accounts not migrating.
-    let legacy_safe = std::env::args().any(|a| a == "--gnosis-safe");
 
     let (signature_type, funder): (&str, String) = if legacy_safe {
         // ── Step 1: Deploy Safe (skip if already deployed) ──
@@ -947,6 +970,22 @@ pub fn to_checksum_address(addr: &str) -> String {
 fn mask_value(s: &str) -> String {
     if s.len() <= 8 { return "***".to_string(); }
     format!("{}...{}", &s[..4], &s[s.len()-4..])
+}
+
+/// `--name value` / `--name=value` lookup in the raw argv
+/// (position-independent, same two spellings as `cli_account::strip_flag`).
+fn arg_value(name: &str) -> Option<String> {
+    let eq_prefix = format!("{}=", name);
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(rest) = a.strip_prefix(&eq_prefix) {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 pub fn keccak256(data: &[u8]) -> [u8; 32] {

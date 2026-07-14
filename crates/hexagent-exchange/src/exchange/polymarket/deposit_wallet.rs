@@ -11,8 +11,8 @@
 //! by the live maintenance path (split / redeem / merge / onramp via the
 //! relayer `WALLET` batch):
 //!   * [`ensure_deposit_wallet`] — find an existing DW (on-chain
-//!     `WalletDeployed` scan + Gamma `/public-profile`) or, after an
-//!     interactive confirm, deploy one via relayer `WALLET-CREATE`.
+//!     `WalletDeployed` scan; Gamma `/public-profile` is a hint only) or,
+//!     after an interactive confirm, deploy one via relayer `WALLET-CREATE`.
 //!   * [`dw_approvals`] / [`dw_split`] / [`dw_redeem`] / [`dw_merge`] /
 //!     [`dw_onramp`] / [`dw_offramp_withdraw`] / [`dw_transfer_erc20`].
 
@@ -500,12 +500,13 @@ pub(crate) fn resolve_deposit_wallet(eoa: &str) -> Result<String> {
 /// `WALLET-CREATE`) if it doesn't exist yet. Used by `deploy_wallet`.
 pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Result<String> {
     // ── Existence pre-check: skip WALLET-CREATE if one already exists ──
-    // Mirrors `scripts/poly_wallet_info.py --resolve`. The authoritative
-    // deposit-wallet signal is the on-chain `WalletDeployed` scan (keyed
-    // by owner EOA); the Polymarket Gamma `/public-profile` API is a
-    // SECONDARY signal — it's keyed by the proxy/wallet address (does NOT
-    // reverse-resolve an EOA), so it only fires when the EOA is itself a
-    // registered Polymarket wallet.
+    // The ONLY authoritative deposit-wallet signal is the on-chain
+    // `WalletDeployed` scan (keyed by owner EOA). The Polymarket Gamma
+    // `/public-profile` API is NOT an existence signal: its `proxyWallet`
+    // is the account's WEBSITE proxy (a Gnosis Safe or magic-link proxy),
+    // never a deposit wallet — treating it as one mis-routed the WALLET
+    // batch to a Safe and the relayer 400'd with "wallet … is not
+    // registered". Gamma is kept below purely as an operator hint.
     if let Ok(dw) = find_existing_deposit_wallet(eoa) {
         println!("  Existing deposit wallet found on-chain (WalletDeployed log): {}", dw);
         println!("  → already exists; skipping WALLET-CREATE.");
@@ -513,18 +514,24 @@ pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Resul
     }
     if let Some(proxy) = gamma_public_profile_proxy(eoa) {
         if !proxy.eq_ignore_ascii_case(eoa) {
-            println!("  Existing wallet found via Polymarket Gamma API (public-profile): {}", proxy);
-            println!("  → already exists; skipping WALLET-CREATE.");
-            return Ok(proxy);
+            let safe = super::deploy_wallet::derive_safe_address(eoa);
+            if proxy.eq_ignore_ascii_case(&safe) {
+                println!("  ⚠ Gamma shows this EOA's website wallet {} — that is its", proxy);
+                println!("    Gnosis Safe, NOT a deposit wallet. For the legacy Safe flow,");
+                println!("    re-run with `--signature-type gnosis_safe`.");
+            } else {
+                println!("  ⚠ Gamma shows website proxy wallet {} for this EOA", proxy);
+                println!("    (not a deposit wallet — informational only).");
+            }
         }
     }
-    // ── Not found by either check → confirm before creating ──
+    // ── No deposit wallet on-chain → confirm before creating ──
     // Deploying is an on-chain action (relayer WALLET-CREATE), so make the
     // operator opt in explicitly rather than auto-creating — especially
     // since the existence check can miss a wallet on a flaky RPC and we
     // don't want to mint a second one by surprise.
     use std::io::Write as _;
-    println!("  No existing deposit wallet found for EOA {} (on-chain scan + Gamma API).", eoa);
+    println!("  No existing deposit wallet found for EOA {} (on-chain WalletDeployed scan).", eoa);
     println!("  A new POLY_1271 deposit wallet will be created via the Polymarket");
     println!("  relayer (on-chain WALLET-CREATE).");
     print!("  Create it now? [y/N]: ");
@@ -552,11 +559,11 @@ pub(crate) fn ensure_deposit_wallet(builder_auth: &PolyAuth, eoa: &str) -> Resul
 /// Polymarket Gamma public-profile lookup (no auth). Returns the
 /// `proxyWallet` for `address` if Gamma has a profile for it, else None.
 ///
-/// ⚠ Gamma is keyed by the PROXY/wallet address, NOT the signer EOA — it
-/// does not reverse-resolve an EOA to its deposit wallet (a fresh EOA
-/// returns `proxyWallet: null`). So this only fires when the queried
-/// address is itself a registered Polymarket wallet; it's a secondary
-/// signal to the on-chain `WalletDeployed` scan (see `--resolve`).
+/// ⚠ INFORMATIONAL ONLY — never treat the result as a deposit wallet.
+/// Gamma's `proxyWallet` is the account's website proxy (a Gnosis Safe or
+/// magic-link proxy); routing a relayer WALLET batch at it fails with
+/// "wallet … is not registered". It also does not reverse-resolve an EOA
+/// (a fresh EOA returns `proxyWallet: null`).
 fn gamma_public_profile_proxy(address: &str) -> Option<String> {
     const GAMMA_API: &str = "https://gamma-api.polymarket.com";
     // Browser UA — Gamma sits behind Cloudflare and 403s a default UA.
