@@ -122,19 +122,13 @@ fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
 /// Outcome of mapping a `not_canceled` reason returned by Polymarket
 /// CLOB. Three categories: definite Cancelled, definite Filled, or
 /// **Uncertain** (server's own wording is ambiguous — both states are
-/// possible). Uncertain is handled differently by each caller:
-///
-///   * First-pass `handle_cancel_reply`: re-route to orphan-cancel
-///     state (return `CancelOrderTimeout`) so the orphan reconciler
-///     queries `GET /data/order/{oid}` to get an authoritative answer
-///     before the strategy's `pending_orders` lock is released.
-///   * Reconcile DELETE retry path: commit to Cancelled (server has
-///     already been queried once via `fetch_order_status_by_id`; a
-///     second deferral would loop indefinitely).
+/// possible). Every caller maps Uncertain to `CancelOrderTimeout`, keeping the
+/// order in orphan-cancel state until an authoritative exchange response says
+/// CANCELED / MATCHED / FILLED. A retry limit may escalate operationally, but
+/// it must never manufacture a terminal order state and release collateral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelReasonOutcome {
-    /// Server explicitly says the order was cancelled (or never
-    /// existed in a state we'd care about).
+    /// Server explicitly says the order was cancelled.
     Cancelled,
     /// Server explicitly says the order matched. The accompanying
     /// trade will arrive on user-feed and update inventory.
@@ -171,8 +165,9 @@ enum CancelReasonOutcome {
 ///     during the brief window before the trade-push arrived,
 ///     `available_cash`/`available_inventory` over-credited and a
 ///     racing new BUY could trip a balance error. Routing to orphan
-///     waits ~1 reconcile RTT (~150 ms) for `GET /data/order/{oid}`
-///     to return MATCHED / CANCELED / 404 authoritatively.
+///     waits for `GET /data/order/{oid}` or the user feed to return an
+///     authoritative MATCHED / FILLED / CANCELED state. A 404 remains
+///     uncertain because the read replica may lag the write path.
 ///
 ///   * `"the order is already canceled"` (3×) → **Cancelled**
 ///     Server confirms cancelled, no ambiguity.
@@ -185,7 +180,8 @@ enum CancelReasonOutcome {
 ///     fallback, which abandoned a still-live order on the book → it rode
 ///     unmanaged to settlement (live.log 2026-06-24: 9 forgotten orders).
 ///
-///   * Other / unrecognised → **Cancelled** (conservative fallback).
+///   * Other / unrecognised → **Uncertain**. Unknown wording is not proof of a
+///     terminal state, so keep the worst-case reservation until reconciliation.
 /// True if a `not_canceled` reason means the cancel raced ahead of the
 /// placement — the order is still being processed server-side and will
 /// shortly become LIVE (NOT gone, NOT matched). Such an orphan is treated as
@@ -216,10 +212,10 @@ fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     if not_found && mentions_matched {
         return CancelReasonOutcome::Uncertain;
     }
-    // "not found" alone (no "or matched"): server has no record. Fine to
-    // commit to Cancelled — there's no fill in flight to wait for.
+    // "not found" alone is not authoritative. The order write may not have
+    // reached the read replica yet, or a fill push may still be in flight.
     if not_found {
-        return CancelReasonOutcome::Cancelled;
+        return CancelReasonOutcome::Uncertain;
     }
     // "can't be canceled because it is pending/delayed" — the cancel raced
     // ahead of the placement: the order is still being processed
@@ -233,8 +229,51 @@ fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     if is_pending_delayed_reason(reason) {
         return CancelReasonOutcome::Uncertain;
     }
-    // "already canceled" / unrecognised — conservative.
-    CancelReasonOutcome::Cancelled
+    // Only explicit already-cancelled wording is a terminal cancel. Unknown
+    // wording remains orphaned: retry exhaustion is an operational fault, not
+    // evidence that collateral can safely be released.
+    if r.contains("already canceled") || r.contains("already cancelled") {
+        return CancelReasonOutcome::Cancelled;
+    }
+    CancelReasonOutcome::Uncertain
+}
+
+/// Convert a DELETE `not_canceled` reason into the lifecycle status emitted to
+/// the strategy. This mapping is deliberately identical for the initial
+/// response and every reconcile retry: uncertainty always remains an orphan.
+fn cancel_reason_order_status(reason: &str) -> OrderStatus {
+    match cancel_not_canceled_outcome(reason) {
+        CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+        CancelReasonOutcome::Filled => OrderStatus::Filled,
+        CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+    }
+}
+
+/// Classify one order inside a successful DELETE response. HTTP success is not
+/// order success: an omitted OID or contradictory canceled/not_canceled entry
+/// remains uncertain and must retain its orphan reservation.
+fn cancel_delete_response_outcome(
+    response: &serde_json::Value,
+    order_id: &str,
+) -> CancelReasonOutcome {
+    let explicitly_canceled = response
+        .get("canceled")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|id| id == order_id))
+        .unwrap_or(false);
+    let matching_reason = response
+        .get("not_canceled")
+        .and_then(|v| v.as_object())
+        .and_then(|nc| nc.get(order_id))
+        .and_then(|reason| reason.as_str());
+
+    match (explicitly_canceled, matching_reason) {
+        (true, None) => CancelReasonOutcome::Cancelled,
+        (false, Some(reason)) => cancel_not_canceled_outcome(reason),
+        // Both collections mentioning the same OID is contradictory; neither
+        // collection mentioning it is an omission. Both remain uncertain.
+        (true, Some(_)) | (false, None) => CancelReasonOutcome::Uncertain,
+    }
 }
 
 fn format_order_brief(o: &OrderRequest) -> String {
@@ -802,13 +841,10 @@ pub struct SharedState {
     /// cancel raced the placement, so the order is still being processed and
     /// will shortly be LIVE (not gone). The reconcile cancel-orphan `""`
     /// (not-found) arm treats these as **Uncertain** and keeps retrying the GET
-    /// (bounded) until the order converges (LIVE → re-DELETE / MATCHED → Filled
-    /// / CANCELED → Cancelled), instead of committing Cancelled on a
-    /// not-yet-indexed order. Inserted at the cancel-reply classification sites;
-    /// cleared on conclusive resolution via `remove_order`. (Belt-and-suspenders
-    /// with the OrderManager resurrection: this avoids even a transient
-    /// Cancelled for pending/delayed; resurrection backstops the bounded-retry
-    /// give-up tail.)
+    /// until the order converges (LIVE → re-DELETE / MATCHED → Filled /
+    /// CANCELED → Cancelled), instead of committing Cancelled on a
+    /// not-yet-indexed order. Inserted at the cancel-reply classification sites
+    /// and cleared only on conclusive resolution via `remove_order`.
     pub(crate) pending_delayed_orphans: Mutex<HashSet<String>>,
 }
 
@@ -2612,50 +2648,27 @@ impl PolymarketTrade {
                     // next tick — the most common cause of the 36
                     // cancel-race rejects observed in live.log).
                     //
-                    // The DELETE response tells us the terminal state
-                    // directly: `canceled=[orderID]` → Cancelled;
-                    // `not_canceled` with "matched" reason → Filled
-                    // (the order raced us to the fill in the retry
-                    // window). Either way we resolve the orphan in
-                    // this reconcile pass instead of waiting another.
+                    // The DELETE response resolves the orphan only when it
+                    // names an authoritative terminal state:
+                    // `canceled=[orderID]` → Cancelled; an explicit matched
+                    // reason → Filled. Ambiguous/missing outcomes stay parked.
                     let body = serde_json::json!({ "orderID": order_id });
                     match self.delete_detailed("/order", &body) {
                         Ok(resp) => {
-                            let in_canceled = resp.get("canceled")
-                                .and_then(|v| v.as_array())
-                                .map(|a| a.iter().filter_map(|v| v.as_str())
-                                    .any(|s| s == order_id))
-                                .unwrap_or(false);
-                            if in_canceled {
-                                info!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} → Cancelled",
-                                    coid, order_id);
-                                OrderStatus::Cancelled
-                            } else if let Some(nc) = resp.get("not_canceled").and_then(|v| v.as_object()) {
-                                if let Some(reason_v) = nc.get(order_id) {
-                                    let reason = reason_v.as_str().unwrap_or("");
-                                    // This is the reconcile retry path — we
-                                    // already queried the server once via
-                                    // `fetch_order_status_by_id`. Even
-                                    // Uncertain reasons must commit here to
-                                    // avoid an infinite re-orphan loop;
-                                    // collapse to Cancelled (the trade push,
-                                    // if a fill happened, will arrive
-                                    // independently via user_feed).
-                                    let s = match cancel_not_canceled_outcome(reason) {
-                                        CancelReasonOutcome::Cancelled
-                                        | CancelReasonOutcome::Uncertain => OrderStatus::Cancelled,
-                                        CancelReasonOutcome::Filled => OrderStatus::Filled,
-                                    };
-                                    info!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} → {:?} (reason={})",
-                                        coid, order_id, s, reason);
-                                    s
-                                } else {
-                                    // Server didn't mention this orderID at all — stay an orphan.
-                                    OrderStatus::CancelOrderTimeout
-                                }
-                            } else {
-                                OrderStatus::CancelOrderTimeout
-                            }
+                            let outcome = cancel_delete_response_outcome(&resp, order_id);
+                            let status = match outcome {
+                                CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+                                CancelReasonOutcome::Filled => OrderStatus::Filled,
+                                CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                            };
+                            let reason = resp.get("not_canceled")
+                                .and_then(|v| v.as_object())
+                                .and_then(|nc| nc.get(order_id))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("<omitted>");
+                            info!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} → {:?} (reason={})",
+                                coid, order_id, status, reason);
+                            status
                         }
                         Err(e) => {
                             // HTTP 425 specifically signals "service overloaded
@@ -2691,73 +2704,41 @@ impl PolymarketTrade {
                     OrderStatus::Cancelled
                 }
                 "" => {
-                    // Not found. Default = assume gone → Cancelled. BUT a
-                    // pending/delayed orphan is treated as UNCERTAIN, not
-                    // cancelled: the cancel raced the placement and
-                    // `GET /data/order` just hasn't indexed the order yet.
-                    // Keep retrying (orphan stays parked; the orphan_reconciler
-                    // re-emits after its in_flight TTL) so a later pass hits the
-                    // "LIVE" arm above and re-DELETEs it — instead of committing
-                    // Cancelled on an order that goes live ~tens of ms later.
-                    // Bounded by RECONCILE_NOT_FOUND_RETRY_LIMIT (≈7.5 s) so a
-                    // never-materialising order can't wedge the orphan-gate; the
-                    // OrderManager resurrection + layer-2 sweep backstop the cap.
-                    // Every other not-found cancel still commits Cancelled
-                    // immediately (unchanged).
-                    if self.shared.pending_delayed_orphans.lock().unwrap().contains(coid) {
-                        let attempts = {
-                            let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
-                            let entry = m.entry(coid.clone()).or_insert(0);
-                            *entry += 1;
-                            *entry
-                        };
-                        if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
-                            warn!(
-                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} pending/delayed not found yet (attempt {}/{}) — uncertain, keeping orphan, retrying",
-                                coid, order_id, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
-                            );
-                            OrderStatus::CancelOrderTimeout
-                        } else {
-                            warn!(
-                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} pending/delayed never materialised (after {} attempts) → Cancelled",
-                                coid, order_id, attempts,
-                            );
-                            self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                            OrderStatus::Cancelled
-                        }
-                    } else {
-                        OrderStatus::Cancelled // not found → assume gone
-                    }
-                }
-                other => {
-                    // Unknown status — defensive retry cap so a future
-                    // Polymarket-introduced status can't permanently wedge
-                    // the orphan-gate (same pattern as the placement-reconcile
-                    // `other` arm). Reuse `reconcile_not_found_attempts` since
-                    // both paths represent "server response we can't act on
-                    // definitively yet". After the cap commit to Cancelled
-                    // (conservative: a cancel DELETE has already been
-                    // attempted at least once and we polled `/data/order`).
+                    // A missing/read-error result is not a terminal state. The
+                    // write may not be visible on this replica, or the order
+                    // may have matched while its user-feed event is in flight.
+                    // Count attempts for diagnostics only; never convert retry
+                    // exhaustion into a fabricated Cancelled status.
                     let attempts = {
                         let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
                         let entry = m.entry(coid.clone()).or_insert(0);
-                        *entry += 1;
+                        *entry = entry.saturating_add(1);
                         *entry
                     };
-                    if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
-                        warn!(
-                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt {}/{}) — keeping as orphan",
-                            coid, order_id, other, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
-                        );
-                        OrderStatus::CancelOrderTimeout
-                    } else {
-                        warn!(
-                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (after {} attempts) → giving up, committing Cancelled",
-                            coid, order_id, other, attempts,
-                        );
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        OrderStatus::Cancelled
-                    }
+                    let pending_delayed = self.shared.pending_delayed_orphans
+                        .lock().unwrap().contains(coid);
+                    warn!(
+                        "[PolymarketTrade] Reconcile cancel coid={} orderID={} not found/read unavailable (attempt={}, pending_delayed={}) — keeping orphan and worst-case reservation",
+                        coid, order_id, attempts, pending_delayed,
+                    );
+                    OrderStatus::CancelOrderTimeout
+                }
+                other => {
+                    // A future/unknown server status is operationally serious,
+                    // but not evidence of cancellation. Keep the orphan and
+                    // reservation indefinitely; alerting/risk-off may escalate
+                    // without changing the semantic order state.
+                    let attempts = {
+                        let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
+                        let entry = m.entry(coid.clone()).or_insert(0);
+                        *entry = entry.saturating_add(1);
+                        *entry
+                    };
+                    warn!(
+                        "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}) — keeping orphan and worst-case reservation",
+                        coid, order_id, other, attempts,
+                    );
+                    OrderStatus::CancelOrderTimeout
                 }
             };
             if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
@@ -3198,59 +3179,71 @@ impl PolymarketTrade {
         reply: Option<HttpReply>,
     ) -> OrderUpdate {
         let CancelCtx { local_oid, symbol, side } = ctx;
-        let mut should_remove = true;
+        // Worst-case default: the order is still live. Only an explicit
+        // terminal response below is allowed to remove tracking.
+        let mut should_remove = false;
         let mut timed_out = false;
-        let mut ok_status = OrderStatus::Cancelled;
+        let mut ok_status = OrderStatus::Accepted;
 
         if let Some(reply) = reply {
             let oid_ref = local_oid.as_deref().unwrap_or("");
             let oid_short = &oid_ref[..16.min(oid_ref.len())];
             match reply {
                 Ok(resp) => {
-                    let canceled_n = resp.get("canceled").and_then(|v| v.as_array())
-                        .map(|a| a.len()).unwrap_or(0);
+                    let canceled = resp.get("canceled").and_then(|v| v.as_array());
+                    let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
                     let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
                     let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
                     info!(
                         "[PolymarketTrade] Cancel result orderID={}... coid={} canceled={} not_canceled={}",
                         oid_short, client_order_id, canceled_n, nc_n,
                     );
+                    let explicitly_canceled = canceled
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|id| id == oid_ref))
+                        .unwrap_or(false);
+                    let matching_reason = not_canceled
+                        .and_then(|nc| nc.get(oid_ref))
+                        .and_then(|reason| reason.as_str());
                     if let Some(nc) = not_canceled {
                         for (id, reason) in nc {
                             let reason_str = reason.as_str().unwrap_or("");
                             info!("[PolymarketTrade] Cancel rejected: {} reason={} coid={}",
                                 id, reason_str, client_order_id);
-                            if Some(id.as_str()) == local_oid.as_deref() {
-                                match cancel_not_canceled_outcome(reason_str) {
-                                    CancelReasonOutcome::Cancelled => ok_status = OrderStatus::Cancelled,
-                                    CancelReasonOutcome::Filled    => ok_status = OrderStatus::Filled,
-                                    CancelReasonOutcome::Uncertain => {
-                                        // "order can't be found - already
-                                        // canceled or matched" — server
-                                        // can't disambiguate. Park as
-                                        // orphan-cancel so the reconciler
-                                        // queries `GET /data/order/{oid}`
-                                        // for an authoritative answer
-                                        // before strategy releases the
-                                        // pending_orders lock.
-                                        // pending/delayed = cancel raced the
-                                        // placement; flag so the reconcile
-                                        // not-found arm treats it as Uncertain
-                                        // (keeps retrying) instead of committing
-                                        // Cancelled (the forgotten-order race).
-                                        if is_pending_delayed_reason(reason_str) {
-                                            self.shared.pending_delayed_orphans
-                                                .lock().unwrap()
-                                                .insert(client_order_id.to_string());
-                                        }
-                                        info!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
-                                            reason_str, client_order_id);
-                                        should_remove = false;
-                                        timed_out = true;
-                                    }
+                        }
+                    }
+                    if !oid_ref.is_empty() {
+                        match cancel_delete_response_outcome(&resp, oid_ref) {
+                            CancelReasonOutcome::Cancelled => {
+                                should_remove = true;
+                                ok_status = OrderStatus::Cancelled;
+                            }
+                            CancelReasonOutcome::Filled => {
+                                should_remove = true;
+                                ok_status = OrderStatus::Filled;
+                            }
+                            CancelReasonOutcome::Uncertain => {
+                                if matching_reason.is_some_and(is_pending_delayed_reason) {
+                                    self.shared.pending_delayed_orphans
+                                        .lock().unwrap()
+                                        .insert(client_order_id.to_string());
                                 }
+                                if explicitly_canceled {
+                                    warn!("[PolymarketTrade] Cancel response contradictory for coid={} orderID={}... (canceled + not_canceled reason={}) → orphan",
+                                        client_order_id, oid_short, matching_reason.unwrap_or(""));
+                                } else if let Some(reason) = matching_reason {
+                                    info!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
+                                        reason, client_order_id);
+                                } else {
+                                    warn!("[PolymarketTrade] Cancel response omitted coid={} orderID={}... → orphan",
+                                        client_order_id, oid_short);
+                                }
+                                timed_out = true;
                             }
                         }
+                    } else {
+                        // No exchange OID means we cannot reconcile by ID.
+                        // Preserve the local Active state so the normal refresh
+                        // path can retry once the mapping appears.
                     }
                 }
                 Err(e) if e.is_unknown_state() => {
@@ -3354,29 +3347,64 @@ impl ExchangeTrade for PolymarketTrade {
         let body = serde_json::Value::Array(
             order_ids.iter().map(|id| serde_json::Value::String(id.clone())).collect()
         );
-        match self.delete_detailed("/orders", &body) {
+        let (response, fallback_status) = match self.delete_detailed("/orders", &body) {
             Ok(resp) => {
                 let canceled_n = resp.get("canceled").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 let nc_n = resp.get("not_canceled").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
                 info!("[PolymarketTrade] Cancel all result for {}: canceled={} not_canceled={}",
                     symbol, canceled_n, nc_n);
+                (Some(resp), OrderStatus::CancelOrderTimeout)
             }
-            Err(e) => warn!("[PolymarketTrade] Cancel all HTTP error: {}", e),
-        }
+            Err(e) if e.is_unknown_state() => {
+                if matches!(e, HttpErr::Status(425, _)) {
+                    self.shared.note_http_425_backoff();
+                }
+                warn!("[PolymarketTrade] Cancel all unknown state: {} — keeping orders as orphans", e);
+                (None, OrderStatus::CancelOrderTimeout)
+            }
+            Err(e) => {
+                warn!("[PolymarketTrade] Cancel all rejected: {} — keeping orders live for retry", e);
+                (None, OrderStatus::Accepted)
+            }
+        };
 
-        // Remove from tracking and build updates
+        // Resolve each OID independently. A successful batch response may
+        // omit or contradict one order; only explicit per-order terminal
+        // evidence may release tracking and collateral.
         let mut updates = Vec::new();
-        for coid in &coids {
+        for (coid, order_id) in coids.iter().zip(order_ids.iter()) {
             let tracked = self.shared.open_orders.lock().unwrap()
                 .get(coid).cloned();
-            self.shared.remove_order(coid);
+            let status = response.as_ref().map(|resp| {
+                match cancel_delete_response_outcome(resp, order_id) {
+                    CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+                    CancelReasonOutcome::Filled => OrderStatus::Filled,
+                    CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                }
+            }).unwrap_or(fallback_status);
+            if status == OrderStatus::CancelOrderTimeout {
+                if let Some(reason) = response.as_ref()
+                    .and_then(|resp| resp.get("not_canceled"))
+                    .and_then(|v| v.as_object())
+                    .and_then(|nc| nc.get(order_id))
+                    .and_then(|v| v.as_str())
+                {
+                    if is_pending_delayed_reason(reason) {
+                        self.shared.pending_delayed_orphans
+                            .lock().unwrap().insert(coid.clone());
+                    }
+                }
+            }
+            if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
+                self.shared.remove_order(coid);
+            }
             updates.push(OrderUpdate {
                 client_order_id: coid.clone(),
                 exchange,
                 symbol: symbol.to_string(),
                 side: tracked.map(|t| t.side).unwrap_or(Side::Buy),
-                exchange_order_id: None,
-                status: OrderStatus::Cancelled,
+                exchange_order_id: Some(order_id.clone()),
+                status,
                 liquidity: None,
                 filled_quantity: 0.0,
                 remaining_quantity: 0.0,
@@ -3691,9 +3719,10 @@ impl ExchangeTrade for PolymarketTrade {
                 );
             }
             // Per-coid outcome map. On Ok: fill from `canceled` +
-            // `not_canceled` (matched → Filled, other reasons → Cancelled).
+            // `not_canceled`; omitted or ambiguous orders stay orphaned.
             // On unknown_state: all coids → CancelOrderTimeout.
-            // On other Err: all coids → Cancelled.
+            // On a definite cancel failure: all coids remain Accepted/live so
+            // the normal refresh path retries without releasing collateral.
             let mut per_coid_outcome: std::collections::HashMap<String, OrderStatus>
                 = std::collections::HashMap::new();
             let fallback_outcome: OrderStatus = match self.delete_detailed(path, &body) {
@@ -3729,30 +3758,20 @@ impl ExchangeTrade for PolymarketTrade {
                                 id, reason_str, coid,
                             );
                             if !coid.is_empty() {
-                                let s = match cancel_not_canceled_outcome(reason_str) {
-                                    CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
-                                    CancelReasonOutcome::Filled    => OrderStatus::Filled,
-                                    // Defer to orphan reconcile — same
-                                    // rationale as `handle_cancel_reply`:
-                                    // server can't disambiguate, ask
-                                    // GET /data/order/{oid} before
-                                    // releasing pending_orders lock.
-                                    CancelReasonOutcome::Uncertain => {
-                                        if is_pending_delayed_reason(reason_str) {
-                                            self.shared.pending_delayed_orphans
-                                                .lock().unwrap().insert(coid.clone());
-                                        }
-                                        OrderStatus::CancelOrderTimeout
-                                    }
-                                };
+                                let s = cancel_reason_order_status(reason_str);
+                                if s == OrderStatus::CancelOrderTimeout
+                                    && is_pending_delayed_reason(reason_str)
+                                {
+                                    self.shared.pending_delayed_orphans
+                                        .lock().unwrap().insert(coid.clone());
+                                }
                                 per_coid_outcome.insert(coid, s);
                             }
                         }
                     }
-                    // Coids the caller sent but that the server didn't
-                    // mention (neither canceled nor not_canceled) default
-                    // to Cancelled — server treated them as gone.
-                    OrderStatus::Cancelled
+                    // A successful batch response that omits an orderID says
+                    // nothing authoritative about that order's state.
+                    OrderStatus::CancelOrderTimeout
                 }
                 Err(e) if e.is_unknown_state() => {
                     if self.shared.should_warn_unknown_state(&e) {
@@ -3765,7 +3784,7 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 Err(e) => {
                     warn!("[PolymarketTrade] Cancel HTTP error: {} coids={:?}", e, client_order_ids);
-                    OrderStatus::Cancelled
+                    OrderStatus::Accepted
                 }
             };
             let mut updates = Vec::new();
@@ -3773,7 +3792,13 @@ impl ExchangeTrade for PolymarketTrade {
                 let tracked = self.shared.open_orders.lock().unwrap()
                     .get(coid).cloned();
                 let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
-                let outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
+                let mut outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
+                if outcome == OrderStatus::CancelOrderTimeout && order_id.is_none() {
+                    // Cannot reconcile an orphan without an exchange OID.
+                    // Revert to live/Accepted so OrderManager retries instead
+                    // of wedging forever in Cancelling or releasing the lock.
+                    outcome = OrderStatus::Accepted;
+                }
                 // Drop local tracking for terminal outcomes; keep for
                 // CancelOrderTimeout so the orphan reconciler can re-query.
                 if matches!(outcome, OrderStatus::Cancelled | OrderStatus::Filled) {
@@ -3798,20 +3823,20 @@ impl ExchangeTrade for PolymarketTrade {
             return Ok(updates);
         }
 
-        // No orderIDs to cancel (either all unmapped / already gone). Emit
-        // Cancelled for every coid so strategy can release locks.
+        // No orderIDs to cancel. Absence of a local mapping is not an
+        // authoritative exchange terminal state: preserve each order as live
+        // so OrderManager can retry after the mapping catches up.
         let mut updates = Vec::new();
         for coid in client_order_ids {
             let tracked = self.shared.open_orders.lock().unwrap()
                 .get(coid).cloned();
-            self.shared.remove_order(coid);
             updates.push(OrderUpdate {
                 client_order_id: coid.clone(),
                 exchange,
                 symbol: tracked.as_ref().map(|t| t.symbol.clone()).unwrap_or_default(),
                 side: tracked.map(|t| t.side).unwrap_or(Side::Buy),
                 exchange_order_id: None,
-                status: OrderStatus::Cancelled,
+                status: OrderStatus::Accepted,
                 liquidity: None,
                 filled_quantity: 0.0,
                 remaining_quantity: 0.0,
@@ -4072,13 +4097,10 @@ impl ExchangeTrade for PolymarketTrade {
         let mut updates: Vec<OrderUpdate> = Vec::new();
 
         // ─── Await + parse cancel ───────────────────────────────────────
-        // Resolve the outcome even when we skipped the HTTP request (i.e.
-        // none of the requested coids had an orderID mapping — typically
-        // because the original NewOrder was rejected by the server and
-        // never reached a placed state). Those coids still need an
-        // OrderUpdate emitted so strategy can clear its in_flight /
-        // OrderManager state; without this they'd sit in in_flight until
-        // the 5s TTL sweep.
+        // Resolve the local control state even when we skipped the HTTP request
+        // because no requested coid had an orderID mapping. Missing local
+        // metadata is not exchange-terminal evidence: emit Accepted/live so
+        // OrderManager retries rather than releasing collateral.
         // `Some((fallback_outcome, per_coid_overrides))` — the fallback
         // applies to coids the server didn't mention; per-coid overrides
         // come from `canceled` / `not_canceled` (the latter with a
@@ -4086,23 +4108,23 @@ impl ExchangeTrade for PolymarketTrade {
         let cancel_outcome: Option<(OrderStatus, std::collections::HashMap<String, OrderStatus>)> = match cancel_rx {
             None if !cancel_client_order_ids.is_empty() => {
                 info!(
-                    "[PolymarketTrade] Cancel request: 0 orders ({} unmapped coids={:?}) → Cancelled locally",
+                    "[PolymarketTrade] Cancel request: 0 orders ({} unmapped coids={:?}) → keep live for retry",
                     unmapped_coids.len(), unmapped_coids,
                 );
-                Some((OrderStatus::Cancelled, std::collections::HashMap::new()))
+                Some((OrderStatus::Accepted, std::collections::HashMap::new()))
             }
             None => None,
             Some(rx) => {
                 // Classify the response so we can emit the right OrderStatus for
                 // each coid:
-                //   - Ok                     → Cancelled (normal success;
-                //                              not_canceled reasons are logged)
+                //   - Ok                     → per-order authoritative result;
+                //                              omitted/ambiguous → orphan
                 //   - Err::is_unknown_state  → CancelOrderTimeout (timeout or
                 //                              HTTP 5xx — server state unknown,
                 //                              orphan reconciler will verify)
-                //   - Err (other / 4xx)      → Cancelled (server rejected cleanly;
-                //                              order is typically "not found /
-                //                              already gone")
+                //   - Err (other / 4xx)      → Accepted/live (the cancel was
+                //                              rejected; keep collateral and
+                //                              retry through normal refresh)
                 // Build a per-coid outcome map; on Ok responses use
                 // `canceled`/`not_canceled` to distinguish plain cancels
                 // from fills that raced ahead of our cancel. On errors
@@ -4143,26 +4165,18 @@ impl ExchangeTrade for PolymarketTrade {
                                     id, reason_str, coid,
                                 );
                                 if !coid.is_empty() {
-                                    let s = match cancel_not_canceled_outcome(reason_str) {
-                                        CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
-                                        CancelReasonOutcome::Filled    => OrderStatus::Filled,
-                                        // Same orphan-defer treatment as the
-                                        // single-cancel path — wait for
-                                        // GET /data/order/{oid} before
-                                        // releasing pending_orders lock.
-                                        CancelReasonOutcome::Uncertain => {
-                                            if is_pending_delayed_reason(reason_str) {
-                                                self.shared.pending_delayed_orphans
-                                                    .lock().unwrap().insert(coid.clone());
-                                            }
-                                            OrderStatus::CancelOrderTimeout
-                                        }
-                                    };
+                                    let s = cancel_reason_order_status(reason_str);
+                                    if s == OrderStatus::CancelOrderTimeout
+                                        && is_pending_delayed_reason(reason_str)
+                                    {
+                                        self.shared.pending_delayed_orphans
+                                            .lock().unwrap().insert(coid.clone());
+                                    }
                                     per_coid_outcome.insert(coid, s);
                                 }
                             }
                         }
-                        OrderStatus::Cancelled
+                        OrderStatus::CancelOrderTimeout
                     }
                     Err(e) if e.is_unknown_state() => {
                         if self.shared.should_warn_unknown_state(&e) {
@@ -4175,7 +4189,7 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                     Err(e) => {
                         warn!("[PolymarketTrade] Cancel HTTP error: {} coids={:?}", e, cancel_client_order_ids);
-                        OrderStatus::Cancelled
+                        OrderStatus::Accepted
                     }
                 };
                 Some((fallback, per_coid_outcome))
@@ -4185,7 +4199,10 @@ impl ExchangeTrade for PolymarketTrade {
             for coid in cancel_client_order_ids {
                 let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
                 let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
-                let outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
+                let mut outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
+                if outcome == OrderStatus::CancelOrderTimeout && order_id.is_none() {
+                    outcome = OrderStatus::Accepted;
+                }
                 // Drop local tracking for terminal (Cancelled / Filled)
                 // outcomes — keep for CancelOrderTimeout so the orphan
                 // reconciler can re-query by orderID.
@@ -4488,28 +4505,91 @@ mod tests {
         // "cant" (no apostrophe) variant — defensive against server typo.
         assert_eq!(
             cancel_not_canceled_outcome("order cant be found"),
-            CancelReasonOutcome::Cancelled,
+            CancelReasonOutcome::Uncertain,
         );
-        // Plain "not found" without "or matched" → no fill in flight,
-        // safe to commit to Cancelled.
+        // A plain not-found can still be read-replica lag.
         assert_eq!(
             cancel_not_canceled_outcome("order not found"),
-            CancelReasonOutcome::Cancelled,
+            CancelReasonOutcome::Uncertain,
         );
     }
 
     #[test]
-    fn cancel_not_canceled_outcome_unrecognised_falls_back_to_cancelled() {
-        // Unknown reason → conservative Cancelled (releases lock, no
-        // infinite reconcile churn). Same behaviour as the previous
-        // `cancel_not_canceled_status`.
+    fn cancel_not_canceled_outcome_unrecognised_stays_uncertain() {
+        // Retry exhaustion must never manufacture a terminal state. Unknown
+        // wording and an empty reason preserve the orphan's worst-case lock.
         assert_eq!(
             cancel_not_canceled_outcome("server explosion - try again later"),
-            CancelReasonOutcome::Cancelled,
+            CancelReasonOutcome::Uncertain,
         );
         assert_eq!(
             cancel_not_canceled_outcome(""),
+            CancelReasonOutcome::Uncertain,
+        );
+    }
+
+    /// Regression for the live race: GET said LIVE, but the following DELETE
+    /// returned "already canceled or matched". The reconcile retry must emit
+    /// another timeout/orphan update, never a synthetic Cancelled that releases
+    /// collateral before the delayed fill push arrives.
+    #[test]
+    fn reconcile_delete_uncertain_remains_cancel_orphan() {
+        assert_eq!(
+            cancel_reason_order_status("order can't be found - already canceled or matched"),
+            OrderStatus::CancelOrderTimeout,
+        );
+        assert_eq!(
+            cancel_reason_order_status("can't be canceled because it is pending/delayed"),
+            OrderStatus::CancelOrderTimeout,
+        );
+        assert_eq!(
+            cancel_reason_order_status("the order is already canceled"),
+            OrderStatus::Cancelled,
+        );
+        assert_eq!(
+            cancel_reason_order_status("matched orders can't be canceled"),
+            OrderStatus::Filled,
+        );
+    }
+
+    #[test]
+    fn delete_response_requires_authoritative_per_order_terminal() {
+        let oid = "0xabc";
+        assert_eq!(
+            cancel_delete_response_outcome(
+                &serde_json::json!({"canceled": [oid], "not_canceled": {}}),
+                oid,
+            ),
             CancelReasonOutcome::Cancelled,
+        );
+        assert_eq!(
+            cancel_delete_response_outcome(
+                &serde_json::json!({
+                    "canceled": [],
+                    "not_canceled": {"0xabc": "order can't be found - already canceled or matched"}
+                }),
+                oid,
+            ),
+            CancelReasonOutcome::Uncertain,
+        );
+        assert_eq!(
+            cancel_delete_response_outcome(
+                &serde_json::json!({"canceled": [], "not_canceled": {}}),
+                oid,
+            ),
+            CancelReasonOutcome::Uncertain,
+            "HTTP success that omits the OID is not terminal",
+        );
+        assert_eq!(
+            cancel_delete_response_outcome(
+                &serde_json::json!({
+                    "canceled": [oid],
+                    "not_canceled": {"0xabc": "pending/delayed"}
+                }),
+                oid,
+            ),
+            CancelReasonOutcome::Uncertain,
+            "contradictory per-order outcomes stay orphaned",
         );
     }
 

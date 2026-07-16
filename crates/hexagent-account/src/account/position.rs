@@ -702,6 +702,45 @@ mod tests {
         assert_eq!(po.remaining_quantity, 5.0);
     }
 
+    /// A cancel orphan represents the worst-case possibility that the order is
+    /// still resting or has matched without its trade push arriving. Neither
+    /// BUY cash nor SELL inventory may be released on CancelOrderTimeout.
+    #[test]
+    fn cancel_timeout_preserves_worst_case_pending_locks() {
+        let mut initial = HashMap::new();
+        initial.insert("TOK".to_string(), 10.0);
+        let mut pm = PositionManager::with_initial_quantities(initial, 100.0);
+        pm.register_pending_order("buy", "TOK", Side::Buy, 0.40, 5.0);
+        pm.register_pending_order("sell", "TOK", Side::Sell, 0.60, 4.0);
+
+        pm.sync_pending_from_update(&ou(
+            "buy",
+            Side::Buy,
+            OrderStatus::CancelOrderTimeout,
+            0.0,
+            0.0,
+        ));
+        pm.sync_pending_from_update(&ou(
+            "sell",
+            Side::Sell,
+            OrderStatus::CancelOrderTimeout,
+            0.0,
+            0.0,
+        ));
+
+        assert_eq!(pm.pending_orders().len(), 2, "both orphan locks remain");
+        assert!((pm.available_cash() - 98.0).abs() < 1e-9, "BUY cash stays reserved");
+        assert!((pm.available_inventory("TOK") - 6.0).abs() < 1e-9,
+            "SELL shares stay reserved");
+
+        // Only an authoritative terminal update releases each resource.
+        pm.sync_pending_from_update(&ou("buy", Side::Buy, OrderStatus::Cancelled, 0.0, 0.0));
+        assert!((pm.available_cash() - 100.0).abs() < 1e-9);
+        assert_eq!(pm.pending_orders().len(), 1);
+        pm.sync_pending_from_update(&ou("sell", Side::Sell, OrderStatus::Filled, 0.0, 0.0));
+        assert_eq!(pm.pending_orders().len(), 0);
+    }
+
     #[test]
     fn first_sighting_returns_add_sign() {
         let mut pm = PositionManager::new();

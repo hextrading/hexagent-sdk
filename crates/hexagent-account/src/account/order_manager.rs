@@ -718,6 +718,27 @@ mod tests {
         assert_eq!(m.live_count(Side::Buy), 1, "Cancelled excludes b → live back to 1");
     }
 
+    /// A DELETE-uncertain update must leave the local order Cancelling/live so
+    /// leg admission and worst-case collateral accounting remain blocked until
+    /// an authoritative terminal update arrives.
+    #[test]
+    fn cancel_timeout_keeps_order_live_and_locked() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
+        cancel(&mut m, "x");
+        assert_eq!(m.live_count(Side::Buy), 1);
+        assert!((m.locked_buy_cost() - 2.0).abs() < 1e-9);
+
+        m.on_order_update(&upd("x", Side::Buy, OrderStatus::CancelOrderTimeout));
+        assert_eq!(m.live_count(Side::Buy), 1, "uncertain cancel remains live");
+        assert!((m.locked_buy_cost() - 2.0).abs() < 1e-9,
+            "uncertain cancel keeps worst-case cash locked");
+
+        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
+        assert_eq!(m.live_count(Side::Buy), 0, "authoritative cancel releases slot");
+        assert_eq!(m.locked_buy_cost(), 0.0, "authoritative cancel releases lock");
+    }
+
     // Cancelled is KEPT in the map (not removed) and excluded from live/active
     // queries; a late `Accepted` (the pending/delayed cancel/placement race)
     // RESURRECTS it to Active, retaining the original price/qty — no
