@@ -817,18 +817,10 @@ pub struct SharedState {
     /// live log can be aggregated without a separate metrics dependency.
     pub(crate) http_425_circuit_entries_total: std::sync::atomic::AtomicU64,
     pub(crate) get_live_delete_uncertain_total: std::sync::atomic::AtomicU64,
-    /// Per-coid counter for `reconcile_orphans` placement queries that
-    /// returned `not_found` from the server. Real Polymarket is
-    /// eventually-consistent across CLOB shards: a brand-new order can
-    /// be 404 on the read replica for 100s of ms even though the write
-    /// replica has it. Live2 evidence (2026-04-30): 66% of "not_found"
-    /// reconciles were actually live orders that later traded. Until
-    /// the counter for a coid hits `RECONCILE_NOT_FOUND_RETRY_LIMIT`
-    /// the reconcile path returns NO update — strategy keeps the coid
-    /// orphaned and the next `Signal::ReconcilePolymarket` will retry.
-    /// Cleared on any conclusive resolution (MATCHED / FILLED /
-    /// CANCELED) so a subsequent unrelated 404 starts fresh.
-    pub(crate) reconcile_not_found_attempts: Mutex<HashMap<String, u32>>,
+    /// Independent placement/cancel retry counters. A coid can be in both
+    /// orphan sets after cancel-before-ack; cancel diagnostics must never
+    /// exhaust the bounded placement retry budget.
+    pub(crate) reconcile_attempts: ReconcileAttemptCounters,
 
     /// Per-coid **exponential backoff** gate for placement not-found GETs:
     /// wall-clock ns before which the next reconcile GET for this coid is
@@ -838,9 +830,9 @@ pub struct SharedState {
     /// slowdown that pours ~5 GETs/orphan onto an already-struggling endpoint
     /// and prolongs the episode. Backing off costs only slower orphan
     /// cleanup — a real fill still lands via the WS user_feed independent of
-    /// this GET. Cleared alongside `reconcile_not_found_attempts` on any
+    /// this GET. Cleared alongside the placement counter on any
     /// conclusive placement resolution.
-    pub(crate) reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
+    pub(crate) placement_reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
 
     /// Coids whose cancel was rejected with a `pending/delayed` reason — the
     /// cancel raced the placement, so the order is still being processed and
@@ -851,6 +843,38 @@ pub struct SharedState {
     /// not-yet-indexed order. Inserted at the cancel-reply classification sites
     /// and cleared only on conclusive resolution via `remove_order`.
     pub(crate) pending_delayed_orphans: Mutex<HashSet<String>>,
+}
+
+/// Retry accounting for mixed placement/cancel orphans. Placement is a
+/// bounded state machine; cancel attempts are unbounded diagnostics only.
+#[derive(Default)]
+pub(crate) struct ReconcileAttemptCounters {
+    placement: Mutex<HashMap<String, u32>>,
+    cancel: Mutex<HashMap<String, u32>>,
+}
+
+impl ReconcileAttemptCounters {
+    fn next_placement(&self, coid: &str) -> u32 {
+        let mut attempts = self.placement.lock().unwrap();
+        let entry = attempts.entry(coid.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    fn clear_placement(&self, coid: &str) {
+        self.placement.lock().unwrap().remove(coid);
+    }
+
+    fn next_cancel(&self, coid: &str) -> u32 {
+        let mut attempts = self.cancel.lock().unwrap();
+        let entry = attempts.entry(coid.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    fn clear_cancel(&self, coid: &str) {
+        self.cancel.lock().unwrap().remove(coid);
+    }
 }
 
 /// Number of consecutive `not_found` GETs we tolerate from the server
@@ -1719,8 +1743,8 @@ impl PolymarketTrade {
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
-                reconcile_not_found_attempts: Mutex::new(HashMap::new()),
-                reconcile_next_retry_ns: Mutex::new(HashMap::new()),
+                reconcile_attempts: ReconcileAttemptCounters::default(),
+                placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
             owner: api_key.to_string(),
@@ -2436,7 +2460,7 @@ impl PolymarketTrade {
                 // Per-coid exponential backoff: skip the GET until this coid's
                 // next-retry deadline (set on the previous not-found). Keeps the
                 // orphan parked without re-hammering a slow PM REST endpoint.
-                if let Some(&next_ns) = self.shared.reconcile_next_retry_ns.lock().unwrap().get(coid) {
+                if let Some(&next_ns) = self.shared.placement_reconcile_next_retry_ns.lock().unwrap().get(coid) {
                     if now_ns() < next_ns {
                         continue;
                     }
@@ -2461,8 +2485,8 @@ impl PolymarketTrade {
                     "LIVE" => {
                         // Conclusive answer — clear the not_found counter
                         // so a future unrelated 404 starts fresh.
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.register_order_id(coid, oid, symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
@@ -2489,8 +2513,8 @@ impl PolymarketTrade {
                         });
                     }
                     "MATCHED" | "FILLED" => {
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → Filled",
@@ -2513,8 +2537,8 @@ impl PolymarketTrade {
                         });
                     }
                     "CANCELED" | "CANCELLED" => {
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → Cancelled",
@@ -2547,12 +2571,7 @@ impl PolymarketTrade {
                         // happens via the strategy's next ReconcilePolymarket
                         // signal (orphan stays in the reconciler map; the
                         // 1.5 s in_flight TTL gates re-emission).
-                        let attempts = {
-                            let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
-                            let entry = m.entry(coid.clone()).or_insert(0);
-                            *entry += 1;
-                            *entry
-                        };
+                        let attempts = self.shared.reconcile_attempts.next_placement(coid);
                         if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
                             warn!(
                                 "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (attempt {}/{}) — keeping orphan, retrying",
@@ -2564,7 +2583,7 @@ impl PolymarketTrade {
                             // loop skips intervening re-emits until this passes.
                             let backoff_ms = RECONCILE_BACKOFF_BASE_MS
                                 .saturating_mul(1u64 << (attempts - 1));
-                            self.shared.reconcile_next_retry_ns.lock().unwrap().insert(
+                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
                                 coid.clone(),
                                 now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                             );
@@ -2577,8 +2596,8 @@ impl PolymarketTrade {
                             "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (after {} attempts) → Rejected",
                             coid, oid, attempts,
                         );
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
-                        self.shared.reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order(coid);
                         updates.push(OrderUpdate {
                             client_order_id: coid.clone(),
@@ -2608,7 +2627,8 @@ impl PolymarketTrade {
                         // poll_pending_snapshots never ran → 11 events
                         // ran with no quoting. Treat exactly like
                         // Rejected so the orphan clears immediately.
-                        self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         warn!(
                             "[PolymarketTrade] Reconcile: placement coid={} orderID={} status=INVALID → Rejected (server validation failed)",
                             coid, oid,
@@ -2638,12 +2658,7 @@ impl PolymarketTrade {
                         // then commit Rejected so a future Polymarket-
                         // introduced status can't permanently wedge the
                         // orphan-gate.
-                        let attempts = {
-                            let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
-                            let entry = m.entry(coid.clone()).or_insert(0);
-                            *entry += 1;
-                            *entry
-                        };
+                        let attempts = self.shared.reconcile_attempts.next_placement(coid);
                         if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
                             warn!(
                                 "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' (attempt {}/{}) — keeping as orphan",
@@ -2654,7 +2669,8 @@ impl PolymarketTrade {
                                 "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' (after {} attempts) → Rejected",
                                 coid, oid, other, attempts,
                             );
-                            self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                            self.shared.reconcile_attempts.clear_placement(coid);
+                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                             self.shared.remove_order(coid);
                             updates.push(OrderUpdate {
                                 client_order_id: coid.clone(),
@@ -2764,12 +2780,7 @@ impl PolymarketTrade {
                     // may have matched while its user-feed event is in flight.
                     // Count attempts for diagnostics only; never convert retry
                     // exhaustion into a fabricated Cancelled status.
-                    let attempts = {
-                        let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
-                        let entry = m.entry(coid.clone()).or_insert(0);
-                        *entry = entry.saturating_add(1);
-                        *entry
-                    };
+                    let attempts = self.shared.reconcile_attempts.next_cancel(coid);
                     let pending_delayed = self.shared.pending_delayed_orphans
                         .lock().unwrap().contains(coid);
                     warn!(
@@ -2783,12 +2794,7 @@ impl PolymarketTrade {
                     // but not evidence of cancellation. Keep the orphan and
                     // reservation indefinitely; alerting/risk-off may escalate
                     // without changing the semantic order state.
-                    let attempts = {
-                        let mut m = self.shared.reconcile_not_found_attempts.lock().unwrap();
-                        let entry = m.entry(coid.clone()).or_insert(0);
-                        *entry = entry.saturating_add(1);
-                        *entry
-                    };
+                    let attempts = self.shared.reconcile_attempts.next_cancel(coid);
                     warn!(
                         "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}) — keeping orphan and worst-case reservation",
                         coid, order_id, other, attempts,
@@ -2801,7 +2807,7 @@ impl PolymarketTrade {
                 // Clear the defensive-retry counter on conclusive resolution
                 // so a later unrelated unknown-status arm for the same coid
                 // starts fresh.
-                self.shared.reconcile_not_found_attempts.lock().unwrap().remove(coid);
+                self.shared.reconcile_attempts.clear_cancel(coid);
             }
             info!("[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
                 coid, order_id, status, status_str);
@@ -4743,6 +4749,28 @@ mod tests {
 
         assert_eq!(gaps_ms, vec![500, 1_000, 2_000, 4_000]);
         assert_eq!(gaps_ms.iter().sum::<u64>(), 7_500);
+    }
+
+    /// A cancel-before-ack timeout can put one coid in both reconcile lists.
+    /// Unbounded cancel polls must not consume placement's five observations.
+    #[test]
+    fn placement_and_cancel_reconcile_attempts_are_isolated() {
+        let attempts = ReconcileAttemptCounters::default();
+        let coid = "mixed-place-cancel";
+
+        assert_eq!(attempts.next_placement(coid), 1);
+        for expected in 1..=8 {
+            assert_eq!(attempts.next_cancel(coid), expected);
+        }
+        assert_eq!(attempts.next_placement(coid), 2);
+
+        attempts.clear_cancel(coid);
+        assert_eq!(attempts.next_cancel(coid), 1);
+        assert_eq!(attempts.next_placement(coid), 3);
+
+        attempts.clear_placement(coid);
+        assert_eq!(attempts.next_placement(coid), 1);
+        assert_eq!(attempts.next_cancel(coid), 2);
     }
 
     /// A 425 must back off only the affected orphan. A healthy sibling must
