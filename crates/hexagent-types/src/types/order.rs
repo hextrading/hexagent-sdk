@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use super::market::{Exchange, Side};
 
+/// Marker attached to a terminal `OrderUpdate` produced by an explicit orphan
+/// reconciliation GET. Consumers use it to distinguish a fresh server audit
+/// from a possibly delayed private-stream lifecycle update.
+pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str =
+    "orphan_reconcile_authoritative_terminal";
+
 fn default_true_fn() -> bool { true }
 
 /// Order type
@@ -126,12 +132,12 @@ pub struct OrderUpdate {
     /// of double-counting.
     #[serde(default)]
     pub trade_id: Option<String>,
-    /// Server-provided error string for rejected orders (only populated
-    /// when `status == Rejected`). Strategies use this to distinguish
-    /// rejection causes — e.g. "invalid post-only order: order crosses
-    /// book" lets the strategy back-infer that the real best bid/ask
-    /// has moved past our quoted price and refresh its local OB
-    /// snapshot before the next quote tick.
+    /// Server-provided error string for rejected orders. Strategies use this
+    /// to distinguish rejection causes — e.g. "invalid post-only order: order
+    /// crosses book" lets the strategy refresh its inferred top of book. A
+    /// terminal update emitted by an explicit orphan-reconcile GET uses
+    /// [`ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL`] as an origin marker; normal
+    /// private-stream lifecycle updates leave this field empty.
     #[serde(default)]
     pub error: Option<String>,
 }
