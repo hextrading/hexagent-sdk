@@ -168,6 +168,13 @@ pub struct OrderManager {
     /// map were a `HashMap`. Same memory profile, O(log N) lookups
     /// (N is at most a handful of resting orders per OM).
     orders: std::collections::BTreeMap<String, LocalOrder>,
+    /// Cancel requests for placements still awaiting their first authoritative
+    /// exchange update. Sending DELETE while the POST is still being processed
+    /// produces the `pending/delayed` cancel-before-ack race; instead we park
+    /// the coid here and emit its cancel immediately after Accepted /
+    /// PartiallyFilled. A NewOrderTimeout also flushes the intent so an order
+    /// that may have landed is still pulled and handed to orphan reconcile.
+    cancel_intents: std::collections::BTreeSet<String>,
 }
 
 /// A desired quote level: price + quantity on a given side.
@@ -200,6 +207,7 @@ impl OrderManager {
             min_marketable_notional: 0.0,
             requote_min_ticks: 0.0,
             orders: std::collections::BTreeMap::new(),
+            cancel_intents: std::collections::BTreeSet::new(),
         }
     }
 
@@ -272,10 +280,79 @@ impl OrderManager {
         }
     }
 
-    /// Update local order state from an exchange OrderUpdate.
-    pub fn on_order_update(&mut self, update: &OrderUpdate) {
+    fn cancel_signal(&self, client_order_id: &str, timestamp_ns: u64) -> Signal {
+        Signal::CancelOrder {
+            exchange: self.exchange,
+            client_order_id: client_order_id.to_string(),
+            instance_id: self.instance_id.clone(),
+            timestamp_ns,
+        }
+    }
+
+    /// Request cancellation without racing a placement that is still awaiting
+    /// its first exchange result. Active orders emit immediately; Submitted
+    /// orders retain a cancel intent until ACK/partial-fill/place-timeout.
+    fn request_cancel(&mut self, client_order_id: &str, timestamp_ns: u64) -> Option<Signal> {
+        let status = self.orders.get(client_order_id).map(|o| o.status)?;
+        match status {
+            LocalOrderStatus::Submitted => {
+                if self.cancel_intents.insert(client_order_id.to_string()) {
+                    log::debug!(
+                        "[OrderManager] {} cancel-intent parked for Submitted coid={} (waiting for place ACK)",
+                        self.symbol, client_order_id,
+                    );
+                }
+                None
+            }
+            LocalOrderStatus::Active => {
+                self.cancel_intents.remove(client_order_id);
+                if let Some(order) = self.orders.get_mut(client_order_id) {
+                    order.status = LocalOrderStatus::Cancelling;
+                }
+                Some(self.cancel_signal(client_order_id, timestamp_ns))
+            }
+            LocalOrderStatus::Cancelling
+            | LocalOrderStatus::Rejected
+            | LocalOrderStatus::Cancelled => None,
+        }
+    }
+
+    /// Flush a parked cancel intent after the placement request can no longer
+    /// be overtaken by a normal ACK. Accepted/PartiallyFilled are authoritative
+    /// evidence that the order exists; NewOrderTimeout is still unknown, so we
+    /// send the cancel defensively and let the orphan lifecycle retain locks.
+    fn flush_cancel_intent(&mut self, update: &OrderUpdate) -> Option<Signal> {
+        if !matches!(
+            update.status,
+            OrderStatus::Accepted
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::NewOrderTimeout
+        ) || !self.cancel_intents.remove(&update.client_order_id)
+        {
+            return None;
+        }
         let Some(order) = self.orders.get_mut(&update.client_order_id) else {
-            return;
+            return None;
+        };
+        order.status = LocalOrderStatus::Cancelling;
+        log::info!(
+            "[OrderManager] {} cancel-intent released coid={} after {:?}",
+            self.symbol, update.client_order_id, update.status,
+        );
+        Some(self.cancel_signal(&update.client_order_id, update.timestamp_ns))
+    }
+
+    /// Whether `coid` has a cancel parked behind its placement ACK.
+    pub fn has_cancel_intent(&self, coid: &str) -> bool {
+        self.cancel_intents.contains(coid)
+    }
+
+    /// Update local order state from an exchange OrderUpdate. Returns a
+    /// deferred `CancelOrder` when this update releases a cancel intent.
+    pub fn on_order_update(&mut self, update: &OrderUpdate) -> Option<Signal> {
+        let Some(order) = self.orders.get_mut(&update.client_order_id) else {
+            self.cancel_intents.remove(&update.client_order_id);
+            return None;
         };
         match update.status {
             OrderStatus::Accepted => {
@@ -339,6 +416,7 @@ impl OrderManager {
                         cumulative.max(update.filled_quantity), order.quantity, tolerance,
                     );
                     self.orders.remove(&update.client_order_id);
+                    self.cancel_intents.remove(&update.client_order_id);
                 }
             }
             OrderStatus::Rejected => {
@@ -352,6 +430,7 @@ impl OrderManager {
                     self.symbol, update.client_order_id, order.side
                 );
                 order.status = LocalOrderStatus::Rejected;
+                self.cancel_intents.remove(&update.client_order_id);
             }
             OrderStatus::Filled => {
                 // Terminal & done — a Filled order never receives a later
@@ -361,6 +440,7 @@ impl OrderManager {
                     self.symbol, update.client_order_id, order.side
                 );
                 self.orders.remove(&update.client_order_id);
+                self.cancel_intents.remove(&update.client_order_id);
             }
             OrderStatus::Cancelled => {
                 // Do NOT remove — keep as `Cancelled` so a late `Accepted`
@@ -372,9 +452,11 @@ impl OrderManager {
                     self.symbol, update.client_order_id, order.side
                 );
                 order.status = LocalOrderStatus::Cancelled;
+                self.cancel_intents.remove(&update.client_order_id);
             }
             _ => {}
         }
+        self.flush_cancel_intent(update)
     }
 
     /// Reconcile local state after the executor DROPPED a signal for `coid`
@@ -403,6 +485,7 @@ impl OrderManager {
         match self.orders.get_mut(coid) {
             Some(o) if o.status == LocalOrderStatus::Submitted => {
                 self.orders.remove(coid);
+                self.cancel_intents.remove(coid);
                 DroppedSignalOutcome::PlaceRemoved
             }
             Some(o) if o.status == LocalOrderStatus::Cancelling => {
@@ -442,12 +525,10 @@ impl OrderManager {
         self.orders.keys().cloned().collect()
     }
 
-    /// Emit Cancel signals for every Submitted/Active order on `side`,
-    /// marking each locally as `Cancelling` so the next `refresh()` won't
-    /// try to reconcile them again. Used by the hard-position-cap enforcer
-    /// in the strategy: when a fill pushes |net| past the intended cap,
-    /// we yank the entire "adding" side from the book in one pass so no
-    /// further passive fill can drive inventory deeper.
+    /// Request cancellation for every Submitted/Active order on `side`.
+    /// Active orders emit immediately and become `Cancelling`; Submitted
+    /// orders park a cancel intent until their first exchange result, avoiding
+    /// DELETE overtaking POST. Used by the hard-position-cap enforcer.
     pub fn cancel_orders_by_side(&mut self, side: Side, ts_event: u64) -> Vec<Signal> {
         let coids: Vec<String> = self.orders.values()
             .filter(|o| o.side == side
@@ -456,15 +537,9 @@ impl OrderManager {
             .collect();
         let mut signals = Vec::with_capacity(coids.len());
         for coid in coids {
-            if let Some(o) = self.orders.get_mut(&coid) {
-                o.status = LocalOrderStatus::Cancelling;
+            if let Some(signal) = self.request_cancel(&coid, ts_event) {
+                signals.push(signal);
             }
-            signals.push(Signal::CancelOrder {
-                exchange: self.exchange,
-                client_order_id: coid,
-                instance_id: self.instance_id.clone(),
-                timestamp_ns: ts_event,
-            });
         }
         signals
     }
@@ -573,15 +648,36 @@ impl OrderManager {
 
     /// Apply reconcile decisions to OM state, emitting the matching signals.
     /// `Place` assigns a fresh monotonic coid, inserts a `Submitted` local
-    /// order, and emits `NewOrder`; `Cancel` emits `CancelOrder` and marks the
-    /// order `Cancelling` (still resting until the exchange confirms). Order is
-    /// preserved (places in decision order, then cancels) so coid assignment +
-    /// signal sequencing match the legacy `reconcile_side`.
+    /// order, and emits `NewOrder`; `Cancel` emits immediately for Active or
+    /// records an intent for Submitted. When a decision would replace a still-
+    /// Submitted order on the same side, the new place is deferred as well —
+    /// the next quote can place it after ACK → intent cancel has started.
     pub fn apply_reconcile(&mut self, actions: Vec<ReconcileAction>, ts_event: u64) -> Vec<Signal> {
+        let defer_buy_place = actions.iter().any(|action| match action {
+            ReconcileAction::Cancel { client_order_id } => self.orders
+                .get(client_order_id)
+                .is_some_and(|o| o.side == Side::Buy && o.status == LocalOrderStatus::Submitted),
+            _ => false,
+        });
+        let defer_sell_place = actions.iter().any(|action| match action {
+            ReconcileAction::Cancel { client_order_id } => self.orders
+                .get(client_order_id)
+                .is_some_and(|o| o.side == Side::Sell && o.status == LocalOrderStatus::Submitted),
+            _ => false,
+        });
         let mut signals = Vec::with_capacity(actions.len());
         for action in actions {
             match action {
                 ReconcileAction::Place { side, price, quantity, order_type, post_only } => {
+                    if (side == Side::Buy && defer_buy_place)
+                        || (side == Side::Sell && defer_sell_place)
+                    {
+                        log::debug!(
+                            "[OrderManager] {} defer new {} @ {:.4}: same-side Submitted cancel-intent awaiting ACK",
+                            self.symbol, side, price,
+                        );
+                        continue;
+                    }
                     let client_order_id = self.next_id();
                     log::debug!(
                         "[OrderManager] {} new {} {} @ {:.4} qty={}",
@@ -620,14 +716,8 @@ impl OrderManager {
                             self.symbol, client_order_id, o.side, o.price,
                         );
                     }
-                    signals.push(Signal::CancelOrder {
-                        exchange: self.exchange,
-                        client_order_id: client_order_id.clone(),
-                        instance_id: self.instance_id.clone(),
-                        timestamp_ns: ts_event,
-                    });
-                    if let Some(o) = self.orders.get_mut(&client_order_id) {
-                        o.status = LocalOrderStatus::Cancelling;
+                    if let Some(signal) = self.request_cancel(&client_order_id, ts_event) {
+                        signals.push(signal);
                     }
                 }
             }
@@ -714,7 +804,7 @@ mod tests {
         assert_eq!(m.live_count(Side::Buy), 2, "Cancelling old + Submitted new = 2");
         // A Cancelled update on b excludes it from live_count → back to 1
         // (b is now KEPT as Cancelled but filtered out of live/active queries).
-        m.on_order_update(&upd("b", Side::Buy, OrderStatus::Cancelled));
+        let _ = m.on_order_update(&upd("b", Side::Buy, OrderStatus::Cancelled));
         assert_eq!(m.live_count(Side::Buy), 1, "Cancelled excludes b → live back to 1");
     }
 
@@ -729,12 +819,12 @@ mod tests {
         assert_eq!(m.live_count(Side::Buy), 1);
         assert!((m.locked_buy_cost() - 2.0).abs() < 1e-9);
 
-        m.on_order_update(&upd("x", Side::Buy, OrderStatus::CancelOrderTimeout));
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::CancelOrderTimeout));
         assert_eq!(m.live_count(Side::Buy), 1, "uncertain cancel remains live");
         assert!((m.locked_buy_cost() - 2.0).abs() < 1e-9,
             "uncertain cancel keeps worst-case cash locked");
 
-        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
         assert_eq!(m.live_count(Side::Buy), 0, "authoritative cancel releases slot");
         assert_eq!(m.locked_buy_cost(), 0.0, "authoritative cancel releases lock");
     }
@@ -751,12 +841,12 @@ mod tests {
         assert_eq!(m.live_count(Side::Buy), 1);
         assert_eq!(m.open_count(), 1);
         // Cancelled: kept in map but excluded from live/active.
-        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
         assert_eq!(m.live_count(Side::Buy), 0, "Cancelled excluded from live_count");
         assert!(m.active_bid().is_none(), "Cancelled excluded from active_bid");
         assert_eq!(m.open_count(), 1, "but KEPT in the map for resurrection");
         // Late Accepted resurrects → Active, retaining original price/qty.
-        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Accepted));
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Accepted));
         assert_eq!(m.live_count(Side::Buy), 1, "Accepted resurrects Cancelled → Active");
         let bid = m.active_bid().expect("resurrected as the active bid");
         assert_eq!(bid.client_order_id, "x");
@@ -771,8 +861,74 @@ mod tests {
     fn filled_is_removed_not_kept() {
         let mut m = om();
         m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
-        m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
         assert_eq!(m.open_count(), 0, "Filled is removed");
+    }
+
+    #[test]
+    fn cancel_before_ack_parks_intent_and_defers_same_side_replacement() {
+        let mut m = om();
+        let coid = place(&mut m, Side::Buy, 0.40, 5.0);
+
+        // Normal reprice decision order is Place then Cancel. Because the old
+        // order is still Submitted, neither DELETE nor the replacement may be
+        // sent before its ACK.
+        let signals = m.apply_reconcile(vec![
+            ReconcileAction::Place {
+                side: Side::Buy,
+                price: 0.42,
+                quantity: 5.0,
+                order_type: OrderType::Limit,
+                post_only: true,
+            },
+            ReconcileAction::Cancel { client_order_id: coid.clone() },
+        ], 2);
+        assert!(signals.is_empty(), "place and cancel both wait for the ACK");
+        assert!(m.has_cancel_intent(&coid));
+        assert_eq!(m.orders.len(), 1, "replacement was not stacked pre-ACK");
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Submitted);
+
+        let signal = m.on_order_update(&upd(&coid, Side::Buy, OrderStatus::Accepted))
+            .expect("Accepted releases the deferred cancel");
+        assert!(matches!(signal, Signal::CancelOrder { ref client_order_id, .. } if client_order_id == &coid));
+        assert!(!m.has_cancel_intent(&coid));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Cancelling);
+    }
+
+    #[test]
+    fn cancel_intent_flushes_after_place_timeout_with_locks_held() {
+        let mut m = om();
+        let coid = place(&mut m, Side::Sell, 0.60, 5.0);
+        let signals = m.apply_reconcile(
+            vec![ReconcileAction::Cancel { client_order_id: coid.clone() }],
+            2,
+        );
+        assert!(signals.is_empty());
+        assert!(m.has_cancel_intent(&coid));
+
+        let signal = m.on_order_update(&upd(&coid, Side::Sell, OrderStatus::NewOrderTimeout))
+            .expect("unknown placement still needs a defensive cancel");
+        assert!(matches!(signal, Signal::CancelOrder { .. }));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Cancelling);
+        assert_eq!(m.live_count(Side::Sell), 1);
+        assert!((m.locked_sell_qty() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn terminal_place_result_clears_cancel_intent_without_delete() {
+        let mut m = om();
+        let coid = place(&mut m, Side::Buy, 0.40, 5.0);
+        let signals = m.apply_reconcile(
+            vec![ReconcileAction::Cancel { client_order_id: coid.clone() }],
+            2,
+        );
+        assert!(signals.is_empty());
+        assert!(m.has_cancel_intent(&coid));
+
+        let signal = m.on_order_update(&upd(&coid, Side::Buy, OrderStatus::Rejected));
+        assert!(signal.is_none(), "rejected placement never needs DELETE");
+        assert!(!m.has_cancel_intent(&coid));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Rejected);
     }
 
     // (The per-side reconcile policy tests — block_place / in-band keep /
