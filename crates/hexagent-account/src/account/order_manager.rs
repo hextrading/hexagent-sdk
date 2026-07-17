@@ -175,6 +175,9 @@ pub struct OrderManager {
     /// PartiallyFilled. A NewOrderTimeout also flushes the intent so an order
     /// that may have landed is still pulled and handed to orphan reconcile.
     cancel_intents: std::collections::BTreeSet<String>,
+    /// Monotonic per-manager telemetry counter. Incremented only when a fresh
+    /// cancel intent is parked behind a still-Submitted placement ACK.
+    cancel_before_ack_count: u64,
 }
 
 /// A desired quote level: price + quantity on a given side.
@@ -208,6 +211,7 @@ impl OrderManager {
             requote_min_ticks: 0.0,
             orders: std::collections::BTreeMap::new(),
             cancel_intents: std::collections::BTreeSet::new(),
+            cancel_before_ack_count: 0,
         }
     }
 
@@ -297,9 +301,10 @@ impl OrderManager {
         match status {
             LocalOrderStatus::Submitted => {
                 if self.cancel_intents.insert(client_order_id.to_string()) {
-                    log::debug!(
-                        "[OrderManager] {} cancel-intent parked for Submitted coid={} (waiting for place ACK)",
-                        self.symbol, client_order_id,
+                    self.cancel_before_ack_count = self.cancel_before_ack_count.saturating_add(1);
+                    log::info!(
+                        "[orphan_metric] cancel_before_ack=1 cancel_before_ack_total={} symbol={} coid={} state=Submitted",
+                        self.cancel_before_ack_count, self.symbol, client_order_id,
                     );
                 }
                 None
@@ -345,6 +350,11 @@ impl OrderManager {
     /// Whether `coid` has a cancel parked behind its placement ACK.
     pub fn has_cancel_intent(&self, coid: &str) -> bool {
         self.cancel_intents.contains(coid)
+    }
+
+    /// Per-manager count exposed for diagnostics and regression tests.
+    pub fn cancel_before_ack_count(&self) -> u64 {
+        self.cancel_before_ack_count
     }
 
     /// Update local order state from an exchange OrderUpdate. Returns a
@@ -885,6 +895,7 @@ mod tests {
         ], 2);
         assert!(signals.is_empty(), "place and cancel both wait for the ACK");
         assert!(m.has_cancel_intent(&coid));
+        assert_eq!(m.cancel_before_ack_count(), 1);
         assert_eq!(m.orders.len(), 1, "replacement was not stacked pre-ACK");
         assert_eq!(m.orders[&coid].status, LocalOrderStatus::Submitted);
 

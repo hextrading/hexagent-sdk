@@ -812,6 +812,11 @@ pub struct SharedState {
     /// This must never become an account-wide circuit breaker: one noisy
     /// order cannot delay terminal audits for every strategy sharing state.
     pub(crate) http_425_reconcile_backoff_until_ns: Mutex<HashMap<String, u64>>,
+    /// Structured safety telemetry counters. These are per SharedState
+    /// (account/instance route) and are emitted with every transition so the
+    /// live log can be aggregated without a separate metrics dependency.
+    pub(crate) http_425_circuit_entries_total: std::sync::atomic::AtomicU64,
+    pub(crate) get_live_delete_uncertain_total: std::sync::atomic::AtomicU64,
     /// Per-coid counter for `reconcile_orphans` placement queries that
     /// returned `not_found` from the server. Real Polymarket is
     /// eventually-consistent across CLOB shards: a brand-new order can
@@ -1000,8 +1005,15 @@ impl SharedState {
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
-        self.http_425_reconcile_backoff_until_ns
-            .lock().unwrap().remove(client_order_id);
+        let now = crate::types::now_ns();
+        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
+        if backoffs.remove(client_order_id).is_some() {
+            let active_count = backoffs.values().filter(|deadline| **deadline > now).count();
+            info!(
+                "[orphan_metric] http_425_circuit_active={} http_425_active_coids={} coid_425_active=0 coid={} reason=terminal",
+                u8::from(active_count > 0), active_count, client_order_id,
+            );
+        }
     }
 
     fn check_rate_limit(&self) -> bool {
@@ -1140,22 +1152,51 @@ impl SharedState {
     /// in the shared account. Idempotent — only advances that coid's deadline.
     pub(crate) fn note_http_425_backoff(&self, coid: &str) {
         let now = crate::types::now_ns();
-        record_http_425_backoff(
-            &mut self.http_425_reconcile_backoff_until_ns.lock().unwrap(),
-            coid,
-            now,
-        );
+        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
+        let was_active = backoffs.get(coid).is_some_and(|deadline| *deadline > now);
+        record_http_425_backoff(&mut backoffs, coid, now);
+        let active_count = backoffs.values().filter(|deadline| **deadline > now).count();
+        let total = if was_active {
+            self.http_425_circuit_entries_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.http_425_circuit_entries_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1)
+        };
+        if !was_active {
+            warn!(
+                "[orphan_metric] http_425_circuit_active=1 http_425_active_coids={} http_425_entries_total={} coid={}",
+                active_count, total, coid,
+            );
+        }
     }
 
     /// True iff this coid's 425 backoff is active. Expired entries are
     /// removed lazily; other coids never affect this decision.
     pub(crate) fn in_http_425_backoff(&self, coid: &str) -> bool {
         let now = crate::types::now_ns();
-        is_http_425_backoff_active(
-            &mut self.http_425_reconcile_backoff_until_ns.lock().unwrap(),
-            coid,
-            now,
-        )
+        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
+        let existed = backoffs.contains_key(coid);
+        let active = is_http_425_backoff_active(&mut backoffs, coid, now);
+        if existed && !active {
+            let active_count = backoffs.values().filter(|deadline| **deadline > now).count();
+            info!(
+                "[orphan_metric] http_425_circuit_active={} http_425_active_coids={} coid_425_active=0 coid={}",
+                u8::from(active_count > 0), active_count, coid,
+            );
+        }
+        active
+    }
+
+    fn note_get_live_delete_uncertain(&self, coid: &str, order_id: &str) {
+        let total = self.get_live_delete_uncertain_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        warn!(
+            "[orphan_metric] GET_LIVE_DELETE_UNCERTAIN=1 GET_LIVE_DELETE_UNCERTAIN_total={} coid={} orderID={} lock_release=forbidden",
+            total, coid, order_id,
+        );
     }
 
     /// Dispatch an HTTP request onto the shared async runtime. Returns a
@@ -1676,6 +1717,8 @@ impl PolymarketTrade {
                 invalid_token_backoff: Mutex::new(HashMap::new()),
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
+                http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
+                get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
                 reconcile_not_found_attempts: Mutex::new(HashMap::new()),
                 reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
@@ -2668,6 +2711,9 @@ impl PolymarketTrade {
                     match self.delete_detailed("/order", &body) {
                         Ok(resp) => {
                             let outcome = cancel_delete_response_outcome(&resp, order_id);
+                            if outcome == CancelReasonOutcome::Uncertain {
+                                self.shared.note_get_live_delete_uncertain(coid, order_id);
+                            }
                             let status = match outcome {
                                 CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                                 CancelReasonOutcome::Filled => OrderStatus::Filled,
@@ -4540,6 +4586,21 @@ mod tests {
     /// collateral before the delayed fill push arrives.
     #[test]
     fn reconcile_delete_uncertain_remains_cancel_orphan() {
+        let oid = "0xlive";
+        let outcome = cancel_delete_response_outcome(
+            &serde_json::json!({
+                "canceled": [],
+                "not_canceled": {(oid): "order can't be found - already canceled or matched"}
+            }),
+            oid,
+        );
+        assert_eq!(outcome, CancelReasonOutcome::Uncertain);
+        let emitted = match outcome {
+            CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+            CancelReasonOutcome::Filled => OrderStatus::Filled,
+            CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+        };
+        assert_eq!(emitted, OrderStatus::CancelOrderTimeout);
         assert_eq!(
             cancel_reason_order_status("order can't be found - already canceled or matched"),
             OrderStatus::CancelOrderTimeout,
