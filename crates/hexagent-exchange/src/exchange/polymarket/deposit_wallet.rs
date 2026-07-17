@@ -96,6 +96,7 @@ const EXCHANGE_V2: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 /// Splitting pUSD directly on the CTF mints pUSD-space tokens the CLOB can't
 /// sell (`balance: 0`). See `hexbot token_check`.
 const CTF_COLLATERAL_ADAPTER: &str = "0xAdA100Db00Ca00073811820692005400218FcE1f";
+const USDC_TOKEN: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"; // native USDC (6dp)
 const USDCE_TOKEN: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC.e (6dp)
 /// Official AutoRedeemer (proxy; docs.polymarket.com/resources/contracts).
 /// Granting it `setApprovalForAll` on the CTF is the on-chain opt-in for
@@ -103,8 +104,8 @@ const USDCE_TOKEN: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC.
 /// conditionIds)` and the payout goes to the position owner. (The UI
 /// "Auto redeem your wins" toggle grants this same approval.)
 const AUTO_REDEEMER: &str = "0xa1200000d0002264C9a1698e001292D00E1b00af";
-const ONRAMP: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee"; // Collateral Onramp (USDC.e→pUSD)
-const OFFRAMP: &str = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"; // Collateral Offramp (pUSD→USDC.e)
+const ONRAMP: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee"; // USDC/USDC.e → pUSD
+const OFFRAMP: &str = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"; // pUSD → USDC/USDC.e
 const WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38]; // wrap(address,address,uint256)
 const UNWRAP_SELECTOR: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f]; // unwrap(address,address,uint256)
 const APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
@@ -282,8 +283,9 @@ fn split_position_calldata(collateral: &str, condition_id: &str, amount_wei: u12
     format!("0x{}", hex::encode(d))
 }
 
-/// `Onramp.wrap(asset, to, amount)` — burns `asset` (USDC.e), mints pUSD
-/// to `to`. Same ABI as `migrate_usdc::build_wrap_calldata`.
+/// `Onramp.wrap(asset, to, amount)` — deposits a supported backing asset
+/// (USDC or USDC.e) and mints pUSD to `to`. Same ABI as
+/// `migrate_usdc::build_wrap_calldata`.
 fn onramp_wrap_calldata(asset: &str, to: &str, amount_wei: u128) -> String {
     let mut d = Vec::with_capacity(4 + 96);
     d.extend_from_slice(&WRAP_SELECTOR);
@@ -481,33 +483,33 @@ pub(crate) fn dw_approvals(
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
 }
 
-/// Wrap `amount_wei` of the DW's USDC.e → pUSD (approve Onramp + wrap) in
-/// one WALLET batch.
+/// Wrap `amount_wei` of a supported backing `asset` (USDC or USDC.e) into
+/// pUSD (approve Onramp + wrap) in one WALLET batch.
 pub(crate) fn dw_onramp(
-    key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth, amount_wei: u128, dry_run: bool,
+    key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
+    asset: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
+    debug_assert!(asset.eq_ignore_ascii_case(USDC_TOKEN) || asset.eq_ignore_ascii_case(USDCE_TOKEN));
     let calls = vec![
-        Call { target: USDCE_TOKEN.to_string(), data: approve_calldata(ONRAMP) },
-        Call { target: ONRAMP.to_string(), data: onramp_wrap_calldata(USDCE_TOKEN, dw, amount_wei) },
+        Call { target: asset.to_string(), data: approve_calldata(ONRAMP) },
+        Call { target: ONRAMP.to_string(), data: onramp_wrap_calldata(asset, dw, amount_wei) },
     ];
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
 }
 
-/// Withdraw the DW's pUSD as USDC.e: in ONE WALLET batch — approve
-/// pUSD→Offramp, unwrap `amount_wei` pUSD → USDC.e (into the DW), then
-/// transfer that USDC.e to `recipient`. The deposit-wallet analogue of
-/// `wallet.rs::run_withdraw_pusd_to_usdce` (Safe path), but atomic: all
-/// three calls run sequentially in a single relayer tx. pUSD↔USDC.e is 1:1
-/// (both 6-decimal), so `amount_wei` is the pUSD burned == USDC.e sent. The
-/// approve is unconditional (idempotent ∞-approval, same as `dw_onramp`).
+/// Withdraw the DW's pUSD as a supported backing `asset` (USDC or USDC.e)
+/// in one WALLET batch: approve pUSD→Offramp, unwrap into the DW, then
+/// transfer the underlying to `recipient`. All supported assets are 1:1
+/// with pUSD and use 6 decimals. The approve is unconditional and idempotent.
 pub(crate) fn dw_offramp_withdraw(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
-    recipient: &str, amount_wei: u128, dry_run: bool,
+    asset: &str, recipient: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
+    debug_assert!(asset.eq_ignore_ascii_case(USDC_TOKEN) || asset.eq_ignore_ascii_case(USDCE_TOKEN));
     let calls = vec![
         Call { target: PUSD_TOKEN.to_string(), data: approve_calldata(OFFRAMP) },
-        Call { target: OFFRAMP.to_string(), data: offramp_unwrap_calldata(USDCE_TOKEN, dw, amount_wei) },
-        Call { target: USDCE_TOKEN.to_string(), data: erc20_transfer_calldata(recipient, amount_wei) },
+        Call { target: OFFRAMP.to_string(), data: offramp_unwrap_calldata(asset, dw, amount_wei) },
+        Call { target: asset.to_string(), data: erc20_transfer_calldata(recipient, amount_wei) },
     ];
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
 }

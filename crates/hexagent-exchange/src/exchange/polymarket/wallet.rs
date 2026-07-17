@@ -1,4 +1,4 @@
-//! CLI commands for Polymarket wallet management: deposit info and USDC withdrawal.
+//! CLI commands for Polymarket wallet management: deposit info and stablecoin withdrawal.
 
 use std::io::Write;
 
@@ -11,12 +11,15 @@ use super::deploy_wallet::{
 };
 use super::signer::{derive_eth_address_from_key, parse_signature_type, SignatureType};
 
-const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// Native Circle USDC on Polygon PoS.
+const USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
+/// Bridged USDC.e, the legacy Polymarket v1 collateral.
+const USDCE_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 /// Polymarket USD (pUSD) — the v2 collateral token. 6 decimals, same
-/// scale as USDC.e. See `migrate_usdc.rs` for how USDC.e converts.
+/// scale as USDC/USDC.e. See `migrate_usdc.rs` for wrapping either asset.
 const PUSD_ADDRESS: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
-/// CollateralOfframp — unwraps pUSD back into USDC.e (the reverse of the
-/// CollateralOnramp's `wrap`; see migrate_usdc.rs). Polygon mainnet, from
+/// CollateralOfframp — unwraps pUSD back into USDC or USDC.e (the reverse
+/// of the CollateralOnramp's `wrap`; see migrate_usdc.rs). Polygon mainnet, from
 /// the Polymarket v2 docs (docs.polymarket.com/resources/contracts).
 const OFFRAMP_ADDRESS: &str = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854";
 const RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
@@ -475,8 +478,8 @@ pub(crate) fn load_wallet_for_account(account_id: &str) -> Result<WalletInfo> {
 const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 
 /// Fetch USDC.e balance directly from chain via eth_call (not Polymarket Data API).
-fn fetch_usdc_balance(safe_address: &str) -> f64 {
-    fetch_erc20_balance_6dec(USDC_ADDRESS, safe_address)
+fn fetch_usdce_balance(safe_address: &str) -> f64 {
+    fetch_erc20_balance_6dec(USDCE_ADDRESS, safe_address)
 }
 
 /// Fetch pUSD (v2 collateral) balance via eth_call.
@@ -490,13 +493,13 @@ fn fetch_pusd_balance(safe_address: &str) -> f64 {
 /// trades). Returns `(pusd, usdce)` for any downstream net-worth math.
 fn print_stablecoin_balances(safe_address: &str) -> (f64, f64) {
     let pusd = fetch_pusd_balance(safe_address);
-    let usdce = fetch_usdc_balance(safe_address);
+    let usdce = fetch_usdce_balance(safe_address);
     println!("{:<6} balance: {:>12.6}   (v2 collateral — used for trading)", "pUSD", pusd);
     if usdce.abs() < 0.000001 {
         println!("{:<6} balance: {:>12.6}", "USDC.e", usdce);
     } else {
         println!(
-            "{:<6} balance: {:>12.6}   ⚠ run `hexbot migrate_usdc all` to convert to v2 pUSD",
+            "{:<6} balance: {:>12.6}   ⚠ run `hexbot migrate_usdce all` to convert to v2 pUSD",
             "USDC.e", usdce,
         );
     }
@@ -577,7 +580,7 @@ pub fn run_deposit() -> Result<()> {
     println!();
     println!("To deposit, send USDC.e (Polygon network) to:");
     println!("  {}", primary);
-    println!("Then run `hexbot migrate_usdc all` to convert USDC.e → v2 pUSD for trading.");
+    println!("Then run `hexbot migrate_usdce all` to convert USDC.e → v2 pUSD for trading.");
 
     Ok(())
 }
@@ -606,9 +609,9 @@ pub fn run_withdraw() -> Result<()> {
     }
 
     // Fetch balances. pUSD is the v2 collateral (what the bot trades and
-    // what `migrate_usdc`/wrap produces); USDC.e is the legacy v1 stable.
+    // what `migrate_usdc[e]`/wrap produces); USDC.e is the legacy v1 stable.
     let pusd_balance = fetch_pusd_balance(&wallet.safe_address);
-    let usdc_balance = fetch_usdc_balance(&wallet.safe_address);
+    let usdc_balance = fetch_usdce_balance(&wallet.safe_address);
     let pol_balance = fetch_pol_balance(&wallet.safe_address).unwrap_or(0.0);
     println!("pUSD   balance: {:.6}   (v2 collateral)", pusd_balance);
     println!("USDC.e balance: {:.6}   (legacy v1)", usdc_balance);
@@ -617,10 +620,11 @@ pub fn run_withdraw() -> Result<()> {
     // Token choice
     println!();
     println!("Which token to withdraw?");
-    println!("  1) pUSD → USDC.e  (unwrap via Offramp, then withdraw USDC.e — gasless)");
-    println!("  2) pUSD           (withdraw pUSD as-is; recipient receives pUSD — gasless)");
-    println!("  3) USDC.e         (legacy v1 — gasless)");
-    println!("  4) POL            (native, on-chain — signer must have ~0.01 POL for gas)");
+    println!("  1) pUSD → USDC    (unwrap via Offramp, then withdraw native USDC — gasless)");
+    println!("  2) pUSD → USDC.e  (unwrap via Offramp, then withdraw bridged USDC.e — gasless)");
+    println!("  3) pUSD           (withdraw pUSD as-is; recipient receives pUSD — gasless)");
+    println!("  4) USDC.e         (legacy v1 — gasless)");
+    println!("  5) POL            (native, on-chain — signer must have ~0.01 POL for gas)");
     print!("> ");
     std::io::stdout().flush()?;
     let mut token_str = String::new();
@@ -628,32 +632,42 @@ pub fn run_withdraw() -> Result<()> {
     let token_choice = token_str.trim();
 
     match token_choice {
-        "1" => run_withdraw_pusd_to_usdce(&wallet, pusd_balance),
-        "2" | "pusd" | "pUSD" | "PUSD" => run_withdraw_erc20(&wallet, PUSD_ADDRESS, "pUSD", pusd_balance),
-        "3" | "usdc" | "USDC" => run_withdraw_erc20(&wallet, USDC_ADDRESS, "USDC.e", usdc_balance),
-        "4" | "pol"  | "POL"  => run_withdraw_pol(&wallet, pol_balance),
-        other => Err(anyhow!("Unknown token choice '{}'. Expected 1-4.", other)),
+        "1" | "pusd-usdc" => run_withdraw_pusd_to_asset(
+            &wallet, pusd_balance, USDC_ADDRESS, "USDC",
+        ),
+        "2" | "pusd-usdce" => run_withdraw_pusd_to_asset(
+            &wallet, pusd_balance, USDCE_ADDRESS, "USDC.e",
+        ),
+        "3" | "pusd" | "pUSD" | "PUSD" => {
+            run_withdraw_erc20(&wallet, PUSD_ADDRESS, "pUSD", pusd_balance)
+        }
+        "4" | "usdce" | "USDC.e" | "USDCE" => {
+            run_withdraw_erc20(&wallet, USDCE_ADDRESS, "USDC.e", usdc_balance)
+        }
+        "5" | "pol" | "POL" => run_withdraw_pol(&wallet, pol_balance),
+        other => Err(anyhow!("Unknown token choice '{}'. Expected 1-5.", other)),
     }
 }
 
 /// Withdraw FROM the deposit wallet via a WALLET batch (all gasless via the
-/// relayer). Supports pUSD + USDC.e direct ERC-20 transfers, and pUSD→USDC.e
-/// (Offramp-unwrap then withdraw the USDC.e — see `run_withdraw_dw_offramp`).
-/// POL withdraw remains Safe-only.
+/// relayer). Supports pUSD + USDC.e direct ERC-20 transfers and offramping
+/// pUSD to either native USDC or bridged USDC.e. POL withdraw remains
+/// Safe-only.
 fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     use std::io::Write;
     println!("=== Polymarket Withdraw (deposit wallet) ===");
     println!();
     println!("Deposit wallet: {}", dw);
     let pusd = fetch_pusd_balance(dw);
-    let usdce = fetch_usdc_balance(dw);
+    let usdce = fetch_usdce_balance(dw);
     println!("pUSD   balance: {:.6}   (v2 collateral)", pusd);
     println!("USDC.e balance: {:.6}   (legacy v1)", usdce);
     println!();
     println!("Which token to withdraw? (FROM the deposit wallet, gasless via relayer)");
     println!("  1) pUSD           (ERC-20 transfer as-is)");
     println!("  2) USDC.e         (ERC-20 transfer as-is)");
-    println!("  3) pUSD → USDC.e  (unwrap via Offramp, then withdraw USDC.e)");
+    println!("  3) pUSD → USDC    (unwrap via Offramp, then withdraw native USDC)");
+    println!("  4) pUSD → USDC.e  (unwrap via Offramp, then withdraw bridged USDC.e)");
     print!("> ");
     std::io::stdout().flush()?;
     let mut choice = String::new();
@@ -662,14 +676,17 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
 
     // Offramp path is a 3-call batch (approve + unwrap + transfer), not a
     // plain ERC-20 transfer — handle it separately.
-    if matches!(choice, "3" | "pusd-usdce" | "offramp") {
-        return run_withdraw_dw_offramp(wallet, dw, pusd);
+    if matches!(choice, "3" | "pusd-usdc") {
+        return run_withdraw_dw_offramp(wallet, dw, pusd, USDC_ADDRESS, "USDC");
+    }
+    if matches!(choice, "4" | "pusd-usdce" | "offramp") {
+        return run_withdraw_dw_offramp(wallet, dw, pusd, USDCE_ADDRESS, "USDC.e");
     }
 
     let (token, label, bal) = match choice {
         "1" | "pusd" | "pUSD" | "PUSD" => (PUSD_ADDRESS, "pUSD", pusd),
-        "2" | "usdc" | "USDC" => (USDC_ADDRESS, "USDC.e", usdce),
-        o => return Err(anyhow!("Unknown choice '{}'. Expected 1, 2, or 3.", o)),
+        "2" | "usdce" | "USDC.e" | "USDCE" => (USDCE_ADDRESS, "USDC.e", usdce),
+        o => return Err(anyhow!("Unknown choice '{}'. Expected 1-4.", o)),
     };
     if bal <= 0.0 {
         println!("No {} to withdraw.", label);
@@ -722,21 +739,25 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     Ok(())
 }
 
-/// Withdraw the deposit wallet's pUSD as USDC.e: unwrap via the Offramp,
-/// then send the USDC.e to a recipient — all in ONE gasless WALLET batch
-/// (pUSD.approve(Offramp,∞) + Offramp.unwrap(USDC.e,DW,amt) +
-/// USDC.e.transfer(recipient,amt)). The deposit-wallet analogue of
-/// `run_withdraw_pusd_to_usdce` (Safe path); pUSD↔USDC.e is 1:1 (6-decimal).
-fn run_withdraw_dw_offramp(wallet: &WalletInfo, dw: &str, pusd_balance: f64) -> Result<()> {
+/// Withdraw the deposit wallet's pUSD as a supported backing asset: unwrap
+/// via the Offramp, then transfer that asset to a recipient, atomically in
+/// one gasless WALLET batch. pUSD, USDC, and USDC.e are all 1:1, 6-decimal.
+fn run_withdraw_dw_offramp(
+    wallet: &WalletInfo,
+    dw: &str,
+    pusd_balance: f64,
+    underlying: &str,
+    underlying_label: &str,
+) -> Result<()> {
     use std::io::Write;
     if pusd_balance <= 0.0 {
         println!("No pUSD to withdraw.");
         return Ok(());
     }
 
-    // Recipient for the unwrapped USDC.e.
+    // Recipient for the unwrapped backing asset.
     println!();
-    println!("Enter recipient address (0x...) to receive USDC.e:");
+    println!("Enter recipient address (0x...) to receive {}:", underlying_label);
     print!("> ");
     std::io::stdout().flush()?;
     let mut recipient = String::new();
@@ -747,7 +768,7 @@ fn run_withdraw_dw_offramp(wallet: &WalletInfo, dw: &str, pusd_balance: f64) -> 
         return Err(anyhow!("recipient must be 0x + 40 hex chars, got '{}'", recipient));
     }
 
-    // Amount of pUSD to unwrap (== USDC.e received, 1:1).
+    // Amount of pUSD to unwrap (== backing asset received, 1:1).
     println!("Amount of pUSD to unwrap & withdraw (or 'all' for {:.6}):", pusd_balance);
     print!("> ");
     std::io::stdout().flush()?;
@@ -772,10 +793,10 @@ fn run_withdraw_dw_offramp(wallet: &WalletInfo, dw: &str, pusd_balance: f64) -> 
 
     // Plan + confirm.
     println!();
-    println!("Plan — unwrap {:.6} pUSD → USDC.e, then withdraw to {} (one WALLET batch):", amount, recipient);
+    println!("Plan — unwrap {:.6} pUSD → {}, then withdraw to {} (one WALLET batch):", amount, underlying_label, recipient);
     println!("  1. pUSD.approve(Offramp {}, ∞)", OFFRAMP_ADDRESS);
-    println!("  2. Offramp.unwrap(USDC.e, DW, {:.6})", amount);
-    println!("  3. USDC.e.transfer({}, {:.6})", recipient, amount);
+    println!("  2. Offramp.unwrap({}, DW, {:.6})", underlying_label, amount);
+    println!("  3. {}.transfer({}, {:.6})", underlying_label, recipient, amount);
     println!("  Gas: Polymarket relayer (gasless)");
     println!();
     println!("⚠  Money-op on the deposit wallet — Offramp-unwrap is unproven on the DW path; test a small amount first.");
@@ -789,15 +810,15 @@ fn run_withdraw_dw_offramp(wallet: &WalletInfo, dw: &str, pusd_balance: f64) -> 
 
     super::deposit_wallet::dw_offramp_withdraw(
         &wallet.signing_key, &wallet.signer_address, dw, &wallet.builder_auth,
-        &recipient, amount_wei, /*dry_run=*/ false,
+        underlying, &recipient, amount_wei, /*dry_run=*/ false,
     )?;
 
     println!();
-    println!("✅ Withdrawal complete — {:.6} USDC.e sent to {}", amount, recipient);
+    println!("✅ Withdrawal complete — {:.6} {} sent to {}", amount, underlying_label, recipient);
     let new_pusd = fetch_pusd_balance(dw);
-    let new_usdce = fetch_usdc_balance(dw);
+    let new_underlying = fetch_erc20_balance_6dec(underlying, dw);
     println!("  pUSD   balance: {:.6}  (deposit wallet)", new_pusd);
-    println!("  USDC.e balance: {:.6}  (deposit wallet)", new_usdce);
+    println!("  {:<6} balance: {:.6}  (deposit wallet)", underlying_label, new_underlying);
     Ok(())
 }
 
@@ -911,14 +932,18 @@ fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balanc
     Ok(())
 }
 
-/// Withdraw pUSD as USDC.e: unwrap pUSD → USDC.e via the CollateralOfframp,
-/// then send the USDC.e to `recipient`. The inverse of `migrate_usdc`'s
-/// wrap flow. Three gasless relayer txs, each awaited to confirmation
-/// before the next (Safe nonce ordering + step dependencies):
-///   1. pUSD.approve(Offramp, ∞)         — one-time; skipped if allowance ≥ amount
-///   2. Offramp.unwrap(USDC.e, Safe, amt) — burns pUSD, returns USDC.e to the Safe
-///   3. USDC.e.transfer(recipient, amt)   — standard withdraw (same path as USDC.e)
-fn run_withdraw_pusd_to_usdce(wallet: &WalletInfo, pusd_balance: f64) -> Result<()> {
+/// Withdraw pUSD as a supported backing asset via the CollateralOfframp,
+/// then send that asset to `recipient`. Three gasless relayer txs are each
+/// awaited before the next (Safe nonce ordering + step dependencies):
+///   1. pUSD.approve(Offramp, ∞)              — skipped if allowance is enough
+///   2. Offramp.unwrap(asset, Safe, amount)   — burns pUSD, returns the asset
+///   3. asset.transfer(recipient, amount)     — standard ERC-20 withdrawal
+fn run_withdraw_pusd_to_asset(
+    wallet: &WalletInfo,
+    pusd_balance: f64,
+    underlying: &str,
+    underlying_label: &str,
+) -> Result<()> {
     if pusd_balance <= 0.0 {
         println!("No pUSD to withdraw.");
         return Ok(());
@@ -926,7 +951,7 @@ fn run_withdraw_pusd_to_usdce(wallet: &WalletInfo, pusd_balance: f64) -> Result<
 
     // Recipient
     println!();
-    println!("Enter recipient address (0x...) to receive USDC.e:");
+    println!("Enter recipient address (0x...) to receive {}:", underlying_label);
     print!("> ");
     std::io::stdout().flush()?;
     let mut recipient = String::new();
@@ -936,7 +961,7 @@ fn run_withdraw_pusd_to_usdce(wallet: &WalletInfo, pusd_balance: f64) -> Result<
         return Err(anyhow!("Invalid address format. Expected 0x + 40 hex chars."));
     }
 
-    // Amount (pUSD and USDC.e are 1:1, both 6-decimal).
+    // Amount (pUSD and both backing assets are 1:1, all 6-decimal).
     println!("Enter amount of pUSD to unwrap & withdraw (e.g. 10.5):");
     print!("> ");
     std::io::stdout().flush()?;
@@ -958,14 +983,14 @@ fn run_withdraw_pusd_to_usdce(wallet: &WalletInfo, pusd_balance: f64) -> Result<
 
     // Plan + confirm.
     println!();
-    println!("Plan — unwrap {:.6} pUSD → USDC.e, then withdraw to {}:", amount, recipient);
+    println!("Plan — unwrap {:.6} pUSD → {}, then withdraw to {}:", amount, underlying_label, recipient);
     if needs_approve {
         println!("  1. pUSD.approve(Offramp {}, ∞)", OFFRAMP_ADDRESS);
     } else {
         println!("  1. (approve SKIPPED — pUSD→Offramp allowance already sufficient)");
     }
-    println!("  2. Offramp.unwrap(USDC.e, Safe, {:.6})", amount);
-    println!("  3. USDC.e.transfer({}, {:.6})", recipient, amount);
+    println!("  2. Offramp.unwrap({}, Safe, {:.6})", underlying_label, amount);
+    println!("  3. {}.transfer({}, {:.6})", underlying_label, recipient, amount);
     println!("  Gas: Polymarket relayer (gasless)");
     println!("Confirm? (y/n):");
     print!("> ");
@@ -987,22 +1012,22 @@ fn run_withdraw_pusd_to_usdce(wallet: &WalletInfo, pusd_balance: f64) -> Result<
         println!("  Step 1/3 approve — SKIPPED (allowance already sufficient)");
     }
 
-    // Step 2: unwrap pUSD → USDC.e into the Safe.
-    let unwrap_calldata = build_unwrap_calldata(USDC_ADDRESS, &wallet.safe_address, amount_wei);
+    // Step 2: unwrap pUSD into the selected backing asset in the Safe.
+    let unwrap_calldata = build_unwrap_calldata(underlying, &wallet.safe_address, amount_wei);
     relayer_submit_and_confirm(wallet, OFFRAMP_ADDRESS, &unwrap_calldata,
-        "Step 2/3 unwrap pUSD→USDC.e")?;
+        &format!("Step 2/3 unwrap pUSD→{}", underlying_label))?;
 
-    // Step 3: send the unwrapped USDC.e to the recipient.
+    // Step 3: send the unwrapped asset to the recipient.
     let transfer_calldata = build_transfer_calldata(&recipient, amount_wei);
-    relayer_submit_and_confirm(wallet, USDC_ADDRESS, &transfer_calldata,
-        "Step 3/3 withdraw USDC.e → recipient")?;
+    relayer_submit_and_confirm(wallet, underlying, &transfer_calldata,
+        &format!("Step 3/3 withdraw {} → recipient", underlying_label))?;
 
     println!();
-    println!("Withdrawal complete — {:.6} USDC.e sent to {}", amount, recipient);
+    println!("Withdrawal complete — {:.6} {} sent to {}", amount, underlying_label, recipient);
     let new_pusd = fetch_pusd_balance(&wallet.safe_address);
-    let new_usdce = fetch_usdc_balance(&wallet.safe_address);
+    let new_underlying = fetch_erc20_balance_6dec(underlying, &wallet.safe_address);
     println!("  pUSD   balance: {:.6}  (Safe)", new_pusd);
-    println!("  USDC.e balance: {:.6}  (Safe)", new_usdce);
+    println!("  {:<6} balance: {:.6}  (Safe)", underlying_label, new_underlying);
     Ok(())
 }
 
@@ -1036,7 +1061,7 @@ fn build_approve_calldata(spender: &str, amount_bytes: &[u8; 32]) -> String {
 }
 
 /// ABI-encode `unwrap(address asset, address to, uint256 amount)` for the
-/// CollateralOfframp. `asset` is the underlying to receive (USDC.e), `to`
+/// CollateralOfframp. `asset` is the underlying to receive (USDC/USDC.e), `to`
 /// the recipient of that underlying, `amount` the pUSD to burn (6-dec).
 fn build_unwrap_calldata(asset: &str, to: &str, amount_wei: u128) -> String {
     let mut buf = Vec::with_capacity(4 + 96);
@@ -1453,7 +1478,7 @@ pub(crate) fn ctf_target(is_v2: bool, neg_risk: bool) -> (&'static str, &'static
         let target = if neg_risk { NEG_RISK_CTF_COLLATERAL_ADAPTER_V2 } else { CTF_COLLATERAL_ADAPTER_V2 };
         (target, PUSD_ADDRESS)
     } else {
-        (CTF_CONTRACT, USDC_ADDRESS)
+        (CTF_CONTRACT, USDCE_ADDRESS)
     }
 }
 // redeemPositions(address,bytes32,bytes32,uint256[]) selector
@@ -1579,7 +1604,7 @@ pub fn ctf_event_outcome_balances(
     // (v2 mints them via the CtfCollateralAdapter); pUSD is only the cash leg,
     // so the position id-space is always USDC.e.
     let _ = is_v2;
-    let collateral = USDC_ADDRESS;
+    let collateral = USDCE_ADDRESS;
     let up = ctf_position_id(condition_id, 1, collateral)
         .map(|pid| ctf_erc1155_balance(owner, &pid))
         .unwrap_or(0.0);
@@ -1820,7 +1845,7 @@ pub fn run_token_check() -> Result<()> {
     println!("=== Token-id check ===");
     println!("conditionId : {}", cid);
     println!("pUSD (v2)   : {}", PUSD_ADDRESS);
-    println!("USDC.e (v1) : {}", USDC_ADDRESS);
+    println!("USDC.e (v1) : {}", USDCE_ADDRESS);
     if !wallet.is_empty() { println!("wallet      : {}", wallet); }
     println!();
 
@@ -1836,7 +1861,7 @@ pub fn run_token_check() -> Result<()> {
         if provided_b.is_none() {
             println!("  (could not parse provided token_id as decimal uint256)");
         }
-        for (cname, collateral) in [("pUSD ", PUSD_ADDRESS), ("USDC.e", USDC_ADDRESS)] {
+        for (cname, collateral) in [("pUSD ", PUSD_ADDRESS), ("USDC.e", USDCE_ADDRESS)] {
             match ctf_position_id(&cid, index_set, collateral) {
                 Some(hex) => {
                     let derived_b = hex_to_bytes32(&hex);
@@ -2087,7 +2112,7 @@ pub fn run_redeem() -> Result<()> {
 
     // Show updated balance
     println!();
-    let new_balance = fetch_usdc_balance(&wallet.safe_address);
+    let new_balance = fetch_usdce_balance(&wallet.safe_address);
     println!("Updated USDC balance: {:.6}", new_balance);
 
     Ok(())
@@ -3586,7 +3611,7 @@ fn run_split_one(
     let balance = if is_v2 {
         fetch_pusd_balance(&wallet.safe_address)
     } else {
-        fetch_usdc_balance(&wallet.safe_address)
+        fetch_usdce_balance(&wallet.safe_address)
     };
     let token_name = if is_v2 { "pUSD" } else { "USDC.e" };
     // Two-tier guard:
@@ -4147,6 +4172,20 @@ mod maintenance_status_tests {
     use super::*;
 
     #[test]
+    fn offramp_calldata_routes_native_and_bridged_usdc() {
+        const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+        for underlying in [USDC_ADDRESS, USDCE_ADDRESS] {
+            let calldata = build_unwrap_calldata(underlying, RECIPIENT, 42_000_000);
+            let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
+            assert_eq!(&bytes[..4], &UNWRAP_SELECTOR);
+            assert_eq!(&bytes[4..36], &address_to_bytes32(underlying));
+            assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
+            assert_eq!(&bytes[68..100], &u256_bytes(42_000_000));
+        }
+        assert_ne!(USDC_ADDRESS, USDCE_ADDRESS);
+    }
+
+    #[test]
     fn produced_seed_inventory_only_on_succeeded() {
         assert!(MaintenanceStatus::Succeeded.produced_seed_inventory());
 
@@ -4207,4 +4246,3 @@ mod maintenance_status_tests {
         }
     }
 }
-

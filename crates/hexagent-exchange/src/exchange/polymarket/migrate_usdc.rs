@@ -1,11 +1,12 @@
-//! `hexbot migrate_usdc` — wrap USDC.e → pUSD in the operator's Gnosis
-//! Safe wallet, so the funds are ready for Polymarket CLOB v2 trading.
+//! `hexbot migrate_usdc[e]` — wrap USDC / USDC.e → pUSD in the
+//! operator's Polymarket wallet, ready for CLOB v2 trading.
 //!
 //! Post-cutover (2026-04-28) the v2 CLOB accepts **pUSD** as collateral,
 //! not USDC.e. This CLI bundles the two txs required to convert:
 //!
-//!   1. `USDC.e.approve(Onramp, amount)`
-//!   2. `Onramp.wrap(USDC.e, Safe, amount)` — burns USDC.e, mints pUSD.
+//!   1. `<asset>.approve(Onramp, amount)`
+//!   2. `Onramp.wrap(<asset>, wallet, amount)` — deposits the selected
+//!      backing asset and mints pUSD 1:1.
 //!
 //! Both txs execute as Safe `execTransaction` calls. The gas-payer is
 //! config-driven — same flag as `hexbot redeem` / `hexbot split` /
@@ -17,12 +18,13 @@
 //!   * `true`  → signer EOA broadcasts on-chain, POL gas paid from EOA.
 //!
 //! Usage:
-//!   hexbot migrate_usdc all           # wrap the entire USDC.e balance
-//!   hexbot migrate_usdc 100           # wrap exactly 100 USDC.e
-//!   hexbot migrate_usdc 100.5         # wrap 100.5 USDC.e (6-decimal rounded)
-//!   hexbot migrate_usdc --dry-run     # print plan without broadcasting
+//!   hexbot migrate_usdc all           # wrap native Polygon USDC
+//!   hexbot migrate_usdce 100          # wrap bridged USDC.e
+//!   hexbot migrate_usdc 100.5         # both assets use 6 decimals
+//!   hexbot migrate_usdc 100 --dry-run # print plan without broadcasting
 //!
 //! Contract addresses (Polygon mainnet, from Polymarket v2 docs):
+//!   USDC    : 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359 (6 decimals)
 //!   USDC.e  : 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174 (6 decimals)
 //!   pUSD    : 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB (6 decimals)
 //!   Onramp  : 0x93070a847efEf7F70739046A929D47a521F5B8ee
@@ -49,9 +51,28 @@ use super::wallet::{
 // Contract addresses (Polygon mainnet)
 // ════════════════════════════════════════════════════════════════
 
+const USDC_ADDR:   &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const USDCE_ADDR:  &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const PUSD_ADDR:   &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 const ONRAMP_ADDR: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MigrateAsset {
+    address: &'static str,
+    label: &'static str,
+    command: &'static str,
+}
+
+const USDC: MigrateAsset = MigrateAsset {
+    address: USDC_ADDR,
+    label: "USDC",
+    command: "migrate_usdc",
+};
+const USDCE: MigrateAsset = MigrateAsset {
+    address: USDCE_ADDR,
+    label: "USDC.e",
+    command: "migrate_usdce",
+};
 
 // ERC-20 `approve(address,uint256)` = keccak256("approve(address,uint256)")[:4]
 const APPROVE_SELECTOR:    [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
@@ -66,7 +87,7 @@ const WRAP_SELECTOR:       [u8; 4] = [0x62, 0x35, 0x56, 0x38];
 /// value; one-time cost saves the per-wrap approve tx forever.
 const U256_MAX_BYTES: [u8; 32] = [0xff; 32];
 
-/// 6-decimal token scale. Shared by USDC.e and pUSD.
+/// 6-decimal token scale. Shared by USDC, USDC.e, and pUSD.
 const USDC_SCALE: u128 = 1_000_000;
 
 /// Post-broadcast confirmation wait. Polygon confirms in 2-5 s under
@@ -76,6 +97,14 @@ const CONFIRM_TIMEOUT_SECS: u64 = 60;
 const CONFIRM_POLL_INTERVAL_SECS: u64 = 3;
 
 pub fn run_migrate_usdc() -> Result<()> {
+    run_migrate(USDC)
+}
+
+pub fn run_migrate_usdce() -> Result<()> {
+    run_migrate(USDCE)
+}
+
+fn run_migrate(asset: MigrateAsset) -> Result<()> {
     let args: Vec<String> = crate::exchange::polymarket::cli_account::cli_args().collect();
     let dry_run = args.iter().any(|a| a == "--dry-run" || a == "-n");
     // By default we approve `type(uint256).max` once and the next
@@ -88,21 +117,22 @@ pub fn run_migrate_usdc() -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!(
             "missing amount. Usage:\n\
-             \thexbot migrate_usdc <amount | all> [--dry-run] [--exact-approve]\n\
+             \thexbot {} <amount | all> [--dry-run] [--exact-approve]\n\
              Examples:\n\
-             \thexbot migrate_usdc all\n\
-             \thexbot migrate_usdc 100\n\
-             \thexbot migrate_usdc 100 --exact-approve   # no infinite approval\n\
-             \thexbot migrate_usdc 100.5 --dry-run"
+             \thexbot {} all\n\
+             \thexbot {} 100\n\
+             \thexbot {} 100 --exact-approve   # no infinite approval\n\
+             \thexbot {} 100.5 --dry-run",
+            asset.command, asset.command, asset.command, asset.command, asset.command,
         ))?;
 
-    // ── POLY_1271: wrap the deposit wallet's USDC.e → pUSD via WALLET
+    // ── POLY_1271: wrap the deposit wallet's selected asset → pUSD via WALLET
     //    batch (the Safe execTransaction path below doesn't apply). ──
     let sig_type_s = std::env::var("POLY_SIGNATURE_TYPE").unwrap_or_default().to_ascii_lowercase();
     if sig_type_s == "poly_1271" || sig_type_s == "deposit_wallet" {
         let wallet = super::wallet::load_wallet()?;
         let dw = super::deposit_wallet::resolve_deposit_wallet(&wallet.signer_address)?;
-        let bal_wei = erc20_balance_of(USDCE_ADDR, &dw).unwrap_or(0);
+        let bal_wei = erc20_balance_of(asset.address, &dw).unwrap_or(0);
         let bal_usdc = bal_wei as f64 / USDC_SCALE as f64;
         let amount_wei: u128 = if amount_arg.eq_ignore_ascii_case("all") {
             bal_wei
@@ -110,17 +140,18 @@ pub fn run_migrate_usdc() -> Result<()> {
             let a: f64 = amount_arg.parse().map_err(|_| anyhow!("bad amount '{}'", amount_arg))?;
             (a * USDC_SCALE as f64).round() as u128
         };
-        println!("── Deposit-wallet onramp: wrap USDC.e → pUSD ──");
-        println!("Deposit wallet: {}  (USDC.e balance: {:.6})", dw, bal_usdc);
-        println!("Wrapping:       {:.6} USDC.e", amount_wei as f64 / USDC_SCALE as f64);
+        println!("── Deposit-wallet onramp: wrap {} → pUSD ──", asset.label);
+        println!("Deposit wallet: {}  ({} balance: {:.6})", dw, asset.label, bal_usdc);
+        println!("Wrapping:       {:.6} {}", amount_wei as f64 / USDC_SCALE as f64, asset.label);
         if amount_wei == 0 {
-            return Err(anyhow!("nothing to wrap (amount=0 / DW USDC.e balance=0)"));
+            return Err(anyhow!("nothing to wrap (amount=0 / DW {} balance=0)", asset.label));
         }
         if amount_wei > bal_wei {
-            return Err(anyhow!("amount > DW USDC.e balance {:.6}", bal_usdc));
+            return Err(anyhow!("amount > DW {} balance {:.6}", asset.label, bal_usdc));
         }
         super::deposit_wallet::dw_onramp(
-            &wallet.signing_key, &wallet.signer_address, &dw, &wallet.builder_auth, amount_wei, dry_run,
+            &wallet.signing_key, &wallet.signer_address, &dw, &wallet.builder_auth,
+            asset.address, amount_wei, dry_run,
         )?;
         println!(
             "✅ onramp {} — the CLOB re-reads the deposit wallet's balance on the next order.",
@@ -138,19 +169,20 @@ pub fn run_migrate_usdc() -> Result<()> {
     let signer_address = wallet.signer_address().to_string();
     let safe_address   = wallet.safe_address().to_string();
     info!(
-        "[migrate_usdc] signer={} safe={} gas={}",
+        "[{}] signer={} safe={} gas={}",
+        asset.command,
         signer_address, safe_address,
         if gas_via_signer { "signer EOA (on-chain, POL)" } else { "relayer (gasless)" },
     );
 
-    // ── Query starting USDC.e balance (on the Safe) ─────────────
-    let balance_wei = erc20_balance_of(USDCE_ADDR, &safe_address)
-        .ok_or_else(|| anyhow!("Failed to read Safe USDC.e balance on-chain"))?;
+    // ── Query starting backing-asset balance (on the Safe) ──────
+    let balance_wei = erc20_balance_of(asset.address, &safe_address)
+        .ok_or_else(|| anyhow!("Failed to read Safe {} balance on-chain", asset.label))?;
     let balance_usdc = balance_wei as f64 / USDC_SCALE as f64;
     if balance_wei == 0 {
         return Err(anyhow!(
-            "Safe {} has 0 USDC.e. Deposit first: `hexbot deposit`",
-            safe_address,
+            "Safe {} has 0 {}. Fund that wallet on Polygon first.",
+            safe_address, asset.label,
         ));
     }
 
@@ -166,8 +198,8 @@ pub fn run_migrate_usdc() -> Result<()> {
         let wei = (amount_human * USDC_SCALE as f64).round() as u128;
         if wei > balance_wei {
             return Err(anyhow!(
-                "requested {:.6} USDC.e > Safe balance {:.6}",
-                amount_human, balance_usdc,
+                "requested {:.6} {} > Safe balance {:.6}",
+                amount_human, asset.label, balance_usdc,
             ));
         }
         wei
@@ -183,7 +215,7 @@ pub fn run_migrate_usdc() -> Result<()> {
     // ~$0.005 MATIC and a couple seconds of confirm-wait. Also
     // guarantees that after one `--unlimited` run (default), every
     // subsequent migration needs only the wrap tx.
-    let existing_allowance = erc20_allowance(USDCE_ADDR, &safe_address, ONRAMP_ADDR)
+    let existing_allowance = erc20_allowance(asset.address, &safe_address, ONRAMP_ADDR)
         .unwrap_or(0);
     let needs_approve = existing_allowance < amount_wei;
 
@@ -196,14 +228,14 @@ pub fn run_migrate_usdc() -> Result<()> {
     } else {
         "Polymarket relayer (gasless)"
     });
-    println!("USDC.e before : {:>12.6}  (Safe balance)", balance_usdc);
+    println!("{:<6} before : {:>12.6}  (Safe balance)", asset.label, balance_usdc);
     println!("pUSD   before : {:>12.6}  (Safe balance)", pusd_before);
     println!("Amount        : {:>12.6}  → pUSD (via Onramp)", amount_usdc);
-    println!("USDC.e after  : {:>12.6}  (projected)", balance_usdc - amount_usdc);
+    println!("{:<6} after  : {:>12.6}  (projected)", asset.label, balance_usdc - amount_usdc);
     println!("pUSD   after  : {:>12.6}  (projected)", pusd_before + amount_usdc);
     println!(
         "Allowance     : {} (Safe → Onramp, existing)",
-        format_allowance(existing_allowance),
+        format_allowance(existing_allowance, asset.label),
     );
     println!();
 
@@ -212,22 +244,22 @@ pub fn run_migrate_usdc() -> Result<()> {
         tx_count, if tx_count == 1 { "" } else { "s" });
     if needs_approve {
         if exact_approve {
-            println!("  1. USDC.e.approve(Onramp, {}) — precise approval", amount_wei);
-            println!("     to   = {}", USDCE_ADDR);
+            println!("  1. {}.approve(Onramp, {}) — precise approval", asset.label, amount_wei);
+            println!("     to   = {}", asset.address);
         } else {
-            println!("  1. USDC.e.approve(Onramp, type(uint256).max) — INFINITE approval");
-            println!("     to   = {}", USDCE_ADDR);
-            println!("     (one-time; future `migrate_usdc` skips this step)");
+            println!("  1. {}.approve(Onramp, type(uint256).max) — INFINITE approval", asset.label);
+            println!("     to   = {}", asset.address);
+            println!("     (one-time; future `{}` skips this step)", asset.command);
         }
         println!();
     } else {
         println!("  (approve SKIPPED — existing allowance is ≥ requested amount)");
         println!();
     }
-    println!("  {}. Onramp.wrap(USDC.e, Safe, {}) — mint pUSD to Safe",
-        if needs_approve { 2 } else { 1 }, amount_wei);
+    println!("  {}. Onramp.wrap({}, Safe, {}) — mint pUSD to Safe",
+        if needs_approve { 2 } else { 1 }, asset.label, amount_wei);
     println!("     to   = {}", ONRAMP_ADDR);
-    println!("     data = wrap({}, {}, {})", USDCE_ADDR, safe_address, amount_wei);
+    println!("     data = wrap({}, {}, {})", asset.address, safe_address, amount_wei);
     println!();
 
     if dry_run {
@@ -244,23 +276,23 @@ pub fn run_migrate_usdc() -> Result<()> {
         };
         let approve_data = build_approve_calldata(ONRAMP_ADDR, &approve_bytes);
         info!(
-            "[migrate_usdc] Step 1: approve {} tx broadcasting",
-            if exact_approve { "precise" } else { "unlimited" },
+            "[{}] Step 1: approve {} tx broadcasting",
+            asset.command, if exact_approve { "precise" } else { "unlimited" },
         );
-        let tx1 = wallet.submit_and_confirm(USDCE_ADDR, &approve_data)?;
+        let tx1 = wallet.submit_and_confirm(asset.address, &approve_data)?;
         println!("Step 1 approve tx: {}", tx1);
         println!("          ✅ confirmed");
         println!();
     } else {
         info!(
-            "[migrate_usdc] Skipping approve (existing allowance {} ≥ {})",
-            existing_allowance, amount_wei,
+            "[{}] Skipping approve (existing allowance {} ≥ {})",
+            asset.command, existing_allowance, amount_wei,
         );
     }
 
     // ── Step 2 (or 1 if approve skipped): wrap ──────────────────
-    let wrap_data = build_wrap_calldata(USDCE_ADDR, &safe_address, amount_wei);
-    info!("[migrate_usdc] Wrap tx broadcasting");
+    let wrap_data = build_wrap_calldata(asset.address, &safe_address, amount_wei);
+    info!("[{}] Wrap tx broadcasting", asset.command);
     let tx2 = wallet.submit_and_confirm(ONRAMP_ADDR, &wrap_data)?;
     let step_label = if needs_approve { "Step 2 wrap tx:" } else { "Step 1 wrap tx:" };
     println!("{:<18} {}", step_label, tx2);
@@ -268,14 +300,14 @@ pub fn run_migrate_usdc() -> Result<()> {
     println!();
 
     // ── Verify post-balances ────────────────────────────────────
-    let usdce_after_wei = erc20_balance_of(USDCE_ADDR, &safe_address).unwrap_or(0);
+    let asset_after_wei = erc20_balance_of(asset.address, &safe_address).unwrap_or(0);
     let pusd_after_wei  = erc20_balance_of(PUSD_ADDR,  &safe_address).unwrap_or(0);
-    let usdce_after = usdce_after_wei as f64 / USDC_SCALE as f64;
+    let asset_after = asset_after_wei as f64 / USDC_SCALE as f64;
     let pusd_after  = pusd_after_wei  as f64 / USDC_SCALE as f64;
     let pusd_delta  = pusd_after - pusd_before;
 
     println!("── Result ──────────────────────────────────────");
-    println!("USDC.e after  : {:>12.6}  (was {:.6}, Δ {:+.6})", usdce_after, balance_usdc, usdce_after - balance_usdc);
+    println!("{:<6} after  : {:>12.6}  (was {:.6}, Δ {:+.6})", asset.label, asset_after, balance_usdc, asset_after - balance_usdc);
     println!("pUSD   after  : {:>12.6}  (was {:.6}, Δ {:+.6})", pusd_after,  pusd_before,   pusd_delta);
     let expected = amount_usdc;
     if (pusd_delta - expected).abs() > 0.000001 {
@@ -404,7 +436,7 @@ impl MigrateWallet {
 /// Pretty-print a raw u128 allowance in 6-decimal USDC units. Renders
 /// `u128::MAX` as "∞ (unlimited)" since the ERC-20 "infinite approval"
 /// convention reads back as that value (or close to it).
-fn format_allowance(allow: u128) -> String {
+fn format_allowance(allow: u128, label: &str) -> String {
     if allow == u128::MAX {
         return "∞ (unlimited)".to_string();
     }
@@ -412,7 +444,7 @@ fn format_allowance(allow: u128) -> String {
     if allow > 1_000_000_000_000_000_u128 * USDC_SCALE {
         return format!("~∞ ({} raw wei)", allow);
     }
-    format!("{:.6} USDC.e", allow as f64 / USDC_SCALE as f64)
+    format!("{:.6} {}", allow as f64 / USDC_SCALE as f64, label)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -432,7 +464,7 @@ fn build_approve_calldata(spender: &str, amount_bytes: &[u8; 32]) -> String {
 }
 
 /// Read ERC-20 `allowance(owner, spender)`. Returns the raw u256
-/// low 128 bits (sufficient for any realistic USDC.e allowance —
+/// low 128 bits (sufficient for any realistic USDC/USDC.e allowance —
 /// anything > u128::MAX reads back clipped, which is fine because
 /// we only compare against `amount_wei: u128`).
 fn erc20_allowance(token: &str, owner: &str, spender: &str) -> Option<u128> {
@@ -529,4 +561,35 @@ fn to_checksum(addr: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+
+    #[test]
+    fn migration_commands_select_distinct_official_assets() {
+        assert_eq!(USDC.command, "migrate_usdc");
+        assert_eq!(USDC.address, USDC_ADDR);
+        assert_eq!(USDC.label, "USDC");
+
+        assert_eq!(USDCE.command, "migrate_usdce");
+        assert_eq!(USDCE.address, USDCE_ADDR);
+        assert_eq!(USDCE.label, "USDC.e");
+        assert_ne!(USDC.address, USDCE.address);
+    }
+
+    #[test]
+    fn wrap_calldata_encodes_the_selected_asset() {
+        for asset in [USDC, USDCE] {
+            let calldata = build_wrap_calldata(asset.address, RECIPIENT, 12_345_678);
+            let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
+            assert_eq!(&bytes[..4], &WRAP_SELECTOR);
+            assert_eq!(&bytes[4..36], &address_to_bytes32(asset.address));
+            assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
+            assert_eq!(&bytes[68..100], &u256_bytes(12_345_678));
+        }
+    }
 }
