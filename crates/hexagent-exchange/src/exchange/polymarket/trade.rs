@@ -877,11 +877,10 @@ impl ReconcileAttemptCounters {
     }
 }
 
-/// Number of consecutive `not_found` GETs we tolerate from the server
-/// before giving up on a placement orphan and committing `Rejected`.
-/// Sized for Polymarket's read-replica lag — five attempts spread over
-/// 7.5 s gives the write ample time to propagate past the observed
-/// 100-300 ms convergence window.
+/// Number of fast `not_found` observations before a placement orphan moves to
+/// cold audit. A timed-out POST remains ambiguous even after repeated 404s:
+/// absence on an eventually-consistent read replica is not an authoritative
+/// rejection and must never release the worst-case reservation.
 pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 
 /// Base interval for the placement not-found retry backoff. The gap before
@@ -890,6 +889,20 @@ pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 /// preventing quote-cadence retries from amplifying a PM REST slowdown;
 /// orphans that actually filled are booked via the WS user_feed independently.
 pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 500;
+
+/// Audit cadence after the fast 0.5/1/2/4 second placement window is
+/// exhausted. The orphan and its risk reservation remain live; this only
+/// removes the high-rate REST/log storm while waiting for authoritative
+/// LIVE/MATCHED/CANCELED/INVALID evidence or settlement-time account audit.
+pub(crate) const RECONCILE_COLD_BACKOFF_MS: u64 = 30_000;
+
+fn placement_reconcile_backoff_ms(attempts: u32) -> u64 {
+    if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
+        RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts.saturating_sub(1)))
+    } else {
+        RECONCILE_COLD_BACKOFF_MS
+    }
+}
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
 /// ready" is observed. 10 s gives the upstream service a chance to drain
@@ -2533,7 +2546,7 @@ impl PolymarketTrade {
                             avg_fill_price: *price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
-                            error: None,
+                            error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
                     }
                     "CANCELED" | "CANCELLED" => {
@@ -2557,7 +2570,7 @@ impl PolymarketTrade {
                             avg_fill_price: 0.0,
                             timestamp_ns: now_ns(),
                             trade_id: None,
-                            error: None,
+                            error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
                     }
                     "" => {
@@ -2567,10 +2580,10 @@ impl PolymarketTrade {
                         // the read endpoint for hundreds of ms (live2 2026-
                         // 04-30: 66 % of these "rejections" later traded as
                         // ghosts). Tolerate `RECONCILE_NOT_FOUND_RETRY_LIMIT`
-                        // attempts before committing Rejected. Each retry
+                        // fast attempts before entering cold audit. Each retry
                         // happens via the strategy's next ReconcilePolymarket
                         // signal (orphan stays in the reconciler map; the
-                        // 1.5 s in_flight TTL gates re-emission).
+                        // 500 ms placement in_flight TTL gates re-emission).
                         let attempts = self.shared.reconcile_attempts.next_placement(coid);
                         if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
                             warn!(
@@ -2581,8 +2594,7 @@ impl PolymarketTrade {
                             // coid: 0.5s · 2^(attempt-1) = 0.5s, 1s, 2s, 4s
                             // across attempts 1..4. The gate at the top of the
                             // loop skips intervening re-emits until this passes.
-                            let backoff_ms = RECONCILE_BACKOFF_BASE_MS
-                                .saturating_mul(1u64 << (attempts - 1));
+                            let backoff_ms = placement_reconcile_backoff_ms(attempts);
                             self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
                                 coid.clone(),
                                 now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
@@ -2592,28 +2604,18 @@ impl PolymarketTrade {
                             // unblock the next dedup'd retry.
                             continue;
                         }
-                        warn!(
-                            "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (after {} attempts) → Rejected",
-                            coid, oid, attempts,
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
+                            coid.clone(),
+                            now_ns().saturating_add(RECONCILE_COLD_BACKOFF_MS.saturating_mul(1_000_000)),
                         );
-                        self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                        self.shared.remove_order(coid);
-                        updates.push(OrderUpdate {
-                            client_order_id: coid.clone(),
-                            exchange: Exchange::Polymarket,
-                            symbol: symbol.clone(),
-                            side: *side,
-                            exchange_order_id: None,
-                            status: OrderStatus::Rejected,
-                            liquidity: None,
-                            filled_quantity: 0.0,
-                            remaining_quantity: 0.0,
-                            avg_fill_price: 0.0,
-                            timestamp_ns: now_ns(),
-                            trade_id: None,
-                            error: None,
-                        });
+                        warn!(
+                            "[orphan_metric] placement_orphan_cold=1 coid={} orderID={} attempts={} next_retry_ms={} lock_release=forbidden",
+                            coid, oid, attempts, RECONCILE_COLD_BACKOFF_MS,
+                        );
+                        // No fabricated Rejected update: the strategy keeps
+                        // the placement orphan, cancel intent, and collateral
+                        // reservation until authoritative evidence arrives.
+                        continue;
                     }
                     "INVALID" => {
                         // Polymarket "INVALID" = order failed server-side
@@ -2651,42 +2653,29 @@ impl PolymarketTrade {
                         });
                     }
                     other => {
-                        // Unknown status — defensive cap: tolerate up to
-                        // RECONCILE_NOT_FOUND_RETRY_LIMIT attempts (reusing
-                        // the not_found counter since both paths represent
-                        // "server response we can't act on definitively"),
-                        // then commit Rejected so a future Polymarket-
-                        // introduced status can't permanently wedge the
-                        // orphan-gate.
+                        // An unknown status is not authority to release risk.
+                        // Use the same fast-then-cold audit policy as 404 while
+                        // surfacing the exact server value to monitoring.
                         let attempts = self.shared.reconcile_attempts.next_placement(coid);
                         if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
                             warn!(
                                 "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' (attempt {}/{}) — keeping as orphan",
                                 coid, oid, other, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
                             );
-                        } else {
-                            warn!(
-                                "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' (after {} attempts) → Rejected",
-                                coid, oid, other, attempts,
+                            let backoff_ms = placement_reconcile_backoff_ms(attempts);
+                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
+                                coid.clone(),
+                                now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                             );
-                            self.shared.reconcile_attempts.clear_placement(coid);
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                            self.shared.remove_order(coid);
-                            updates.push(OrderUpdate {
-                                client_order_id: coid.clone(),
-                                exchange: Exchange::Polymarket,
-                                symbol: symbol.clone(),
-                                side: *side,
-                                exchange_order_id: None,
-                                status: OrderStatus::Rejected,
-                                liquidity: None,
-                                filled_quantity: 0.0,
-                                remaining_quantity: 0.0,
-                                avg_fill_price: 0.0,
-                                timestamp_ns: now_ns(),
-                                trade_id: None,
-                                error: Some(format!("unexpected status '{}' (after {} attempts)", other, attempts)),
-                            });
+                        } else {
+                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
+                                coid.clone(),
+                                now_ns().saturating_add(RECONCILE_COLD_BACKOFF_MS.saturating_mul(1_000_000)),
+                            );
+                            warn!(
+                                "[orphan_metric] placement_orphan_cold=1 coid={} orderID={} attempts={} unexpected_status='{}' next_retry_ms={} lock_release=forbidden",
+                                coid, oid, attempts, other, RECONCILE_COLD_BACKOFF_MS,
+                            );
                         }
                     }
                 }
@@ -2828,7 +2817,8 @@ impl PolymarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
-                error: None,
+                error: matches!(status, OrderStatus::Cancelled | OrderStatus::Filled)
+                    .then(|| ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
             });
         }
 
@@ -4744,11 +4734,13 @@ mod tests {
     #[test]
     fn reconcile_not_found_backoff_schedule_is_half_to_four_seconds() {
         let gaps_ms: Vec<u64> = (1..RECONCILE_NOT_FOUND_RETRY_LIMIT)
-            .map(|attempt| RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempt - 1)))
+            .map(placement_reconcile_backoff_ms)
             .collect();
 
         assert_eq!(gaps_ms, vec![500, 1_000, 2_000, 4_000]);
         assert_eq!(gaps_ms.iter().sum::<u64>(), 7_500);
+        assert_eq!(placement_reconcile_backoff_ms(5), RECONCILE_COLD_BACKOFF_MS);
+        assert_eq!(placement_reconcile_backoff_ms(50), RECONCILE_COLD_BACKOFF_MS);
     }
 
     /// A cancel-before-ack timeout can put one coid in both reconcile lists.

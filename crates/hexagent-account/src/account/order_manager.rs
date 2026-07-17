@@ -172,8 +172,11 @@ pub struct OrderManager {
     /// exchange update. Sending DELETE while the POST is still being processed
     /// produces the `pending/delayed` cancel-before-ack race; instead we park
     /// the coid here and emit its cancel immediately after Accepted /
-    /// PartiallyFilled. A NewOrderTimeout also flushes the intent so an order
-    /// that may have landed is still pulled and handed to orphan reconcile.
+    /// PartiallyFilled. A NewOrderTimeout deliberately does not flush the
+    /// intent: the placement reconciler must first prove that the order is
+    /// LIVE. This keeps one coid on one uncertainty chain and avoids creating
+    /// simultaneous placement and cancel orphans for an order that may never
+    /// have landed.
     cancel_intents: std::collections::BTreeSet<String>,
     /// Monotonic per-manager telemetry counter. Incremented only when a fresh
     /// cancel intent is parked behind a still-Submitted placement ACK.
@@ -295,7 +298,7 @@ impl OrderManager {
 
     /// Request cancellation without racing a placement that is still awaiting
     /// its first exchange result. Active orders emit immediately; Submitted
-    /// orders retain a cancel intent until ACK/partial-fill/place-timeout.
+    /// orders retain a cancel intent until an authoritative placement update.
     fn request_cancel(&mut self, client_order_id: &str, timestamp_ns: u64) -> Option<Signal> {
         let status = self.orders.get(client_order_id).map(|o| o.status)?;
         match status {
@@ -322,16 +325,14 @@ impl OrderManager {
         }
     }
 
-    /// Flush a parked cancel intent after the placement request can no longer
-    /// be overtaken by a normal ACK. Accepted/PartiallyFilled are authoritative
-    /// evidence that the order exists; NewOrderTimeout is still unknown, so we
-    /// send the cancel defensively and let the orphan lifecycle retain locks.
+    /// Flush a parked cancel intent only after authoritative evidence proves
+    /// that the placement exists. A timeout is not such evidence: issuing a
+    /// blind DELETE there creates a second, independent uncertainty chain and
+    /// can leave a cancel orphan retrying forever after placement 404s.
     fn flush_cancel_intent(&mut self, update: &OrderUpdate) -> Option<Signal> {
         if !matches!(
             update.status,
-            OrderStatus::Accepted
-                | OrderStatus::PartiallyFilled
-                | OrderStatus::NewOrderTimeout
+            OrderStatus::Accepted | OrderStatus::PartiallyFilled
         ) || !self.cancel_intents.remove(&update.client_order_id)
         {
             return None;
@@ -465,6 +466,14 @@ impl OrderManager {
                 self.cancel_intents.remove(&update.client_order_id);
             }
             _ => {}
+        }
+        if update.status == OrderStatus::NewOrderTimeout
+            && self.cancel_intents.contains(&update.client_order_id)
+        {
+            log::info!(
+                "[orphan_metric] blind_delete_after_place_timeout=0 cancel_intent_retained=1 symbol={} coid={}",
+                self.symbol, update.client_order_id,
+            );
         }
         self.flush_cancel_intent(update)
     }
@@ -907,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_intent_flushes_after_place_timeout_with_locks_held() {
+    fn cancel_intent_stays_parked_after_place_timeout_with_locks_held() {
         let mut m = om();
         let coid = place(&mut m, Side::Sell, 0.60, 5.0);
         let signals = m.apply_reconcile(
@@ -917,12 +926,18 @@ mod tests {
         assert!(signals.is_empty());
         assert!(m.has_cancel_intent(&coid));
 
-        let signal = m.on_order_update(&upd(&coid, Side::Sell, OrderStatus::NewOrderTimeout))
-            .expect("unknown placement still needs a defensive cancel");
-        assert!(matches!(signal, Signal::CancelOrder { .. }));
-        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Cancelling);
+        let signal = m.on_order_update(&upd(&coid, Side::Sell, OrderStatus::NewOrderTimeout));
+        assert!(signal.is_none(), "a timeout must not emit a blind DELETE");
+        assert!(m.has_cancel_intent(&coid));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Submitted);
         assert_eq!(m.live_count(Side::Sell), 1);
         assert!((m.locked_sell_qty() - 5.0).abs() < 1e-9);
+
+        let signal = m.on_order_update(&upd(&coid, Side::Sell, OrderStatus::Accepted))
+            .expect("authoritative LIVE evidence releases the cancel intent");
+        assert!(matches!(signal, Signal::CancelOrder { .. }));
+        assert!(!m.has_cancel_intent(&coid));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Cancelling);
     }
 
     #[test]
