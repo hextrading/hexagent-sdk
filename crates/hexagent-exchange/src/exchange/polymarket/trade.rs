@@ -827,9 +827,9 @@ pub struct SharedState {
 
     /// Per-coid **exponential backoff** gate for placement not-found GETs:
     /// wall-clock ns before which the next reconcile GET for this coid is
-    /// skipped. Set after each not-found to `now + 1.5s · 2^(attempt-1)`
-    /// (1.5s → 3s → 6s → 12s across the 5 attempts). Without this the
-    /// reconciler re-hammers the GET every ~1.5s re-emit; during a PM REST
+    /// skipped. Set after each not-found to `now + 0.5s · 2^(attempt-1)`
+    /// (0.5s → 1s → 2s → 4s across the 5 attempts). Without this the
+    /// reconciler re-hammers the GET every ~0.5s re-emit; during a PM REST
     /// slowdown that pours ~5 GETs/orphan onto an already-struggling endpoint
     /// and prolongs the episode. Backing off costs only slower orphan
     /// cleanup — a real fill still lands via the WS user_feed independent of
@@ -850,17 +850,17 @@ pub struct SharedState {
 
 /// Number of consecutive `not_found` GETs we tolerate from the server
 /// before giving up on a placement orphan and committing `Rejected`.
-/// Sized for Polymarket's read-replica lag — 5 attempts at ≥1.5 s
-/// retry interval (= `IN_FLIGHT_TTL_NS`) gives ~7.5 s for the write to
-/// propagate, well past the observed 100-300 ms convergence window.
+/// Sized for Polymarket's read-replica lag — five attempts spread over
+/// 7.5 s gives the write ample time to propagate past the observed
+/// 100-300 ms convergence window.
 pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 
 /// Base interval for the placement not-found retry backoff. The gap before
-/// the Nth GET doubles: 1.5s, 3s, 6s, 12s across attempts 2..5, so the 5
-/// attempts span ~22.5s (was a flat ~1.5s each = ~6s). Longer, but it stops
-/// the reconciler from amplifying a PM REST slowdown; orphans that actually
-/// filled are still booked via the WS user_feed regardless of GET timing.
-pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 1500;
+/// the Nth GET doubles: 0.5s, 1s, 2s, 4s across attempts 2..5, so the five
+/// attempts span ~7.5s. This keeps orphan resolution responsive while still
+/// preventing quote-cadence retries from amplifying a PM REST slowdown;
+/// orphans that actually filled are booked via the WS user_feed independently.
+pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 500;
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
 /// ready" is observed. 10 s gives the upstream service a chance to drain
@@ -2516,7 +2516,7 @@ impl PolymarketTrade {
                                 coid, oid, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
                             );
                             // Exponential backoff before the next GET for this
-                            // coid: 1.5s · 2^(attempt-1) = 1.5s, 3s, 6s, 12s
+                            // coid: 0.5s · 2^(attempt-1) = 0.5s, 1s, 2s, 4s
                             // across attempts 1..4. The gate at the top of the
                             // loop skips intervening re-emits until this passes.
                             let backoff_ms = RECONCILE_BACKOFF_BASE_MS
@@ -4670,6 +4670,18 @@ mod tests {
             !HttpErr::Status(404, "not found".to_string()).is_unknown_state(),
             "404 is a definitive answer — must NOT be unknown_state"
         );
+    }
+
+    /// Placement-orphan not-found retries should resolve in about one third
+    /// of the former 22.5 s window while retaining all five observations.
+    #[test]
+    fn reconcile_not_found_backoff_schedule_is_half_to_four_seconds() {
+        let gaps_ms: Vec<u64> = (1..RECONCILE_NOT_FOUND_RETRY_LIMIT)
+            .map(|attempt| RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempt - 1)))
+            .collect();
+
+        assert_eq!(gaps_ms, vec![500, 1_000, 2_000, 4_000]);
+        assert_eq!(gaps_ms.iter().sum::<u64>(), 7_500);
     }
 
     /// A 425 must back off only the affected orphan. A healthy sibling must
