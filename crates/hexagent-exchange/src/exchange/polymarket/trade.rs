@@ -800,18 +800,18 @@ pub struct SharedState {
     /// 425s + cancel 425s in the same 30 min. One operator alert per
     /// 5 min is more useful than 15k near-identical log lines.
     pub(crate) http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64,
-    /// Wall-clock ns until which `reconcile_orphans` short-circuits (returns
-    /// empty updates without hitting HTTP) because the server is in a 425
-    /// "service not ready" storm. Set by the cancel-reply / reconcile-DELETE
-    /// paths when they hit 425; cleared lazily by the deadline.
+    /// Per-coid wall-clock deadlines for HTTP 425 reconcile backoff. A 425
+    /// parks only the affected orphan; unrelated orders continue reconciling.
+    /// Entries are cleared on terminal removal or lazily after expiry.
     ///
     /// Rationale: HTTP 425 means "service is overloaded, retry later". The
     /// reconciler's 500 ms / 1.5 s loop converts that signal into a flood
     /// (live 2026-05-12 13:14–13:37: 1,975 retry log lines for one coid).
-    /// During backoff we keep the orphan parked but skip HTTP roundtrips
-    /// — the reconciler will naturally re-try after the deadline expires.
-    /// Read/write Relaxed.
-    pub(crate) http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64,
+    /// During backoff we keep that orphan parked but skip its HTTP roundtrip
+    /// — the reconciler naturally retries it after the deadline expires.
+    /// This must never become an account-wide circuit breaker: one noisy
+    /// order cannot delay terminal audits for every strategy sharing state.
+    pub(crate) http_425_reconcile_backoff_until_ns: Mutex<HashMap<String, u64>>,
     /// Per-coid counter for `reconcile_orphans` placement queries that
     /// returned `not_found` from the server. Real Polymarket is
     /// eventually-consistent across CLOB shards: a brand-new order can
@@ -869,6 +869,39 @@ pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 1500;
 /// (2026-05-12 13:14–13:21, ~7 min) recover in single-digit minutes, so
 /// 10 s × extending-on-repeat reaches a healthy steady state.
 pub(crate) const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
+
+/// Add or extend a 425 backoff for one orphan. Kept pure so tests can verify
+/// isolation and monotonic deadlines without constructing authenticated
+/// `SharedState`.
+fn record_http_425_backoff(
+    backoffs: &mut HashMap<String, u64>,
+    client_order_id: &str,
+    now_ns: u64,
+) {
+    if client_order_id.is_empty() {
+        return;
+    }
+    let new_deadline = now_ns.saturating_add(HTTP_425_BACKOFF_NS);
+    let deadline = backoffs.entry(client_order_id.to_string()).or_insert(0);
+    *deadline = (*deadline).max(new_deadline);
+}
+
+/// Check one orphan's 425 backoff, removing an expired entry as part of the
+/// lookup. No other coid can influence the result.
+fn is_http_425_backoff_active(
+    backoffs: &mut HashMap<String, u64>,
+    client_order_id: &str,
+    now_ns: u64,
+) -> bool {
+    match backoffs.get(client_order_id).copied() {
+        Some(until) if now_ns < until => true,
+        Some(_) => {
+            backoffs.remove(client_order_id);
+            false
+        }
+        None => false,
+    }
+}
 
 /// Grace period a settling event's coid↔oid mappings are kept AFTER its
 /// expiry sweep before being reclaimed. The event's final matching fills land
@@ -967,6 +1000,8 @@ impl SharedState {
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
+        self.http_425_reconcile_backoff_until_ns
+            .lock().unwrap().remove(client_order_id);
     }
 
     fn check_rate_limit(&self) -> bool {
@@ -1100,35 +1135,27 @@ impl SharedState {
         }
     }
 
-    /// Record that an HTTP 425 was observed by the cancel-reply or
-    /// reconcile-DELETE path, and push `http_425_reconcile_backoff_until_ns`
-    /// to `now + HTTP_425_BACKOFF_NS`. Used to gate `reconcile_orphans` so
-    /// the bot doesn't hammer the upstream service while it's still
-    /// recovering. Idempotent — only advances the deadline, never shortens.
-    pub(crate) fn note_http_425_backoff(&self) {
+    /// Record an HTTP 425 for one orphan. The deadline is scoped to `coid`,
+    /// preventing a single throttled order from stopping every orphan audit
+    /// in the shared account. Idempotent — only advances that coid's deadline.
+    pub(crate) fn note_http_425_backoff(&self, coid: &str) {
         let now = crate::types::now_ns();
-        let new_deadline = now.saturating_add(HTTP_425_BACKOFF_NS);
-        // Use a CAS-like fetch_max to ensure we only advance the deadline
-        // (relaxed is fine — eventual consistency on the deadline value
-        // is acceptable, the loop will retry naturally).
-        let cur = self.http_425_reconcile_backoff_until_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if new_deadline > cur {
-            self.http_425_reconcile_backoff_until_ns
-                .store(new_deadline, std::sync::atomic::Ordering::Relaxed);
-        }
+        record_http_425_backoff(
+            &mut self.http_425_reconcile_backoff_until_ns.lock().unwrap(),
+            coid,
+            now,
+        );
     }
 
-    /// True iff a 425 backoff is currently active (set by
-    /// `note_http_425_backoff` and not yet expired). When true,
-    /// `reconcile_orphans` short-circuits without making HTTP calls.
-    pub(crate) fn in_http_425_backoff(&self) -> bool {
-        let until = self.http_425_reconcile_backoff_until_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if until == 0 {
-            return false;
-        }
-        crate::types::now_ns() < until
+    /// True iff this coid's 425 backoff is active. Expired entries are
+    /// removed lazily; other coids never affect this decision.
+    pub(crate) fn in_http_425_backoff(&self, coid: &str) -> bool {
+        let now = crate::types::now_ns();
+        is_http_425_backoff_active(
+            &mut self.http_425_reconcile_backoff_until_ns.lock().unwrap(),
+            coid,
+            now,
+        )
     }
 
     /// Dispatch an HTTP request onto the shared async runtime. Returns a
@@ -1648,7 +1675,7 @@ impl PolymarketTrade {
                 balance_backoff_until_ns: Mutex::new(HashMap::new()),
                 invalid_token_backoff: Mutex::new(HashMap::new()),
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
-                http_425_reconcile_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
+                http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
                 reconcile_not_found_attempts: Mutex::new(HashMap::new()),
                 reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
@@ -2340,25 +2367,6 @@ impl PolymarketTrade {
         pending_places: &[(String, String, Side, f64, Option<String>)],
         pending_cancels: &[(String, String)],
     ) -> Vec<OrderUpdate> {
-        // HTTP 425 backoff gate: if the upstream service signalled "not
-        // ready" recently, short-circuit before making more HTTP roundtrips.
-        // Orphans stay parked; the orphan_reconciler will fire another
-        // Signal::ReconcilePolymarket after its throttle and we'll re-enter
-        // here. Once the deadline expires `in_http_425_backoff` returns
-        // false and reconciliation resumes naturally.
-        //
-        // Without this gate a 425 storm gets amplified by the reconciler:
-        // live 2026-05-12 13:14–13:37, one coid logged 1,975 retry lines
-        // over 23 min because each retry hit 425 → kept-as-orphan →
-        // re-emit 500 ms later → repeat.
-        if self.shared.in_http_425_backoff() {
-            log::debug!(
-                "[PolymarketTrade] Reconcile skipped: HTTP 425 backoff active ({} places, {} cancels parked)",
-                pending_places.len(), pending_cancels.len(),
-            );
-            return Vec::new();
-        }
-
         let mut updates: Vec<OrderUpdate> = Vec::new();
 
         // --- Placements: deterministic per-orderID lookup ---
@@ -2390,11 +2398,15 @@ impl PolymarketTrade {
                         continue;
                     }
                 }
-                let fetch_result = self.fetch_order_status_by_id(oid);
-                // 425 mid-iteration: defer this and remaining orphans rather
-                // than commit a false outcome via the `""` (not-found) arm
-                // below. Next reconcile call short-circuits on backoff.
-                if fetch_result.is_none() && self.shared.in_http_425_backoff() {
+                // A prior 425 backs off only this orphan. Other coids in the
+                // same reconcile batch must continue to authoritative audit.
+                if self.shared.in_http_425_backoff(coid) {
+                    continue;
+                }
+                let fetch_result = self.fetch_order_status_by_id(coid, oid);
+                // A 425 from this GET is not a not-found answer. Keep this
+                // orphan parked without affecting the rest of the batch.
+                if fetch_result.is_none() && self.shared.in_http_425_backoff(coid) {
                     log::debug!(
                         "[PolymarketTrade] Reconcile placement coid={} orderID={}: fetch deferred (HTTP 425 backoff); keeping orphan",
                         coid, oid,
@@ -2624,13 +2636,13 @@ impl PolymarketTrade {
 
         // --- Cancels: query each order by id ---
         for (coid, order_id) in pending_cancels {
-            let fetch_result = self.fetch_order_status_by_id(order_id);
-            // 425 mid-iteration: the fetch failed and noted a backoff. Keep
-            // every remaining orphan parked instead of incorrectly committing
-            // Cancelled via the `""` arm below — the next reconcile call
-            // will short-circuit on `in_http_425_backoff()` and we'll retry
-            // once the deadline expires.
-            if fetch_result.is_none() && self.shared.in_http_425_backoff() {
+            if self.shared.in_http_425_backoff(coid) {
+                continue;
+            }
+            let fetch_result = self.fetch_order_status_by_id(coid, order_id);
+            // A 425 mid-iteration parks only this cancel orphan; unrelated
+            // orders continue through the loop and can release their locks.
+            if fetch_result.is_none() && self.shared.in_http_425_backoff(coid) {
                 log::debug!(
                     "[PolymarketTrade] Reconcile cancel coid={} orderID={}: fetch deferred (HTTP 425 backoff); keeping orphan",
                     coid, order_id,
@@ -2671,13 +2683,10 @@ impl PolymarketTrade {
                             status
                         }
                         Err(e) => {
-                            // HTTP 425 specifically signals "service overloaded
-                            // — retry later". Open the global backoff so the
-                            // next ~10 s of reconcile signals short-circuit
-                            // before hitting HTTP. The order stays orphan and
-                            // gets re-checked once the deadline expires.
+                            // HTTP 425 backs off this orphan only. It stays
+                            // parked and gets re-checked after the deadline.
                             if matches!(e, HttpErr::Status(425, _)) {
-                                self.shared.note_http_425_backoff();
+                                self.shared.note_http_425_backoff(coid);
                             }
                             warn!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} HTTP error: {} — keeping as orphan",
                                 coid, order_id, e);
@@ -2783,18 +2792,16 @@ impl PolymarketTrade {
     /// — empirically returns `404 page not found` from clob.polymarket.com
     /// while `/data/order/{id}` returns proper status strings. The
     /// py-clob-client SDK also uses the /data path.
-    fn fetch_order_status_by_id(&self, order_id: &str) -> Option<String> {
+    fn fetch_order_status_by_id(&self, coid: &str, order_id: &str) -> Option<String> {
         let path = format!("/data/order/{}", order_id);
         let json = match self.shared.http_call_sync("GET", &path, "") {
             Ok(j) => j,
             Err(e) => {
-                // HTTP 425 from the GET side: the upstream service is in a
-                // "not ready" storm. Open the global reconcile backoff so
-                // subsequent reconciles short-circuit; the caller will see
-                // None here and (defensively) treat it as "no status yet"
-                // — see the empty-string handling around the call site.
+                // HTTP 425 from the GET side backs off this orphan only. The
+                // caller sees None and distinguishes it from not-found via
+                // the per-coid deadline before evaluating the empty arm.
                 if matches!(e, HttpErr::Status(425, _)) {
-                    self.shared.note_http_425_backoff();
+                    self.shared.note_http_425_backoff(coid);
                 }
                 warn!("[PolymarketTrade] Reconcile /data/order/{}: {}", order_id, e);
                 return None;
@@ -3254,14 +3261,11 @@ impl PolymarketTrade {
                         warn!("[PolymarketTrade] Cancel unknown state ({}) coid={} orderID={}... → CancelOrderTimeout",
                             e, client_order_id, oid_short);
                     }
-                    // HTTP 425 specifically signals "service overloaded, retry
-                    // later" — open a global backoff so subsequent
-                    // `reconcile_orphans` skips its DELETE retries until the
-                    // upstream service recovers. The order still becomes an
-                    // orphan (we have no way to know if the cancel was
-                    // received) but we won't hammer the server with retries.
+                    // HTTP 425 backs off reconciliation for this orphan only.
+                    // The order still becomes an orphan (we cannot know if the
+                    // cancel landed), while unrelated audits keep running.
                     if matches!(e, HttpErr::Status(425, _)) {
-                        self.shared.note_http_425_backoff();
+                        self.shared.note_http_425_backoff(client_order_id);
                     }
                     should_remove = false;
                     timed_out = true;
@@ -3357,7 +3361,9 @@ impl ExchangeTrade for PolymarketTrade {
             }
             Err(e) if e.is_unknown_state() => {
                 if matches!(e, HttpErr::Status(425, _)) {
-                    self.shared.note_http_425_backoff();
+                    for coid in &coids {
+                        self.shared.note_http_425_backoff(coid);
+                    }
                 }
                 warn!("[PolymarketTrade] Cancel all unknown state: {} — keeping orders as orphans", e);
                 (None, OrderStatus::CancelOrderTimeout)
@@ -4666,38 +4672,40 @@ mod tests {
         );
     }
 
-    /// The 425 backoff window must be monotonic: once a longer deadline
-    /// is set, a subsequent note must not shorten it. This guards the
-    /// `note_http_425_backoff` implementation's `store-only-if-greater`
-    /// rule directly via the AtomicU64 field (avoids building a full
-    /// SharedState, which requires real auth keys / signer / etc.).
-    /// Regression guard for Bug #2 cascade amplification.
+    /// A 425 must back off only the affected orphan. A healthy sibling must
+    /// remain eligible for reconcile, otherwise one throttled order becomes
+    /// an account-wide circuit breaker. Deadlines also remain monotonic per
+    /// coid and expired entries are removed lazily.
     #[test]
-    fn http_425_backoff_field_is_monotonic() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        let backoff = AtomicU64::new(0);
+    fn http_425_backoff_is_per_coid_and_monotonic() {
+        let mut backoffs = HashMap::new();
         let now: u64 = 1_000_000_000_000; // arbitrary wall-clock proxy
 
-        // First 425: store now + HTTP_425_BACKOFF_NS (10 s).
+        record_http_425_backoff(&mut backoffs, "throttled", now);
         let d1 = now.saturating_add(HTTP_425_BACKOFF_NS);
-        let cur = backoff.load(Ordering::Relaxed);
-        if d1 > cur { backoff.store(d1, Ordering::Relaxed); }
-        assert_eq!(backoff.load(Ordering::Relaxed), d1);
+        assert_eq!(backoffs.get("throttled"), Some(&d1));
+        assert!(is_http_425_backoff_active(&mut backoffs, "throttled", now));
+        assert!(
+            !is_http_425_backoff_active(&mut backoffs, "healthy-sibling", now),
+            "a 425 on one coid must not block unrelated orphan audits",
+        );
 
         // Operator-style bump: extend to +60 s for a sustained storm.
-        backoff.store(now.saturating_add(60_000_000_000), Ordering::Relaxed);
-        let bumped = backoff.load(Ordering::Relaxed);
+        let bumped = now.saturating_add(60_000_000_000);
+        backoffs.insert("throttled".to_string(), bumped);
         assert!(bumped > d1);
 
-        // Another 425 arrives — the `store-only-if-greater` rule must
-        // NOT pull the deadline backwards from the +60s bump.
-        let d2 = now.saturating_add(HTTP_425_BACKOFF_NS);
-        let cur2 = backoff.load(Ordering::Relaxed);
-        if d2 > cur2 { backoff.store(d2, Ordering::Relaxed); }
-        let after = backoff.load(Ordering::Relaxed);
-        assert_eq!(after, bumped,
-            "note_http_425_backoff must only ADVANCE the deadline (never shorten). bumped={bumped} got={after}");
+        // Another 425 cannot pull that coid's deadline backwards.
+        record_http_425_backoff(&mut backoffs, "throttled", now);
+        assert_eq!(backoffs.get("throttled"), Some(&bumped));
+
+        // Expiry is local and removes only the expired coid's entry.
+        assert!(!is_http_425_backoff_active(
+            &mut backoffs,
+            "throttled",
+            bumped,
+        ));
+        assert!(!backoffs.contains_key("throttled"));
     }
 
     /// `HTTP_425_BACKOFF_NS` must be long enough to break a tight reconcile
