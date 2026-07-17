@@ -482,19 +482,33 @@ fn fetch_usdce_balance(safe_address: &str) -> f64 {
     fetch_erc20_balance_6dec(USDCE_ADDRESS, safe_address)
 }
 
+/// Fetch native Polygon USDC balance directly from chain via eth_call.
+fn fetch_usdc_balance(safe_address: &str) -> f64 {
+    fetch_erc20_balance_6dec(USDC_ADDRESS, safe_address)
+}
+
 /// Fetch pUSD (v2 collateral) balance via eth_call.
 fn fetch_pusd_balance(safe_address: &str) -> f64 {
     fetch_erc20_balance_6dec(PUSD_ADDRESS, safe_address)
 }
 
 /// Print the Safe's stablecoin balances with **pUSD (v2 collateral) as the
-/// primary line** and **USDC.e (v1) secondary**. When any USDC.e remains,
-/// nudge the operator to migrate it into pUSD (the token the v2 bot
-/// trades). Returns `(pusd, usdce)` for any downstream net-worth math.
-fn print_stablecoin_balances(safe_address: &str) -> (f64, f64) {
+/// primary line**, followed by native USDC and bridged USDC.e. When either
+/// backing asset remains, nudge the operator to wrap it into pUSD (the token
+/// the v2 bot trades). Returns `(pusd, usdc, usdce)` for downstream use.
+fn print_stablecoin_balances(safe_address: &str) -> (f64, f64, f64) {
     let pusd = fetch_pusd_balance(safe_address);
+    let usdc = fetch_usdc_balance(safe_address);
     let usdce = fetch_usdce_balance(safe_address);
     println!("{:<6} balance: {:>12.6}   (v2 collateral — used for trading)", "pUSD", pusd);
+    if usdc.abs() < 0.000001 {
+        println!("{:<6} balance: {:>12.6}", "USDC", usdc);
+    } else {
+        println!(
+            "{:<6} balance: {:>12.6}   ⚠ run `hexbot migrate_usdc all` to convert to v2 pUSD",
+            "USDC", usdc,
+        );
+    }
     if usdce.abs() < 0.000001 {
         println!("{:<6} balance: {:>12.6}", "USDC.e", usdce);
     } else {
@@ -503,11 +517,11 @@ fn print_stablecoin_balances(safe_address: &str) -> (f64, f64) {
             "USDC.e", usdce,
         );
     }
-    (pusd, usdce)
+    (pusd, usdc, usdce)
 }
 
-/// Generic 6-decimal ERC-20 balance reader. USDC.e and pUSD both use
-/// 6 decimals; dedup the wrapper via this helper.
+/// Generic 6-decimal ERC-20 balance reader. USDC, USDC.e, and pUSD all
+/// use 6 decimals; dedup the wrapper via this helper.
 fn fetch_erc20_balance_6dec(token: &str, owner: &str) -> f64 {
     let mut data = Vec::with_capacity(4 + 32);
     data.extend_from_slice(&ERC20_BALANCE_OF_SELECTOR);
@@ -574,13 +588,13 @@ pub fn run_deposit() -> Result<()> {
     }
     println!("Deployed");
 
-    // Balances — pUSD (v2 collateral) primary, USDC.e secondary.
+    // Balances — pUSD (v2 collateral), native USDC, and bridged USDC.e.
     print_stablecoin_balances(&primary);
 
     println!();
-    println!("To deposit, send USDC.e (Polygon network) to:");
+    println!("To deposit, send USDC or USDC.e (Polygon network) to:");
     println!("  {}", primary);
-    println!("Then run `hexbot migrate_usdce all` to convert USDC.e → v2 pUSD for trading.");
+    println!("Then run `hexbot migrate_usdc all` or `hexbot migrate_usdce all` to wrap it into pUSD.");
 
     Ok(())
 }
@@ -611,10 +625,12 @@ pub fn run_withdraw() -> Result<()> {
     // Fetch balances. pUSD is the v2 collateral (what the bot trades and
     // what `migrate_usdc[e]`/wrap produces); USDC.e is the legacy v1 stable.
     let pusd_balance = fetch_pusd_balance(&wallet.safe_address);
-    let usdc_balance = fetch_usdce_balance(&wallet.safe_address);
+    let usdc_balance = fetch_usdc_balance(&wallet.safe_address);
+    let usdce_balance = fetch_usdce_balance(&wallet.safe_address);
     let pol_balance = fetch_pol_balance(&wallet.safe_address).unwrap_or(0.0);
     println!("pUSD   balance: {:.6}   (v2 collateral)", pusd_balance);
-    println!("USDC.e balance: {:.6}   (legacy v1)", usdc_balance);
+    println!("USDC   balance: {:.6}   (native Polygon USDC)", usdc_balance);
+    println!("USDC.e balance: {:.6}   (legacy v1)", usdce_balance);
     println!("POL    balance: {:.6}", pol_balance);
 
     // Token choice
@@ -642,7 +658,7 @@ pub fn run_withdraw() -> Result<()> {
             run_withdraw_erc20(&wallet, PUSD_ADDRESS, "pUSD", pusd_balance)
         }
         "4" | "usdce" | "USDC.e" | "USDCE" => {
-            run_withdraw_erc20(&wallet, USDCE_ADDRESS, "USDC.e", usdc_balance)
+            run_withdraw_erc20(&wallet, USDCE_ADDRESS, "USDC.e", usdce_balance)
         }
         "5" | "pol" | "POL" => run_withdraw_pol(&wallet, pol_balance),
         other => Err(anyhow!("Unknown token choice '{}'. Expected 1-5.", other)),
@@ -659,8 +675,10 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     println!();
     println!("Deposit wallet: {}", dw);
     let pusd = fetch_pusd_balance(dw);
+    let usdc = fetch_usdc_balance(dw);
     let usdce = fetch_usdce_balance(dw);
     println!("pUSD   balance: {:.6}   (v2 collateral)", pusd);
+    println!("USDC   balance: {:.6}   (native Polygon USDC)", usdc);
     println!("USDC.e balance: {:.6}   (legacy v1)", usdce);
     println!();
     println!("Which token to withdraw? (FROM the deposit wallet, gasless via relayer)");
