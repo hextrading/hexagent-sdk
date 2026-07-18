@@ -111,6 +111,7 @@ fn parse_user_event(data: &serde_json::Value) -> Option<OrderUpdate> {
                 avg_fill_price: avg_price,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                order_audit: None,
                 error: None,
             })
         }
@@ -148,6 +149,7 @@ fn parse_user_event(data: &serde_json::Value) -> Option<OrderUpdate> {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                order_audit: None,
                 error: None,
             })
         }

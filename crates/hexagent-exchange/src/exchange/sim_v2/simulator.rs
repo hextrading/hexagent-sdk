@@ -730,6 +730,7 @@ impl Simulator {
             avg_fill_price: 0.0,
             timestamp_ns: ts,
             trade_id: None,
+            order_audit: None,
             error: None,
         })
     }
@@ -1005,6 +1006,7 @@ mod tests {
         let recon = Signal::ReconcilePolymarket {
             pending_places: vec![("a".into(), "tok".into(), Side::Buy, 0.6, None)],
             pending_cancels: vec![],
+            pending_trade_ids: vec![],
             instance_id: String::new(),
         };
         sim.submit(&recon, 2_000_000_000);

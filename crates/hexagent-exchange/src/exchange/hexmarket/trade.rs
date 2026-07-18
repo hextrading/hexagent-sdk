@@ -239,6 +239,7 @@ impl ExchangeTrade for HexmarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }
@@ -275,6 +276,7 @@ impl ExchangeTrade for HexmarketTrade {
                     avg_fill_price: 0.0,
                     timestamp_ns: now_ns(),
                     trade_id: None,
+                    order_audit: None,
                     error: None,
                 })
             }
@@ -293,6 +295,7 @@ impl ExchangeTrade for HexmarketTrade {
                     avg_fill_price: 0.0,
                     timestamp_ns: now_ns(),
                     trade_id: None,
+                    order_audit: None,
                     error: None,
                 })
             }
@@ -325,6 +328,7 @@ impl ExchangeTrade for HexmarketTrade {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         })
     }
@@ -354,6 +358,7 @@ impl ExchangeTrade for HexmarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             })
             .collect();
@@ -378,6 +383,7 @@ impl ExchangeTrade for HexmarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             }).collect());
         }
@@ -407,6 +413,7 @@ impl ExchangeTrade for HexmarketTrade {
                             remaining_quantity: order.quantity, avg_fill_price: 0.0,
                             timestamp_ns: now,
                             trade_id: None,
+                            order_audit: None,
                             error: None,
                         });
                     } else {
@@ -424,6 +431,7 @@ impl ExchangeTrade for HexmarketTrade {
                             remaining_quantity: order.quantity, avg_fill_price: 0.0,
                             timestamp_ns: now,
                             trade_id: None,
+                            order_audit: None,
                             error: None,
                         });
                     }
@@ -477,6 +485,7 @@ impl ExchangeTrade for HexmarketTrade {
             liquidity: None, filled_quantity: 0.0, remaining_quantity: 0.0,
             avg_fill_price: 0.0, timestamp_ns: now,
             trade_id: None,
+            order_audit: None,
             error: None,
         }).collect())
     }
@@ -525,6 +534,7 @@ impl ExchangeTrade for HexmarketTrade {
                         liquidity: None, filled_quantity: 0.0, remaining_quantity: 0.0,
                         avg_fill_price: 0.0, timestamp_ns: now,
                         trade_id: None,
+                        order_audit: None,
                         error: None,
                     });
                 }
@@ -543,6 +553,7 @@ impl ExchangeTrade for HexmarketTrade {
                             remaining_quantity: order.quantity, avg_fill_price: 0.0,
                             timestamp_ns: now,
                             trade_id: None,
+                            order_audit: None,
                             error: None,
                         });
                     } else {
@@ -559,6 +570,7 @@ impl ExchangeTrade for HexmarketTrade {
                             remaining_quantity: order.quantity, avg_fill_price: 0.0,
                             timestamp_ns: now,
                             trade_id: None,
+                            order_audit: None,
                             error: None,
                         });
                     }

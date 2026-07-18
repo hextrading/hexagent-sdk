@@ -109,6 +109,10 @@ pub enum Signal {
     ReconcilePolymarket {
         pending_places: Vec<(String, String, Side, f64, Option<String>)>,
         pending_cancels: Vec<(String, String)>,
+        /// Base trade IDs named by an authoritative order audit but not yet
+        /// observed in the strategy ledger. The executor fetches and replays
+        /// them through the normal private-feed parser.
+        pending_trade_ids: Vec<String>,
         /// Strategy instance ID — reconcile-by-orderID hits the
         /// per-account `/data/order/{id}` endpoint, so the executor
         /// must route this to the matching SharedState's auth.

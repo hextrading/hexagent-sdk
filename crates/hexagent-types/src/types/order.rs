@@ -108,6 +108,22 @@ pub struct OrderRequest {
     pub outcome_label: String,
 }
 
+/// Exact metadata from an authenticated, order-specific reconciliation GET.
+///
+/// Quantities remain strings because the exchange API is fixed-point; this
+/// preserves terminal dust exactly for reconciliation diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeOrderAudit {
+    #[serde(default)]
+    pub original_size: Option<String>,
+    #[serde(default)]
+    pub size_matched: Option<String>,
+    /// Base Polymarket trade IDs associated with this order. Maker private
+    /// updates use `<trade_id>:<order_id>` as their ledger key.
+    #[serde(default)]
+    pub associate_trades: Vec<String>,
+}
+
 /// Update on an existing order
 #[derive(
     Debug, Clone, Serialize, Deserialize,
@@ -132,6 +148,9 @@ pub struct OrderUpdate {
     /// of double-counting.
     #[serde(default)]
     pub trade_id: Option<String>,
+    /// Present only on an authoritative order-specific GET result.
+    #[serde(default)]
+    pub order_audit: Option<AuthoritativeOrderAudit>,
     /// Server-provided error string for rejected orders. Strategies use this
     /// to distinguish rejection causes — e.g. "invalid post-only order: order
     /// crosses book" lets the strategy refresh its inferred top of book. A

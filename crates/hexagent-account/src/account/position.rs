@@ -662,6 +662,7 @@ mod tests {
             avg_fill_price: price,
             timestamp_ns: 0,
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -763,6 +764,21 @@ mod tests {
         assert_eq!(b.accumulator_sign, 0);
         assert_eq!(c.accumulator_sign, 0);
         assert!((pm.maker_volume - 2.0).abs() < 1e-9, "got {}", pm.maker_volume);
+    }
+
+    #[test]
+    fn taker_buy_fee_changes_net_position_not_gross_trade_size() {
+        let mut pm = PositionManager::new();
+        let result = pm.upsert_trade(
+            "taker-1", "TOKEN", Side::Buy, 5.0, 0.4,
+            TradeStatus::Matched, false, 0.0, 0.05, None,
+        );
+        assert_eq!(result.accumulator_sign, 1);
+        let trade = pm.trades().get("taker-1").expect("gross trade record");
+        assert_eq!(trade.size, 5.0, "drain identity uses gross execution");
+        assert_eq!(trade.shares_fee, 0.05);
+        assert!((pm.get_quantity("TOKEN") - 4.95).abs() < 1e-12,
+            "only net inventory subtracts the share-denominated fee");
     }
 
     #[test]

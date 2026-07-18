@@ -219,6 +219,7 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
             avg_fill_price: last_px,
             timestamp_ns: ts,
             trade_id: tid,
+            order_audit: None,
             error: None,
         });
     }
@@ -244,6 +245,7 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
         avg_fill_price: 0.0,
         timestamp_ns: ts,
         trade_id: None,
+        order_audit: None,
         error: None,
     })
 }

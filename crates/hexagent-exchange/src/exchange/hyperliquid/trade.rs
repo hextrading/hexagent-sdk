@@ -388,6 +388,7 @@ impl StatusEntry {
             avg_fill_price: avg,
             timestamp_ns: crate::types::now_ns(),
             trade_id: None,
+            order_audit: None,
             error: err,
         };
         match self {
@@ -433,6 +434,7 @@ fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderU
         avg_fill_price: 0.0,
         timestamp_ns: crate::types::now_ns(),
         trade_id: None,
+        order_audit: None,
         error: err,
     }
 }

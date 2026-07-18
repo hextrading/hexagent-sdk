@@ -225,6 +225,7 @@ fn parse_trades(
                 avg_fill_price: price,
                 timestamp_ns: ts,
                 trade_id: tid,
+                order_audit: None,
                 error: None,
             });
         }
@@ -284,6 +285,7 @@ fn parse_orders(
                 avg_fill_price: 0.0,
                 timestamp_ns: ts,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }

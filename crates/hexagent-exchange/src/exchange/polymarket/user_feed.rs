@@ -30,7 +30,7 @@ const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Parse a Polymarket user WebSocket event into zero-or-more OrderUpdates.
 /// A single "trade" push from a MAKER perspective may expand into multiple
 /// OrderUpdates (one per matching `maker_orders[]` entry owned by us).
-fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
+pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
     let event_type = match data.get("event_type")
         .or_else(|| data.get("type"))
@@ -142,7 +142,10 @@ fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<Order
                 _ => None,
             };
 
-            let status_str = data.get("status").and_then(|v| v.as_str()).unwrap_or("MATCHED");
+            let status_raw = data.get("status").and_then(|v| v.as_str()).unwrap_or("MATCHED");
+            let status_str = status_raw
+                .strip_prefix("TRADE_STATUS_")
+                .unwrap_or(status_raw);
 
             let match_time_secs: u64 = data.get("match_time")
                 .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))
@@ -262,6 +265,7 @@ fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<Order
                         avg_fill_price: mo_price,
                         timestamp_ns: now_ns(),
                         trade_id: if leg_id.is_empty() { None } else { Some(leg_id) },
+                        order_audit: None,
                         error: failure_reason.clone(),
                     });
                 }
@@ -301,6 +305,7 @@ fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<Order
                     avg_fill_price: price,
                     timestamp_ns: now_ns(),
                     trade_id: if trade_id.is_empty() { None } else { Some(trade_id.to_string()) },
+                    order_audit: None,
                     error: failure_reason.clone(),
                 });
             }

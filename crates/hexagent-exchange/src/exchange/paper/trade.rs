@@ -47,6 +47,7 @@ impl ExchangeTrade for PaperTrade {
             avg_fill_price: fill_price,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         };
 
@@ -72,6 +73,7 @@ impl ExchangeTrade for PaperTrade {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         })
     }

@@ -16,6 +16,7 @@ use crate::types::*;
 use super::auth::PolyAuth;
 use super::live_position::LivePositionManager;
 use super::signer::{OrderSigner, SignatureType};
+use super::user_feed::parse_user_event;
 
 /// CLOB protocol version selector. Threaded through `SharedState` so
 /// every signing / POST / auth path can dispatch at runtime.
@@ -52,6 +53,40 @@ impl ClobVersion {
 /// you need to point at a non-prod environment.
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct FetchedOrder {
+    status: String,
+    audit: AuthoritativeOrderAudit,
+}
+
+fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
+    let status = json.get("status").and_then(|value| value.as_str())?.to_string();
+    let string_field = |name: &str| {
+        json.get(name).and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    };
+    let associate_trades = json
+        .get("associate_trades")
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter()
+            .filter_map(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect())
+        .unwrap_or_default();
+    Some(FetchedOrder {
+        status,
+        audit: AuthoritativeOrderAudit {
+            original_size: string_field("original_size"),
+            size_matched: string_field("size_matched"),
+            associate_trades,
+        },
+    })
+}
 
 /// Internal HTTP error discriminator for callers that need to map errors
 /// to specific `OrderStatus` variants (Timeout vs server Status vs Other).
@@ -1306,11 +1341,14 @@ impl SharedState {
             .or_else(|| latency_record_kind(method.as_str(), path));
         let t_start = crate::latency::Instant::now();
         let url = format!("{}{}", self.clob_base_url, path);
+        // L2 HMAC covers the endpoint path, not the query string. This also
+        // matches the existing `/trades?after=...` gap-replay request.
+        let auth_path = path.split('?').next().unwrap_or(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
         // Primary leg: sign + spawn now.
         {
-            let headers = self.auth.sign_request(method.as_str(), path, body);
+            let headers = self.auth.sign_request(method.as_str(), auth_path, body);
             let path_owned = path.to_string();
             let body_owned = body.to_string();
             let url_owned = url.clone();
@@ -1369,6 +1407,7 @@ impl SharedState {
             let auth = self.auth.clone();
             let method_b = method;
             let path_b = path.to_string();
+            let auth_path_b = auth_path.to_string();
             let body_b = body.to_string();
             let url_b = url;
             let tx_b = reply_tx;
@@ -1381,7 +1420,7 @@ impl SharedState {
                 // Re-sign: Polymarket auth signature is timestamp-bound, so
                 // the hedge needs its own headers (re-using primary's headers
                 // would risk the server rejecting on stale timestamp).
-                let headers_b = auth.sign_request(method_b.as_str(), &path_b, &body_b);
+                let headers_b = auth.sign_request(method_b.as_str(), &auth_path_b, &body_b);
                 let reply = execute_http(method_b.clone(), url_b, path_b.clone(), headers_b, body_b).await;
                 // POST /order dedup guard (mirror of the primary leg's
                 // check): the hedge can't be allowed to win with a 400
@@ -2382,6 +2421,7 @@ impl PolymarketTrade {
             avg_fill_price: rejected_price,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: if msg.is_empty() { None } else { Some(msg.to_string()) },
         }
     }
@@ -2406,6 +2446,7 @@ impl PolymarketTrade {
             avg_fill_price: order.price.unwrap_or(0.0),
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -2425,6 +2466,7 @@ impl PolymarketTrade {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -2446,6 +2488,7 @@ impl PolymarketTrade {
         &self,
         pending_places: &[(String, String, Side, f64, Option<String>)],
         pending_cancels: &[(String, String)],
+        pending_trade_ids: &[String],
     ) -> Vec<OrderUpdate> {
         let mut updates: Vec<OrderUpdate> = Vec::new();
 
@@ -2483,7 +2526,7 @@ impl PolymarketTrade {
                 if self.shared.in_http_425_backoff(coid) {
                     continue;
                 }
-                let fetch_result = self.fetch_order_status_by_id(coid, oid);
+                let fetch_result = self.fetch_order_by_id(coid, oid);
                 // A 425 from this GET is not a not-found answer. Keep this
                 // orphan parked without affecting the rest of the batch.
                 if fetch_result.is_none() && self.shared.in_http_425_backoff(coid) {
@@ -2493,7 +2536,10 @@ impl PolymarketTrade {
                     );
                     continue;
                 }
-                let status_str = fetch_result.unwrap_or_default();
+                let status_str = fetch_result.as_ref()
+                    .map(|order| order.status.clone())
+                    .unwrap_or_default();
+                let order_audit = fetch_result.as_ref().map(|order| order.audit.clone());
                 match status_str.as_str() {
                     "LIVE" => {
                         // Conclusive answer — clear the not_found counter
@@ -2522,6 +2568,7 @@ impl PolymarketTrade {
                             avg_fill_price: *price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: order_audit.clone(),
                             error: None,
                         });
                     }
@@ -2546,6 +2593,7 @@ impl PolymarketTrade {
                             avg_fill_price: *price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: order_audit.clone(),
                             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
                     }
@@ -2570,6 +2618,7 @@ impl PolymarketTrade {
                             avg_fill_price: 0.0,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: order_audit.clone(),
                             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
                     }
@@ -2649,6 +2698,7 @@ impl PolymarketTrade {
                             avg_fill_price: 0.0,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: None,
                             error: Some("server status=INVALID (validation failed)".to_string()),
                         });
                     }
@@ -2687,7 +2737,7 @@ impl PolymarketTrade {
             if self.shared.in_http_425_backoff(coid) {
                 continue;
             }
-            let fetch_result = self.fetch_order_status_by_id(coid, order_id);
+            let fetch_result = self.fetch_order_by_id(coid, order_id);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
             if fetch_result.is_none() && self.shared.in_http_425_backoff(coid) {
@@ -2697,7 +2747,10 @@ impl PolymarketTrade {
                 );
                 continue;
             }
-            let status_str = fetch_result.unwrap_or_default();
+            let status_str = fetch_result.as_ref()
+                .map(|order| order.status.clone())
+                .unwrap_or_default();
+            let order_audit = fetch_result.as_ref().map(|order| order.audit.clone());
             let status = match status_str.as_str() {
                 "LIVE" => {
                     // The order is still active on the server — our
@@ -2817,24 +2870,79 @@ impl PolymarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                // Metadata is valid for terminal Filled only when that same
+                // GET returned MATCHED/FILLED. A LIVE snapshot followed by an
+                // ambiguous retry DELETE must trigger another audit.
+                order_audit: matches!(status_str.as_str(), "MATCHED" | "FILLED")
+                    .then(|| order_audit.clone())
+                    .flatten(),
                 error: matches!(status, OrderStatus::Cancelled | OrderStatus::Filled)
                     .then(|| ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
             });
         }
 
+        // The terminal order audit names the complete associated trade set.
+        // Replay missing IDs through the same parser used by WS/gap recovery,
+        // leaving PositionManager as the sole dedup/accounting authority.
+        for trade_id in pending_trade_ids {
+            let path = format!("/trades?id={}", trade_id);
+            let json = match self.shared.http_call_sync("GET", &path, "") {
+                Ok(json) => json,
+                Err(error) => {
+                    warn!(
+                        "[orphan_metric] terminal_trade_backfill_failed=1 trade_id={} error={} lock_release=forbidden",
+                        trade_id, error,
+                    );
+                    continue;
+                }
+            };
+            let records = if let Some(records) = json.as_array() {
+                records.clone()
+            } else if let Some(records) = json.get("data").and_then(|value| value.as_array()) {
+                records.clone()
+            } else if json.get("id").and_then(|value| value.as_str()).is_some() {
+                vec![json]
+            } else {
+                Vec::new()
+            };
+            let mut matched = 0usize;
+            for mut record in records {
+                if record.get("id").and_then(|value| value.as_str()) != Some(trade_id.as_str()) {
+                    continue;
+                }
+                if let Some(object) = record.as_object_mut() {
+                    object.entry("event_type".to_string())
+                        .or_insert(serde_json::Value::String("trade".to_string()));
+                }
+                let parsed = parse_user_event(&record, &self.shared);
+                matched += parsed.len();
+                updates.extend(parsed);
+            }
+            if matched == 0 {
+                warn!(
+                    "[orphan_metric] terminal_trade_backfill_missing=1 trade_id={} lock_release=forbidden",
+                    trade_id,
+                );
+            } else {
+                info!(
+                    "[orphan_metric] terminal_trade_backfill_updates={} trade_id={}",
+                    matched, trade_id,
+                );
+            }
+        }
+
         updates
     }
 
-    /// Query a single order's server status by orderID. Returns the status
-    /// string (e.g. "LIVE", "MATCHED", "CANCELED") or None on error /
-    /// not found.
+    /// Query a single order by orderID and retain exact reconciliation
+    /// metadata. Status alone cannot prove that all private fills were booked.
     ///
     /// Endpoint: `GET /data/order/{orderID}`. Tried `GET /order/{id}`
     /// briefly (commit 8b4ce1b) on the guess that it was "more modern"
     /// — empirically returns `404 page not found` from clob.polymarket.com
     /// while `/data/order/{id}` returns proper status strings. The
     /// py-clob-client SDK also uses the /data path.
-    fn fetch_order_status_by_id(&self, coid: &str, order_id: &str) -> Option<String> {
+    fn fetch_order_by_id(&self, coid: &str, order_id: &str) -> Option<FetchedOrder> {
         let path = format!("/data/order/{}", order_id);
         let json = match self.shared.http_call_sync("GET", &path, "") {
             Ok(j) => j,
@@ -2849,7 +2957,7 @@ impl PolymarketTrade {
                 return None;
             }
         };
-        json.get("status").and_then(|v| v.as_str()).map(|s| s.to_string())
+        parse_fetched_order(&json)
     }
 }
 
@@ -3162,6 +3270,7 @@ impl PolymarketTrade {
             },
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -3343,6 +3452,7 @@ impl PolymarketTrade {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -3459,6 +3569,7 @@ impl ExchangeTrade for PolymarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }
@@ -3641,6 +3752,7 @@ impl ExchangeTrade for PolymarketTrade {
                             avg_fill_price: 0.0,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: None,
                             error: None,
                         });
                     }
@@ -3865,6 +3977,7 @@ impl ExchangeTrade for PolymarketTrade {
                     avg_fill_price: 0.0,
                     timestamp_ns: now_ns(),
                     trade_id: None,
+                    order_audit: None,
                     error: None,
                 });
             }
@@ -3891,6 +4004,7 @@ impl ExchangeTrade for PolymarketTrade {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns(),
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }
@@ -4270,6 +4384,7 @@ impl ExchangeTrade for PolymarketTrade {
                     avg_fill_price: 0.0,
                     timestamp_ns: now_ns(),
                     trade_id: None,
+                    order_audit: None,
                     error: None,
                 });
             }
@@ -4383,6 +4498,7 @@ impl ExchangeTrade for PolymarketTrade {
                             avg_fill_price: rejected_price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
+                            order_audit: None,
                             error: err_field,
                         });
                     }
@@ -4461,6 +4577,35 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authoritative_order_parser_retains_exact_sizes_and_trade_ids() {
+        let json = serde_json::json!({
+            "status": "MATCHED",
+            "original_size": "40",
+            "size_matched": "39.993332",
+            "associate_trades": ["trade-1", "trade-2", "trade-3", "trade-4"]
+        });
+        let fetched = parse_fetched_order(&json).expect("matched order");
+        assert_eq!(fetched.status, "MATCHED");
+        assert_eq!(fetched.audit.original_size.as_deref(), Some("40"));
+        assert_eq!(fetched.audit.size_matched.as_deref(), Some("39.993332"));
+        assert_eq!(fetched.audit.associate_trades,
+            vec!["trade-1", "trade-2", "trade-3", "trade-4"]);
+    }
+
+    #[test]
+    fn authoritative_order_parser_preserves_numeric_fixed_point_values() {
+        let json = serde_json::json!({
+            "status": "MATCHED",
+            "original_size": 20,
+            "size_matched": 19.990489,
+            "associate_trades": ["trade-1"]
+        });
+        let fetched = parse_fetched_order(&json).expect("matched order");
+        assert_eq!(fetched.audit.original_size.as_deref(), Some("20"));
+        assert_eq!(fetched.audit.size_matched.as_deref(), Some("19.990489"));
+    }
 
     // Event-expiry reclaim purges only the settling event's tokens, leaving
     // other concurrent events' coid↔oid mappings intact — and a coid kept

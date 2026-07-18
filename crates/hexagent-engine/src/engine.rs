@@ -4114,6 +4114,7 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
                         filled_quantity: 0.0, remaining_quantity: order.quantity,
                         avg_fill_price: 0.0, timestamp_ns: now_ns(),
                         trade_id: None,
+                        order_audit: None,
                         error: None,
                     }]
                 }
@@ -4170,6 +4171,7 @@ fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
         avg_fill_price: 0.0,
         timestamp_ns: now_ns(),
         trade_id: None,
+        order_audit: None,
         error: None,
     }
 }
@@ -4189,6 +4191,7 @@ fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
         avg_fill_price: 0.0,
         timestamp_ns: now_ns(),
         trade_id: None,
+        order_audit: None,
         error: None,
     }
 }
@@ -4414,6 +4417,7 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     };
@@ -4431,6 +4435,7 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             avg_fill_price: 0.0,
             timestamp_ns: now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     };
@@ -4472,6 +4477,7 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                         filled_quantity: 0.0, remaining_quantity: order.quantity,
                         avg_fill_price: 0.0, timestamp_ns: now_ns(),
                         trade_id: None,
+                        order_audit: None,
                         error: None,
                     }]
                 }
@@ -4591,10 +4597,16 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 error!("[Executor] Replace error: {}", e); vec![]
             })
         }
-        Signal::ReconcilePolymarket { pending_places, pending_cancels, .. } => {
-            executor.poly_route_mut(&instance_id)
-                .reconcile_orphans(&pending_places, &pending_cancels)
-        }
+        Signal::ReconcilePolymarket {
+            pending_places,
+            pending_cancels,
+            pending_trade_ids,
+            ..
+        } => executor.poly_route_mut(&instance_id).reconcile_orphans(
+            &pending_places,
+            &pending_cancels,
+            &pending_trade_ids,
+        ),
         Signal::PolymarketCancelAllOrders { reason, market, asset_ids, .. } => {
             let route = executor.poly_route_mut(&instance_id);
             match market {

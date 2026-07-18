@@ -875,6 +875,7 @@ impl SimExchangeV2 {
                 avg_fill_price: f.price,
                 timestamp_ns: now_ns,
                 trade_id: Some(trade_id),
+                order_audit: None,
                 error: None,
             });
             if f.fully {
@@ -1301,6 +1302,7 @@ impl SimExchangeV2 {
             avg_fill_price: avg,
             timestamp_ns: now_ns,
             trade_id: Some(format!("simv2-taker-{}", o.client_order_id)),
+            order_audit: None,
             error: None,
         }
     }
@@ -1461,6 +1463,7 @@ impl SimExchangeV2 {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns,
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -1482,6 +1485,7 @@ impl SimExchangeV2 {
             avg_fill_price: o.price.unwrap_or(0.0),
             timestamp_ns: now_ns,
             trade_id: None,
+            order_audit: None,
             error: Some(err.to_string()),
         }
     }
@@ -1500,6 +1504,7 @@ impl SimExchangeV2 {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns,
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -1520,6 +1525,7 @@ impl SimExchangeV2 {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             };
         }
@@ -1547,6 +1553,7 @@ impl SimExchangeV2 {
                 avg_fill_price: price,
                 timestamp_ns: now_ns,
                 trade_id: Some(trade_id),
+                order_audit: None,
                 error: None,
             };
         }
@@ -1577,6 +1584,7 @@ impl SimExchangeV2 {
             avg_fill_price: 0.0,
             timestamp_ns: now_ns,
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }
@@ -1611,6 +1619,7 @@ impl SimExchangeV2 {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }
@@ -1628,6 +1637,7 @@ impl SimExchangeV2 {
                 avg_fill_price: 0.0,
                 timestamp_ns: now_ns,
                 trade_id: None,
+                order_audit: None,
                 error: None,
             });
         }

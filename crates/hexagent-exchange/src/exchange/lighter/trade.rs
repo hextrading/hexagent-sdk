@@ -252,6 +252,7 @@ impl super::super::ExchangeTrade for LighterTrade {
             avg_fill_price: 0.0,
             timestamp_ns: crate::types::now_ns(),
             trade_id: None,
+            order_audit: None,
             error: None,
         })
     }
@@ -379,6 +380,7 @@ fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderU
         avg_fill_price: 0.0,
         timestamp_ns: crate::types::now_ns(),
         trade_id: None,
+        order_audit: None,
         error: err,
     }
 }

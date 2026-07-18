@@ -804,6 +804,7 @@ mod tests {
             avg_fill_price: 0.0,
             timestamp_ns: 0,
             trade_id: None,
+            order_audit: None,
             error: None,
         }
     }

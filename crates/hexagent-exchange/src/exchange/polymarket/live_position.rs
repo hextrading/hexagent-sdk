@@ -211,7 +211,9 @@ pub enum TradeStatus {
 impl TradeStatus {
     /// Parse from Polymarket status string (case-insensitive).
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
+        let upper = s.to_uppercase();
+        let normalized = upper.strip_prefix("TRADE_STATUS_").unwrap_or(&upper);
+        match normalized {
             "MATCHED" => Some(Self::Matched),
             "MINED" => Some(Self::Mined),
             "CONFIRMED" => Some(Self::Confirmed),
