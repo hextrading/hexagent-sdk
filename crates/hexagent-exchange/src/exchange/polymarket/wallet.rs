@@ -505,7 +505,7 @@ fn print_stablecoin_balances(safe_address: &str) -> (f64, f64, f64) {
         println!("{:<6} balance: {:>12.6}", "USDC", usdc);
     } else {
         println!(
-            "{:<6} balance: {:>12.6}   ⚠ run `hexbot migrate_usdc all` to convert to v2 pUSD",
+            "{:<6} balance: {:>12.6}   ⚠ native USDC can't be wrapped (Onramp paused) — swap it to USDC.e first",
             "USDC", usdc,
         );
     }
@@ -592,9 +592,9 @@ pub fn run_deposit() -> Result<()> {
     print_stablecoin_balances(&primary);
 
     println!();
-    println!("To deposit, send USDC or USDC.e (Polygon network) to:");
+    println!("To deposit, send USDC.e (Polygon network) to:");
     println!("  {}", primary);
-    println!("Then run `hexbot migrate_usdc all` or `hexbot migrate_usdce all` to wrap it into pUSD.");
+    println!("Then run `hexbot migrate_usdce all` to wrap it into pUSD.");
 
     Ok(())
 }
@@ -623,7 +623,7 @@ pub fn run_withdraw() -> Result<()> {
     }
 
     // Fetch balances. pUSD is the v2 collateral (what the bot trades and
-    // what `migrate_usdc[e]`/wrap produces); USDC.e is the legacy v1 stable.
+    // what `migrate_usdce`/wrap produces); USDC.e is the legacy v1 stable.
     // Native USDC is intentionally absent: Polymarket has paused it on both
     // the Onramp and the Offramp (pUSD is ~100% USDC.e-backed), so every
     // unwrap-to-USDC batch reverts at the relayer simulation.

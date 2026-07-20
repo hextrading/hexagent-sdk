@@ -1,5 +1,5 @@
-//! `hexbot migrate_usdc[e]` — wrap USDC / USDC.e → pUSD in the
-//! operator's Polymarket wallet, ready for CLOB v2 trading.
+//! `hexbot migrate_usdce` — wrap USDC.e → pUSD in the operator's
+//! Polymarket wallet, ready for CLOB v2 trading.
 //!
 //! Post-cutover (2026-04-28) the v2 CLOB accepts **pUSD** as collateral,
 //! not USDC.e. This CLI bundles the two txs required to convert:
@@ -7,6 +7,10 @@
 //!   1. `<asset>.approve(Onramp, amount)`
 //!   2. `Onramp.wrap(<asset>, wallet, amount)` — deposits the selected
 //!      backing asset and mints pUSD 1:1.
+//!
+//! Native USDC is not offered (`migrate_usdc` was removed): Polymarket
+//! has paused native USDC on the Collateral Onramp, so its `wrap` batch
+//! always reverts. Only bridged USDC.e wraps are live.
 //!
 //! Both txs execute as Safe `execTransaction` calls. The gas-payer is
 //! config-driven — same flag as `hexbot redeem` / `hexbot split` /
@@ -18,13 +22,11 @@
 //!   * `true`  → signer EOA broadcasts on-chain, POL gas paid from EOA.
 //!
 //! Usage:
-//!   hexbot migrate_usdc all           # wrap native Polygon USDC
-//!   hexbot migrate_usdce 100          # wrap bridged USDC.e
-//!   hexbot migrate_usdc 100.5         # both assets use 6 decimals
-//!   hexbot migrate_usdc 100 --dry-run # print plan without broadcasting
+//!   hexbot migrate_usdce all            # wrap bridged USDC.e
+//!   hexbot migrate_usdce 100.5          # 6 decimals
+//!   hexbot migrate_usdce 100 --dry-run  # print plan without broadcasting
 //!
 //! Contract addresses (Polygon mainnet, from Polymarket v2 docs):
-//!   USDC    : 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359 (6 decimals)
 //!   USDC.e  : 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174 (6 decimals)
 //!   pUSD    : 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB (6 decimals)
 //!   Onramp  : 0x93070a847efEf7F70739046A929D47a521F5B8ee
@@ -51,7 +53,6 @@ use super::wallet::{
 // Contract addresses (Polygon mainnet)
 // ════════════════════════════════════════════════════════════════
 
-const USDC_ADDR:   &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const USDCE_ADDR:  &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const PUSD_ADDR:   &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 const ONRAMP_ADDR: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee";
@@ -63,11 +64,6 @@ struct MigrateAsset {
     command: &'static str,
 }
 
-const USDC: MigrateAsset = MigrateAsset {
-    address: USDC_ADDR,
-    label: "USDC",
-    command: "migrate_usdc",
-};
 const USDCE: MigrateAsset = MigrateAsset {
     address: USDCE_ADDR,
     label: "USDC.e",
@@ -95,10 +91,6 @@ const USDC_SCALE: u128 = 1_000_000;
 /// still confirm — we just won't wait for it).
 const CONFIRM_TIMEOUT_SECS: u64 = 60;
 const CONFIRM_POLL_INTERVAL_SECS: u64 = 3;
-
-pub fn run_migrate_usdc() -> Result<()> {
-    run_migrate(USDC)
-}
 
 pub fn run_migrate_usdce() -> Result<()> {
     run_migrate(USDCE)
@@ -570,26 +562,19 @@ mod tests {
     const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
 
     #[test]
-    fn migration_commands_select_distinct_official_assets() {
-        assert_eq!(USDC.command, "migrate_usdc");
-        assert_eq!(USDC.address, USDC_ADDR);
-        assert_eq!(USDC.label, "USDC");
-
+    fn migration_command_selects_official_usdce() {
         assert_eq!(USDCE.command, "migrate_usdce");
         assert_eq!(USDCE.address, USDCE_ADDR);
         assert_eq!(USDCE.label, "USDC.e");
-        assert_ne!(USDC.address, USDCE.address);
     }
 
     #[test]
     fn wrap_calldata_encodes_the_selected_asset() {
-        for asset in [USDC, USDCE] {
-            let calldata = build_wrap_calldata(asset.address, RECIPIENT, 12_345_678);
-            let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
-            assert_eq!(&bytes[..4], &WRAP_SELECTOR);
-            assert_eq!(&bytes[4..36], &address_to_bytes32(asset.address));
-            assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
-            assert_eq!(&bytes[68..100], &u256_bytes(12_345_678));
-        }
+        let calldata = build_wrap_calldata(USDCE.address, RECIPIENT, 12_345_678);
+        let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
+        assert_eq!(&bytes[..4], &WRAP_SELECTOR);
+        assert_eq!(&bytes[4..36], &address_to_bytes32(USDCE.address));
+        assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
+        assert_eq!(&bytes[68..100], &u256_bytes(12_345_678));
     }
 }

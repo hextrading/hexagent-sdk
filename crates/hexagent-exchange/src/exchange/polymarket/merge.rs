@@ -163,7 +163,7 @@ pub fn run_merge() -> Result<()> {
         return Ok(());
     }
 
-    // Only the on-chain path is wired — matches `migrate_usdc` / `approve_v2`.
+    // Only the on-chain path is wired — matches `migrate_usdce` / `approve_v2`.
     // The relayer path is nonstandard for merge (not a typical redeem/split
     // maintenance action) and the operator has MATIC for gas anyway.
     if !gas_via_signer {

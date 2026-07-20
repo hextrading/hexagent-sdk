@@ -202,7 +202,7 @@ fn reset_local_nonce(signer: &str) {
 /// Submit a Safe transaction directly on-chain via the signer EOA.
 ///
 /// Backward-compatible single-attempt API used by manual CLI paths
-/// (`migrate_usdc`, `merge`). For the maintenance path which retries
+/// (`migrate_usdce`, `merge`). For the maintenance path which retries
 /// with gas escalation, see [`submit_safe_tx_onchain_with_gas`] and
 /// [`broadcast_with_escalation`].
 ///
