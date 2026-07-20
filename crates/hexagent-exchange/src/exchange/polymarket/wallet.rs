@@ -11,8 +11,6 @@ use super::deploy_wallet::{
 };
 use super::signer::{derive_eth_address_from_key, parse_signature_type, SignatureType};
 
-/// Native Circle USDC on Polygon PoS.
-const USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 /// Bridged USDC.e, the legacy Polymarket v1 collateral.
 const USDCE_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 /// Polymarket USD (pUSD) — the v2 collateral token. 6 decimals, same
@@ -482,33 +480,19 @@ fn fetch_usdce_balance(safe_address: &str) -> f64 {
     fetch_erc20_balance_6dec(USDCE_ADDRESS, safe_address)
 }
 
-/// Fetch native Polygon USDC balance directly from chain via eth_call.
-fn fetch_usdc_balance(safe_address: &str) -> f64 {
-    fetch_erc20_balance_6dec(USDC_ADDRESS, safe_address)
-}
-
 /// Fetch pUSD (v2 collateral) balance via eth_call.
 fn fetch_pusd_balance(safe_address: &str) -> f64 {
     fetch_erc20_balance_6dec(PUSD_ADDRESS, safe_address)
 }
 
 /// Print the Safe's stablecoin balances with **pUSD (v2 collateral) as the
-/// primary line**, followed by native USDC and bridged USDC.e. When either
-/// backing asset remains, nudge the operator to wrap it into pUSD (the token
-/// the v2 bot trades). Returns `(pusd, usdc, usdce)` for downstream use.
-fn print_stablecoin_balances(safe_address: &str) -> (f64, f64, f64) {
+/// primary line**, followed by bridged USDC.e. Native USDC is intentionally
+/// omitted from `hexbot deposit`. When USDC.e remains, nudge the operator to
+/// wrap it into pUSD (the token the v2 bot trades).
+fn print_stablecoin_balances(safe_address: &str) {
     let pusd = fetch_pusd_balance(safe_address);
-    let usdc = fetch_usdc_balance(safe_address);
     let usdce = fetch_usdce_balance(safe_address);
     println!("{:<6} balance: {:>12.6}   (v2 collateral — used for trading)", "pUSD", pusd);
-    if usdc.abs() < 0.000001 {
-        println!("{:<6} balance: {:>12.6}", "USDC", usdc);
-    } else {
-        println!(
-            "{:<6} balance: {:>12.6}   ⚠ native USDC can't be wrapped (Onramp paused) — swap it to USDC.e first",
-            "USDC", usdc,
-        );
-    }
     if usdce.abs() < 0.000001 {
         println!("{:<6} balance: {:>12.6}", "USDC.e", usdce);
     } else {
@@ -517,7 +501,6 @@ fn print_stablecoin_balances(safe_address: &str) -> (f64, f64, f64) {
             "USDC.e", usdce,
         );
     }
-    (pusd, usdc, usdce)
 }
 
 /// Generic 6-decimal ERC-20 balance reader. USDC, USDC.e, and pUSD all
@@ -588,7 +571,7 @@ pub fn run_deposit() -> Result<()> {
     }
     println!("Deployed");
 
-    // Balances — pUSD (v2 collateral), native USDC, and bridged USDC.e.
+    // Balances — pUSD (v2 collateral) and bridged USDC.e.
     print_stablecoin_balances(&primary);
 
     println!();
