@@ -20,6 +20,8 @@
 
 use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::auth::PolyAuth;
 use super::deploy_wallet::{
@@ -110,7 +112,6 @@ const WRAP_SELECTOR: [u8; 4] = [0x62, 0x35, 0x56, 0x38]; // wrap(address,address
 const UNWRAP_SELECTOR: [u8; 4] = [0x8c, 0xc7, 0x10, 0x4f]; // unwrap(address,address,uint256)
 const APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
 const SET_APPROVAL_FOR_ALL_SELECTOR: [u8; 4] = [0xa2, 0x2c, 0xb4, 0x65]; // setApprovalForAll(address,bool)
-const NONCE_SELECTOR: [u8; 4] = [0xaf, 0xfe, 0xd0, 0xe0]; // nonce()
 const U256_MAX_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 // Relayer requires the batch deadline within a window ending at now+300s;
 // 240 was rejected "deadline too soon", so sit near the max (leaves ~10s
@@ -120,6 +121,59 @@ const BATCH_DEADLINE_SECS: u64 = 290;
 struct Call {
     target: String,
     data: String, // 0x-hex calldata; value is always 0
+}
+
+static WALLET_SUBMIT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static PENDING_WALLET_ACTIONS: OnceLock<Mutex<HashMap<String, PendingWalletAction>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct PendingWalletAction {
+    transaction_id: String,
+    nonce: u128,
+}
+
+fn wallet_submit_lock(signer: &str) -> Result<Arc<Mutex<()>>> {
+    let locks = WALLET_SUBMIT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| anyhow!("WALLET submit lock registry poisoned"))?;
+    Ok(locks
+        .entry(signer.to_ascii_lowercase())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
+}
+
+fn pending_wallet_action(signer: &str) -> Result<Option<PendingWalletAction>> {
+    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let actions = actions
+        .lock()
+        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
+    Ok(actions.get(&signer.to_ascii_lowercase()).cloned())
+}
+
+fn remember_wallet_action(signer: &str, transaction_id: String, nonce: u128) -> Result<()> {
+    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut actions = actions
+        .lock()
+        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
+    actions.insert(
+        signer.to_ascii_lowercase(),
+        PendingWalletAction {
+            transaction_id,
+            nonce,
+        },
+    );
+    Ok(())
+}
+
+fn forget_wallet_action(signer: &str) -> Result<()> {
+    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut actions = actions
+        .lock()
+        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
+    actions.remove(&signer.to_ascii_lowercase());
+    Ok(())
 }
 
 fn deposit_wallet_domain_separator(dw: &str) -> [u8; 32] {
@@ -132,32 +186,39 @@ fn deposit_wallet_domain_separator(dw: &str) -> [u8; 32] {
     ]))
 }
 
-/// Read the deposit wallet's current batch `nonce()`.
-fn dw_nonce(dw: &str) -> Result<u128> {
-    let data = format!("0x{}", hex::encode(NONCE_SELECTOR));
-    let res = super::deploy_wallet::eth_call(dw, &data)
-        .ok_or_else(|| anyhow!("eth_call nonce() on {} returned nothing", dw))?;
-    let bytes = hex::decode(res.strip_prefix("0x").unwrap_or(&res)).unwrap_or_default();
-    let mut buf = [0u8; 16];
-    if bytes.len() >= 16 {
-        buf.copy_from_slice(&bytes[bytes.len() - 16..]);
+fn parse_nonce_value(value: &serde_json::Value) -> Option<u128> {
+    if let Some(nonce) = value.as_str() {
+        return nonce.parse::<u128>().ok();
     }
-    Ok(u128::from_be_bytes(buf))
+    value.as_u64().map(u128::from)
 }
 
-/// Sign + submit a relayer `type:"WALLET"` batch. Returns the tx id.
-fn submit_wallet_batch(
+fn parse_wallet_nonce(json: &serde_json::Value) -> Result<u128> {
+    let value = json
+        .get("nonce")
+        .ok_or_else(|| anyhow!("relayer WALLET nonce response has no nonce: {}", json))?;
+    parse_nonce_value(value)
+        .ok_or_else(|| anyhow!("invalid relayer WALLET nonce value: {}", value))
+}
+
+/// Fetch the relayer-owned WALLET nonce for the signer EOA. This is
+/// intentionally not the deposit-wallet contract's on-chain `nonce()`:
+/// the relayer can reserve an action before that on-chain nonce advances.
+fn relayer_wallet_nonce(builder_auth: &PolyAuth, signer: &str) -> Result<u128> {
+    let path = format!("/nonce?address={}&type=WALLET", signer);
+    let headers = builder_auth.sign_request("GET", &path, "");
+    let json = relayer_get(format!("{}{}", RELAYER_URL, path), headers)?;
+    parse_wallet_nonce(&json)
+}
+
+fn build_wallet_batch_body(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
-    builder_auth: &PolyAuth,
     calls: &[Call],
-    now_secs: u64,
-    dry_run: bool,
+    nonce: u128,
+    deadline: u64,
 ) -> Result<String> {
-    let nonce = dw_nonce(dw)?;
-    let deadline = now_secs + BATCH_DEADLINE_SECS;
-
     let call_typehash = keccak256(b"Call(address target,uint256 value,bytes data)");
     let mut calls_concat = Vec::with_capacity(calls.len() * 32);
     let mut calls_json = Vec::with_capacity(calls.len());
@@ -191,7 +252,7 @@ fn submit_wallet_batch(
     sb[64] = recid.to_byte() + 27;
     let signature = format!("0x{}", hex::encode(sb));
 
-    let body = serde_json::json!({
+    Ok(serde_json::json!({
         "type": "WALLET",
         "from": eoa,
         "to": DEPOSIT_WALLET_FACTORY,
@@ -202,26 +263,196 @@ fn submit_wallet_batch(
             "deadline": deadline.to_string(),
             "calls": calls_json,
         }
-    });
-    let body_str = body.to_string();
-    if dry_run {
-        println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
-        return Ok(String::new());
+    })
+    .to_string())
+}
+
+fn is_terminal_wallet_state(state: &str) -> bool {
+    matches!(
+        state,
+        "STATE_CONFIRMED" | "STATE_FAILED" | "STATE_INVALID"
+    )
+}
+
+fn action_matches_signer_nonce(action: &serde_json::Value, signer: &str, nonce: u128) -> bool {
+    let from = action
+        .get("from")
+        .or_else(|| action.get("owner"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let action_nonce = action.get("nonce").and_then(parse_nonce_value);
+    from.eq_ignore_ascii_case(signer) && action_nonce == Some(nonce)
+}
+
+/// Refresh a known action by its transaction ID. Returns `false` only when
+/// `/transaction` has no record yet, allowing the caller to fall back to the
+/// signer+nonce scan of `/transactions`.
+fn reconcile_wallet_transaction_id(
+    builder_auth: &PolyAuth,
+    signer: &str,
+    transaction_id: &str,
+    nonce: u128,
+) -> Result<bool> {
+    match super::wallet::poll_transaction(builder_auth, transaction_id) {
+        Ok((state, _hash)) if state.is_empty() => Ok(false),
+        Ok((state, hash)) if is_terminal_wallet_state(&state) => {
+            println!(
+                "   previous WALLET action resolved: txID={} nonce={} state={} tx={}",
+                transaction_id, nonce, state, hash
+            );
+            forget_wallet_action(signer)?;
+            Ok(true)
+        }
+        Ok((state, hash)) => Err(anyhow!(
+            "previous WALLET action is still active: txID={} nonce={} state={} tx={}; refusing a new submission",
+            transaction_id,
+            nonce,
+            state,
+            hash,
+        )),
+        Err(e) if e.to_string().contains("Transaction failed") => {
+            println!(
+                "   previous WALLET action failed: txID={} nonce={} ({})",
+                transaction_id, nonce, e
+            );
+            forget_wallet_action(signer)?;
+            Ok(true)
+        }
+        Err(e) => Err(anyhow!(
+            "could not refresh previous WALLET action txID={} nonce={}: {}; refusing a new submission",
+            transaction_id,
+            nonce,
+            e,
+        )),
     }
+}
+
+/// Reconcile an old action before considering a new submission. A locally
+/// remembered transaction ID is authoritative and queried first. If it is
+/// unavailable (including after a restart), `/transactions` is filtered by
+/// the exact `(from=signer, nonce)` pair. A still-active match is a hard stop.
+fn reconcile_previous_wallet_action(
+    builder_auth: &PolyAuth,
+    signer: &str,
+    fallback_nonce: u128,
+) -> Result<()> {
+    let remembered = pending_wallet_action(signer)?;
+    let lookup_nonce = remembered
+        .as_ref()
+        .map(|action| action.nonce)
+        .unwrap_or(fallback_nonce);
+
+    if let Some(action) = remembered {
+        if reconcile_wallet_transaction_id(
+            builder_auth,
+            signer,
+            &action.transaction_id,
+            action.nonce,
+        )? {
+            return Ok(());
+        }
+    }
+
+    let path = "/transactions";
+    let headers = builder_auth.sign_request("GET", path, "");
+    let json = relayer_get(format!("{}{}", RELAYER_URL, path), headers)?;
+    let actions = json
+        .as_array()
+        .ok_or_else(|| anyhow!("relayer /transactions returned non-array: {}", json))?;
+    for action in actions {
+        if !action_matches_signer_nonce(action, signer, lookup_nonce) {
+            continue;
+        }
+        let listed_state = action.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let tx_id = action
+            .get("transactionID")
+            .and_then(|v| v.as_str());
+        if let Some(tx_id) = tx_id {
+            if reconcile_wallet_transaction_id(
+                builder_auth,
+                signer,
+                tx_id,
+                lookup_nonce,
+            )? {
+                continue;
+            }
+        }
+        if is_terminal_wallet_state(listed_state) {
+            forget_wallet_action(signer)?;
+            continue;
+        }
+        return Err(anyhow!(
+            "previous relayer action matched by signer+nonce and is still active: txID={} nonce={} state={}; refusing a new submission",
+            tx_id.unwrap_or("UNKNOWN"),
+            lookup_nonce,
+            if listed_state.is_empty() { "UNKNOWN" } else { listed_state },
+        ));
+    }
+    Ok(())
+}
+
+fn wallet_busy_error(
+    builder_auth: &PolyAuth,
+    signer: &str,
+    nonce: u128,
+    submit_error: anyhow::Error,
+) -> anyhow::Error {
+    match reconcile_previous_wallet_action(builder_auth, signer, nonce) {
+        Ok(()) => anyhow!(
+            "{}; queried prior WALLET action by transaction_id, then signer={} nonce={} fallback, but none remained active; not resubmitting automatically",
+            submit_error,
+            signer,
+            nonce,
+        ),
+        Err(status) => anyhow!("{}; prior WALLET action status: {}", submit_error, status),
+    }
+}
+
+/// Sign + submit a relayer `type:"WALLET"` batch. Returns the tx id.
+fn submit_wallet_batch(
+    key: &SigningKey,
+    eoa: &str,
+    dw: &str,
+    builder_auth: &PolyAuth,
+    calls: &[Call],
+    dry_run: bool,
+) -> Result<String> {
+    // Serialize only this signer. Different accounts remain concurrent, while
+    // two strategies sharing one signer cannot race on the same fresh nonce.
+    let submit_lock = wallet_submit_lock(eoa)?;
+    let _submit_guard = submit_lock
+        .lock()
+        .map_err(|_| anyhow!("WALLET submit lock poisoned for {}", eoa))?;
+
+    if !dry_run {
+        // This nonce is only an exact fallback key for reconciliation. The
+        // actual submission fetches again below after old-action status is
+        // known, so its deadline/digest/signature use a post-reconcile nonce.
+        let reconciliation_nonce = relayer_wallet_nonce(builder_auth, eoa)?;
+        reconcile_previous_wallet_action(builder_auth, eoa, reconciliation_nonce)?;
+    }
+
     // The relayer's wallet registry can lag WALLET-CREATE by a few seconds
     // even after the create tx polls STATE_CONFIRMED (observed 2026-07-14:
     // the first batch for a fresh deposit wallet 400'd "wallet … is not
     // registered"). That rejection is transient — retry it on a fixed 5s
-    // backoff for up to ~90s, re-signing the auth headers each attempt.
-    // The EIP-712 Batch itself stays valid across retries (nothing landed,
-    // so the nonce is unchanged, and 90s sits well under the 290s
-    // deadline). Any other error is terminal.
+    // backoff for up to ~90s. Every rejected attempt fetches a fresh relayer
+    // WALLET nonce and rebuilds deadline, digest, and batch signature.
+    // Any ambiguous error (especially wallet-busy) is terminal until the old
+    // action's state has been queried; it is never retried with only a new nonce.
     const REGISTRY_RETRIES: u32 = 18;
     let mut attempt = 0u32;
-    let json = loop {
+    let (json, submitted_nonce) = loop {
+        let nonce = relayer_wallet_nonce(builder_auth, eoa)?;
+        let deadline = now_secs()? + BATCH_DEADLINE_SECS;
+        let body_str = build_wallet_batch_body(key, eoa, dw, calls, nonce, deadline)?;
+        if dry_run {
+            println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
+            return Ok(String::new());
+        }
         let headers = builder_auth.sign_request("POST", "/submit", &body_str);
         match relayer_post(format!("{}/submit", RELAYER_URL), headers, body_str.clone()) {
-            Ok(json) => break json,
+            Ok(json) => break (json, nonce),
             Err(e) if attempt < REGISTRY_RETRIES && e.to_string().contains("is not registered") => {
                 attempt += 1;
                 println!(
@@ -229,6 +460,9 @@ fn submit_wallet_batch(
                     attempt, REGISTRY_RETRIES
                 );
                 std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            Err(e) if e.to_string().contains("wallet busy") => {
+                return Err(wallet_busy_error(builder_auth, eoa, nonce, e));
             }
             Err(e) => return Err(e),
         }
@@ -238,8 +472,19 @@ fn submit_wallet_batch(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("WALLET batch returned no transactionID: {}", json))?
         .to_string();
+    if let Err(e) = remember_wallet_action(eoa, tx_id.clone(), submitted_nonce) {
+        log::warn!(
+            "could not remember submitted WALLET action txID={} nonce={}: {}",
+            tx_id,
+            submitted_nonce,
+            e
+        );
+    }
     println!("   WALLET batch submitted (txID={}) — polling …", tx_id);
     let tx_hash = poll_relayer_tx(builder_auth, &tx_id)?;
+    if let Err(e) = forget_wallet_action(eoa) {
+        log::warn!("could not clear confirmed WALLET action txID={}: {}", tx_id, e);
+    }
     println!("   confirmed (tx=0x{})", tx_hash.trim_start_matches("0x"));
     Ok(tx_id)
 }
@@ -356,7 +601,7 @@ pub(crate) fn dw_split(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, /*dry_run=*/ false)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, /*dry_run=*/ false)
 }
 
 /// Redeem a matured condition FROM the deposit wallet, via `redeemPositions`
@@ -374,7 +619,7 @@ pub(crate) fn dw_redeem(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: redeem_calldata(PUSD_TOKEN, condition_id),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, /*dry_run=*/ false)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, /*dry_run=*/ false)
 }
 
 /// `mergePositions(collateral, 0, conditionId, [1,2], amount)` — burns
@@ -420,7 +665,7 @@ pub(crate) fn dw_merge(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: merge_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
 }
 
 /// Set the DW's v2 allowances in one WALLET batch. Each allowance already
@@ -480,7 +725,7 @@ pub(crate) fn dw_approvals(
         println!("  All DW allowances already set — skipping WALLET batch.");
         return Ok(String::new());
     }
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
 }
 
 /// Wrap `amount_wei` of a supported backing `asset` (USDC or USDC.e) into
@@ -494,7 +739,7 @@ pub(crate) fn dw_onramp(
         Call { target: asset.to_string(), data: approve_calldata(ONRAMP) },
         Call { target: ONRAMP.to_string(), data: onramp_wrap_calldata(asset, dw, amount_wei) },
     ];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
 }
 
 /// Withdraw the DW's pUSD as a supported backing `asset` (USDC or USDC.e)
@@ -511,7 +756,7 @@ pub(crate) fn dw_offramp_withdraw(
         Call { target: OFFRAMP.to_string(), data: offramp_unwrap_calldata(asset, dw, amount_wei) },
         Call { target: asset.to_string(), data: erc20_transfer_calldata(recipient, amount_wei) },
     ];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
 }
 
 /// Transfer `amount_wei` of an ERC-20 (`token`) FROM the DW to `to`
@@ -521,7 +766,7 @@ pub(crate) fn dw_transfer_erc20(
     token: &str, to: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
     let calls = vec![Call { target: token.to_string(), data: erc20_transfer_calldata(to, amount_wei) }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, now_secs()?, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
 }
 
 /// Resolve the deposit-wallet address for `eoa`: prefer the configured
@@ -711,7 +956,7 @@ fn poll_relayer_tx(builder_auth: &PolyAuth, tx_id: &str) -> Result<String> {
                     return Ok(hash);
                 }
                 if state == "STATE_FAILED" || state == "STATE_INVALID" {
-                    return Err(anyhow!("relayer reports WALLET-CREATE {}", state));
+                    return Err(anyhow!("relayer transaction {} is {}", tx_id, state));
                 }
                 // else: still pending — keep polling.
             }
@@ -725,7 +970,29 @@ fn poll_relayer_tx(builder_auth: &PolyAuth, tx_id: &str) -> Result<String> {
             }
         }
     }
-    Err(anyhow!("WALLET-CREATE not confirmed after polling"))
+
+    // The bounded poll expired. Query the same transaction one final time and
+    // report its authoritative action state. The caller must not respond by
+    // fetching another nonce and blindly submitting the same calls again.
+    match super::wallet::poll_transaction(builder_auth, tx_id) {
+        Ok((state, hash)) if state == "STATE_CONFIRMED" && !hash.is_empty() => {
+            Ok(hash)
+        }
+        Ok((state, hash)) if matches!(state.as_str(), "STATE_FAILED" | "STATE_INVALID") => {
+            Err(anyhow!("relayer transaction {} is {} (tx={})", tx_id, state, hash))
+        }
+        Ok((state, hash)) => Err(anyhow!(
+            "relayer polling timed out; old WALLET action txID={} remains state={} tx={}; refusing automatic resubmission",
+            tx_id,
+            if state.is_empty() { "UNKNOWN" } else { &state },
+            hash,
+        )),
+        Err(e) => Err(anyhow!(
+            "relayer polling timed out; final status query for old WALLET action txID={} failed: {}; refusing automatic resubmission",
+            tx_id,
+            e,
+        )),
+    }
 }
 
 /// Pull the deployed wallet address out of the `WalletDeployed` log in the
@@ -1018,9 +1285,96 @@ fn relayer_post(
     })
 }
 
+fn relayer_get(
+    url: String,
+    headers: super::auth::AuthHeaders,
+) -> Result<serde_json::Value> {
+    let client = crate::async_rt::http_client();
+    crate::async_rt::block_on_runtime(async move {
+        let mut req = client.get(&url);
+        for (k, v) in headers.as_builder_pairs() {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(|e| anyhow!("{}: {}", url, e))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("{} ({}): {}", url, status, text));
+        }
+        serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} ({})", url, e, text))
+    })
+}
+
 #[cfg(test)]
 mod derive_tests {
     use super::*;
+
+    #[test]
+    fn wallet_nonce_response_accepts_string_and_number() {
+        assert_eq!(
+            parse_wallet_nonce(&serde_json::json!({"nonce": "1873"})).unwrap(),
+            1873
+        );
+        assert_eq!(
+            parse_wallet_nonce(&serde_json::json!({"nonce": 1874})).unwrap(),
+            1874
+        );
+        assert!(parse_wallet_nonce(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn wallet_action_fallback_requires_exact_signer_and_nonce() {
+        let signer = "0x111111111111111111111111111111111111AaAa";
+        let action = serde_json::json!({
+            "from": "0x111111111111111111111111111111111111aaaa",
+            "nonce": "1873",
+            "type": "WALLET",
+            "state": "STATE_EXECUTED",
+        });
+        assert!(action_matches_signer_nonce(&action, signer, 1873));
+        assert!(!action_matches_signer_nonce(&action, signer, 1874));
+        assert!(!action_matches_signer_nonce(
+            &action,
+            "0x2222222222222222222222222222222222222222",
+            1873,
+        ));
+
+        let different_type = serde_json::json!({
+            "from": signer,
+            "nonce": 1873,
+            "type": "SAFE",
+        });
+        assert!(action_matches_signer_nonce(&different_type, signer, 1873));
+    }
+
+    #[test]
+    fn wallet_batch_rebuilds_signature_for_nonce_and_deadline() {
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let eoa = "0x1111111111111111111111111111111111111111";
+        let dw = "0x2222222222222222222222222222222222222222";
+        let calls = vec![Call {
+            target: "0x3333333333333333333333333333333333333333".to_string(),
+            data: "0x1234".to_string(),
+        }];
+
+        let first: serde_json::Value = serde_json::from_str(
+            &build_wallet_batch_body(&key, eoa, dw, &calls, 1873, 2_000_000_000).unwrap(),
+        )
+        .unwrap();
+        let new_nonce: serde_json::Value = serde_json::from_str(
+            &build_wallet_batch_body(&key, eoa, dw, &calls, 1874, 2_000_000_000).unwrap(),
+        )
+        .unwrap();
+        let new_deadline: serde_json::Value = serde_json::from_str(
+            &build_wallet_batch_body(&key, eoa, dw, &calls, 1873, 2_000_000_001).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(first["nonce"], "1873");
+        assert_eq!(first["depositWalletParams"]["deadline"], "2000000000");
+        assert_ne!(first["signature"], new_nonce["signature"]);
+        assert_ne!(first["signature"], new_deadline["signature"]);
+    }
 
     /// Known mainnet pair (relayer WALLET-CREATE tx `0x176477af…`,
     /// 2026-07-14): owner EOA → BeaconProxy-era deposit wallet. Pins the
