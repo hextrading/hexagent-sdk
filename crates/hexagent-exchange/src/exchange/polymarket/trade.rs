@@ -94,6 +94,11 @@ fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
 pub(crate) enum HttpErr {
     Timeout,
     Status(u16, String),
+    /// The request failed while reqwest was sending it or receiving the
+    /// response, without an HTTP status. For an order-placement POST the
+    /// server may still have accepted the signed order, so submit callers
+    /// must reconcile it instead of treating it as a definitive rejection.
+    Transport(String),
     Other(String),
 }
 
@@ -102,6 +107,7 @@ impl std::fmt::Display for HttpErr {
         match self {
             HttpErr::Timeout => write!(f, "timeout"),
             HttpErr::Status(code, body) => write!(f, "status {} ({})", code, body),
+            HttpErr::Transport(s) => write!(f, "transport: {}", s),
             HttpErr::Other(s) => write!(f, "{}", s),
         }
     }
@@ -119,10 +125,10 @@ impl HttpErr {
     /// (NewOrderTimeout / CancelOrderTimeout) so the orphan reconciler can
     /// resolve state by re-querying.
     ///
-    /// HTTP 4xx (other than 425), JSON parse errors, and other Transport
-    /// errors are definitive rejections — the request reached the server
-    /// and was rejected cleanly, so state is known (no order placed / no
-    /// cancel performed).
+    /// HTTP 4xx (other than 425) is a definitive server response. Local
+    /// errors and response parse errors are also excluded here. A
+    /// status-less transport error is deliberately handled by the separate
+    /// placement-only classifier below, so cancel/GET behavior is unchanged.
     ///
     /// **425 Too Early** is treated as unknown_state (transient server
     /// backpressure, NOT a definitive rejection). Polymarket emits 425 at
@@ -136,12 +142,23 @@ impl HttpErr {
         match self {
             HttpErr::Timeout => true,
             HttpErr::Status(code, _) => *code >= 500 || *code == 425,
+            HttpErr::Transport(_) => false,
             HttpErr::Other(_) => false,
         }
     }
+
+    /// Placement-only unknown-state classification. A status-less reqwest
+    /// failure happens after the signed POST has been handed to the HTTP
+    /// stack, so the exchange may have accepted the order even though no
+    /// response reached us. Keep this separate from `is_unknown_state` so
+    /// adding the transport case does not change cancel/GET semantics.
+    pub(crate) fn is_submit_unknown_state(&self) -> bool {
+        self.is_unknown_state() || matches!(self, HttpErr::Transport(_))
+    }
 }
 
-/// Classify a reqwest error into our HttpErr taxonomy.
+/// Classify a reqwest HTTP-I/O error into our `HttpErr` taxonomy without
+/// relying on its human-readable message.
 fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
     if e.is_timeout() || e.is_connect() {
         // connect-timeout is functionally equivalent to a read timeout
@@ -149,6 +166,14 @@ fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
         HttpErr::Timeout
     } else if let Some(status) = e.status() {
         HttpErr::Status(status.as_u16(), e.to_string())
+    } else if e.is_request() || e.is_body() {
+        // `is_request` is reqwest's structured category for a failure while
+        // sending the request; `is_body` covers a response-body I/O failure.
+        HttpErr::Transport(e.to_string())
+    } else if e.is_builder() || e.is_redirect() || e.is_decode() {
+        // These fail locally or while decoding a response; they are not the
+        // status-less HTTP I/O failure covered by the placement fix.
+        HttpErr::Other(e.to_string())
     } else {
         HttpErr::Other(e.to_string())
     }
@@ -523,6 +548,7 @@ fn latency_record_status(reply: &HttpReply) -> String {
         Ok(_) => "ok".to_string(),
         Err(HttpErr::Timeout) => "timeout".to_string(),
         Err(HttpErr::Status(code, _)) => format!("http_{}", code),
+        Err(HttpErr::Transport(_)) => "transport_error".to_string(),
         Err(HttpErr::Other(_)) => "error".to_string(),
     }
 }
@@ -684,10 +710,12 @@ async fn execute_http_on(
         let body = resp.text().await.unwrap_or_default();
         return Err(HttpErr::Status(status.as_u16(), body));
     }
-    match resp.json::<serde_json::Value>().await {
-        Ok(v) => Ok(v),
-        Err(e) => Err(HttpErr::Other(format!("json parse: {}", e))),
-    }
+    // Split response-body transport from JSON syntax/shape errors. Using
+    // `Response::json` would wrap both in `reqwest::Error`, losing the exact
+    // distinction needed by placement reconciliation.
+    let bytes = resp.bytes().await.map_err(map_reqwest_err)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| HttpErr::Other(format!("json parse: {}", e)))
 }
 
 /// User-feed gap-replay tuning (sourced from `exchanges[polymarket]`). All
@@ -3130,7 +3158,7 @@ impl PolymarketTrade {
     ) -> OrderUpdate {
         let resp = match reply {
             Ok(r) => r,
-            Err(e) if e.is_unknown_state() => {
+            Err(e) if e.is_submit_unknown_state() => {
                 if self.shared.should_warn_unknown_state(&e) {
                     warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
                         e, order.client_order_id, &local_oid[..18.min(local_oid.len())]);
@@ -3138,13 +3166,10 @@ impl PolymarketTrade {
                 return Self::make_timeout_place(order, Some(local_oid));
             }
             Err(e) => {
-                // Non-timeout HTTP error (e.g. 4xx parse error, transport
-                // failure that's NOT classified as unknown_state). The
-                // server's state is ambiguous in transport errors but we
-                // already commit to "Rejected" semantics here, so clear
-                // both `coid_to_oid` and `open_orders` to keep our local
-                // tracking consistent — otherwise `handle_balance_error`
-                // would later snapshot a phantom coid.
+                // Explicit HTTP 4xx or a non-transport local/parse error.
+                // Status-less request/body I/O failures cannot reach this
+                // branch: `is_submit_unknown_state` routed them above.
+                // Clear local active tracking before emitting Rejected.
                 let err_s = e.to_string();
                 if SharedState::is_balance_error(&err_s) {
                     self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
@@ -3761,7 +3786,7 @@ impl ExchangeTrade for PolymarketTrade {
                         accepted_coids, rejected_coids,
                     );
                 }
-                Err(e) if e.is_unknown_state() => {
+                Err(e) if e.is_submit_unknown_state() => {
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Submit unknown state ({}) coids={:?} → NewOrderTimeout",
@@ -3778,9 +3803,9 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    // HTTP 4xx or other definitive error — the server rejected
-                    // the batch cleanly (no order placed). Emit Rejected for
-                    // all orders in the chunk.
+                    // HTTP 4xx or a non-transport local/parse error (outside
+                    // this fix's transport scope). Emit Rejected for all
+                    // orders in the chunk.
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Use the first chunk order's side+symbol as the
@@ -4507,8 +4532,9 @@ impl ExchangeTrade for PolymarketTrade {
                         accepted_coids, rejected_coids,
                     );
                 }
-                Err(e) if e.is_unknown_state() => {
-                    // Timeout, HTTP 5xx, or 425 — server state is unknown.
+                Err(e) if e.is_submit_unknown_state() => {
+                    // Timeout, status-less transport failure, HTTP 5xx, or
+                    // 425 — server state is unknown.
                     // Emit NewOrderTimeout with the pre-computed orderID so
                     // the strategy can cancel / status-query by orderID
                     // directly, no open-order scan needed.
@@ -4524,10 +4550,9 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    // HTTP 4xx or other definitive error — server rejected
-                    // the request cleanly (no order placed). Strategy's
-                    // OrderManager will mark these as Rejected locally and
-                    // stop issuing cancels for them.
+                    // HTTP 4xx or a non-transport local/parse error (outside
+                    // this fix's transport scope). Strategy's OrderManager
+                    // will mark these as Rejected locally.
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Pick the first place_chunk order (mapped via
@@ -4871,6 +4896,35 @@ mod tests {
         assert!(
             !HttpErr::Status(404, "not found".to_string()).is_unknown_state(),
             "404 is a definitive answer — must NOT be unknown_state"
+        );
+    }
+
+    /// A status-less reqwest send failure is ambiguous only for placement
+    /// handlers. This guards against both the original false rejection and
+    /// accidentally broadening cancel/GET behavior by changing the shared
+    /// classifier.
+    #[test]
+    fn transport_error_is_unknown_for_submit_only() {
+        let transport = HttpErr::Transport(
+            "error sending request for url (https://clob.polymarket.com/order)".to_string(),
+        );
+        assert!(
+            transport.is_submit_unknown_state(),
+            "a placement POST may have landed before its transport failed"
+        );
+        assert!(
+            !transport.is_unknown_state(),
+            "the shared cancel/GET classifier must retain its existing behavior"
+        );
+        assert!(
+            !HttpErr::Other("json parse: invalid response".to_string())
+                .is_submit_unknown_state(),
+            "local/parse errors must not be swept into the transport fix"
+        );
+        assert!(
+            !HttpErr::Status(400, "bad request".to_string())
+                .is_submit_unknown_state(),
+            "an explicit HTTP 400 response remains a definitive rejection"
         );
     }
 
