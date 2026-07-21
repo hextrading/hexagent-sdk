@@ -126,6 +126,12 @@ struct Call {
 static WALLET_SUBMIT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static PENDING_WALLET_ACTIONS: OnceLock<Mutex<HashMap<String, PendingWalletAction>>> =
     OnceLock::new();
+// The relayer ultimately broadcasts WALLET maintenance actions through its own
+// Polygon transaction pipeline. Keep cross-account maintenance bursts out of
+// that pipeline: after one action is accepted, no other maintenance signer may
+// submit until the accepted action has left STATE_NEW. Per-signer locks below
+// still protect each wallet's action nonce for the remainder of its lifecycle.
+static WALLET_NEW_STATE_SUBMIT_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct PendingWalletAction {
@@ -274,6 +280,44 @@ fn is_terminal_wallet_state(state: &str) -> bool {
     )
 }
 
+fn wallet_action_blocks_next_submit(state: &str) -> bool {
+    state.is_empty() || state == "STATE_NEW"
+}
+
+/// Hold the cross-account submit gate until the relayer has indexed and begun
+/// processing this action. There is deliberately no timeout: releasing while
+/// the action is still STATE_NEW would recreate the burst that this gate is
+/// intended to prevent. A terminal relayer error also means the action has
+/// left STATE_NEW; the normal poll below will surface its full error.
+fn wait_wallet_action_leaves_new(builder_auth: &PolyAuth, tx_id: &str) {
+    loop {
+        match super::wallet::poll_transaction(builder_auth, tx_id) {
+            Ok((state, _hash)) if wallet_action_blocks_next_submit(&state) => {}
+            Ok((state, _hash)) => {
+                println!(
+                    "   WALLET batch left STATE_NEW (txID={} state={}) — releasing global submit gate",
+                    tx_id, state,
+                );
+                return;
+            }
+            Err(e) if e.to_string().contains("Transaction failed") => {
+                println!(
+                    "   WALLET batch left STATE_NEW with terminal failure (txID={}) — releasing global submit gate",
+                    tx_id,
+                );
+                return;
+            }
+            Err(e) => {
+                println!(
+                    "   WALLET STATE_NEW gate poll error for txID={} (retrying): {}",
+                    tx_id, e,
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn action_matches_signer_nonce(action: &serde_json::Value, signer: &str, nonce: u128) -> bool {
     let from = action
         .get("from")
@@ -415,6 +459,7 @@ fn submit_wallet_batch(
     dw: &str,
     builder_auth: &PolyAuth,
     calls: &[Call],
+    gate_maintenance_until_started: bool,
     dry_run: bool,
 ) -> Result<String> {
     // Serialize only this signer. Different accounts remain concurrent, while
@@ -431,6 +476,20 @@ fn submit_wallet_batch(
         let reconciliation_nonce = relayer_wallet_nonce(builder_auth, eoa)?;
         reconcile_previous_wallet_action(builder_auth, eoa, reconciliation_nonce)?;
     }
+
+    // For maintenance calls, serialize only the acceptance phase across every
+    // signer. Once this action leaves STATE_NEW the guard is dropped and its
+    // confirmation poll continues concurrently with the next account's submit.
+    let global_submit_gate = WALLET_NEW_STATE_SUBMIT_GATE.get_or_init(|| Mutex::new(()));
+    let global_submit_guard = if dry_run || !gate_maintenance_until_started {
+        None
+    } else {
+        Some(
+            global_submit_gate
+                .lock()
+                .map_err(|_| anyhow!("global WALLET STATE_NEW submit gate poisoned"))?,
+        )
+    };
 
     // The relayer's wallet registry can lag WALLET-CREATE by a few seconds
     // even after the create tx polls STATE_CONFIRMED (observed 2026-07-14:
@@ -481,6 +540,10 @@ fn submit_wallet_batch(
         );
     }
     println!("   WALLET batch submitted (txID={}) — polling …", tx_id);
+    if global_submit_guard.is_some() {
+        wait_wallet_action_leaves_new(builder_auth, &tx_id);
+    }
+    drop(global_submit_guard);
     let tx_hash = poll_relayer_tx(builder_auth, &tx_id)?;
     if let Err(e) = forget_wallet_action(eoa) {
         log::warn!("could not clear confirmed WALLET action txID={}: {}", tx_id, e);
@@ -601,7 +664,15 @@ pub(crate) fn dw_split(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, /*dry_run=*/ false)
+    submit_wallet_batch(
+        key,
+        eoa,
+        dw,
+        builder_auth,
+        &calls,
+        /*gate_maintenance_until_started=*/ true,
+        /*dry_run=*/ false,
+    )
 }
 
 /// Redeem a matured condition FROM the deposit wallet, via `redeemPositions`
@@ -619,7 +690,15 @@ pub(crate) fn dw_redeem(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: redeem_calldata(PUSD_TOKEN, condition_id),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, /*dry_run=*/ false)
+    submit_wallet_batch(
+        key,
+        eoa,
+        dw,
+        builder_auth,
+        &calls,
+        /*gate_maintenance_until_started=*/ true,
+        /*dry_run=*/ false,
+    )
 }
 
 /// `mergePositions(collateral, 0, conditionId, [1,2], amount)` — burns
@@ -665,7 +744,7 @@ pub(crate) fn dw_merge(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: merge_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
     }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
 /// Set the DW's v2 allowances in one WALLET batch. Each allowance already
@@ -725,7 +804,7 @@ pub(crate) fn dw_approvals(
         println!("  All DW allowances already set — skipping WALLET batch.");
         return Ok(String::new());
     }
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
 /// Wrap `amount_wei` of a supported backing `asset` (USDC or USDC.e) into
@@ -739,7 +818,7 @@ pub(crate) fn dw_onramp(
         Call { target: asset.to_string(), data: approve_calldata(ONRAMP) },
         Call { target: ONRAMP.to_string(), data: onramp_wrap_calldata(asset, dw, amount_wei) },
     ];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
 /// Withdraw the DW's pUSD as a supported backing `asset` (USDC or USDC.e)
@@ -756,7 +835,7 @@ pub(crate) fn dw_offramp_withdraw(
         Call { target: OFFRAMP.to_string(), data: offramp_unwrap_calldata(asset, dw, amount_wei) },
         Call { target: asset.to_string(), data: erc20_transfer_calldata(recipient, amount_wei) },
     ];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
 /// Transfer `amount_wei` of an ERC-20 (`token`) FROM the DW to `to`
@@ -766,7 +845,7 @@ pub(crate) fn dw_transfer_erc20(
     token: &str, to: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
     let calls = vec![Call { target: token.to_string(), data: erc20_transfer_calldata(to, amount_wei) }];
-    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, dry_run)
+    submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
 /// Resolve the deposit-wallet address for `eoa`: prefer the configured
@@ -1320,6 +1399,16 @@ mod derive_tests {
             1874
         );
         assert!(parse_wallet_nonce(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn global_submit_gate_waits_for_new_or_unindexed_actions() {
+        assert!(wallet_action_blocks_next_submit(""));
+        assert!(wallet_action_blocks_next_submit("STATE_NEW"));
+        assert!(!wallet_action_blocks_next_submit("STATE_EXECUTED"));
+        assert!(!wallet_action_blocks_next_submit("STATE_CONFIRMED"));
+        assert!(!wallet_action_blocks_next_submit("STATE_FAILED"));
+        assert!(!wallet_action_blocks_next_submit("STATE_INVALID"));
     }
 
     #[test]
