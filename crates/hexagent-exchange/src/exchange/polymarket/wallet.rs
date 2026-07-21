@@ -734,7 +734,7 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
 
 /// Withdraw the deposit wallet's pUSD as a supported backing asset: unwrap
 /// via the Offramp, then transfer that asset to a recipient, atomically in
-/// one gasless WALLET batch. pUSD, USDC, and USDC.e are all 1:1, 6-decimal.
+/// one gasless WALLET batch. pUSD and USDC.e are both 1:1, 6-decimal.
 fn run_withdraw_dw_offramp(
     wallet: &WalletInfo,
     dw: &str,
@@ -1054,7 +1054,7 @@ fn build_approve_calldata(spender: &str, amount_bytes: &[u8; 32]) -> String {
 }
 
 /// ABI-encode `unwrap(address asset, address to, uint256 amount)` for the
-/// CollateralOfframp. `asset` is the underlying to receive (USDC/USDC.e), `to`
+/// CollateralOfframp. `asset` is the underlying USDC.e to receive, `to`
 /// the recipient of that underlying, `amount` the pUSD to burn (6-dec).
 fn build_unwrap_calldata(asset: &str, to: &str, amount_wei: u128) -> String {
     let mut buf = Vec::with_capacity(4 + 96);
@@ -4165,17 +4165,14 @@ mod maintenance_status_tests {
     use super::*;
 
     #[test]
-    fn offramp_calldata_routes_native_and_bridged_usdc() {
+    fn offramp_calldata_routes_bridged_usdc() {
         const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
-        for underlying in [USDC_ADDRESS, USDCE_ADDRESS] {
-            let calldata = build_unwrap_calldata(underlying, RECIPIENT, 42_000_000);
-            let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
-            assert_eq!(&bytes[..4], &UNWRAP_SELECTOR);
-            assert_eq!(&bytes[4..36], &address_to_bytes32(underlying));
-            assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
-            assert_eq!(&bytes[68..100], &u256_bytes(42_000_000));
-        }
-        assert_ne!(USDC_ADDRESS, USDCE_ADDRESS);
+        let calldata = build_unwrap_calldata(USDCE_ADDRESS, RECIPIENT, 42_000_000);
+        let bytes = hex::decode(calldata.trim_start_matches("0x")).unwrap();
+        assert_eq!(&bytes[..4], &UNWRAP_SELECTOR);
+        assert_eq!(&bytes[4..36], &address_to_bytes32(USDCE_ADDRESS));
+        assert_eq!(&bytes[36..68], &address_to_bytes32(RECIPIENT));
+        assert_eq!(&bytes[68..100], &u256_bytes(42_000_000));
     }
 
     #[test]
