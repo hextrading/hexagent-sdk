@@ -821,6 +821,18 @@ mod tests {
         // Position derivation already excludes Failed trades.
         let q = pm.get_quantity("TOKEN");
         assert!(q.abs() < 1e-9, "expected 0, got {}", q);
+
+        // The FAILED tombstone absorbs arbitrary replay and stale earlier
+        // stages without resurrecting inventory, cash, or volume.
+        for _ in 1..118 {
+            assert!(!upsert(&mut pm, "t1", TradeStatus::Failed).applied);
+        }
+        assert!(!upsert(&mut pm, "t1", TradeStatus::Matched).applied);
+        assert!(!upsert(&mut pm, "t1", TradeStatus::Mined).applied);
+        assert!(!upsert(&mut pm, "t1", TradeStatus::Confirmed).applied);
+        assert!(pm.maker_volume.abs() < 1e-9);
+        assert!(pm.get_quantity("TOKEN").abs() < 1e-9);
+        assert!(pm.balance().abs() < 1e-9);
     }
 
     #[test]

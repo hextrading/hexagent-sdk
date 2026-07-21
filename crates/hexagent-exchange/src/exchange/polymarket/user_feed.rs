@@ -6,7 +6,7 @@
 //! async runtime.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::async_rt;
 use crate::types::*;
-use super::live_position::TradeStatus;
+use super::live_position::{LivePositionManager, TradeStatus};
 use super::trade::SharedState;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
@@ -26,6 +26,32 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Record one trade-lifecycle edge and tell the caller whether it is new.
+/// The live ledger owns the terminal/monotonic rules; gating at the feed
+/// boundary prevents replayed terminal trades from reaching reconciliation
+/// or inventory accounting again.
+fn record_trade_transition(
+    live_position: &Mutex<LivePositionManager>,
+    trade_key: &str,
+    status_str: &str,
+    asset_id: &str,
+    side: Side,
+    size: f64,
+    price: f64,
+    is_maker: bool,
+    reason: Option<&str>,
+) -> bool {
+    let Some(status) = TradeStatus::from_str(status_str) else {
+        return false;
+    };
+    if trade_key.is_empty() || size <= 0.0 {
+        return false;
+    }
+    live_position.lock().unwrap().update_trade(
+        trade_key, status, asset_id, side, size, price, is_maker, reason,
+    )
+}
 
 /// Parse a Polymarket user WebSocket event into zero-or-more OrderUpdates.
 /// A single "trade" push from a MAKER perspective may expand into multiple
@@ -99,9 +125,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
             // handle both via the `is_maker` check below.
             //
             // IMPORTANT: Polymarket emits one `trade` push per status
-            // transition (MATCHED → MINED → CONFIRMED); each carries the
-            // full trade object. We re-emit on every transition so the
-            // strategy's ledger can lift records from Matched → Confirmed.
+            // transition (MATCHED → MINED → CONFIRMED/FAILED); each carries
+            // the full trade object. Gap replay can repeat the same object,
+            // so only an edge accepted by `update_trade` is forwarded.
+            // FAILED is terminal: the first edge is forwarded for inventory
+            // reversal; later FAILED or stale earlier states are dropped.
             //
             // Fee fields come from the server under `fee_bps` / `fee_rate_bps`;
             // we ignore them here because the strategy computes fee locally
@@ -200,20 +228,7 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 }
                 None
             };
-            let failure_reason: Option<String> = if status == OrderStatus::Failed {
-                let r = extract_reason(data);
-                if r.is_none() {
-                    // Surface the full payload so we learn the real
-                    // field name. Limited to FAILED so we don't spam
-                    // on the happy path.
-                    warn!("[PolyUserFeed] FAILED trade {} carries no known \
-                          reason field; raw payload: {}",
-                          trade_id, data);
-                }
-                r
-            } else {
-                extract_reason(data)
-            };
+            let failure_reason: Option<String> = extract_reason(data);
             let reason_ref: Option<&str> = failure_reason.as_deref();
 
             let mut updates: Vec<OrderUpdate> = Vec::new();
@@ -241,13 +256,19 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         format!("{}:{}", trade_id, mo_order_id)
                     };
 
-                    if let Some(trade_status) = TradeStatus::from_str(status_str) {
-                        if !leg_id.is_empty() && mo_size > 0.0 {
-                            shared.live_position.lock().unwrap().update_trade(
-                                &leg_id, trade_status, &mo_asset_id, mo_side,
-                                mo_size, mo_price, true, reason_ref,
-                            );
-                        }
+                    let lifecycle_advanced = record_trade_transition(
+                        &shared.live_position,
+                        &leg_id,
+                        status_str,
+                        &mo_asset_id,
+                        mo_side,
+                        mo_size,
+                        mo_price,
+                        true,
+                        reason_ref,
+                    );
+                    if !lifecycle_advanced {
+                        continue;
                     }
 
                     let coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
@@ -273,14 +294,17 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 let matched_amount: f64 = parse_f(data.get("size").or_else(|| data.get("matched_amount")));
                 let price: f64 = parse_f(data.get("price"));
 
-                if let Some(trade_status) = TradeStatus::from_str(status_str) {
-                    if !trade_id.is_empty() && matched_amount > 0.0 {
-                        shared.live_position.lock().unwrap().update_trade(
-                            trade_id, trade_status, &asset_id, side,
-                            matched_amount, price, false, reason_ref,
-                        );
-                    }
-                }
+                let lifecycle_advanced = record_trade_transition(
+                    &shared.live_position,
+                    trade_id,
+                    status_str,
+                    &asset_id,
+                    side,
+                    matched_amount,
+                    price,
+                    false,
+                    reason_ref,
+                );
 
                 // Vacate the taker-matched accelerator buffer for this fill:
                 // the authoritative WS push has arrived (this `OrderUpdate` is
@@ -289,6 +313,10 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 // contributing. Runs BEFORE the OrderUpdate is delivered, so
                 // the strategy never double-counts.
                 shared.taker_matched.on_ws_trade(trade_id);
+
+                if !lifecycle_advanced {
+                    return Vec::new();
+                }
 
                 let coid = shared.lookup_coid(order_id).unwrap_or_default();
 
@@ -308,6 +336,17 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     order_audit: None,
                     error: failure_reason.clone(),
                 });
+            }
+
+            if status == OrderStatus::Failed
+                && failure_reason.is_none()
+                && !updates.is_empty()
+            {
+                // Warn only for the accepted terminal edge. Periodic REST
+                // replay can return the same FAILED trade indefinitely.
+                warn!("[PolyUserFeed] FAILED trade {} carries no known \
+                      reason field; raw payload: {}",
+                      trade_id, data);
             }
 
             updates
@@ -703,4 +742,48 @@ pub fn spawn_user_feed(
         })?;
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(manager: &Mutex<LivePositionManager>, status: &str) -> bool {
+        record_trade_transition(
+            manager,
+            "1651e74c-6358-41d1-b9df-5c5b38bd981e:0xmaker-order",
+            status,
+            "TOKEN",
+            Side::Sell,
+            10.0,
+            0.58,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn failed_is_forwarded_once_then_replay_and_regression_are_dropped() {
+        let manager = Mutex::new(LivePositionManager::new());
+
+        assert!(record(&manager, "MATCHED"));
+        assert!(record(&manager, "FAILED"));
+
+        // Mirrors the live 118-push replay storm: only the first FAILED edge
+        // may reach downstream accounting and reverse MATCHED inventory.
+        for _ in 1..118 {
+            assert!(!record(&manager, "FAILED"));
+        }
+        assert!(!record(&manager, "MATCHED"), "FAILED is terminal");
+        assert!(!record(&manager, "MINED"), "FAILED cannot regress");
+        assert!(!record(&manager, "CONFIRMED"), "FAILED cannot flip terminal");
+    }
+
+    #[test]
+    fn first_sighting_failed_is_forwarded_once_for_tombstoning() {
+        let manager = Mutex::new(LivePositionManager::new());
+
+        assert!(record(&manager, "FAILED"));
+        assert!(!record(&manager, "FAILED"));
+    }
 }
