@@ -156,6 +156,10 @@ impl HttpErr {
         matches!(self, HttpErr::Status(425, _))
     }
 
+    fn is_transport(&self) -> bool {
+        matches!(self, HttpErr::Transport(_))
+    }
+
     fn is_explicit_not_found(&self) -> bool {
         matches!(self, HttpErr::Status(404, _))
     }
@@ -930,7 +934,14 @@ pub struct SharedState {
     /// Placements whose original POST returned HTTP 425, plus their current
     /// run of explicit reconcile not-found results. Unlike the short 425 deadline,
     /// this provenance must survive until a conclusive placement result.
-    pub(crate) place_http_425_reconcile: PlaceHttp425ReconcileState,
+    pub(crate) place_http_425_reconcile: PlaceNotFoundReconcileState,
+
+    /// Placements whose original POST returned a status-less transport error,
+    /// plus their current uninterrupted run of explicit reconcile not-found
+    /// results. This is deliberately separate from timeout/5xx provenance:
+    /// only Transport-origin placements become Rejected after the bounded
+    /// negative-proof window.
+    pub(crate) place_transport_reconcile: PlaceNotFoundReconcileState,
 
     /// Per-coid **exponential backoff** gate for placement not-found GETs:
     /// wall-clock ns before which the next reconcile GET for this coid is
@@ -963,17 +974,18 @@ pub(crate) struct ReconcileAttemptCounters {
     cancel: Mutex<HashMap<String, u32>>,
 }
 
-/// Persistent provenance and consecutive-404 count for placements whose
-/// original POST returned HTTP 425. Presence in the map means "originated
-/// from a place 425"; the value counts only uninterrupted, explicit not-found
-/// reconcile responses. Any other observation resets the value but retains
-/// the provenance marker until the placement reaches a conclusive state.
+/// Persistent placement-failure provenance and consecutive not-found count.
+/// Each instance is scoped to one original POST failure class (for example
+/// HTTP 425 or Transport). Presence in the map retains that provenance; the
+/// value counts only uninterrupted, explicit not-found reconcile responses.
+/// Any other observation resets the value but retains the marker until the
+/// placement reaches a conclusive state.
 #[derive(Default)]
-pub(crate) struct PlaceHttp425ReconcileState {
+pub(crate) struct PlaceNotFoundReconcileState {
     consecutive_not_found: Mutex<HashMap<String, u32>>,
 }
 
-impl PlaceHttp425ReconcileState {
+impl PlaceNotFoundReconcileState {
     fn mark(&self, coid: &str) {
         if !coid.is_empty() {
             self.consecutive_not_found.lock().unwrap().insert(coid.to_string(), 0);
@@ -981,7 +993,7 @@ impl PlaceHttp425ReconcileState {
     }
 
     /// Return the new consecutive count, or `None` for a placement that did
-    /// not originate from an HTTP 425 response.
+    /// not originate from this state's POST failure class.
     fn note_explicit_not_found(&self, coid: &str) -> Option<u32> {
         let mut states = self.consecutive_not_found.lock().unwrap();
         let attempts = states.get_mut(coid)?;
@@ -1038,8 +1050,17 @@ pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
 /// the first explicit not-found response from order reconciliation. The
 /// initial 425 already parks the coid for `HTTP_425_BACKOFF_NS` (10 seconds),
 /// so another multi-attempt window would only prolong a known failed place.
-/// Other placement orphans retain the generic fast-then-cold audit policy.
+/// Timeout and HTTP 5xx placement orphans retain the generic fast-then-cold
+/// audit policy; Transport has its own four-result rule below.
 pub(crate) const PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT: u32 = 1;
+
+/// A placement whose POST returned a status-less Transport error becomes
+/// Rejected after four uninterrupted explicit not-found reconciliation
+/// results. Four observations preserve the live-proven stale-replica grace
+/// period while preventing this specific failure class from remaining an
+/// orphan until settlement. Timeout, HTTP 5xx, 425, and reconcile transport
+/// failures do not use or advance this counter.
+pub(crate) const PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT: u32 = 4;
 
 /// Base interval for the placement not-found retry backoff. The gap before
 /// the Nth GET doubles: 0.5s, 1s, 2s, 4s across attempts 2..5, so the five
@@ -1201,6 +1222,7 @@ impl SharedState {
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
         self.place_http_425_reconcile.clear(client_order_id);
+        self.place_transport_reconcile.clear(client_order_id);
         let now = crate::types::now_ns();
         let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
         if backoffs.remove(client_order_id).is_some() {
@@ -1373,8 +1395,17 @@ impl SharedState {
     /// per-coid backoff prevents an immediate reconcile burst while the
     /// upstream service is still reporting overload.
     pub(crate) fn note_place_http_425(&self, coid: &str) {
+        self.place_transport_reconcile.clear(coid);
         self.place_http_425_reconcile.mark(coid);
         self.note_http_425_backoff(coid);
+    }
+
+    /// Mark a placement whose POST returned a status-less Transport error.
+    /// Reconciliation counts only subsequent uninterrupted explicit
+    /// not-found observations toward the four-result terminal rule.
+    pub(crate) fn note_place_transport(&self, coid: &str) {
+        self.place_http_425_reconcile.clear(coid);
+        self.place_transport_reconcile.mark(coid);
     }
 
     /// True iff this coid's 425 backoff is active. Expired entries are
@@ -1929,7 +1960,8 @@ impl PolymarketTrade {
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
-                place_http_425_reconcile: PlaceHttp425ReconcileState::default(),
+                place_http_425_reconcile: PlaceNotFoundReconcileState::default(),
+                place_transport_reconcile: PlaceNotFoundReconcileState::default(),
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
@@ -2171,6 +2203,7 @@ impl PolymarketTrade {
         self.shared.coid_to_token.lock().unwrap().clear();
         self.shared.pending_reclaim.lock().unwrap().clear();
         self.shared.place_http_425_reconcile.clear_all();
+        self.shared.place_transport_reconcile.clear_all();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -2668,6 +2701,7 @@ impl PolymarketTrade {
                     && self.shared.in_http_425_backoff(coid)
                 {
                     self.shared.place_http_425_reconcile.reset_consecutive(coid);
+                    self.shared.place_transport_reconcile.reset_consecutive(coid);
                     log::debug!(
                         "[PolymarketTrade] Reconcile placement coid={} orderID={}: fetch deferred (HTTP 425 backoff); keeping orphan",
                         coid, oid,
@@ -2675,10 +2709,11 @@ impl PolymarketTrade {
                     continue;
                 }
 
-                // Special terminal rule: only a placement whose original POST
-                // returned HTTP 425 is eligible, and only an uninterrupted run
-                // of explicit server not-found lookup responses advances it.
-                // Any other lookup result breaks the run conservatively.
+                // Source-specific terminal rules. Only placements whose
+                // original POST has matching provenance are eligible, and
+                // only an uninterrupted run of explicit server not-found
+                // lookup responses advances a counter. Any other lookup
+                // result breaks both runs conservatively.
                 if fetch_result.is_explicit_not_found() {
                     if let Some(attempts) = self.shared.place_http_425_reconcile
                         .note_explicit_not_found(coid)
@@ -2717,8 +2752,47 @@ impl PolymarketTrade {
                             coid, oid, attempts, PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT,
                         );
                     }
+
+                    if let Some(attempts) = self.shared.place_transport_reconcile
+                        .note_explicit_not_found(coid)
+                    {
+                        if attempts >= PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT {
+                            self.shared.reconcile_attempts.clear_placement(coid);
+                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                            warn!(
+                                "[orphan_metric] place_transport_failed=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
+                                coid, oid, attempts,
+                            );
+                            self.shared.remove_order(coid);
+                            updates.push(OrderUpdate {
+                                client_order_id: coid.clone(),
+                                exchange: Exchange::Polymarket,
+                                symbol: symbol.clone(),
+                                side: *side,
+                                exchange_order_id: Some(oid.to_string()),
+                                status: OrderStatus::Rejected,
+                                liquidity: None,
+                                filled_quantity: 0.0,
+                                remaining_quantity: 0.0,
+                                avg_fill_price: *price,
+                                timestamp_ns: now_ns(),
+                                trade_id: None,
+                                order_audit: None,
+                                error: Some(format!(
+                                    "place Transport followed by {} consecutive reconcile not-found responses",
+                                    attempts,
+                                )),
+                            });
+                            continue;
+                        }
+                        warn!(
+                            "[orphan_metric] place_transport_not_found=1 coid={} orderID={} consecutive_not_found={}/{} terminal=pending",
+                            coid, oid, attempts, PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT,
+                        );
+                    }
                 } else {
                     self.shared.place_http_425_reconcile.reset_consecutive(coid);
+                    self.shared.place_transport_reconcile.reset_consecutive(coid);
                 }
 
                 let fetched_order = fetch_result.order();
@@ -2733,6 +2807,7 @@ impl PolymarketTrade {
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.place_http_425_reconcile.clear(coid);
+                        self.shared.place_transport_reconcile.clear(coid);
                         self.shared.register_order_id(coid, oid, symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
@@ -3328,6 +3403,8 @@ impl PolymarketTrade {
             Err(e) if e.is_submit_unknown_state() => {
                 if e.is_http_425() {
                     self.shared.note_place_http_425(&order.client_order_id);
+                } else if e.is_transport() {
+                    self.shared.note_place_transport(&order.client_order_id);
                 }
                 if self.shared.should_warn_unknown_state(&e) {
                     warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
@@ -3958,6 +4035,7 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 Err(e) if e.is_submit_unknown_state() => {
                     let is_http_425 = e.is_http_425();
+                    let is_transport = e.is_transport();
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Submit unknown state ({}) coids={:?} → NewOrderTimeout",
@@ -3972,6 +4050,8 @@ impl ExchangeTrade for PolymarketTrade {
                         let order = &chunk[body_to_chunk[i]];
                         if is_http_425 {
                             self.shared.note_place_http_425(&order.client_order_id);
+                        } else if is_transport {
+                            self.shared.note_place_transport(&order.client_order_id);
                         }
                         all_updates.push(Self::make_timeout_place(order, Some(oh)));
                     }
@@ -4713,6 +4793,7 @@ impl ExchangeTrade for PolymarketTrade {
                     // the strategy can cancel / status-query by orderID
                     // directly, no open-order scan needed.
                     let is_http_425 = e.is_http_425();
+                    let is_transport = e.is_transport();
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Submit unknown state ({}) coids={:?} → NewOrderTimeout",
@@ -4723,6 +4804,8 @@ impl ExchangeTrade for PolymarketTrade {
                         let order = &place_chunk[place_body_to_chunk[i]];
                         if is_http_425 {
                             self.shared.note_place_http_425(&order.client_order_id);
+                        } else if is_transport {
+                            self.shared.note_place_transport(&order.client_order_id);
                         }
                         updates.push(Self::make_timeout_place(order, Some(oh)));
                     }
@@ -5118,7 +5201,7 @@ mod tests {
     /// This stays separate from the generic placement audit attempts.
     #[test]
     fn place_http_425_requires_one_explicit_not_found_after_backoff() {
-        let state = PlaceHttp425ReconcileState::default();
+        let state = PlaceNotFoundReconcileState::default();
         let coid = "place-425";
 
         assert_eq!(state.note_explicit_not_found("ordinary-timeout"), None);
@@ -5131,6 +5214,33 @@ mod tests {
         // the placement remains 425-marked, but its consecutive run restarts.
         state.reset_consecutive(coid);
         assert_eq!(state.note_explicit_not_found(coid), Some(1));
+
+        state.clear(coid);
+        assert_eq!(state.note_explicit_not_found(coid), None);
+    }
+
+    /// Transport-origin placement orphans require exactly four uninterrupted
+    /// explicit not-found observations. An unavailable/found lookup resets the
+    /// run, while non-Transport placements never enter this provenance state.
+    #[test]
+    fn place_transport_requires_four_consecutive_explicit_not_found() {
+        let state = PlaceNotFoundReconcileState::default();
+        let coid = "place-transport";
+
+        assert_eq!(state.note_explicit_not_found("ordinary-timeout"), None);
+
+        state.mark(coid);
+        assert_eq!(PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT, 4);
+        assert_eq!(state.note_explicit_not_found(coid), Some(1));
+        assert_eq!(state.note_explicit_not_found(coid), Some(2));
+
+        // Any non-not-found reconcile observation breaks consecutiveness but
+        // retains the original Transport provenance for subsequent audits.
+        state.reset_consecutive(coid);
+        assert_eq!(state.note_explicit_not_found(coid), Some(1));
+        assert_eq!(state.note_explicit_not_found(coid), Some(2));
+        assert_eq!(state.note_explicit_not_found(coid), Some(3));
+        assert_eq!(state.note_explicit_not_found(coid), Some(4));
 
         state.clear(coid);
         assert_eq!(state.note_explicit_not_found(coid), None);
@@ -5149,10 +5259,13 @@ mod tests {
             transport.is_submit_unknown_state(),
             "a placement POST may have landed before its transport failed"
         );
+        assert!(transport.is_transport());
         assert!(
             !transport.is_unknown_state(),
             "the shared cancel/GET classifier must retain its existing behavior"
         );
+        assert!(!HttpErr::Timeout.is_transport());
+        assert!(!HttpErr::Status(425, "Too Early".to_string()).is_transport());
         assert!(
             !HttpErr::Other("json parse: invalid response".to_string())
                 .is_submit_unknown_state(),
