@@ -12,7 +12,7 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use crate::config::{Config, RunMode};
@@ -29,6 +29,29 @@ use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 use crate::types::*;
 
 const CHANNEL_CAPACITY: usize = 10_000;
+
+/// Current readiness of one configured public market-data feed.
+///
+/// The state is stored independently from strategy callbacks so operators and
+/// embedding applications can distinguish "process is alive" from "all feeds
+/// required for quoting are usable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedReadiness {
+    Starting,
+    NotReady { stage: String, reason: String },
+    Ready,
+}
+
+fn set_feed_readiness(
+    states: &Arc<RwLock<HashMap<String, FeedReadiness>>>,
+    feed: &str,
+    state: FeedReadiness,
+) {
+    states
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(feed.to_string(), state);
+}
 
 /// Live trading does not replay Polymarket's event-local orderbook/trade
 /// history after restart, so persisting that high-volume stream only adds
@@ -58,11 +81,31 @@ fn forward_recorder_event(
     }
 }
 
+/// Sleep for a retry delay while keeping shutdown latency bounded. Subscription
+/// recovery can remain in its capped backoff state indefinitely, so a plain
+/// `thread::sleep` could otherwise delay process shutdown by tens of seconds.
+fn sleep_with_shutdown(shutdown: &AtomicBool, delay: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    while !shutdown.load(Ordering::Relaxed) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(std::time::Duration::from_millis(100)),
+        );
+    }
+    false
+}
+
 pub struct Engine {
     config: Config,
     /// Strategy factories the application registered (the engine never names a
     /// concrete strategy type — see `build_strategies`).
     registry: StrategyRegistry,
+    feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
 }
 
 impl Engine {
@@ -71,7 +114,36 @@ impl Engine {
         // Each registered strategy injects its own required market-data symbols
         // (replaces the engine's old per-strategy-name inject_*_symbols).
         registry.inject_all_config(&mut config);
-        Self { config, registry }
+        let feed_readiness = config
+            .exchanges
+            .iter()
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| (cfg.name.clone(), FeedReadiness::Starting))
+            .collect();
+        Self {
+            config,
+            registry,
+            feed_readiness: Arc::new(RwLock::new(feed_readiness)),
+        }
+    }
+
+    /// Snapshot the readiness of every enabled public market-data feed.
+    pub fn feed_readiness(&self) -> HashMap<String, FeedReadiness> {
+        self.feed_readiness
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Process-level readiness suitable for a health/readiness endpoint.
+    /// Liveness remains separate: a running process with one `NotReady` feed
+    /// returns false here and must not be considered ready to quote.
+    pub fn feeds_ready(&self) -> bool {
+        self.feed_readiness
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .all(|state| matches!(state, FeedReadiness::Ready))
     }
 
     /// Backtest start timestamp (ns since epoch); 0 outside backtest mode.
@@ -2986,6 +3058,7 @@ impl Engine {
             let sim_tx = if exchange_cfg.name == "polymarket" { sim_feed_tx.clone() } else { None };
             let cfg = exchange_cfg.clone();
             let shutdown = shutdown.clone();
+            let feed_readiness = self.feed_readiness.clone();
             // Resolve the spot kline interval BEFORE moving into the
             // feed thread — `self` (or its &refs) can't escape the
             // method into the thread closure's 'static bound.
@@ -3026,6 +3099,14 @@ impl Engine {
                         "aster" => Exchange::Aster,
                         "lighter" => Exchange::Lighter,
                         other => {
+                            set_feed_readiness(
+                                &feed_readiness,
+                                &cfg.name,
+                                FeedReadiness::NotReady {
+                                    stage: "configuration".to_string(),
+                                    reason: format!("unknown exchange: {}", other),
+                                },
+                            );
                             error!("Unknown exchange: {}", other);
                             return;
                         }
@@ -3121,6 +3202,14 @@ impl Engine {
                             let meta = match crate::exchange::lighter::info::fetch_meta(&rest) {
                                 Ok(m) => m,
                                 Err(e) => {
+                                    set_feed_readiness(
+                                        &feed_readiness,
+                                        &cfg.name,
+                                        FeedReadiness::NotReady {
+                                            stage: "initialization".to_string(),
+                                            reason: e.to_string(),
+                                        },
+                                    );
                                     error!("[Lighter] orderBookDetails fetch failed, feed disabled: {}", e);
                                     return;
                                 }
@@ -3130,9 +3219,97 @@ impl Engine {
                         _ => return,
                     };
 
-                    if let Err(e) = feed.subscribe(&cfg.symbols) {
-                        error!("[{}] Subscribe error: {}", cfg.name, e);
-                        return;
+                    // `PolymarketMarket::subscribe` resolves the *current*
+                    // series event through Gamma before the CLOB WS can be
+                    // opened. A transient Gamma outage used to terminate this
+                    // feed thread permanently here, so every later 5-minute
+                    // event was missed until the whole process restarted.
+                    //
+                    // Keep the short HTTP-level retry inside `subscribe`, then
+                    // retry the complete subscription for the lifetime of the
+                    // process. Rebuild PolymarketMarket after every failed
+                    // round so a partially-populated token/series map can
+                    // never leak into the next attempt. A fresh subscribe also
+                    // recomputes `end_date_min` from wall clock and therefore
+                    // follows event rotation instead of retrying a stale URL.
+                    let mut subscribe_backoff =
+                        crate::exchange::ReconnectBackoff::new(1_000, 30_000);
+                    let mut subscribe_failures = 0_u64;
+                    let subscribe_started = std::time::Instant::now();
+                    loop {
+                        if shutdown.load(Ordering::Relaxed) {
+                            feed.disconnect();
+                            return;
+                        }
+
+                        match feed.subscribe(&cfg.symbols) {
+                            Ok(()) => {
+                                if subscribe_failures > 0 {
+                                    info!(
+                                        "[feed_health] {} readiness=SUBSCRIBED recovered_after={:.1}s attempts={}",
+                                        cfg.name,
+                                        subscribe_started.elapsed().as_secs_f64(),
+                                        subscribe_failures + 1,
+                                    );
+                                }
+                                break;
+                            }
+                            Err(e) if cfg.name == "polymarket" => {
+                                subscribe_failures = subscribe_failures.saturating_add(1);
+                                let delay = subscribe_backoff
+                                    .next_delay()
+                                    .min(std::time::Duration::from_secs(30));
+                                set_feed_readiness(
+                                    &feed_readiness,
+                                    &cfg.name,
+                                    FeedReadiness::NotReady {
+                                        stage: "subscribe".to_string(),
+                                        reason: e.to_string(),
+                                    },
+                                );
+                                if subscribe_failures == 1 {
+                                    error!(
+                                        "[feed_health] polymarket readiness=NOT_READY stage=subscribe \
+                                         error={} retrying_in={:.1}s",
+                                        e,
+                                        delay.as_secs_f64(),
+                                    );
+                                    let _ = tx.send(MarketEvent::Disconnected {
+                                        exchange,
+                                        reason: format!("subscription unavailable: {}", e),
+                                    });
+                                } else {
+                                    warn!(
+                                        "[polymarket] Subscribe attempt {} failed: {}; retrying in {:.1}s",
+                                        subscribe_failures,
+                                        e,
+                                        delay.as_secs_f64(),
+                                    );
+                                }
+
+                                feed.disconnect();
+                                let mut replacement = PolymarketMarket::new();
+                                replacement.set_market_tx(tx.clone(), shutdown.clone());
+                                feed = Box::new(replacement);
+
+                                if !sleep_with_shutdown(&shutdown, delay) {
+                                    feed.disconnect();
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                set_feed_readiness(
+                                    &feed_readiness,
+                                    &cfg.name,
+                                    FeedReadiness::NotReady {
+                                        stage: "subscribe".to_string(),
+                                        reason: e.to_string(),
+                                    },
+                                );
+                                error!("[{}] Subscribe error: {}", cfg.name, e);
+                                return;
+                            }
+                        }
                     }
 
                     let mut backoff = crate::exchange::ReconnectBackoff::new(100, 30_000);
@@ -3144,7 +3321,21 @@ impl Engine {
 
                         if let Err(e) = feed.connect() {
                             let delay = backoff.next_delay();
+                            set_feed_readiness(
+                                &feed_readiness,
+                                &cfg.name,
+                                FeedReadiness::NotReady {
+                                    stage: "connect".to_string(),
+                                    reason: e.to_string(),
+                                },
+                            );
                             warn!("[{}] Connect error: {}, retrying in {:.1}s...", cfg.name, e, delay.as_secs_f64());
+                            if cfg.name == "polymarket" {
+                                warn!(
+                                    "[feed_health] polymarket readiness=NOT_READY stage=connect error={}",
+                                    e,
+                                );
+                            }
                             let _ = tx.send(MarketEvent::Disconnected {
                                 exchange,
                                 reason: e.to_string(),
@@ -3154,6 +3345,14 @@ impl Engine {
                         }
 
                         let connected_at = std::time::Instant::now();
+                        set_feed_readiness(
+                            &feed_readiness,
+                            &cfg.name,
+                            FeedReadiness::Ready,
+                        );
+                        if cfg.name == "polymarket" {
+                            info!("[feed_health] polymarket readiness=READY stage=market_stream");
+                        }
                         let _ = tx.send(MarketEvent::Connected { exchange });
                         let mut last_data_at = std::time::Instant::now();
                         // Per-feed stale-data timeout. The default 10 s fits
@@ -3210,6 +3409,14 @@ impl Engine {
                                     if last_data_at.elapsed() > data_timeout
                                         && feed.has_active_subscription()
                                     {
+                                        set_feed_readiness(
+                                            &feed_readiness,
+                                            &cfg.name,
+                                            FeedReadiness::NotReady {
+                                                stage: "data_stream".to_string(),
+                                                reason: "data timeout".to_string(),
+                                            },
+                                        );
                                         warn!("[{}] No data for {:.0}s, reconnecting...",
                                             cfg.name, last_data_at.elapsed().as_secs_f64());
                                         let _ = tx.send(MarketEvent::Disconnected {
@@ -3236,6 +3443,14 @@ impl Engine {
                                     continue;
                                 }
                                 Err(e) => {
+                                    set_feed_readiness(
+                                        &feed_readiness,
+                                        &cfg.name,
+                                        FeedReadiness::NotReady {
+                                            stage: "data_stream".to_string(),
+                                            reason: e.to_string(),
+                                        },
+                                    );
                                     warn!("[{}] Feed error: {}", cfg.name, e);
                                     let _ = tx.send(MarketEvent::Disconnected {
                                         exchange,
@@ -5148,6 +5363,35 @@ impl ExchangeTrade for LiveRouter {
 mod market_router_tests {
     use super::*;
     use crossbeam_channel::Receiver;
+
+    #[test]
+    fn feed_readiness_records_stage_reason_and_recovery() {
+        let states = Arc::new(RwLock::new(HashMap::from([(
+            "polymarket".to_string(),
+            FeedReadiness::Starting,
+        )])));
+        set_feed_readiness(
+            &states,
+            "polymarket",
+            FeedReadiness::NotReady {
+                stage: "subscribe".into(),
+                reason: "gamma 500".into(),
+            },
+        );
+        assert_eq!(
+            states.read().unwrap().get("polymarket"),
+            Some(&FeedReadiness::NotReady {
+                stage: "subscribe".into(),
+                reason: "gamma 500".into(),
+            }),
+        );
+
+        set_feed_readiness(&states, "polymarket", FeedReadiness::Ready);
+        assert_eq!(
+            states.read().unwrap().get("polymarket"),
+            Some(&FeedReadiness::Ready),
+        );
+    }
 
     fn binary_option(slug: &str, tokens: &[&str]) -> Instrument {
         Instrument::BinaryOption(BinaryOption {
