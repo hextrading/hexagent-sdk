@@ -9,18 +9,31 @@ use crate::types::OrderBookSnapshot;
 ///   * `created_ns`  — local-clock timestamp at the moment we made the
 ///                     nudge. Compared against the **server-side**
 ///                     `exchange_timestamp_ns` of incoming WS snapshots
-///                     to decide when the nudge is no longer needed.
-///                     A snapshot whose `exchange_timestamp_ns` is
-///                     **strictly greater** than `created_ns` was
-///                     generated server-side AFTER the moment we
-///                     learned about the moved top, so by definition
-///                     it reflects the post-move state — safe to clear
-///                     the nudge.
+///                     to decide when the nudge is no longer needed:
+///                     a snapshot may clear the nudge only when its
+///                     `exchange_timestamp_ns` exceeds `created_ns` by
+///                     at least `NUDGE_MIN_HOLD_NS`.
 #[derive(Debug, Clone, Copy)]
 struct Nudge {
     price: f64,
     created_ns: u64,
 }
+
+/// Minimum nudge hold: a snapshot clears a nudge only if its server-side
+/// `exchange_timestamp_ns` is later than the nudge's `created_ns` by MORE
+/// than this margin.
+///
+/// A bare `snapshot_ts > created_ns` check proved insufficient in live:
+/// the snapshot's timestamp is assigned when the book publisher emits the
+/// message, which can postdate the matching-engine state it was built
+/// from. During fast moves Polymarket kept sending snapshots stamped
+/// 60–100 ms after our nudge moment that still carried the pre-move top,
+/// clearing the nudge and letting the strategy re-emit the same crossing
+/// post-only price. Observed 2026-07-23 08:02:01 (coid btc02-
+/// 1784778635245…248): SELL @ 0.41 rejected 4× in 300 ms, each repeat
+/// enabled by a pseudo-fresh stale snapshot wiping the nudge. The 500 ms
+/// margin absorbs that publisher pipeline lag plus modest NTP skew.
+const NUDGE_MIN_HOLD_NS: u64 = 500_000_000;
 
 /// Maintains the latest OrderBookSnapshot per symbol, plus
 /// timestamp-anchored nudge overrides for cases where a server
@@ -30,11 +43,13 @@ struct Nudge {
 /// Stale WS snapshots — those generated server-side BEFORE the move
 /// that produced the rejection — can update body levels but cannot
 /// push the top back behind the nudge. The nudge clears only when a
-/// snapshot arrives whose `exchange_timestamp_ns` is strictly later
-/// than the moment the nudge was made, signalling that the server
-/// has had a chance to incorporate the moved top into its outgoing
-/// snapshot stream. There is no time-based TTL — the only auto-clear
-/// is via this server-fresher-than-nudge timestamp signal.
+/// snapshot arrives whose `exchange_timestamp_ns` is later than the
+/// moment the nudge was made by more than `NUDGE_MIN_HOLD_NS`,
+/// signalling that the server has had a chance to incorporate the
+/// moved top into its outgoing snapshot stream (snapshot timestamps
+/// are stamped at publish time and can postdate the book state they
+/// carry — see `NUDGE_MIN_HOLD_NS`). There is no expiry TTL — the
+/// only auto-clear is via this timestamp-plus-margin signal.
 pub struct OrderbookManager {
     books: HashMap<String, OrderBookSnapshot>,
     bid_nudges: HashMap<String, Nudge>,
@@ -51,22 +66,24 @@ impl OrderbookManager {
     }
 
     /// Update cache with a new orderbook snapshot. Auto-clears nudges
-    /// whose timestamp is strictly older than this snapshot's
-    /// `exchange_timestamp_ns` — i.e. the server generated this
-    /// snapshot AFTER our nudge moment, so it's authoritative.
+    /// once this snapshot's `exchange_timestamp_ns` is past the nudge
+    /// moment by more than `NUDGE_MIN_HOLD_NS` — i.e. the server
+    /// generated this snapshot long enough after our nudge moment that
+    /// it must reflect the post-move book, so it's authoritative.
     pub fn update(&mut self, ob: &OrderBookSnapshot) {
         // Compare nudge.created_ns (local wall-clock) against
         // ob.exchange_timestamp_ns (server wall-clock). Both are
-        // Unix-epoch ns. With reasonable NTP sync (≤100 ms drift)
-        // this gives the right "did the server have time to learn
-        // about the new top before producing this snapshot?" answer.
+        // Unix-epoch ns. The NUDGE_MIN_HOLD_NS margin covers both the
+        // publisher pipeline lag (snapshots stamped after the nudge can
+        // still carry the pre-move book) and modest NTP drift between
+        // the two clocks.
         if let Some(n) = self.bid_nudges.get(&ob.symbol).copied() {
-            if ob.exchange_timestamp_ns > n.created_ns {
+            if ob.exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
                 self.bid_nudges.remove(&ob.symbol);
             }
         }
         if let Some(n) = self.ask_nudges.get(&ob.symbol).copied() {
-            if ob.exchange_timestamp_ns > n.created_ns {
+            if ob.exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
                 self.ask_nudges.remove(&ob.symbol);
             }
         }
@@ -151,10 +168,11 @@ impl OrderbookManager {
     /// same-price post-only rejects on the same token).
     ///
     /// Auto-clear: nudges clear only when an incoming snapshot's
-    /// `exchange_timestamp_ns` is strictly greater than the nudge's
-    /// `created_ns` (see `update`). There is no fixed TTL — a nudge
-    /// stays alive as long as the server hasn't yet produced a
-    /// snapshot newer than the moment we made it.
+    /// `exchange_timestamp_ns` exceeds the nudge's `created_ns` by more
+    /// than `NUDGE_MIN_HOLD_NS` (see `update`). There is no expiry
+    /// TTL — a nudge stays alive as long as the server hasn't yet
+    /// produced a snapshot comfortably newer than the moment we made
+    /// it.
     ///
     /// Semantics:
     ///   * `side == Sell`: real bid ≥ price → set bid_nudge → best_bid_price
@@ -319,11 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn nudge_clears_only_when_server_ts_strictly_after_nudge() {
-        // The clear condition is `exchange_timestamp_ns > created_ns`,
-        // strict-greater. A snapshot with exactly the same server ts
-        // as the nudge is treated as concurrent (might or might not
-        // include the move) and keeps the nudge alive.
+    fn nudge_clears_only_after_min_hold_elapsed() {
+        // The clear condition is `exchange_timestamp_ns > created_ns +
+        // NUDGE_MIN_HOLD_NS`. Snapshots stamped after the nudge but
+        // within the hold margin are treated as possibly pre-move
+        // (publisher pipeline lag) and keep the nudge alive.
         let mut om = OrderbookManager::new();
         let nudge_ts = 1_000_000_000_000u64;
 
@@ -334,26 +352,69 @@ mod tests {
 
         let _ = om.nudge_inferred_top("tok", Side::Sell, 0.69, nudge_ts);
 
-        // Snapshot ts equal to nudge ts → not strictly after → nudge survives.
+        // Snapshot ts equal to nudge ts → nudge survives.
         let mut equal_ts = empty_book("tok");
         equal_ts.bids = vec![PriceLevel { price: 0.66, quantity: 5.0 }];
         equal_ts.exchange_timestamp_ns = nudge_ts;
         om.update(&equal_ts);
         assert_eq!(om.best_bid_price("tok"), Some(0.69));
 
-        // Snapshot ts strictly after → clears.
+        // Snapshot ts after the nudge but exactly at the hold boundary
+        // → not strictly beyond the margin → nudge survives.
+        let mut at_hold = empty_book("tok");
+        at_hold.bids = vec![PriceLevel { price: 0.66, quantity: 5.0 }];
+        at_hold.exchange_timestamp_ns = nudge_ts + NUDGE_MIN_HOLD_NS;
+        om.update(&at_hold);
+        assert_eq!(om.best_bid_price("tok"), Some(0.69));
+
+        // Snapshot ts strictly beyond the hold margin → clears.
         let mut after = empty_book("tok");
         after.bids = vec![PriceLevel { price: 0.70, quantity: 5.0 }];
-        after.exchange_timestamp_ns = nudge_ts + 1;
+        after.exchange_timestamp_ns = nudge_ts + NUDGE_MIN_HOLD_NS + 1;
         om.update(&after);
         assert_eq!(om.best_bid_price("tok"), Some(0.70));
     }
 
     #[test]
+    fn nudge_survives_pseudo_fresh_snapshot_within_hold() {
+        // Reproduces 2026-07-23 08:02:01 live: SELL @ 0.41 post-only
+        // rejected → nudge bid to 0.41. Polymarket then delivered
+        // snapshots stamped 60-100 ms AFTER the nudge moment that still
+        // carried the pre-move bid (publisher stamps at emit time, not
+        // book-state time). Pre-fix the bare `ts > created_ns` check
+        // cleared the nudge on each one, and the same crossing price
+        // was re-emitted and rejected 4× in 300 ms. Post-fix those
+        // pseudo-fresh snapshots fall inside NUDGE_MIN_HOLD_NS and the
+        // nudge holds.
+        let mut om = OrderbookManager::new();
+        let nudge_ts = 1_000_000_000_000u64;
+
+        let mut book = empty_book("tok");
+        book.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        book.exchange_timestamp_ns = nudge_ts - 30_000_000;
+        om.update(&book);
+
+        let _ = om.nudge_inferred_top("tok", Side::Sell, 0.41, nudge_ts);
+        assert_eq!(om.best_bid_price("tok"), Some(0.41));
+
+        // Three pseudo-fresh stale snapshots, ~100 ms apart, all within
+        // the hold margin — none may clear the nudge.
+        for lag_ms in [60u64, 160, 260] {
+            let mut pseudo = empty_book("tok");
+            pseudo.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+            pseudo.exchange_timestamp_ns = nudge_ts + lag_ms * 1_000_000;
+            om.update(&pseudo);
+            assert_eq!(om.best_bid_price("tok"), Some(0.41),
+                "nudge cleared by pseudo-fresh snapshot at +{} ms", lag_ms);
+        }
+    }
+
+    #[test]
     fn nudge_clears_then_subsequent_lower_bid_honoured() {
-        // Once the server has produced a snapshot post-nudge, the nudge
-        // is gone — subsequent snapshots can legitimately lower the bid
-        // (e.g. price moved up briefly then dropped back).
+        // Once the server has produced a snapshot comfortably past the
+        // nudge (beyond the hold margin), the nudge is gone —
+        // subsequent snapshots can legitimately lower the bid (e.g.
+        // price moved up briefly then dropped back).
         let mut om = OrderbookManager::new();
         let nudge_ts = 1_000_000_000_000u64;
 
@@ -364,17 +425,26 @@ mod tests {
 
         let _ = om.nudge_inferred_top("tok", Side::Sell, 0.69, nudge_ts);
 
-        // Server confirms post-move state with a fresher snapshot.
+        // Note the interim 0.70 print while the nudge is still held:
+        // best_bid = max(book 0.70, nudge 0.69) = 0.70, so a higher
+        // book top shows through even before the nudge clears.
         let mut confirm = empty_book("tok");
         confirm.bids = vec![PriceLevel { price: 0.70, quantity: 8.0 }];
         confirm.exchange_timestamp_ns = nudge_ts + 50_000_000;
         om.update(&confirm);
         assert_eq!(om.best_bid_price("tok"), Some(0.70));
 
+        // Server confirms post-move state beyond the hold margin.
+        let mut past_hold = empty_book("tok");
+        past_hold.bids = vec![PriceLevel { price: 0.70, quantity: 8.0 }];
+        past_hold.exchange_timestamp_ns = nudge_ts + NUDGE_MIN_HOLD_NS + 100_000_000;
+        om.update(&past_hold);
+        assert_eq!(om.best_bid_price("tok"), Some(0.70));
+
         // Later snapshot lowers the bid — should be honoured (nudge gone).
         let mut later = empty_book("tok");
         later.bids = vec![PriceLevel { price: 0.66, quantity: 5.0 }];
-        later.exchange_timestamp_ns = nudge_ts + 200_000_000;
+        later.exchange_timestamp_ns = nudge_ts + NUDGE_MIN_HOLD_NS + 200_000_000;
         om.update(&later);
         assert_eq!(om.best_bid_price("tok"), Some(0.66));
     }
