@@ -12,16 +12,19 @@ use log::{info, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::exchange::ExchangeMarket;
+use crate::exchange::{
+    ExchangeMarket, WsHealth, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
+    POLYMARKET_WS_HEARTBEAT_INTERVAL,
+};
 use crate::types::*;
 
 const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
-const PING_INTERVAL: Duration = Duration::from_secs(4);
 /// Per-task read-side stall watchdog — see binance/market.rs.
 const STALE_THRESHOLD: Duration = Duration::from_secs(60);
+const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct ChainlinkMarket {
     symbols: Vec<String>,
@@ -68,7 +71,8 @@ async fn chainlink_ws_task(
         // healthy. Resetting here let a connect-then-immediate-drop (server-side
         // rate-limit / 429 flap) hammer reconnect every ~base_ms and never back
         // off. Reset only after the connection proves stable (≥30s), below.
-        let connected_at = std::time::Instant::now();
+        let connected_at = Instant::now();
+        let mut health = WsHealth::new(connected_at);
         let (mut write, mut read) = stream.split();
 
         // ALWAYS subscribe the whole topic unfiltered and filter client-side
@@ -103,39 +107,91 @@ async fn chainlink_ws_task(
         }
         info!("[Chainlink] Connected, subscribed to {:?}", symbols);
 
-        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+        let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
         ping_interval.tick().await;
+        let mut health_interval =
+            tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+        health_interval.tick().await;
 
         loop {
             tokio::select! {
                 biased;
                 _ = ping_interval.tick() => {
-                    // RTDS keepalive = the literal text "ping" (NOT JSON), per the
-                    // official client (Polymarket/real-time-data-client sends
-                    // `ws.send("ping")` every 5s; docs: "send PING every 5s"). The
-                    // server replies with a pong frame, which resets the read-side
-                    // stall watchdog below — giving a liveness signal independent of
-                    // price ticks. The old JSON `{"action":"ping"}` was not a
-                    // recognised keepalive (→ server-initiated closes).
-                    if let Err(e) = write.send(Message::Text("ping".to_string())).await {
-                        warn!("[Chainlink] Ping send failed: {}", e);
+                    let now = Instant::now();
+                    if health.pong_timed_out(now) {
+                        warn!(
+                            "[Chainlink] RTDS transport heartbeat timeout — reconnecting; {}",
+                            health.rtds_summary(now),
+                        );
                         break;
+                    }
+                    // Application-level text heartbeat used by the current
+                    // Polymarket SDK. This is deliberately not a WS protocol
+                    // Ping frame.
+                    if let Err(e) = write.send(Message::Text("PING".to_string())).await {
+                        warn!(
+                            "[Chainlink] PING send failed: {}; {}",
+                            e,
+                            health.rtds_summary(now),
+                        );
+                        break;
+                    }
+                    health.record_ping_sent(now);
+                }
+                _ = health_interval.tick() => {
+                    let now = Instant::now();
+                    if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
+                        warn!(
+                            "[Chainlink] RTDS subscription silent; {}",
+                            health.rtds_summary(now),
+                        );
+                    } else if health
+                        .btc_price_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD)
+                    {
+                        warn!(
+                            "[Chainlink] RTDS BTC price gap; {}",
+                            health.rtds_summary(now),
+                        );
                     }
                 }
                 read_result = tokio::time::timeout(STALE_THRESHOLD, read.next()) => {
                     let msg = match read_result {
                         Ok(Some(Ok(m))) => m,
-                        Ok(Some(Err(e))) => { warn!("[Chainlink] WS read error: {}", e); break; }
-                        Ok(None) => { warn!("[Chainlink] WS closed"); break; }
+                        Ok(Some(Err(e))) => {
+                            let now = Instant::now();
+                            warn!(
+                                "[Chainlink] WS read error: {}; {}",
+                                e,
+                                health.rtds_summary(now),
+                            );
+                            break;
+                        }
+                        Ok(None) => {
+                            let now = Instant::now();
+                            warn!(
+                                "[Chainlink] WS closed; {}",
+                                health.rtds_summary(now),
+                            );
+                            break;
+                        }
                         Err(_elapsed) => {
-                            warn!("[Chainlink] No message for {:.0}s (stall watchdog) — reconnecting",
-                                STALE_THRESHOLD.as_secs_f64());
+                            let now = Instant::now();
+                            warn!(
+                                "[Chainlink] No raw frame for {:.0}s (stall watchdog) — reconnecting; {}",
+                                STALE_THRESHOLD.as_secs_f64(),
+                                health.rtds_summary(now),
+                            );
                             break;
                         }
                     };
+                    let received_at = Instant::now();
+                    health.record_raw_frame(received_at);
                     match msg {
                         Message::Ping(payload) => {
                             let _ = write.send(Message::Pong(payload)).await;
+                        }
+                        Message::Pong(_) => {
+                            health.record_pong(received_at);
                         }
                         Message::Close(reason) => {
                             // 1000 "Normal" / 1001 "Going away" = Polymarket RTDS
@@ -144,14 +200,31 @@ async fn chainlink_ws_task(
                             // close codes stay WARN. The reconnect below is ~330ms.
                             let code: Option<u16> = reason.as_ref().map(|c| c.code.into());
                             if matches!(code, Some(1000) | Some(1001)) {
-                                info!("[Chainlink] Server closed (expected recycle): {:?}", reason);
+                                info!(
+                                    "[Chainlink] Server closed (expected recycle): {:?}; {}",
+                                    reason,
+                                    health.rtds_summary(received_at),
+                                );
                             } else {
-                                warn!("[Chainlink] Server closed: {:?}", reason);
+                                warn!(
+                                    "[Chainlink] Server closed: {:?}; {}",
+                                    reason,
+                                    health.rtds_summary(received_at),
+                                );
                             }
                             break;
                         }
                         Message::Text(text) => {
                             if text.is_empty() { continue; }
+                            let body = text.trim();
+                            if body.eq_ignore_ascii_case("PONG") {
+                                health.record_pong(received_at);
+                                continue;
+                            }
+                            if body.eq_ignore_ascii_case("PING") {
+                                let _ = write.send(Message::Text("PONG".to_string())).await;
+                                continue;
+                            }
                             // simd-json drop-in for SIMD parse speedup.
                             let mut buf = text.as_bytes().to_vec();
                             let data: serde_json::Value = match simd_json::serde::from_slice(&mut buf) {
@@ -162,6 +235,7 @@ async fn chainlink_ws_task(
                                 Some(t) if t == "crypto_prices_chainlink" => t.to_string(),
                                 _ => continue,
                             };
+                            health.record_topic_frame(received_at);
                             let payload = match data.get("payload") {
                                 Some(p) => p.clone(),
                                 None => continue,
@@ -170,11 +244,15 @@ async fn chainlink_ws_task(
                                 Some(s) => s.to_string(),
                                 None => continue,
                             };
-                            let price = match payload.get("value").and_then(|v| v.as_f64()) {
+                            let price = match payload.get("value").and_then(json_f64) {
                                 Some(p) => p,
                                 None => continue,
                             };
                             let server_ts_ms = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                            if symbol.eq_ignore_ascii_case("btc/usd") {
+                                health.record_btc_price(received_at);
+                            }
 
                             if !symbols.iter().any(|f| f.eq_ignore_ascii_case(&symbol)) {
                                 log::trace!("[Chainlink] Filtered out: topic={} symbol={} price={}", topic, symbol, price);
@@ -206,6 +284,12 @@ async fn chainlink_ws_task(
         tokio::time::sleep(delay).await;
     }
     info!("[Chainlink] WS task exiting");
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
 impl ExchangeMarket for ChainlinkMarket {

@@ -5,22 +5,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Interval between keepalive pings. Polymarket's CLOB market/user
-/// channel requires the client to send a text `"PING"` every 10 s
-/// (server replies `"PONG"`); it drops connections that go ~10 s
-/// without one. See clob_ws_task for the send site.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-
-use crate::exchange::ExchangeMarket;
+use crate::exchange::{
+    ExchangeMarket, WsHealth, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
+    POLYMARKET_WS_HEARTBEAT_INTERVAL,
+};
 use crate::types::*;
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 
-const RTDS_PING_INTERVAL: Duration = Duration::from_secs(4);
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
 /// Per-task read-side stall watchdogs. CLOB book diffs + trade ticks
@@ -33,6 +29,7 @@ const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 /// silence is plenty anomalous.
 const CLOB_STALE_THRESHOLD: Duration = Duration::from_secs(90);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
+const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 // ── Polymarket Event Types ─────────────────────────────────────────
 
@@ -660,6 +657,10 @@ pub struct PolymarketMarket {
     ws_ctrl_tx: Option<tokio::sync::mpsc::UnboundedSender<WsCtrl>>,
     /// Shared shutdown flag — shared between the main CLOB task and RTDS task.
     ws_shutdown: Arc<AtomicBool>,
+    /// Persists across engine-level disconnect/connect cycles. Once any CLOB
+    /// subscription has been advertised READY, every later task must wait for
+    /// a valid book before advertising recovery.
+    clob_subscribed_once: Arc<AtomicBool>,
     /// RTDS subscriptions (parsed during subscribe, spawned as task in connect).
     rtds_subscriptions: Vec<RtdsSubscription>,
     /// Sender for RTDS task to push SpotPrice events directly to engine.
@@ -677,6 +678,7 @@ impl PolymarketMarket {
             event_rx: None,
             ws_ctrl_tx: None,
             ws_shutdown: Arc::new(AtomicBool::new(false)),
+            clob_subscribed_once: Arc::new(AtomicBool::new(false)),
             rtds_subscriptions: Vec::new(),
             rtds_tx: None,
             rtds_shutdown: Arc::new(AtomicBool::new(false)),
@@ -867,15 +869,95 @@ impl PolymarketMarket {
 ///     until a Resubscribe/Shutdown arrives or the socket fails.
 ///   - Parses each message into `MarketEvent`s and forwards them through
 ///     the sync crossbeam `event_tx` for `next_event()` to drain.
-///   - Exponential backoff on connect failures; ping every PING_INTERVAL.
+///   - Exponential backoff on connect failures; shared 5-second heartbeat.
+#[derive(Debug, Default)]
+struct ClobLifecycle {
+    subscribed_once: bool,
+    not_ready_announced: bool,
+}
+
+impl ClobLifecycle {
+    /// The first successful subscription is ready immediately. A
+    /// re-subscription after a transport failure stays NOT_READY until a
+    /// non-empty book for one of the subscribed tokens arrives.
+    fn subscribed(&mut self) -> bool {
+        if !self.subscribed_once {
+            self.subscribed_once = true;
+            self.not_ready_announced = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn disconnected(&mut self) -> bool {
+        if self.not_ready_announced {
+            false
+        } else {
+            self.not_ready_announced = true;
+            true
+        }
+    }
+
+    fn valid_book(&mut self) -> bool {
+        if self.subscribed_once && self.not_ready_announced {
+            self.not_ready_announced = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn is_valid_subscribed_book(event: &MarketEvent, tokens: &[String]) -> bool {
+    match event {
+        MarketEvent::OrderBook(book) => {
+            tokens.iter().any(|token| token == &book.symbol)
+                && (book.best_bid().is_some() || book.best_ask().is_some())
+        }
+        _ => false,
+    }
+}
+
+fn has_complete_clob_subscription(tokens: &[String]) -> bool {
+    // The subscription frame contains the full token set for every current
+    // event. Sending that frame is atomic: there is no per-token ACK in the
+    // CLOB protocol. A non-empty set therefore means every token selected for
+    // the current event(s) was included, regardless of market cardinality.
+    !tokens.is_empty()
+}
+
+fn announce_clob_not_ready(
+    event_tx: &crossbeam_channel::Sender<MarketEvent>,
+    lifecycle: &mut ClobLifecycle,
+    reason: impl Into<String>,
+) {
+    let reason = reason.into();
+    if lifecycle.disconnected() {
+        let _ = event_tx.send(MarketEvent::Disconnected {
+            exchange: Exchange::Polymarket,
+            reason,
+        });
+    }
+}
+
 async fn clob_ws_task(
     initial_tokens: Vec<String>,
     event_tx: crossbeam_channel::Sender<MarketEvent>,
     mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
+    subscribed_once: Arc<AtomicBool>,
 ) {
     let mut tokens = initial_tokens;
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
+    let mut lifecycle = ClobLifecycle {
+        subscribed_once: was_previously_subscribed,
+        // Engine-level reconnects create a fresh task after already placing
+        // the feed in NOT_READY. Preserve that recovery state so this task
+        // still waits for a valid book.
+        not_ready_announced: was_previously_subscribed,
+    };
     // Guard: if we enter with shutdown already latched true we'll exit
     // immediately below — surface it so the silent-reconnect-loop failure
     // mode that shipped on 2026-04-20 is detectable from day-1 logs.
@@ -900,6 +982,11 @@ async fn clob_ws_task(
         let stream = match tokio_tungstenite::connect_async(POLYMARKET_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
+                announce_clob_not_ready(
+                    &event_tx,
+                    &mut lifecycle,
+                    format!("WS connect failed: {}", e),
+                );
                 let delay = backoff.next_delay();
                 warn!("[Polymarket] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
                 tokio::time::sleep(delay).await;
@@ -908,6 +995,7 @@ async fn clob_ws_task(
         };
         backoff.reset();
         let (mut write, mut read) = stream.split();
+        let mut health = WsHealth::new(Instant::now());
 
         // Align with the official CLOB SDK: lowercase channel `"market"`
         // (the user channel already uses lowercase `"user"`; the server is
@@ -919,13 +1007,36 @@ async fn clob_ws_task(
             "custom_feature_enabled": true,
         });
         if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
+            announce_clob_not_ready(
+                &event_tx,
+                &mut lifecycle,
+                format!("WS subscribe send failed: {}", e),
+            );
             warn!("[Polymarket] WS subscribe send failed: {}", e);
             continue;
         }
         info!("[Polymarket] Subscribed to {} tokens", tokens.len());
+        if !has_complete_clob_subscription(&tokens) {
+            announce_clob_not_ready(
+                &event_tx,
+                &mut lifecycle,
+                "CLOB subscription has no event tokens",
+            );
+            warn!(
+                "[Polymarket] CLOB subscription has no event tokens; readiness remains NOT_READY",
+            );
+        } else if lifecycle.subscribed() {
+            subscribed_once.store(true, Ordering::Relaxed);
+            let _ = event_tx.send(MarketEvent::Connected {
+                exchange: Exchange::Polymarket,
+            });
+        }
 
-        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+        let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
         ping_interval.tick().await; // consume immediate tick
+        let mut health_interval =
+            tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+        health_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -935,6 +1046,11 @@ async fn clob_ws_task(
                     match ctrl {
                         Some(WsCtrl::Resubscribe(new_tokens)) => {
                             tokens = new_tokens;
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                "CLOB resubscribe requested",
+                            );
                             info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", tokens.len());
                             let _ = write.send(Message::Close(None)).await;
                             continue 'outer;
@@ -944,13 +1060,44 @@ async fn clob_ws_task(
                 }
 
                 _ = ping_interval.tick() => {
-                    // Polymarket CLOB expects an application-level text
-                    // "PING" heartbeat (NOT a WebSocket protocol ping
-                    // frame) every 10 s, else it resets the connection
-                    // without a close handshake. Server replies "PONG".
-                    if let Err(e) = write.send(Message::Text("PING".to_string())).await {
-                        warn!("[Polymarket] Ping send failed: {}", e);
+                    let now = Instant::now();
+                    if health.pong_timed_out(now) {
+                        announce_clob_not_ready(
+                            &event_tx,
+                            &mut lifecycle,
+                            "CLOB transport heartbeat timeout",
+                        );
+                        warn!(
+                            "[Polymarket] CLOB transport heartbeat timeout — reconnecting; {}",
+                            health.transport_summary(now),
+                        );
                         break;
+                    }
+                    // Current Polymarket SDK heartbeat: application-level
+                    // text "PING" (not a WS protocol Ping frame), every 5s.
+                    if let Err(e) = write.send(Message::Text("PING".to_string())).await {
+                        announce_clob_not_ready(
+                            &event_tx,
+                            &mut lifecycle,
+                            format!("Ping send failed: {}", e),
+                        );
+                        warn!(
+                            "[Polymarket] PING send failed: {}; {}",
+                            e,
+                            health.transport_summary(now),
+                        );
+                        break;
+                    }
+                    health.record_ping_sent(now);
+                }
+
+                _ = health_interval.tick() => {
+                    let now = Instant::now();
+                    if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
+                        warn!(
+                            "[Polymarket] CLOB topic silent; {}",
+                            health.transport_summary(now),
+                        );
                     }
                 }
 
@@ -958,19 +1105,52 @@ async fn clob_ws_task(
                     let msg = match read_result {
                         Ok(Some(Ok(m))) => m,
                         Ok(Some(Err(e))) => {
-                            warn!("[Polymarket] WS read error: {} — reconnecting", e);
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                format!("WS read error: {}", e),
+                            );
+                            let now = Instant::now();
+                            warn!(
+                                "[Polymarket] WS read error: {} — reconnecting; {}",
+                                e,
+                                health.transport_summary(now),
+                            );
                             break;
                         }
                         Ok(None) => {
-                            warn!("[Polymarket] WS closed — reconnecting");
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                "WS closed",
+                            );
+                            let now = Instant::now();
+                            warn!(
+                                "[Polymarket] WS closed — reconnecting; {}",
+                                health.transport_summary(now),
+                            );
                             break;
                         }
                         Err(_elapsed) => {
-                            warn!("[Polymarket] CLOB no message for {:.0}s (stall watchdog) — reconnecting",
-                                CLOB_STALE_THRESHOLD.as_secs_f64());
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                format!(
+                                    "CLOB no message for {:.0}s",
+                                    CLOB_STALE_THRESHOLD.as_secs_f64(),
+                                ),
+                            );
+                            let now = Instant::now();
+                            warn!(
+                                "[Polymarket] CLOB no raw frame for {:.0}s (stall watchdog) — reconnecting; {}",
+                                CLOB_STALE_THRESHOLD.as_secs_f64(),
+                                health.transport_summary(now),
+                            );
                             break;
                         }
                     };
+                    let received_at = Instant::now();
+                    health.record_raw_frame(received_at);
                     match msg {
                         Message::Text(text) => {
                             // Server answers our text "PING" heartbeat with
@@ -978,15 +1158,36 @@ async fn clob_ws_task(
                             // frames — skip them so parse_clob_frame doesn't
                             // warn on every heartbeat.
                             let body = text.trim();
-                            if body.eq_ignore_ascii_case("PONG")
-                                || body.eq_ignore_ascii_case("PING")
-                            {
+                            if body.eq_ignore_ascii_case("PONG") {
+                                health.record_pong(received_at);
                                 continue;
                             }
+                            if body.eq_ignore_ascii_case("PING") {
+                                let _ = write.send(Message::Text("PONG".to_string())).await;
+                                continue;
+                            }
+                            health.record_topic_frame(received_at);
                             let t_parse = crate::latency::Instant::now();
-                            for event in parse_clob_frame(&text) {
+                            let events = parse_clob_frame(&text);
+                            let has_valid_book = events
+                                .iter()
+                                .any(|event| is_valid_subscribed_book(event, &tokens));
+                            for event in events {
                                 if event_tx.send(event).is_err() {
                                     break 'outer; // engine gone
+                                }
+                            }
+                            // Queue READY after the qualifying book event, so
+                            // observers cannot see a recovered stream before
+                            // the first valid post-reconnect book was received.
+                            if has_valid_book && lifecycle.valid_book() {
+                                info!(
+                                    "[Polymarket] CLOB recovered after valid order book"
+                                );
+                                if event_tx.send(MarketEvent::Connected {
+                                    exchange: Exchange::Polymarket,
+                                }).is_err() {
+                                    break 'outer;
                                 }
                             }
                             // Parse + dispatch latency for the whole
@@ -997,8 +1198,20 @@ async fn clob_ws_task(
                         Message::Ping(payload) => {
                             let _ = write.send(Message::Pong(payload)).await;
                         }
-                        Message::Close(_) => {
-                            warn!("[Polymarket] Server closed WS — reconnecting");
+                        Message::Pong(_) => {
+                            health.record_pong(received_at);
+                        }
+                        Message::Close(reason) => {
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                "Server closed WS",
+                            );
+                            warn!(
+                                "[Polymarket] Server closed WS {:?} — reconnecting; {}",
+                                reason,
+                                health.transport_summary(received_at),
+                            );
                             break;
                         }
                         _ => {}
@@ -1055,6 +1268,13 @@ async fn rtds_connect_and_run(
     info!("[RTDS] Connecting to {}", POLYMARKET_RTDS_URL);
     let (stream, _) = tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL).await?;
     let (mut write, mut read) = stream.split();
+    let mut health = WsHealth::new(Instant::now());
+    let monitors_btc = subscriptions.iter().any(|rtds| {
+        let (topic, _) = rtds.topic_and_type();
+        matches!(topic, "crypto_prices" | "crypto_prices_chainlink")
+            && (rtds.filters.is_empty()
+                || rtds.filters.iter().any(|symbol| is_btc_symbol(symbol)))
+    });
 
     // Build and send subscriptions — ALWAYS one unfiltered subscription
     // per topic, symbols filtered client-side by the `pass` check in the
@@ -1084,8 +1304,11 @@ async fn rtds_connect_and_run(
 
     info!("[RTDS] Connected, {} subscriptions", subscriptions.len());
 
-    let mut ping_interval = tokio::time::interval(RTDS_PING_INTERVAL);
+    let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
     ping_interval.tick().await;
+    let mut health_interval =
+        tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+    health_interval.tick().await;
 
     loop {
         if shutdown.load(Ordering::Relaxed) { return Ok(()); }
@@ -1093,30 +1316,96 @@ async fn rtds_connect_and_run(
         tokio::select! {
             biased;
             _ = ping_interval.tick() => {
-                write.send(Message::Text(r#"{"action":"ping"}"#.to_string())).await?;
+                let now = Instant::now();
+                if health.pong_timed_out(now) {
+                    return Err(anyhow!(
+                        "RTDS transport heartbeat timeout; {}",
+                        health.rtds_summary(now),
+                    ));
+                }
+                if let Err(e) = write.send(Message::Text("PING".to_string())).await {
+                    return Err(anyhow!(
+                        "RTDS PING send failed: {}; {}",
+                        e,
+                        health.rtds_summary(now),
+                    ));
+                }
+                health.record_ping_sent(now);
+            }
+            _ = health_interval.tick() => {
+                let now = Instant::now();
+                if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
+                    warn!(
+                        "[RTDS] Subscription silent; {}",
+                        health.rtds_summary(now),
+                    );
+                } else if monitors_btc
+                    && health.btc_price_is_stale(
+                        now,
+                        TOPIC_STALE_WARNING_THRESHOLD,
+                    )
+                {
+                    warn!(
+                        "[RTDS] BTC price gap; {}",
+                        health.rtds_summary(now),
+                    );
+                }
             }
             read_result = tokio::time::timeout(RTDS_STALE_THRESHOLD, read.next()) => {
                 let msg = match read_result {
                     Ok(Some(Ok(m))) => m,
-                    Ok(Some(Err(e))) => return Err(e.into()),
-                    Ok(None) => return Err(anyhow!("RTDS stream ended")),
-                    Err(_elapsed) => {
+                    Ok(Some(Err(e))) => {
+                        let now = Instant::now();
                         return Err(anyhow!(
-                            "RTDS no message for {:.0}s (stall watchdog) — forcing reconnect",
+                            "RTDS read error: {}; {}",
+                            e,
+                            health.rtds_summary(now),
+                        ));
+                    }
+                    Ok(None) => {
+                        let now = Instant::now();
+                        return Err(anyhow!(
+                            "RTDS stream ended; {}",
+                            health.rtds_summary(now),
+                        ));
+                    }
+                    Err(_elapsed) => {
+                        let now = Instant::now();
+                        return Err(anyhow!(
+                            "RTDS no raw frame for {:.0}s (stall watchdog) — forcing reconnect; {}",
                             RTDS_STALE_THRESHOLD.as_secs_f64(),
+                            health.rtds_summary(now),
                         ));
                     }
                 };
+                let received_at = Instant::now();
+                health.record_raw_frame(received_at);
                 match msg {
                     Message::Ping(payload) => {
                         let _ = write.send(Message::Pong(payload)).await;
                     }
+                    Message::Pong(_) => {
+                        health.record_pong(received_at);
+                    }
                     Message::Close(reason) => {
-                        warn!("[RTDS] Server closed: {:?}", reason);
+                        warn!(
+                            "[RTDS] Server closed: {:?}; {}",
+                            reason,
+                            health.rtds_summary(received_at),
+                        );
                         return Err(anyhow!("RTDS closed"));
                     }
                     Message::Text(text) => {
                         if text.is_empty() { continue; }
+                        let body = text.trim();
+                        if body.eq_ignore_ascii_case("PONG") {
+                            health.record_pong(received_at);
+                            continue;
+                        }
+                        if body.eq_ignore_ascii_case("PING") {
+                            let _ = write.send(Message::Text("PONG".to_string())).await;
+                            continue;
+                        }
                         // simd-json drop-in — same Value output, SIMD parse.
                         let mut buf = text.as_bytes().to_vec();
                         let data: serde_json::Value = match simd_json::serde::from_slice(&mut buf) {
@@ -1127,20 +1416,24 @@ async fn rtds_connect_and_run(
                             Some(t) if !t.is_empty() => t,
                             _ => continue,
                         };
-                        let payload = match data.get("payload") { Some(p) => p, None => continue };
-                        let symbol = match payload.get("symbol").and_then(|v| v.as_str()) {
-                            Some(s) => s, None => continue,
-                        };
-                        let price = match payload.get("value").and_then(|v| v.as_f64()) {
-                            Some(p) => p, None => continue,
-                        };
-                        let server_ts_ms = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
                         let source = match topic {
                             "crypto_prices" => "rtds_binance",
                             "crypto_prices_chainlink" => "rtds_chainlink",
                             "equity_prices" => "rtds_pyth",
                             _ => continue,
                         };
+                        health.record_topic_frame(received_at);
+                        let payload = match data.get("payload") { Some(p) => p, None => continue };
+                        let symbol = match payload.get("symbol").and_then(|v| v.as_str()) {
+                            Some(s) => s, None => continue,
+                        };
+                        let price = match payload.get("value").and_then(json_f64) {
+                            Some(p) => p, None => continue,
+                        };
+                        let server_ts_ms = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if is_btc_symbol(symbol) {
+                            health.record_btc_price(received_at);
+                        }
                         let pass = subscriptions.iter().any(|r| {
                             let (t, _) = r.topic_and_type();
                             t == topic && (r.filters.is_empty() || r.filters.iter().any(|f| f.eq_ignore_ascii_case(symbol)))
@@ -1165,6 +1458,19 @@ async fn rtds_connect_and_run(
             }
         }
     }
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn is_btc_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol.to_ascii_lowercase().as_str(),
+        "btc/usd" | "btcusd" | "btcusdt"
+    )
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1445,6 +1751,7 @@ impl ExchangeMarket for PolymarketMarket {
             event_tx,
             ctrl_rx,
             shutdown,
+            self.clob_subscribed_once.clone(),
         ));
 
         // Spawn RTDS task if subscriptions exist (only once)
@@ -1767,5 +2074,80 @@ mod pick_current_event_tests {
         e.slug = "categorical-market-no-timestamp".into();
         let picked = pick_current_event(vec![e.clone()], "s").unwrap();
         assert_eq!(picked.slug, e.slug, "unknown start -> open (legacy end-only)");
+    }
+
+    fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {
+        MarketEvent::OrderBook(OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: symbol.to_string(),
+            bids,
+            asks,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 2,
+        })
+    }
+
+    #[test]
+    fn initial_subscription_is_ready_but_reconnect_waits_for_valid_book() {
+        assert!(!has_complete_clob_subscription(&[]));
+        assert!(has_complete_clob_subscription(&["only-outcome".to_string()]));
+        assert!(has_complete_clob_subscription(&[
+            "up".to_string(),
+            "down".to_string(),
+            "third-outcome".to_string(),
+        ]));
+        let mut lifecycle = ClobLifecycle::default();
+        assert!(lifecycle.subscribed(), "first successful subscribe is READY");
+
+        assert!(lifecycle.disconnected(), "read error emits NOT_READY once");
+        assert!(!lifecycle.disconnected(), "retry failures do not flap NOT_READY");
+        assert!(
+            !lifecycle.subscribed(),
+            "successful re-subscribe alone must not restore READY",
+        );
+
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let trade = MarketEvent::Trade(TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "up".to_string(),
+            price: 0.5,
+            quantity: 1.0,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 2,
+        });
+        assert!(!is_valid_subscribed_book(&trade, &tokens));
+        assert!(!is_valid_subscribed_book(&book("up", vec![], vec![]), &tokens));
+        assert!(!is_valid_subscribed_book(
+            &book(
+                "other",
+                vec![PriceLevel { price: 0.49, quantity: 1.0 }],
+                vec![],
+            ),
+            &tokens,
+        ));
+        assert!(is_valid_subscribed_book(
+            &book(
+                "up",
+                vec![PriceLevel { price: 0.49, quantity: 1.0 }],
+                vec![],
+            ),
+            &tokens,
+        ));
+        assert!(lifecycle.valid_book(), "first valid subscribed book restores READY");
+        assert!(!lifecycle.valid_book(), "subsequent books do not duplicate READY");
+    }
+
+    #[test]
+    fn engine_level_reconnect_also_waits_for_valid_book() {
+        let mut lifecycle = ClobLifecycle {
+            subscribed_once: true,
+            not_ready_announced: true,
+        };
+        assert!(
+            !lifecycle.subscribed(),
+            "a new task must remember that this is not the initial subscription",
+        );
+        assert!(lifecycle.valid_book());
     }
 }

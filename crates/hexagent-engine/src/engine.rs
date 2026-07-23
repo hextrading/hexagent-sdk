@@ -53,6 +53,26 @@ fn set_feed_readiness(
         .insert(feed.to_string(), state);
 }
 
+/// Polymarket readiness is lifecycle-driven by the async CLOB task:
+/// `Connected` is emitted only after the first subscription or a valid
+/// post-reconnect book, while `Disconnected` is emitted at the transport
+/// failure boundary.
+fn polymarket_readiness_transition(event: &MarketEvent) -> Option<FeedReadiness> {
+    match event {
+        MarketEvent::Connected {
+            exchange: Exchange::Polymarket,
+        } => Some(FeedReadiness::Ready),
+        MarketEvent::Disconnected {
+            exchange: Exchange::Polymarket,
+            reason,
+        } => Some(FeedReadiness::NotReady {
+            stage: "data_stream".to_string(),
+            reason: reason.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Live trading does not replay Polymarket's event-local orderbook/trade
 /// history after restart, so persisting that high-volume stream only adds
 /// recorder I/O. `SpotPrice` is deliberately kept: its `exchange()` method
@@ -3084,7 +3104,7 @@ impl Engine {
                         "binance" => Exchange::Binance,
                         "bybit" => Exchange::Bybit,
                         "binance_futures" => Exchange::Binance, // placeholder; sends SpotPrice events
-                        "chainlink" => Exchange::Polymarket, // placeholder; Chainlink sends SpotPrice events
+                        "chainlink" => Exchange::Chainlink,
                         "coinbase" => Exchange::Coinbase,
                         "kraken" => Exchange::Kraken,
                         "okx" => Exchange::Okx,
@@ -3345,15 +3365,30 @@ impl Engine {
                         }
 
                         let connected_at = std::time::Instant::now();
-                        set_feed_readiness(
-                            &feed_readiness,
-                            &cfg.name,
-                            FeedReadiness::Ready,
-                        );
+                        // Polymarket's connect() only launches its async CLOB
+                        // task. The task emits Connected after the actual
+                        // subscription frame has been sent, so do not expose
+                        // a premature READY window here.
                         if cfg.name == "polymarket" {
-                            info!("[feed_health] polymarket readiness=READY stage=market_stream");
+                            set_feed_readiness(
+                                &feed_readiness,
+                                &cfg.name,
+                                FeedReadiness::NotReady {
+                                    stage: "subscription".to_string(),
+                                    reason: "awaiting CLOB subscription confirmation".to_string(),
+                                },
+                            );
+                            info!(
+                                "[feed_health] polymarket readiness=NOT_READY stage=subscription reason=awaiting_clob_subscription"
+                            );
+                        } else {
+                            set_feed_readiness(
+                                &feed_readiness,
+                                &cfg.name,
+                                FeedReadiness::Ready,
+                            );
+                            let _ = tx.send(MarketEvent::Connected { exchange });
                         }
-                        let _ = tx.send(MarketEvent::Connected { exchange });
                         let mut last_data_at = std::time::Instant::now();
                         // Per-feed stale-data timeout. The default 10 s fits
                         // spot book / trade streams that push multiple times
@@ -3391,6 +3426,27 @@ impl Engine {
                             match feed.next_event() {
                                 Ok(Some(event)) => {
                                     last_data_at = std::time::Instant::now();
+                                    if cfg.name == "polymarket" {
+                                        if let Some(state) =
+                                            polymarket_readiness_transition(&event)
+                                        {
+                                            set_feed_readiness(
+                                                &feed_readiness,
+                                                &cfg.name,
+                                                state.clone(),
+                                            );
+                                            match state {
+                                                FeedReadiness::Ready => info!(
+                                                    "[feed_health] polymarket readiness=READY stage=market_stream"
+                                                ),
+                                                FeedReadiness::NotReady { reason, .. } => warn!(
+                                                    "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={}",
+                                                    reason,
+                                                ),
+                                                FeedReadiness::Starting => {}
+                                            }
+                                        }
+                                    }
                                     // Paper mode: also send Polymarket events to the sim_v2 core
                                     if let Some(ref stx) = sim_tx {
                                         let _ = stx.send(event.clone());
@@ -5390,6 +5446,34 @@ mod market_router_tests {
         assert_eq!(
             states.read().unwrap().get("polymarket"),
             Some(&FeedReadiness::Ready),
+        );
+    }
+
+    #[test]
+    fn polymarket_lifecycle_events_drive_not_ready_then_ready() {
+        let disconnected = MarketEvent::Disconnected {
+            exchange: Exchange::Polymarket,
+            reason: "WS read error: reset".into(),
+        };
+        assert_eq!(
+            polymarket_readiness_transition(&disconnected),
+            Some(FeedReadiness::NotReady {
+                stage: "data_stream".into(),
+                reason: "WS read error: reset".into(),
+            }),
+        );
+        assert_eq!(
+            polymarket_readiness_transition(&MarketEvent::Connected {
+                exchange: Exchange::Polymarket,
+            }),
+            Some(FeedReadiness::Ready),
+        );
+        assert_eq!(
+            polymarket_readiness_transition(&MarketEvent::Connected {
+                exchange: Exchange::Chainlink,
+            }),
+            None,
+            "Chainlink lifecycle must not mutate Polymarket readiness",
         );
     }
 

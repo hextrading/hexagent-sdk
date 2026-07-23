@@ -18,11 +18,116 @@ pub mod paper;
 pub mod sim;
 pub mod sim_v2;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::types::MarketEvent;
 use crate::types::{Exchange, OrderRequest, OrderUpdate};
 use anyhow::Result;
+
+/// Polymarket's current SDK defaults: application-level text `PING` every
+/// five seconds and a 15-second deadline for the matching text `PONG`.
+pub(crate) const POLYMARKET_WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const POLYMARKET_WS_PONG_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const POLYMARKET_WS_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Layered WebSocket liveness timestamps.
+///
+/// Keeping these clocks separate lets an incident log distinguish:
+/// - no PONG: transport/heartbeat failure;
+/// - PONG and raw frames, but no topic frame: subscription silence;
+/// - topic frames, but no BTC price: a single-symbol data gap.
+pub(crate) struct WsHealth {
+    connected_at: Instant,
+    last_pong: Option<Instant>,
+    last_raw_frame: Option<Instant>,
+    last_topic_frame: Option<Instant>,
+    last_btc_price: Option<Instant>,
+    awaiting_pong_since: Option<Instant>,
+}
+
+impl WsHealth {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            connected_at: now,
+            last_pong: None,
+            last_raw_frame: None,
+            last_topic_frame: None,
+            last_btc_price: None,
+            awaiting_pong_since: None,
+        }
+    }
+
+    pub(crate) fn record_raw_frame(&mut self, now: Instant) {
+        self.last_raw_frame = Some(now);
+    }
+
+    pub(crate) fn record_pong(&mut self, now: Instant) {
+        self.last_pong = Some(now);
+        self.awaiting_pong_since = None;
+    }
+
+    pub(crate) fn record_topic_frame(&mut self, now: Instant) {
+        self.last_topic_frame = Some(now);
+    }
+
+    pub(crate) fn record_btc_price(&mut self, now: Instant) {
+        self.last_btc_price = Some(now);
+    }
+
+    pub(crate) fn record_ping_sent(&mut self, now: Instant) {
+        // Preserve the oldest unanswered PING so repeated sends cannot defer
+        // the timeout forever.
+        self.awaiting_pong_since.get_or_insert(now);
+    }
+
+    pub(crate) fn pong_timed_out(&self, now: Instant) -> bool {
+        self.awaiting_pong_since
+            .is_some_and(|sent_at| elapsed(now, sent_at) >= POLYMARKET_WS_PONG_TIMEOUT)
+    }
+
+    pub(crate) fn topic_is_stale(&self, now: Instant, threshold: Duration) -> bool {
+        self.age(self.last_topic_frame, now) >= threshold
+    }
+
+    pub(crate) fn btc_price_is_stale(&self, now: Instant, threshold: Duration) -> bool {
+        self.age(self.last_btc_price, now) >= threshold
+    }
+
+    pub(crate) fn transport_summary(&self, now: Instant) -> String {
+        format!(
+            "last_pong={} last_raw_frame={} last_topic_frame={}",
+            self.age_label(self.last_pong, now),
+            self.age_label(self.last_raw_frame, now),
+            self.age_label(self.last_topic_frame, now),
+        )
+    }
+
+    pub(crate) fn rtds_summary(&self, now: Instant) -> String {
+        format!(
+            "{} last_btc_price={}",
+            self.transport_summary(now),
+            self.age_label(self.last_btc_price, now),
+        )
+    }
+
+    fn age(&self, last: Option<Instant>, now: Instant) -> Duration {
+        elapsed(now, last.unwrap_or(self.connected_at))
+    }
+
+    fn age_label(&self, last: Option<Instant>, now: Instant) -> String {
+        match last {
+            Some(at) => format!("{:.1}s_ago", elapsed(now, at).as_secs_f64()),
+            None => format!(
+                "never({:.1}s_since_connect)",
+                elapsed(now, self.connected_at).as_secs_f64(),
+            ),
+        }
+    }
+}
+
+fn elapsed(now: Instant, then: Instant) -> Duration {
+    now.checked_duration_since(then).unwrap_or_default()
+}
 
 /// Exponential backoff with jitter for reconnection.
 ///
@@ -177,4 +282,42 @@ pub trait ExchangeTrade: Send {
 
     /// Name of this executor
     fn name(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_health_times_out_oldest_unanswered_ping() {
+        let start = Instant::now();
+        let mut health = WsHealth::new(start);
+
+        health.record_ping_sent(start + Duration::from_secs(5));
+        health.record_ping_sent(start + Duration::from_secs(10));
+
+        assert!(!health.pong_timed_out(start + Duration::from_secs(19)));
+        assert!(health.pong_timed_out(start + Duration::from_secs(20)));
+
+        health.record_pong(start + Duration::from_secs(20));
+        assert!(!health.pong_timed_out(start + Duration::from_secs(40)));
+    }
+
+    #[test]
+    fn ws_health_keeps_transport_topic_and_btc_clocks_separate() {
+        let start = Instant::now();
+        let mut health = WsHealth::new(start);
+
+        health.record_raw_frame(start + Duration::from_secs(1));
+        health.record_pong(start + Duration::from_secs(2));
+        health.record_topic_frame(start + Duration::from_secs(3));
+        health.record_btc_price(start + Duration::from_secs(4));
+
+        let now = start + Duration::from_secs(10);
+        let summary = health.rtds_summary(now);
+        assert!(summary.contains("last_pong=8.0s_ago"));
+        assert!(summary.contains("last_raw_frame=9.0s_ago"));
+        assert!(summary.contains("last_topic_frame=7.0s_ago"));
+        assert!(summary.contains("last_btc_price=6.0s_ago"));
+    }
 }

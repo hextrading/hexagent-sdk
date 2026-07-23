@@ -8,6 +8,7 @@ use std::fmt;
 #[serde(rename_all = "lowercase")]
 pub enum Exchange {
     Binance,
+    Chainlink,
     Bybit,
     Coinbase,
     Kraken,
@@ -27,6 +28,7 @@ impl fmt::Display for Exchange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Exchange::Binance => write!(f, "binance"),
+            Exchange::Chainlink => write!(f, "chainlink"),
             Exchange::Bybit => write!(f, "bybit"),
             Exchange::Coinbase => write!(f, "coinbase"),
             Exchange::Kraken => write!(f, "kraken"),
@@ -48,6 +50,7 @@ impl Exchange {
     pub fn from_name(name: &str) -> Option<Exchange> {
         match name {
             "binance" => Some(Exchange::Binance),
+            "chainlink" => Some(Exchange::Chainlink),
             "bybit" => Some(Exchange::Bybit),
             "coinbase" => Some(Exchange::Coinbase),
             "kraken" => Some(Exchange::Kraken),
@@ -310,6 +313,13 @@ mod tests {
     //! whichever direction the upstream sorts, `best_bid` returns the
     //! highest-price level and `best_ask` returns the lowest-price level.
     use super::*;
+
+    #[test]
+    fn chainlink_has_its_own_exchange_label() {
+        assert_eq!(Exchange::Chainlink.to_string(), "chainlink");
+        assert_eq!(Exchange::from_name("chainlink"), Some(Exchange::Chainlink));
+        assert_ne!(Exchange::Chainlink, Exchange::Polymarket);
+    }
 
     fn lvl(price: f64, qty: f64) -> PriceLevel {
         PriceLevel { price, quantity: qty }
