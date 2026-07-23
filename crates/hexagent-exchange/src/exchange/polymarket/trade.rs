@@ -62,7 +62,8 @@ struct FetchedOrder {
 
 /// Result of an orphan order lookup. Keep an explicit server not-found result
 /// separate from transport/service/parse failures: only the former is
-/// authoritative enough to advance the special place-425 terminalization rule.
+/// authoritative enough to advance the universal four-result placement
+/// terminalization rule.
 enum FetchOrderResult {
     Found(FetchedOrder),
     NotFound,
@@ -154,10 +155,6 @@ impl From<HttpErr> for anyhow::Error {
 impl HttpErr {
     fn is_http_425(&self) -> bool {
         matches!(self, HttpErr::Status(425, _))
-    }
-
-    fn is_transport(&self) -> bool {
-        matches!(self, HttpErr::Transport(_))
     }
 
     fn is_explicit_not_found(&self) -> bool {
@@ -926,27 +923,16 @@ pub struct SharedState {
     /// live log can be aggregated without a separate metrics dependency.
     pub(crate) http_425_circuit_entries_total: std::sync::atomic::AtomicU64,
     pub(crate) get_live_delete_uncertain_total: std::sync::atomic::AtomicU64,
-    /// Independent placement/cancel retry counters. A coid can be in both
-    /// orphan sets after cancel-before-ack; cancel diagnostics must never
+    /// Independent placement/cancel retry counters. Placement counts only
+    /// uninterrupted explicit not-found responses; a coid can be in both
+    /// orphan sets after cancel-before-ack, so cancel diagnostics must never
     /// exhaust the bounded placement retry budget.
     pub(crate) reconcile_attempts: ReconcileAttemptCounters,
-
-    /// Placements whose original POST returned HTTP 425, plus their current
-    /// run of explicit reconcile not-found results. Unlike the short 425 deadline,
-    /// this provenance must survive until a conclusive placement result.
-    pub(crate) place_http_425_reconcile: PlaceNotFoundReconcileState,
-
-    /// Placements whose original POST returned a status-less transport error,
-    /// plus their current uninterrupted run of explicit reconcile not-found
-    /// results. This is deliberately separate from timeout/5xx provenance:
-    /// only Transport-origin placements become Rejected after the bounded
-    /// negative-proof window.
-    pub(crate) place_transport_reconcile: PlaceNotFoundReconcileState,
 
     /// Per-coid **exponential backoff** gate for placement not-found GETs:
     /// wall-clock ns before which the next reconcile GET for this coid is
     /// skipped. Set after each not-found to `now + 0.5s · 2^(attempt-1)`
-    /// (0.5s → 1s → 2s → 4s across the 5 attempts). Without this the
+    /// (0.5s → 1s → 2s across the four observations). Without this the
     /// reconciler re-hammers the GET every ~0.5s re-emit; during a PM REST
     /// slowdown that pours ~5 GETs/orphan onto an already-struggling endpoint
     /// and prolongs the episode. Backing off costs only slower orphan
@@ -974,48 +960,6 @@ pub(crate) struct ReconcileAttemptCounters {
     cancel: Mutex<HashMap<String, u32>>,
 }
 
-/// Persistent placement-failure provenance and consecutive not-found count.
-/// Each instance is scoped to one original POST failure class (for example
-/// HTTP 425 or Transport). Presence in the map retains that provenance; the
-/// value counts only uninterrupted, explicit not-found reconcile responses.
-/// Any other observation resets the value but retains the marker until the
-/// placement reaches a conclusive state.
-#[derive(Default)]
-pub(crate) struct PlaceNotFoundReconcileState {
-    consecutive_not_found: Mutex<HashMap<String, u32>>,
-}
-
-impl PlaceNotFoundReconcileState {
-    fn mark(&self, coid: &str) {
-        if !coid.is_empty() {
-            self.consecutive_not_found.lock().unwrap().insert(coid.to_string(), 0);
-        }
-    }
-
-    /// Return the new consecutive count, or `None` for a placement that did
-    /// not originate from this state's POST failure class.
-    fn note_explicit_not_found(&self, coid: &str) -> Option<u32> {
-        let mut states = self.consecutive_not_found.lock().unwrap();
-        let attempts = states.get_mut(coid)?;
-        *attempts = attempts.saturating_add(1);
-        Some(*attempts)
-    }
-
-    fn reset_consecutive(&self, coid: &str) {
-        if let Some(attempts) = self.consecutive_not_found.lock().unwrap().get_mut(coid) {
-            *attempts = 0;
-        }
-    }
-
-    fn clear(&self, coid: &str) {
-        self.consecutive_not_found.lock().unwrap().remove(coid);
-    }
-
-    fn clear_all(&self) {
-        self.consecutive_not_found.lock().unwrap().clear();
-    }
-}
-
 impl ReconcileAttemptCounters {
     fn next_placement(&self, coid: &str) -> u32 {
         let mut attempts = self.placement.lock().unwrap();
@@ -1040,56 +984,31 @@ impl ReconcileAttemptCounters {
     }
 }
 
-/// Number of fast `not_found` observations before a placement orphan moves to
-/// cold audit. A timed-out POST remains ambiguous even after repeated 404s:
-/// absence on an eventually-consistent read replica is not an authoritative
-/// rejection and must never release the worst-case reservation.
-pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 5;
-
-/// A placement whose POST returned HTTP 425 is considered failed only after
-/// the first explicit not-found response from order reconciliation. The
-/// initial 425 already parks the coid for `HTTP_425_BACKOFF_NS` (10 seconds),
-/// so another multi-attempt window would only prolong a known failed place.
-/// Timeout and HTTP 5xx placement orphans retain the generic fast-then-cold
-/// audit policy; Transport has its own four-result rule below.
-pub(crate) const PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT: u32 = 1;
-
-/// A placement whose POST returned a status-less Transport error becomes
-/// Rejected after four uninterrupted explicit not-found reconciliation
-/// results. Four observations preserve the live-proven stale-replica grace
-/// period while preventing this specific failure class from remaining an
-/// orphan until settlement. Timeout, HTTP 5xx, 425, and reconcile transport
-/// failures do not use or advance this counter.
-pub(crate) const PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT: u32 = 4;
+/// Number of consecutive explicit server not-found observations required to
+/// resolve any placement orphan as Rejected. The rule is provenance-agnostic:
+/// timeout, HTTP 5xx (including DeadlineExceeded), HTTP 425/service-not-ready,
+/// and status-less transport failures all use the same four-result terminal
+/// policy. Any unavailable, found, or otherwise non-not-found lookup resets
+/// the run.
+pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 4;
 
 /// Base interval for the placement not-found retry backoff. The gap before
-/// the Nth GET doubles: 0.5s, 1s, 2s, 4s across attempts 2..5, so the five
-/// attempts span ~7.5s. This keeps orphan resolution responsive while still
+/// the Nth GET doubles: 0.5s, 1s, 2s across attempts 2..4, so four
+/// observations span ~3.5s. This keeps orphan resolution responsive while
 /// preventing quote-cadence retries from amplifying a PM REST slowdown;
 /// orphans that actually filled are booked via the WS user_feed independently.
 pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 500;
 
-/// Audit cadence after the fast 0.5/1/2/4 second placement window is
-/// exhausted. The orphan and its risk reservation remain live; this only
-/// removes the high-rate REST/log storm while waiting for authoritative
-/// LIVE/MATCHED/CANCELED/INVALID evidence or settlement-time account audit.
-pub(crate) const RECONCILE_COLD_BACKOFF_MS: u64 = 30_000;
-
 fn placement_reconcile_backoff_ms(attempts: u32) -> u64 {
-    if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
-        RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts.saturating_sub(1)))
-    } else {
-        RECONCILE_COLD_BACKOFF_MS
-    }
+    RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts.saturating_sub(1)))
 }
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
-/// ready" is observed. 10 s gives the upstream service a chance to drain
-/// without us hammering it; the reconciler resumes automatically on next
-/// `Signal::ReconcilePolymarket` after the deadline. Observed 425 storms
-/// (2026-05-12 13:14–13:21, ~7 min) recover in single-digit minutes, so
-/// 10 s × extending-on-repeat reaches a healthy steady state.
-pub(crate) const HTTP_425_BACKOFF_NS: u64 = 10_000_000_000;
+/// ready" is observed. One second breaks the immediate retry loop while
+/// allowing the orphan to enter the same four-consecutive-not-found proof
+/// used by timeout, HTTP 5xx, and transport-origin placements. A repeated
+/// 425 extends this per-coid deadline and still does not advance that proof.
+pub(crate) const HTTP_425_BACKOFF_NS: u64 = 1_000_000_000;
 
 /// Add or extend a 425 backoff for one orphan. Kept pure so tests can verify
 /// isolation and monotonic deadlines without constructing authenticated
@@ -1221,8 +1140,6 @@ impl SharedState {
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
-        self.place_http_425_reconcile.clear(client_order_id);
-        self.place_transport_reconcile.clear(client_order_id);
         let now = crate::types::now_ns();
         let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
         if backoffs.remove(client_order_id).is_some() {
@@ -1388,24 +1305,6 @@ impl SharedState {
                 active_count, total, coid,
             );
         }
-    }
-
-    /// Mark a placement whose POST returned 425. The persistent marker makes
-    /// the first-not-found terminal rule specific to this class; the normal 10 s
-    /// per-coid backoff prevents an immediate reconcile burst while the
-    /// upstream service is still reporting overload.
-    pub(crate) fn note_place_http_425(&self, coid: &str) {
-        self.place_transport_reconcile.clear(coid);
-        self.place_http_425_reconcile.mark(coid);
-        self.note_http_425_backoff(coid);
-    }
-
-    /// Mark a placement whose POST returned a status-less Transport error.
-    /// Reconciliation counts only subsequent uninterrupted explicit
-    /// not-found observations toward the four-result terminal rule.
-    pub(crate) fn note_place_transport(&self, coid: &str) {
-        self.place_http_425_reconcile.clear(coid);
-        self.place_transport_reconcile.mark(coid);
     }
 
     /// True iff this coid's 425 backoff is active. Expired entries are
@@ -1960,8 +1859,6 @@ impl PolymarketTrade {
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
-                place_http_425_reconcile: PlaceNotFoundReconcileState::default(),
-                place_transport_reconcile: PlaceNotFoundReconcileState::default(),
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
@@ -2202,8 +2099,6 @@ impl PolymarketTrade {
         self.shared.oid_to_coid.lock().unwrap().clear();
         self.shared.coid_to_token.lock().unwrap().clear();
         self.shared.pending_reclaim.lock().unwrap().clear();
-        self.shared.place_http_425_reconcile.clear_all();
-        self.shared.place_transport_reconcile.clear_all();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -2700,8 +2595,7 @@ impl PolymarketTrade {
                 if matches!(&fetch_result, FetchOrderResult::Unavailable)
                     && self.shared.in_http_425_backoff(coid)
                 {
-                    self.shared.place_http_425_reconcile.reset_consecutive(coid);
-                    self.shared.place_transport_reconcile.reset_consecutive(coid);
+                    self.shared.reconcile_attempts.clear_placement(coid);
                     log::debug!(
                         "[PolymarketTrade] Reconcile placement coid={} orderID={}: fetch deferred (HTTP 425 backoff); keeping orphan",
                         coid, oid,
@@ -2709,90 +2603,57 @@ impl PolymarketTrade {
                     continue;
                 }
 
-                // Source-specific terminal rules. Only placements whose
-                // original POST has matching provenance are eligible, and
-                // only an uninterrupted run of explicit server not-found
-                // lookup responses advances a counter. Any other lookup
-                // result breaks both runs conservatively.
+                // Every placement orphan uses the same terminal rule,
+                // regardless of whether the original POST failed with a
+                // timeout, HTTP 5xx/DeadlineExceeded, HTTP 425, or a
+                // status-less transport error. Only uninterrupted explicit
+                // server not-found responses advance the counter.
                 if fetch_result.is_explicit_not_found() {
-                    if let Some(attempts) = self.shared.place_http_425_reconcile
-                        .note_explicit_not_found(coid)
-                    {
-                        if attempts >= PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT {
-                            self.shared.reconcile_attempts.clear_placement(coid);
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                            warn!(
-                                "[orphan_metric] place_http_425_failed=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
-                                coid, oid, attempts,
-                            );
-                            self.shared.remove_order(coid);
-                            updates.push(OrderUpdate {
-                                client_order_id: coid.clone(),
-                                exchange: Exchange::Polymarket,
-                                symbol: symbol.clone(),
-                                side: *side,
-                                exchange_order_id: Some(oid.to_string()),
-                                status: OrderStatus::Rejected,
-                                liquidity: None,
-                                filled_quantity: 0.0,
-                                remaining_quantity: 0.0,
-                                avg_fill_price: *price,
-                                timestamp_ns: now_ns(),
-                                trade_id: None,
-                                order_audit: None,
-                                error: Some(format!(
-                                    "place HTTP 425 followed by {} consecutive reconcile not-found responses",
-                                    attempts,
-                                )),
-                            });
-                            continue;
-                        }
+                    let attempts = self.shared.reconcile_attempts.next_placement(coid);
+                    if attempts >= RECONCILE_NOT_FOUND_RETRY_LIMIT {
+                        self.shared.reconcile_attempts.clear_placement(coid);
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         warn!(
-                            "[orphan_metric] place_http_425_not_found=1 coid={} orderID={} consecutive_not_found={}/{} terminal=pending",
-                            coid, oid, attempts, PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT,
+                            "[orphan_metric] placement_not_found_terminal=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
+                            coid, oid, attempts,
                         );
+                        self.shared.remove_order(coid);
+                        updates.push(OrderUpdate {
+                            client_order_id: coid.clone(),
+                            exchange: Exchange::Polymarket,
+                            symbol: symbol.clone(),
+                            side: *side,
+                            exchange_order_id: Some(oid.to_string()),
+                            status: OrderStatus::Rejected,
+                            liquidity: None,
+                            filled_quantity: 0.0,
+                            remaining_quantity: 0.0,
+                            avg_fill_price: *price,
+                            timestamp_ns: now_ns(),
+                            trade_id: None,
+                            order_audit: None,
+                            error: Some(format!(
+                                "placement orphan followed by {} consecutive reconcile not-found responses",
+                                attempts,
+                            )),
+                        });
+                        continue;
                     }
-
-                    if let Some(attempts) = self.shared.place_transport_reconcile
-                        .note_explicit_not_found(coid)
-                    {
-                        if attempts >= PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT {
-                            self.shared.reconcile_attempts.clear_placement(coid);
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                            warn!(
-                                "[orphan_metric] place_transport_failed=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
-                                coid, oid, attempts,
-                            );
-                            self.shared.remove_order(coid);
-                            updates.push(OrderUpdate {
-                                client_order_id: coid.clone(),
-                                exchange: Exchange::Polymarket,
-                                symbol: symbol.clone(),
-                                side: *side,
-                                exchange_order_id: Some(oid.to_string()),
-                                status: OrderStatus::Rejected,
-                                liquidity: None,
-                                filled_quantity: 0.0,
-                                remaining_quantity: 0.0,
-                                avg_fill_price: *price,
-                                timestamp_ns: now_ns(),
-                                trade_id: None,
-                                order_audit: None,
-                                error: Some(format!(
-                                    "place Transport followed by {} consecutive reconcile not-found responses",
-                                    attempts,
-                                )),
-                            });
-                            continue;
-                        }
-                        warn!(
-                            "[orphan_metric] place_transport_not_found=1 coid={} orderID={} consecutive_not_found={}/{} terminal=pending",
-                            coid, oid, attempts, PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT,
-                        );
-                    }
+                    warn!(
+                        "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (attempt {}/{}) — keeping orphan, retrying",
+                        coid, oid, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
+                    );
+                    let backoff_ms = placement_reconcile_backoff_ms(attempts);
+                    self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
+                        coid.clone(),
+                        now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
+                    );
+                    continue;
                 } else {
-                    self.shared.place_http_425_reconcile.reset_consecutive(coid);
-                    self.shared.place_transport_reconcile.reset_consecutive(coid);
+                    // Consecutiveness is strict: service/transport failures,
+                    // found orders, and unexpected statuses all restart the
+                    // four-result negative-proof window.
+                    self.shared.reconcile_attempts.clear_placement(coid);
                 }
 
                 let fetched_order = fetch_result.order();
@@ -2806,8 +2667,6 @@ impl PolymarketTrade {
                         // so a future unrelated 404 starts fresh.
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                        self.shared.place_http_425_reconcile.clear(coid);
-                        self.shared.place_transport_reconcile.clear(coid);
                         self.shared.register_order_id(coid, oid, symbol);
                         self.shared.open_orders.lock().unwrap().insert(
                             coid.clone(),
@@ -2885,47 +2744,14 @@ impl PolymarketTrade {
                         });
                     }
                     "" => {
-                        // 404 may be a stale read replica — Polymarket CLOB
-                        // is eventually-consistent across shards and a
-                        // freshly-accepted order can return not_found from
-                        // the read endpoint for hundreds of ms (live2 2026-
-                        // 04-30: 66 % of these "rejections" later traded as
-                        // ghosts). Tolerate `RECONCILE_NOT_FOUND_RETRY_LIMIT`
-                        // fast attempts before entering cold audit. Each retry
-                        // happens via the strategy's next ReconcilePolymarket
-                        // signal (orphan stays in the reconciler map; the
-                        // 500 ms placement in_flight TTL gates re-emission).
-                        let attempts = self.shared.reconcile_attempts.next_placement(coid);
-                        if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
-                            warn!(
-                                "[PolymarketTrade] Reconcile: placement coid={} orderID={} not found on server (attempt {}/{}) — keeping orphan, retrying",
-                                coid, oid, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
-                            );
-                            // Exponential backoff before the next GET for this
-                            // coid: 0.5s · 2^(attempt-1) = 0.5s, 1s, 2s, 4s
-                            // across attempts 1..4. The gate at the top of the
-                            // loop skips intervening re-emits until this passes.
-                            let backoff_ms = placement_reconcile_backoff_ms(attempts);
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
-                                coid.clone(),
-                                now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
-                            );
-                            // No update emitted — strategy keeps the orphan
-                            // and the orphan_reconciler in_flight TTL will
-                            // unblock the next dedup'd retry.
-                            continue;
-                        }
-                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
-                            coid.clone(),
-                            now_ns().saturating_add(RECONCILE_COLD_BACKOFF_MS.saturating_mul(1_000_000)),
+                        // Explicit not-found returned above. An empty status
+                        // here therefore means the lookup was unavailable;
+                        // keep the orphan and retry without advancing the
+                        // consecutive-not-found counter.
+                        log::debug!(
+                            "[PolymarketTrade] Reconcile placement coid={} orderID={}: lookup unavailable; keeping orphan",
+                            coid, oid,
                         );
-                        warn!(
-                            "[orphan_metric] placement_orphan_cold=1 coid={} orderID={} attempts={} next_retry_ms={} lock_release=forbidden",
-                            coid, oid, attempts, RECONCILE_COLD_BACKOFF_MS,
-                        );
-                        // No fabricated Rejected update: the strategy keeps
-                        // the placement orphan, cancel intent, and collateral
-                        // reservation until authoritative evidence arrives.
                         continue;
                     }
                     "INVALID" => {
@@ -2965,30 +2791,18 @@ impl PolymarketTrade {
                         });
                     }
                     other => {
-                        // An unknown status is not authority to release risk.
-                        // Use the same fast-then-cold audit policy as 404 while
-                        // surfacing the exact server value to monitoring.
-                        let attempts = self.shared.reconcile_attempts.next_placement(coid);
-                        if attempts < RECONCILE_NOT_FOUND_RETRY_LIMIT {
-                            warn!(
-                                "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' (attempt {}/{}) — keeping as orphan",
-                                coid, oid, other, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
-                            );
-                            let backoff_ms = placement_reconcile_backoff_ms(attempts);
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
-                                coid.clone(),
-                                now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
-                            );
-                        } else {
-                            self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
-                                coid.clone(),
-                                now_ns().saturating_add(RECONCILE_COLD_BACKOFF_MS.saturating_mul(1_000_000)),
-                            );
-                            warn!(
-                                "[orphan_metric] placement_orphan_cold=1 coid={} orderID={} attempts={} unexpected_status='{}' next_retry_ms={} lock_release=forbidden",
-                                coid, oid, attempts, other, RECONCILE_COLD_BACKOFF_MS,
-                            );
-                        }
+                        // An unknown status is not authority to release risk
+                        // and is not a not-found result. Keep the orphan,
+                        // restart the consecutive-not-found window, and use a
+                        // short retry delay to avoid quote-cadence polling.
+                        warn!(
+                            "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' — keeping as orphan",
+                            coid, oid, other,
+                        );
+                        self.shared.placement_reconcile_next_retry_ns.lock().unwrap().insert(
+                            coid.clone(),
+                            now_ns().saturating_add(RECONCILE_BACKOFF_BASE_MS.saturating_mul(1_000_000)),
+                        );
                     }
                 }
             }
@@ -3214,7 +3028,7 @@ impl PolymarketTrade {
             Err(e) => {
                 // HTTP 404 is the only transport result classified as an
                 // explicit not-found observation. A 425 or any other failure
-                // is unavailable evidence and must not advance the place-425
+                // is unavailable evidence and must not advance the universal
                 // consecutive-not-found terminalization rule.
                 if e.is_explicit_not_found() {
                     warn!("[PolymarketTrade] Reconcile /data/order/{}: {}", order_id, e);
@@ -3402,9 +3216,7 @@ impl PolymarketTrade {
             Ok(r) => r,
             Err(e) if e.is_submit_unknown_state() => {
                 if e.is_http_425() {
-                    self.shared.note_place_http_425(&order.client_order_id);
-                } else if e.is_transport() {
-                    self.shared.note_place_transport(&order.client_order_id);
+                    self.shared.note_http_425_backoff(&order.client_order_id);
                 }
                 if self.shared.should_warn_unknown_state(&e) {
                     warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
@@ -4035,7 +3847,6 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 Err(e) if e.is_submit_unknown_state() => {
                     let is_http_425 = e.is_http_425();
-                    let is_transport = e.is_transport();
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Submit unknown state ({}) coids={:?} → NewOrderTimeout",
@@ -4049,9 +3860,7 @@ impl ExchangeTrade for PolymarketTrade {
                     for (i, oh) in signed_hashes.iter().enumerate() {
                         let order = &chunk[body_to_chunk[i]];
                         if is_http_425 {
-                            self.shared.note_place_http_425(&order.client_order_id);
-                        } else if is_transport {
-                            self.shared.note_place_transport(&order.client_order_id);
+                            self.shared.note_http_425_backoff(&order.client_order_id);
                         }
                         all_updates.push(Self::make_timeout_place(order, Some(oh)));
                     }
@@ -4793,7 +4602,6 @@ impl ExchangeTrade for PolymarketTrade {
                     // the strategy can cancel / status-query by orderID
                     // directly, no open-order scan needed.
                     let is_http_425 = e.is_http_425();
-                    let is_transport = e.is_transport();
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Submit unknown state ({}) coids={:?} → NewOrderTimeout",
@@ -4803,9 +4611,7 @@ impl ExchangeTrade for PolymarketTrade {
                     for (i, oh) in place_signed.iter().enumerate() {
                         let order = &place_chunk[place_body_to_chunk[i]];
                         if is_http_425 {
-                            self.shared.note_place_http_425(&order.client_order_id);
-                        } else if is_transport {
-                            self.shared.note_place_transport(&order.client_order_id);
+                            self.shared.note_http_425_backoff(&order.client_order_id);
                         }
                         updates.push(Self::make_timeout_place(order, Some(oh)));
                     }
@@ -5139,8 +4945,16 @@ mod tests {
     #[test]
     fn http_425_classified_as_unknown_state() {
         assert!(
+            HttpErr::Status(500, "DeadlineExceeded".to_string()).is_submit_unknown_state(),
+            "500 DeadlineExceeded must create a placement orphan"
+        );
+        assert!(
             HttpErr::Status(425, "Too Early".to_string()).is_unknown_state(),
             "425 must route through unknown_state so the cancel path treats it as transient"
+        );
+        assert!(
+            HttpErr::Status(425, "service not ready".to_string()).is_submit_unknown_state(),
+            "service-not-ready must create a placement orphan"
         );
         assert!(
             HttpErr::Status(503, "Service Unavailable".to_string()).is_unknown_state(),
@@ -5196,54 +5010,23 @@ mod tests {
         ));
     }
 
-    /// Only place-425 provenance enables the terminal rule, and any lookup
-    /// observation other than the configured not-found result resets the run.
-    /// This stays separate from the generic placement audit attempts.
+    /// Every placement-orphan provenance uses the same four-result terminal
+    /// rule. Clearing the counter models any intervening non-not-found lookup
+    /// and must restart the consecutive run.
     #[test]
-    fn place_http_425_requires_one_explicit_not_found_after_backoff() {
-        let state = PlaceNotFoundReconcileState::default();
-        let coid = "place-425";
+    fn all_placement_orphans_require_four_consecutive_not_found_results() {
+        assert_eq!(RECONCILE_NOT_FOUND_RETRY_LIMIT, 4);
 
-        assert_eq!(state.note_explicit_not_found("ordinary-timeout"), None);
-
-        state.mark(coid);
-        assert_eq!(PLACE_HTTP_425_NOT_FOUND_TERMINAL_LIMIT, 1);
-        assert_eq!(state.note_explicit_not_found(coid), Some(1));
-
-        // Simulate any reconcile outcome other than the configured not-found:
-        // the placement remains 425-marked, but its consecutive run restarts.
-        state.reset_consecutive(coid);
-        assert_eq!(state.note_explicit_not_found(coid), Some(1));
-
-        state.clear(coid);
-        assert_eq!(state.note_explicit_not_found(coid), None);
-    }
-
-    /// Transport-origin placement orphans require exactly four uninterrupted
-    /// explicit not-found observations. An unavailable/found lookup resets the
-    /// run, while non-Transport placements never enter this provenance state.
-    #[test]
-    fn place_transport_requires_four_consecutive_explicit_not_found() {
-        let state = PlaceNotFoundReconcileState::default();
-        let coid = "place-transport";
-
-        assert_eq!(state.note_explicit_not_found("ordinary-timeout"), None);
-
-        state.mark(coid);
-        assert_eq!(PLACE_TRANSPORT_NOT_FOUND_TERMINAL_LIMIT, 4);
-        assert_eq!(state.note_explicit_not_found(coid), Some(1));
-        assert_eq!(state.note_explicit_not_found(coid), Some(2));
-
-        // Any non-not-found reconcile observation breaks consecutiveness but
-        // retains the original Transport provenance for subsequent audits.
-        state.reset_consecutive(coid);
-        assert_eq!(state.note_explicit_not_found(coid), Some(1));
-        assert_eq!(state.note_explicit_not_found(coid), Some(2));
-        assert_eq!(state.note_explicit_not_found(coid), Some(3));
-        assert_eq!(state.note_explicit_not_found(coid), Some(4));
-
-        state.clear(coid);
-        assert_eq!(state.note_explicit_not_found(coid), None);
+        for coid in ["timeout", "deadline-exceeded", "service-not-ready", "transport"] {
+            let attempts = ReconcileAttemptCounters::default();
+            assert_eq!(attempts.next_placement(coid), 1);
+            assert_eq!(attempts.next_placement(coid), 2);
+            attempts.clear_placement(coid);
+            assert_eq!(attempts.next_placement(coid), 1);
+            assert_eq!(attempts.next_placement(coid), 2);
+            assert_eq!(attempts.next_placement(coid), 3);
+            assert_eq!(attempts.next_placement(coid), 4);
+        }
     }
 
     /// A status-less reqwest send failure is ambiguous only for placement
@@ -5259,13 +5042,10 @@ mod tests {
             transport.is_submit_unknown_state(),
             "a placement POST may have landed before its transport failed"
         );
-        assert!(transport.is_transport());
         assert!(
             !transport.is_unknown_state(),
             "the shared cancel/GET classifier must retain its existing behavior"
         );
-        assert!(!HttpErr::Timeout.is_transport());
-        assert!(!HttpErr::Status(425, "Too Early".to_string()).is_transport());
         assert!(
             !HttpErr::Other("json parse: invalid response".to_string())
                 .is_submit_unknown_state(),
@@ -5278,22 +5058,20 @@ mod tests {
         );
     }
 
-    /// Placement-orphan not-found retries should resolve in about one third
-    /// of the former 22.5 s window while retaining all five observations.
+    /// Four not-found observations use 0.5/1/2 second gaps and reach the
+    /// terminal Rejected decision after about 3.5 seconds.
     #[test]
-    fn reconcile_not_found_backoff_schedule_is_half_to_four_seconds() {
+    fn reconcile_not_found_backoff_schedule_spans_three_and_a_half_seconds() {
         let gaps_ms: Vec<u64> = (1..RECONCILE_NOT_FOUND_RETRY_LIMIT)
             .map(placement_reconcile_backoff_ms)
             .collect();
 
-        assert_eq!(gaps_ms, vec![500, 1_000, 2_000, 4_000]);
-        assert_eq!(gaps_ms.iter().sum::<u64>(), 7_500);
-        assert_eq!(placement_reconcile_backoff_ms(5), RECONCILE_COLD_BACKOFF_MS);
-        assert_eq!(placement_reconcile_backoff_ms(50), RECONCILE_COLD_BACKOFF_MS);
+        assert_eq!(gaps_ms, vec![500, 1_000, 2_000]);
+        assert_eq!(gaps_ms.iter().sum::<u64>(), 3_500);
     }
 
     /// A cancel-before-ack timeout can put one coid in both reconcile lists.
-    /// Unbounded cancel polls must not consume placement's five observations.
+    /// Unbounded cancel polls must not consume placement's four observations.
     #[test]
     fn placement_and_cancel_reconcile_attempts_are_isolated() {
         let attempts = ReconcileAttemptCounters::default();
@@ -5350,18 +5128,13 @@ mod tests {
         assert!(!backoffs.contains_key("throttled"));
     }
 
-    /// `HTTP_425_BACKOFF_NS` must be long enough to break a tight reconcile
-    /// loop (≥ 500 ms throttle × few iterations) but short enough that
-    /// recovery is responsive when the upstream comes back. Lock the
-    /// chosen value at 10 s.
+    /// `HTTP_425_BACKOFF_NS` breaks the immediate reconcile loop but remains
+    /// short enough to enter the normal four-not-found proof promptly.
     #[test]
     fn http_425_backoff_constant_is_in_sane_range() {
-        // ≥ 5 s ensures the reconciler's 500 ms throttle gets at least
-        // 10 missed iterations between 425s — well past the storm window.
-        assert!(HTTP_425_BACKOFF_NS >= 5_000_000_000,
-            "HTTP_425_BACKOFF_NS = {} ns is too short to suppress the reconcile cascade", HTTP_425_BACKOFF_NS);
-        // ≤ 60 s keeps recovery responsive once Polymarket recovers.
-        assert!(HTTP_425_BACKOFF_NS <= 60_000_000_000,
-            "HTTP_425_BACKOFF_NS = {} ns is too long; degrades real-time responsiveness", HTTP_425_BACKOFF_NS);
+        assert_eq!(
+            HTTP_425_BACKOFF_NS, 1_000_000_000,
+            "425/service-not-ready must use the selected one-second per-coid backoff",
+        );
     }
 }
