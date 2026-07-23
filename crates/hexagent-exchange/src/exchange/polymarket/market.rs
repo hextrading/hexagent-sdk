@@ -293,25 +293,32 @@ fn fetch_series_id(series_slug: &str) -> Result<String> {
 }
 
 /// Step 2: Fetch the soonest-to-end event in a series whose `end_date`
-/// is ≥ now+1s. This is the "currently trading" event for cycle-based
-/// series like `btc-up-or-down-5m`.
+/// leaves enough time to initialize safely. This is the "currently trading"
+/// event for cycle-based series like `btc-up-or-down-5m`, or the next event
+/// when the current cycle is already too close to expiry.
 ///
-/// Uses `GET /events?series_id=...&end_date_min=<now+1s>&ascending=true&limit=1`.
-/// The +1s skew makes sure the just-expired event isn't picked up during
-/// the rotation second (event end_date == now → boundary case).
+/// Uses `GET /events?series_id=...&end_date_min=<now+guard>&ascending=true&limit=1`.
+/// The guard is 20% of the parsed event duration, clamped to 5–60 seconds
+/// (60 seconds for a 5-minute event). Unknown-duration series keep the
+/// legacy 1-second boundary guard.
 ///
 /// `closed` is intentionally NOT in the query — gamma-api occasionally
 /// flips a freshly-rotated event's `closed` flag to `true` for a few
 /// seconds before the next event is published, which would otherwise
 /// surface as a spurious "no live event" warning. The
-/// `end_date_min ≥ now+1s` filter alone is enough to exclude expired
-/// events; the strategy's own settle-and-detach machinery handles
-/// closed-flag transitions.
-fn fetch_active_events_by_series_id(series_id: &str) -> Result<Vec<PolymarketEvent>> {
+/// The guarded `end_date_min` filter excludes expired/nearly-expired events;
+/// the strategy's own settle-and-detach machinery handles closed-flag
+/// transitions.
+fn fetch_active_events_by_series_id(
+    series_id: &str,
+    series_slug: &str,
+) -> Result<Vec<PolymarketEvent>> {
     let now_secs = chrono::Utc::now().timestamp() as u64;
-    let end_min_iso = chrono::DateTime::<chrono::Utc>::from_timestamp((now_secs + 1) as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_default();
+    let guard_secs = min_event_remaining_secs(series_slug);
+    let end_min_iso =
+        chrono::DateTime::<chrono::Utc>::from_timestamp((now_secs + guard_secs) as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_default();
     let url = format!(
         "{}/events?series_id={}&end_date_min={}&ascending=true&limit=1",
         GAMMA_API_BASE, series_id, end_min_iso,
@@ -354,12 +361,24 @@ fn event_open_ns(event: &PolymarketEvent) -> Option<u64> {
     None
 }
 
+/// Minimum useful lifetime for a newly-discovered event. Joining a nearly
+/// finished cycle causes avoidable CLOB churn and often leaves too little time
+/// to resolve its opening strike. Use a duration-relative guard for short
+/// series while capping longer series at the strategy's 60-second strike
+/// recovery window.
+fn min_event_remaining_secs(series_slug: &str) -> u64 {
+    parse_slug_duration_secs(series_slug)
+        .map(|duration| (duration / 5).clamp(5, 60))
+        .unwrap_or(1)
+}
+
 /// Pick the currently trading event from a list of events.
 ///
 /// "Currently trading" = the event is **already open** (`start ≤ now`) and
-/// not yet expired (`end > now`), choosing the soonest-to-expire among
-/// those. An event whose open time is unknown is treated as open, so
-/// series without a start timestamp keep the previous end-only behaviour.
+/// has enough useful lifetime left (`end > now + guard`), choosing the
+/// soonest-to-expire among those. An event whose open time is unknown is
+/// treated as open, so series without a start timestamp keep the previous
+/// end-only behaviour.
 ///
 /// When no event is open yet but one is scheduled to open soon (a series
 /// "gap" — the next cycle's market hasn't started), we log a WARN and
@@ -371,6 +390,8 @@ fn event_open_ns(event: &PolymarketEvent) -> Option<u64> {
 fn pick_current_event(events: Vec<PolymarketEvent>, series_slug: &str) -> Result<PolymarketEvent> {
     let now = chrono::Utc::now();
     let now_ns = now.timestamp_nanos_opt().unwrap_or(0) as u64;
+    let min_remaining_secs = min_event_remaining_secs(series_slug);
+    let min_end = now + chrono::Duration::seconds(min_remaining_secs as i64);
 
     let parse_end = |s: &str| -> Option<chrono::DateTime<chrono::Utc>> {
         chrono::DateTime::parse_from_rfc3339(s)
@@ -393,7 +414,7 @@ fn pick_current_event(events: Vec<PolymarketEvent>, series_slug: &str) -> Result
     for event in events {
         if event.end_date.is_empty() { continue; }
         let Some(end_dt) = parse_end(&event.end_date) else { continue };
-        if end_dt <= now { continue; } // already expired
+        if end_dt <= min_end { continue; } // expired or too close to expiry
 
         let start_ns = event_open_ns(&event).unwrap_or(0);
         let is_open = start_ns == 0 || start_ns <= now_ns;
@@ -421,7 +442,11 @@ fn pick_current_event(events: Vec<PolymarketEvent>, series_slug: &str) -> Result
         );
         return Ok(event);
     }
-    Err(anyhow!("No currently trading event in series '{}'", series_slug))
+    Err(anyhow!(
+        "No event with at least {}s remaining in series '{}'",
+        min_remaining_secs,
+        series_slug,
+    ))
 }
 
 /// Fetch the currently trading event for a series slug (first call — resolves series_id).
@@ -440,7 +465,7 @@ pub fn fetch_active_event(series_slug: &str) -> Result<(String, PolymarketEvent)
 
 fn fetch_active_event_with_series_id_pub(series_slug: &str) -> Result<(String, PolymarketEvent)> {
     let series_id = fetch_series_id(series_slug)?;
-    let events = fetch_active_events_by_series_id(&series_id)?;
+    let events = fetch_active_events_by_series_id(&series_id, series_slug)?;
     let event = pick_current_event(events, series_slug)?;
     Ok((series_id, event))
 }
@@ -540,7 +565,7 @@ pub fn fetch_next_event_condition_id(
 
 /// Fetch the currently trading event using a cached series_id (rotation calls).
 fn fetch_active_event_by_series_id(series_id: &str, series_slug: &str) -> Result<PolymarketEvent> {
-    let events = fetch_active_events_by_series_id(series_id)?;
+    let events = fetch_active_events_by_series_id(series_id, series_slug)?;
     pick_current_event(events, series_slug)
 }
 
@@ -1706,6 +1731,24 @@ mod pick_current_event_tests {
         let ends_later = mk_event(n - 60, n + 240);
         let picked = pick_current_event(vec![ends_later, ends_sooner.clone()], "s").unwrap();
         assert_eq!(picked.slug, ends_sooner.slug);
+    }
+
+    #[test]
+    fn skips_nearly_expired_cycle_for_next_full_event() {
+        let n = now();
+        let near_end = mk_event(n - 270, n + 30);
+        let next = mk_event(n + 30, n + 330);
+        let picked =
+            pick_current_event(vec![near_end, next.clone()], "btc-updown-5m").unwrap();
+        assert_eq!(picked.slug, next.slug, "5m series requires 60s useful lifetime");
+    }
+
+    #[test]
+    fn remaining_time_guard_scales_and_caps() {
+        assert_eq!(min_event_remaining_secs("btc-updown-1m"), 12);
+        assert_eq!(min_event_remaining_secs("btc-updown-5m"), 60);
+        assert_eq!(min_event_remaining_secs("eth-updown-1h"), 60);
+        assert_eq!(min_event_remaining_secs("categorical-market"), 1);
     }
 
     #[test]
