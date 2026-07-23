@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
@@ -26,6 +26,47 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapReplayOutcome {
+    Complete { records: usize },
+    Truncated { records: usize },
+}
+
+impl GapReplayOutcome {
+    fn records(self) -> usize {
+        match self {
+            Self::Complete { records } | Self::Truncated { records } => records,
+        }
+    }
+}
+
+/// Apply a successful reconnect replay to feed health. Failed REST attempts
+/// never call this helper, so `recovering` stays asserted and quoting remains
+/// paused until the same recovery window has been fetched completely.
+///
+/// A truncated replay is transport-complete but inventory-incomplete: resume
+/// consuming the WS while keeping trading stopped via `inventory_uncertain`.
+fn accept_reconnect_replay(
+    health: &super::live_position::UserFeedHealth,
+    outcome: GapReplayOutcome,
+) {
+    if matches!(outcome, GapReplayOutcome::Truncated { .. }) {
+        health.set_inventory_uncertain(true);
+    }
+    health.set_recovering(false);
+}
+
+/// Pin the beginning of one reconnect-recovery episode. REST replay updates
+/// `last_match_time_secs` as it parses each page, including before a later page
+/// fails, so recomputing this value on every attempt could skip the failed gap.
+fn recovery_window_start(
+    current: &mut Option<u64>,
+    last_match_time_secs: u64,
+    rewind_secs: u64,
+) -> u64 {
+    *current.get_or_insert_with(|| last_match_time_secs.saturating_sub(rewind_secs))
+}
 
 /// Record one trade-lifecycle edge and tell the caller whether it is new.
 /// The live ledger owns the terminal/monotonic rules; gating at the feed
@@ -362,7 +403,7 @@ async fn replay_missed_trades(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
     after_secs: u64,
-) -> usize {
+) -> Result<GapReplayOutcome> {
     // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
     // account, so we fetch ALL of the wallet's trades since `after` (no
     // `?market=` narrowing). This is multi-market correct — two instances
@@ -403,19 +444,32 @@ async fn replay_missed_trades(
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("[PolyUserFeed] Gap-fetch /trades error: {}", e);
-                break;
+                return Err(anyhow!(
+                    "Gap-fetch /trades request failed after {} records: {}",
+                    count,
+                    e,
+                ));
             }
         };
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            warn!("[PolyUserFeed] Gap-fetch /trades {}: {}", code, body);
-            break;
+            return Err(anyhow!(
+                "Gap-fetch /trades HTTP {} after {} records: {}",
+                code,
+                count,
+                body,
+            ));
         }
         let json: serde_json::Value = match resp.json().await {
             Ok(j) => j,
-            Err(e) => { warn!("[PolyUserFeed] Gap-fetch parse: {}", e); break; }
+            Err(e) => {
+                return Err(anyhow!(
+                    "Gap-fetch /trades parse failed after {} records: {}",
+                    count,
+                    e,
+                ));
+            }
         };
 
         let (records, next) = if let Some(arr) = json.as_array() {
@@ -452,10 +506,10 @@ async fn replay_missed_trades(
              quoting/trading it and ride to settlement)",
             MAX_PAGES, count,
         );
-        shared.user_feed_health.set_inventory_uncertain(true);
+        Ok(GapReplayOutcome::Truncated { records: count })
+    } else {
+        Ok(GapReplayOutcome::Complete { records: count })
     }
-
-    count
 }
 
 /// Async WebSocket loop. Spawned as a tokio task on the shared runtime.
@@ -480,6 +534,12 @@ async fn user_feed_loop(
             lp.touch_match_time(now_secs);
         }
     }
+    let reconnect_rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
+    // Fixed lower bound for the current recovery episode. A partial REST
+    // attempt may advance `last_match_time_secs`; recomputing from that cursor
+    // would then skip an earlier page that failed. Retain this floor across
+    // reconnect attempts and clear it only after a successful replay.
+    let mut recovery_after_secs: Option<u64> = None;
 
     // Periodic gap-replay task — independent of the WS read loop so its HTTP
     // call never pauses WS reads, and it keeps recovering fills *across*
@@ -523,7 +583,20 @@ async fn user_feed_loop(
                 } else {
                     now_ms.saturating_sub(rewind_ms) / 1000        // rewind (ms) → floor to sec
                 };
-                replay_missed_trades(&shared, &update_tx, after).await;
+                match replay_missed_trades(&shared, &update_tx, after).await {
+                    Ok(GapReplayOutcome::Complete { .. }) => {}
+                    Ok(outcome @ GapReplayOutcome::Truncated { .. }) => {
+                        shared.user_feed_health.set_inventory_uncertain(true);
+                        warn!(
+                            "[PolyUserFeed] Periodic gap replay incomplete: {} records fetched; \
+                             inventory remains uncertain",
+                            outcome.records(),
+                        );
+                    }
+                    Err(e) => {
+                        warn!("[PolyUserFeed] Periodic gap replay failed: {}", e);
+                    }
+                }
             }
         }, gap_span));
     }
@@ -559,7 +632,6 @@ async fn user_feed_loop(
         }
 
         info!("[PolyUserFeed] Connected and authenticated (async)");
-        backoff.reset();
 
         // Gap recovery on (re)connect — whole-wallet, rewind
         // `gap_replay.reconnect_rewind_ms` (default 5s, quantised up to whole
@@ -567,12 +639,55 @@ async fn user_feed_loop(
         // around the disconnect edge isn't skipped by an exact `after=`
         // boundary. Idempotent via the upsert_trade / update_trade status
         // dedup. Covers ALL active markets on this wallet at once.
-        let rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
-        let after_secs = shared.live_position.lock().unwrap()
-            .last_match_time_secs().saturating_sub(rewind_secs);
-        let replayed = replay_missed_trades(&shared, &update_tx, after_secs).await;
-        info!("[PolyUserFeed] Gap recovery after={} replayed={} trades", after_secs, replayed);
-        shared.user_feed_health.set_recovering(false);
+        let last_match_time_secs =
+            shared.live_position.lock().unwrap().last_match_time_secs();
+        let after_secs = recovery_window_start(
+            &mut recovery_after_secs,
+            last_match_time_secs,
+            reconnect_rewind_secs,
+        );
+        match replay_missed_trades(&shared, &update_tx, after_secs).await {
+            Ok(outcome) => {
+                match outcome {
+                    GapReplayOutcome::Complete { records } => {
+                        info!(
+                            "[PolyUserFeed] Gap recovery after={} replayed={} trades (complete)",
+                            after_secs,
+                            records,
+                        );
+                    }
+                    GapReplayOutcome::Truncated { records } => {
+                        warn!(
+                            "[PolyUserFeed] Gap recovery after={} replayed={} trades but was \
+                             truncated; WS consumption will continue with trading stopped",
+                            after_secs,
+                            records,
+                        );
+                    }
+                }
+                accept_reconnect_replay(&shared.user_feed_health, outcome);
+                recovery_after_secs = None;
+                backoff.reset();
+            }
+            Err(e) => {
+                // Do not enter the WS read loop with an unverified gap. Drop
+                // this socket, retain `recovery_after_secs`, and retry the
+                // complete original window after reconnect.
+                shared.user_feed_health.set_recovering(true);
+                let delay = backoff.next_delay();
+                warn!(
+                    "[PolyUserFeed] Gap recovery after={} failed: {}; keeping quoting paused and \
+                     reconnecting in {:.1}s",
+                    after_secs,
+                    e,
+                    delay.as_secs_f64(),
+                );
+                if !shutdown.load(Ordering::Relaxed) {
+                    sleep(delay).await;
+                }
+                continue;
+            }
+        }
 
         let mut last_ping = Instant::now();
         let mut last_data = Instant::now();
@@ -696,6 +811,13 @@ async fn user_feed_loop(
         // Disconnected
         info!("[PolyUserFeed] Disconnected, will reconcile on reconnect");
         shared.user_feed_health.set_recovering(true);
+        let last_match_time_secs =
+            shared.live_position.lock().unwrap().last_match_time_secs();
+        recovery_window_start(
+            &mut recovery_after_secs,
+            last_match_time_secs,
+            reconnect_rewind_secs,
+        );
         if !shutdown.load(Ordering::Relaxed) {
             let delay = backoff.next_delay();
             warn!("[PolyUserFeed] Reconnecting in {:.1}s", delay.as_secs_f64());
@@ -785,5 +907,57 @@ mod tests {
 
         assert!(record(&manager, "FAILED"));
         assert!(!record(&manager, "FAILED"));
+    }
+
+    #[test]
+    fn reconnect_health_clears_only_after_a_successful_replay() {
+        let health = super::super::live_position::UserFeedHealth::new();
+        assert!(health.is_recovering());
+
+        // A failed REST result never reaches `accept_reconnect_replay`.
+        let failed: Result<GapReplayOutcome> = Err(anyhow!("temporary REST failure"));
+        if let Ok(outcome) = failed {
+            accept_reconnect_replay(&health, outcome);
+        }
+        assert!(
+            health.is_recovering(),
+            "REST failure must keep quoting paused",
+        );
+
+        accept_reconnect_replay(
+            &health,
+            GapReplayOutcome::Complete { records: 3 },
+        );
+        assert!(!health.is_recovering());
+        assert!(!health.inventory_uncertain());
+    }
+
+    #[test]
+    fn truncated_replay_keeps_trading_stopped_via_inventory_uncertain() {
+        let health = super::super::live_position::UserFeedHealth::new();
+
+        accept_reconnect_replay(
+            &health,
+            GapReplayOutcome::Truncated { records: 2_500 },
+        );
+
+        assert!(!health.is_recovering(), "WS consumption may resume");
+        assert!(
+            health.inventory_uncertain(),
+            "quoting must remain stopped after an incomplete replay",
+        );
+    }
+
+    #[test]
+    fn reconnect_retries_keep_the_original_recovery_window() {
+        let mut recovery_after = None;
+
+        assert_eq!(recovery_window_start(&mut recovery_after, 1_000, 3), 997);
+        // A partial first attempt may have advanced the observed match time,
+        // but its failed later page still requires the original lower bound.
+        assert_eq!(recovery_window_start(&mut recovery_after, 1_100, 3), 997);
+
+        recovery_after = None;
+        assert_eq!(recovery_window_start(&mut recovery_after, 1_100, 3), 1_097);
     }
 }
