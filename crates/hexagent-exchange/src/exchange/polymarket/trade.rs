@@ -227,8 +227,11 @@ fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
 /// **Uncertain** (server's own wording is ambiguous — both states are
 /// possible). Every caller maps Uncertain to `CancelOrderTimeout`, keeping the
 /// order in orphan-cancel state until an authoritative exchange response says
-/// CANCELED / MATCHED / FILLED. A retry limit may escalate operationally, but
-/// it must never manufacture a terminal order state and release collateral.
+/// CANCELED / MATCHED / FILLED. The one bounded exception is the exact
+/// "order can't be found - already canceled or matched" DELETE response:
+/// three observations from reconciler-issued DELETE retries resolve the local
+/// cancel lifecycle to Cancelled so a stale orphan cannot block an entire
+/// event. The initial cancel response is deliberately excluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelReasonOutcome {
     /// Server explicitly says the order was cancelled.
@@ -298,6 +301,49 @@ fn is_pending_delayed_reason(reason: &str) -> bool {
     r.contains("pending") || r.contains("delayed") || r.contains("processing")
 }
 
+/// Polymarket's exact ambiguous DELETE reply. A single observation is not
+/// authoritative (the order may have matched), but repeatedly receiving this
+/// response after re-GETing a LIVE order means the CLOB no longer has anything
+/// cancelable under that order id. Count only DELETEs issued by the
+/// cancel-orphan reconciler after GET returned LIVE: keep the first two
+/// observations orphaned; the third is the bounded cancel-lifecycle terminal
+/// requested by the live strategy.
+fn is_cancel_not_found_already_canceled_or_matched(reason: &str) -> bool {
+    reason
+        .trim()
+        .eq_ignore_ascii_case("order can't be found - already canceled or matched")
+}
+
+pub(crate) const CANCEL_NOT_FOUND_TERMINAL_LIMIT: u32 = 3;
+
+fn record_cancel_not_found_observation(
+    counts: &mut HashMap<String, u32>,
+    coid: &str,
+    reason: Option<&str>,
+    outcome: CancelReasonOutcome,
+) -> Option<u32> {
+    if outcome != CancelReasonOutcome::Uncertain
+        || coid.is_empty()
+        || !reason.is_some_and(is_cancel_not_found_already_canceled_or_matched)
+    {
+        return None;
+    }
+    let count = counts.entry(coid.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    Some(*count)
+}
+
+fn cancel_not_found_outcome_after_observation(
+    outcome: CancelReasonOutcome,
+    observation: Option<u32>,
+) -> CancelReasonOutcome {
+    if observation.is_some_and(|n| n >= CANCEL_NOT_FOUND_TERMINAL_LIMIT) {
+        CancelReasonOutcome::Cancelled
+    } else {
+        outcome
+    }
+}
+
 fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
     let r = reason.to_ascii_lowercase();
     let not_found = r.contains("not found")
@@ -344,6 +390,7 @@ fn cancel_not_canceled_outcome(reason: &str) -> CancelReasonOutcome {
 /// Convert a DELETE `not_canceled` reason into the lifecycle status emitted to
 /// the strategy. This mapping is deliberately identical for the initial
 /// response and every reconcile retry: uncertainty always remains an orphan.
+#[cfg(test)]
 fn cancel_reason_order_status(reason: &str) -> OrderStatus {
     match cancel_not_canceled_outcome(reason) {
         CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
@@ -923,6 +970,14 @@ pub struct SharedState {
     /// live log can be aggregated without a separate metrics dependency.
     pub(crate) http_425_circuit_entries_total: std::sync::atomic::AtomicU64,
     pub(crate) get_live_delete_uncertain_total: std::sync::atomic::AtomicU64,
+    /// Per-coid cumulative count of the exact ambiguous DELETE response
+    /// "order can't be found - already canceled or matched" returned by
+    /// DELETEs issued from the cancel-orphan reconciler. The initial cancel
+    /// and ordinary single/batch cancel paths never advance this counter.
+    /// The first two reconcile responses remain cancel orphans; the third
+    /// resolves the local lifecycle to Cancelled. Cleared with the order on
+    /// any terminal result.
+    pub(crate) reconcile_cancel_not_found_counts: Mutex<HashMap<String, u32>>,
     /// Independent placement/cancel retry counters. Placement counts only
     /// uninterrupted explicit not-found responses; a coid can be in both
     /// orphan sets after cancel-before-ack, so cancel diagnostics must never
@@ -1140,6 +1195,8 @@ impl SharedState {
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
+        self.reconcile_cancel_not_found_counts
+            .lock().unwrap().remove(client_order_id);
         let now = crate::types::now_ns();
         let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
         if backoffs.remove(client_order_id).is_some() {
@@ -1332,6 +1389,38 @@ impl SharedState {
             "[orphan_metric] GET_LIVE_DELETE_UNCERTAIN=1 GET_LIVE_DELETE_UNCERTAIN_total={} coid={} orderID={} lock_release=forbidden",
             total, coid, order_id,
         );
+    }
+
+    /// Apply the bounded terminal policy for Polymarket's exact ambiguous
+    /// DELETE not-found reply from the cancel-orphan reconciler. This method
+    /// must not be called by initial, ordinary single, or batch cancel paths:
+    /// only three DELETEs issued after reconcile GET returned LIVE may resolve
+    /// the orphan to Cancelled.
+    fn apply_reconcile_cancel_not_found_terminal(
+        &self,
+        coid: &str,
+        reason: Option<&str>,
+        outcome: CancelReasonOutcome,
+    ) -> CancelReasonOutcome {
+        let attempt = {
+            let mut counts = self.reconcile_cancel_not_found_counts.lock().unwrap();
+            record_cancel_not_found_observation(&mut counts, coid, reason, outcome)
+        };
+        let Some(attempt) = attempt else { return outcome };
+        let bounded_outcome =
+            cancel_not_found_outcome_after_observation(outcome, Some(attempt));
+        if bounded_outcome == CancelReasonOutcome::Cancelled {
+            warn!(
+                "[PolymarketTrade] Cancel orphan terminal coid={} reason=\"order can't be found - already canceled or matched\" reconcile_delete_observations={} → Cancelled",
+                coid, attempt,
+            );
+        } else {
+            info!(
+                "[PolymarketTrade] Cancel orphan ambiguous not-found coid={} reconcile_delete_observation={}/{} → keeping orphan",
+                coid, attempt, CANCEL_NOT_FOUND_TERMINAL_LIMIT,
+            );
+        }
+        bounded_outcome
     }
 
     /// Dispatch an HTTP request onto the shared async runtime. Returns a
@@ -1858,6 +1947,7 @@ impl PolymarketTrade {
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
+                reconcile_cancel_not_found_counts: Mutex::new(HashMap::new()),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
@@ -2099,6 +2189,7 @@ impl PolymarketTrade {
         self.shared.oid_to_coid.lock().unwrap().clear();
         self.shared.coid_to_token.lock().unwrap().clear();
         self.shared.pending_reclaim.lock().unwrap().clear();
+        self.shared.reconcile_cancel_not_found_counts.lock().unwrap().clear();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -2847,7 +2938,15 @@ impl PolymarketTrade {
                     let body = serde_json::json!({ "orderID": order_id });
                     match self.delete_detailed("/order", &body) {
                         Ok(resp) => {
-                            let outcome = cancel_delete_response_outcome(&resp, order_id);
+                            let reason = resp.get("not_canceled")
+                                .and_then(|v| v.as_object())
+                                .and_then(|nc| nc.get(order_id))
+                                .and_then(|v| v.as_str());
+                            let outcome = self.shared.apply_reconcile_cancel_not_found_terminal(
+                                coid,
+                                reason,
+                                cancel_delete_response_outcome(&resp, order_id),
+                            );
                             if outcome == CancelReasonOutcome::Uncertain {
                                 self.shared.note_get_live_delete_uncertain(coid, order_id);
                             }
@@ -2856,13 +2955,8 @@ impl PolymarketTrade {
                                 CancelReasonOutcome::Filled => OrderStatus::Filled,
                                 CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
                             };
-                            let reason = resp.get("not_canceled")
-                                .and_then(|v| v.as_object())
-                                .and_then(|nc| nc.get(order_id))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("<omitted>");
                             info!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} → {:?} (reason={})",
-                                coid, order_id, status, reason);
+                                coid, order_id, status, reason.unwrap_or("<omitted>"));
                             status
                         }
                         Err(e) => {
@@ -3454,7 +3548,11 @@ impl PolymarketTrade {
                         }
                     }
                     if !oid_ref.is_empty() {
-                        match cancel_delete_response_outcome(&resp, oid_ref) {
+                        // The initial/ordinary cancel establishes the orphan
+                        // but does not consume one of its three reconcile
+                        // DELETE observations.
+                        let outcome = cancel_delete_response_outcome(&resp, oid_ref);
+                        match outcome {
                             CancelReasonOutcome::Cancelled => {
                                 should_remove = true;
                                 ok_status = OrderStatus::Cancelled;
@@ -3618,6 +3716,8 @@ impl ExchangeTrade for PolymarketTrade {
             let tracked = self.shared.open_orders.lock().unwrap()
                 .get(coid).cloned();
             let status = response.as_ref().map(|resp| {
+                // Ordinary cancel-all responses do not advance the bounded
+                // reconcile DELETE counter.
                 match cancel_delete_response_outcome(resp, order_id) {
                     CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                     CancelReasonOutcome::Filled => OrderStatus::Filled,
@@ -4006,7 +4106,14 @@ impl ExchangeTrade for PolymarketTrade {
                                 id, reason_str, coid,
                             );
                             if !coid.is_empty() {
-                                let s = cancel_reason_order_status(reason_str);
+                                // This is the initial/ordinary cancel path;
+                                // only reconciler-issued DELETEs are counted.
+                                let outcome = cancel_not_canceled_outcome(reason_str);
+                                let s = match outcome {
+                                    CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+                                    CancelReasonOutcome::Filled => OrderStatus::Filled,
+                                    CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                };
                                 if s == OrderStatus::CancelOrderTimeout
                                     && is_pending_delayed_reason(reason_str)
                                 {
@@ -4415,7 +4522,15 @@ impl ExchangeTrade for PolymarketTrade {
                                     id, reason_str, coid,
                                 );
                                 if !coid.is_empty() {
-                                    let s = cancel_reason_order_status(reason_str);
+                                    // This is the initial/ordinary cancel
+                                    // path; it must not advance reconcile
+                                    // DELETE observations.
+                                    let outcome = cancel_not_canceled_outcome(reason_str);
+                                    let s = match outcome {
+                                        CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+                                        CancelReasonOutcome::Filled => OrderStatus::Filled,
+                                        CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                    };
                                     if s == OrderStatus::CancelOrderTimeout
                                         && is_pending_delayed_reason(reason_str)
                                     {
@@ -4778,6 +4893,88 @@ mod tests {
             cancel_not_canceled_outcome("order can't be found - already canceled or matched"),
             CancelReasonOutcome::Uncertain,
         );
+    }
+
+    #[test]
+    fn initial_cancel_is_excluded_and_third_reconcile_delete_is_terminal() {
+        let reason = "order can't be found - already canceled or matched";
+        let initial_outcome = cancel_not_canceled_outcome(reason);
+        let mut counts = HashMap::new();
+
+        assert_eq!(initial_outcome, CancelReasonOutcome::Uncertain);
+        assert!(
+            counts.is_empty(),
+            "the initial cancel response must not enter the reconcile counter",
+        );
+
+        assert_eq!(
+            record_cancel_not_found_observation(
+                &mut counts, "coid-a", Some(reason), initial_outcome,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            cancel_not_found_outcome_after_observation(
+                initial_outcome,
+                counts.get("coid-a").copied(),
+            ),
+            CancelReasonOutcome::Uncertain,
+            "first reconcile DELETE keeps the orphan",
+        );
+        assert_eq!(
+            record_cancel_not_found_observation(
+                &mut counts, "coid-a", Some(reason), initial_outcome,
+            ),
+            Some(2),
+        );
+        assert_eq!(
+            cancel_not_found_outcome_after_observation(
+                initial_outcome,
+                counts.get("coid-a").copied(),
+            ),
+            CancelReasonOutcome::Uncertain,
+            "second reconcile DELETE keeps the orphan",
+        );
+        let third = record_cancel_not_found_observation(
+            &mut counts, "coid-a", Some(reason), initial_outcome,
+        );
+        assert_eq!(third, Some(CANCEL_NOT_FOUND_TERMINAL_LIMIT));
+        assert_eq!(
+            cancel_not_found_outcome_after_observation(initial_outcome, third),
+            CancelReasonOutcome::Cancelled,
+            "third reconcile DELETE observation must be a Cancelled terminal",
+        );
+    }
+
+    #[test]
+    fn cancel_not_found_counter_is_per_order_and_exact_reason_only() {
+        let reason = "order can't be found - already canceled or matched";
+        let outcome = cancel_not_canceled_outcome(reason);
+        let mut counts = HashMap::new();
+
+        assert_eq!(
+            record_cancel_not_found_observation(
+                &mut counts, "coid-a", Some(reason), outcome,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            record_cancel_not_found_observation(
+                &mut counts, "coid-b", Some(reason), outcome,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            record_cancel_not_found_observation(
+                &mut counts,
+                "coid-a",
+                Some("order not found"),
+                CancelReasonOutcome::Uncertain,
+            ),
+            None,
+        );
+        assert_eq!(counts.get("coid-a"), Some(&1));
+        assert_eq!(counts.get("coid-b"), Some(&1));
     }
 
     #[test]
