@@ -697,9 +697,14 @@ async fn user_feed_loop(
             if shutdown.load(Ordering::Relaxed) { break; }
 
             // Periodic PING (application-level — CLOB uses plaintext "PING"/"PONG"
-            // strings, not WS-frame pings).
+            // strings). Also send a WebSocket protocol Ping frame.
             if last_ping.elapsed() >= PING_INTERVAL {
-                if sink.send(Message::Text("PING".to_string())).await.is_err() {
+                if let Err(e) = sink.send(Message::Text("PING".to_string())).await {
+                    warn!("[PolyUserFeed] Text PING send failed: {}", e);
+                    break;
+                }
+                if let Err(e) = sink.send(Message::Ping(Vec::new())).await {
+                    warn!("[PolyUserFeed] Frame Ping send failed: {}", e);
                     break;
                 }
                 last_ping = Instant::now();
@@ -782,6 +787,9 @@ async fn user_feed_loop(
                         Message::Ping(payload) => {
                             last_data = Instant::now();
                             let _ = sink.send(Message::Pong(payload)).await;
+                        }
+                        Message::Pong(_) => {
+                            last_data = Instant::now();
                         }
                         Message::Close(_) => {
                             warn!("[PolyUserFeed] Server closed connection");

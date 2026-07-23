@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ExchangeMarket, WsHealth, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
+    ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
+    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
     POLYMARKET_WS_HEARTBEAT_INTERVAL,
 };
 use crate::types::*;
@@ -1061,20 +1062,8 @@ async fn clob_ws_task(
 
                 _ = ping_interval.tick() => {
                     let now = Instant::now();
-                    if health.pong_timed_out(now) {
-                        announce_clob_not_ready(
-                            &event_tx,
-                            &mut lifecycle,
-                            "CLOB transport heartbeat timeout",
-                        );
-                        warn!(
-                            "[Polymarket] CLOB transport heartbeat timeout — reconnecting; {}",
-                            health.transport_summary(now),
-                        );
-                        break;
-                    }
-                    // Current Polymarket SDK heartbeat: application-level
-                    // text "PING" (not a WS protocol Ping frame), every 5s.
+                    // Send both the CLOB application-level text heartbeat and
+                    // a WebSocket protocol Ping frame every 5s.
                     if let Err(e) = write.send(Message::Text("PING".to_string())).await {
                         announce_clob_not_ready(
                             &event_tx,
@@ -1088,7 +1077,19 @@ async fn clob_ws_task(
                         );
                         break;
                     }
-                    health.record_ping_sent(now);
+                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                        announce_clob_not_ready(
+                            &event_tx,
+                            &mut lifecycle,
+                            format!("Frame Ping send failed: {}", e),
+                        );
+                        warn!(
+                            "[Polymarket] Frame Ping send failed: {}; {}",
+                            e,
+                            health.transport_summary(now),
+                        );
+                        break;
+                    }
                 }
 
                 _ = health_interval.tick() => {
@@ -1304,7 +1305,7 @@ async fn rtds_connect_and_run(
 
     info!("[RTDS] Connected, {} subscriptions", subscriptions.len());
 
-    let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
+    let mut ping_interval = tokio::time::interval(POLYMARKET_RTDS_PING_INTERVAL);
     ping_interval.tick().await;
     let mut health_interval =
         tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
@@ -1317,20 +1318,23 @@ async fn rtds_connect_and_run(
             biased;
             _ = ping_interval.tick() => {
                 let now = Instant::now();
-                if health.pong_timed_out(now) {
+                if let Err(e) = write
+                    .send(Message::Text(POLYMARKET_RTDS_PING_PAYLOAD.to_string()))
+                    .await
+                {
                     return Err(anyhow!(
-                        "RTDS transport heartbeat timeout; {}",
-                        health.rtds_summary(now),
-                    ));
-                }
-                if let Err(e) = write.send(Message::Text("PING".to_string())).await {
-                    return Err(anyhow!(
-                        "RTDS PING send failed: {}; {}",
+                        "RTDS ping send failed: {}; {}",
                         e,
                         health.rtds_summary(now),
                     ));
                 }
-                health.record_ping_sent(now);
+                if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                    return Err(anyhow!(
+                        "RTDS frame Ping send failed: {}; {}",
+                        e,
+                        health.rtds_summary(now),
+                    ));
+                }
             }
             _ = health_interval.tick() => {
                 let now = Instant::now();
