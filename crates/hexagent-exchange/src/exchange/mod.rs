@@ -24,16 +24,19 @@ use crate::types::MarketEvent;
 use crate::types::{Exchange, OrderRequest, OrderUpdate};
 use anyhow::Result;
 
-/// Polymarket's current SDK defaults: application-level text `PING` every
-/// five seconds and a 15-second deadline for the matching text `PONG`.
+/// Heartbeat cadence for the Polymarket CLOB feed. Each tick sends both its
+/// application-level text heartbeat and a WebSocket protocol Ping frame.
 pub(crate) const POLYMARKET_WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-pub(crate) const POLYMARKET_WS_PONG_TIMEOUT: Duration = Duration::from_secs(15);
+/// RTDS heartbeat: lowercase application text `ping` every five seconds,
+/// accompanied by a WebSocket protocol Ping frame.
+pub(crate) const POLYMARKET_RTDS_PING_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const POLYMARKET_RTDS_PING_PAYLOAD: &str = "ping";
 pub(crate) const POLYMARKET_WS_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Layered WebSocket liveness timestamps.
 ///
 /// Keeping these clocks separate lets an incident log distinguish:
-/// - no PONG: transport/heartbeat failure;
+/// - no PONG: heartbeat response absent (diagnostic only);
 /// - PONG and raw frames, but no topic frame: subscription silence;
 /// - topic frames, but no BTC price: a single-symbol data gap.
 pub(crate) struct WsHealth {
@@ -42,7 +45,6 @@ pub(crate) struct WsHealth {
     last_raw_frame: Option<Instant>,
     last_topic_frame: Option<Instant>,
     last_btc_price: Option<Instant>,
-    awaiting_pong_since: Option<Instant>,
 }
 
 impl WsHealth {
@@ -53,7 +55,6 @@ impl WsHealth {
             last_raw_frame: None,
             last_topic_frame: None,
             last_btc_price: None,
-            awaiting_pong_since: None,
         }
     }
 
@@ -63,7 +64,6 @@ impl WsHealth {
 
     pub(crate) fn record_pong(&mut self, now: Instant) {
         self.last_pong = Some(now);
-        self.awaiting_pong_since = None;
     }
 
     pub(crate) fn record_topic_frame(&mut self, now: Instant) {
@@ -72,17 +72,6 @@ impl WsHealth {
 
     pub(crate) fn record_btc_price(&mut self, now: Instant) {
         self.last_btc_price = Some(now);
-    }
-
-    pub(crate) fn record_ping_sent(&mut self, now: Instant) {
-        // Preserve the oldest unanswered PING so repeated sends cannot defer
-        // the timeout forever.
-        self.awaiting_pong_since.get_or_insert(now);
-    }
-
-    pub(crate) fn pong_timed_out(&self, now: Instant) -> bool {
-        self.awaiting_pong_since
-            .is_some_and(|sent_at| elapsed(now, sent_at) >= POLYMARKET_WS_PONG_TIMEOUT)
     }
 
     pub(crate) fn topic_is_stale(&self, now: Instant, threshold: Duration) -> bool {
@@ -289,18 +278,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ws_health_times_out_oldest_unanswered_ping() {
-        let start = Instant::now();
-        let mut health = WsHealth::new(start);
-
-        health.record_ping_sent(start + Duration::from_secs(5));
-        health.record_ping_sent(start + Duration::from_secs(10));
-
-        assert!(!health.pong_timed_out(start + Duration::from_secs(19)));
-        assert!(health.pong_timed_out(start + Duration::from_secs(20)));
-
-        health.record_pong(start + Duration::from_secs(20));
-        assert!(!health.pong_timed_out(start + Duration::from_secs(40)));
+    fn rtds_text_heartbeat_uses_lowercase_ping_every_five_seconds() {
+        assert_eq!(POLYMARKET_RTDS_PING_INTERVAL, Duration::from_secs(5));
+        assert_eq!(POLYMARKET_RTDS_PING_PAYLOAD, "ping");
     }
 
     #[test]

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ExchangeMarket, WsHealth, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
-    POLYMARKET_WS_HEARTBEAT_INTERVAL,
+    ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
+    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
 };
 use crate::types::*;
 
@@ -107,7 +107,7 @@ async fn chainlink_ws_task(
         }
         info!("[Chainlink] Connected, subscribed to {:?}", symbols);
 
-        let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
+        let mut ping_interval = tokio::time::interval(POLYMARKET_RTDS_PING_INTERVAL);
         ping_interval.tick().await;
         let mut health_interval =
             tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
@@ -118,25 +118,25 @@ async fn chainlink_ws_task(
                 biased;
                 _ = ping_interval.tick() => {
                     let now = Instant::now();
-                    if health.pong_timed_out(now) {
+                    if let Err(e) = write
+                        .send(Message::Text(POLYMARKET_RTDS_PING_PAYLOAD.to_string()))
+                        .await
+                    {
                         warn!(
-                            "[Chainlink] RTDS transport heartbeat timeout — reconnecting; {}",
-                            health.rtds_summary(now),
-                        );
-                        break;
-                    }
-                    // Application-level text heartbeat used by the current
-                    // Polymarket SDK. This is deliberately not a WS protocol
-                    // Ping frame.
-                    if let Err(e) = write.send(Message::Text("PING".to_string())).await {
-                        warn!(
-                            "[Chainlink] PING send failed: {}; {}",
+                            "[Chainlink] RTDS ping send failed: {}; {}",
                             e,
                             health.rtds_summary(now),
                         );
                         break;
                     }
-                    health.record_ping_sent(now);
+                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                        warn!(
+                            "[Chainlink] RTDS frame Ping send failed: {}; {}",
+                            e,
+                            health.rtds_summary(now),
+                        );
+                        break;
+                    }
                 }
                 _ = health_interval.tick() => {
                     let now = Instant::now();
