@@ -347,14 +347,6 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     reason_ref,
                 );
 
-                // Vacate the taker-matched accelerator buffer for this fill:
-                // the authoritative WS push has arrived (this `OrderUpdate` is
-                // pushed below and booked into PositionManager by the
-                // strategy), so the HTTP-sourced placeholder must stop
-                // contributing. Runs BEFORE the OrderUpdate is delivered, so
-                // the strategy never double-counts.
-                shared.taker_matched.on_ws_trade(trade_id);
-
                 if !lifecycle_advanced {
                     return Vec::new();
                 }

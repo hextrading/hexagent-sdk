@@ -907,12 +907,6 @@ pub struct SharedState {
     pub clob_base_url: String,
     /// Live position & balance manager (trade-status-based)
     pub live_position: Mutex<LivePositionManager>,
-    /// Taker-matched inventory accelerator: HTTP `POST /order` matched fills
-    /// recorded here (writer) so the strategy (reader, wired via
-    /// `set_taker_matched` in `build_strategies`) reflects them before the WS
-    /// `user_feed` push lands. The user feed vacates each entry on arrival.
-    /// See [`TakerMatchedInventory`].
-    pub taker_matched: std::sync::Arc<super::live_position::TakerMatchedInventory>,
     /// Narrow user-feed health handle shared with the strategy (pause-quoting
     /// signals). See [`UserFeedHealth`]. The user feed writes; the strategy
     /// reads (wired via `set_user_feed_health` in `build_strategies`).
@@ -1937,7 +1931,6 @@ impl PolymarketTrade {
                 use_batch_orders,
                 clob_base_url,
                 live_position: Mutex::new(LivePositionManager::new()),
-                taker_matched: std::sync::Arc::new(super::live_position::TakerMatchedInventory::new()),
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
                 gap_replay,
                 rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
@@ -3381,35 +3374,21 @@ impl PolymarketTrade {
         //     ~ line 4781) so the placeholder does NOT double-count
         //     volume / cashflow / fees. The real WS push (trade_id present,
         //     filled_quantity = qty) lands the trade exactly once.
-        // The brief side-effect: `sync_pending_from_update` removes the
-        // BUY-side cash lock on the placeholder, so `available_cash` is
-        // briefly overstated by `price × qty` until the WS push books
-        // the trade. Bounded to ~300 ms and at most O($10) at typical
-        // polymaker sizes — acceptable.
+        // Polymaker treats this zero-quantity terminal as a placement orphan
+        // and immediately performs an order-specific REST lookup. A complete
+        // MATCHED/FILLED audit then moves the residual into its
+        // `UnauditedMatchedOrders` bridge; the POST response itself does not
+        // create a parallel inventory cache.
         let (status, filled_quantity, remaining_quantity) = match status_str {
             "matched" => {
-                let trade_ids_arr = resp.get("tradeIDs").and_then(|v| v.as_array());
-                let trade_ids = trade_ids_arr.map(|a| a.len()).unwrap_or(0);
-                // Single-trade taker match: the whole order filled against one
-                // maker, so `order.quantity` IS the fill size and the lone
-                // `tradeIDs[0]` keys cleanly against the WS taker push (which
-                // also keys by plain `trade_id`). Buffer it so local inventory
-                // reflects the fill before the (sometimes multi-second,
-                // out-of-order) WS push lands. Multi-trade matches are skipped
-                // (per-trade size attribution is ambiguous from this response).
-                if trade_ids == 1 {
-                    if let Some(tid) = trade_ids_arr
-                        .and_then(|a| a.first())
-                        .and_then(|v| v.as_str())
-                    {
-                        self.shared.taker_matched.try_add(
-                            tid, &order_id, &order.symbol, order.side, order.quantity,
-                        );
-                    }
-                }
+                let trade_ids = resp
+                    .get("tradeIDs")
+                    .and_then(|v| v.as_array())
+                    .map(|ids| ids.len())
+                    .unwrap_or(0);
                 info!("[PolymarketTrade] Matched immediately: orderID={} trades={} \
-                       (emitting placeholder Filled so OM removes the order; \
-                       ledger updated via WS user_feed)",
+                       (emitting placeholder Filled for immediate order REST audit; \
+                       ledger updated via authoritative trade updates)",
                       order_id, trade_ids);
                 (OrderStatus::Filled, 0.0, 0.0)
             }

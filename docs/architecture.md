@@ -145,8 +145,11 @@ Two traits: `ExchangeMarket` (market data, blocking `next_event`) and
 - **User feed** (`user_feed.rs`): per-account authenticated WS task with
   **gap-replay** (`/trades?after=` catch-up on a periodic cadence and on
   reconnect rewind), PING keepalive + watchdog. Balance/inventory sync is
-  keyed by `account_id` (`LivePositionManager`, `TakerMatchedInventory`,
-  `UserFeedHealth`).
+  keyed by `account_id` (`LivePositionManager`, `UserFeedHealth`). An HTTP
+  placement reply reporting `matched` is emitted as a placeholder filled
+  update so the strategy can enter orphan state and immediately audit the
+  order through REST; no parallel matched-inventory cache is maintained in
+  the adapter.
 - **On-chain maintenance** (`onchain_tx.rs`, `merge.rs`): redeem / split /
   merge serialized behind a `MaintenanceStatus` state machine; startup top-up
   runs first. Auto-redeem is default-OFF in code (enabled per deployment).
