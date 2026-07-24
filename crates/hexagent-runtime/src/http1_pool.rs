@@ -47,8 +47,12 @@
 //!   sessions) where business traffic alone would let connections go
 //!   idle/evicted. Polymarket's signed `/heartbeats` loop (which also
 //!   keeps the API key active) already fans out across
-//!   [`clients_all`], so it doubles as this venue's keep-warm — only
+//!   [`pooled_clients_all`], so it doubles as this venue's keep-warm — only
 //!   venues without such a loop (Aster) need `spawn_keep_warm`.
+//! * **Repair**: business requests and keep-warm probes report transport
+//!   outcomes through [`PooledClient`]. Two consecutive failures quarantine
+//!   the exact slot, build a fresh client in the background, prewarm it, and
+//!   only then atomically return it to admission.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -153,18 +157,14 @@ fn sizes() -> PoolSizes {
 // ── Pools ─────────────────────────────────────────────────────────
 
 struct Pools {
-    fast: Vec<Arc<reqwest::Client>>,
-    cancel: Vec<Arc<reqwest::Client>>,
-    reconcile: Vec<Arc<reqwest::Client>>,
-    query: Vec<Arc<reqwest::Client>>,
+    fast: RolePool,
+    cancel: RolePool,
+    reconcile: RolePool,
+    query: RolePool,
     gap_replay: RolePool,
 }
 
 static POOLS: OnceLock<Pools> = OnceLock::new();
-static RR_FAST: AtomicUsize = AtomicUsize::new(0);
-static RR_CANCEL: AtomicUsize = AtomicUsize::new(0);
-static RR_RECONCILE: AtomicUsize = AtomicUsize::new(0);
-static RR_QUERY: AtomicUsize = AtomicUsize::new(0);
 
 /// Build an HTTP/1.1-only client. `pool_max_idle_per_host = 2` keeps the
 /// client's primary connection plus one burst spare; the long
@@ -206,22 +206,14 @@ fn build_h1_client(timeout: Duration) -> Result<reqwest::Client> {
         .context("build h1 reqwest client")
 }
 
-fn build_role(n: usize, timeout: Duration) -> Result<Vec<Arc<reqwest::Client>>> {
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        v.push(Arc::new(build_h1_client(timeout)?));
-    }
-    Ok(v)
-}
-
 /// Build all pools. Called once from `async_rt::init()`.
 pub(crate) fn init_pools() -> Result<()> {
     let s = sizes();
     let pools = Pools {
-        fast: build_role(s.fast, FAST_TIMEOUT_CEILING)?,
-        cancel: build_role(s.cancel, CANCEL_TIMEOUT_CEILING)?,
-        reconcile: build_role(s.reconcile, RECONCILE_TIMEOUT)?,
-        query: build_role(s.query, QUERY_TIMEOUT)?,
+        fast: RolePool::new(s.fast, FAST_TIMEOUT_CEILING, Role::Fast)?,
+        cancel: RolePool::new(s.cancel, CANCEL_TIMEOUT_CEILING, Role::Cancel)?,
+        reconcile: RolePool::new(s.reconcile, RECONCILE_TIMEOUT, Role::Reconcile)?,
+        query: RolePool::new(s.query, QUERY_TIMEOUT, Role::Query)?,
         gap_replay: RolePool::new(s.gap_replay, GAP_REPLAY_TIMEOUT, Role::GapReplay)?,
     };
     POOLS
@@ -240,29 +232,22 @@ fn pools() -> &'static Pools {
 
 /// Round-robin client for `role`.
 pub fn client(role: Role) -> Arc<reqwest::Client> {
-    let p = pools();
-    if role == Role::GapReplay {
-        return p.gap_replay.exempt_client();
-    }
-    let (list, ctr) = match role {
-        Role::Fast => (&p.fast, &RR_FAST),
-        Role::Cancel => (&p.cancel, &RR_CANCEL),
-        Role::Reconcile => (&p.reconcile, &RR_RECONCILE),
-        Role::Query => (&p.query, &RR_QUERY),
-        Role::GapReplay => unreachable!(),
-    };
-    let i = ctr.fetch_add(1, Ordering::Relaxed) % list.len();
-    list[i].clone()
+    global_role(role).exempt_client()
+}
+
+/// Round-robin global-role client plus its slot health handle.
+pub fn pooled_client(role: Role) -> PooledClient {
+    global_role(role).exempt_pooled_client()
 }
 
 /// All clients across every role — for prewarm / keep-warm fan-out that
 /// must touch *every* underlying connection, not just one pick.
 pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     let p = pools();
-    let mut all = p.fast.clone();
-    all.extend(p.cancel.iter().cloned());
-    all.extend(p.reconcile.iter().cloned());
-    all.extend(p.query.iter().cloned());
+    let mut all = p.fast.clients();
+    all.extend(p.cancel.clients());
+    all.extend(p.reconcile.clients());
+    all.extend(p.query.clients());
     all.extend(p.gap_replay.clients());
     // Include the per-instance admission-pool connections so prewarm /
     // keep-warm / heartbeat fan-out holds them open too — they carry real
@@ -282,6 +267,26 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     all
 }
 
+/// All current clients plus health handles. Polymarket heartbeat uses this
+/// form so keep-warm transport failures feed the same rebuild machinery as
+/// business requests.
+pub fn pooled_clients_all() -> Vec<PooledClient> {
+    let p = pools();
+    let mut all = p.fast.pooled_clients();
+    all.extend(p.cancel.pooled_clients());
+    all.extend(p.reconcile.pooled_clients());
+    all.extend(p.query.pooled_clients());
+    all.extend(p.gap_replay.pooled_clients());
+    if let Some(m) = INSTANCE_POOLS.get() {
+        for inst in m.values() {
+            for rp in [&inst.fast, &inst.cancel, &inst.reconcile, &inst.query] {
+                all.extend(rp.pooled_clients());
+            }
+        }
+    }
+    all
+}
+
 // ── Prewarm + keep-warm ───────────────────────────────────────────
 
 /// Result of concurrently prewarming every client in one global role.
@@ -292,15 +297,19 @@ pub struct PrewarmReport {
     pub first_error: Option<String>,
 }
 
-fn global_role_clients(role: Role) -> Vec<Arc<reqwest::Client>> {
+fn global_role(role: Role) -> &'static RolePool {
     let p = pools();
     match role {
-        Role::Fast => p.fast.clone(),
-        Role::Cancel => p.cancel.clone(),
-        Role::Reconcile => p.reconcile.clone(),
-        Role::Query => p.query.clone(),
-        Role::GapReplay => p.gap_replay.clients(),
+        Role::Fast => &p.fast,
+        Role::Cancel => &p.cancel,
+        Role::Reconcile => &p.reconcile,
+        Role::Query => &p.query,
+        Role::GapReplay => &p.gap_replay,
     }
+}
+
+fn global_role_clients(role: Role) -> Vec<Arc<reqwest::Client>> {
+    global_role(role).clients()
 }
 
 /// Concurrently establish TCP+TLS state for every client in a global role.
@@ -312,7 +321,10 @@ pub async fn prewarm_role(role: Role, warm_url: &str) -> PrewarmReport {
     for client in clients {
         let url = warm_url.to_string();
         set.spawn(async move {
-            client.get(url).send().await.map(|r| r.status().as_u16())
+            let response = client.get(url).send().await?;
+            let status = response.status().as_u16();
+            response.bytes().await?;
+            Ok::<u16, reqwest::Error>(status)
         });
     }
     let mut ok = 0usize;
@@ -371,7 +383,12 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
             let mut set = tokio::task::JoinSet::new();
             for c in clients {
                 let url = warm_url.clone();
-                set.spawn(async move { c.get(&url).send().await.map(|r| r.status().as_u16()) });
+                set.spawn(async move {
+                    let response = c.get(&url).send().await?;
+                    let status = response.status().as_u16();
+                    response.bytes().await?;
+                    Ok::<u16, reqwest::Error>(status)
+                });
             }
             let mut ok = 0usize;
             let mut first_err: Option<String> = None;
@@ -440,10 +457,160 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 struct Slot {
     client: Arc<RwLock<Arc<reqwest::Client>>>,
     busy: Arc<AtomicBool>,
+    quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
     timeout: Duration,
+}
+
+#[derive(Clone)]
+struct ConnectionHealth {
+    role: Role,
+    slot: usize,
+    generation_at_pick: u64,
+    slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
+    quarantined: Arc<AtomicBool>,
+    transport_failures: Arc<AtomicUsize>,
+    generation: Arc<AtomicU64>,
+    last_rebuild: Arc<Mutex<Option<Instant>>>,
+    timeout: Duration,
+}
+
+impl ConnectionHealth {
+    fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.generation_at_pick
+    }
+
+    fn note_transport_success(&self) {
+        if self.is_current() {
+            self.transport_failures.store(0, Ordering::Release);
+        }
+    }
+
+    fn claim_rebuild(&self, threshold: usize, cooldown: Duration) -> Option<usize> {
+        if !self.is_current() {
+            return None;
+        }
+        let failures = self.transport_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if failures < threshold.max(1) {
+            return None;
+        }
+        let now = Instant::now();
+        let mut last = self.last_rebuild.lock().unwrap();
+        if last.map(|t| now.duration_since(t) < cooldown).unwrap_or(false) {
+            return None;
+        }
+        *last = Some(now);
+        self.quarantined.store(true, Ordering::Release);
+        Some(failures)
+    }
+
+    fn build_replacement(&self) -> Result<Arc<reqwest::Client>> {
+        Ok(Arc::new(build_h1_client(self.timeout)?))
+    }
+
+    fn install_replacement(
+        &self,
+        replacement: Arc<reqwest::Client>,
+        failures: usize,
+    ) -> Option<u64> {
+        if !self.is_current() {
+            return None;
+        }
+        *self.slot_client.write().unwrap() = replacement;
+        self.transport_failures.store(0, Ordering::Release);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.quarantined.store(false, Ordering::Release);
+        log::warn!(
+            "[http1_pool] role={:?} slot={} replaced unhealthy client after {} consecutive transport failures generation={}",
+            self.role, self.slot, failures, generation,
+        );
+        Some(generation)
+    }
+
+    async fn rebuild_and_prewarm(self, prewarm_url: String, failures: usize) {
+        let candidate = match self.build_replacement() {
+            Ok(client) => client,
+            Err(error) => {
+                self.quarantined.store(false, Ordering::Release);
+                log::warn!(
+                    "[http1_pool] role={:?} slot={} client rebuild failed after {} transport failures: {}",
+                    self.role, self.slot, failures, error,
+                );
+                return;
+            }
+        };
+        let prewarm_result = async {
+            let response = candidate
+                .get(&prewarm_url)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status));
+            }
+            response.bytes().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        }.await;
+        match prewarm_result {
+            Ok(()) => {
+                if let Some(generation) =
+                    self.install_replacement(candidate, failures)
+                {
+                    log::info!(
+                        "[http1_pool] role={:?} slot={} rebuilt and prewarmed generation={} url={}",
+                        self.role, self.slot, generation, prewarm_url,
+                    );
+                }
+            }
+            Err(error) => {
+                self.quarantined.store(false, Ordering::Release);
+                log::warn!(
+                    "[http1_pool] role={:?} slot={} replacement prewarm failed: {}; keeping generation={} url={}",
+                    self.role, self.slot, error, self.generation_at_pick, prewarm_url,
+                );
+            }
+        }
+    }
+}
+
+/// A selected pool client with a generation-fenced health handle.
+///
+/// Callers report only transport success/failure; HTTP status and JSON-shape
+/// errors prove the socket carried bytes and therefore count as transport
+/// success. Rebuild runs in the background and installs only after prewarm.
+#[derive(Clone)]
+pub struct PooledClient {
+    client: Arc<reqwest::Client>,
+    health: ConnectionHealth,
+}
+
+impl PooledClient {
+    pub fn client(&self) -> &Arc<reqwest::Client> {
+        &self.client
+    }
+
+    pub fn note_transport_success(&self) {
+        self.health.note_transport_success();
+    }
+
+    /// Record a transport failure. On the second consecutive failure this
+    /// quarantines the slot and starts background rebuild + prewarm. Returns
+    /// true when this call claimed the rebuild.
+    pub fn note_transport_failure(&self, prewarm_url: String) -> bool {
+        let Some(failures) =
+            self.health.claim_rebuild(2, Duration::from_secs(30))
+        else {
+            return false;
+        };
+        let health = self.health.clone();
+        crate::async_rt::handle().spawn(async move {
+            health.rebuild_and_prewarm(prewarm_url, failures).await;
+        });
+        true
+    }
 }
 
 /// Admission permit: owns an exclusive slot's client for the duration of
@@ -455,6 +622,7 @@ pub struct Permit {
     flag: Arc<AtomicBool>,
     client: Arc<reqwest::Client>,
     slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
+    quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
@@ -471,101 +639,41 @@ impl Permit {
     pub fn slot(&self) -> usize { self.slot }
     pub fn generation(&self) -> u64 { self.acquired_generation }
 
+    fn health(&self, generation_at_pick: u64) -> ConnectionHealth {
+        ConnectionHealth {
+            role: self.role,
+            slot: self.slot,
+            generation_at_pick,
+            slot_client: self.slot_client.clone(),
+            quarantined: self.quarantined.clone(),
+            transport_failures: self.transport_failures.clone(),
+            generation: self.generation.clone(),
+            last_rebuild: self.last_rebuild.clone(),
+            timeout: self.timeout,
+        }
+    }
+
+    pub fn pooled_client(&self) -> PooledClient {
+        PooledClient {
+            client: self.client.clone(),
+            health: self.health(self.acquired_generation),
+        }
+    }
+
     /// Current client installed in this slot. Reconcile callers use this
     /// accessor because a long batch can rebuild the slot between order GETs.
     pub fn current_client(&self) -> Arc<reqwest::Client> {
         self.slot_client.read().unwrap().clone()
     }
 
-    /// Record a timeout/status-less transport failure on this exact pool slot.
-    /// On the second consecutive failure, replace the slot's reqwest client so
-    /// all future permits use a fresh connection pool. Returns that replacement
-    /// for an immediate one-shot retry; the first failure returns `None` so the
-    /// caller can use a disjoint fallback connection.
-    pub fn note_transport_failure(&self) -> Option<Arc<reqwest::Client>> {
-        if self.generation.load(Ordering::Acquire) != self.acquired_generation {
-            return None;
+    pub fn current_pooled_client(&self) -> PooledClient {
+        let generation = self.generation.load(Ordering::Acquire);
+        PooledClient {
+            client: self.current_client(),
+            health: self.health(generation),
         }
-        let failures = self.transport_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if failures < 2 {
-            return None;
-        }
-        let replacement = match build_h1_client(self.timeout) {
-            Ok(client) => Arc::new(client),
-            Err(error) => {
-                log::warn!(
-                    "[http1_pool] client rebuild failed after {} consecutive transport failures: {}",
-                    failures,
-                    error,
-                );
-                return None;
-            }
-        };
-        self.install_replacement(replacement.clone(), failures)
-            .map(|_| replacement)
     }
 
-    /// Record a failure and claim a threshold/cooldown-controlled rebuild.
-    /// The cooldown is claimed before construction/prewarm to prevent storms.
-    pub fn note_transport_failure_with_rebuild_policy(
-        &self,
-        threshold: usize,
-        cooldown: Duration,
-    ) -> bool {
-        if self.generation.load(Ordering::Acquire) != self.acquired_generation {
-            return false;
-        }
-        let failures = self.transport_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if failures < threshold.max(1) { return false; }
-        let now = Instant::now();
-        let mut last = self.last_rebuild.lock().unwrap();
-        if last.map(|t| now.duration_since(t) < cooldown).unwrap_or(false) {
-            return false;
-        }
-        *last = Some(now);
-        true
-    }
-
-    /// Build a fresh, initially cold client with this slot's timeout policy.
-    pub fn build_replacement(&self) -> Result<Arc<reqwest::Client>> {
-        Ok(Arc::new(build_h1_client(self.timeout)?))
-    }
-
-    /// Install a caller-prewarmed client iff this permit still owns the
-    /// current slot generation.
-    pub fn install_prewarmed_replacement(
-        &self,
-        replacement: Arc<reqwest::Client>,
-    ) -> Option<u64> {
-        let failures = self.transport_failures.load(Ordering::Acquire);
-        self.install_replacement(replacement, failures)
-    }
-
-    fn install_replacement(
-        &self,
-        replacement: Arc<reqwest::Client>,
-        failures: usize,
-    ) -> Option<u64> {
-        if self.generation.load(Ordering::Acquire) != self.acquired_generation {
-            return None;
-        }
-        *self.slot_client.write().unwrap() = replacement;
-        self.transport_failures.store(0, Ordering::Release);
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        log::warn!(
-            "[http1_pool] role={:?} slot={} replaced unhealthy client after {} consecutive transport failures generation={}",
-            self.role, self.slot, failures, generation,
-        );
-        Some(generation)
-    }
-
-    /// Any HTTP response (including 4xx/5xx) proves the connection transported
-    /// bytes successfully and clears the consecutive transport-failure streak.
-    pub fn note_transport_success(&self) {
-        if self.generation.load(Ordering::Acquire) == self.acquired_generation {
-            self.transport_failures.store(0, Ordering::Release);
-        }
-    }
 }
 
 impl Drop for Permit {
@@ -596,6 +704,7 @@ impl RolePool {
             slots.push(Slot {
                 client: Arc::new(RwLock::new(Arc::new(build_h1_client(timeout)?))),
                 busy: Arc::new(AtomicBool::new(false)),
+                quarantined: Arc::new(AtomicBool::new(false)),
                 transport_failures: Arc::new(AtomicUsize::new(0)),
                 generation: Arc::new(AtomicU64::new(0)),
                 last_rebuild: Arc::new(Mutex::new(None)),
@@ -632,6 +741,9 @@ impl RolePool {
         for offset in 0..self.slots.len() {
             let slot = (start + offset) % self.slots.len();
             let s = &self.slots[slot];
+            if s.quarantined.load(Ordering::Acquire) {
+                continue;
+            }
             if s.busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -649,6 +761,7 @@ impl RolePool {
                     flag: s.busy.clone(),
                     client: s.client.read().unwrap().clone(),
                     slot_client: s.client.clone(),
+                    quarantined: s.quarantined.clone(),
                     transport_failures: s.transport_failures.clone(),
                     generation: s.generation.clone(),
                     last_rebuild: s.last_rebuild.clone(),
@@ -668,13 +781,50 @@ impl RolePool {
     /// returns — may cold-connect if every warm connection is busy. For
     /// heartbeat / keep-warm / cancel-all only.
     fn exempt_client(&self) -> Arc<reqwest::Client> {
-        let i = self.rr.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        self.slots[i].client.read().unwrap().clone()
+        self.exempt_pooled_client().client
+    }
+
+    fn pooled_client_for_slot(&self, slot: usize) -> PooledClient {
+        let state = &self.slots[slot];
+        let generation = state.generation.load(Ordering::Acquire);
+        PooledClient {
+            client: state.client.read().unwrap().clone(),
+            health: ConnectionHealth {
+                role: self.role,
+                slot,
+                generation_at_pick: generation,
+                slot_client: state.client.clone(),
+                quarantined: state.quarantined.clone(),
+                transport_failures: state.transport_failures.clone(),
+                generation: state.generation.clone(),
+                last_rebuild: state.last_rebuild.clone(),
+                timeout: state.timeout,
+            },
+        }
+    }
+
+    fn exempt_pooled_client(&self) -> PooledClient {
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.slots.len() {
+            let slot = (start + offset) % self.slots.len();
+            if !self.slots[slot].quarantined.load(Ordering::Acquire) {
+                return self.pooled_client_for_slot(slot);
+            }
+        }
+        // Must-complete traffic retains the historical escape hatch when all
+        // slots are quarantined; its outcome still feeds health tracking.
+        self.pooled_client_for_slot(start % self.slots.len())
     }
 
     fn clients(&self) -> Vec<Arc<reqwest::Client>> {
         self.slots.iter()
             .map(|s| s.client.read().unwrap().clone())
+            .collect()
+    }
+
+    fn pooled_clients(&self) -> Vec<PooledClient> {
+        (0..self.slots.len())
+            .map(|slot| self.pooled_client_for_slot(slot))
             .collect()
     }
 
@@ -818,8 +968,8 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, u64, usize)> {
 }
 
 /// GapReplay pool counters and per-slot health:
-/// `(acquires, skips, busy, [(slot, generation, consecutive_failures)])`.
-pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize)>) {
+/// `(acquires, skips, busy, [(slot, generation, failures, quarantined)])`.
+pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize, bool)>) {
     let pool = &pools().gap_replay;
     let (acquires, skips, _, _, busy) = pool.stats();
     let slots = pool.slots.iter().enumerate()
@@ -827,6 +977,7 @@ pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize)>) {
             i,
             s.generation.load(Ordering::Acquire),
             s.transport_failures.load(Ordering::Acquire),
+            s.quarantined.load(Ordering::Acquire),
         ))
         .collect();
     (acquires, skips, busy, slots)
@@ -924,31 +1075,17 @@ mod tests {
     }
 
     #[test]
-    fn repeated_transport_failures_replace_the_pool_slot_client() {
+    fn transported_response_resets_the_slot_failure_streak() {
         let p = pool(1);
         let permit = p.try_acquire().unwrap();
-        let original = permit.client().clone();
+        let health = permit.health(permit.generation());
         assert!(
-            permit.note_transport_failure().is_none(),
-            "the first failure uses a disjoint fallback without churning the slot",
+            health.claim_rebuild(2, Duration::from_secs(30)).is_none(),
+            "the first failure stays below the rebuild threshold",
         );
-        let replacement = permit
-            .note_transport_failure()
-            .expect("the second consecutive failure rebuilds the slot");
-        assert!(
-            !Arc::ptr_eq(&original, &replacement),
-            "the replacement must own a new reqwest connection pool",
-        );
-        drop(permit);
-
-        let next = p.try_acquire().unwrap();
-        assert!(
-            Arc::ptr_eq(next.client(), &replacement),
-            "future permits must bind to the rebuilt client",
-        );
-        next.note_transport_success();
+        health.note_transport_success();
         assert_eq!(
-            next.transport_failures.load(Ordering::Acquire),
+            permit.transport_failures.load(Ordering::Acquire),
             0,
             "a transported HTTP response resets the failure streak",
         );
@@ -958,20 +1095,13 @@ mod tests {
     fn gap_replay_rebuild_policy_requires_threshold_and_cooldown() {
         let p = RolePool::new(1, Duration::from_secs(5), Role::GapReplay).unwrap();
         let permit = p.try_acquire().unwrap();
-        assert!(!permit.note_transport_failure_with_rebuild_policy(
-            2, Duration::from_secs(30),
-        ));
-        assert!(permit.note_transport_failure_with_rebuild_policy(
-            2, Duration::from_secs(30),
-        ));
-        assert!(!permit.note_transport_failure_with_rebuild_policy(
-            2, Duration::from_secs(30),
-        ));
+        let health = permit.health(permit.generation());
+        assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
+        assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
+        assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
         *permit.last_rebuild.lock().unwrap() =
             Some(Instant::now() - Duration::from_secs(31));
-        assert!(permit.note_transport_failure_with_rebuild_policy(
-            2, Duration::from_secs(30),
-        ));
+        assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
     }
 
     #[test]
@@ -983,6 +1113,34 @@ mod tests {
         drop(first);
         let second = p.try_acquire().unwrap();
         assert_eq!((second.slot(), second.generation()), (1, 0));
+    }
+
+    #[test]
+    fn quarantined_slot_returns_only_after_replacement_install() {
+        let p = RolePool::new(1, Duration::from_secs(2), Role::Fast).unwrap();
+        let permit = p.try_acquire().unwrap();
+        let original = permit.client().clone();
+        let health = permit.health(permit.generation());
+        let failures = health
+            .claim_rebuild(1, Duration::from_secs(30))
+            .expect("first failure reaches the test threshold");
+        drop(permit);
+        assert!(
+            p.try_acquire().is_none(),
+            "a slot claimed for repair must stay out of admission",
+        );
+
+        // Production calls `install_replacement` only after the candidate's
+        // async prewarm request and body drain have succeeded.
+        let candidate = health.build_replacement().unwrap();
+        health.install_replacement(candidate, failures).unwrap();
+
+        let repaired = p.try_acquire().expect("prewarmed slot returns to service");
+        assert_eq!(repaired.generation(), 1);
+        assert!(
+            !Arc::ptr_eq(&original, repaired.client()),
+            "the repaired slot must own a fresh reqwest connection pool",
+        );
     }
 
     #[test]

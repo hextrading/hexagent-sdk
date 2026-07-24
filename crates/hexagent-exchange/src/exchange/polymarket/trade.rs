@@ -518,6 +518,15 @@ impl RateLimiter {
 
 type HttpReply = std::result::Result<serde_json::Value, HttpErr>;
 
+async fn send_and_drain(
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<u16, reqwest::Error> {
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    response.bytes().await?;
+    Ok(status)
+}
+
 /// Async heartbeat loop. Spawned as a tokio task on the shared runtime
 /// at startup. Each tick (every `HEARTBEAT_INTERVAL`) fires **one**
 /// `POST /heartbeats` per primary HTTP/1.1 client across **every** role
@@ -535,7 +544,7 @@ async fn heartbeat_loop(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     base_url: String,
 ) {
-    let n_clients = async_rt::http_clients_all().len();
+    let n_clients = crate::http1_pool::pooled_clients_all().len();
     info!(
         "[PolyHeartbeat] Started (interval={}s, transport=h1.1, fan_out={} clients)",
         HEARTBEAT_INTERVAL.as_secs(), n_clients,
@@ -553,23 +562,34 @@ async fn heartbeat_loop(
         let path = "/heartbeats";
         let headers = auth.sign_request("POST", path, "");
         let url = format!("{}{}", base_url, path);
+        let prewarm_url = format!("{}/time", base_url.trim_end_matches('/'));
 
         // Fan out one ping per client across ALL pools concurrently.
         // Each client has its own TCP connection; using `client.request`
         // directly bypasses `pick_client`'s path-based routing so we
         // can target a specific connection.
         let mut set = tokio::task::JoinSet::new();
-        for client in async_rt::http_clients_all() {
+        for client in crate::http1_pool::pooled_clients_all() {
             let url_c = url.clone();
             let headers_c = headers.clone();
+            let prewarm_url_c = prewarm_url.clone();
             set.spawn(async move {
-                let mut req = client.request(reqwest::Method::POST, &url_c)
+                let mut req = client.client().request(reqwest::Method::POST, &url_c)
                     .header("Content-Type", "application/json")
                     .body(String::new());
                 for (k, v) in headers_c.as_pairs() {
                     req = req.header(k, v);
                 }
-                req.send().await.map(|r| r.status().as_u16())
+                match send_and_drain(req).await {
+                    Ok(status) => {
+                        client.note_transport_success();
+                        Ok(status)
+                    }
+                    Err(error) => {
+                        client.note_transport_failure(prewarm_url_c);
+                        Err(error)
+                    }
+                }
             });
         }
 
@@ -677,12 +697,15 @@ fn latency_record_status(reply: &HttpReply) -> String {
 ///
 /// Gap replay bypasses this generic router and explicitly acquires the
 /// process-global `GapReplay` role so it cannot consume Query capacity.
-fn pick_client(method: &reqwest::Method, path: &str) -> std::sync::Arc<reqwest::Client> {
+fn pick_client(method: &reqwest::Method, path: &str) -> crate::http1_pool::PooledClient {
     match (method.as_str(), path) {
-        ("POST", "/order") | ("POST", "/orders") => async_rt::http_client_fast(),
-        ("DELETE", _) => async_rt::http_client_cancel(),
-        ("GET", p) if p.starts_with("/data/order/") => async_rt::http_client_reconcile(),
-        _ => async_rt::http_client_query(),
+        ("POST", "/order") | ("POST", "/orders") =>
+            crate::http1_pool::pooled_client(crate::http1_pool::Role::Fast),
+        ("DELETE", _) =>
+            crate::http1_pool::pooled_client(crate::http1_pool::Role::Cancel),
+        ("GET", p) if p.starts_with("/data/order/") =>
+            crate::http1_pool::pooled_client(crate::http1_pool::Role::Reconcile),
+        _ => crate::http1_pool::pooled_client(crate::http1_pool::Role::Query),
     }
 }
 
@@ -791,15 +814,23 @@ async fn execute_http(
 /// fresh round-robin pick) is what lets the fire-and-track path guarantee a
 /// request runs on its reserved warm connection instead of opening a cold one.
 async fn execute_http_on(
-    client: std::sync::Arc<reqwest::Client>,
+    client: crate::http1_pool::PooledClient,
     method: reqwest::Method,
     url: String,
     path: String,
     headers: super::auth::AuthHeaders,
     body: String,
 ) -> HttpReply {
+    let prewarm_url = reqwest::Url::parse(&url)
+        .map(|mut parsed| {
+            parsed.set_path("/time");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string());
     let req_timeout = per_request_timeout(&method, &path);
-    let mut req = client.request(method.clone(), &url)
+    let mut req = client.client().request(method.clone(), &url)
         .header("Content-Type", "application/json")
         .body(body);
     // Per-request timeout override (FAST / CANCEL paths only). The pool
@@ -816,17 +847,37 @@ async fn execute_http_on(
     }
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return Err(map_reqwest_err(e)),
+        Err(e) => {
+            client.note_transport_failure(prewarm_url);
+            return Err(map_reqwest_err(e));
+        }
     };
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(HttpErr::Status(status.as_u16(), body));
+        return match resp.text().await {
+            Ok(body) => {
+                client.note_transport_success();
+                Err(HttpErr::Status(status.as_u16(), body))
+            }
+            Err(error) => {
+                client.note_transport_failure(prewarm_url);
+                Err(map_reqwest_err(error))
+            }
+        };
     }
     // Split response-body transport from JSON syntax/shape errors. Using
     // `Response::json` would wrap both in `reqwest::Error`, losing the exact
     // distinction needed by placement reconciliation.
-    let bytes = resp.bytes().await.map_err(map_reqwest_err)?;
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => {
+            client.note_transport_success();
+            bytes
+        }
+        Err(error) => {
+            client.note_transport_failure(prewarm_url);
+            return Err(map_reqwest_err(error));
+        }
+    };
     serde_json::from_slice(&bytes)
         .map_err(|e| HttpErr::Other(format!("json parse: {}", e)))
 }
@@ -1654,8 +1705,8 @@ impl SharedState {
     /// with a receiver; the caller completes off-thread (fire-and-track).
     pub(crate) fn http_call_async_on(
         &self,
-        client: std::sync::Arc<reqwest::Client>,
-        hedge_client: Option<std::sync::Arc<reqwest::Client>>,
+        client: crate::http1_pool::PooledClient,
+        hedge_client: Option<crate::http1_pool::PooledClient>,
         method: &str,
         path: &str,
         body: &str,
@@ -1783,7 +1834,7 @@ impl SharedState {
     /// engine reserved.
     pub(crate) fn http_call_sync_on(
         &self,
-        client: std::sync::Arc<reqwest::Client>,
+        client: crate::http1_pool::PooledClient,
         method: &str,
         path: &str,
         body: &str,
@@ -2083,7 +2134,7 @@ impl PolymarketTrade {
                 Vec::with_capacity(n_primaries * 3 + 1);
 
             for (idx, primary) in primaries.into_iter().enumerate() {
-                // CLOB: signed heartbeat (keeps API key active + warms h2).
+                // CLOB: signed heartbeat (keeps API key active + warms h1.1).
                 let clob_url = clob_url.clone();
                 let h = h.clone();
                 let p = primary.clone();
@@ -2096,11 +2147,11 @@ impl PolymarketTrade {
                         .header("POLY_SIGNATURE", &h.signature)
                         .header("POLY_TIMESTAMP", &h.timestamp)
                         .header("POLY_PASSPHRASE", &h.passphrase);
-                    let r = req.send().await;
+                    let r = send_and_drain(req).await;
                     (
                         t0.elapsed(),
                         format!("clob[{}]", idx),
-                        r.map(|x| x.status().as_u16()).map_err(|e| e.to_string()),
+                        r.map_err(|e| e.to_string()),
                     )
                 }));
 
@@ -2108,11 +2159,13 @@ impl PolymarketTrade {
                 let p = primary.clone();
                 tasks.push(tokio::spawn(async move {
                     let t0 = std::time::Instant::now();
-                    let r = p.get("https://data-api.polymarket.com/").send().await;
+                    let r = send_and_drain(
+                        p.get("https://data-api.polymarket.com/")
+                    ).await;
                     (
                         t0.elapsed(),
                         format!("data-api[{}]", idx),
-                        r.map(|x| x.status().as_u16()).map_err(|e| e.to_string()),
+                        r.map_err(|e| e.to_string()),
                     )
                 }));
 
@@ -2120,11 +2173,13 @@ impl PolymarketTrade {
                 let p = primary.clone();
                 tasks.push(tokio::spawn(async move {
                     let t0 = std::time::Instant::now();
-                    let r = p.get("https://gamma-api.polymarket.com/").send().await;
+                    let r = send_and_drain(
+                        p.get("https://gamma-api.polymarket.com/")
+                    ).await;
                     (
                         t0.elapsed(),
                         format!("gamma-api[{}]", idx),
-                        r.map(|x| x.status().as_u16()).map_err(|e| e.to_string()),
+                        r.map_err(|e| e.to_string()),
                     )
                 }));
             }
@@ -2137,14 +2192,13 @@ impl PolymarketTrade {
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
-                let r = rpc.post(&url)
+                let r = send_and_drain(rpc.post(&url)
                     .header("Content-Type", "application/json")
-                    .body(body)
-                    .send().await;
+                    .body(body)).await;
                 (
                     t0.elapsed(),
                     "polygon-rpc".to_string(),
-                    r.map(|x| x.status().as_u16()).map_err(|e| e.to_string()),
+                    r.map_err(|e| e.to_string()),
                 )
             }));
 
@@ -3165,7 +3219,7 @@ impl PolymarketTrade {
                 || self.shared.http_call_sync("GET", &path, ""),
                 |permit| {
                     self.shared
-                        .http_call_sync_on(permit.current_client(), "GET", &path, "")
+                        .http_call_sync_on(permit.current_pooled_client(), "GET", &path, "")
                 },
             );
             let json = match reply {
@@ -3235,44 +3289,26 @@ impl PolymarketTrade {
             || self.shared.http_call_sync("GET", &path, ""),
             |permit| {
                 self.shared
-                    .http_call_sync_on(permit.current_client(), "GET", &path, "")
+                    .http_call_sync_on(permit.current_pooled_client(), "GET", &path, "")
             },
         );
 
-        if let (Some(permit), Err(error)) = (permit, &reply) {
+        if let (Some(_), Err(error)) = (permit, &reply) {
             if error.is_transport_failure() {
                 let failure_kind = error.fetch_unavailable();
-                let rebuilt = permit.note_transport_failure();
-                let (retry_client, retry_source) = match rebuilt {
-                    Some(client) => (client, "rebuilt_instance_slot"),
-                    None => (async_rt::http_client_reconcile(), "global_reconcile_fallback"),
-                };
+                let retry_client =
+                    crate::http1_pool::pooled_client(crate::http1_pool::Role::Reconcile);
                 warn!(
                     "[orphan_metric] reconcile_transport_fallback=1 coid={} orderID={} primary_failure={:?} retry_source={}",
                     coid,
                     order_id,
                     failure_kind,
-                    retry_source,
+                    "global_reconcile_fallback",
                 );
                 reply = self
                     .shared
                     .http_call_sync_on(retry_client, "GET", &path, "");
-                if retry_source == "rebuilt_instance_slot" {
-                    if reply
-                        .as_ref()
-                        .err()
-                        .is_some_and(HttpErr::is_transport_failure)
-                    {
-                        permit.note_transport_failure();
-                    } else {
-                        permit.note_transport_success();
-                    }
-                }
-            } else {
-                permit.note_transport_success();
             }
-        } else if let Some(permit) = permit {
-            permit.note_transport_success();
         }
 
         let json = match reply {
@@ -3349,7 +3385,7 @@ impl PolymarketTrade {
     pub fn submit_fire(
         &mut self,
         order: &OrderRequest,
-        client: std::sync::Arc<reqwest::Client>,
+        client: crate::http1_pool::PooledClient,
     ) -> std::result::Result<PendingSubmit, OrderUpdate> {
         let (local_oid, body_str) = self.submit_prep(order)?;
         // Places never hedge (idempotency + connection-pressure): `None`.
@@ -3377,8 +3413,8 @@ impl PolymarketTrade {
     pub fn cancel_fire(
         &mut self,
         client_order_id: &str,
-        client: std::sync::Arc<reqwest::Client>,
-        hedge_client: Option<std::sync::Arc<reqwest::Client>>,
+        client: crate::http1_pool::PooledClient,
+        hedge_client: Option<crate::http1_pool::PooledClient>,
     ) -> PendingCancel {
         let (ctx, body) = self.cancel_prep(client_order_id);
         let rx = body.map(|body_str| {

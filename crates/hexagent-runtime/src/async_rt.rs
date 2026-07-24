@@ -299,13 +299,26 @@ pub fn http_client_h1() -> Arc<reqwest::Client> {
 /// directly so they can batch work.
 pub fn blocking_get_text(url: &str) -> Result<String> {
     let url = url.to_string();
-    let client = http_client_query();
+    let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
     block_on_runtime(async move {
-        let resp = client.get(&url).send().await
-            .map_err(|e| anyhow!("GET {} failed: {}", url, e))?;
+        let resp = match client.client().get(&url).send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                client.note_transport_failure(url.clone());
+                return Err(anyhow!("GET {} failed: {}", url, error));
+            }
+        };
         let status = resp.status();
-        let body = resp.text().await
-            .map_err(|e| anyhow!("GET {} read body: {}", url, e))?;
+        let body = match resp.text().await {
+            Ok(body) => {
+                client.note_transport_success();
+                body
+            }
+            Err(error) => {
+                client.note_transport_failure(url.clone());
+                return Err(anyhow!("GET {} read body: {}", url, error));
+            }
+        };
         if !status.is_success() {
             return Err(anyhow!("GET {} returned {}", url, status));
         }
@@ -332,31 +345,39 @@ pub fn blocking_get_text_retry(
     base_backoff_ms: u64,
 ) -> Result<String> {
     let url = url.to_string();
-    let client = http_client_query();
     let attempts = attempts.max(1);
     block_on_runtime(async move {
         let mut last_err: Option<anyhow::Error> = None;
         for i in 0..attempts {
-            match client.get(&url).send().await {
+            let client =
+                crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
+            match client.client().get(&url).send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
                         match resp.text().await {
-                            Ok(body) => return Ok(body),
+                            Ok(body) => {
+                                client.note_transport_success();
+                                return Ok(body);
+                            }
                             Err(e) => {
+                                client.note_transport_failure(url.clone());
                                 last_err = Some(anyhow!("GET {} read body: {}", url, e));
                                 // body-read error is transient — fall through to retry
                             }
                         }
                     } else if is_retriable_status(status) && i + 1 < attempts {
+                        client.note_transport_success();
                         last_err = Some(anyhow!("GET {} returned {}", url, status));
                         // fall through to backoff
                     } else {
+                        client.note_transport_success();
                         // non-retriable status, OR last attempt — return now
                         return Err(anyhow!("GET {} returned {}", url, status));
                     }
                 }
                 Err(e) => {
+                    client.note_transport_failure(url.clone());
                     last_err = Some(anyhow!("GET {} failed: {}", url, e));
                     // Network / connect error is always retriable until we
                     // run out of attempts.

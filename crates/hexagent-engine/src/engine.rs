@@ -4669,7 +4669,7 @@ fn fire_or_execute(
                     let _ = utx.send(exec_rejected_place(&order)); // skip = hold
                 }
                 Some(permit) => {
-                    let client = permit.client().clone();
+                    let client = permit.pooled_client();
                     match worker.poly_route_mut(&iid).submit_fire(&order, client) {
                         Ok(pending) => {
                             let iid2 = iid;
@@ -4700,11 +4700,11 @@ fn fire_or_execute(
                     let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
                 }
                 Some(permit) => {
-                    let client = permit.client().clone();
+                    let client = permit.pooled_client();
                     // Component 3 idle-gate: hedge the cancel ONLY if a second
                     // Cancel connection is free right now (else no hedge).
                     let hedge_permit = try_acquire_hedge(&iid, Role::Cancel);
-                    let hedge_client = hedge_permit.as_ref().map(|p| p.client().clone());
+                    let hedge_client = hedge_permit.as_ref().map(|p| p.pooled_client());
                     let route = worker.poly_route_mut(&iid);
                     route.set_gen_ns_hint(timestamp_ns);
                     let pending = route.cancel_fire(&client_order_id, client, hedge_client);
@@ -4757,7 +4757,7 @@ fn fire_or_execute(
             // single coids re-cancel-looped 24-40× → held live → adverse fills /
             // one-sided inventory). Idle-hedge is kept only for standalone
             // CancelOrder, which has no paired leg competing for the same tick.
-            let cclient = cancel_permit.client().clone();
+            let cclient = cancel_permit.pooled_client();
             let route = worker.poly_route_mut(&iid);
             route.set_gen_ns_hint(timestamp_ns);
             let cpending = route.cancel_fire(&coid, cclient, None);
@@ -4775,7 +4775,7 @@ fn fire_or_execute(
                     let _ = utx.send(exec_rejected_place(&place));
                 }
                 Some(ppermit) => {
-                    let pclient = ppermit.client().clone();
+                    let pclient = ppermit.pooled_client();
                     match worker.poly_route_mut(&iid).submit_fire(&place, pclient) {
                         Ok(pending) => {
                             let iid_p = iid;

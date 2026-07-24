@@ -28,8 +28,6 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
-const GAP_CLIENT_REBUILD_AFTER_FAILURES: u32 = 2;
-const GAP_CLIENT_REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 const GAP_REPLAY_DEGRADED_AFTER_FAILURES: u32 = 3;
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 
@@ -154,8 +152,7 @@ struct GapHttpResponse {
 
 struct GapAttemptFailure {
     failure: GapSendFailure,
-    permit: Option<crate::http1_pool::Permit>,
-    rebuild_claimed: bool,
+    _permit: Option<crate::http1_pool::Permit>,
 }
 
 /// Facade over the process-global, physically isolated GapReplay role.
@@ -189,85 +186,28 @@ impl GapReplayTransport {
                     usize::MAX, 0, "pool_busy",
                     "no GapReplay warm slot available".to_string(),
                 ),
-                permit: None,
-                rebuild_claimed: false,
+                _permit: None,
             }),
         };
         let slot = permit.slot();
         let generation = permit.generation();
-        let client = permit.client().clone();
+        let client = permit.pooled_client();
         let headers = shared.auth.sign_request("GET", "/trades", "");
-        let mut request = client.get(url).header("User-Agent", GAP_USER_AGENT);
+        let mut request = client.client().get(url).header("User-Agent", GAP_USER_AGENT);
         for (key, value) in headers.as_pairs() {
             request = request.header(key, value);
         }
         match request.send().await {
-            Ok(response) => {
-                permit.note_transport_success();
-                Ok(GapHttpResponse { response, permit })
-            }
+            Ok(response) => Ok(GapHttpResponse { response, permit }),
             Err(error) => {
                 let failure = GapSendFailure::from_reqwest(slot, generation, &error);
-                let rebuild_claimed = failure.is_transport()
-                    && permit.note_transport_failure_with_rebuild_policy(
-                        GAP_CLIENT_REBUILD_AFTER_FAILURES as usize,
-                        GAP_CLIENT_REBUILD_COOLDOWN,
-                    );
+                if failure.is_transport() {
+                    client.note_transport_failure(format!("{}/time", CLOB_BASE_URL));
+                }
                 Err(GapAttemptFailure {
                     failure,
-                    permit: Some(permit),
-                    rebuild_claimed,
+                    _permit: Some(permit),
                 })
-            }
-        }
-    }
-
-    async fn rebuild_if_needed(&self, attempt: &GapAttemptFailure) {
-        if !attempt.rebuild_claimed { return; }
-        let Some(permit) = attempt.permit.as_ref() else { return; };
-        let slot = permit.slot();
-        let generation = permit.generation();
-        let candidate = match permit.build_replacement() {
-            Ok(client) => client,
-            Err(error) => {
-                warn!(
-                    "[PolyUserFeed] GapReplay role slot={} generation={} rebuild failed: {:#}",
-                    slot, generation, error,
-                );
-                return;
-            }
-        };
-        let probe_url = format!("{}/time", CLOB_BASE_URL);
-        match candidate
-            .get(&probe_url)
-            .header("User-Agent", GAP_USER_AGENT)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                match permit.install_prewarmed_replacement(candidate) {
-                    Some(new_generation) => info!(
-                        "[PolyUserFeed] GapReplay role slot={} rebuilt and prewarmed generation={}",
-                        slot, new_generation,
-                    ),
-                    None => warn!(
-                        "[PolyUserFeed] GapReplay role slot={} generation={} replacement stale before install",
-                        slot, generation,
-                    ),
-                }
-            }
-            Ok(response) => {
-                warn!(
-                    "[PolyUserFeed] GapReplay role slot={} replacement prewarm HTTP {}; keeping generation={}",
-                    slot, response.status(), generation,
-                );
-            }
-            Err(error) => {
-                let failure = GapSendFailure::from_reqwest(slot, generation, &error);
-                warn!(
-                    "[PolyUserFeed] GapReplay role slot={} replacement prewarm failed ({}); keeping generation={}",
-                    slot, failure, generation,
-                );
             }
         }
     }
@@ -291,12 +231,9 @@ impl GapReplayTransport {
                             result.permit.slot(),
                             result.permit.generation(),
                         );
-                        self.rebuild_if_needed(&first).await;
                         Ok(result)
                     }
                     Err(second) => {
-                        self.rebuild_if_needed(&first).await;
-                        self.rebuild_if_needed(&second).await;
                         Err(format!(
                             "primary [{}]; fallback [{}]",
                             first.failure,
@@ -313,16 +250,11 @@ impl GapReplayTransport {
         permit: crate::http1_pool::Permit,
         failure: GapSendFailure,
     ) {
-        let rebuild_claimed = failure.is_transport()
-            && permit.note_transport_failure_with_rebuild_policy(
-                GAP_CLIENT_REBUILD_AFTER_FAILURES as usize,
-                GAP_CLIENT_REBUILD_COOLDOWN,
-            );
-        self.rebuild_if_needed(&GapAttemptFailure {
-            failure,
-            permit: Some(permit),
-            rebuild_claimed,
-        }).await;
+        if failure.is_transport() {
+            permit
+                .pooled_client()
+                .note_transport_failure(format!("{}/time", CLOB_BASE_URL));
+        }
     }
 }
 
@@ -704,7 +636,10 @@ async fn replay_missed_trades(
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let body = match resp.text().await {
-                Ok(body) => body,
+                Ok(body) => {
+                    permit.pooled_client().note_transport_success();
+                    body
+                }
                 Err(error) => {
                     let failure = GapSendFailure::from_reqwest(
                         response_slot,
@@ -729,7 +664,10 @@ async fn replay_missed_trades(
             ));
         }
         let json: serde_json::Value = match resp.json().await {
-            Ok(j) => j,
+            Ok(j) => {
+                permit.pooled_client().note_transport_success();
+                j
+            }
             Err(error) => {
                 let failure = GapSendFailure::from_reqwest(
                     response_slot,
@@ -745,6 +683,7 @@ async fn replay_missed_trades(
                         detail,
                     ));
                 }
+                permit.pooled_client().note_transport_success();
                 return Err(anyhow!(
                     "Gap-fetch /trades parse failed after {} records: {}",
                     count,
