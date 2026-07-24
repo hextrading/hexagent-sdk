@@ -31,10 +31,14 @@ use crate::types::Side;
 ///   trades still pending — we may have *permanently* missed fills. The
 ///   current event's inventory is unknowable; stop quoting/trading it and let
 ///   it ride to settlement. Cleared on the next event settlement.
+/// - `gap_replay_degraded`: the periodic REST safety net has failed repeatedly.
+///   The WebSocket may still be connected, but until the pinned replay window
+///   catches up we cannot prove that its local ledger is complete.
 #[derive(Debug)]
 pub struct UserFeedHealth {
     recovering: AtomicBool,
     inventory_uncertain: AtomicBool,
+    gap_replay_degraded: AtomicBool,
 }
 
 impl UserFeedHealth {
@@ -44,12 +48,19 @@ impl UserFeedHealth {
         Self {
             recovering: AtomicBool::new(true),
             inventory_uncertain: AtomicBool::new(false),
+            gap_replay_degraded: AtomicBool::new(false),
         }
     }
     pub fn is_recovering(&self) -> bool { self.recovering.load(Ordering::Relaxed) }
     pub fn set_recovering(&self, v: bool) { self.recovering.store(v, Ordering::Relaxed); }
     pub fn inventory_uncertain(&self) -> bool { self.inventory_uncertain.load(Ordering::Relaxed) }
     pub fn set_inventory_uncertain(&self, v: bool) { self.inventory_uncertain.store(v, Ordering::Relaxed); }
+    pub fn gap_replay_degraded(&self) -> bool {
+        self.gap_replay_degraded.load(Ordering::Relaxed)
+    }
+    pub fn set_gap_replay_degraded(&self, v: bool) {
+        self.gap_replay_degraded.store(v, Ordering::Relaxed);
+    }
 }
 
 impl Default for UserFeedHealth {
@@ -247,6 +258,7 @@ mod user_feed_health_tests {
         let h = UserFeedHealth::new();
         assert!(h.is_recovering());
         assert!(!h.inventory_uncertain());
+        assert!(!h.gap_replay_degraded());
     }
 
     #[test]
@@ -267,6 +279,18 @@ mod user_feed_health_tests {
         assert!(!h.is_recovering());
         h.set_inventory_uncertain(false); // cleared at settlement
         assert!(!h.inventory_uncertain());
+    }
+
+    #[test]
+    fn gap_replay_degraded_is_independent_and_recoverable() {
+        let h = UserFeedHealth::new();
+        h.set_recovering(false);
+        h.set_gap_replay_degraded(true);
+        assert!(h.gap_replay_degraded());
+        assert!(!h.is_recovering());
+        assert!(!h.inventory_uncertain());
+        h.set_gap_replay_degraded(false);
+        assert!(!h.gap_replay_degraded());
     }
 }
 

@@ -5,6 +5,8 @@
 //! but under the hood the WS read loop runs as a tokio task on the shared
 //! async runtime.
 
+use std::error::Error as _;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +28,13 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+const GAP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const GAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const GAP_CLIENT_REBUILD_AFTER_FAILURES: u32 = 2;
+const GAP_CLIENT_REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
+const GAP_REPLAY_DEGRADED_AFTER_FAILURES: u32 = 3;
+const GAP_CLIENT_SLOTS: usize = 2;
+const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapReplayOutcome {
@@ -66,6 +75,286 @@ fn recovery_window_start(
     rewind_secs: u64,
 ) -> u64 {
     *current.get_or_insert_with(|| last_match_time_secs.saturating_sub(rewind_secs))
+}
+
+/// Pin a periodic replay window until one complete REST sweep succeeds.
+///
+/// The former implementation recomputed `now - rewind` after every failed
+/// request. A five-second timeout with a three-second rewind therefore moved
+/// the next lower bound *past* part of the failed interval, permanently
+/// abandoning fills that the WebSocket may also have dropped.
+fn periodic_window_start(current: &mut Option<u64>, candidate_after_secs: u64) -> u64 {
+    *current.get_or_insert(candidate_after_secs)
+}
+
+#[derive(Debug, Clone)]
+struct GapSendFailure {
+    slot: usize,
+    generation: u64,
+    kind: &'static str,
+    detail: String,
+}
+
+impl GapSendFailure {
+    fn from_reqwest(slot: usize, generation: u64, error: &reqwest::Error) -> Self {
+        let kind = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else if error.is_body() {
+            "body"
+        } else if error.is_request() {
+            "request"
+        } else if error.is_decode() {
+            "decode"
+        } else {
+            "other"
+        };
+        let mut detail = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            detail.push_str(": ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        Self {
+            slot,
+            generation,
+            kind,
+            detail,
+        }
+    }
+
+    fn is_transport(&self) -> bool {
+        matches!(self.kind, "timeout" | "connect" | "body" | "request")
+    }
+}
+
+impl fmt::Display for GapSendFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "slot={} generation={} kind={}: {}",
+            self.slot,
+            self.generation,
+            self.kind,
+            self.detail,
+        )
+    }
+}
+
+struct GapClientSlot {
+    client: reqwest::Client,
+    generation: u64,
+    consecutive_transport_failures: u32,
+    last_rebuild: Option<Instant>,
+}
+
+impl GapClientSlot {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            client: crate::http1_pool::build_client(
+                GAP_HTTP_TIMEOUT,
+                GAP_CONNECT_TIMEOUT,
+            )?,
+            generation: 0,
+            consecutive_transport_failures: 0,
+            last_rebuild: None,
+        })
+    }
+}
+
+struct GapHttpResponse {
+    response: reqwest::Response,
+    slot: usize,
+    generation: u64,
+}
+
+/// Small endpoint-specific persistent pool for `/trades` replay.
+///
+/// It deliberately stays separate from the shared QUERY pool: a wedged CLOB
+/// `/trades` connection must not contaminate balance, metadata or heartbeat
+/// traffic. Two long-lived slots retain TLS reuse on the happy path. A
+/// transport failure retries once on the peer slot; repeatedly failing slots
+/// are rebuilt with a cooldown so an upstream incident cannot cause a client
+/// construction storm.
+struct GapReplayTransport {
+    slots: [GapClientSlot; GAP_CLIENT_SLOTS],
+    next_slot: usize,
+}
+
+impl GapReplayTransport {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            slots: [GapClientSlot::new()?, GapClientSlot::new()?],
+            next_slot: 0,
+        })
+    }
+
+    async fn send_once(
+        &self,
+        slot: usize,
+        shared: &SharedState,
+        url: &str,
+    ) -> std::result::Result<GapHttpResponse, GapSendFailure> {
+        let generation = self.slots[slot].generation;
+        let client = self.slots[slot].client.clone();
+        let headers = shared.auth.sign_request("GET", "/trades", "");
+        let mut request = client.get(url).header("User-Agent", GAP_USER_AGENT);
+        for (key, value) in headers.as_pairs() {
+            request = request.header(key, value);
+        }
+        request
+            .send()
+            .await
+            .map(|response| GapHttpResponse {
+                response,
+                slot,
+                generation,
+            })
+            .map_err(|error| GapSendFailure::from_reqwest(slot, generation, &error))
+    }
+
+    fn note_success(&mut self, slot: usize, generation: u64) {
+        let state = &mut self.slots[slot];
+        if state.generation == generation {
+            state.consecutive_transport_failures = 0;
+        }
+    }
+
+    fn note_failure(&mut self, failure: &GapSendFailure) {
+        if !failure.is_transport() {
+            return;
+        }
+        let state = &mut self.slots[failure.slot];
+        if state.generation == failure.generation {
+            state.consecutive_transport_failures =
+                state.consecutive_transport_failures.saturating_add(1);
+        }
+    }
+
+    fn should_rebuild(&self, slot: usize, now: Instant) -> bool {
+        let state = &self.slots[slot];
+        state.consecutive_transport_failures >= GAP_CLIENT_REBUILD_AFTER_FAILURES
+            && state
+                .last_rebuild
+                .map(|last| now.duration_since(last) >= GAP_CLIENT_REBUILD_COOLDOWN)
+                .unwrap_or(true)
+    }
+
+    async fn rebuild_if_needed(&mut self, slot: usize) {
+        let now = Instant::now();
+        if !self.should_rebuild(slot, now) {
+            return;
+        }
+        // Claim the cooldown before building/probing so a failed prewarm
+        // cannot immediately trigger another rebuild on the next sweep.
+        self.slots[slot].last_rebuild = Some(now);
+        let candidate = match crate::http1_pool::build_client(
+            GAP_HTTP_TIMEOUT,
+            GAP_CONNECT_TIMEOUT,
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    "[PolyUserFeed] Gap client slot={} rebuild failed: {:#}",
+                    slot,
+                    error,
+                );
+                return;
+            }
+        };
+        let probe_url = format!("{}/time", CLOB_BASE_URL);
+        match candidate
+            .get(&probe_url)
+            .header("User-Agent", GAP_USER_AGENT)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let state = &mut self.slots[slot];
+                state.client = candidate;
+                state.generation = state.generation.saturating_add(1);
+                state.consecutive_transport_failures = 0;
+                info!(
+                    "[PolyUserFeed] Gap client slot={} rebuilt and prewarmed generation={}",
+                    slot,
+                    state.generation,
+                );
+            }
+            Ok(response) => {
+                warn!(
+                    "[PolyUserFeed] Gap client slot={} replacement prewarm HTTP {}; keeping \
+                     generation={}",
+                    slot,
+                    response.status(),
+                    self.slots[slot].generation,
+                );
+            }
+            Err(error) => {
+                let failure = GapSendFailure::from_reqwest(
+                    slot,
+                    self.slots[slot].generation,
+                    &error,
+                );
+                warn!(
+                    "[PolyUserFeed] Gap client slot={} replacement prewarm failed ({}); keeping \
+                     generation={}",
+                    slot,
+                    failure,
+                    self.slots[slot].generation,
+                );
+            }
+        }
+    }
+
+    async fn get(
+        &mut self,
+        shared: &SharedState,
+        url: &str,
+    ) -> std::result::Result<GapHttpResponse, String> {
+        let primary = self.next_slot;
+        self.next_slot = (self.next_slot + 1) % GAP_CLIENT_SLOTS;
+        match self.send_once(primary, shared, url).await {
+            Ok(result) => {
+                self.note_success(result.slot, result.generation);
+                Ok(result)
+            }
+            Err(first) => {
+                self.note_failure(&first);
+                let fallback = (primary + 1) % GAP_CLIENT_SLOTS;
+                match self.send_once(fallback, shared, url).await {
+                    Ok(result) => {
+                        self.note_success(result.slot, result.generation);
+                        warn!(
+                            "[PolyUserFeed] Gap request transport failover succeeded: failed [{}], \
+                             fallback_slot={} generation={}",
+                            first,
+                            result.slot,
+                            result.generation,
+                        );
+                        self.rebuild_if_needed(primary).await;
+                        Ok(result)
+                    }
+                    Err(second) => {
+                        self.note_failure(&second);
+                        self.rebuild_if_needed(primary).await;
+                        self.rebuild_if_needed(fallback).await;
+                        Err(format!(
+                            "primary [{}]; fallback [{}]",
+                            first,
+                            second,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn report_body_failure(&mut self, failure: &GapSendFailure) {
+        self.note_failure(failure);
+        self.rebuild_if_needed(failure.slot).await;
+    }
 }
 
 /// Record one trade-lifecycle edge and tell the caller whether it is new.
@@ -389,12 +678,12 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
 }
 
 /// Fetch trades newer than `after_secs` from the authenticated CLOB `/trades`
-/// endpoint and replay them through the update channel. Async version —
-/// uses the shared reqwest HTTP/2 client.
+/// endpoint and replay them through the update channel.
 async fn replay_missed_trades(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
     after_secs: u64,
+    transport: &mut GapReplayTransport,
 ) -> Result<GapReplayOutcome> {
     // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
     // account, so we fetch ALL of the wallet's trades since `after` (no
@@ -405,7 +694,6 @@ async fn replay_missed_trades(
     // which a sibling instance could clobber → wrong-market replay.)
     let mut cursor = String::new();
     let mut count = 0usize;
-    let client = async_rt::http_client();
 
     // Roll back 1 s on the boundary so trades sharing the same second as
     // `last_match_time` aren't excluded by Polymarket's strict-`>`
@@ -422,30 +710,39 @@ async fn replay_missed_trades(
     const MAX_PAGES: usize = 50;
     let mut truncated = false;
     for page in 0..MAX_PAGES {
-        let headers = shared.auth.sign_request("GET", "/trades", "");
         let url = if cursor.is_empty() {
             format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
             format!("{}/trades?after={}&next_cursor={}",
                 CLOB_BASE_URL, after_param, cursor)
         };
-        let mut req = client.get(&url);
-        for (k, v) in headers.as_pairs() {
-            req = req.header(k, v);
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let gap_response = match transport.get(shared, &url).await {
+            Ok(response) => response,
+            Err(error) => {
                 return Err(anyhow!(
                     "Gap-fetch /trades request failed after {} records: {}",
                     count,
-                    e,
+                    error,
                 ));
             }
         };
+        let response_slot = gap_response.slot;
+        let response_generation = gap_response.generation;
+        let resp = gap_response.response;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = match resp.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    let failure = GapSendFailure::from_reqwest(
+                        response_slot,
+                        response_generation,
+                        &error,
+                    );
+                    transport.report_body_failure(&failure).await;
+                    format!("<response body read failed: {}>", failure)
+                }
+            };
             return Err(anyhow!(
                 "Gap-fetch /trades HTTP {} after {} records: {}",
                 code,
@@ -455,11 +752,19 @@ async fn replay_missed_trades(
         }
         let json: serde_json::Value = match resp.json().await {
             Ok(j) => j,
-            Err(e) => {
+            Err(error) => {
+                let failure = GapSendFailure::from_reqwest(
+                    response_slot,
+                    response_generation,
+                    &error,
+                );
+                if failure.is_transport() {
+                    transport.report_body_failure(&failure).await;
+                }
                 return Err(anyhow!(
                     "Gap-fetch /trades parse failed after {} records: {}",
                     count,
-                    e,
+                    failure,
                 ));
             }
         };
@@ -527,6 +832,18 @@ async fn user_feed_loop(
         }
     }
     let reconnect_rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
+    let gap_transport = match GapReplayTransport::new() {
+        Ok(transport) => Arc::new(tokio::sync::Mutex::new(transport)),
+        Err(error) => {
+            shared.user_feed_health.set_recovering(true);
+            warn!(
+                "[PolyUserFeed] Cannot build dedicated gap replay transport: {:#}; \
+                 keeping quoting paused",
+                error,
+            );
+            return;
+        }
+    };
     // Fixed lower bound for the current recovery episode. A partial REST
     // attempt may advance `last_match_time_secs`; recomputing from that cursor
     // would then skip an earlier page that failed. Retain this floor across
@@ -551,6 +868,7 @@ async fn user_feed_loop(
         let shared = shared.clone();
         let update_tx = update_tx.clone();
         let shutdown = shutdown.clone();
+        let gap_transport = gap_transport.clone();
         // New task → won't inherit the loop's span; re-attach the same
         // per-account span so gap-recovery logs are tagged too.
         let gap_span = tracing::info_span!("user_feed", acct = %shared.instance_id);
@@ -563,6 +881,8 @@ async fn user_feed_loop(
             // small rewind. (Was keyed on per-event `CurrentMarket` change,
             // which a sibling instance sharing the wallet could clobber.)
             let mut did_startup_deep = false;
+            let mut periodic_after_secs: Option<u64> = None;
+            let mut consecutive_failures = 0u32;
             loop {
                 sleep(interval).await;
                 if shutdown.load(Ordering::Relaxed) { break; }
@@ -575,10 +895,31 @@ async fn user_feed_loop(
                 } else {
                     now_ms.saturating_sub(rewind_ms) / 1000        // rewind (ms) → floor to sec
                 };
-                match replay_missed_trades(&shared, &update_tx, after).await {
-                    Ok(GapReplayOutcome::Complete { .. }) => {}
+                let after = periodic_window_start(&mut periodic_after_secs, after);
+                let replay_result = {
+                    let mut transport = gap_transport.lock().await;
+                    replay_missed_trades(&shared, &update_tx, after, &mut transport).await
+                };
+                match replay_result {
+                    Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
+                        if consecutive_failures > 0 {
+                            info!(
+                                "[PolyUserFeed] Periodic gap replay recovered: after={} attempts={} \
+                                 records={}",
+                                after,
+                                consecutive_failures.saturating_add(1),
+                                outcome.records(),
+                            );
+                        }
+                        consecutive_failures = 0;
+                        periodic_after_secs = None;
+                        shared.user_feed_health.set_gap_replay_degraded(false);
+                    }
                     Ok(outcome @ GapReplayOutcome::Truncated { .. }) => {
                         shared.user_feed_health.set_inventory_uncertain(true);
+                        shared.user_feed_health.set_gap_replay_degraded(false);
+                        consecutive_failures = 0;
+                        periodic_after_secs = None;
                         warn!(
                             "[PolyUserFeed] Periodic gap replay incomplete: {} records fetched; \
                              inventory remains uncertain",
@@ -586,7 +927,28 @@ async fn user_feed_loop(
                         );
                     }
                     Err(e) => {
-                        warn!("[PolyUserFeed] Periodic gap replay failed: {}", e);
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= GAP_REPLAY_DEGRADED_AFTER_FAILURES {
+                            let newly_degraded = !shared
+                                .user_feed_health
+                                .gap_replay_degraded();
+                            shared.user_feed_health.set_gap_replay_degraded(true);
+                            if newly_degraded {
+                                warn!(
+                                    "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
+                                     consecutive failures; after={} remains pinned and quoting \
+                                     will pause until catch-up succeeds",
+                                    consecutive_failures,
+                                    after,
+                                );
+                            }
+                        }
+                        warn!(
+                            "[PolyUserFeed] Periodic gap replay failed: {} (attempt={} pinned_after={})",
+                            e,
+                            consecutive_failures,
+                            after,
+                        );
                     }
                 }
             }
@@ -638,7 +1000,17 @@ async fn user_feed_loop(
             last_match_time_secs,
             reconnect_rewind_secs,
         );
-        match replay_missed_trades(&shared, &update_tx, after_secs).await {
+        let replay_result = {
+            let mut transport = gap_transport.lock().await;
+            replay_missed_trades(
+                &shared,
+                &update_tx,
+                after_secs,
+                &mut transport,
+            )
+            .await
+        };
+        match replay_result {
             Ok(outcome) => {
                 match outcome {
                     GapReplayOutcome::Complete { records } => {
@@ -959,5 +1331,50 @@ mod tests {
 
         recovery_after = None;
         assert_eq!(recovery_window_start(&mut recovery_after, 1_100, 3), 1_097);
+    }
+
+    #[test]
+    fn periodic_retries_keep_the_original_failed_window() {
+        let mut periodic_after = None;
+
+        assert_eq!(periodic_window_start(&mut periodic_after, 1_000), 1_000);
+        // Wall time advances while `/trades` times out, but the lower bound
+        // must not move until a complete sweep succeeds.
+        assert_eq!(periodic_window_start(&mut periodic_after, 1_006), 1_000);
+        assert_eq!(periodic_window_start(&mut periodic_after, 1_120), 1_000);
+
+        periodic_after = None; // complete replay
+        assert_eq!(periodic_window_start(&mut periodic_after, 1_120), 1_120);
+    }
+
+    #[test]
+    fn gap_client_rebuild_requires_threshold_and_respects_cooldown() {
+        let mut transport = GapReplayTransport::new().unwrap();
+        let now = Instant::now();
+        assert!(!transport.should_rebuild(0, now));
+
+        transport.slots[0].consecutive_transport_failures =
+            GAP_CLIENT_REBUILD_AFTER_FAILURES;
+        assert!(transport.should_rebuild(0, now));
+
+        transport.slots[0].last_rebuild = Some(now);
+        assert!(!transport.should_rebuild(0, now));
+        assert!(transport.should_rebuild(
+            0,
+            now + GAP_CLIENT_REBUILD_COOLDOWN,
+        ));
+    }
+
+    #[test]
+    fn successful_gap_request_clears_only_matching_generation_failures() {
+        let mut transport = GapReplayTransport::new().unwrap();
+        transport.slots[0].generation = 4;
+        transport.slots[0].consecutive_transport_failures = 2;
+
+        transport.note_success(0, 3);
+        assert_eq!(transport.slots[0].consecutive_transport_failures, 2);
+
+        transport.note_success(0, 4);
+        assert_eq!(transport.slots[0].consecutive_transport_failures, 0);
     }
 }
