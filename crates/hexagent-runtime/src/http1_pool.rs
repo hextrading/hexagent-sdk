@@ -391,6 +391,8 @@ struct RolePool {
     rr: AtomicUsize, // round-robin cursor for exempt (no-permit) picks
     acquires: AtomicU64,
     skips: AtomicU64,
+    hedge_acquires: AtomicU64,
+    hedge_skips: AtomicU64,
 }
 
 impl RolePool {
@@ -408,6 +410,8 @@ impl RolePool {
             rr: AtomicUsize::new(0),
             acquires: AtomicU64::new(0),
             skips: AtomicU64::new(0),
+            hedge_acquires: AtomicU64::new(0),
+            hedge_skips: AtomicU64::new(0),
         })
     }
 
@@ -415,19 +419,38 @@ impl RolePool {
     /// SKIPS — no cold connection is opened). Binds permit → slot → warm
     /// connection so the connection is never used by two requests at once.
     fn try_acquire(&self) -> Option<Permit> {
+        self.try_acquire_counted(false)
+    }
+
+    /// Optional duplicate/hedge acquisition. It uses the same slots but keeps
+    /// separate observability counters: failure here only suppresses the
+    /// duplicate request and must not be reported as a dropped primary.
+    fn try_acquire_hedge(&self) -> Option<Permit> {
+        self.try_acquire_counted(true)
+    }
+
+    fn try_acquire_counted(&self, hedge: bool) -> Option<Permit> {
         for s in &self.slots {
             if s.busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.acquires.fetch_add(1, Ordering::Relaxed);
+                if hedge {
+                    self.hedge_acquires.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.acquires.fetch_add(1, Ordering::Relaxed);
+                }
                 return Some(Permit {
                     flag: s.busy.clone(),
                     client: s.client.clone(),
                 });
             }
         }
-        self.skips.fetch_add(1, Ordering::Relaxed);
+        if hedge {
+            self.hedge_skips.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.skips.fetch_add(1, Ordering::Relaxed);
+        }
         None
     }
 
@@ -439,8 +462,9 @@ impl RolePool {
         self.slots[i].client.clone()
     }
 
-    /// (acquires, skips, busy_now) for observability.
-    fn stats(&self) -> (u64, u64, usize) {
+    /// (primary_acquires, primary_skips, hedge_acquires, hedge_skips,
+    /// busy_now) for observability.
+    fn stats(&self) -> (u64, u64, u64, u64, usize) {
         let busy = self
             .slots
             .iter()
@@ -449,6 +473,8 @@ impl RolePool {
         (
             self.acquires.load(Ordering::Relaxed),
             self.skips.load(Ordering::Relaxed),
+            self.hedge_acquires.load(Ordering::Relaxed),
+            self.hedge_skips.load(Ordering::Relaxed),
             busy,
         )
     }
@@ -522,6 +548,17 @@ pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
     INSTANCE_POOLS.get()?.get(instance)?.role(role).try_acquire()
 }
 
+/// Admission control for an optional duplicate/hedge request. A failed hedge
+/// acquisition is tracked separately because the primary request is already
+/// in flight and no business operation was dropped.
+pub fn try_acquire_hedge(instance: &str, role: Role) -> Option<Permit> {
+    INSTANCE_POOLS
+        .get()?
+        .get(instance)?
+        .role(role)
+        .try_acquire_hedge()
+}
+
 /// Exempt dispatch for must-complete traffic (heartbeat / keep-warm /
 /// cancel-all): never blocked by admission, may cold-connect. Falls back
 /// to the shared global pool when the instance is unknown / pools not yet
@@ -533,9 +570,10 @@ pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
     client(role)
 }
 
-/// Observability snapshot: `(instance, role, acquires, skips, busy_now)`
-/// sorted by instance then role. Empty until `init_instance_pools` runs.
-pub fn admission_stats() -> Vec<(String, Role, u64, u64, usize)> {
+/// Observability snapshot: `(instance, role, primary_acquires, primary_skips,
+/// hedge_acquires, hedge_skips, busy_now)` sorted by instance then role. Empty
+/// until `init_instance_pools` runs.
+pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, u64, usize)> {
     let mut out = Vec::new();
     if let Some(m) = INSTANCE_POOLS.get() {
         let mut ids: Vec<&String> = m.keys().collect();
@@ -543,8 +581,8 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, usize)> {
         for id in ids {
             let p = &m[id];
             for role in [Role::Fast, Role::Cancel, Role::Reconcile, Role::Query] {
-                let (a, s, b) = p.role(role).stats();
-                out.push((id.clone(), role, a, s, b));
+                let (a, s, ha, hs, b) = p.role(role).stats();
+                out.push((id.clone(), role, a, s, ha, hs, b));
             }
         }
     }
@@ -595,10 +633,12 @@ mod tests {
         assert!(a.is_some() && b.is_some(), "first 2 acquires succeed");
         assert!(p.try_acquire().is_none(), "3rd acquire on a size-2 pool must skip");
 
-        let (acquires, skips, busy) = p.stats();
+        let (acquires, skips, hedge_acquires, hedge_skips, busy) = p.stats();
         assert_eq!(busy, 2, "both slots busy");
         assert_eq!(acquires, 2);
         assert_eq!(skips, 1, "one skip recorded");
+        assert_eq!(hedge_acquires, 0);
+        assert_eq!(hedge_skips, 0);
 
         drop(a); // release one slot
         assert!(
@@ -618,7 +658,22 @@ mod tests {
         for _ in 0..10 {
             assert!(p.try_acquire().is_none(), "never exceed N in-flight");
         }
-        assert_eq!(p.stats().2, 3, "exactly N busy");
+        assert_eq!(p.stats().4, 3, "exactly N busy");
+    }
+
+    #[test]
+    fn admission_hedge_stats_are_separate_from_primary() {
+        let p = pool(2);
+        let primary = p.try_acquire();
+        let hedge = p.try_acquire_hedge();
+        assert!(primary.is_some() && hedge.is_some());
+        assert!(p.try_acquire_hedge().is_none());
+        assert!(p.try_acquire().is_none());
+
+        let (acquires, skips, hedge_acquires, hedge_skips, busy) = p.stats();
+        assert_eq!((acquires, skips), (1, 1));
+        assert_eq!((hedge_acquires, hedge_skips), (1, 1));
+        assert_eq!(busy, 2);
     }
 
     #[test]

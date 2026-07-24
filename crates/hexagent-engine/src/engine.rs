@@ -73,6 +73,17 @@ fn polymarket_readiness_transition(event: &MarketEvent) -> Option<FeedReadiness>
     }
 }
 
+/// Reasons emitted by the normal five-minute market lifecycle. Keep these
+/// exact-match checks narrow: unexpected account-wide cancels and real CLOB
+/// disconnects must remain warnings.
+fn is_routine_expiry_cancel(reason: &str, market_scoped: bool) -> bool {
+    market_scoped && reason == "event_expiry_sweep"
+}
+
+fn is_routine_clob_resubscribe(reason: &str) -> bool {
+    reason == "CLOB resubscribe requested"
+}
+
 /// Live trading does not replay Polymarket's event-local orderbook/trade
 /// history after restart, so persisting that high-volume stream only adds
 /// recorder I/O. `SpotPrice` is deliberately kept: its `exchange()` method
@@ -1965,8 +1976,12 @@ impl Engine {
                                     // order state to reconcile against — the sim
                                     // delivers deterministic results synchronously.
                                 }
-                                Ok(Signal::PolymarketCancelAllOrders { ref reason, .. }) => {
-                                    warn!("[PaperExec] PolymarketCancelAllOrders: reason={}", reason);
+                                Ok(Signal::PolymarketCancelAllOrders { ref reason, ref market, .. }) => {
+                                    if is_routine_expiry_cancel(reason, market.is_some()) {
+                                        info!("[PaperExec] PolymarketCancelAllOrders: reason={}", reason);
+                                    } else {
+                                        warn!("[PaperExec] PolymarketCancelAllOrders: reason={}", reason);
+                                    }
                                     updates.extend(sim.cancel_all(Exchange::Polymarket, "", sim_now));
                                 }
                                 Ok(Signal::Exit) => {
@@ -3439,10 +3454,19 @@ impl Engine {
                                                 FeedReadiness::Ready => info!(
                                                     "[feed_health] polymarket readiness=READY stage=market_stream"
                                                 ),
-                                                FeedReadiness::NotReady { reason, .. } => warn!(
-                                                    "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={}",
-                                                    reason,
-                                                ),
+                                                FeedReadiness::NotReady { reason, .. } => {
+                                                    if is_routine_clob_resubscribe(&reason) {
+                                                        info!(
+                                                            "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={}",
+                                                            reason,
+                                                        );
+                                                    } else {
+                                                        warn!(
+                                                            "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={}",
+                                                            reason,
+                                                        );
+                                                    }
+                                                }
                                                 FeedReadiness::Starting => {}
                                             }
                                         }
@@ -4148,18 +4172,17 @@ impl Engine {
                         poly_worker_n, n_drainers
                     );
                     // Admission-control observability daemon: every 30 s log the
-                    // per-(instance,role) delta — acquires, skips (= quotes held
-                    // because a warm connection was busy), and current busy. A
-                    // rising skip count = connection pressure / congestion
-                    // shedding; cross-check against the PM REST RTT window. Cold
-                    // connections should stay ~0 (skips shed load instead).
+                    // per-(instance,role) delta — primary acquires/skips,
+                    // optional hedge acquires/skips, and current busy. Primary
+                    // skips shed a business operation and are WARN; hedge skips
+                    // only suppress a duplicate cancel and remain INFO.
                     {
                         let stop = poly_stats_stop.clone();
                         let h = thread::Builder::new()
                             .name("poly-admission-stats".into())
                             .spawn(move || {
                                 crate::os_tune::pin_background("poly-admission-stats");
-                                let mut prev: HashMap<String, (u64, u64)> = HashMap::new();
+                                let mut prev = HashMap::new();
                                 loop {
                                     let mut slept = 0;
                                     while slept < 30 {
@@ -4169,28 +4192,12 @@ impl Engine {
                                         thread::sleep(std::time::Duration::from_secs(1));
                                         slept += 1;
                                     }
-                                    let mut by_inst: std::collections::BTreeMap<String, String> =
-                                        Default::default();
-                                    let mut any_skip = false;
-                                    for (iid, role, acq, sk, busy) in
-                                        hexagent_runtime::http1_pool::admission_stats()
-                                    {
-                                        let key = format!("{}/{:?}", iid, role);
-                                        let (pa, ps) =
-                                            prev.get(&key).copied().unwrap_or((0, 0));
-                                        let dacq = acq.saturating_sub(pa);
-                                        let dsk = sk.saturating_sub(ps);
-                                        prev.insert(key, (acq, sk));
-                                        if dsk > 0 {
-                                            any_skip = true;
-                                        }
-                                        by_inst.entry(iid).or_default().push_str(&format!(
-                                            "{:?}(+{} skip+{} busy{}) ",
-                                            role, dacq, dsk, busy
-                                        ));
-                                    }
-                                    for (iid, line) in by_inst {
-                                        if any_skip {
+                                    let by_inst = admission_log_snapshot(
+                                        &mut prev,
+                                        hexagent_runtime::http1_pool::admission_stats(),
+                                    );
+                                    for (iid, (line, primary_skip)) in by_inst {
+                                        if primary_skip {
                                             warn!("[admission] {} {}", iid, line.trim_end());
                                         } else {
                                             info!("[admission] {} {}", iid, line.trim_end());
@@ -4420,6 +4427,51 @@ fn extract_instance_id(signal: &Signal) -> String {
     }
 }
 
+type AdmissionCounters = (u64, u64, u64, u64);
+type AdmissionStat = (
+    String,
+    hexagent_runtime::http1_pool::Role,
+    u64,
+    u64,
+    u64,
+    u64,
+    usize,
+);
+
+/// Convert cumulative pool counters into per-window, per-instance log lines.
+/// The boolean is true only when a primary business request was shed. Optional
+/// hedge skips remain visible in the line but never elevate it to WARN.
+fn admission_log_snapshot(
+    prev: &mut HashMap<String, AdmissionCounters>,
+    stats: Vec<AdmissionStat>,
+) -> std::collections::BTreeMap<String, (String, bool)> {
+    let mut by_inst: std::collections::BTreeMap<String, (String, bool)> = Default::default();
+    for (iid, role, acq, sk, hedge_acq, hedge_sk, busy) in stats {
+        let key = format!("{}/{:?}", iid, role);
+        let (pa, ps, pha, phs) = prev.get(&key).copied().unwrap_or((0, 0, 0, 0));
+        let dacq = acq.saturating_sub(pa);
+        let dsk = sk.saturating_sub(ps);
+        let dhedge_acq = hedge_acq.saturating_sub(pha);
+        let dhedge_sk = hedge_sk.saturating_sub(phs);
+        prev.insert(key, (acq, sk, hedge_acq, hedge_sk));
+
+        let entry = by_inst.entry(iid).or_insert_with(Default::default);
+        entry.1 |= dsk > 0;
+        if role == hexagent_runtime::http1_pool::Role::Cancel {
+            entry.0.push_str(&format!(
+                "{:?}(+{} primary_cancel_skip+{} hedge+{} hedge_skip+{} busy{}) ",
+                role, dacq, dsk, dhedge_acq, dhedge_sk, busy
+            ));
+        } else {
+            entry.0.push_str(&format!(
+                "{:?}(+{} skip+{} busy{}) ",
+                role, dacq, dsk, busy
+            ));
+        }
+    }
+    by_inst
+}
+
 fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderUpdate> {
     // Tag this Hexmarket worker's `[Executor]` lines with the owning
     // instance_id (`exec{iid=<id>}:`) — same rationale as
@@ -4534,7 +4586,7 @@ fn fire_or_execute(
     done_tx: &Sender<(PolyCompletionFn, Sender<OrderUpdate>)>,
     utx: &Sender<OrderUpdate>,
 ) {
-    use hexagent_runtime::http1_pool::{try_acquire, Role};
+    use hexagent_runtime::http1_pool::{try_acquire, try_acquire_hedge, Role};
     // Same stale semantics as the sync path's `is_stale`.
     let is_stale = |ts: u64| {
         ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms
@@ -4588,7 +4640,7 @@ fn fire_or_execute(
                     let client = permit.client().clone();
                     // Component 3 idle-gate: hedge the cancel ONLY if a second
                     // Cancel connection is free right now (else no hedge).
-                    let hedge_permit = try_acquire(&iid, Role::Cancel);
+                    let hedge_permit = try_acquire_hedge(&iid, Role::Cancel);
                     let hedge_client = hedge_permit.as_ref().map(|p| p.client().clone());
                     let route = worker.poly_route_mut(&iid);
                     route.set_gen_ns_hint(timestamp_ns);
@@ -4935,7 +4987,11 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             let route = executor.poly_route_mut(&instance_id);
             match market {
                 Some(cid) => {
-                    warn!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                    if is_routine_expiry_cancel(&reason, true) {
+                        info!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                    } else {
+                        warn!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                    }
                     route.cancel_market_orders(&cid, &asset_ids);
                 }
                 None => {
@@ -5698,6 +5754,50 @@ mod market_router_tests {
         assert_eq!(owner_from_coid("1782840607342", &m), None);
         // Unknown instance → broadcast.
         assert_eq!(owner_from_coid("eth09-7", &m), None);
+    }
+
+    #[test]
+    fn admission_hedge_skip_stays_info() {
+        use hexagent_runtime::http1_pool::Role;
+
+        let mut prev = HashMap::new();
+        let lines = admission_log_snapshot(
+            &mut prev,
+            vec![("btc".into(), Role::Cancel, 10, 0, 4, 2, 3)],
+        );
+        let (line, should_warn) = lines.get("btc").unwrap();
+        assert!(!should_warn, "optional hedge shedding is not a warning");
+        assert!(line.contains("primary_cancel_skip+0"));
+        assert!(line.contains("hedge+4 hedge_skip+2"));
+    }
+
+    #[test]
+    fn admission_primary_skip_warns_only_affected_instance() {
+        use hexagent_runtime::http1_pool::Role;
+
+        let mut prev = HashMap::new();
+        let lines = admission_log_snapshot(
+            &mut prev,
+            vec![
+                ("btc".into(), Role::Cancel, 10, 1, 4, 0, 3),
+                ("eth".into(), Role::Cancel, 8, 0, 2, 3, 2),
+            ],
+        );
+        assert!(lines.get("btc").unwrap().1);
+        assert!(!lines.get("eth").unwrap().1);
+    }
+
+    #[test]
+    fn routine_polymarket_lifecycle_classification_is_narrow() {
+        assert!(is_routine_expiry_cancel("event_expiry_sweep", true));
+        assert!(
+            !is_routine_expiry_cancel("event_expiry_sweep", false),
+            "account-wide cancellation remains a warning",
+        );
+        assert!(!is_routine_expiry_cancel("risk_limit", true));
+
+        assert!(is_routine_clob_resubscribe("CLOB resubscribe requested"));
+        assert!(!is_routine_clob_resubscribe("websocket read failed"));
     }
 
     #[test]
