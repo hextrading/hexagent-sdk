@@ -4732,17 +4732,28 @@ fn fire_or_execute(
             }
         }
         // Reconcile: concurrency gate on the dedicated per-instance Reconcile
-        // pool (NOT full fire-track). Bounds concurrent reconciles per instance
-        // so orphan-retry storms can't fan out and overwhelm the global
-        // Reconcile connections. Skip (drop) when none free — the strategy's
+        // pool (NOT full fire-track). The permit's exact client is threaded
+        // through every order GET, so this is both admission control and a real
+        // connection reservation. Skip (drop) when none free — the strategy's
         // orphan reconciler re-emits on its own throttle, so a dropped
         // reconcile simply retries next tick. Gating on the Reconcile pool
         // (disjoint from Fast/Cancel) means it never steals hot-path capacity.
-        s @ Signal::ReconcilePolymarket { .. } if !iid.is_empty() => {
+        Signal::ReconcilePolymarket {
+            pending_places,
+            pending_cancels,
+            pending_trade_ids,
+            ..
+        } if !iid.is_empty() => {
             match try_acquire(&iid, Role::Reconcile) {
                 None => {} // shed; reconciler re-emits
-                Some(_permit) => {
-                    for update in execute_fallback_signal(worker, s, stale_ms) {
+                Some(permit) => {
+                    let updates = worker.poly_route_mut(&iid).reconcile_orphans_on(
+                        &permit,
+                        &pending_places,
+                        &pending_cancels,
+                        &pending_trade_ids,
+                    );
+                    for update in updates {
                         if utx.send(update).is_err() {
                             break;
                         }

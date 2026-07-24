@@ -67,14 +67,22 @@ struct FetchedOrder {
 enum FetchOrderResult {
     Found(FetchedOrder),
     NotFound,
-    Unavailable,
+    Unavailable(FetchUnavailable),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchUnavailable {
+    Timeout,
+    Transport,
+    Http(u16),
+    InvalidResponse,
 }
 
 impl FetchOrderResult {
     fn order(&self) -> Option<&FetchedOrder> {
         match self {
             Self::Found(order) => Some(order),
-            Self::NotFound | Self::Unavailable => None,
+            Self::NotFound | Self::Unavailable(_) => None,
         }
     }
 
@@ -159,6 +167,19 @@ impl HttpErr {
 
     fn is_explicit_not_found(&self) -> bool {
         matches!(self, HttpErr::Status(404, _))
+    }
+
+    fn is_transport_failure(&self) -> bool {
+        matches!(self, HttpErr::Timeout | HttpErr::Transport(_))
+    }
+
+    fn fetch_unavailable(&self) -> FetchUnavailable {
+        match self {
+            HttpErr::Timeout => FetchUnavailable::Timeout,
+            HttpErr::Transport(_) => FetchUnavailable::Transport,
+            HttpErr::Status(code, _) => FetchUnavailable::Http(*code),
+            HttpErr::Other(_) => FetchUnavailable::InvalidResponse,
+        }
     }
 
     /// True when the server's response was either never received (timeout)
@@ -651,7 +672,7 @@ fn latency_record_status(reply: &HttpReply) -> String {
 /// Routing table (all relative to CLOB_BASE_URL):
 ///   * POST /order, POST /orders        → fast (500 ms)
 ///   * DELETE /order, /orders, /cancel-all, DELETE *  → cancel (500 ms)
-///   * GET /data/order/{id}              → reconcile (1000 ms)
+///   * GET /data/order/{id}              → reconcile (2000 ms)
 ///   * everything else (heartbeats, /trades gap-fill, generic GET / POST)
 ///                                      → query (5000 ms)
 fn pick_client(method: &reqwest::Method, path: &str) -> std::sync::Arc<reqwest::Client> {
@@ -989,6 +1010,11 @@ pub struct SharedState {
     /// this GET. Cleared alongside the placement counter on any
     /// conclusive placement resolution.
     pub(crate) placement_reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
+    /// Per-coid retry deadline for cancel-order GETs that returned an explicit
+    /// not-found/empty success. Jittered exponential delay avoids synchronizing
+    /// many orphans on the strategy quote cadence while preserving the
+    /// worst-case reservation until a conclusive status or private fill arrives.
+    pub(crate) cancel_reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
 
     /// Coids whose cancel was rejected with a `pending/delayed` reason — the
     /// cancel raced the placement, so the order is still being processed and
@@ -1050,6 +1076,16 @@ pub(crate) const RECONCILE_BACKOFF_BASE_MS: u64 = 500;
 
 fn placement_reconcile_backoff_ms(attempts: u32) -> u64 {
     RECONCILE_BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts.saturating_sub(1)))
+}
+
+fn cancel_reconcile_backoff_ms(coid: &str, attempts: u32) -> u64 {
+    let exponential = RECONCILE_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << attempts.saturating_sub(1).min(3))
+        .min(4_000);
+    let hash = coid.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3).wrapping_add(u64::from(byte))
+    });
+    exponential.saturating_add(hash.wrapping_add(u64::from(attempts)) % 251)
 }
 
 /// Backoff window applied to `reconcile_orphans` when a 425 "service not
@@ -1190,6 +1226,8 @@ impl SharedState {
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
         self.reconcile_cancel_not_found_counts
+            .lock().unwrap().remove(client_order_id);
+        self.cancel_reconcile_next_retry_ns
             .lock().unwrap().remove(client_order_id);
         let now = crate::types::now_ns();
         let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
@@ -1738,6 +1776,21 @@ impl SharedState {
             .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
     }
 
+    /// Permit-bound synchronous request. Unlike [`Self::http_call_sync`], this
+    /// never round-robins away from the exact admission-pool connection the
+    /// engine reserved.
+    pub(crate) fn http_call_sync_on(
+        &self,
+        client: std::sync::Arc<reqwest::Client>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> HttpReply {
+        self.http_call_async_on(client, None, method, path, body)
+            .recv()
+            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+    }
+
     /// [`http_call_sync`] with a latency-CSV kind override — see
     /// [`http_call_async_rec`](Self::http_call_async_rec).
     pub(crate) fn http_call_sync_rec(
@@ -1943,6 +1996,7 @@ impl PolymarketTrade {
                 reconcile_cancel_not_found_counts: Mutex::new(HashMap::new()),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
+                cancel_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
             }),
             owner: api_key.to_string(),
@@ -2637,6 +2691,40 @@ impl PolymarketTrade {
         pending_cancels: &[(String, String)],
         pending_trade_ids: &[String],
     ) -> Vec<OrderUpdate> {
+        self.reconcile_orphans_with_permit(
+            None,
+            pending_places,
+            pending_cancels,
+            pending_trade_ids,
+        )
+    }
+
+    /// Admission-bound reconcile path used by the live engine. Every order
+    /// lookup starts on the exact per-instance Reconcile slot held by `permit`;
+    /// timeout/status-less transport failures retry once on a disjoint client,
+    /// and repeated slot failures replace that pool slot permanently.
+    pub fn reconcile_orphans_on(
+        &self,
+        permit: &crate::http1_pool::Permit,
+        pending_places: &[(String, String, Side, f64, Option<String>)],
+        pending_cancels: &[(String, String)],
+        pending_trade_ids: &[String],
+    ) -> Vec<OrderUpdate> {
+        self.reconcile_orphans_with_permit(
+            Some(permit),
+            pending_places,
+            pending_cancels,
+            pending_trade_ids,
+        )
+    }
+
+    fn reconcile_orphans_with_permit(
+        &self,
+        permit: Option<&crate::http1_pool::Permit>,
+        pending_places: &[(String, String, Side, f64, Option<String>)],
+        pending_cancels: &[(String, String)],
+        pending_trade_ids: &[String],
+    ) -> Vec<OrderUpdate> {
         let mut updates: Vec<OrderUpdate> = Vec::new();
 
         // --- Placements: deterministic per-orderID lookup ---
@@ -2673,10 +2761,10 @@ impl PolymarketTrade {
                 if self.shared.in_http_425_backoff(coid) {
                     continue;
                 }
-                let fetch_result = self.fetch_order_by_id(coid, oid);
+                let fetch_result = self.fetch_order_by_id(coid, oid, permit);
                 // A 425 from this GET is not a not-found answer. Keep this
                 // orphan parked without affecting the rest of the batch.
-                if matches!(&fetch_result, FetchOrderResult::Unavailable)
+                if matches!(&fetch_result, FetchOrderResult::Unavailable(_))
                     && self.shared.in_http_425_backoff(coid)
                 {
                     self.shared.reconcile_attempts.clear_placement(coid);
@@ -2894,13 +2982,21 @@ impl PolymarketTrade {
 
         // --- Cancels: query each order by id ---
         for (coid, order_id) in pending_cancels {
+            {
+                let now = now_ns();
+                let mut deadlines = self.shared.cancel_reconcile_next_retry_ns.lock().unwrap();
+                if deadlines.get(coid).is_some_and(|deadline| *deadline > now) {
+                    continue;
+                }
+                deadlines.remove(coid);
+            }
             if self.shared.in_http_425_backoff(coid) {
                 continue;
             }
-            let fetch_result = self.fetch_order_by_id(coid, order_id);
+            let fetch_result = self.fetch_order_by_id(coid, order_id, permit);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
-            if matches!(&fetch_result, FetchOrderResult::Unavailable)
+            if matches!(&fetch_result, FetchOrderResult::Unavailable(_))
                 && self.shared.in_http_425_backoff(coid)
             {
                 log::debug!(
@@ -2991,10 +3087,24 @@ impl PolymarketTrade {
                     let attempts = self.shared.reconcile_attempts.next_cancel(coid);
                     let pending_delayed = self.shared.pending_delayed_orphans
                         .lock().unwrap().contains(coid);
-                    warn!(
-                        "[PolymarketTrade] Reconcile cancel coid={} orderID={} not found/read unavailable (attempt={}, pending_delayed={}) — keeping orphan and worst-case reservation",
-                        coid, order_id, attempts, pending_delayed,
+                    let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts);
+                    self.shared.cancel_reconcile_next_retry_ns.lock().unwrap().insert(
+                        coid.clone(),
+                        now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
+                    match &fetch_result {
+                        FetchOrderResult::NotFound => warn!(
+                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=explicit_not_found attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
+                            coid, order_id, attempts, pending_delayed, backoff_ms,
+                        ),
+                        FetchOrderResult::Unavailable(kind) => warn!(
+                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=unavailable kind={:?} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
+                            coid, order_id, kind, attempts, pending_delayed, backoff_ms,
+                        ),
+                        FetchOrderResult::Found(_) => unreachable!(
+                            "a fetched order with a status cannot reach the empty-status arm"
+                        ),
+                    }
                     OrderStatus::CancelOrderTimeout
                 }
                 other => {
@@ -3003,9 +3113,14 @@ impl PolymarketTrade {
                     // reservation indefinitely; alerting/risk-off may escalate
                     // without changing the semantic order state.
                     let attempts = self.shared.reconcile_attempts.next_cancel(coid);
+                    let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts);
+                    self.shared.cancel_reconcile_next_retry_ns.lock().unwrap().insert(
+                        coid.clone(),
+                        now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
+                    );
                     warn!(
-                        "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}) — keeping orphan and worst-case reservation",
-                        coid, order_id, other, attempts,
+                        "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}, retry_ms={}) — keeping orphan and worst-case reservation",
+                        coid, order_id, other, attempts, backoff_ms,
                     );
                     OrderStatus::CancelOrderTimeout
                 }
@@ -3052,7 +3167,14 @@ impl PolymarketTrade {
         // leaving PositionManager as the sole dedup/accounting authority.
         for trade_id in pending_trade_ids {
             let path = format!("/trades?id={}", trade_id);
-            let json = match self.shared.http_call_sync("GET", &path, "") {
+            let reply = permit.map_or_else(
+                || self.shared.http_call_sync("GET", &path, ""),
+                |permit| {
+                    self.shared
+                        .http_call_sync_on(permit.current_client(), "GET", &path, "")
+                },
+            );
+            let json = match reply {
                 Ok(json) => json,
                 Err(error) => {
                     warn!(
@@ -3108,9 +3230,58 @@ impl PolymarketTrade {
     /// — empirically returns `404 page not found` from clob.polymarket.com
     /// while `/data/order/{id}` returns proper status strings. The
     /// py-clob-client SDK also uses the /data path.
-    fn fetch_order_by_id(&self, coid: &str, order_id: &str) -> FetchOrderResult {
+    fn fetch_order_by_id(
+        &self,
+        coid: &str,
+        order_id: &str,
+        permit: Option<&crate::http1_pool::Permit>,
+    ) -> FetchOrderResult {
         let path = format!("/data/order/{}", order_id);
-        let json = match self.shared.http_call_sync("GET", &path, "") {
+        let mut reply = permit.map_or_else(
+            || self.shared.http_call_sync("GET", &path, ""),
+            |permit| {
+                self.shared
+                    .http_call_sync_on(permit.current_client(), "GET", &path, "")
+            },
+        );
+
+        if let (Some(permit), Err(error)) = (permit, &reply) {
+            if error.is_transport_failure() {
+                let failure_kind = error.fetch_unavailable();
+                let rebuilt = permit.note_transport_failure();
+                let (retry_client, retry_source) = match rebuilt {
+                    Some(client) => (client, "rebuilt_instance_slot"),
+                    None => (async_rt::http_client_reconcile(), "global_reconcile_fallback"),
+                };
+                warn!(
+                    "[orphan_metric] reconcile_transport_fallback=1 coid={} orderID={} primary_failure={:?} retry_source={}",
+                    coid,
+                    order_id,
+                    failure_kind,
+                    retry_source,
+                );
+                reply = self
+                    .shared
+                    .http_call_sync_on(retry_client, "GET", &path, "");
+                if retry_source == "rebuilt_instance_slot" {
+                    if reply
+                        .as_ref()
+                        .err()
+                        .is_some_and(HttpErr::is_transport_failure)
+                    {
+                        permit.note_transport_failure();
+                    } else {
+                        permit.note_transport_success();
+                    }
+                }
+            } else {
+                permit.note_transport_success();
+            }
+        } else if let Some(permit) = permit {
+            permit.note_transport_success();
+        }
+
+        let json = match reply {
             Ok(j) => j,
             Err(e) => {
                 // HTTP 404 is the only transport result classified as an
@@ -3124,8 +3295,14 @@ impl PolymarketTrade {
                 if e.is_http_425() {
                     self.shared.note_http_425_backoff(coid);
                 }
-                warn!("[PolymarketTrade] Reconcile /data/order/{}: {}", order_id, e);
-                return FetchOrderResult::Unavailable;
+                let unavailable = e.fetch_unavailable();
+                warn!(
+                    "[PolymarketTrade] Reconcile /data/order/{} unavailable={:?}: {}",
+                    order_id,
+                    unavailable,
+                    e,
+                );
+                return FetchOrderResult::Unavailable(unavailable);
             }
         };
         classify_successful_order_lookup(&json)
@@ -5244,6 +5421,43 @@ mod tests {
 
         assert_eq!(gaps_ms, vec![500, 1_000, 2_000]);
         assert_eq!(gaps_ms.iter().sum::<u64>(), 3_500);
+    }
+
+    #[test]
+    fn cancel_reconcile_backoff_is_capped_and_deterministically_jittered() {
+        let gaps: Vec<u64> = (1..=6)
+            .map(|attempt| cancel_reconcile_backoff_ms("btc03-order", attempt))
+            .collect();
+        assert!((500..=750).contains(&gaps[0]));
+        assert!((1_000..=1_250).contains(&gaps[1]));
+        assert!((2_000..=2_250).contains(&gaps[2]));
+        assert!(gaps[3..].iter().all(|gap| (4_000..=4_250).contains(gap)));
+        assert_eq!(
+            gaps,
+            (1..=6)
+                .map(|attempt| cancel_reconcile_backoff_ms("btc03-order", attempt))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn reconcile_unavailable_classification_separates_transport_from_http() {
+        assert_eq!(
+            HttpErr::Timeout.fetch_unavailable(),
+            FetchUnavailable::Timeout,
+        );
+        assert_eq!(
+            HttpErr::Transport("reset".to_string()).fetch_unavailable(),
+            FetchUnavailable::Transport,
+        );
+        assert_eq!(
+            HttpErr::Status(503, "unavailable".to_string()).fetch_unavailable(),
+            FetchUnavailable::Http(503),
+        );
+        assert_eq!(
+            HttpErr::Other("json parse".to_string()).fetch_unavailable(),
+            FetchUnavailable::InvalidResponse,
+        );
     }
 
     /// A cancel-before-ack timeout can put one coid in both reconcile lists.

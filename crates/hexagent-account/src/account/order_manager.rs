@@ -410,12 +410,10 @@ impl OrderManager {
                 // but OM kept it as Active, so the strategy's next quote
                 // tick re-emitted a Cancel that the server rejected with
                 // "matched orders can't be canceled" — wasted RTT and a
-                // misleading log. Use max(0.01 share, 0.5% of qty) to
-                // close the rounding gap without prematurely retiring
-                // genuine partial fills (smallest legitimate residual
-                // we'd want to keep alive >> 0.01 share at typical
-                // base_qty values).
-                let tolerance = (order.quantity * 0.005).max(0.01);
+                // misleading log. Treat 99% cumulative execution as complete:
+                // this matches the strategy's cancel-orphan release rule while
+                // still requiring exact trade-ID deduplication.
+                let tolerance = (order.quantity * 0.01).max(1e-9);
                 // Also respect a single-event "full fill" signal when
                 // there's no trade_id to dedup by (best-effort fallback).
                 let single_event_full = update.trade_id.is_none()
@@ -883,6 +881,26 @@ mod tests {
         m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
         let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
         assert_eq!(m.open_count(), 0, "Filled is removed");
+    }
+
+    #[test]
+    fn matched_volume_uses_one_percent_full_coverage_tolerance() {
+        let fill = |coid: &str, trade_id: &str, quantity: f64| {
+            let mut update = upd(coid, Side::Buy, OrderStatus::PartiallyFilled);
+            update.trade_id = Some(trade_id.to_string());
+            update.filled_quantity = quantity;
+            update
+        };
+
+        let mut below = om();
+        below.inject_open_order("below".into(), Side::Buy, 0.40, 10.0);
+        let _ = below.on_order_update(&fill("below", "t1", 9.899_999));
+        assert_eq!(below.open_count(), 1, "less than 99% remains active");
+
+        let mut covered = om();
+        covered.inject_open_order("covered".into(), Side::Buy, 0.40, 10.0);
+        let _ = covered.on_order_update(&fill("covered", "t1", 9.9));
+        assert_eq!(covered.open_count(), 0, "99% retires the local order");
     }
 
     #[test]

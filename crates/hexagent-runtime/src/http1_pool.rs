@@ -51,7 +51,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -252,7 +252,11 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     if let Some(m) = INSTANCE_POOLS.get() {
         for inst in m.values() {
             for rp in [&inst.fast, &inst.cancel, &inst.reconcile, &inst.query] {
-                all.extend(rp.slots.iter().map(|s| s.client.clone()));
+                all.extend(
+                    rp.slots
+                        .iter()
+                        .map(|s| s.client.read().unwrap().clone()),
+                );
             }
         }
     }
@@ -358,8 +362,11 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 /// One connection slot: a warm h1.1 client + an in-use flag. Held by at
 /// most one in-flight request at a time.
 struct Slot {
-    client: Arc<reqwest::Client>,
+    client: Arc<RwLock<Arc<reqwest::Client>>>,
     busy: Arc<AtomicBool>,
+    transport_failures: Arc<AtomicUsize>,
+    generation: Arc<AtomicU64>,
+    timeout: Duration,
 }
 
 /// Admission permit: owns an exclusive slot's client for the duration of
@@ -367,12 +374,60 @@ struct Slot {
 pub struct Permit {
     flag: Arc<AtomicBool>,
     client: Arc<reqwest::Client>,
+    slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
+    transport_failures: Arc<AtomicUsize>,
+    generation: Arc<AtomicU64>,
+    timeout: Duration,
 }
 
 impl Permit {
     /// The reserved client — dispatch the request on this.
     pub fn client(&self) -> &Arc<reqwest::Client> {
         &self.client
+    }
+
+    /// Current client installed in this slot. Reconcile callers use this
+    /// accessor because a long batch can rebuild the slot between order GETs.
+    pub fn current_client(&self) -> Arc<reqwest::Client> {
+        self.slot_client.read().unwrap().clone()
+    }
+
+    /// Record a timeout/status-less transport failure on this exact pool slot.
+    /// On the second consecutive failure, replace the slot's reqwest client so
+    /// all future permits use a fresh connection pool. Returns that replacement
+    /// for an immediate one-shot retry; the first failure returns `None` so the
+    /// caller can use a disjoint fallback connection.
+    pub fn note_transport_failure(&self) -> Option<Arc<reqwest::Client>> {
+        let failures = self.transport_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if failures < 2 {
+            return None;
+        }
+        let replacement = match build_h1_client(self.timeout) {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                log::warn!(
+                    "[http1_pool] client rebuild failed after {} consecutive transport failures: {}",
+                    failures,
+                    error,
+                );
+                return None;
+            }
+        };
+        *self.slot_client.write().unwrap() = replacement.clone();
+        self.transport_failures.store(0, Ordering::Release);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        log::warn!(
+            "[http1_pool] replaced unhealthy client slot after {} consecutive transport failures generation={}",
+            failures,
+            generation,
+        );
+        Some(replacement)
+    }
+
+    /// Any HTTP response (including 4xx/5xx) proves the connection transported
+    /// bytes successfully and clears the consecutive transport-failure streak.
+    pub fn note_transport_success(&self) {
+        self.transport_failures.store(0, Ordering::Release);
     }
 }
 
@@ -401,8 +456,11 @@ impl RolePool {
         let mut slots = Vec::with_capacity(n);
         for _ in 0..n {
             slots.push(Slot {
-                client: Arc::new(build_h1_client(timeout)?),
+                client: Arc::new(RwLock::new(Arc::new(build_h1_client(timeout)?))),
                 busy: Arc::new(AtomicBool::new(false)),
+                transport_failures: Arc::new(AtomicUsize::new(0)),
+                generation: Arc::new(AtomicU64::new(0)),
+                timeout,
             });
         }
         Ok(Self {
@@ -442,7 +500,11 @@ impl RolePool {
                 }
                 return Some(Permit {
                     flag: s.busy.clone(),
-                    client: s.client.clone(),
+                    client: s.client.read().unwrap().clone(),
+                    slot_client: s.client.clone(),
+                    transport_failures: s.transport_failures.clone(),
+                    generation: s.generation.clone(),
+                    timeout: s.timeout,
                 });
             }
         }
@@ -459,7 +521,7 @@ impl RolePool {
     /// heartbeat / keep-warm / cancel-all only.
     fn exempt_client(&self) -> Arc<reqwest::Client> {
         let i = self.rr.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        self.slots[i].client.clone()
+        self.slots[i].client.read().unwrap().clone()
     }
 
     /// (primary_acquires, primary_skips, hedge_acquires, hedge_skips,
@@ -674,6 +736,37 @@ mod tests {
         assert_eq!((acquires, skips), (1, 1));
         assert_eq!((hedge_acquires, hedge_skips), (1, 1));
         assert_eq!(busy, 2);
+    }
+
+    #[test]
+    fn repeated_transport_failures_replace_the_pool_slot_client() {
+        let p = pool(1);
+        let permit = p.try_acquire().unwrap();
+        let original = permit.client().clone();
+        assert!(
+            permit.note_transport_failure().is_none(),
+            "the first failure uses a disjoint fallback without churning the slot",
+        );
+        let replacement = permit
+            .note_transport_failure()
+            .expect("the second consecutive failure rebuilds the slot");
+        assert!(
+            !Arc::ptr_eq(&original, &replacement),
+            "the replacement must own a new reqwest connection pool",
+        );
+        drop(permit);
+
+        let next = p.try_acquire().unwrap();
+        assert!(
+            Arc::ptr_eq(next.client(), &replacement),
+            "future permits must bind to the rebuilt client",
+        );
+        next.note_transport_success();
+        assert_eq!(
+            next.transport_failures.load(Ordering::Acquire),
+            0,
+            "a transported HTTP response resets the failure streak",
+        );
     }
 
     #[test]
