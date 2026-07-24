@@ -30,6 +30,18 @@ use crate::types::*;
 
 const CHANNEL_CAPACITY: usize = 10_000;
 
+fn polymarket_instance_pool_sizes() -> hexagent_runtime::http1_pool::PoolSizes {
+    hexagent_runtime::http1_pool::PoolSizes {
+        fast: 3,
+        cancel: 3,
+        reconcile: 1,
+        query: 1,
+        // GapReplay is process-global; this field is ignored by
+        // `init_instance_pools` but kept explicit for forward compatibility.
+        gap_replay: 2,
+    }
+}
+
 /// Current readiness of one configured public market-data feed.
 ///
 /// The state is stored independently from strategy callbacks so operators and
@@ -3613,9 +3625,7 @@ impl Engine {
     /// registry + HTTP agent + live position manager) shared by the user
     /// feed thread, the heartbeat thread, and the LiveRouter in the
     /// execution thread. Cloning `Arc<SharedState>` into each consumer
-    /// means they all share the process-wide h2 reqwest client — one
-    /// multiplexed TLS connection to clob.polymarket.com instead of each
-    /// consumer spinning up its own.
+    /// means they all share the process-wide role-separated HTTP/1.1 pools.
     /// **Multi-instance** SharedState builder — Phase 2a of the
     /// multi-strategy refactor. Loads `secrets.toml` and constructs
     /// one `Arc<SharedState>` per polymaker strategy in the config,
@@ -3624,7 +3634,7 @@ impl Engine {
     /// Common Polymarket transport config (`clob_version`,
     /// `api_url_prefix`, `use_batch_orders`, `rate_limit_per_second`,
     /// `http_timeout_*_ms`) still lives in `[[exchanges]] polymarket`
-    /// and is shared across all instances (single h2 pool, single
+    /// and is shared across all instances (shared role pools, single
     /// session-timeout table — auth, signer, and order-id registry
     /// are per-instance).
     ///
@@ -3648,8 +3658,36 @@ impl Engine {
             }
         };
 
-        // Install global FAST/CANCEL h2 timeout ONCE — shared by all
-        // instances since they share the underlying h2 pool.
+        // Build per-instance role pools before the first SharedState invokes
+        // `prewarm_connections()`. Previously these pools were created later
+        // in the executor thread, after the global prewarm had completed, so
+        // their first place/cancel/reconcile/query request paid a cold
+        // DNS+TCP+TLS setup despite startup reporting prewarm success.
+        if !hexagent_runtime::http1_pool::instance_pools_ready() {
+            let mut instance_ids: Vec<String> = self.config.strategies.iter()
+                .filter(|sc| {
+                    sc.enabled
+                        && self.registry.capabilities(&sc.name).needs_poly_user_feed
+                        && !sc.instance_id.is_empty()
+                })
+                .map(|sc| sc.instance_id.clone())
+                .collect();
+            instance_ids.sort();
+            instance_ids.dedup();
+            if !instance_ids.is_empty() {
+                if let Err(error) = hexagent_runtime::http1_pool::init_instance_pools(
+                    &instance_ids,
+                    polymarket_instance_pool_sizes(),
+                ) {
+                    warn!(
+                        "[Engine] per-instance admission pools not initialised before prewarm: {}",
+                        error,
+                    );
+                }
+            }
+        }
+
+        // Install global FAST/CANCEL timeout ONCE — shared by all instances.
         crate::async_rt::init_http_timeout(poly_cfg.http_timeout_ms);
 
         // Resolve and load secrets.toml. Empty (= no file) is fine for
@@ -4118,16 +4156,18 @@ impl Engine {
                     // connection per side absorbs one extra overlapping wave).
                     // Concurrency is bounded by warm connections *per instance*
                     // (no cross-instance preemption, no cold connection).
-                    let sizes = hexagent_runtime::http1_pool::PoolSizes {
-                        fast: 3,
-                        cancel: 3,
-                        reconcile: 1,
-                        query: 1,
-                    };
+                    let sizes = polymarket_instance_pool_sizes();
                     let mut iids: Vec<String> = poly_states.keys().cloned().collect();
                     iids.sort();
-                    if let Err(e) = hexagent_runtime::http1_pool::init_instance_pools(&iids, sizes) {
-                        warn!("[Executor] per-instance admission pools not initialised: {}", e);
+                    if !hexagent_runtime::http1_pool::instance_pools_ready() {
+                        if let Err(e) =
+                            hexagent_runtime::http1_pool::init_instance_pools(&iids, sizes)
+                        {
+                            warn!(
+                                "[Executor] per-instance admission pools not initialised: {}",
+                                e,
+                            );
+                        }
                     }
                     // One drainer per possible in-flight fired request
                     // (Σ per-instance fast+cancel) + slack, so a fired request
@@ -4183,6 +4223,7 @@ impl Engine {
                             .spawn(move || {
                                 crate::os_tune::pin_background("poly-admission-stats");
                                 let mut prev = HashMap::new();
+                                let mut gap_prev = (0u64, 0u64);
                                 loop {
                                     let mut slept = 0;
                                     while slept < 30 {
@@ -4202,6 +4243,28 @@ impl Engine {
                                         } else {
                                             info!("[admission] {} {}", iid, line.trim_end());
                                         }
+                                    }
+                                    let (gap_acq, gap_skip, gap_busy, gap_slots) =
+                                        hexagent_runtime::http1_pool::gap_replay_stats();
+                                    let gap_acq_delta = gap_acq.saturating_sub(gap_prev.0);
+                                    let gap_skip_delta = gap_skip.saturating_sub(gap_prev.1);
+                                    gap_prev = (gap_acq, gap_skip);
+                                    if gap_skip_delta > 0 {
+                                        warn!(
+                                            "[admission] global GapReplay(+{} skip+{} busy{} slots={:?})",
+                                            gap_acq_delta,
+                                            gap_skip_delta,
+                                            gap_busy,
+                                            gap_slots,
+                                        );
+                                    } else {
+                                        info!(
+                                            "[admission] global GapReplay(+{} skip+{} busy{} slots={:?})",
+                                            gap_acq_delta,
+                                            gap_skip_delta,
+                                            gap_busy,
+                                            gap_slots,
+                                        );
                                     }
                                 }
                             })

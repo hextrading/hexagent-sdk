@@ -17,7 +17,7 @@
 //!
 //! Shared globals:
 //!   - `RUNTIME_HANDLE`: `OnceLock` of the tokio Handle
-//!   - Four role-specific HTTP/1.1 client pools (see [`crate::http1_pool`]),
+//!   - Five role-specific HTTP/1.1 client pools (see [`crate::http1_pool`]),
 //!     each with its own per-request deadline tuned to the endpoint it
 //!     serves. h1.1 has no multiplexing, so role isolation — a slow query
 //!     can never occupy the connection an order needs — comes from the
@@ -38,9 +38,12 @@
 //!         hot-path budget so that a brief server wobble doesn't re-orphan
 //!         the order we're trying to resolve.
 //!       * `HTTP_CLIENTS_QUERY`   — everything else: data-api snapshots,
-//!         gamma-api, /positions, /trades gap-fill, wallet relayer,
-//!         heartbeats. 5 s timeout — these responses can be large
+//!         gamma-api, /positions, wallet relayer, heartbeats. 5 s
+//!         timeout — these responses can be large
 //!         (positions, open orders) and aren't latency-critical.
+//!       * `HTTP_CLIENTS_GAP_REPLAY` — authenticated Polymarket /trades
+//!         recovery. 5 s timeout, with exclusive slots and transport-aware
+//!         replacement isolated from ordinary queries.
 //!
 //!     Round-robin within each pool spreads concurrent traffic across
 //!     distinct TCP connections so packet loss on one doesn't stall others.
@@ -249,32 +252,32 @@ pub fn http_client_cancel() -> Arc<reqwest::Client> {
     crate::http1_pool::client(crate::http1_pool::Role::Cancel)
 }
 
-/// Get one of the reconcile HTTP/2 clients. Used by the orphan reconciler
+/// Get one of the reconcile HTTP/1.1 clients. Used by the orphan reconciler
 /// — GET /data/order/{id} and DELETE /order retries on timed-out cancels.
 /// Separate pool so a slow reconcile can't back-pressure the fast submit
-/// path via shared h2 stream credits.
+/// path.
 pub fn http_client_reconcile() -> Arc<reqwest::Client> {
     crate::http1_pool::client(crate::http1_pool::Role::Reconcile)
 }
 
-/// Get one of the query HTTP/2 clients. Default client for non-hot-path
-/// callers — data-api snapshots, /positions, /trades gap-fill, wallet
-/// relayer, heartbeats, generic GETs. 5 s timeout tolerates larger
+/// Get one of the query HTTP/1.1 clients. Default client for non-hot-path
+/// callers — data-api snapshots, /positions, wallet relayer, heartbeats,
+/// generic GETs. 5 s timeout tolerates larger
 /// responses.
 pub fn http_client_query() -> Arc<reqwest::Client> {
     crate::http1_pool::client(crate::http1_pool::Role::Query)
 }
 
 /// Backwards-compatible alias for `http_client_query()`. Legacy callers
-/// (position.rs, wallet.rs, user_feed.rs gap-fill, `blocking_get_text`)
-/// all do non-hot-path queries that want the 5 s budget; the four new
-/// role getters are preferred in new code.
+/// (position.rs, wallet.rs, `blocking_get_text`) all do non-hot-path
+/// queries that want the 5 s budget; role-specific getters are preferred
+/// in new code.
 pub fn http_client() -> Arc<reqwest::Client> {
     http_client_query()
 }
 
-/// All HTTP/2 clients across every role as an owned Vec. Intended for
-/// prewarm paths that need to establish h2 + TLS state on *every* client,
+/// All HTTP/1.1 clients across every role as an owned Vec. Intended for
+/// prewarm paths that need to establish TCP + TLS state on *every* client,
 /// not just one.
 pub fn http_clients_all() -> Vec<Arc<reqwest::Client>> {
     crate::http1_pool::clients_all()
@@ -451,4 +454,3 @@ mod tests {
         assert_eq!(load_timeout_or(500), 2000, "non-zero (at ceiling) must pass through");
     }
 }
-

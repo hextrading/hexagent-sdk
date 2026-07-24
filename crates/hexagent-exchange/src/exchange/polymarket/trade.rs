@@ -520,11 +520,11 @@ type HttpReply = std::result::Result<serde_json::Value, HttpErr>;
 
 /// Async heartbeat loop. Spawned as a tokio task on the shared runtime
 /// at startup. Each tick (every `HEARTBEAT_INTERVAL`) fires **one**
-/// `POST /heartbeats` per primary HTTP/2 client across **every** role
-/// pool (FAST + CANCEL + RECONCILE + QUERY) so each underlying TCP
+/// `POST /heartbeats` per primary HTTP/1.1 client across **every** role
+/// pool (FAST + CANCEL + RECONCILE + QUERY + GAP_REPLAY) so each underlying TCP
 /// connection sees traffic before reqwest's `pool_idle_timeout` evicts
 /// it. Without this, only the QUERY pool stays warm and the next
-/// place / cancel after a quiet stretch pays a TLS+h2 handshake.
+/// place / cancel after a quiet stretch pays a TCP+TLS handshake.
 ///
 /// Logging cadence:
 ///   - success (all pings ok): TRACE per tick
@@ -666,15 +666,17 @@ fn latency_record_status(reply: &HttpReply) -> String {
 
 /// Pick the per-role HTTP client for a (method, path) pair. Role isolation
 /// ensures a slow query / heartbeat can't back-pressure the hot-path
-/// submit via shared h2 stream credits or TCP receive windows — each role
+/// submit via shared TCP receive windows — each role
 /// owns a distinct TCP connection per host.
 ///
 /// Routing table (all relative to CLOB_BASE_URL):
 ///   * POST /order, POST /orders        → fast (500 ms)
 ///   * DELETE /order, /orders, /cancel-all, DELETE *  → cancel (500 ms)
 ///   * GET /data/order/{id}              → reconcile (2000 ms)
-///   * everything else (heartbeats, /trades gap-fill, generic GET / POST)
-///                                      → query (5000 ms)
+///   * everything else (heartbeats, generic GET / POST) → query (5000 ms)
+///
+/// Gap replay bypasses this generic router and explicitly acquires the
+/// process-global `GapReplay` role so it cannot consume Query capacity.
 fn pick_client(method: &reqwest::Method, path: &str) -> std::sync::Arc<reqwest::Client> {
     match (method.as_str(), path) {
         ("POST", "/order") | ("POST", "/orders") => async_rt::http_client_fast(),
@@ -2048,22 +2050,14 @@ impl PolymarketTrade {
         self.shared.clone()
     }
 
-    /// Pre-warm `n` HTTP connections to `clob.polymarket.com` by firing that
-    /// many concurrent `POST /heartbeats` requests. Each establishes a TLS
-    /// socket that returns to the shared reqwest pool on response,
-    /// so subsequent real orders / cancels don't pay the 100-200ms TLS
-    /// handshake cost on the first few batches after startup.
-    ///
-    /// Uses its own transient spawned threads (not the 2-worker HTTP pool)
-    /// because the pool can only run 2 requests concurrently; to fill a
-    /// pool of size N we need N concurrent in-flight requests.
+    /// Pre-warm every global-role and per-instance HTTP/1.1 client
+    /// concurrently. Each establishes a TLS socket that returns to its
+    /// reqwest pool on response, so the first real place/cancel/query/replay
+    /// request does not pay the connection setup cost.
     pub fn prewarm_connections(&self) {
-        // HTTP/2 multiplexes many in-flight requests over a single TCP
-        // connection — "prewarming a pool" is no longer meaningful under
-        // the reqwest h2 client. Instead we concurrently warm the three
-        // Polymarket hosts we hit on the hot path (clob / data-api /
-        // gamma-api) plus the Polygon RPC, so TLS + h2 handshakes complete
-        // before the first real request.
+        // Warm every role (including the global GapReplay role) and every
+        // per-instance pool against the three Polymarket hosts we hit on the
+        // hot path, plus the Polygon RPC, before the first real request.
         let start = std::time::Instant::now();
         info!("[PolymarketTrade] Pre-warming h1.1 connections (clob/data-api/gamma-api + polygon-rpc)...");
 
@@ -2074,7 +2068,7 @@ impl PolymarketTrade {
         // Warm every primary client against every Polymarket host in
         // parallel. Each primary client owns its own connection pool,
         // so a single GET / POST per (client, host) pair is enough to
-        // stand up the TLS + h2 session that subsequent real requests
+        // stand up the TLS session that subsequent real requests
         // will reuse. Polygon RPC uses the auto (ALPN) client — one
         // warmup is sufficient since it's a single client.
         let primaries = crate::async_rt::http_clients_all().to_vec();
