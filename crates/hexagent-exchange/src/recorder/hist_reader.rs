@@ -124,6 +124,128 @@ pub fn load_hist_bars(data_dir: &Path, req: &HistDataRequest) -> Result<Vec<BarD
     Ok(local_bars)
 }
 
+/// Streaming variant of [`load_hist_bars`] (2026-07-26): identical file
+/// discovery, ordering, dedup and gap-fill semantics, but bars are handed to
+/// `sink` one at a time instead of being accumulated into a single `Vec`.
+///
+/// Why: a 1s-bar request over a month is ~3M rows; `load_hist_bars` holds
+/// them all as `Vec<BarData>` (~144 B/row + 2 heap `String`s each ≈ 500 MB
+/// transient). The backtest engine only forwards each bar to
+/// `Strategy::on_hist_bar` (or compacts it), so per-file streaming caps the
+/// resident set at one day-file (~86k rows ≈ 12 MB).
+///
+/// Equivalence with `load_hist_bars` (bit-for-bit for the emitted sequence):
+///   * Pass 1 reads every local file (via the same `read_parquet_file`,
+///     same `[start,end)` filter) collecting only `open_time_ns`, and
+///     verifies the concatenation is already strictly increasing — true for
+///     the day-file layout, where files are discovered in sorted name order
+///     and rows are written chronologically. In that case the legacy
+///     `sort_by_key` is a no-op and `dedup_by_key` removes nothing, so
+///     pass 2's re-read + emit-in-file-order reproduces the legacy sequence
+///     exactly.
+///   * Any deviation — out-of-order/duplicate timestamps across files, or
+///     gaps that need the REST fill — falls back to `load_hist_bars` itself
+///     and emits from its returned (sorted/deduped/gap-filled) Vec, i.e.
+///     literally the legacy result.
+///
+/// Returns the number of bars emitted.
+pub fn load_hist_bars_streamed(
+    data_dir: &Path,
+    req: &HistDataRequest,
+    sink: &mut dyn FnMut(&BarData),
+) -> Result<u64> {
+    let interval_ns = interval_to_ns(&req.interval)?;
+    let exchange_str = req.exchange.to_string();
+    let hist_dir = data_dir
+        .join("histdata")
+        .join(&exchange_str)
+        .join(&req.symbol)
+        .join(&req.interval);
+
+    if !hist_dir.is_dir() {
+        // No local data at all → the legacy path (pure API fetch) already
+        // holds only the fetched window; nothing to stream around.
+        let bars = load_hist_bars(data_dir, req)?;
+        for b in &bars {
+            sink(b);
+        }
+        return Ok(bars.len() as u64);
+    }
+
+    let start_dt = DateTime::<Utc>::from_timestamp_nanos(req.start_date_ns as i64);
+    let end_dt = DateTime::<Utc>::from_timestamp_nanos(req.end_date_ns as i64);
+    let files = discover_parquet_files(&hist_dir, start_dt.date_naive(), end_dt.date_naive())?;
+
+    // ── Pass 1: timestamps only — sortedness check + gap detection ──
+    let mut ts: Vec<u64> = Vec::new();
+    let mut sorted_strict = true;
+    for path in &files {
+        match read_parquet_file(path, req.exchange, &req.interval, req.start_date_ns as i64, req.end_date_ns as i64) {
+            Ok(file_bars) => {
+                for b in &file_bars {
+                    if let Some(&last) = ts.last() {
+                        if b.open_time_ns <= last {
+                            sorted_strict = false;
+                        }
+                    }
+                    ts.push(b.open_time_ns);
+                }
+            }
+            // Same skip-and-warn as the legacy local read; pass 2 / the
+            // fallback hit the identical error and skip the same file.
+            Err(e) => warn!("[HistReader] Skip {}: {}", path.display(), e),
+        }
+    }
+    let gaps = if sorted_strict {
+        find_gaps_ts(&ts, req.start_date_ns, req.end_date_ns, interval_ns)
+    } else {
+        Vec::new() // fallback below re-derives gaps on the sorted set
+    };
+
+    if !sorted_strict || !gaps.is_empty() {
+        // Rare path (recorder wrote out-of-order files, or the window needs a
+        // REST gap-fill): defer entirely to the legacy loader so ordering,
+        // dedup, fetch and merge semantics stay byte-identical.
+        let bars = load_hist_bars(data_dir, req)?;
+        for b in &bars {
+            sink(b);
+        }
+        return Ok(bars.len() as u64);
+    }
+
+    // Mirrors the legacy "Local: N bars" line (N == deduped count here since
+    // the stream is strictly increasing).
+    info!(
+        "[HistReader] Local: {} bars for {}/{} {} [{} → {}] (streamed)",
+        ts.len(),
+        req.exchange,
+        req.symbol,
+        req.interval,
+        fmt_ns(req.start_date_ns),
+        fmt_ns(req.end_date_ns),
+    );
+
+    // ── Pass 2: re-read per file and emit in order ──
+    let mut emitted: u64 = 0;
+    let mut last_ts: Option<u64> = None;
+    for path in &files {
+        if let Ok(file_bars) = read_parquet_file(path, req.exchange, &req.interval, req.start_date_ns as i64, req.end_date_ns as i64) {
+            for b in &file_bars {
+                // Defensive monotonic guard (a file mutating between passes
+                // would be a recorder bug): drop-if-not-greater matches the
+                // legacy sort+dedup keep-first behavior.
+                if last_ts.is_some_and(|l| b.open_time_ns <= l) {
+                    continue;
+                }
+                last_ts = Some(b.open_time_ns);
+                sink(b);
+                emitted += 1;
+            }
+        }
+    }
+    Ok(emitted)
+}
+
 /// Find gap ranges [start_ns, end_ns) where bars are missing.
 fn find_gaps(bars: &[BarData], start_ns: u64, end_ns: u64, interval_ns: u64) -> Vec<(u64, u64)> {
     let mut gaps = Vec::new();
@@ -143,6 +265,24 @@ fn find_gaps(bars: &[BarData], start_ns: u64, end_ns: u64, interval_ns: u64) -> 
         gaps.push((expected, end_ns));
     }
 
+    gaps
+}
+
+/// [`find_gaps`] over bare open timestamps — same algorithm, used by the
+/// streaming loader's pass 1 which doesn't retain full `BarData` rows.
+fn find_gaps_ts(ts: &[u64], start_ns: u64, end_ns: u64, interval_ns: u64) -> Vec<(u64, u64)> {
+    let aligned_start = (start_ns / interval_ns) * interval_ns;
+    let mut expected = aligned_start;
+    let mut gaps = Vec::new();
+    for &t in ts {
+        if t > expected {
+            gaps.push((expected, t));
+        }
+        expected = t + interval_ns;
+    }
+    if expected < end_ns {
+        gaps.push((expected, end_ns));
+    }
     gaps
 }
 
