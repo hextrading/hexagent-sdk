@@ -1131,7 +1131,74 @@ impl Engine {
         // Strategies that return no request fall back to the legacy 30-day
         // window. ──
         let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
-        let mut bar_events: Vec<(u64, MarketEvent)> = Vec::new();
+        // Compact hist-bar storage (2026-07-26). Formerly every loaded bar
+        // became a `(u64, MarketEvent::Bar)` (272 B enum + 2 heap Strings per
+        // bar) in one big sorted Vec — a 29d 1s lookback + in-window tail is
+        // ~3.1M bars ≈ >1 GB transient. Bars are now STREAMED out of the
+        // parquet reader (`load_hist_bars_streamed`): pre-window bars are fed
+        // straight to `Strategy::on_hist_bar` without being retained, and
+        // only in-window rows are kept — 72 B each, rebuilt into a full
+        // `BarData` on emission in the merge loop below.
+        //
+        // Both bar producers (parquet reader + REST kline fetch) set
+        // `is_closed = true` and `exchange/local_timestamp_ns =
+        // close_time_ns`, so the row only stores the 9 varying fields;
+        // `to_bar` reinstates the invariant ones from the per-source
+        // template (exchange/symbol/interval).
+        #[derive(Clone, Copy)]
+        struct HistBarRow {
+            open_time_ns: u64,
+            close_time_ns: u64,
+            open: f64,
+            high: f64,
+            low: f64,
+            close: f64,
+            volume: f64,
+            taker_buy_base: f64,
+            quote_volume: f64,
+        }
+        impl HistBarRow {
+            fn from_bar(b: &crate::types::BarData) -> Self {
+                debug_assert!(
+                    b.is_closed
+                        && b.exchange_timestamp_ns == b.close_time_ns
+                        && b.local_timestamp_ns == b.close_time_ns,
+                    "hist bar violates the compact-row invariants"
+                );
+                Self {
+                    open_time_ns: b.open_time_ns,
+                    close_time_ns: b.close_time_ns,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                    taker_buy_base: b.taker_buy_base,
+                    quote_volume: b.quote_volume,
+                }
+            }
+            fn to_bar(&self, template: &crate::types::BarData) -> crate::types::BarData {
+                let mut b = template.clone();
+                b.open_time_ns = self.open_time_ns;
+                b.close_time_ns = self.close_time_ns;
+                b.open = self.open;
+                b.high = self.high;
+                b.low = self.low;
+                b.close = self.close;
+                b.volume = self.volume;
+                b.taker_buy_base = self.taker_buy_base;
+                b.quote_volume = self.quote_volume;
+                b.is_closed = true;
+                b.exchange_timestamp_ns = self.close_time_ns;
+                b.local_timestamp_ns = self.close_time_ns;
+                b
+            }
+        }
+        let mut bar_templates: Vec<crate::types::BarData> = Vec::new();
+        // In-window rows as (source-idx, row), merged by (close_time, source)
+        // — exactly the order the former stable `sort_by_key(close_time)`
+        // produced (push order was source order).
+        let mut bar_rows: Vec<(u32, HistBarRow)> = Vec::new();
         if needs_hist_bars {
             let hist_bar_interval: String = self.config.strategies.iter()
                 .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
@@ -1149,8 +1216,20 @@ impl Engine {
             info!("[Replayer v2] hist-bar window: {:.2}d before backtest start ({})",
                 (start_ns.saturating_sub(hist_start_ns)) as f64 / 86_400e9,
                 if strat_start_ns.is_some() { "strategy-declared" } else { "30d fallback" });
-            for (exchange, symbol) in &replay_sources {
-                if exchange != "binance" { continue; }
+            let bin_symbols: Vec<String> = replay_sources.iter()
+                .filter(|(exchange, _)| exchange == "binance")
+                .map(|(_, symbol)| symbol.clone())
+                .collect();
+            // Sole source (the standing config) ⇒ stream order IS merged
+            // order: pre-window bars are fed inline with zero retention.
+            // Multi-source keeps compact pre-window rows per source and
+            // merge-feeds them below so the interleaving matches the former
+            // global sort.
+            let single_source = bin_symbols.len() == 1;
+            let mut pre_rows_by_src: Vec<Vec<HistBarRow>> = Vec::new();
+            let mut in_rows_by_src: Vec<Vec<HistBarRow>> = Vec::new();
+            let mut fed_hist = false;
+            for symbol in &bin_symbols {
                 let req = crate::types::HistDataRequest {
                     exchange: crate::types::Exchange::Binance,
                     symbol: symbol.clone(),
@@ -1158,41 +1237,87 @@ impl Engine {
                     start_date_ns: hist_start_ns,
                     end_date_ns: end_ns,
                 };
-                match crate::recorder::load_hist_bars(&data_path, &req) {
-                    Ok(bars) => {
-                        for bar in bars {
-                            let ts = bar.close_time_ns;
-                            bar_events.push((ts, MarketEvent::Bar(bar)));
+                bar_templates.push(crate::types::BarData {
+                    exchange: crate::types::Exchange::Binance,
+                    symbol: symbol.clone(),
+                    interval: hist_bar_interval.clone(),
+                    open_time_ns: 0,
+                    close_time_ns: 0,
+                    open: 0.0,
+                    high: 0.0,
+                    low: 0.0,
+                    close: 0.0,
+                    volume: 0.0,
+                    taker_buy_base: 0.0,
+                    quote_volume: 0.0,
+                    is_closed: true,
+                    exchange_timestamp_ns: 0,
+                    local_timestamp_ns: 0,
+                });
+                let mut pre: Vec<HistBarRow> = Vec::new();
+                let mut inr: Vec<HistBarRow> = Vec::new();
+                let src_idx = in_rows_by_src.len() as u32;
+                let res = crate::recorder::load_hist_bars_streamed(&data_path, &req, &mut |bar| {
+                    // The event ts (former sort key) is close_time_ns.
+                    if bar.close_time_ns < start_ns {
+                        if single_source {
+                            for s in &mut strategies { s.on_hist_bar(bar); }
+                            fed_hist = true;
+                        } else {
+                            pre.push(HistBarRow::from_bar(bar));
+                        }
+                    } else if single_source {
+                        bar_rows.push((src_idx, HistBarRow::from_bar(bar)));
+                    } else {
+                        inr.push(HistBarRow::from_bar(bar));
+                    }
+                });
+                if let Err(e) = res {
+                    error!("[Replayer v2] CRITICAL: load_hist_bars failed for binance/{} {}: {}",
+                        symbol, hist_bar_interval, e);
+                    std::process::exit(2);
+                }
+                pre_rows_by_src.push(pre);
+                in_rows_by_src.push(inr);
+            }
+            // k-way merge by (close_time, source-idx) — multi-source only;
+            // the single-source vectors above are empty.
+            let merge = |by_src: Vec<Vec<HistBarRow>>, emit: &mut dyn FnMut(u32, &HistBarRow)| {
+                let mut cursors = vec![0usize; by_src.len()];
+                loop {
+                    let mut best: Option<(u64, usize)> = None;
+                    for (i, rows) in by_src.iter().enumerate() {
+                        if let Some(r) = rows.get(cursors[i]) {
+                            if best.map_or(true, |(bt, _)| r.close_time_ns < bt) {
+                                best = Some((r.close_time_ns, i));
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("[Replayer v2] CRITICAL: load_hist_bars failed for {}/{} {}: {}",
-                            exchange, symbol, hist_bar_interval, e);
-                        std::process::exit(2);
-                    }
+                    let Some((_, i)) = best else { break };
+                    emit(i as u32, &by_src[i][cursors[i]]);
+                    cursors[i] += 1;
                 }
+            };
+            if !single_source {
+                let templates = &bar_templates;
+                merge(pre_rows_by_src, &mut |src, row| {
+                    let bar = row.to_bar(&templates[src as usize]);
+                    for s in &mut strategies { s.on_hist_bar(&bar); }
+                    fed_hist = true;
+                });
+                merge(in_rows_by_src, &mut |src, row| {
+                    bar_rows.push((src, *row));
+                });
             }
-            bar_events.sort_by_key(|e| e.0);
-        }
-        let mut bar_cursor: usize = 0;
-
-        // Split bar_events: pre-backtest bars → on_hist_bar, in-range → loop.
-        if !bar_events.is_empty() {
-            let hist_bars: Vec<_> = bar_events.iter().filter(|(ts, _)| *ts < start_ns).collect();
-            if !hist_bars.is_empty() {
-                for (_, event) in &hist_bars {
-                    if let MarketEvent::Bar(b) = event {
-                        for s in &mut strategies { s.on_hist_bar(b); }
-                    }
-                }
+            if fed_hist {
                 // Fresh-bars gate (when on) reads completeness from each
                 // strategy's own fit-window-capped resample cache, so BT (a
                 // 30-day prefetch) matches live (fit-window load) — out-of-
                 // window holes auto-drop and don't false-pause.
                 for s in &mut strategies { s.on_hist_data_loaded(start_ns); }
             }
-            bar_events.retain(|(ts, _)| *ts >= start_ns);
         }
+        let mut bar_cursor: usize = 0;
 
         // ── Prediction warm-up — verbatim from v1 ──
         {
@@ -1571,7 +1696,7 @@ impl Engine {
             cancel_profile,
         })?;
 
-        info!("[Backtest v2] {} strat replayers, {} bar events", strat_replayers.len(), bar_events.len());
+        info!("[Backtest v2] {} strat replayers, {} bar events", strat_replayers.len(), bar_rows.len());
 
         // ── k-way merge: strat lane (local_ts) + bars + sim (wall clock) ──
         #[derive(Eq, PartialEq)]
@@ -1592,7 +1717,7 @@ impl Engine {
 
         loop {
             let strat_ts = strat_heap.peek().map(|e| e.ts).unwrap_or(u64::MAX);
-            let bar_ts = bar_events.get(bar_cursor).map(|(ts, _)| *ts).unwrap_or(u64::MAX);
+            let bar_ts = bar_rows.get(bar_cursor).map(|(_, r)| r.close_time_ns).unwrap_or(u64::MAX);
             let strat_min = strat_ts.min(bar_ts);
             let sim_ts = sim.peek_when().unwrap_or(u64::MAX);
             let min_ts = strat_min.min(sim_ts);
@@ -1615,10 +1740,12 @@ impl Engine {
                 }
             } else {
                 // Strategy market event (by local_timestamp) — replayer or bars.
-                let (ts, event) = if min_ts == bar_ts && bar_cursor < bar_events.len() {
-                    let pair = bar_events[bar_cursor].clone();
+                let (ts, event) = if min_ts == bar_ts && bar_cursor < bar_rows.len() {
+                    // Rebuild the full BarData from the compact row (the
+                    // former code cloned a pre-built MarketEvent here).
+                    let (src, row) = bar_rows[bar_cursor];
                     bar_cursor += 1;
-                    pair
+                    (row.close_time_ns, MarketEvent::Bar(row.to_bar(&bar_templates[src as usize])))
                 } else {
                     let entry = strat_heap.pop().unwrap();
                     let best_idx = entry.idx;
@@ -1646,9 +1773,15 @@ impl Engine {
                             // Hist gap-fill BEFORE on_instrument (matches v1).
                             let hist_reqs = strategy.load_hist_data(ts);
                             for req in &hist_reqs {
-                                match crate::recorder::load_hist_bars(&hist_data_dir, req) {
-                                    Ok(bars) => { for bar in &bars { strategy.on_hist_bar(bar); } }
-                                    Err(e) => warn!("[Strategy v2] Failed to load hist bars: {}", e),
+                                // Streamed (2026-07-26): identical bar sequence to
+                                // the former collect-then-feed, but a 29d 1s
+                                // refetch no longer materializes a ~430 MB Vec.
+                                // Errors fire before the first emitted bar, so the
+                                // fed-nothing-on-error behavior is preserved.
+                                if let Err(e) = crate::recorder::load_hist_bars_streamed(
+                                    &hist_data_dir, req, &mut |bar| { strategy.on_hist_bar(bar); },
+                                ) {
+                                    warn!("[Strategy v2] Failed to load hist bars: {}", e);
                                 }
                             }
                             if !hist_reqs.is_empty() { strategy.on_hist_data_loaded(ts); }
