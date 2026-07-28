@@ -7,7 +7,7 @@
 //! Emits MarketEvent::SpotPrice with source = "chainlink".
 
 use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use log::{info, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
-    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
+    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
+    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL, WS_CONNECT_TIMEOUT,
 };
 use crate::types::*;
 
@@ -82,11 +82,25 @@ async fn chainlink_ws_task(
         if shutdown.load(Ordering::Relaxed) { break; }
 
         info!("[Chainlink] Connecting to {}", RTDS_URL);
-        let stream = match tokio_tungstenite::connect_async(RTDS_URL).await {
-            Ok((s, _)) => s,
-            Err(e) => {
+        let stream = match tokio::time::timeout(
+            WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(RTDS_URL),
+        ).await {
+            Ok(Ok((s, _))) => s,
+            Ok(Err(e)) => {
                 let delay = backoff.next_delay();
                 warn!("[Chainlink] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(_) => {
+                let delay = backoff.next_delay();
+                warn!(
+                    "[Chainlink] WS connect stalled >{:.0}s (TLS handshake never \
+                     completed), retry in {:.1}s",
+                    WS_CONNECT_TIMEOUT.as_secs_f64(),
+                    delay.as_secs_f64(),
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -126,7 +140,7 @@ async fn chainlink_ws_task(
             "subscriptions": subs,
         });
         info!("[Chainlink] Subscribe: {}", sub_msg);
-        if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
+        if let Err(e) = ws_send(&mut write, Message::Text(sub_msg.to_string())).await {
             warn!("[Chainlink] subscribe failed: {}", e);
             continue;
         }
@@ -143,9 +157,10 @@ async fn chainlink_ws_task(
                 biased;
                 _ = ping_interval.tick() => {
                     let now = Instant::now();
-                    if let Err(e) = write
-                        .send(Message::Text(POLYMARKET_RTDS_PING_PAYLOAD.to_string()))
-                        .await
+                    if let Err(e) = ws_send(
+                        &mut write,
+                        Message::Text(POLYMARKET_RTDS_PING_PAYLOAD.to_string()),
+                    ).await
                     {
                         warn!(
                             "[Chainlink] RTDS ping send failed: {}; {}",
@@ -154,7 +169,7 @@ async fn chainlink_ws_task(
                         );
                         break;
                     }
-                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                    if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
                         warn!(
                             "[Chainlink] RTDS frame Ping send failed: {}; {}",
                             e,
@@ -226,7 +241,7 @@ async fn chainlink_ws_task(
                     health.record_raw_frame(received_at);
                     match msg {
                         Message::Ping(payload) => {
-                            let _ = write.send(Message::Pong(payload)).await;
+                            let _ = ws_send(&mut write, Message::Pong(payload)).await;
                         }
                         Message::Pong(_) => {
                             health.record_pong(received_at);
@@ -260,7 +275,7 @@ async fn chainlink_ws_task(
                                 continue;
                             }
                             if body.eq_ignore_ascii_case("PING") {
-                                let _ = write.send(Message::Text("PONG".to_string())).await;
+                                let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
                                 continue;
                             }
                             // simd-json drop-in for SIMD parse speedup.

@@ -33,6 +33,75 @@ pub(crate) const POLYMARKET_RTDS_PING_INTERVAL: Duration = Duration::from_secs(5
 pub(crate) const POLYMARKET_RTDS_PING_PAYLOAD: &str = "ping";
 pub(crate) const POLYMARKET_WS_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Bound on a single outbound WebSocket write.
+///
+/// `SinkExt::send` is `feed` + `flush`, and `flush` on a TCP sink awaits until
+/// the kernel accepts the bytes. If the peer stops reading (zero-window) or the
+/// link goes half-open, it never returns. That await lives INSIDE a
+/// `tokio::select!` branch body — not among the futures the select polls — so a
+/// single hung write suspends the entire task: the read-stall watchdog and the
+/// health tick stop being polled, and nothing in-process can recover it. The
+/// engine's own data-timeout cannot help either; it can only mark the feed
+/// stale, it cannot unstick the task.
+///
+/// Observed twice in 2116 h of recorded Chainlink RTDS (2026-05-01..07-28):
+/// 2026-06-15 18:59:59Z for 41.1 min and 2026-07-23 18:01:35Z for 46.8 min.
+/// In the second, all three RTDS symbols stopped on the same minute while
+/// Binance, Coinbase, Hyperliquid AND the Polymarket CLOB — same process, and
+/// in the CLOB's case the same vendor — recorded continuously throughout. One
+/// task frozen, everything around it healthy.
+///
+/// 10 s is 2x the 5 s heartbeat cadence; a healthy write completes in
+/// microseconds, so this only ever fires on a genuinely stuck sink.
+pub(crate) const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on connect + TLS handshake + WS upgrade. `connect_async` is equally
+/// unbounded: the OS caps the TCP connect (~75 s), but nothing caps the TLS
+/// handshake that follows, and this await sits in the reconnect loop where a
+/// hang is indistinguishable from the send hang above. The reconnect backoff
+/// caps at 6.4 s, so a *failing* connect cannot explain a 40-minute silence —
+/// only a *hanging* one can.
+pub(crate) const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Send one WebSocket message under [`WS_SEND_TIMEOUT`].
+///
+/// Returns the reason as a string on failure so callers can log it and break to
+/// their reconnect path; a stalled sink is reported distinctly from a sink that
+/// returned an error, because the two mean different things in an incident log.
+pub(crate) async fn ws_send<S>(
+    sink: &mut S,
+    msg: tokio_tungstenite::tungstenite::Message,
+) -> std::result::Result<(), String>
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
+    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error:
+        std::fmt::Display,
+{
+    ws_send_within(sink, msg, WS_SEND_TIMEOUT).await
+}
+
+/// [`ws_send`] with the bound supplied by the caller, so the timeout path is
+/// testable without a multi-second test.
+pub(crate) async fn ws_send_within<S>(
+    sink: &mut S,
+    msg: tokio_tungstenite::tungstenite::Message,
+    bound: Duration,
+) -> std::result::Result<(), String>
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
+    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error:
+        std::fmt::Display,
+{
+    match tokio::time::timeout(bound, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "write stalled >{:.1}s (sink never flushed)",
+            bound.as_secs_f64()
+        )),
+    }
+}
+
 /// Layered WebSocket liveness timestamps.
 ///
 /// Keeping these clocks separate lets an incident log distinguish:
@@ -299,6 +368,49 @@ mod tests {
         assert!(summary.contains("last_raw_frame=9.0s_ago"));
         assert!(summary.contains("last_topic_frame=7.0s_ago"));
         assert!(summary.contains("last_btc_price=6.0s_ago"));
+    }
+
+    /// A sink whose flush never completes must not be able to hold the task
+    /// forever. This is the 2026-06-15 / 2026-07-23 RTDS freeze shape: every
+    /// timer in the task lives in a `tokio::select!`, and a `write.send(...)`
+    /// inside a branch body is NOT one of the futures that select polls — so
+    /// while it is pending, the read-stall watchdog and the health tick are
+    /// never polled again and nothing in-process can recover.
+    #[tokio::test]
+    async fn ws_send_gives_up_on_a_sink_that_never_flushes() {
+        use futures_util::Sink;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio_tungstenite::tungstenite::Message;
+
+        /// Accepts the message, then never finishes flushing it — a TCP sink
+        /// whose peer has stopped reading.
+        struct NeverFlushes;
+        impl Sink<Message> for NeverFlushes {
+            type Error = std::io::Error;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+        }
+
+        let mut sink = NeverFlushes;
+        let err = ws_send_within(
+            &mut sink,
+            Message::Text("ping".to_string()),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("a sink that never flushes must time out, not hang");
+        assert!(err.contains("stalled"), "unexpected reason: {err}");
     }
 
     /// A heartbeat responder that outlives the market-data feed must NOT read
