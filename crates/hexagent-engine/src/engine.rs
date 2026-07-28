@@ -4345,10 +4345,10 @@ impl Engine {
                         poly_worker_n, n_drainers
                     );
                     // Admission-control observability daemon: every 30 s log the
-                    // per-(instance,role) delta — primary acquires/skips,
-                    // optional hedge acquires/skips, and current busy. Primary
-                    // skips shed a business operation and are WARN; hedge skips
-                    // only suppress a duplicate cancel and remain INFO.
+                    // per-(instance,role) delta — acquires/skips, retained cancel
+                    // waits, and current busy. Placement skips shed a business
+                    // operation and are WARN; cancel waits remain INFO because
+                    // the cancel is retained until a slot becomes available.
                     {
                         let stop = poly_stats_stop.clone();
                         let h = thread::Builder::new()
@@ -4623,11 +4623,10 @@ fn extract_instance_id(signal: &Signal) -> String {
     }
 }
 
-type AdmissionCounters = (u64, u64, u64, u64);
+type AdmissionCounters = (u64, u64, u64);
 type AdmissionStat = (
     String,
     hexagent_runtime::http1_pool::Role,
-    u64,
     u64,
     u64,
     u64,
@@ -4635,28 +4634,27 @@ type AdmissionStat = (
 );
 
 /// Convert cumulative pool counters into per-window, per-instance log lines.
-/// The boolean is true only when a primary business request was shed. Optional
-/// hedge skips remain visible in the line but never elevate it to WARN.
+/// The boolean is true only when a business request was shed. Retained cancel
+/// waits remain visible but never elevate the line to WARN.
 fn admission_log_snapshot(
     prev: &mut HashMap<String, AdmissionCounters>,
     stats: Vec<AdmissionStat>,
 ) -> std::collections::BTreeMap<String, (String, bool)> {
     let mut by_inst: std::collections::BTreeMap<String, (String, bool)> = Default::default();
-    for (iid, role, acq, sk, hedge_acq, hedge_sk, busy) in stats {
+    for (iid, role, acq, sk, waits, busy) in stats {
         let key = format!("{}/{:?}", iid, role);
-        let (pa, ps, pha, phs) = prev.get(&key).copied().unwrap_or((0, 0, 0, 0));
+        let (pa, ps, pw) = prev.get(&key).copied().unwrap_or((0, 0, 0));
         let dacq = acq.saturating_sub(pa);
         let dsk = sk.saturating_sub(ps);
-        let dhedge_acq = hedge_acq.saturating_sub(pha);
-        let dhedge_sk = hedge_sk.saturating_sub(phs);
-        prev.insert(key, (acq, sk, hedge_acq, hedge_sk));
+        let dwaits = waits.saturating_sub(pw);
+        prev.insert(key, (acq, sk, waits));
 
         let entry = by_inst.entry(iid).or_insert_with(Default::default);
         entry.1 |= dsk > 0;
         if role == hexagent_runtime::http1_pool::Role::Cancel {
             entry.0.push_str(&format!(
-                "{:?}(+{} primary_cancel_skip+{} hedge+{} hedge_skip+{} busy{}) ",
-                role, dacq, dsk, dhedge_acq, dhedge_sk, busy
+                "{:?}(+{} skip+{} retained_wait+{} busy{}) ",
+                role, dacq, dsk, dwaits, busy
             ));
         } else {
             entry.0.push_str(&format!(
@@ -4748,7 +4746,8 @@ fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
     }
 }
 
-/// ExecutorRejected update for a cancel we never sent (admission skip / stale).
+/// ExecutorRejected update for a cancel we cannot route because its instance
+/// is unknown. Ordinary pool saturation is retained and never reaches here.
 fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
     OrderUpdate {
         client_order_id: coid,
@@ -4771,10 +4770,10 @@ fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
 /// Fire-and-track + admission dispatch for the hot single-leg Polymarket
 /// paths (place / cancel / 1×1 replace). Acquires a per-instance admission
 /// permit, fires on the reserved connection WITHOUT blocking, and hands the
-/// reply-completion closure to a drainer. On no permit it SKIPS (emits
-/// ExecutorRejected — the strategy holds/retries). Everything else (batch,
-/// reconcile, cancel-all, non-poly, empty/unknown instance) falls through to
-/// the synchronous `execute_fallback_signal`, unchanged.
+/// reply-completion closure to a drainer. Placement may be skipped when stale
+/// or saturated; cancellation is retained and woken by permit release.
+/// Everything else (batch, reconcile, cancel-all, non-poly, empty/unknown
+/// instance) falls through to the synchronous `execute_fallback_signal`.
 fn fire_or_execute(
     worker: &mut LiveRouter,
     signal: Signal,
@@ -4782,7 +4781,7 @@ fn fire_or_execute(
     done_tx: &Sender<(PolyCompletionFn, Sender<OrderUpdate>)>,
     utx: &Sender<OrderUpdate>,
 ) {
-    use hexagent_runtime::http1_pool::{try_acquire, try_acquire_hedge, Role};
+    use hexagent_runtime::http1_pool::{acquire, try_acquire, Role};
     // Same stale semantics as the sync path's `is_stale`.
     let is_stale = |ts: u64| {
         ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms
@@ -4824,30 +4823,37 @@ fn fire_or_execute(
         Signal::CancelOrder { exchange, client_order_id, timestamp_ns, .. }
             if exchange == Exchange::Polymarket && !iid.is_empty() =>
         {
-            if is_stale(timestamp_ns) {
-                let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
-                return;
-            }
-            match try_acquire(&iid, Role::Cancel) {
+            // A cancel is monotonic while the order is live: unlike a place,
+            // age does not make it unsafe. Retain it across temporary pool
+            // saturation and wake on permit release instead of reverting the
+            // order to Active for a quote-tick retry.
+            let wait_started = std::time::Instant::now();
+            match acquire(&iid, Role::Cancel) {
                 None => {
+                    // Unknown instance/role is permanent; ordinary saturation
+                    // never reaches this branch.
                     let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
                 }
                 Some(permit) => {
+                    let wait = wait_started.elapsed();
+                    if wait >= std::time::Duration::from_millis(1) {
+                        info!(
+                            "[Executor] retained cancel acquired iid={} coid={} wait_ms={:.3}",
+                            iid,
+                            client_order_id,
+                            wait.as_secs_f64() * 1000.0,
+                        );
+                    }
                     let client = permit.pooled_client();
-                    // Component 3 idle-gate: hedge the cancel ONLY if a second
-                    // Cancel connection is free right now (else no hedge).
-                    let hedge_permit = try_acquire_hedge(&iid, Role::Cancel);
-                    let hedge_client = hedge_permit.as_ref().map(|p| p.pooled_client());
                     let route = worker.poly_route_mut(&iid);
                     route.set_gen_ns_hint(timestamp_ns);
-                    let pending = route.cancel_fire(&client_order_id, client, hedge_client);
+                    let pending = route.cancel_fire(&client_order_id, client);
                     let iid2 = iid;
                     let f: PolyCompletionFn = Box::new(move |r| {
                         let u = r
                             .poly_route_mut(&iid2)
                             .complete_cancel(exchange, &client_order_id, pending);
                         drop(permit);
-                        drop(hedge_permit); // release the hedge connection too
                         vec![u]
                     });
                     let _ = done_tx.send((f, utx.clone()));
@@ -4865,16 +4871,14 @@ fn fire_or_execute(
             && cancel_client_order_ids.len() == 1
             && place_orders.len() == 1 =>
         {
-            if is_stale(timestamp_ns) {
-                let _ = utx.send(exec_rejected_cancel(cancel_client_order_ids[0].clone(), exchange));
-                let _ = utx.send(exec_rejected_place(&place_orders[0]));
-                return;
-            }
+            let place_is_stale = is_stale(timestamp_ns);
             let coid = cancel_client_order_ids.into_iter().next().unwrap();
             let place = place_orders.into_iter().next().unwrap();
-            // Rule 4: cancel gates place. Acquire the Cancel permit first; if
-            // none, skip the WHOLE replace (hold the current quote).
-            let cancel_permit = match try_acquire(&iid, Role::Cancel) {
+            // Cancel is retained even when the replace signal has aged. The
+            // stale place leg is disposable and will be recomputed after the
+            // old order is confirmed off-book.
+            let wait_started = std::time::Instant::now();
+            let cancel_permit = match acquire(&iid, Role::Cancel) {
                 Some(p) => p,
                 None => {
                     let _ = utx.send(exec_rejected_cancel(coid, exchange));
@@ -4882,18 +4886,19 @@ fn fire_or_execute(
                     return;
                 }
             };
-            // Fire the cancel — NO hedge on the replace path. With Cancel=2 and
-            // two quoting legs (bid+ask) repricing each tick, the two legs' two
-            // primary cancels exactly fill the pool; a replace-cancel that also
-            // grabbed a hedge permit would take BOTH and starve the other leg's
-            // cancel → its stale order never gets pulled (live smoke 2026-07-07:
-            // single coids re-cancel-looped 24-40× → held live → adverse fills /
-            // one-sided inventory). Idle-hedge is kept only for standalone
-            // CancelOrder, which has no paired leg competing for the same tick.
+            let wait = wait_started.elapsed();
+            if wait >= std::time::Duration::from_millis(1) {
+                info!(
+                    "[Executor] retained replace-cancel acquired iid={} coid={} wait_ms={:.3}",
+                    iid,
+                    coid,
+                    wait.as_secs_f64() * 1000.0,
+                );
+            }
             let cclient = cancel_permit.pooled_client();
             let route = worker.poly_route_mut(&iid);
             route.set_gen_ns_hint(timestamp_ns);
-            let cpending = route.cancel_fire(&coid, cclient, None);
+            let cpending = route.cancel_fire(&coid, cclient);
             let iid_c = iid.clone();
             let cf: PolyCompletionFn = Box::new(move |r| {
                 let u = r.poly_route_mut(&iid_c).complete_cancel(exchange, &coid, cpending);
@@ -4901,6 +4906,10 @@ fn fire_or_execute(
                 vec![u]
             });
             let _ = done_tx.send((cf, utx.clone()));
+            if place_is_stale {
+                let _ = utx.send(exec_rejected_place(&place));
+                return;
+            }
             // Place: independent Fast permit. If none, skip place only (the
             // cancel already fired → pull-to-flat on this side, which is safe).
             match try_acquire(&iid, Role::Fast) {
@@ -5004,24 +5013,6 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             error: None,
         }
     };
-    let build_exec_rejected_cancel = |coid: String, exchange: Exchange| -> OrderUpdate {
-        OrderUpdate {
-            client_order_id: coid,
-            exchange,
-            symbol: String::new(),
-            side: Side::Buy,
-            exchange_order_id: None,
-            status: OrderStatus::ExecutorRejected,
-            liquidity: None,
-            filled_quantity: 0.0,
-            remaining_quantity: 0.0,
-            avg_fill_price: 0.0,
-            timestamp_ns: now_ns(),
-            trade_id: None,
-            order_audit: None,
-            error: None,
-        }
-    };
     let is_stale = |ts: u64| -> bool {
         if ts == 0 || stale_threshold_ms == 0 { return false; }
         let now = now_ns();
@@ -5067,10 +5058,8 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             }
         }
         Signal::CancelOrder { exchange, client_order_id, timestamp_ns, .. } => {
-            if is_stale(timestamp_ns) {
-                warn!("[Executor] Signal stale, dropping CancelOrder coid={}", client_order_id);
-                return vec![build_exec_rejected_cancel(client_order_id, exchange)];
-            }
+            // Cancellation is monotonic: age can make a replacement quote
+            // stale, but never makes pulling the old order unsafe.
             let result = if exchange == Exchange::Polymarket {
                 let route = executor.poly_route_mut(&instance_id);
                 route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log line
@@ -5109,12 +5098,6 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             })
         }
         Signal::BatchCancelOrders { exchange, market_id, client_order_ids, timestamp_ns, .. } => {
-            if is_stale(timestamp_ns) {
-                warn!("[Executor] Signal stale, dropping BatchCancelOrders ({} ids)", client_order_ids.len());
-                return client_order_ids.into_iter()
-                    .map(|coid| build_exec_rejected_cancel(coid, exchange))
-                    .collect();
-            }
             let result = if exchange == Exchange::Polymarket {
                 let route = executor.poly_route_mut(&instance_id);
                 route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
@@ -5129,12 +5112,20 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
         Signal::BatchUpdateOrders { exchange, market_id, cancel_client_order_ids, place_orders, timestamp_ns, .. } => {
             if is_stale(timestamp_ns) {
                 warn!(
-                    "[Executor] Signal stale, dropping BatchUpdateOrders ({} cancels, {} places)",
+                    "[Executor] Signal stale, retaining {} BatchUpdateOrders cancels and dropping {} places",
                     cancel_client_order_ids.len(), place_orders.len(),
                 );
-                let mut out: Vec<OrderUpdate> = cancel_client_order_ids.into_iter()
-                    .map(|coid| build_exec_rejected_cancel(coid, exchange))
-                    .collect();
+                let mut out = if exchange == Exchange::Polymarket {
+                    let route = executor.poly_route_mut(&instance_id);
+                    route.set_gen_ns_hint(timestamp_ns);
+                    route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                } else {
+                    executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                }
+                .unwrap_or_else(|error| {
+                    error!("[Executor] Retained batch cancel error: {}", error);
+                    vec![]
+                });
                 out.extend(place_orders.iter().map(build_exec_rejected_place));
                 return out;
             }
@@ -5156,12 +5147,20 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
         Signal::ReplaceOrder { exchange, market_id, cancel_client_order_ids, place_orders, timestamp_ns, .. } => {
             if is_stale(timestamp_ns) {
                 warn!(
-                    "[Executor] Signal stale, dropping ReplaceOrder ({} cancels, {} places)",
+                    "[Executor] Signal stale, retaining {} ReplaceOrder cancels and dropping {} places",
                     cancel_client_order_ids.len(), place_orders.len(),
                 );
-                let mut out: Vec<OrderUpdate> = cancel_client_order_ids.into_iter()
-                    .map(|coid| build_exec_rejected_cancel(coid, exchange))
-                    .collect();
+                let mut out = if exchange == Exchange::Polymarket {
+                    let route = executor.poly_route_mut(&instance_id);
+                    route.set_gen_ns_hint(timestamp_ns);
+                    route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                } else {
+                    executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                }
+                .unwrap_or_else(|error| {
+                    error!("[Executor] Retained replace cancel error: {}", error);
+                    vec![]
+                });
                 out.extend(place_orders.iter().map(build_exec_rejected_place));
                 return out;
             }
@@ -5964,18 +5963,17 @@ mod market_router_tests {
     }
 
     #[test]
-    fn admission_hedge_skip_stays_info() {
+    fn admission_retained_wait_stays_info() {
         use hexagent_runtime::http1_pool::Role;
 
         let mut prev = HashMap::new();
         let lines = admission_log_snapshot(
             &mut prev,
-            vec![("btc".into(), Role::Cancel, 10, 0, 4, 2, 3)],
+            vec![("btc".into(), Role::Cancel, 10, 0, 4, 3)],
         );
         let (line, should_warn) = lines.get("btc").unwrap();
-        assert!(!should_warn, "optional hedge shedding is not a warning");
-        assert!(line.contains("primary_cancel_skip+0"));
-        assert!(line.contains("hedge+4 hedge_skip+2"));
+        assert!(!should_warn, "a retained cancel is not shed");
+        assert!(line.contains("skip+0 retained_wait+4 busy3"));
     }
 
     #[test]
@@ -5986,8 +5984,8 @@ mod market_router_tests {
         let lines = admission_log_snapshot(
             &mut prev,
             vec![
-                ("btc".into(), Role::Cancel, 10, 1, 4, 0, 3),
-                ("eth".into(), Role::Cancel, 8, 0, 2, 3, 2),
+                ("btc".into(), Role::Cancel, 10, 1, 4, 3),
+                ("eth".into(), Role::Cancel, 8, 0, 2, 2),
             ],
         );
         assert!(lines.get("btc").unwrap().1);

@@ -382,7 +382,19 @@ impl OrderManager {
                 order.status = LocalOrderStatus::Active;
             }
             OrderStatus::PartiallyFilled => {
-                order.status = LocalOrderStatus::Active;
+                // A confirmed Cancelled state is terminal for order admission.
+                // A delayed trade push may still adjust inventory, but it must
+                // not resurrect the order as Active and trigger another DELETE
+                // for an order the exchange already confirmed cancelled.
+                let was_cancelled = order.status == LocalOrderStatus::Cancelled;
+                if !was_cancelled {
+                    order.status = LocalOrderStatus::Active;
+                } else {
+                    log::debug!(
+                        "[OrderManager] {} {} {} late fill after Cancelled; preserving terminal state",
+                        self.symbol, update.client_order_id, order.side,
+                    );
+                }
                 // Polymarket's trade push goes MATCHED → MINED → CONFIRMED
                 // with the same `matched_amount` each time; we only get
                 // the terminal `Filled` status on the CONFIRMED leg, which
@@ -881,6 +893,23 @@ mod tests {
         m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
         let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
         assert_eq!(m.open_count(), 0, "Filled is removed");
+    }
+
+    #[test]
+    fn late_partial_fill_does_not_resurrect_cancelled_order() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
+        let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
+
+        let mut late_fill = upd("x", Side::Buy, OrderStatus::PartiallyFilled);
+        late_fill.trade_id = Some("late-trade".into());
+        late_fill.filled_quantity = 1.0;
+        late_fill.remaining_quantity = 4.0;
+        let _ = m.on_order_update(&late_fill);
+
+        assert_eq!(m.live_count(Side::Buy), 0);
+        assert!(m.active_bid().is_none());
+        assert_eq!(m.orders["x"].status, LocalOrderStatus::Cancelled);
     }
 
     #[test]

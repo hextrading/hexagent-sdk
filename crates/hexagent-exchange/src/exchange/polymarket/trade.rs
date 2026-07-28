@@ -4,7 +4,7 @@
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -527,13 +527,93 @@ async fn send_and_drain(
     Ok(status)
 }
 
-/// Async heartbeat loop. Spawned as a tokio task on the shared runtime
-/// at startup. Each tick (every `HEARTBEAT_INTERVAL`) fires **one**
-/// `POST /heartbeats` per primary HTTP/1.1 client across **every** role
-/// pool (FAST + CANCEL + RECONCILE + QUERY + GAP_REPLAY) so each underlying TCP
-/// connection sees traffic before reqwest's `pool_idle_timeout` evicts
-/// it. Without this, only the QUERY pool stays warm and the next
-/// place / cancel after a quiet stretch pays a TCP+TLS handshake.
+const PREWARM_CONCURRENCY: usize = 4;
+const PREWARM_STAGGER_MS: u64 = 25;
+
+#[derive(Default)]
+struct PrewarmSummary {
+    total: usize,
+    ok: usize,
+    rate_limited: usize,
+    first_error: Option<String>,
+}
+
+/// Warm a set of distinct reqwest pools without turning process startup into
+/// a connection storm. Tasks are retained in a bounded lane and their starts
+/// are staggered, so even a large per-instance pool cannot hit one host in a
+/// single scheduler turn.
+async fn prewarm_clients_staggered(
+    label: &'static str,
+    clients: Vec<Arc<reqwest::Client>>,
+    url: String,
+) -> PrewarmSummary {
+    let total = clients.len();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(PREWARM_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, client) in clients.into_iter().enumerate() {
+        let semaphore = semaphore.clone();
+        let url = url.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(
+                PREWARM_STAGGER_MS.saturating_mul(idx as u64),
+            ))
+            .await;
+            let _permit = semaphore.acquire_owned().await.expect("prewarm semaphore open");
+            send_and_drain(client.get(url)).await
+        });
+    }
+
+    let mut summary = PrewarmSummary { total, ..Default::default() };
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(status)) if (200..400).contains(&status) => summary.ok += 1,
+            Ok(Ok(429)) => {
+                summary.rate_limited += 1;
+                if summary.first_error.is_none() {
+                    summary.first_error = Some("HTTP 429".into());
+                }
+            }
+            Ok(Ok(status)) => {
+                if summary.first_error.is_none() {
+                    summary.first_error = Some(format!("HTTP {}", status));
+                }
+            }
+            Ok(Err(error)) => {
+                if summary.first_error.is_none() {
+                    summary.first_error = Some(error.to_string());
+                }
+            }
+            Err(error) => {
+                if summary.first_error.is_none() {
+                    summary.first_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+    if summary.ok == summary.total {
+        info!(
+            "[PolymarketTrade] Pre-warm {} {}/{} ok",
+            label, summary.ok, summary.total,
+        );
+    } else {
+        warn!(
+            "[PolymarketTrade] Pre-warm {} {}/{} ok rate_limited={} first_error={}",
+            label,
+            summary.ok,
+            summary.total,
+            summary.rate_limited,
+            summary.first_error.as_deref().unwrap_or("unknown"),
+        );
+    }
+    summary
+}
+
+static TRANSPORT_PREWARMED: OnceLock<()> = OnceLock::new();
+
+/// Account-scoped heartbeat loop. Each tick sends exactly one signed
+/// `POST /heartbeats`; transport warming is handled separately at startup.
+/// This avoids multiplying account heartbeat traffic by the number of HTTP
+/// clients (and then again by the number of accounts).
 ///
 /// Logging cadence:
 ///   - success (all pings ok): TRACE per tick
@@ -544,10 +624,9 @@ async fn heartbeat_loop(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     base_url: String,
 ) {
-    let n_clients = crate::http1_pool::pooled_clients_all().len();
     info!(
-        "[PolyHeartbeat] Started (interval={}s, transport=h1.1, fan_out={} clients)",
-        HEARTBEAT_INTERVAL.as_secs(), n_clients,
+        "[PolyHeartbeat] Started (interval={}s, one signed request per account)",
+        HEARTBEAT_INTERVAL.as_secs(),
     );
     const SUMMARY_TICKS: u32 = 30;
     let mut tick_ok = 0u32;
@@ -564,66 +643,39 @@ async fn heartbeat_loop(
         let url = format!("{}{}", base_url, path);
         let prewarm_url = format!("{}/time", base_url.trim_end_matches('/'));
 
-        // Fan out one ping per client across ALL pools concurrently.
-        // Each client has its own TCP connection; using `client.request`
-        // directly bypasses `pick_client`'s path-based routing so we
-        // can target a specific connection.
-        let mut set = tokio::task::JoinSet::new();
-        for client in crate::http1_pool::pooled_clients_all() {
-            let url_c = url.clone();
-            let headers_c = headers.clone();
-            let prewarm_url_c = prewarm_url.clone();
-            set.spawn(async move {
-                let mut req = client.client().request(reqwest::Method::POST, &url_c)
-                    .header("Content-Type", "application/json")
-                    .body(String::new());
-                for (k, v) in headers_c.as_pairs() {
-                    req = req.header(k, v);
-                }
-                match send_and_drain(req).await {
-                    Ok(status) => {
-                        client.note_transport_success();
-                        Ok(status)
-                    }
-                    Err(error) => {
-                        client.note_transport_failure(prewarm_url_c);
-                        Err(error)
-                    }
-                }
-            });
+        let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
+        let mut request = client
+            .client()
+            .request(reqwest::Method::POST, &url)
+            .header("Content-Type", "application/json")
+            .body(String::new());
+        for (name, value) in headers.as_pairs() {
+            request = request.header(name, value);
         }
-
-        let mut ok_n = 0usize;
-        let mut err_n = 0usize;
-        let mut first_err: Option<String> = None;
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(status)) if (200..400).contains(&status) => ok_n += 1,
-                Ok(Ok(status)) => {
-                    err_n += 1;
-                    if first_err.is_none() {
-                        first_err = Some(format!("HTTP {}", status));
-                    }
-                }
-                Ok(Err(e)) => {
-                    err_n += 1;
-                    if first_err.is_none() { first_err = Some(e.to_string()); }
-                }
-                Err(_) => {
-                    err_n += 1;
-                    if first_err.is_none() { first_err = Some("task cancelled".into()); }
-                }
+        let result = send_and_drain(request).await;
+        let (err_n, first_err) = match result {
+            Ok(status) if (200..400).contains(&status) => {
+                client.note_transport_success();
+                (0usize, None)
             }
-        }
+            Ok(status) => {
+                client.note_transport_success();
+                (1, Some(format!("HTTP {}", status)))
+            }
+            Err(error) => {
+                client.note_transport_failure(prewarm_url);
+                (1, Some(error.to_string()))
+            }
+        };
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         if err_n == 0 {
-            log::trace!("[PolyHeartbeat] ok ({} pings, {:.0}ms)", ok_n, elapsed_ms);
+            log::trace!("[PolyHeartbeat] ok ({:.0}ms)", elapsed_ms);
             tick_ok += 1;
         } else {
             warn!(
-                "[PolyHeartbeat] {}/{} pings failed ({:.0}ms): first_err={}",
-                err_n, ok_n + err_n, elapsed_ms,
+                "[PolyHeartbeat] request failed ({:.0}ms): first_err={}",
+                elapsed_ms,
                 first_err.unwrap_or_default(),
             );
             tick_err += 1;
@@ -721,71 +773,6 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
         ("DELETE", _) => Some(async_rt::current_cancel_timeout()),
         _ => None,
     }
-}
-
-/// Hedge delay (ms) for cancel paths. p50 cancel RTT in 2026-04-27
-/// live = 31 ms, p95 = 243 ms — at 120 ms we cover the long tail
-/// (~15-20% of cancels) while only doubling traffic on slow cases.
-/// The hedge skips its own send if the primary already won by then
-/// (channel-full check), so on the healthy path it costs only one
-/// wakeup of the tokio sleep.
-pub(crate) const HEDGE_DELAY_MS_CANCEL: u64 = 120;
-
-/// Hedge delay (ms) for place paths. p50 place RTT in 2026-05-04 live
-/// = 29 ms, p95 = 236 ms; the long tail keeps p95 pinned to the 500 ms
-/// FAST_TIMEOUT in slow Polymarket-CLOB windows (the 11h22m run had
-/// 23.8% NewOrderTimeout). 250 ms is past p95 but well below the
-/// timeout, so the hedge only fires on the genuinely slow ~5% — and
-/// since Polymarket dedupes by orderID hash (deterministic over the
-/// EIP-712-signed body, which is identical between the two legs), a
-/// duplicate that lands second simply gets rejected as already-known
-/// while the first leg gives us our ack. Net effect: on the slow tail
-/// we trade one extra request for an ack 100-300 ms sooner, and we
-/// avoid the orphan-reconcile cycle that timeout would otherwise
-/// incur.
-pub(crate) const HEDGE_DELAY_MS_PLACE: u64 = 250;
-
-/// If `(method, path)` is a hedge-eligible endpoint, return the delay
-/// (ms) the hedge leg should sleep before firing; otherwise `None`.
-///
-/// Eligible:
-///   * `DELETE /order`, `DELETE /orders`     → cancel hedge (120 ms)
-///   * `POST /order`                          → place hedge (250 ms)
-///
-/// Excluded:
-///   * `DELETE /cancel-all` — heavier session-shutdown / balance-error
-///     path that doesn't benefit from racing.
-///   * `POST /orders` (batch place) — duplicating a 5-order batch
-///     amplifies traffic 10×; single-order place is the common path
-///     and gets the targeted treatment.
-fn hedge_delay_ms(method: &reqwest::Method, path: &str) -> Option<u64> {
-    if method == reqwest::Method::DELETE && (path == "/order" || path == "/orders") {
-        Some(HEDGE_DELAY_MS_CANCEL)
-    } else if method == reqwest::Method::POST && path == "/order" {
-        Some(HEDGE_DELAY_MS_PLACE)
-    } else {
-        None
-    }
-}
-
-/// True if a POST /order reply is a server-side dedup rejection (400
-/// "Duplicated") — meaning the OTHER leg of the hedged pair already
-/// reached the server and created the order. The dedup-rejection
-/// reply must NOT be allowed to win the channel race: doing so makes
-/// the strategy mark the order Rejected, unregister the coid mapping,
-/// and lose track of the actual fill that the winning leg's accepted
-/// order goes on to receive (observed 1,033× / 7h17m on
-/// 2026-05-05 — every one of those coids subsequently saw an
-/// authoritative WS Trade Matched push for the same orderID).
-///
-/// Polymarket's body wording is `"order <oid> is invalid. Duplicated."`;
-/// match on the substring `"Duplicated"` to catch minor server-side
-/// rephrasings.
-fn is_dedup_reject_post(method: &reqwest::Method, path: &str, reply: &HttpReply) -> bool {
-    if method != reqwest::Method::POST || path != "/order" {
-        return false;
-    }
-    matches!(reply, Err(HttpErr::Status(400, body)) if body.contains("Duplicated"))
 }
 
 /// Execute a single authenticated POST/DELETE against the CLOB via the
@@ -1515,26 +1502,9 @@ impl SharedState {
     /// sequential calls of this method are dispatched concurrently on
     /// the runtime (HTTP/2 multiplexes them on a single TCP connection).
     ///
-    /// **Hedged retry**: when `(method, path)` is hedge-eligible, a
-    /// second identical request is fired on a different pool client
-    /// after a path-specific delay iff the primary hasn't replied yet.
-    /// First reply wins via a `bounded(1)` channel; the loser's
-    /// `try_send` is silently dropped on full/disconnected.
-    ///
-    /// Eligible paths and their delays (see `hedge_delay_ms`):
-    ///   * `DELETE /order`, `DELETE /orders` → 120 ms (cancel)
-    ///   * `POST /order`                      → 250 ms (place)
-    ///
-    /// Idempotency:
-    ///   * DELETE: already-cancelled orders return inside `not_canceled`
-    ///     with a benign reason — no double-cancel risk.
-    ///   * POST: the body is byte-identical between legs and contains
-    ///     the EIP-712-signed order params, so both legs hash to the
-    ///     same orderID; Polymarket dedupes server-side, the second
-    ///     leg lands as already-known. No double-fill risk.
-    /// `/cancel-all` is intentionally **not** hedged — it's a
-    /// session-shutdown / balance-error escape hatch and the heavier
-    /// payload doesn't benefit from racing.
+    /// Exactly one HTTP request is sent. Retries and speculative duplicate
+    /// requests are deliberately left to explicit reconciliation so place
+    /// and cancel traffic cannot be multiplied during an upstream slowdown.
     pub(crate) fn http_call_async(
         &self,
         method: &str,
@@ -1549,7 +1519,7 @@ impl SharedState {
     /// for callers whose traffic must stay distinguishable from real
     /// order flow on the same endpoints (the RTT probe's `probe_place` /
     /// `probe_cancel`). The override affects ONLY the CSV kind — stage
-    /// histogram, routing and hedging are untouched.
+    /// histogram and routing are untouched.
     pub(crate) fn http_call_async_rec(
         &self,
         method: &str,
@@ -1572,8 +1542,7 @@ impl SharedState {
         // we haven't categorised.
         let stage = http_stage(method.as_str(), path);
         // Per-request latency CSV: classify place / cancel once up-front
-        // (None ⇒ not recorded). Both legs tag the winning reply with
-        // this instance's id when recording is active.
+        // (None ⇒ not recorded).
         let rec_kind = rec_kind_override
             .or_else(|| latency_record_kind(method.as_str(), path));
         let t_start = crate::latency::Instant::now();
@@ -1583,35 +1552,17 @@ impl SharedState {
         let auth_path = path.split('?').next().unwrap_or(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
-        // Primary leg: sign + spawn now.
+        // Sign once and dispatch exactly one request.
         {
             let headers = self.auth.sign_request(method.as_str(), auth_path, body);
             let path_owned = path.to_string();
             let body_owned = body.to_string();
             let url_owned = url.clone();
             let method_owned = method.clone();
-            let tx_a = reply_tx.clone();
+            let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             async_rt::handle().spawn(async move {
                 let reply = execute_http(method_owned.clone(), url_owned, path_owned.clone(), headers, body_owned).await;
-                // POST /order dedup guard: if THIS leg lost the race to
-                // server (the hedge created the order first), the server
-                // returned 400 "Duplicated" — never let that reply win
-                // the channel, otherwise the strategy marks the order
-                // Rejected and forgets about the actual fill the winning
-                // leg's accepted order will receive. Drop the reply
-                // silently and let the OTHER leg's reply (or
-                // FAST_TIMEOUT → orphan reconciler) be the truth.
-                if is_dedup_reject_post(&method_owned, &path_owned, &reply) {
-                    log::debug!("[PolymarketTrade] Primary discarded Duplicated 400 (hedge won race)");
-                    return;
-                }
-                // try_send: succeeds iff this leg won the race.
-                // Full (hedge already sent) or Disconnected (caller dropped rx)
-                // are both benign — drop silently. Latency only recorded for
-                // the winner so the histogram reflects actual user-observed
-                // wall-clock RTT (from `t_start`, the moment the caller
-                // dispatched the request), not wasted hedge work.
                 // Capture the CSV status before `reply` is moved into the
                 // channel (only when we'll actually record).
                 let rec = rec_kind
@@ -1628,85 +1579,17 @@ impl SharedState {
             });
         }
 
-        // Hedge leg: spawn iff this is a hedge-eligible endpoint. Sleeps
-        // the path-specific delay (cancel: 120 ms; place: 250 ms) first;
-        // if the primary already won (channel full) its `try_send` will
-        // fail and we skip the actual HTTP call, saving one round-trip's
-        // worth of pool traffic.
-        //
-        // Place hedging is safe because Polymarket dedupes orders by
-        // EIP-712 orderID hash — the same `body` string contains the
-        // signed order params, so both legs hash to the same orderID,
-        // and the second arrival is rejected as already-known. Auth
-        // headers are re-signed (timestamp-bound) but the body itself
-        // is byte-identical between legs.
-        if let Some(delay_ms) = hedge_delay_ms(&method, path) {
-            let auth = self.auth.clone();
-            let method_b = method;
-            let path_b = path.to_string();
-            let auth_path_b = auth_path.to_string();
-            let body_b = body.to_string();
-            let url_b = url;
-            let tx_b = reply_tx;
-            let iid_b = self.instance_id.clone();
-            async_rt::handle().spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                // Channel full ⇒ primary already replied. Skip the hedge —
-                // no point spending a request slot on a doomed leg.
-                if tx_b.is_full() { return; }
-                // Re-sign: Polymarket auth signature is timestamp-bound, so
-                // the hedge needs its own headers (re-using primary's headers
-                // would risk the server rejecting on stale timestamp).
-                let headers_b = auth.sign_request(method_b.as_str(), &auth_path_b, &body_b);
-                let reply = execute_http(method_b.clone(), url_b, path_b.clone(), headers_b, body_b).await;
-                // POST /order dedup guard (mirror of the primary leg's
-                // check): the hedge can't be allowed to win with a 400
-                // Duplicated, otherwise the strategy mis-classifies an
-                // order the primary actually accepted as Rejected. See
-                // `is_dedup_reject_post`.
-                if is_dedup_reject_post(&method_b, &path_b, &reply) {
-                    log::debug!("[PolymarketTrade] Hedge discarded Duplicated 400 (primary won race) path={}", path_b);
-                    return;
-                }
-                let rec = rec_kind
-                    .filter(|_| crate::latency_record::is_active())
-                    .map(|k| (k, latency_record_status(&reply)));
-                if tx_b.try_send(reply).is_ok() {
-                    // Record from `t_start` (caller dispatch time), NOT from
-                    // post-sleep `Instant::now()`. The strategy's wall-clock
-                    // RTT for a hedge-won request is `delay_ms + hedge_http_rtt`
-                    // — recording only the post-sleep portion would understate
-                    // p95/p99 in the histogram and bias the BT calibrator
-                    // (`sim_latency_calibrate_from`) low by ~delay_ms on the
-                    // hedge-won fraction (~5% of slow tail).
-                    crate::latency::record(stage, t_start);
-                    if let Some((k, status)) = rec {
-                        crate::latency_record::record(
-                            &iid_b, k, t_start.elapsed().as_secs_f64() * 1000.0, status,
-                        );
-                    }
-                    log::debug!(
-                        "[PolymarketTrade] Hedged {} won path={} delay_ms={}",
-                        method_b, path_b, delay_ms,
-                    );
-                }
-            });
-        }
-
         reply_rx
     }
 
-    /// Admission-bound, **un-hedged** variant of [`Self::http_call_async`]:
+    /// Admission-bound variant of [`Self::http_call_async`]:
     /// dispatches the request on the exact `client` reserved by an
     /// [`crate::http1_pool::Permit`] (via [`execute_http_on`]) instead of a
-    /// round-robin pick. No hedge leg — hedging picks a *second* pool client,
-    /// which is incompatible with permit-bound dispatch and is re-introduced
-    /// (cancel-only, idle-only) at the admission layer. Returns immediately
-    /// with a receiver; the caller completes off-thread (fire-and-track).
+    /// round-robin pick. Returns immediately with a receiver; the caller
+    /// completes off-thread (fire-and-track).
     pub(crate) fn http_call_async_on(
         &self,
         client: crate::http1_pool::PooledClient,
-        hedge_client: Option<crate::http1_pool::PooledClient>,
         method: &str,
         path: &str,
         body: &str,
@@ -1727,24 +1610,19 @@ impl SharedState {
         let url = format!("{}{}", self.clob_base_url, path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
-        // Primary leg on the reserved connection.
+        // Single request on the reserved connection.
         {
             let headers = self.auth.sign_request(method.as_str(), path, body);
             let method_a = method.clone();
             let path_a = path.to_string();
             let body_a = body.to_string();
             let url_a = url.clone();
-            let tx_a = reply_tx.clone();
+            let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             async_rt::handle().spawn(async move {
                 let reply =
                     execute_http_on(client, method_a.clone(), url_a, path_a.clone(), headers, body_a)
                         .await;
-                // Mirror the hedged path's dedup guard so a stale server-side
-                // duplicate (e.g. a prior orphan retry) never wins as a Rejected.
-                if is_dedup_reject_post(&method_a, &path_a, &reply) {
-                    return;
-                }
                 let rec = rec_kind
                     .filter(|_| crate::latency_record::is_active())
                     .map(|k| (k, latency_record_status(&reply)));
@@ -1760,55 +1638,6 @@ impl SharedState {
                     }
                 }
             });
-        }
-
-        // Idle-gated hedge leg (component 3): fire ONLY when the caller
-        // supplied a *second* reserved connection — i.e. a warm connection
-        // was idle at admission time. Cancel-only by construction (only
-        // `cancel_fire` passes a hedge client; `submit_fire` passes `None`).
-        // No cold connection possible: the hedge races on an already-reserved
-        // warm connection, and if none was free the caller passed `None` and
-        // no hedge fires at all.
-        if let Some(hclient) = hedge_client {
-            let auth = self.auth.clone();
-            let method_b = method;
-            let path_b = path.to_string();
-            let body_b = body.to_string();
-            let url_b = url;
-            let tx_b = reply_tx;
-            let iid_b = self.instance_id.clone();
-            async_rt::handle().spawn(async move {
-                tokio::time::sleep(Duration::from_millis(HEDGE_DELAY_MS_CANCEL)).await;
-                // Primary already replied ⇒ skip the hedge round-trip.
-                if tx_b.is_full() {
-                    return;
-                }
-                let headers_b = auth.sign_request(method_b.as_str(), &path_b, &body_b);
-                let reply =
-                    execute_http_on(hclient, method_b.clone(), url_b, path_b.clone(), headers_b, body_b)
-                        .await;
-                if is_dedup_reject_post(&method_b, &path_b, &reply) {
-                    return;
-                }
-                let rec = rec_kind
-                    .filter(|_| crate::latency_record::is_active())
-                    .map(|k| (k, latency_record_status(&reply)));
-                if tx_b.try_send(reply).is_ok() {
-                    crate::latency::record(stage, t_start);
-                    if let Some((k, status)) = rec {
-                        crate::latency_record::record(
-                            &iid_b,
-                            k,
-                            t_start.elapsed().as_secs_f64() * 1000.0,
-                            status,
-                        );
-                    }
-                }
-            });
-        } else {
-            // No hedge: drop the extra sender so `reply_rx` disconnects
-            // promptly if the primary task dies.
-            drop(reply_tx);
         }
 
         reply_rx
@@ -1839,7 +1668,7 @@ impl SharedState {
         path: &str,
         body: &str,
     ) -> HttpReply {
-        self.http_call_async_on(client, None, method, path, body)
+        self.http_call_async_on(client, method, path, body)
             .recv()
             .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
     }
@@ -2060,16 +1889,10 @@ impl PolymarketTrade {
         })
     }
 
-    /// Spawn a heartbeat thread that, every `HEARTBEAT_INTERVAL`,
-    /// fires one `POST /heartbeats` per primary HTTP/2 client across
-    /// every role pool (FAST + CANCEL + RECONCILE + QUERY). Two jobs
-    /// in one:
-    ///   1. Keeps the CLOB session active so the server doesn't
-    ///      auto-cancel resting orders.
-    ///   2. Touches every TCP connection in every pool so reqwest's
-    ///      `pool_idle_timeout` doesn't evict a client that hasn't
-    ///      seen business traffic recently — preventing the next real
-    ///      place/cancel from paying a fresh TLS+h2 handshake.
+    /// Spawn an account heartbeat thread that sends one signed
+    /// `POST /heartbeats` every `HEARTBEAT_INTERVAL`. Connection pools are
+    /// warmed once by [`Self::prewarm_connections`]; heartbeats no longer fan
+    /// out across every client.
     /// Returns a join handle; the thread stops when `shutdown` is set.
     pub fn spawn_heartbeat(
         &self,
@@ -2101,122 +1924,102 @@ impl PolymarketTrade {
         self.shared.clone()
     }
 
-    /// Pre-warm every global-role and per-instance HTTP/1.1 client
-    /// concurrently. Each establishes a TLS socket that returns to its
-    /// reqwest pool on response, so the first real place/cancel/query/replay
-    /// request does not pay the connection setup cost.
+    /// Pre-warm transport pools once per process, then send one signed
+    /// heartbeat for this account.
+    ///
+    /// CLOB owns the hot place/cancel pools, so every CLOB client is warmed.
+    /// data-api and gamma are query-only and therefore warm only the global
+    /// Query role. Host groups are bounded and staggered to avoid startup 429s.
     pub fn prewarm_connections(&self) {
-        // Warm every role (including the global GapReplay role) and every
-        // per-instance pool against the three Polymarket hosts we hit on the
-        // hot path, plus the Polygon RPC, before the first real request.
         let start = std::time::Instant::now();
-        info!("[PolymarketTrade] Pre-warming h1.1 connections (clob/data-api/gamma-api + polygon-rpc)...");
+        let clob_base_url = self.shared.clob_base_url.clone();
+        TRANSPORT_PREWARMED.get_or_init(|| {
+            let clob_clients = crate::async_rt::http_clients_all();
+            let query_clients =
+                crate::http1_pool::clients_for_role(crate::http1_pool::Role::Query);
+            info!(
+                "[PolymarketTrade] Pre-warming transport once: clob={} data/gamma={} concurrency={} stagger={}ms",
+                clob_clients.len(),
+                query_clients.len(),
+                PREWARM_CONCURRENCY,
+                PREWARM_STAGGER_MS,
+            );
+            async_rt::block_on_runtime(async move {
+                prewarm_clients_staggered(
+                    "clob",
+                    clob_clients,
+                    format!("{}/time", clob_base_url.trim_end_matches('/')),
+                )
+                .await;
+                prewarm_clients_staggered(
+                    "data-api",
+                    query_clients.clone(),
+                    "https://data-api.polymarket.com/".into(),
+                )
+                .await;
+                prewarm_clients_staggered(
+                    "gamma-api",
+                    query_clients,
+                    "https://gamma-api.polymarket.com/".into(),
+                )
+                .await;
 
-        let auth = self.shared.auth.clone();
-        let heartbeat_headers = auth.sign_request("POST", "/heartbeats", "");
-        let clob_url = format!("{}{}", self.shared.clob_base_url, "/heartbeats");
-
-        // Warm every primary client against every Polymarket host in
-        // parallel. Each primary client owns its own connection pool,
-        // so a single GET / POST per (client, host) pair is enough to
-        // stand up the TLS session that subsequent real requests
-        // will reuse. Polygon RPC uses the auto (ALPN) client — one
-        // warmup is sufficient since it's a single client.
-        let primaries = crate::async_rt::http_clients_all().to_vec();
-        let n_primaries = primaries.len();
-        async_rt::block_on_runtime(async move {
-            // Warm the dedicated Polygon RPC client (the one on-chain reads
-            // actually use — formerly this warmed the retired ALPN client).
-            let rpc = super::onchain_tx::rpc_http_client().clone();
-            let h = heartbeat_headers;
-
-            let mut tasks: Vec<tokio::task::JoinHandle<(std::time::Duration, String, std::result::Result<u16, String>)>> =
-                Vec::with_capacity(n_primaries * 3 + 1);
-
-            for (idx, primary) in primaries.into_iter().enumerate() {
-                // CLOB: signed heartbeat (keeps API key active + warms h1.1).
-                let clob_url = clob_url.clone();
-                let h = h.clone();
-                let p = primary.clone();
-                tasks.push(tokio::spawn(async move {
-                    let t0 = std::time::Instant::now();
-                    let req = p.request(reqwest::Method::POST, &clob_url)
-                        .header("Content-Type", "application/json")
-                        .header("POLY_API_KEY", &h.api_key)
-                        .header("POLY_ADDRESS", &h.address)
-                        .header("POLY_SIGNATURE", &h.signature)
-                        .header("POLY_TIMESTAMP", &h.timestamp)
-                        .header("POLY_PASSPHRASE", &h.passphrase);
-                    let r = send_and_drain(req).await;
-                    (
-                        t0.elapsed(),
-                        format!("clob[{}]", idx),
-                        r.map_err(|e| e.to_string()),
-                    )
-                }));
-
-                // data-api: cheap unauth GET.
-                let p = primary.clone();
-                tasks.push(tokio::spawn(async move {
-                    let t0 = std::time::Instant::now();
-                    let r = send_and_drain(
-                        p.get("https://data-api.polymarket.com/")
-                    ).await;
-                    (
-                        t0.elapsed(),
-                        format!("data-api[{}]", idx),
-                        r.map_err(|e| e.to_string()),
-                    )
-                }));
-
-                // gamma-api: cheap unauth GET.
-                let p = primary.clone();
-                tasks.push(tokio::spawn(async move {
-                    let t0 = std::time::Instant::now();
-                    let r = send_and_drain(
-                        p.get("https://gamma-api.polymarket.com/")
-                    ).await;
-                    (
-                        t0.elapsed(),
-                        format!("gamma-api[{}]", idx),
-                        r.map_err(|e| e.to_string()),
-                    )
-                }));
-            }
-
-            // Polygon RPC: tiny eth_chainId call via the dedicated RPC client.
-            tasks.push(tokio::spawn(async move {
-                let t0 = std::time::Instant::now();
+                let rpc = super::onchain_tx::rpc_http_client().clone();
                 let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
                 let url = std::env::var("POLYGON_RPC")
                     .ok()
-                    .filter(|s| !s.is_empty())
+                    .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
-                let r = send_and_drain(rpc.post(&url)
-                    .header("Content-Type", "application/json")
-                    .body(body)).await;
-                (
-                    t0.elapsed(),
-                    "polygon-rpc".to_string(),
-                    r.map_err(|e| e.to_string()),
+                match send_and_drain(
+                    rpc.post(&url)
+                        .header("Content-Type", "application/json")
+                        .body(body),
                 )
-            }));
-
-            for j in tasks {
-                if let Ok((dur, host, res)) = j.await {
-                    match res {
-                        Ok(status) => info!(
-                            "[PolymarketTrade] Pre-warm {} → {} ({}ms)",
-                            host, status, dur.as_millis(),
-                        ),
-                        Err(e) => warn!(
-                            "[PolymarketTrade] Pre-warm {} failed: {} ({}ms)",
-                            host, e, dur.as_millis(),
-                        ),
+                .await
+                {
+                    Ok(status) if (200..400).contains(&status) => {
+                        info!("[PolymarketTrade] Pre-warm polygon-rpc ok")
+                    }
+                    Ok(status) => {
+                        warn!("[PolymarketTrade] Pre-warm polygon-rpc HTTP {}", status)
+                    }
+                    Err(error) => {
+                        warn!("[PolymarketTrade] Pre-warm polygon-rpc failed: {}", error)
                     }
                 }
-            }
+            });
         });
+
+        // Heartbeat is account-scoped, but connection warming is not. Send
+        // exactly one signed request per account instead of one per client.
+        let auth = self.shared.auth.clone();
+        let headers = auth.sign_request("POST", "/heartbeats", "");
+        let heartbeat_url =
+            format!("{}/heartbeats", self.shared.clob_base_url.trim_end_matches('/'));
+        let client = crate::async_rt::http_client_query();
+        let heartbeat_status = async_rt::block_on_runtime(async move {
+            let mut request = client
+                .post(&heartbeat_url)
+                .header("Content-Type", "application/json")
+                .body(String::new());
+            for (name, value) in headers.as_pairs() {
+                request = request.header(name, value);
+            }
+            send_and_drain(request).await
+        });
+        match heartbeat_status {
+            Ok(status) if (200..400).contains(&status) => {
+                info!("[PolymarketTrade] Account heartbeat pre-warm ok")
+            }
+            Ok(status) => warn!(
+                "[PolymarketTrade] Account heartbeat pre-warm HTTP {}",
+                status,
+            ),
+            Err(error) => warn!(
+                "[PolymarketTrade] Account heartbeat pre-warm failed: {}",
+                error,
+            ),
+        }
         info!(
             "[PolymarketTrade] Pre-warm complete ({:.0}ms total)",
             start.elapsed().as_secs_f64() * 1000.0,
@@ -3388,10 +3191,9 @@ impl PolymarketTrade {
         client: crate::http1_pool::PooledClient,
     ) -> std::result::Result<PendingSubmit, OrderUpdate> {
         let (local_oid, body_str) = self.submit_prep(order)?;
-        // Places never hedge (idempotency + connection-pressure): `None`.
         let rx = self
             .shared
-            .http_call_async_on(client, None, "POST", "/order", &body_str);
+            .http_call_async_on(client, "POST", "/order", &body_str);
         Ok(PendingSubmit { local_oid, rx })
     }
 
@@ -3405,21 +3207,18 @@ impl PolymarketTrade {
         self.handle_submit_reply(order, &local_oid, reply)
     }
 
-    /// Fire-and-track cancel: sync prep + dispatch on the permit-bound
-    /// `client`. `hedge_client` is `Some` iff a *second* Cancel connection
-    /// was idle at admission (component 3 idle-gate) — the cancel then races
-    /// a hedge on that reserved connection; `None` = no hedge. `PendingCancel
-    /// .rx == None` when the coid had no local orderID (nothing to send).
+    /// Fire-and-track cancel: sync prep + exactly one dispatch on the
+    /// permit-bound `client`. `PendingCancel.rx == None` when the coid had
+    /// no local orderID (nothing to send).
     pub fn cancel_fire(
         &mut self,
         client_order_id: &str,
         client: crate::http1_pool::PooledClient,
-        hedge_client: Option<crate::http1_pool::PooledClient>,
     ) -> PendingCancel {
         let (ctx, body) = self.cancel_prep(client_order_id);
         let rx = body.map(|body_str| {
             self.shared
-                .http_call_async_on(client, hedge_client, "DELETE", "/order", &body_str)
+                .http_call_async_on(client, "DELETE", "/order", &body_str)
         });
         PendingCancel { ctx, rx }
     }
