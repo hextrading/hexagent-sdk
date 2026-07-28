@@ -23,7 +23,32 @@ use crate::types::*;
 
 const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 /// Per-task read-side stall watchdog — see binance/market.rs.
+///
+/// `STALE_THRESHOLD` bounds the RAW-frame read and is defeated the same way the
+/// CLOB one is: the server answers our 5 s `ping` with `PONG`, `record_raw_frame`
+/// runs before the `PONG` branch, so a heartbeat responder outliving the price
+/// feed keeps this timer green forever. `RTDS_TOPIC_STALL_THRESHOLD` bounds the
+/// age of the last `crypto_prices_chainlink` frame instead.
+///
+/// 90 s, measured over 2026-07-21..07-28 (1,692,788 frames, btc/eth/sol merged,
+/// `scripts/cmp_rtds_topic_gaps.py` in the hexbot repo):
+///
+///   p50 0.11s · p90 1.04s · p99 1.66s · p99.9 2.42s · p99.99 8.59s
+///   gaps >= 20s: 139 total — 1 in [20,30), 8 in [30,45), 2 in [45,60),
+///                5 in [60,90), **0 in [90,115)**, 122 in [121.4,124.7], 1 huge
+///
+/// The [90,115) bucket is EMPTY, and the 122-strong cluster at ~122.4 s is the
+/// engine's own 120 s chainlink data-timeout reconnecting (120 s + ~2.4 s to
+/// re-establish). Read together: on this feed, silence that reaches 90 s has
+/// never once recovered on its own — it recovers only when someone reconnects.
+/// So a 90 s topic watchdog costs zero false trips on that week and recovers
+/// each incident ~30 s sooner than the engine backstop does.
+///
+/// Unlike the CLOB watchdog this one needs NO subscription gate: RTDS has no
+/// between-events quiet period to protect (p99.99 is 8.6 s), so any 90 s of
+/// silence is anomalous by construction.
 const STALE_THRESHOLD: Duration = Duration::from_secs(60);
+const RTDS_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct ChainlinkMarket {
@@ -152,6 +177,19 @@ async fn chainlink_ws_task(
                             "[Chainlink] RTDS BTC price gap; {}",
                             health.rtds_summary(now),
                         );
+                    }
+                    // Topic-level stall watchdog. No subscription gate — see
+                    // RTDS_TOPIC_STALL_THRESHOLD: this feed has no legitimate
+                    // 90 s quiet period, and silence that deep has never been
+                    // observed to self-heal.
+                    if health.topic_is_stale(now, RTDS_TOPIC_STALL_THRESHOLD) {
+                        warn!(
+                            "[Chainlink] RTDS no topic frame for {:.0}s (topic stall watchdog) \
+                             — reconnecting; {}",
+                            RTDS_TOPIC_STALL_THRESHOLD.as_secs_f64(),
+                            health.rtds_summary(now),
+                        );
+                        break;
                     }
                 }
                 read_result = tokio::time::timeout(STALE_THRESHOLD, read.next()) => {
