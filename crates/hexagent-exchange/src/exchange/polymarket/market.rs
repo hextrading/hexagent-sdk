@@ -28,7 +28,21 @@ const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 /// to cover quiet periods between events without false-tripping.
 /// RTDS streams (spot prices) push ~10 Hz when subscribed; 30 s of
 /// silence is plenty anomalous.
+///
+/// `CLOB_STALE_THRESHOLD` bounds the RAW-frame read: it only fires when
+/// the socket delivers nothing at all. That is necessary but not
+/// sufficient — the server answers our 5 s `PING` with `PONG`, and a
+/// `PONG` is a raw frame, so this timer is reset every 5 s for as long
+/// as the server's heartbeat responder is alive. A CLOB feed whose
+/// market data has frozen while its heartbeat keeps answering is
+/// therefore INVISIBLE to it. `CLOB_TOPIC_STALL_THRESHOLD` closes that
+/// hole by bounding the age of the last TOPIC frame (book / trade /
+/// price change) instead. Same 90 s for the same reason — it must clear
+/// the quiet stretch between events — and it stays above the engine's
+/// own 45 s Polymarket data-timeout, so the engine remains the first
+/// responder and this is the backstop it was always documented to be.
 const CLOB_STALE_THRESHOLD: Duration = Duration::from_secs(90);
+const CLOB_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
@@ -1099,6 +1113,32 @@ async fn clob_ws_task(
                             "[Polymarket] CLOB topic silent; {}",
                             health.transport_summary(now),
                         );
+                    }
+                    // Topic-level stall watchdog. Only meaningful while we
+                    // actually hold event tokens: between events the CLOB is
+                    // legitimately silent, which is exactly why the engine
+                    // gates its own data-timeout on `has_active_subscription()`.
+                    // `has_complete_clob_subscription` is the in-task equivalent
+                    // of that check, so reuse it rather than churning the socket
+                    // every 90 s while nothing is trading.
+                    if has_complete_clob_subscription(&tokens)
+                        && health.topic_is_stale(now, CLOB_TOPIC_STALL_THRESHOLD)
+                    {
+                        announce_clob_not_ready(
+                            &event_tx,
+                            &mut lifecycle,
+                            format!(
+                                "CLOB no topic frame for {:.0}s",
+                                CLOB_TOPIC_STALL_THRESHOLD.as_secs_f64(),
+                            ),
+                        );
+                        warn!(
+                            "[Polymarket] CLOB no topic frame for {:.0}s (topic stall watchdog) \
+                             — reconnecting; {}",
+                            CLOB_TOPIC_STALL_THRESHOLD.as_secs_f64(),
+                            health.transport_summary(now),
+                        );
+                        break;
                     }
                 }
 
