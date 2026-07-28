@@ -300,4 +300,31 @@ mod tests {
         assert!(summary.contains("last_topic_frame=7.0s_ago"));
         assert!(summary.contains("last_btc_price=6.0s_ago"));
     }
+
+    /// A heartbeat responder that outlives the market-data feed must NOT read
+    /// as liveness. This is the exact shape of the 2026-06-24 Polymarket CLOB
+    /// freeze: `PONG` kept arriving every 5 s (so the raw-frame clock never
+    /// aged past its 90 s bound) while no book or trade frame landed for 37
+    /// minutes. Only the topic clock can see that, which is why the CLOB task
+    /// reconnects on `topic_is_stale` and not on raw-frame silence alone.
+    #[test]
+    fn pongs_do_not_mask_a_topic_stall() {
+        let start = Instant::now();
+        let mut health = WsHealth::new(start);
+        health.record_topic_frame(start);
+
+        // 5 s heartbeat answered for 10 minutes; no topic frame after t=0.
+        let mut now = start;
+        for _ in 0..120 {
+            now += Duration::from_secs(5);
+            health.record_raw_frame(now);
+            health.record_pong(now);
+        }
+
+        // Raw-frame clock is fresh — a read-timeout watchdog sees nothing wrong.
+        assert_eq!(health.age(health.last_raw_frame, now), Duration::ZERO);
+        // Topic clock is 10 minutes old — the stall is visible here and only here.
+        assert!(health.topic_is_stale(now, Duration::from_secs(90)));
+        assert!(!health.topic_is_stale(start + Duration::from_secs(89), Duration::from_secs(90)));
+    }
 }
