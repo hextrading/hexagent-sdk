@@ -1928,8 +1928,9 @@ impl PolymarketTrade {
     /// heartbeat for this account.
     ///
     /// CLOB owns the hot place/cancel pools, so every CLOB client is warmed.
-    /// data-api and gamma are query-only and therefore warm only the global
-    /// Query role. Host groups are bounded and staggered to avoid startup 429s.
+    /// data-api is query-only and therefore warms only the global Query role.
+    /// Gamma is deliberately demand-driven: its ordinary client may reuse a
+    /// recent connection, but receives no prewarm or keep-warm traffic.
     pub fn prewarm_connections(&self) {
         let start = std::time::Instant::now();
         let clob_base_url = self.shared.clob_base_url.clone();
@@ -1938,7 +1939,7 @@ impl PolymarketTrade {
             let query_clients =
                 crate::http1_pool::clients_for_role(crate::http1_pool::Role::Query);
             info!(
-                "[PolymarketTrade] Pre-warming transport once: clob={} data/gamma={} concurrency={} stagger={}ms",
+                "[PolymarketTrade] Pre-warming transport once: clob={} data-api={} concurrency={} stagger={}ms",
                 clob_clients.len(),
                 query_clients.len(),
                 PREWARM_CONCURRENCY,
@@ -1953,14 +1954,8 @@ impl PolymarketTrade {
                 .await;
                 prewarm_clients_staggered(
                     "data-api",
-                    query_clients.clone(),
-                    "https://data-api.polymarket.com/".into(),
-                )
-                .await;
-                prewarm_clients_staggered(
-                    "gamma-api",
                     query_clients,
-                    "https://gamma-api.polymarket.com/".into(),
+                    "https://data-api.polymarket.com/".into(),
                 )
                 .await;
             });

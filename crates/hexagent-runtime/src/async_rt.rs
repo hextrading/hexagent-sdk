@@ -38,7 +38,7 @@
 //!         hot-path budget so that a brief server wobble doesn't re-orphan
 //!         the order we're trying to resolve.
 //!       * `HTTP_CLIENTS_QUERY`   — everything else: data-api snapshots,
-//!         gamma-api, /positions, wallet relayer, heartbeats. 5 s
+//!         /positions, wallet relayer, heartbeats. 5 s
 //!         timeout — these responses can be large
 //!         (positions, open orders) and aren't latency-critical.
 //!       * `HTTP_CLIENTS_GAP_REPLAY` — authenticated Polymarket /trades
@@ -338,7 +338,7 @@ pub fn blocking_get_text(url: &str) -> Result<String> {
 /// (capped at 30 s per sleep). With defaults `attempts=5,
 /// base_backoff_ms=200` total wait before giving up is roughly
 /// 200 + 400 + 800 + 1600 + 3200 ≈ 6.2 s — long enough to ride out
-/// brief gamma-api 500s without permanently stalling the caller.
+/// brief upstream 500s without permanently stalling the caller.
 pub fn blocking_get_text_retry(
     url: &str,
     attempts: u32,
