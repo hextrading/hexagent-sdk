@@ -1963,30 +1963,6 @@ impl PolymarketTrade {
                     "https://gamma-api.polymarket.com/".into(),
                 )
                 .await;
-
-                let rpc = super::onchain_tx::rpc_http_client().clone();
-                let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
-                let url = std::env::var("POLYGON_RPC")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
-                match send_and_drain(
-                    rpc.post(&url)
-                        .header("Content-Type", "application/json")
-                        .body(body),
-                )
-                .await
-                {
-                    Ok(status) if (200..400).contains(&status) => {
-                        info!("[PolymarketTrade] Pre-warm polygon-rpc ok")
-                    }
-                    Ok(status) => {
-                        warn!("[PolymarketTrade] Pre-warm polygon-rpc HTTP {}", status)
-                    }
-                    Err(error) => {
-                        warn!("[PolymarketTrade] Pre-warm polygon-rpc failed: {}", error)
-                    }
-                }
             });
         });
 

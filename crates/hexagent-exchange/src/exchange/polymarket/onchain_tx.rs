@@ -571,19 +571,18 @@ pub(super) fn polygon_rpc_urls() -> Result<Vec<String>> {
     Ok(urls)
 }
 
-/// Dedicated RPC HTTP client with timeouts bigger than the shared
-/// h1.1 pools. On Polygon, public RPCs occasionally take >800 ms just
-/// to accept the TCP connection, and a full JSON-RPC round trip can
-/// take 2-3 seconds on contested endpoints — the pool budgets
-/// (connect 2 s, total ≤5 s) are too aggressive here.
-pub(crate) fn rpc_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // h1.1-only via the shared pool builder (HTTP/2 is gone from the
-        // codebase; every public RPC speaks h1.1), with RPC-sized budgets.
-        crate::http1_pool::build_client(Duration::from_secs(15), Duration::from_secs(5))
-            .expect("build rpc http client")
-    })
+/// Build an ephemeral Polygon RPC client. RPC is maintenance traffic, not a
+/// quoting hot path: it is intentionally excluded from startup prewarm and
+/// keeps no idle/TCP-alive connection after a request.
+fn rpc_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .expect("build ephemeral rpc http client")
 }
 
 /// Flatten an error + its `source()` chain into one line. Without this,
@@ -627,7 +626,7 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
         "id": 1,
     }).to_string();
 
-    let client = rpc_http_client().clone();
+    let client = rpc_http_client();
     const MAX_TRANSIENT_ATTEMPTS: usize = 3;
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -654,6 +653,7 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
             let result: Result<serde_json::Value> = crate::async_rt::block_on_runtime(async move {
                 let resp = match client_cl.post(&url_cl)
                     .header("Content-Type", "application/json")
+                    .header(reqwest::header::CONNECTION, "close")
                     .body(body_cl)
                     .send().await
                 {
