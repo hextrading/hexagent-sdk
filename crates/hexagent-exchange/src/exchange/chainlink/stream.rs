@@ -12,7 +12,7 @@
 //! Emits MarketEvent::SpotPrice with source = "chainlink_stream".
 
 use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use log::{info, warn};
 use sha2::{Sha256, Digest};
@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::exchange::ExchangeMarket;
+use crate::exchange::{ws_send, ExchangeMarket, WS_CONNECT_TIMEOUT};
 use crate::types::*;
 
 const DEFAULT_WS_URL: &str = "wss://ws.dataengine.chain.link";
@@ -132,11 +132,25 @@ async fn chainlink_stream_ws_task(
             Err(e) => { warn!("[ChainlinkStream] bad sig header: {}", e); continue; }
         }
 
-        let (stream, response) = match tokio_tungstenite::connect_async(request).await {
-            Ok(v) => v,
-            Err(e) => {
+        let (stream, response) = match tokio::time::timeout(
+            WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(request),
+        ).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 let delay = backoff.next_delay();
                 warn!("[ChainlinkStream] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(_) => {
+                let delay = backoff.next_delay();
+                warn!(
+                    "[ChainlinkStream] WS connect stalled >{:.0}s (TLS handshake never \
+                     completed), retry in {:.1}s",
+                    WS_CONNECT_TIMEOUT.as_secs_f64(),
+                    delay.as_secs_f64(),
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -162,7 +176,7 @@ async fn chainlink_stream_ws_task(
             tokio::select! {
                 biased;
                 _ = ping_interval.tick() => {
-                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                    if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
                         warn!("[ChainlinkStream] Ping send failed: {}", e);
                         break;
                     }
@@ -182,7 +196,7 @@ async fn chainlink_stream_ws_task(
                         Message::Binary(data) => serde_json::from_slice(&data).ok(),
                         Message::Text(text) => serde_json::from_str(&text).ok(),
                         Message::Ping(payload) => {
-                            let _ = write.send(Message::Pong(payload)).await;
+                            let _ = ws_send(&mut write, Message::Pong(payload)).await;
                             None
                         }
                         Message::Close(reason) => {

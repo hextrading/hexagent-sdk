@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
+    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
     POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
-    POLYMARKET_WS_HEARTBEAT_INTERVAL,
+    POLYMARKET_WS_HEARTBEAT_INTERVAL, WS_CONNECT_TIMEOUT,
 };
 use crate::types::*;
 
@@ -994,9 +994,12 @@ async fn clob_ws_task(
         }
 
         info!("[Polymarket] Connecting to {} ({} tokens)", POLYMARKET_WS_URL, tokens.len());
-        let stream = match tokio_tungstenite::connect_async(POLYMARKET_WS_URL).await {
-            Ok((s, _)) => s,
-            Err(e) => {
+        let stream = match tokio::time::timeout(
+            WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(POLYMARKET_WS_URL),
+        ).await {
+            Ok(Ok((s, _))) => s,
+            Ok(Err(e)) => {
                 announce_clob_not_ready(
                     &event_tx,
                     &mut lifecycle,
@@ -1004,6 +1007,25 @@ async fn clob_ws_task(
                 );
                 let delay = backoff.next_delay();
                 warn!("[Polymarket] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(_) => {
+                announce_clob_not_ready(
+                    &event_tx,
+                    &mut lifecycle,
+                    format!(
+                        "WS connect stalled >{:.0}s",
+                        WS_CONNECT_TIMEOUT.as_secs_f64(),
+                    ),
+                );
+                let delay = backoff.next_delay();
+                warn!(
+                    "[Polymarket] WS connect stalled >{:.0}s (TLS handshake never \
+                     completed), retry in {:.1}s",
+                    WS_CONNECT_TIMEOUT.as_secs_f64(),
+                    delay.as_secs_f64(),
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -1021,7 +1043,7 @@ async fn clob_ws_task(
             "assets_ids": tokens,
             "custom_feature_enabled": true,
         });
-        if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
+        if let Err(e) = ws_send(&mut write, Message::Text(sub_msg.to_string())).await {
             announce_clob_not_ready(
                 &event_tx,
                 &mut lifecycle,
@@ -1067,7 +1089,7 @@ async fn clob_ws_task(
                                 "CLOB resubscribe requested",
                             );
                             info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", tokens.len());
-                            let _ = write.send(Message::Close(None)).await;
+                            let _ = ws_send(&mut write, Message::Close(None)).await;
                             continue 'outer;
                         }
                         Some(WsCtrl::Shutdown) | None => break 'outer,
@@ -1078,7 +1100,7 @@ async fn clob_ws_task(
                     let now = Instant::now();
                     // Send both the CLOB application-level text heartbeat and
                     // a WebSocket protocol Ping frame every 5s.
-                    if let Err(e) = write.send(Message::Text("PING".to_string())).await {
+                    if let Err(e) = ws_send(&mut write, Message::Text("PING".to_string())).await {
                         announce_clob_not_ready(
                             &event_tx,
                             &mut lifecycle,
@@ -1091,7 +1113,7 @@ async fn clob_ws_task(
                         );
                         break;
                     }
-                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                    if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
                         announce_clob_not_ready(
                             &event_tx,
                             &mut lifecycle,
@@ -1204,7 +1226,7 @@ async fn clob_ws_task(
                                 continue;
                             }
                             if body.eq_ignore_ascii_case("PING") {
-                                let _ = write.send(Message::Text("PONG".to_string())).await;
+                                let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
                                 continue;
                             }
                             health.record_topic_frame(received_at);
@@ -1237,7 +1259,7 @@ async fn clob_ws_task(
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
                         }
                         Message::Ping(payload) => {
-                            let _ = write.send(Message::Pong(payload)).await;
+                            let _ = ws_send(&mut write, Message::Pong(payload)).await;
                         }
                         Message::Pong(_) => {
                             health.record_pong(received_at);
@@ -1307,7 +1329,12 @@ async fn rtds_connect_and_run(
     shutdown: &AtomicBool,
 ) -> Result<()> {
     info!("[RTDS] Connecting to {}", POLYMARKET_RTDS_URL);
-    let (stream, _) = tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL).await?;
+    let (stream, _) = tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL),
+    )
+    .await
+    .map_err(|_| anyhow!("RTDS connect stalled >{:.0}s", WS_CONNECT_TIMEOUT.as_secs_f64()))??;
     let (mut write, mut read) = stream.split();
     let mut health = WsHealth::new(Instant::now());
     let monitors_btc = subscriptions.iter().any(|rtds| {
@@ -1341,7 +1368,9 @@ async fn rtds_connect_and_run(
         "subscriptions": subs,
     });
     info!("[RTDS] Subscribe: {}", msg);
-    write.send(Message::Text(msg.to_string())).await?;
+    ws_send(&mut write, Message::Text(msg.to_string()))
+        .await
+        .map_err(|e| anyhow!("RTDS subscribe failed: {}", e))?;
 
     info!("[RTDS] Connected, {} subscriptions", subscriptions.len());
 
@@ -1368,7 +1397,7 @@ async fn rtds_connect_and_run(
                         health.rtds_summary(now),
                     ));
                 }
-                if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
                     return Err(anyhow!(
                         "RTDS frame Ping send failed: {}; {}",
                         e,
@@ -1426,7 +1455,7 @@ async fn rtds_connect_and_run(
                 health.record_raw_frame(received_at);
                 match msg {
                     Message::Ping(payload) => {
-                        let _ = write.send(Message::Pong(payload)).await;
+                        let _ = ws_send(&mut write, Message::Pong(payload)).await;
                     }
                     Message::Pong(_) => {
                         health.record_pong(received_at);
@@ -1447,7 +1476,7 @@ async fn rtds_connect_and_run(
                             continue;
                         }
                         if body.eq_ignore_ascii_case("PING") {
-                            let _ = write.send(Message::Text("PONG".to_string())).await;
+                            let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
                             continue;
                         }
                         // simd-json drop-in — same Value output, SIMD parse.
