@@ -956,7 +956,7 @@ fn gamma_public_profile_proxy(address: &str) -> Option<String> {
     const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
                       AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
     let url = format!("{}/public-profile?address={}", GAMMA_API, address);
-    let client = crate::async_rt::http_client();
+    let client = super::market::gamma_http_client();
     let res: Result<Option<String>> = crate::async_rt::block_on_runtime(async move {
         let resp = client.get(&url).header("User-Agent", UA).send().await
             .map_err(|e| anyhow!("gamma public-profile GET: {}", e))?;

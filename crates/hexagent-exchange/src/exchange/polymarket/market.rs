@@ -4,7 +4,7 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -19,6 +19,79 @@ const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/m
 const POLYMARKET_RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+const GAMMA_EVENT_CACHE_TTL: Duration = Duration::from_secs(120);
+const GAMMA_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Gamma is control-plane traffic (startup metadata and event rotation), not
+/// an order-path service. Keep one ordinary client for opportunistic HTTP/1.1
+/// reuse, but do not pre-warm it or enable TCP keepalive. An idle connection
+/// naturally leaves the pool after 90 seconds.
+pub(crate) fn gamma_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .http1_only()
+                .pool_idle_timeout(GAMMA_HTTP_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(2)
+                .tcp_nodelay(true)
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .expect("build Gamma HTTP client")
+        })
+        .clone()
+}
+
+/// Gamma GET with the same transient-error policy used previously:
+/// retry network/body errors plus 408/425/429/5xx with exponential backoff.
+pub(crate) fn gamma_get_text_retry(
+    url: &str,
+    attempts: u32,
+    base_backoff_ms: u64,
+) -> Result<String> {
+    let url = url.to_string();
+    let attempts = attempts.max(1);
+    let client = gamma_http_client();
+    crate::async_rt::block_on_runtime(async move {
+        let mut last_err: Option<anyhow::Error> = None;
+        for i in 0..attempts {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.text().await {
+                            Ok(body) => return Ok(body),
+                            Err(e) => {
+                                last_err = Some(anyhow!("GET {} read body: {}", url, e));
+                            }
+                        }
+                    } else {
+                        let retriable = matches!(status.as_u16(), 408 | 425 | 429)
+                            || status.is_server_error();
+                        if !retriable || i + 1 == attempts {
+                            return Err(anyhow!("GET {} returned {}", url, status));
+                        }
+                        last_err = Some(anyhow!("GET {} returned {}", url, status));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("GET {} failed: {}", url, e));
+                }
+            }
+
+            if i + 1 < attempts {
+                let exp = i.min(7);
+                let delay_ms = base_backoff_ms
+                    .saturating_mul(1u64 << exp)
+                    .min(30_000);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("GET {} failed after {} attempts", url, attempts)))
+    })
+}
 
 /// Per-task read-side stall watchdogs. CLOB book diffs + trade ticks
 /// arrive frequently during active markets but go quiet when there's
@@ -212,6 +285,89 @@ impl PolymarketEvent {
     }
 }
 
+#[derive(Clone)]
+struct CachedGammaEvent {
+    series_id: String,
+    event: PolymarketEvent,
+    cached_at: Instant,
+}
+
+/// Process-wide cache keyed by Gamma event id. `fetch_next_event` callers do
+/// not know that id in advance, so lookups scan the small live set by series
+/// and end-date threshold. There is intentionally no in-flight/singleflight
+/// state: simultaneous first misses may each call Gamma, while every completed
+/// result is immediately reusable by the other accounts and by rotation.
+static GAMMA_EVENT_CACHE: OnceLock<Mutex<HashMap<String, CachedGammaEvent>>> = OnceLock::new();
+
+fn gamma_event_cache() -> &'static Mutex<HashMap<String, CachedGammaEvent>> {
+    GAMMA_EVENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_entry_is_fresh(entry: &CachedGammaEvent, now: Instant) -> bool {
+    now.checked_duration_since(entry.cached_at)
+        .map(|age| age <= GAMMA_EVENT_CACHE_TTL)
+        .unwrap_or(false)
+}
+
+fn cache_gamma_events_at(
+    cache: &Mutex<HashMap<String, CachedGammaEvent>>,
+    series_id: &str,
+    events: &[PolymarketEvent],
+    now: Instant,
+) {
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
+    for event in events {
+        if event.id.is_empty() {
+            continue;
+        }
+        cache.insert(
+            event.id.clone(),
+            CachedGammaEvent {
+                series_id: series_id.to_string(),
+                event: event.clone(),
+                cached_at: now,
+            },
+        );
+    }
+}
+
+fn cache_gamma_events(series_id: &str, events: &[PolymarketEvent]) {
+    cache_gamma_events_at(gamma_event_cache(), series_id, events, Instant::now());
+}
+
+fn cached_gamma_event_after_at(
+    cache: &Mutex<HashMap<String, CachedGammaEvent>>,
+    series_id: &str,
+    end_date_min_secs: u64,
+    now: Instant,
+) -> Option<PolymarketEvent> {
+    let min_end_ns = end_date_min_secs.saturating_mul(1_000_000_000);
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
+    cache
+        .values()
+        .filter(|entry| entry.series_id == series_id)
+        .filter_map(|entry| {
+            let end_ns = parse_date_ns(&entry.event.end_date).ok()?;
+            (end_ns > min_end_ns).then_some((end_ns, entry.event.clone()))
+        })
+        .min_by_key(|(end_ns, _)| *end_ns)
+        .map(|(_, event)| event)
+}
+
+fn cached_gamma_event_after(
+    series_id: &str,
+    end_date_min_secs: u64,
+) -> Option<PolymarketEvent> {
+    cached_gamma_event_after_at(
+        gamma_event_cache(),
+        series_id,
+        end_date_min_secs,
+        Instant::now(),
+    )
+}
+
 /// Parse an ISO 8601 date string to nanoseconds since epoch.
 fn parse_date_ns(date_str: &str) -> Result<u64> {
     let dt = chrono::DateTime::parse_from_rfc3339(date_str)
@@ -238,7 +394,7 @@ pub fn fetch_event_by_slug_with_log(slug: &str, log: bool) -> Result<PolymarketE
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
     // permanently stalling the subscribe / maintenance path.
-    let resp_text = crate::async_rt::blocking_get_text_retry(&url, 5, 200)?;
+    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
     if log {
         info!("[Polymarket] Gamma API response (first 500 chars): {}", &resp_text[..resp_text.len().min(500)]);
     }
@@ -292,7 +448,7 @@ fn fetch_series_id(series_slug: &str) -> Result<String> {
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
     // permanently stalling the subscribe / maintenance path.
-    let resp_text = crate::async_rt::blocking_get_text_retry(&url, 5, 200)?;
+    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
     let series_list: Vec<PolymarketSeries> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse series response: {}", e))?;
 
@@ -340,10 +496,11 @@ fn fetch_active_events_by_series_id(
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
     // permanently stalling the subscribe / maintenance path.
-    let resp_text = crate::async_rt::blocking_get_text_retry(&url, 5, 200)?;
+    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
     let events: Vec<PolymarketEvent> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse events response: {}", e))?;
 
+    cache_gamma_events(series_id, &events);
     info!("[Polymarket] Found {} active events in series", events.len());
     Ok(events)
 }
@@ -529,6 +686,14 @@ pub fn fetch_next_event(
     series_id: &str,
     end_date_min_secs: u64,
 ) -> Result<Option<PolymarketEvent>> {
+    if let Some(event) = cached_gamma_event_after(series_id, end_date_min_secs) {
+        info!(
+            "[Polymarket] Next event cache hit: series_id={} id={} slug={}",
+            series_id, event.id, event.slug,
+        );
+        return Ok(Some(event));
+    }
+
     // Polymarket gamma API accepts RFC3339 / ISO8601 for `end_date_min`.
     let end_min_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(end_date_min_secs as i64, 0)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -542,10 +707,11 @@ pub fn fetch_next_event(
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
     // permanently stalling the subscribe / maintenance path.
-    let resp_text = crate::async_rt::blocking_get_text_retry(&url, 5, 200)?;
+    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
     let events: Vec<PolymarketEvent> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse next-event response: {}", e))?;
 
+    cache_gamma_events(series_id, &events);
     let Some(event) = events.into_iter().next() else {
         info!("[Polymarket] Next event: <none> (no event with end_date ≥ {})", end_min_iso);
         return Ok(None);
@@ -577,6 +743,16 @@ pub fn fetch_next_event_condition_id(
 
 /// Fetch the currently trading event using a cached series_id (rotation calls).
 fn fetch_active_event_by_series_id(series_id: &str, series_slug: &str) -> Result<PolymarketEvent> {
+    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    let end_date_min_secs = now_secs.saturating_add(min_event_remaining_secs(series_slug));
+    if let Some(event) = cached_gamma_event_after(series_id, end_date_min_secs) {
+        info!(
+            "[Polymarket] Rotation cache hit: series_id={} event_id={} slug={}",
+            series_id, event.id, event.slug,
+        );
+        return pick_current_event(vec![event], series_slug);
+    }
+
     let events = fetch_active_events_by_series_id(series_id, series_slug)?;
     pick_current_event(events, series_slug)
 }
@@ -2129,6 +2305,67 @@ mod pick_current_event_tests {
         assert_eq!(min_event_remaining_secs("btc-updown-5m"), 60);
         assert_eq!(min_event_remaining_secs("eth-updown-1h"), 60);
         assert_eq!(min_event_remaining_secs("categorical-market"), 1);
+    }
+
+    #[test]
+    fn gamma_event_cache_is_keyed_by_event_id_and_selects_earliest_match() {
+        let cache = Mutex::new(HashMap::new());
+        let inserted_at = Instant::now();
+        let base = now();
+        let first = mk_event(base, base + 300);
+        let second = mk_event(base + 300, base + 600);
+
+        cache_gamma_events_at(
+            &cache,
+            "series-1",
+            &[second.clone(), first.clone(), first.clone()],
+            inserted_at,
+        );
+
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            2,
+            "duplicate event ids must replace rather than grow the cache",
+        );
+        let cached = cached_gamma_event_after_at(
+            &cache,
+            "series-1",
+            base + 299,
+            inserted_at,
+        )
+        .expect("first event should satisfy the strict end-date threshold");
+        assert_eq!(cached.id, first.id);
+
+        let cached = cached_gamma_event_after_at(
+            &cache,
+            "series-1",
+            base + 300,
+            inserted_at,
+        )
+        .expect("second event should be selected once the first no longer qualifies");
+        assert_eq!(cached.id, second.id);
+        assert!(
+            cached_gamma_event_after_at(&cache, "other-series", base, inserted_at).is_none(),
+            "cache entries must not leak between series",
+        );
+    }
+
+    #[test]
+    fn gamma_event_cache_expires_without_blocking_on_a_refresh() {
+        let cache = Mutex::new(HashMap::new());
+        let now_instant = Instant::now();
+        let inserted_at = now_instant
+            .checked_sub(GAMMA_EVENT_CACHE_TTL + Duration::from_secs(1))
+            .unwrap();
+        let base = now();
+        let event = mk_event(base, base + 300);
+        cache_gamma_events_at(&cache, "series-1", &[event], inserted_at);
+
+        assert!(
+            cached_gamma_event_after_at(&cache, "series-1", base, now_instant).is_none(),
+            "expired entries must fall through to a normal Gamma request",
+        );
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]

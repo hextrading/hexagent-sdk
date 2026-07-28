@@ -56,7 +56,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -312,6 +312,15 @@ fn global_role_clients(role: Role) -> Vec<Arc<reqwest::Client>> {
     global_role(role).clients()
 }
 
+/// Return only the process-global clients for `role`.
+///
+/// Unlike [`all_clients`], this intentionally excludes per-instance
+/// admission pools. It is useful for low-volume query hosts where warming
+/// every place/cancel client would create a needless request burst.
+pub fn clients_for_role(role: Role) -> Vec<Arc<reqwest::Client>> {
+    global_role_clients(role)
+}
+
 /// Concurrently establish TCP+TLS state for every client in a global role.
 /// Gap replay calls this before its first `/trades` request.
 pub async fn prewarm_role(role: Role, warm_url: &str) -> PrewarmReport {
@@ -432,8 +441,8 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 // The role pools above are process-global and shared across strategy
 // instances; a request just round-robins a client and, if that client's
 // warm connection is busy, hyper opens a **cold** TCP+TLS connection.
-// Under wave-overlap or hedge doubling that produces cold-connection
-// storms exactly when the endpoint is already slow.
+// Under overlapping waves that produces cold-connection storms exactly
+// when the endpoint is already slow.
 //
 // This layer replaces "round-robin + hope" with explicit admission
 // control, per (instance, role):
@@ -445,8 +454,9 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 //   * Pools are **per-instance**: instance A exhausting its Fast pool
 //     cannot starve or preempt instance B. Roles are independent too
 //     (a saturated Cancel pool never blocks a Fast placement).
-//   * When all slots are busy, `try_acquire` returns `None` and the
-//     caller **skips** (holds the quote) rather than cold-connecting.
+//   * Placement may use `try_acquire` and hold the quote when all slots
+//     are busy. Cancellation uses `acquire`: it retains the request and is
+//     woken immediately by permit release instead of waiting for a quote tick.
 //   * `exempt_client` is the escape hatch for must-complete traffic
 //     (heartbeat / keep-warm / cancel-all): it always returns a client
 //     WITHOUT a permit, accepting a possible cold connection because
@@ -474,6 +484,7 @@ struct ConnectionHealth {
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
+    availability: Arc<(Mutex<()>, Condvar)>,
     timeout: Duration,
 }
 
@@ -521,7 +532,7 @@ impl ConnectionHealth {
         *self.slot_client.write().unwrap() = replacement;
         self.transport_failures.store(0, Ordering::Release);
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.quarantined.store(false, Ordering::Release);
+        self.release_quarantine();
         log::warn!(
             "[http1_pool] role={:?} slot={} replaced unhealthy client after {} consecutive transport failures generation={}",
             self.role, self.slot, failures, generation,
@@ -529,11 +540,18 @@ impl ConnectionHealth {
         Some(generation)
     }
 
+    fn release_quarantine(&self) {
+        let (lock, ready) = &*self.availability;
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.quarantined.store(false, Ordering::Release);
+        ready.notify_all();
+    }
+
     async fn rebuild_and_prewarm(self, prewarm_url: String, failures: usize) {
         let candidate = match self.build_replacement() {
             Ok(client) => client,
             Err(error) => {
-                self.quarantined.store(false, Ordering::Release);
+                self.release_quarantine();
                 log::warn!(
                     "[http1_pool] role={:?} slot={} client rebuild failed after {} transport failures: {}",
                     self.role, self.slot, failures, error,
@@ -566,7 +584,7 @@ impl ConnectionHealth {
                 }
             }
             Err(error) => {
-                self.quarantined.store(false, Ordering::Release);
+                self.release_quarantine();
                 log::warn!(
                     "[http1_pool] role={:?} slot={} replacement prewarm failed: {}; keeping generation={} url={}",
                     self.role, self.slot, error, self.generation_at_pick, prewarm_url,
@@ -626,6 +644,7 @@ pub struct Permit {
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
+    availability: Arc<(Mutex<()>, Condvar)>,
     timeout: Duration,
 }
 
@@ -649,6 +668,7 @@ impl Permit {
             transport_failures: self.transport_failures.clone(),
             generation: self.generation.clone(),
             last_rebuild: self.last_rebuild.clone(),
+            availability: self.availability.clone(),
             timeout: self.timeout,
         }
     }
@@ -678,9 +698,13 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Release the slot. `Release` pairs with the `Acquire` in the
-        // next `try_acquire`'s successful CAS.
+        // Synchronise release + notification with `RolePool::acquire`.
+        // Taking the mutex closes the classic "recheck, then sleep" lost-wake
+        // race while the atomic flag keeps the uncontended try path lock-free.
+        let (lock, ready) = &*self.availability;
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.flag.store(false, Ordering::Release);
+        ready.notify_one();
     }
 }
 
@@ -690,10 +714,10 @@ struct RolePool {
     role: Role,
     slots: Vec<Slot>,
     rr: AtomicUsize, // round-robin cursor for exempt (no-permit) picks
+    availability: Arc<(Mutex<()>, Condvar)>,
     acquires: AtomicU64,
     skips: AtomicU64,
-    hedge_acquires: AtomicU64,
-    hedge_skips: AtomicU64,
+    waits: AtomicU64,
 }
 
 impl RolePool {
@@ -715,10 +739,10 @@ impl RolePool {
             role,
             slots,
             rr: AtomicUsize::new(0),
+            availability: Arc::new((Mutex::new(()), Condvar::new())),
             acquires: AtomicU64::new(0),
             skips: AtomicU64::new(0),
-            hedge_acquires: AtomicU64::new(0),
-            hedge_skips: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
         })
     }
 
@@ -726,17 +750,31 @@ impl RolePool {
     /// SKIPS — no cold connection is opened). Binds permit → slot → warm
     /// connection so the connection is never used by two requests at once.
     fn try_acquire(&self) -> Option<Permit> {
-        self.try_acquire_counted(false)
+        self.try_acquire_inner(true)
     }
 
-    /// Optional duplicate/hedge acquisition. It uses the same slots but keeps
-    /// separate observability counters: failure here only suppresses the
-    /// duplicate request and must not be reported as a dropped primary.
-    fn try_acquire_hedge(&self) -> Option<Permit> {
-        self.try_acquire_counted(true)
+    /// Retain a must-dispatch request until a warm slot becomes available.
+    /// Permit release wakes one waiter immediately, so callers do not poll or
+    /// fall back to a strategy cadence. Unlike `try_acquire`, contention here
+    /// is counted as a wait rather than a shed business operation.
+    fn acquire(&self) -> Permit {
+        if let Some(permit) = self.try_acquire_inner(false) {
+            return permit;
+        }
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let (lock, ready) = &*self.availability;
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(permit) = self.try_acquire_inner(false) {
+                return permit;
+            }
+            guard = ready
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
     }
 
-    fn try_acquire_counted(&self, hedge: bool) -> Option<Permit> {
+    fn try_acquire_inner(&self, count_skip: bool) -> Option<Permit> {
         let start = self.rr.fetch_add(1, Ordering::Relaxed);
         for offset in 0..self.slots.len() {
             let slot = (start + offset) % self.slots.len();
@@ -748,11 +786,7 @@ impl RolePool {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                if hedge {
-                    self.hedge_acquires.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.acquires.fetch_add(1, Ordering::Relaxed);
-                }
+                self.acquires.fetch_add(1, Ordering::Relaxed);
                 let acquired_generation = s.generation.load(Ordering::Acquire);
                 return Some(Permit {
                     role: self.role,
@@ -765,13 +799,12 @@ impl RolePool {
                     transport_failures: s.transport_failures.clone(),
                     generation: s.generation.clone(),
                     last_rebuild: s.last_rebuild.clone(),
+                    availability: self.availability.clone(),
                     timeout: s.timeout,
                 });
             }
         }
-        if hedge {
-            self.hedge_skips.fetch_add(1, Ordering::Relaxed);
-        } else {
+        if count_skip {
             self.skips.fetch_add(1, Ordering::Relaxed);
         }
         None
@@ -798,6 +831,7 @@ impl RolePool {
                 transport_failures: state.transport_failures.clone(),
                 generation: state.generation.clone(),
                 last_rebuild: state.last_rebuild.clone(),
+                availability: self.availability.clone(),
                 timeout: state.timeout,
             },
         }
@@ -828,9 +862,8 @@ impl RolePool {
             .collect()
     }
 
-    /// (primary_acquires, primary_skips, hedge_acquires, hedge_skips,
-    /// busy_now) for observability.
-    fn stats(&self) -> (u64, u64, u64, u64, usize) {
+    /// (acquires, skips, waits, busy_now) for observability.
+    fn stats(&self) -> (u64, u64, u64, usize) {
         let busy = self
             .slots
             .iter()
@@ -839,8 +872,7 @@ impl RolePool {
         (
             self.acquires.load(Ordering::Relaxed),
             self.skips.load(Ordering::Relaxed),
-            self.hedge_acquires.load(Ordering::Relaxed),
-            self.hedge_skips.load(Ordering::Relaxed),
+            self.waits.load(Ordering::Relaxed),
             busy,
         )
     }
@@ -915,15 +947,11 @@ pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
     INSTANCE_POOLS.get()?.get(instance)?.role(role)?.try_acquire()
 }
 
-/// Admission control for an optional duplicate/hedge request. A failed hedge
-/// acquisition is tracked separately because the primary request is already
-/// in flight and no business operation was dropped.
-pub fn try_acquire_hedge(instance: &str, role: Role) -> Option<Permit> {
-    INSTANCE_POOLS
-        .get()?
-        .get(instance)?
-        .role(role)?
-        .try_acquire_hedge()
+/// Event-driven admission for a request that must not be dropped. Returns
+/// `None` only for an unknown instance/role; ordinary saturation waits for the
+/// next permit release and dispatches immediately.
+pub fn acquire(instance: &str, role: Role) -> Option<Permit> {
+    Some(INSTANCE_POOLS.get()?.get(instance)?.role(role)?.acquire())
 }
 
 /// Reserve a process-global GapReplay slot with the same exclusive
@@ -948,10 +976,9 @@ pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
     client(role)
 }
 
-/// Observability snapshot: `(instance, role, primary_acquires, primary_skips,
-/// hedge_acquires, hedge_skips, busy_now)` sorted by instance then role. Empty
-/// until `init_instance_pools` runs.
-pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, u64, usize)> {
+/// Observability snapshot: `(instance, role, acquires, skips, waits, busy_now)`
+/// sorted by instance then role. Empty until `init_instance_pools` runs.
+pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, usize)> {
     let mut out = Vec::new();
     if let Some(m) = INSTANCE_POOLS.get() {
         let mut ids: Vec<&String> = m.keys().collect();
@@ -959,8 +986,8 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, u64, usize)> {
         for id in ids {
             let p = &m[id];
             for role in [Role::Fast, Role::Cancel, Role::Reconcile, Role::Query] {
-                let (a, s, ha, hs, b) = p.role(role).unwrap().stats();
-                out.push((id.clone(), role, a, s, ha, hs, b));
+                let (a, s, w, b) = p.role(role).unwrap().stats();
+                out.push((id.clone(), role, a, s, w, b));
             }
         }
     }
@@ -971,7 +998,7 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, u64, usize)> {
 /// `(acquires, skips, busy, [(slot, generation, failures, quarantined)])`.
 pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize, bool)>) {
     let pool = &pools().gap_replay;
-    let (acquires, skips, _, _, busy) = pool.stats();
+    let (acquires, skips, _, busy) = pool.stats();
     let slots = pool.slots.iter().enumerate()
         .map(|(i, s)| (
             i,
@@ -1031,12 +1058,11 @@ mod tests {
         assert!(a.is_some() && b.is_some(), "first 2 acquires succeed");
         assert!(p.try_acquire().is_none(), "3rd acquire on a size-2 pool must skip");
 
-        let (acquires, skips, hedge_acquires, hedge_skips, busy) = p.stats();
+        let (acquires, skips, waits, busy) = p.stats();
         assert_eq!(busy, 2, "both slots busy");
         assert_eq!(acquires, 2);
         assert_eq!(skips, 1, "one skip recorded");
-        assert_eq!(hedge_acquires, 0);
-        assert_eq!(hedge_skips, 0);
+        assert_eq!(waits, 0);
 
         drop(a); // release one slot
         assert!(
@@ -1056,22 +1082,33 @@ mod tests {
         for _ in 0..10 {
             assert!(p.try_acquire().is_none(), "never exceed N in-flight");
         }
-        assert_eq!(p.stats().4, 3, "exactly N busy");
+        assert_eq!(p.stats().3, 3, "exactly N busy");
     }
 
     #[test]
-    fn admission_hedge_stats_are_separate_from_primary() {
-        let p = pool(2);
-        let primary = p.try_acquire();
-        let hedge = p.try_acquire_hedge();
-        assert!(primary.is_some() && hedge.is_some());
-        assert!(p.try_acquire_hedge().is_none());
-        assert!(p.try_acquire().is_none());
+    fn retained_acquire_wakes_on_permit_release_without_polling() {
+        let p = Arc::new(pool(1));
+        let held = p.try_acquire().unwrap();
+        let waiter_pool = p.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let permit = waiter_pool.acquire();
+            tx.send(permit.slot()).unwrap();
+        });
 
-        let (acquires, skips, hedge_acquires, hedge_skips, busy) = p.stats();
-        assert_eq!((acquires, skips), (1, 1));
-        assert_eq!((hedge_acquires, hedge_skips), (1, 1));
-        assert_eq!(busy, 2);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "retained acquire must wait while the only slot is busy",
+        );
+        drop(held);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            0,
+            "permit release must wake the retained cancel immediately",
+        );
+        waiter.join().unwrap();
+        let (acquires, skips, waits, busy) = p.stats();
+        assert_eq!((acquires, skips, waits, busy), (2, 0, 1, 0));
     }
 
     #[test]

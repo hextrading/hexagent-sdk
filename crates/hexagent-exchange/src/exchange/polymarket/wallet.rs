@@ -199,7 +199,12 @@ fn user_clob_get_ok(
 /// Unauth JSON GET (gamma-api / data-api). Returns `Value::Null` on failure
 /// (mirroring the tolerant behavior of the former sync call sites).
 fn unauth_get_json(url: &str) -> serde_json::Value {
-    match crate::async_rt::blocking_get_text(url) {
+    let result = if url.starts_with("https://gamma-api.polymarket.com") {
+        super::market::gamma_get_text_retry(url, 1, 0)
+    } else {
+        crate::async_rt::blocking_get_text(url)
+    };
+    match result {
         Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
         Err(_) => serde_json::Value::Null,
     }
