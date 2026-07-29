@@ -1729,7 +1729,7 @@ fn is_btc_symbol(symbol: &str) -> bool {
 // Each incoming frame is either a single JSON object or a JSON array
 // of objects. Each object is either a tagged CLOB event (carrying
 // `event_type`: book / trade / last_trade_price / tick_size_change /
-// price_change) OR an RTDS spot-price record (has `source` + `pair`,
+// price_change / best_bid_ask) OR an RTDS spot-price record (has `source` + `pair`,
 // no event_type) — the server multiplexes both streams on the same
 // socket. We model this with a `#[serde(untagged)]` outer enum that
 // picks tagged-vs-RTDS per message, and a `#[serde(tag = "event_type")]`
@@ -1775,6 +1775,19 @@ struct TickSizeFields {
     new_tick_size: f64,
 }
 
+#[derive(serde::Deserialize)]
+struct BestBidAskFields {
+    asset_id: String,
+    #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
+    best_bid: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
+    best_ask: Option<f64>,
+    /// Polymarket emits timestamps as stringified milliseconds, but accept
+    /// JSON numbers as well for wire compatibility across server versions.
+    #[serde(default)]
+    timestamp: Option<serde_json::Value>,
+}
+
 /// Inline RTDS spot-price record seen on the CLOB socket (distinct from
 /// the dedicated RTDS WS schema, which wraps in `topic`/`payload`).
 #[derive(serde::Deserialize)]
@@ -1804,6 +1817,7 @@ enum TaggedMessage {
     LastTradePrice(TradeFields),
     TickSizeChange(TickSizeFields),
     PriceChange {},
+    BestBidAsk(BestBidAskFields),
 }
 
 #[derive(serde::Deserialize)]
@@ -1889,6 +1903,18 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
                 out.push(make_tick_size_event(t, now));
             }
             ClobFrame::Tagged(TaggedMessage::PriceChange {}) => { /* ignored */ }
+            ClobFrame::Tagged(TaggedMessage::BestBidAsk(q)) => {
+                let exchange_ts_ns = timestamp_value_to_ns(q.timestamp.as_ref(), now);
+                if let Some(event) = make_quote_event(
+                    q.asset_id,
+                    q.best_bid,
+                    q.best_ask,
+                    exchange_ts_ns,
+                    now,
+                ) {
+                    out.push(event);
+                }
+            }
             ClobFrame::Rtds(r) => {
                 if let Some(e) = make_inline_rtds_event(r, now) { out.push(e); }
             }
@@ -1921,6 +1947,51 @@ fn make_book_event(b: BookFields, now: u64) -> MarketEvent {
         exchange_timestamp_ns: exchange_ts_ns,
         local_timestamp_ns: now,
     })
+}
+
+fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64) -> u64 {
+    let raw = timestamp.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    });
+    match raw {
+        // The CLOB protocol defines timestamps as Unix milliseconds. Accept
+        // already-normalized nanoseconds too, which is useful for internal
+        // replay fixtures without losing the exchange/local distinction.
+        Some(ts) if ts < 1_000_000_000_000_000 => ts.saturating_mul(1_000_000),
+        Some(ts) => ts,
+        None => fallback_ns,
+    }
+}
+
+fn make_quote_event(
+    asset_id: String,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    exchange_ts_ns: u64,
+    local_now: u64,
+) -> Option<MarketEvent> {
+    let bid_price = best_bid?;
+    let ask_price = best_ask?;
+    if !bid_price.is_finite()
+        || !ask_price.is_finite()
+        || !(0.0..=1.0).contains(&bid_price)
+        || !(0.0..=1.0).contains(&ask_price)
+    {
+        return None;
+    }
+    Some(MarketEvent::Quote(QuoteTick {
+        exchange: Exchange::Polymarket,
+        symbol: asset_id,
+        bid_price,
+        // The best_bid_ask and price_change messages do not carry top-level
+        // quantities. Zero means unavailable; consumers use only prices.
+        bid_qty: 0.0,
+        ask_price,
+        ask_qty: 0.0,
+        exchange_timestamp_ns: exchange_ts_ns,
+        local_timestamp_ns: local_now,
+    }))
 }
 
 fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
@@ -2384,6 +2455,57 @@ mod pick_current_event_tests {
         e.slug = "categorical-market-no-timestamp".into();
         let picked = pick_current_event(vec![e.clone()], "s").unwrap();
         assert_eq!(picked.slug, e.slug, "unknown start -> open (legacy end-only)");
+    }
+
+    #[test]
+    fn parses_best_bid_ask_as_quote_with_server_timestamp() {
+        let events = parse_clob_frame(
+            r#"{
+                "event_type":"best_bid_ask",
+                "market":"0xcondition",
+                "asset_id":"up-token",
+                "best_bid":"0.48",
+                "best_ask":"0.52",
+                "spread":"0.04",
+                "timestamp":"1757908892351"
+            }"#,
+        );
+        assert_eq!(events.len(), 1);
+        let MarketEvent::Quote(q) = &events[0] else {
+            panic!("best_bid_ask must produce QuoteTick");
+        };
+        assert_eq!(q.exchange, Exchange::Polymarket);
+        assert_eq!(q.symbol, "up-token");
+        assert_eq!(q.bid_price, 0.48);
+        assert_eq!(q.ask_price, 0.52);
+        assert_eq!(q.bid_qty, 0.0);
+        assert_eq!(q.ask_qty, 0.0);
+        assert_eq!(q.exchange_timestamp_ns, 1_757_908_892_351_000_000);
+        assert!(q.local_timestamp_ns > 0);
+    }
+
+    #[test]
+    fn incomplete_or_invalid_top_is_ignored() {
+        let missing_ask = parse_clob_frame(
+            r#"{
+                "event_type":"best_bid_ask",
+                "asset_id":"token",
+                "best_bid":"0.48",
+                "timestamp":"1757908892351"
+            }"#,
+        );
+        assert!(missing_ask.is_empty());
+
+        let invalid_price = parse_clob_frame(
+            r#"{
+                "event_type":"best_bid_ask",
+                "asset_id":"token",
+                "best_bid":"1.1",
+                "best_ask":"0.52",
+                "timestamp":"1757908892351"
+            }"#,
+        );
+        assert!(invalid_price.is_empty());
     }
 
     fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {
