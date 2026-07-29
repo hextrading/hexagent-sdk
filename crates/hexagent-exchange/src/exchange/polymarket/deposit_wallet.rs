@@ -117,6 +117,41 @@ const U256_MAX_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffff
 // 240 was rejected "deadline too soon", so sit near the max (leaves ~10s
 // headroom under 300 for clock skew + request latency).
 const BATCH_DEADLINE_SECS: u64 = 290;
+/// Safe GETs may be repeated freely. Three attempts cover a stale pooled
+/// connection plus one short edge-network flap without consuming the
+/// maintenance lead window.
+const RELAYER_GET_ATTEMPTS: u32 = 3;
+/// A WALLET POST is retried only with the exact same signed batch/nonce.
+/// Before every retry we scan the relayer for that signer+nonce and adopt an
+/// already-accepted action, so a lost HTTP response cannot double-split.
+const WALLET_POST_ATTEMPTS: u32 = 3;
+const WALLET_POST_RECONCILE_ATTEMPTS: u32 = 3;
+
+/// Marker for a request whose outcome is retryable. For POST this also means
+/// "ambiguous": the request may have reached the relayer even though the
+/// client did not receive a usable response.
+#[derive(Debug)]
+struct RetryableRelayerError {
+    detail: String,
+}
+
+impl std::fmt::Display for RetryableRelayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for RetryableRelayerError {}
+
+fn retryable_relayer_error(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(RetryableRelayerError {
+        detail: detail.into(),
+    })
+}
+
+fn is_retryable_relayer_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableRelayerError>().is_some()
+}
 
 struct Call {
     target: String,
@@ -328,6 +363,169 @@ fn action_matches_signer_nonce(action: &serde_json::Value, signer: &str, nonce: 
     from.eq_ignore_ascii_case(signer) && action_nonce == Some(nonce)
 }
 
+fn wallet_action_recovery_rank(action: &serde_json::Value) -> u8 {
+    match action.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+        "STATE_CONFIRMED" => 3,
+        "STATE_NEW" | "STATE_EXECUTED" | "STATE_MINED" => 2,
+        "STATE_FAILED" | "STATE_INVALID" => 0,
+        _ => 1,
+    }
+}
+
+fn is_wallet_action(action: &serde_json::Value) -> bool {
+    action
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("WALLET"))
+}
+
+/// Find the best relayer record for one exact signed WALLET nonce. Retrying a
+/// POST with a new nonce is unsafe after a response-loss error: the original
+/// action may already be accepted and would then be followed by a second
+/// split. The signer+nonce pair is stable across an exact-body retry and is
+/// therefore the idempotency key we can recover from `/transactions`.
+fn find_wallet_action_by_signer_nonce(
+    builder_auth: &PolyAuth,
+    signer: &str,
+    nonce: u128,
+) -> Result<Option<serde_json::Value>> {
+    let path = "/transactions";
+    let headers = builder_auth.sign_request("GET", path, "");
+    let json = relayer_get(format!("{}{}", RELAYER_URL, path), headers)?;
+    let actions = json
+        .as_array()
+        .ok_or_else(|| anyhow!("relayer /transactions returned non-array: {}", json))?;
+    let best = actions
+        .iter()
+        .filter(|action| {
+            action_matches_signer_nonce(action, signer, nonce)
+                && is_wallet_action(action)
+                && action.get("transactionID").and_then(|v| v.as_str()).is_some()
+        })
+        .max_by_key(|action| wallet_action_recovery_rank(action))
+        .cloned();
+    Ok(best)
+}
+
+/// Execute an ambiguous WALLET submission safely.
+///
+/// A transport error, transient HTTP response, or malformed 2xx body does not
+/// prove that POST /submit failed. Before retrying, query `/transactions` for
+/// the exact signer+nonce and adopt its transaction ID when present. If no
+/// record is indexed yet, retry the *same* signed batch/nonce; never allocate a
+/// fresh nonce for an ambiguous result.
+///
+/// The closures make the state machine deterministic under unit test. The
+/// production caller re-signs only the HTTP builder-auth headers per POST;
+/// the EIP-712 batch body and WALLET nonce remain byte-identical.
+fn submit_with_ambiguous_recovery<Submit, Lookup, Sleep>(
+    signer: &str,
+    nonce: u128,
+    mut submit: Submit,
+    mut lookup: Lookup,
+    mut sleep: Sleep,
+) -> Result<serde_json::Value>
+where
+    Submit: FnMut() -> Result<serde_json::Value>,
+    Lookup: FnMut() -> Result<Option<serde_json::Value>>,
+    Sleep: FnMut(std::time::Duration),
+{
+    for submit_attempt in 1..=WALLET_POST_ATTEMPTS {
+        let submit_error = match submit() {
+            Ok(json) => return Ok(json),
+            Err(error) => error,
+        };
+        let error_text = submit_error.to_string().to_ascii_lowercase();
+        let submission_conflict = error_text.contains("wallet busy")
+            || error_text.contains("nonce already")
+            || error_text.contains("nonce has already")
+            || error_text.contains("nonce too low")
+            || error_text.contains("invalid nonce");
+        if !is_retryable_relayer_error(&submit_error) && !submission_conflict {
+            return Err(submit_error);
+        }
+
+        log::warn!(
+            "[Relayer] WALLET submit outcome uncertain signer={} nonce={} \
+             attempt={}/{}: {} — reconciling before any retry",
+            signer,
+            nonce,
+            submit_attempt,
+            WALLET_POST_ATTEMPTS,
+            submit_error,
+        );
+
+        for lookup_attempt in 1..=WALLET_POST_RECONCILE_ATTEMPTS {
+            match lookup() {
+                Ok(Some(action)) => {
+                    let tx_id = action
+                        .get("transactionID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("UNKNOWN");
+                    let state = action
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("UNKNOWN");
+                    log::warn!(
+                        "[Relayer] Recovered accepted WALLET action after ambiguous submit: \
+                         signer={} nonce={} txID={} state={} — suppressing duplicate POST",
+                        signer,
+                        nonce,
+                        tx_id,
+                        state,
+                    );
+                    return Ok(action);
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "[Relayer] WALLET action not indexed yet signer={} nonce={} \
+                         reconcile={}/{}",
+                        signer,
+                        nonce,
+                        lookup_attempt,
+                        WALLET_POST_RECONCILE_ATTEMPTS,
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[Relayer] WALLET reconciliation request failed signer={} nonce={} \
+                         reconcile={}/{}: {}",
+                        signer,
+                        nonce,
+                        lookup_attempt,
+                        WALLET_POST_RECONCILE_ATTEMPTS,
+                        error,
+                    );
+                }
+            }
+            if lookup_attempt < WALLET_POST_RECONCILE_ATTEMPTS {
+                sleep(std::time::Duration::from_millis(
+                    200 * (1u64 << (lookup_attempt - 1)),
+                ));
+            }
+        }
+
+        // A busy/nonce conflict is positive evidence that another action may
+        // own this nonce. If it still cannot be identified, do not POST again.
+        if submission_conflict || submit_attempt == WALLET_POST_ATTEMPTS {
+            return Err(submit_error);
+        }
+
+        log::warn!(
+            "[Relayer] No accepted WALLET action found for signer={} nonce={}; \
+             retrying the identical signed batch ({}/{})",
+            signer,
+            nonce,
+            submit_attempt + 1,
+            WALLET_POST_ATTEMPTS,
+        );
+        sleep(std::time::Duration::from_millis(
+            200 * (1u64 << (submit_attempt - 1)),
+        ));
+    }
+    unreachable!("WALLET_POST_ATTEMPTS is non-zero")
+}
+
 /// Refresh a known action by its transaction ID. Returns `false` only when
 /// `/transaction` has no record yet, allowing the caller to fall back to the
 /// signer+nonce scan of `/transactions`.
@@ -497,8 +695,10 @@ fn submit_wallet_batch(
     // registered"). That rejection is transient — retry it on a fixed 5s
     // backoff for up to ~90s. Every rejected attempt fetches a fresh relayer
     // WALLET nonce and rebuilds deadline, digest, and batch signature.
-    // Any ambiguous error (especially wallet-busy) is terminal until the old
-    // action's state has been queried; it is never retried with only a new nonce.
+    // Any ambiguous error is reconciled by exact signer+nonce before retrying
+    // the byte-identical batch. A fresh nonce is used only for the definite
+    // "wallet not registered" rejection, where the relayer did not accept the
+    // action.
     const REGISTRY_RETRIES: u32 = 18;
     let mut attempt = 0u32;
     let (json, submitted_nonce) = loop {
@@ -509,8 +709,32 @@ fn submit_wallet_batch(
             println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
             return Ok(String::new());
         }
-        let headers = builder_auth.sign_request("POST", "/submit", &body_str);
-        match relayer_post(format!("{}/submit", RELAYER_URL), headers, body_str.clone()) {
+        let submit_result = submit_with_ambiguous_recovery(
+            eoa,
+            nonce,
+            || {
+                let headers = builder_auth.sign_request("POST", "/submit", &body_str);
+                let json = relayer_post(
+                    format!("{}/submit", RELAYER_URL),
+                    headers,
+                    body_str.clone(),
+                )?;
+                if json
+                    .get("transactionID")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                {
+                    return Err(retryable_relayer_error(format!(
+                        "WALLET batch returned no transactionID: {}",
+                        json,
+                    )));
+                }
+                Ok(json)
+            },
+            || find_wallet_action_by_signer_nonce(builder_auth, eoa, nonce),
+            std::thread::sleep,
+        );
+        match submit_result {
             Ok(json) => break (json, nonce),
             Err(e) if attempt < REGISTRY_RETRIES && e.to_string().contains("is not registered") => {
                 attempt += 1;
@@ -1354,13 +1578,48 @@ fn relayer_post(
         for (k, v) in headers.as_builder_pairs() {
             req = req.header(k, v);
         }
-        let resp = req.send().await.map_err(|e| anyhow!("{}: {}", url, e))?;
+        let resp = req.send().await.map_err(|e| {
+            retryable_relayer_error(format!(
+                "{}: error sending request: {:#?}",
+                url,
+                e,
+            ))
+        })?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = resp.text().await.map_err(|e| {
+            retryable_relayer_error(format!(
+                "{}: error reading successful submit response: {:#?}",
+                url,
+                e,
+            ))
+        })?;
         if !status.is_success() {
+            // A timeout/rate-limit/server response can be emitted after the
+            // action was accepted. Mark it ambiguous so the caller recovers
+            // by signer+nonce before retrying the exact same batch.
+            if status.as_u16() == 408
+                || status.as_u16() == 429
+                || status.is_server_error()
+            {
+                return Err(retryable_relayer_error(format!(
+                    "{} ({}): {}",
+                    url,
+                    status,
+                    text,
+                )));
+            }
             return Err(anyhow!("{} ({}): {}", url, status, text));
         }
-        serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} ({})", url, e, text))
+        serde_json::from_str(&text).map_err(|e| {
+            // A malformed/truncated 2xx body is also response loss: the
+            // relayer may already own the submitted action.
+            retryable_relayer_error(format!(
+                "parse successful {} response: {} ({})",
+                url,
+                e,
+                text,
+            ))
+        })
     })
 }
 
@@ -1370,17 +1629,68 @@ fn relayer_get(
 ) -> Result<serde_json::Value> {
     let client = crate::async_rt::http_client();
     crate::async_rt::block_on_runtime(async move {
-        let mut req = client.get(&url);
-        for (k, v) in headers.as_builder_pairs() {
-            req = req.header(k, v);
+        for attempt in 1..=RELAYER_GET_ATTEMPTS {
+            let mut req = client.get(&url);
+            for (k, v) in headers.as_builder_pairs() {
+                req = req.header(k, v);
+            }
+            let result = match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(text) if status.is_success() => serde_json::from_str(&text)
+                            .map_err(|e| retryable_relayer_error(format!(
+                                "parse successful {} response: {} ({})",
+                                url,
+                                e,
+                                text,
+                            ))),
+                        Ok(text)
+                            if status.as_u16() == 408
+                                || status.as_u16() == 429
+                                || status.is_server_error() =>
+                        {
+                            Err(retryable_relayer_error(format!(
+                                "{} ({}): {}",
+                                url,
+                                status,
+                                text,
+                            )))
+                        }
+                        Ok(text) => Err(anyhow!("{} ({}): {}", url, status, text)),
+                        Err(e) => Err(retryable_relayer_error(format!(
+                            "{}: error reading response: {:#?}",
+                            url,
+                            e,
+                        ))),
+                    }
+                }
+                Err(e) => Err(retryable_relayer_error(format!(
+                    "{}: error sending request: {:#?}",
+                    url,
+                    e,
+                ))),
+            };
+            match result {
+                Err(error)
+                    if is_retryable_relayer_error(&error)
+                        && attempt < RELAYER_GET_ATTEMPTS =>
+                {
+                    log::warn!(
+                        "[Relayer] GET failed attempt={}/{}; retrying: {}",
+                        attempt,
+                        RELAYER_GET_ATTEMPTS,
+                        error,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (1u64 << (attempt - 1)),
+                    ))
+                    .await;
+                }
+                other => return other,
+            }
         }
-        let resp = req.send().await.map_err(|e| anyhow!("{}: {}", url, e))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("{} ({}): {}", url, status, text));
-        }
-        serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} ({})", url, e, text))
+        unreachable!("RELAYER_GET_ATTEMPTS is non-zero")
     })
 }
 
@@ -1421,6 +1731,7 @@ mod derive_tests {
             "state": "STATE_EXECUTED",
         });
         assert!(action_matches_signer_nonce(&action, signer, 1873));
+        assert!(is_wallet_action(&action));
         assert!(!action_matches_signer_nonce(&action, signer, 1874));
         assert!(!action_matches_signer_nonce(
             &action,
@@ -1434,6 +1745,152 @@ mod derive_tests {
             "type": "SAFE",
         });
         assert!(action_matches_signer_nonce(&different_type, signer, 1873));
+        assert!(!is_wallet_action(&different_type));
+    }
+
+    #[test]
+    fn ambiguous_wallet_submit_adopts_indexed_action_without_reposting() {
+        let signer = "0x1111111111111111111111111111111111111111";
+        let mut submit_calls = 0;
+        let mut lookup_calls = 0;
+        let mut sleeps = 0;
+        let recovered = submit_with_ambiguous_recovery(
+            signer,
+            1873,
+            || {
+                submit_calls += 1;
+                Err(retryable_relayer_error("connection reset after POST"))
+            },
+            || {
+                lookup_calls += 1;
+                if lookup_calls == 2 {
+                    Ok(Some(serde_json::json!({
+                        "from": signer,
+                        "nonce": "1873",
+                        "transactionID": "tx-recovered",
+                        "state": "STATE_EXECUTED",
+                    })))
+                } else {
+                    Ok(None)
+                }
+            },
+            |_| sleeps += 1,
+        )
+        .unwrap();
+
+        assert_eq!(recovered["transactionID"], "tx-recovered");
+        assert_eq!(submit_calls, 1);
+        assert_eq!(lookup_calls, 2);
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn ambiguous_wallet_submit_reposts_only_after_reconciliation_misses() {
+        let signer = "0x1111111111111111111111111111111111111111";
+        let mut submit_calls = 0;
+        let mut lookup_calls = 0;
+        let submitted = submit_with_ambiguous_recovery(
+            signer,
+            1873,
+            || {
+                submit_calls += 1;
+                if submit_calls == 1 {
+                    Err(retryable_relayer_error("connect failed before response"))
+                } else {
+                    Ok(serde_json::json!({
+                        "transactionID": "tx-second-http-attempt",
+                        "state": "STATE_NEW",
+                    }))
+                }
+            },
+            || {
+                lookup_calls += 1;
+                Ok(None)
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(submitted["transactionID"], "tx-second-http-attempt");
+        assert_eq!(submit_calls, 2);
+        assert_eq!(
+            lookup_calls,
+            WALLET_POST_RECONCILE_ATTEMPTS as usize,
+        );
+    }
+
+    #[test]
+    fn wallet_busy_without_identifiable_action_is_never_reposted() {
+        let mut submit_calls = 0;
+        let mut lookup_calls = 0;
+        let result = submit_with_ambiguous_recovery(
+            "0x1111111111111111111111111111111111111111",
+            1873,
+            || {
+                submit_calls += 1;
+                Err(anyhow!("wallet busy"))
+            },
+            || {
+                lookup_calls += 1;
+                Ok(None)
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(submit_calls, 1);
+        assert_eq!(
+            lookup_calls,
+            WALLET_POST_RECONCILE_ATTEMPTS as usize,
+        );
+    }
+
+    #[test]
+    fn nonce_conflict_without_identifiable_action_is_never_reposted() {
+        let mut submit_calls = 0;
+        let result = submit_with_ambiguous_recovery(
+            "0x1111111111111111111111111111111111111111",
+            1873,
+            || {
+                submit_calls += 1;
+                Err(anyhow!("invalid nonce: nonce too low"))
+            },
+            || Ok(None),
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(submit_calls, 1);
+    }
+
+    #[test]
+    fn definite_wallet_submit_rejection_is_not_retried_or_reconciled() {
+        let mut lookup_calls = 0;
+        let result = submit_with_ambiguous_recovery(
+            "0x1111111111111111111111111111111111111111",
+            1873,
+            || Err(anyhow!("relayer rejected signature (400)")),
+            || {
+                lookup_calls += 1;
+                Ok(None)
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(lookup_calls, 0);
+    }
+
+    #[test]
+    fn recovered_wallet_action_prefers_tradeable_state_over_failure() {
+        assert!(
+            wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_CONFIRMED"}))
+                > wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_FAILED"}))
+        );
+        assert!(
+            wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_EXECUTED"}))
+                > wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_INVALID"}))
+        );
     }
 
     #[test]

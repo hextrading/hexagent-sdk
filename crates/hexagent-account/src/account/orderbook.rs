@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::OrderBookSnapshot;
+use crate::types::{OrderBookSnapshot, QuoteTick};
 
 /// One nudge per (symbol, side).
 ///
@@ -35,23 +35,24 @@ struct Nudge {
 /// margin absorbs that publisher pipeline lag plus modest NTP skew.
 const NUDGE_MIN_HOLD_NS: u64 = 500_000_000;
 
-/// Maintains the latest OrderBookSnapshot per symbol, plus
+/// Maintains the latest OrderBookSnapshot and best-bid/ask QuoteTick per
+/// symbol, plus
 /// timestamp-anchored nudge overrides for cases where a server
 /// rejection (e.g. post-only-crosses-book) reveals the real top is
 /// ahead of our cached snapshot.
 ///
-/// Stale WS snapshots — those generated server-side BEFORE the move
-/// that produced the rejection — can update body levels but cannot
-/// push the top back behind the nudge. The nudge clears only when a
-/// snapshot arrives whose `exchange_timestamp_ns` is later than the
-/// moment the nudge was made by more than `NUDGE_MIN_HOLD_NS`,
-/// signalling that the server has had a chance to incorporate the
-/// moved top into its outgoing snapshot stream (snapshot timestamps
-/// are stamped at publish time and can postdate the book state they
-/// carry — see `NUDGE_MIN_HOLD_NS`). There is no expiry TTL — the
-/// only auto-clear is via this timestamp-plus-margin signal.
+/// Stale WS updates — those generated server-side BEFORE the move that
+/// produced the rejection — cannot push the top back behind the nudge.
+/// The nudge clears only when a full-book or best-bid/ask update arrives
+/// whose `exchange_timestamp_ns` is later than the moment the nudge was
+/// made by more than `NUDGE_MIN_HOLD_NS`, signalling that the server has
+/// had a chance to incorporate the moved top into its outgoing stream
+/// (publisher timestamps can postdate the book state they carry — see
+/// `NUDGE_MIN_HOLD_NS`). There is no expiry TTL — the only auto-clear is
+/// via this timestamp-plus-margin signal.
 pub struct OrderbookManager {
     books: HashMap<String, OrderBookSnapshot>,
+    quotes: HashMap<String, QuoteTick>,
     bid_nudges: HashMap<String, Nudge>,
     ask_nudges: HashMap<String, Nudge>,
 }
@@ -60,8 +61,22 @@ impl OrderbookManager {
     pub fn new() -> Self {
         Self {
             books: HashMap::new(),
+            quotes: HashMap::new(),
             bid_nudges: HashMap::new(),
             ask_nudges: HashMap::new(),
+        }
+    }
+
+    fn clear_nudges_after_market_update(&mut self, symbol: &str, exchange_timestamp_ns: u64) {
+        if let Some(n) = self.bid_nudges.get(symbol).copied() {
+            if exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
+                self.bid_nudges.remove(symbol);
+            }
+        }
+        if let Some(n) = self.ask_nudges.get(symbol).copied() {
+            if exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
+                self.ask_nudges.remove(symbol);
+            }
         }
     }
 
@@ -71,22 +86,23 @@ impl OrderbookManager {
     /// generated this snapshot long enough after our nudge moment that
     /// it must reflect the post-move book, so it's authoritative.
     pub fn update(&mut self, ob: &OrderBookSnapshot) {
+        if self
+            .books
+            .get(&ob.symbol)
+            .is_some_and(|existing| {
+                existing.exchange_timestamp_ns > ob.exchange_timestamp_ns
+            })
+        {
+            return;
+        }
+
         // Compare nudge.created_ns (local wall-clock) against
         // ob.exchange_timestamp_ns (server wall-clock). Both are
         // Unix-epoch ns. The NUDGE_MIN_HOLD_NS margin covers both the
         // publisher pipeline lag (snapshots stamped after the nudge can
         // still carry the pre-move book) and modest NTP drift between
         // the two clocks.
-        if let Some(n) = self.bid_nudges.get(&ob.symbol).copied() {
-            if ob.exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
-                self.bid_nudges.remove(&ob.symbol);
-            }
-        }
-        if let Some(n) = self.ask_nudges.get(&ob.symbol).copied() {
-            if ob.exchange_timestamp_ns > n.created_ns + NUDGE_MIN_HOLD_NS {
-                self.ask_nudges.remove(&ob.symbol);
-            }
-        }
+        self.clear_nudges_after_market_update(&ob.symbol, ob.exchange_timestamp_ns);
 
         // Reuse existing entry to avoid symbol String clone on every update.
         if let Some(existing) = self.books.get_mut(&ob.symbol) {
@@ -100,15 +116,77 @@ impl OrderbookManager {
         }
     }
 
+    /// Update the independent top-of-book cache. Out-of-order quote events
+    /// cannot replace a newer quote for the same symbol. Whether this quote
+    /// or the full book supplies L1 is decided wholesale by exchange
+    /// timestamp in `raw_l1`, so bid and ask are never mixed across sources.
+    pub fn update_quote(&mut self, quote: &QuoteTick) {
+        if self
+            .quotes
+            .get(&quote.symbol)
+            .is_some_and(|existing| {
+                existing.exchange_timestamp_ns > quote.exchange_timestamp_ns
+            })
+        {
+            return;
+        }
+
+        self.clear_nudges_after_market_update(
+            &quote.symbol,
+            quote.exchange_timestamp_ns,
+        );
+        if let Some(existing) = self.quotes.get_mut(&quote.symbol) {
+            *existing = quote.clone();
+        } else {
+            self.quotes.insert(quote.symbol.clone(), quote.clone());
+        }
+    }
+
     /// Get the latest orderbook for a symbol.
     pub fn get(&self, symbol: &str) -> Option<&OrderBookSnapshot> {
         self.books.get(symbol)
     }
 
+    /// Get the server timestamp of the L1 source currently selected for a
+    /// symbol. A quote wins ties so a dedicated best-bid/ask event can take
+    /// effect immediately even when it shares a publisher timestamp with a
+    /// full snapshot.
+    pub fn l1_timestamp_ns(&self, symbol: &str) -> Option<u64> {
+        self.raw_l1(symbol).2
+    }
+
+    fn raw_l1(&self, symbol: &str) -> (Option<f64>, Option<f64>, Option<u64>) {
+        let book = self.books.get(symbol);
+        let quote = self.quotes.get(symbol);
+        let use_quote = match (book, quote) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(book), Some(quote)) => {
+                quote.exchange_timestamp_ns >= book.exchange_timestamp_ns
+            }
+        };
+        if use_quote {
+            let quote = quote.expect("quote selected above");
+            (
+                Some(quote.bid_price),
+                Some(quote.ask_price),
+                Some(quote.exchange_timestamp_ns),
+            )
+        } else if let Some(book) = book {
+            (
+                book.best_bid().map(|level| level.price),
+                book.best_ask().map(|level| level.price),
+                Some(book.exchange_timestamp_ns),
+            )
+        } else {
+            (None, None, None)
+        }
+    }
+
     /// Get best bid price for a symbol — clamped up by an active
     /// Sell-side nudge if present.
     pub fn best_bid_price(&self, symbol: &str) -> Option<f64> {
-        let book_bid = self.books.get(symbol).and_then(|b| b.best_bid()).map(|l| l.price);
+        let book_bid = self.raw_l1(symbol).0;
         let nudge = self.bid_nudges.get(symbol).map(|n| n.price);
         match (book_bid, nudge) {
             (Some(b), Some(n)) => Some(b.max(n)),
@@ -121,7 +199,7 @@ impl OrderbookManager {
     /// Get best ask price for a symbol — clamped down by an active
     /// Buy-side nudge if present.
     pub fn best_ask_price(&self, symbol: &str) -> Option<f64> {
-        let book_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
+        let book_ask = self.raw_l1(symbol).1;
         let nudge = self.ask_nudges.get(symbol).map(|n| n.price);
         match (book_ask, nudge) {
             (Some(b), Some(n)) => Some(b.min(n)),
@@ -133,16 +211,14 @@ impl OrderbookManager {
 
     /// Get mid price for a symbol.
     pub fn mid_price(&self, symbol: &str) -> Option<f64> {
-        if let Some(book) = self.books.get(symbol) {
-            Some(book.mid_price())
-        } else {
-            None
-        }
+        let (bid, ask, _) = self.raw_l1(symbol);
+        Some((bid? + ask?) / 2.0)
     }
 
     /// Get spread for a symbol.
     pub fn spread(&self, symbol: &str) -> Option<f64> {
-        self.books.get(symbol)?.spread()
+        let (bid, ask, _) = self.raw_l1(symbol);
+        Some(ask? - bid?)
     }
 
     /// All cached orderbooks.
@@ -167,12 +243,12 @@ impl OrderbookManager {
     /// 2026-04-29 04:22:15 (coid 1777433120347-...363, ~17 consecutive
     /// same-price post-only rejects on the same token).
     ///
-    /// Auto-clear: nudges clear only when an incoming snapshot's
-    /// `exchange_timestamp_ns` exceeds the nudge's `created_ns` by more
-    /// than `NUDGE_MIN_HOLD_NS` (see `update`). There is no expiry
-    /// TTL — a nudge stays alive as long as the server hasn't yet
-    /// produced a snapshot comfortably newer than the moment we made
-    /// it.
+    /// Auto-clear: nudges clear only when an incoming full-book or
+    /// best-bid/ask update's `exchange_timestamp_ns` exceeds the nudge's
+    /// `created_ns` by more than `NUDGE_MIN_HOLD_NS` (see `update` and
+    /// `update_quote`). There is no expiry TTL — a nudge stays alive as
+    /// long as the server hasn't yet produced market data comfortably newer
+    /// than the moment we made it.
     ///
     /// Semantics:
     ///   * `side == Sell`: real bid ≥ price → set bid_nudge → best_bid_price
@@ -192,8 +268,7 @@ impl OrderbookManager {
         match side {
             crate::types::Side::Sell => {
                 // Caller asserts real bid ≥ price.
-                let book_bid = self.books.get(symbol).and_then(|b| b.best_bid()).map(|l| l.price)
-                    .unwrap_or(0.0);
+                let book_bid = self.raw_l1(symbol).0.unwrap_or(0.0);
                 let cur_nudge = self.bid_nudges.get(symbol).copied();
                 let cur = match cur_nudge {
                     Some(n) => book_bid.max(n.price),
@@ -207,8 +282,7 @@ impl OrderbookManager {
             }
             crate::types::Side::Buy => {
                 // Caller asserts real ask ≤ price.
-                let book_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price)
-                    .unwrap_or(f64::INFINITY);
+                let book_ask = self.raw_l1(symbol).1.unwrap_or(f64::INFINITY);
                 let cur_nudge = self.ask_nudges.get(symbol).copied();
                 let cur = match cur_nudge {
                     Some(n) => book_ask.min(n.price),
@@ -228,7 +302,7 @@ impl OrderbookManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Exchange, PriceLevel, Side};
+    use crate::types::{Exchange, PriceLevel, QuoteTick, Side};
 
     fn empty_book(symbol: &str) -> OrderBookSnapshot {
         OrderBookSnapshot {
@@ -243,6 +317,90 @@ mod tests {
 
     /// Helper: real wall-clock timestamp.
     fn now() -> u64 { crate::types::now_ns() }
+
+    fn quote(symbol: &str, bid: f64, ask: f64, ts_ns: u64) -> QuoteTick {
+        QuoteTick {
+            exchange: Exchange::Polymarket,
+            symbol: symbol.to_string(),
+            bid_price: bid,
+            bid_qty: 0.0,
+            ask_price: ask,
+            ask_qty: 0.0,
+            exchange_timestamp_ns: ts_ns,
+            local_timestamp_ns: ts_ns + 1,
+        }
+    }
+
+    #[test]
+    fn newest_server_timestamp_selects_book_or_quote_wholesale() {
+        let mut om = OrderbookManager::new();
+        let mut book = empty_book("tok");
+        book.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        book.asks = vec![PriceLevel { price: 0.60, quantity: 10.0 }];
+        book.exchange_timestamp_ns = 100;
+        om.update(&book);
+
+        om.update_quote(&quote("tok", 0.45, 0.55, 200));
+        assert_eq!(om.best_bid_price("tok"), Some(0.45));
+        assert_eq!(om.best_ask_price("tok"), Some(0.55));
+        assert_eq!(om.mid_price("tok"), Some(0.50));
+        assert!((om.spread("tok").unwrap() - 0.10).abs() < 1e-12);
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(200));
+
+        // A newer full snapshot replaces both quote sides together.
+        book.bids[0].price = 0.47;
+        book.asks[0].price = 0.53;
+        book.exchange_timestamp_ns = 300;
+        om.update(&book);
+        assert_eq!(om.best_bid_price("tok"), Some(0.47));
+        assert_eq!(om.best_ask_price("tok"), Some(0.53));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+
+        // An out-of-order quote cannot roll the quote cache backward and,
+        // in any case, cannot outrank the newer full snapshot.
+        om.update_quote(&quote("tok", 0.10, 0.90, 150));
+        assert_eq!(om.best_bid_price("tok"), Some(0.47));
+        assert_eq!(om.best_ask_price("tok"), Some(0.53));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+
+        let mut stale_book = book.clone();
+        stale_book.bids[0].price = 0.20;
+        stale_book.asks[0].price = 0.80;
+        stale_book.exchange_timestamp_ns = 250;
+        om.update(&stale_book);
+        assert_eq!(om.best_bid_price("tok"), Some(0.47));
+        assert_eq!(om.best_ask_price("tok"), Some(0.53));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+    }
+
+    #[test]
+    fn quote_wins_equal_timestamp_and_still_honours_nudges() {
+        let mut om = OrderbookManager::new();
+        let mut book = empty_book("tok");
+        book.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        book.asks = vec![PriceLevel { price: 0.60, quantity: 10.0 }];
+        book.exchange_timestamp_ns = 1_000_000_000_000;
+        om.update(&book);
+
+        om.update_quote(&quote("tok", 0.45, 0.55, book.exchange_timestamp_ns));
+        assert_eq!(om.best_bid_price("tok"), Some(0.45));
+        assert_eq!(om.best_ask_price("tok"), Some(0.55));
+
+        let nudge_ts = book.exchange_timestamp_ns + 10;
+        assert!(om.nudge_inferred_top("tok", Side::Sell, 0.48, nudge_ts));
+        assert!(om.nudge_inferred_top("tok", Side::Buy, 0.52, nudge_ts));
+        assert_eq!(om.best_bid_price("tok"), Some(0.48));
+        assert_eq!(om.best_ask_price("tok"), Some(0.52));
+
+        om.update_quote(&quote(
+            "tok",
+            0.46,
+            0.54,
+            nudge_ts + NUDGE_MIN_HOLD_NS + 1,
+        ));
+        assert_eq!(om.best_bid_price("tok"), Some(0.46));
+        assert_eq!(om.best_ask_price("tok"), Some(0.54));
+    }
 
     #[test]
     fn nudge_bid_up_on_postonly_sell_reject() {
