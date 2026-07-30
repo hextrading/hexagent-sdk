@@ -30,6 +30,154 @@ use crate::types::*;
 
 const CHANNEL_CAPACITY: usize = 10_000;
 
+/// Exact identity of one historical-bars input snapshot.
+///
+/// This deliberately contains only raw-data coordinates. Two strategies with
+/// different model parameters may safely reuse the same immutable bars while
+/// still building their own independent model state from them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HistBarsKey {
+    exchange: Exchange,
+    symbol: String,
+    interval: String,
+    start_date_ns: u64,
+    end_date_ns: u64,
+}
+
+impl From<&HistDataRequest> for HistBarsKey {
+    fn from(req: &HistDataRequest) -> Self {
+        Self {
+            exchange: req.exchange,
+            symbol: req.symbol.clone(),
+            interval: req.interval.clone(),
+            start_date_ns: req.start_date_ns,
+            end_date_ns: req.end_date_ns,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HistPreloadStats {
+    requests: usize,
+    unique_loads: usize,
+    cache_hits: usize,
+    failed_loads: usize,
+    initialized_strategies: usize,
+}
+
+/// Preload historical bars for every strategy against one fixed end timestamp.
+///
+/// Requests with the same raw-data identity are loaded once and the resulting
+/// immutable slice is replayed into every consumer. Model state is intentionally
+/// *not* shared here: each strategy still receives its own `on_hist_bar` /
+/// `on_hist_data_loaded` callbacks, preserving isolation across model configs.
+fn preload_hist_bars_with<F>(
+    strategies: &mut [Box<dyn Strategy>],
+    hist_end_ns: u64,
+    mut loader: F,
+) -> HistPreloadStats
+where
+    F: FnMut(&HistDataRequest) -> Option<Vec<BarData>>,
+{
+    // Ask every strategy with the same anchor before doing any I/O. Preserve
+    // each strategy's requested lookback duration, but force the exact common
+    // end so sequential instance startup cannot shift otherwise-identical
+    // windows by milliseconds or seconds.
+    let request_sets: Vec<Vec<HistDataRequest>> = strategies
+        .iter()
+        .map(|strategy| {
+            let mut requests = strategy.load_hist_data(hist_end_ns);
+            for req in &mut requests {
+                let lookback_ns = req.end_date_ns.saturating_sub(req.start_date_ns);
+                req.end_date_ns = hist_end_ns;
+                req.start_date_ns = hist_end_ns.saturating_sub(lookback_ns);
+            }
+            requests
+        })
+        .collect();
+
+    let mut stats = HistPreloadStats::default();
+    let mut cache: HashMap<HistBarsKey, Option<Arc<[BarData]>>> = HashMap::new();
+
+    for (strategy, requests) in strategies.iter_mut().zip(request_sets) {
+        if requests.is_empty() {
+            continue;
+        }
+        stats.initialized_strategies += 1;
+
+        for req in &requests {
+            stats.requests += 1;
+            let key = HistBarsKey::from(req);
+            let bars = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    stats.cache_hits += 1;
+                    entry.get().clone()
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    stats.unique_loads += 1;
+                    let loaded = loader(req)
+                        .filter(|bars| !bars.is_empty())
+                        .map(|bars| Arc::<[BarData]>::from(bars.into_boxed_slice()));
+                    if loaded.is_none() {
+                        stats.failed_loads += 1;
+                    }
+                    entry.insert(loaded.clone());
+                    loaded
+                }
+            };
+
+            if let Some(bars) = bars {
+                for bar in bars.iter() {
+                    strategy.on_hist_bar(bar);
+                }
+            }
+        }
+
+        // Preserve the existing lifecycle: a strategy that requested history
+        // is notified once even when the load was empty/failed, so its
+        // freshness gate can remain blocked and retry later.
+        strategy.on_hist_data_loaded(hist_end_ns);
+    }
+
+    stats
+}
+
+fn preload_hist_bars(
+    strategies: &mut [Box<dyn Strategy>],
+    data_dirs: &[PathBuf],
+    hist_end_ns: u64,
+) -> HistPreloadStats {
+    preload_hist_bars_with(strategies, hist_end_ns, |req| {
+        for dir in data_dirs {
+            match crate::recorder::load_hist_bars(dir, req) {
+                Ok(bars) if !bars.is_empty() => {
+                    info!(
+                        "[Strategy] Loaded {} hist bars once for {}/{} {} [{}..{}) ({})",
+                        bars.len(),
+                        req.exchange,
+                        req.symbol,
+                        req.interval,
+                        req.start_date_ns,
+                        req.end_date_ns,
+                        dir.display(),
+                    );
+                    return Some(bars);
+                }
+                _ => {}
+            }
+        }
+        warn!(
+            "[Strategy] Failed to preload hist bars for {}/{} {} [{}..{})",
+            req.exchange,
+            req.symbol,
+            req.interval,
+            req.start_date_ns,
+            req.end_date_ns,
+        );
+        None
+    })
+}
+
 fn polymarket_instance_pool_sizes() -> hexagent_runtime::http1_pool::PoolSizes {
     hexagent_runtime::http1_pool::PoolSizes {
         fast: 3,
@@ -2317,6 +2465,31 @@ impl Engine {
                     self.config.recording.output_dir,
                 );
             }
+        }
+
+        // ── Historical-bars preload: one fixed snapshot for all instances ──
+        //
+        // Previously each per-instance worker waited for its first Instrument
+        // and called `load_hist_data(event.timestamp_ns())` independently.
+        // Two otherwise-identical BTC instances therefore used slightly
+        // different end timestamps and performed the same parquet/REST load
+        // twice, producing different initial volatility fits. Capture the
+        // anchor once, before any worker is spawned, load each exact raw-data
+        // request once, and fan the immutable bars into every matching
+        // strategy. A later freshness retry still follows the existing
+        // Instrument path with the then-current event timestamp.
+        let hist_end_ns = crate::types::now_ns();
+        let hist_stats = preload_hist_bars(&mut strategies, &data_dirs, hist_end_ns);
+        if hist_stats.requests > 0 {
+            info!(
+                "[Strategy] Historical preload complete: end_ns={} strategies={} requests={} unique_loads={} cache_hits={} failed={}",
+                hist_end_ns,
+                hist_stats.initialized_strategies,
+                hist_stats.requests,
+                hist_stats.unique_loads,
+                hist_stats.cache_hits,
+                hist_stats.failed_loads,
+            );
         }
 
         // ── Prediction warm-up: done BEFORE spawning thread (before exchange feeds start) ──
@@ -5681,6 +5854,148 @@ impl ExchangeTrade for LiveRouter {
 mod market_router_tests {
     use super::*;
     use crossbeam_channel::Receiver;
+
+    #[derive(Default)]
+    struct HistConsumerState {
+        load_anchors: Vec<u64>,
+        bar_open_times: Vec<u64>,
+        loaded_ends: Vec<u64>,
+    }
+
+    struct HistTestStrategy {
+        id: &'static str,
+        request: HistDataRequest,
+        state: Arc<std::sync::Mutex<HistConsumerState>>,
+    }
+
+    impl Strategy for HistTestStrategy {
+        fn name(&self) -> &str { "hist-test" }
+        fn instance_id(&self) -> &str { self.id }
+
+        fn load_hist_data(&self, ts_event: u64) -> Vec<HistDataRequest> {
+            self.state.lock().unwrap().load_anchors.push(ts_event);
+            vec![self.request.clone()]
+        }
+
+        fn on_hist_bar(&mut self, bar: &BarData) {
+            self.state.lock().unwrap().bar_open_times.push(bar.open_time_ns);
+        }
+
+        fn on_hist_data_loaded(&mut self, end_ns: u64) {
+            self.state.lock().unwrap().loaded_ends.push(end_ns);
+        }
+    }
+
+    fn hist_request(symbol: &str, interval: &str, start_ns: u64, end_ns: u64) -> HistDataRequest {
+        HistDataRequest {
+            exchange: Exchange::Binance,
+            symbol: symbol.to_string(),
+            interval: interval.to_string(),
+            start_date_ns: start_ns,
+            end_date_ns: end_ns,
+        }
+    }
+
+    fn hist_bar(req: &HistDataRequest) -> BarData {
+        BarData {
+            exchange: req.exchange,
+            symbol: req.symbol.clone(),
+            interval: req.interval.clone(),
+            open_time_ns: req.start_date_ns,
+            close_time_ns: req.start_date_ns.saturating_add(1),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+            taker_buy_base: 0.5,
+            quote_volume: 100.5,
+            is_closed: true,
+            exchange_timestamp_ns: req.start_date_ns.saturating_add(1),
+            local_timestamp_ns: req.start_date_ns.saturating_add(1),
+        }
+    }
+
+    #[test]
+    fn historical_preload_uses_one_anchor_and_one_load_for_identical_inputs() {
+        let s1 = Arc::new(std::sync::Mutex::new(HistConsumerState::default()));
+        let s2 = Arc::new(std::sync::Mutex::new(HistConsumerState::default()));
+        // The original request ends differ, simulating two sequential instance
+        // callbacks. Equal lookback durations become one exact anchored input.
+        let mut strategies: Vec<Box<dyn Strategy>> = vec![
+            Box::new(HistTestStrategy {
+                id: "btc01",
+                request: hist_request("BTCUSDT", "1s", 100, 200),
+                state: s1.clone(),
+            }),
+            Box::new(HistTestStrategy {
+                id: "btc02",
+                request: hist_request("BTCUSDT", "1s", 300, 400),
+                state: s2.clone(),
+            }),
+        ];
+        let mut loads = 0usize;
+        let stats = preload_hist_bars_with(&mut strategies, 1_000, |req| {
+            loads += 1;
+            assert_eq!(req.start_date_ns, 900);
+            assert_eq!(req.end_date_ns, 1_000);
+            Some(vec![hist_bar(req)])
+        });
+
+        assert_eq!(loads, 1);
+        assert_eq!(
+            stats,
+            HistPreloadStats {
+                requests: 2,
+                unique_loads: 1,
+                cache_hits: 1,
+                failed_loads: 0,
+                initialized_strategies: 2,
+            },
+        );
+        for state in [&s1, &s2] {
+            let state = state.lock().unwrap();
+            assert_eq!(state.load_anchors, vec![1_000]);
+            assert_eq!(state.bar_open_times, vec![900]);
+            assert_eq!(state.loaded_ends, vec![1_000]);
+        }
+    }
+
+    #[test]
+    fn historical_preload_does_not_share_different_symbols_or_windows() {
+        let states: Vec<_> = (0..3)
+            .map(|_| Arc::new(std::sync::Mutex::new(HistConsumerState::default())))
+            .collect();
+        let mut strategies: Vec<Box<dyn Strategy>> = vec![
+            Box::new(HistTestStrategy {
+                id: "btc",
+                request: hist_request("BTCUSDT", "1s", 100, 200),
+                state: states[0].clone(),
+            }),
+            Box::new(HistTestStrategy {
+                id: "eth",
+                request: hist_request("ETHUSDT", "1s", 100, 200),
+                state: states[1].clone(),
+            }),
+            Box::new(HistTestStrategy {
+                id: "btc-longer",
+                request: hist_request("BTCUSDT", "1s", 50, 200),
+                state: states[2].clone(),
+            }),
+        ];
+        let mut loaded_keys = Vec::new();
+        let stats = preload_hist_bars_with(&mut strategies, 1_000, |req| {
+            loaded_keys.push(HistBarsKey::from(req));
+            Some(vec![hist_bar(req)])
+        });
+
+        assert_eq!(stats.requests, 3);
+        assert_eq!(stats.unique_loads, 3);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(loaded_keys.len(), 3);
+        assert_ne!(loaded_keys[0], loaded_keys[1], "different assets must not share");
+        assert_ne!(loaded_keys[0], loaded_keys[2], "different lookbacks must not share");
+    }
 
     #[test]
     fn feed_readiness_records_stage_reason_and_recovery() {
