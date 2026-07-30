@@ -244,29 +244,10 @@ fn is_routine_clob_resubscribe(reason: &str) -> bool {
     reason == "CLOB resubscribe requested"
 }
 
-/// Live trading does not replay Polymarket's event-local orderbook/trade
-/// history after restart, so persisting that high-volume stream only adds
-/// recorder I/O. `SpotPrice` is deliberately kept: its `exchange()` method
-/// returns a placeholder Polymarket value even though the event represents an
-/// external source such as Chainlink.
-fn is_polymarket_market_event(event: &MarketEvent) -> bool {
-    match event {
-        MarketEvent::SpotPrice(_) | MarketEvent::Exit => false,
-        _ => event.exchange() == Exchange::Polymarket,
-    }
-}
-
-/// Filter before cloning/enqueuing so high-rate Polymarket books do not add
-/// recorder-channel pressure to the Live strategy/router thread. The recorder
-/// repeats the check as a final guard before disk writes.
 fn forward_recorder_event(
     recorder_tx: Option<&Sender<MarketEvent>>,
     event: &MarketEvent,
-    skip_polymarket: bool,
 ) {
-    if skip_polymarket && is_polymarket_market_event(event) {
-        return;
-    }
     if let Some(tx) = recorder_tx {
         let _ = tx.send(event.clone());
     }
@@ -360,15 +341,14 @@ impl Engine {
 
     /// Spawn a market data recorder thread. Returns (sender, join handle).
     fn spawn_recorder_thread(&self) -> Result<(Sender<MarketEvent>, thread::JoinHandle<()>)> {
-        // This helper is used only by Live mode. Record mode has its own
-        // unfiltered recorder loop and Paper explicitly opts out below.
-        self.spawn_recorder_thread_to(&self.config.recording.output_dir, true)
+        // Live uses the same unfiltered recorder semantics as Record mode:
+        // external spot/index and Polymarket events share one output root.
+        self.spawn_recorder_thread_to(&self.config.recording.output_dir)
     }
 
     fn spawn_recorder_thread_to(
         &self,
         dir: &str,
-        skip_polymarket: bool,
     ) -> Result<(Sender<MarketEvent>, thread::JoinHandle<()>)> {
         let output_dir = std::fs::canonicalize(dir)
             .unwrap_or_else(|_| {
@@ -387,12 +367,6 @@ impl Engine {
                     Ok(r) => r,
                     Err(e) => { error!("[Recorder] Failed to create: {}", e); return; }
                 };
-                if skip_polymarket {
-                    info!(
-                        "[Recorder] Live mode: Polymarket market-data persistence disabled; \
-                         external spot/index sources remain enabled"
-                    );
-                }
                 let mut last_flush = std::time::Instant::now();
                 let flush_interval = std::time::Duration::from_secs(60);
                 // **Checkpoint cadence** (added 2026-05-20): every 5
@@ -417,9 +391,6 @@ impl Engine {
                     match recorder_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(event) => {
                             if matches!(event, MarketEvent::Exit) { break; }
-                            if skip_polymarket && is_polymarket_market_event(&event) {
-                                continue;
-                            }
                             if let Err(e) = recorder.write_event(&event) {
                                 error!("[Recorder] Write error: {}", e);
                             }
@@ -634,8 +605,8 @@ impl Engine {
             None
         };
 
-        // Persist external spot/index sources used by restart warm-up. Live
-        // intentionally excludes Polymarket's event-local market data.
+        // Persist every subscribed live market-data source through one
+        // recorder before strategy fan-out.
         let (recorder_tx, recorder_handle) = self.spawn_recorder_thread()?;
 
         // Build the per-instance Polymarket SharedState map. The
@@ -822,7 +793,7 @@ impl Engine {
 
         // Spawn recorder for market data persistence (paper data goes to separate dir)
         let (recorder_tx, recorder_handle) =
-            self.spawn_recorder_thread_to(&self.config.recording.paper_data_dir, false)?;
+            self.spawn_recorder_thread_to(&self.config.recording.paper_data_dir)?;
 
         // Strategy thread: same as live, data_dir = backtest.data_dir with paper_data_dir fallback
         // Paper mode: no RTT-probe (no real CLOB to probe). No stale-
@@ -2391,7 +2362,6 @@ impl Engine {
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> thread::JoinHandle<()> {
         let mut strategies = self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
-        let skip_polymarket_recording = self.config.general.mode == RunMode::Live;
         let data_dir = PathBuf::from(&self.config.backtest.data_dir);
         // Prediction-warmup data sources.
         //
@@ -2429,16 +2399,9 @@ impl Engine {
         // recorded live ticks could contain feed-glitch outliers that
         // would self-contaminate a freshly-trained prediction model.
         //
-        // We now intentionally point both at the same canonical store
-        // (`./data`) so external spot/index recordings used by prediction
-        // warm-up become available without a copy step. Polymarket's
-        // event-local market data is not replayed by Live and is therefore
-        // filtered out by the Live recorder.
-        //
-        // New behaviour: detect the unified case → INFO log + keep the
-        // dir. Only flag a WARN when the dirs DIFFER (operator
-        // misconfiguration → Live recordings invisible to the apv2
-        // warm-up).
+        // Detect whether live recordings and canonical warm-up data share a
+        // root. A split root is valid for a dedicated calibration archive;
+        // prediction warm-up continues to read only `backtest.data_dir`.
         if self.config.general.mode == RunMode::Live {
             let recorder_out = PathBuf::from(&self.config.recording.output_dir);
             let recorder_out_canon = std::fs::canonicalize(&recorder_out)
@@ -2455,12 +2418,10 @@ impl Engine {
                     recorder_out.display(),
                 );
             } else {
-                log::warn!(
-                    "[Strategy] Live mode: STORAGE SPLIT — \
+                log::info!(
+                    "[Strategy] Live mode: dedicated recorder storage — \
                      backtest.data_dir={} ≠ recording.output_dir={}. \
-                     prediction warm-up will NOT see this session's external \
-                     spot/index recordings; point both at the same path to \
-                     enable unified storage.",
+                     prediction warm-up remains on the canonical data root.",
                     self.config.backtest.data_dir,
                     self.config.recording.output_dir,
                 );
@@ -2562,9 +2523,7 @@ impl Engine {
                 // belong to the live thread after warm-up ends.
                 let mut drained = 0u64;
                 while let Ok(event) = market_rx.try_recv() {
-                    forward_recorder_event(
-                        recorder_tx.as_ref(), &event, skip_polymarket_recording,
-                    );
+                    forward_recorder_event(recorder_tx.as_ref(), &event);
                     for strategy in &mut strategies {
                         match &event {
                             MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
@@ -2721,9 +2680,7 @@ impl Engine {
                 // (mirrors the prediction warm-up drain above).
                 let mut drained = 0u64;
                 while let Ok(event) = market_rx.try_recv() {
-                    forward_recorder_event(
-                        recorder_tx.as_ref(), &event, skip_polymarket_recording,
-                    );
+                    forward_recorder_event(recorder_tx.as_ref(), &event);
                     for strategy in &mut strategies {
                         match &event {
                             MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
@@ -2783,7 +2740,6 @@ impl Engine {
         if !backtest && strategies.len() > 1 {
             return self.spawn_per_instance_strategy_threads(
                 strategies, market_rx, signal_tx, update_rx, recorder_tx, data_dirs,
-                skip_polymarket_recording,
             );
         }
 
@@ -2812,15 +2768,12 @@ impl Engine {
                                     let _ = signal_tx.send(Signal::Exit);
                                     forward_recorder_event(
                                         recorder_tx.as_ref(), &MarketEvent::Exit,
-                                        skip_polymarket_recording,
                                     );
                                     return;
                                 }
                                 Ok(event) => {
                                     // Record market data if recorder is active
-                                    forward_recorder_event(
-                                        recorder_tx.as_ref(), &event, skip_polymarket_recording,
-                                    );
+                                    forward_recorder_event(recorder_tx.as_ref(), &event);
                                     if backtest {
                                         if !matches!(&event, MarketEvent::Instrument(_) | MarketEvent::Connected { .. } | MarketEvent::Disconnected { .. }) {
                                             set_sim_clock(event.timestamp_ns());
@@ -2957,7 +2910,6 @@ impl Engine {
         update_rx: Receiver<OrderUpdate>,
         recorder_tx: Option<Sender<MarketEvent>>,
         data_dirs: Vec<PathBuf>,
-        skip_polymarket_recording: bool,
     ) -> thread::JoinHandle<()> {
         // Static symbol → instance routing map (lowercased keys). A
         // symbol shared by several instances (e.g. two BTC timeframes on
@@ -3041,15 +2993,12 @@ impl Engine {
                             Ok(MarketEvent::Exit) => {
                                 forward_recorder_event(
                                     recorder_tx.as_ref(), &MarketEvent::Exit,
-                                    skip_polymarket_recording,
                                 );
                                 for tx in &market_txs { let _ = tx.send(MarketEvent::Exit); }
                                 break;
                             }
                             Ok(event) => {
-                                forward_recorder_event(
-                                    recorder_tx.as_ref(), &event, skip_polymarket_recording,
-                                );
+                                forward_recorder_event(recorder_tx.as_ref(), &event);
                                 Self::route_market_event(
                                     &event, &sym_to_instances, &mut token_to_instances, &market_txs,
                                 );
@@ -6107,33 +6056,25 @@ mod market_router_tests {
     }
 
     #[test]
-    fn live_recorder_filter_skips_only_polymarket_market_data() {
-        assert!(is_polymarket_market_event(&MarketEvent::EventStart {
-            exchange: Exchange::Polymarket,
-            symbol: "series:btc-up-or-down-5m".into(),
-            event_id: "event".into(),
-            event_start_ns: 1,
-        }));
-        assert!(is_polymarket_market_event(&MarketEvent::Instrument(
-            binary_option("btc-up-or-down-5m", &["up", "down"]),
-        )));
-        assert!(is_polymarket_market_event(&ob(Exchange::Polymarket, "up")));
-
-        assert!(!is_polymarket_market_event(&ob(Exchange::Binance, "BTCUSDT")));
-        // SpotPrice::exchange() currently returns a Polymarket placeholder;
-        // the filter must nevertheless preserve Chainlink/Pyth recordings.
-        assert!(!is_polymarket_market_event(&spot("btc/usd")));
-        assert!(!is_polymarket_market_event(&MarketEvent::Exit));
-
+    fn live_recorder_forwards_polymarket_and_external_sources_once() {
         let (tx, rx) = bounded::<MarketEvent>(4);
-        forward_recorder_event(
-            Some(&tx), &ob(Exchange::Polymarket, "up"), true,
-        );
-        assert!(rx.try_recv().is_err(), "Live must not enqueue Polymarket data");
-        forward_recorder_event(Some(&tx), &spot("btc/usd"), true);
+        forward_recorder_event(Some(&tx), &ob(Exchange::Polymarket, "up"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(MarketEvent::OrderBook(OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                ..
+            }))
+        ));
+        assert!(rx.try_recv().is_err(), "Polymarket event must be enqueued once");
+
+        forward_recorder_event(Some(&tx), &spot("btc/usd"));
         assert!(matches!(rx.try_recv(), Ok(MarketEvent::SpotPrice(_))));
-        forward_recorder_event(Some(&tx), &MarketEvent::Exit, true);
+        assert!(rx.try_recv().is_err(), "external event must be enqueued once");
+
+        forward_recorder_event(Some(&tx), &MarketEvent::Exit);
         assert!(matches!(rx.try_recv(), Ok(MarketEvent::Exit)));
+        assert!(rx.try_recv().is_err(), "exit event must be enqueued once");
     }
 
     fn two_instance_map() -> HashMap<String, Vec<usize>> {
