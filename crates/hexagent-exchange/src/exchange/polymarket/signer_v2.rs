@@ -30,9 +30,10 @@ use sha3::{Digest, Keccak256};
 use super::signer::{
     SignatureType,
     compute_amounts,
-    account_salt,
+    account_salt_prekeyed,
     derive_addresses,
 };
+use std::sync::OnceLock;
 
 // ════════════════════════════════════════════════════════════════
 // v2 Exchange addresses + domain
@@ -47,7 +48,8 @@ pub const CTF_EXCHANGE_V2: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 pub const NEG_RISK_CTF_EXCHANGE_V2: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
 fn eip712_domain_type_hash() -> [u8; 32] {
-    keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"))
 }
 
 // ── ERC-7739 / POLY_1271 (deposit-wallet) signing constants ──
@@ -68,8 +70,28 @@ const DEPOSIT_WALLET_VERSION: &str = "1";
 /// v2 Order typehash. Field order MUST match
 /// `CTF_EXCHANGE_V2_ORDER_STRUCT` in ctfExchangeV2TypedData.ts.
 fn order_v2_type_hash() -> [u8; 32] {
-    keccak256(b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)")
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)"))
 }
+
+/// keccak256 of `SOLADY_ORDER_TYPE_STRING` — constant, memoized.
+fn solady_order_type_hash() -> [u8; 32] {
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(SOLADY_ORDER_TYPE_STRING.as_bytes()))
+}
+
+/// keccak256 of `DEPOSIT_WALLET_NAME` / `_VERSION` — constant, memoized.
+fn deposit_wallet_name_hash() -> [u8; 32] {
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(DEPOSIT_WALLET_NAME.as_bytes()))
+}
+fn deposit_wallet_version_hash() -> [u8; 32] {
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(DEPOSIT_WALLET_VERSION.as_bytes()))
+}
+
+/// `bytes32(0)` as the 0x-prefixed hex the wire format expects.
+const METADATA_ZERO_HEX: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 // ════════════════════════════════════════════════════════════════
 // v2 Order + SignedOrder
@@ -120,6 +142,15 @@ pub struct OrderSignerV2 {
     /// Deposit-wallet address for POLY_1271 (the order `maker`/`signer`).
     /// `None` for other signature types. Set via [`Self::with_funder`].
     funder: Option<String>,
+    /// EIP-712 domain separator — constant per (exchange, chain); cached
+    /// so the hot order path pays 0 instead of 8 keccaks for it (it was
+    /// recomputed once for the signature and once for the orderID).
+    domain_sep: [u8; 32],
+    /// `builder_code` in wire form (`0x…` hex), formatted once.
+    builder_hex: String,
+    /// Pre-lowercased maker key for `account_salt_prekeyed`. Kept in
+    /// sync by `with_funder` (POLY_1271 salts key off the funder).
+    salt_key: String,
 }
 
 impl OrderSignerV2 {
@@ -146,10 +177,14 @@ impl OrderSignerV2 {
 
         let builder_code = parse_bytes32(builder_code_hex)?;
 
+        let domain_sep = compute_domain_separator_v2(&exchange_address);
+        let builder_hex = format!("0x{}", hex::encode(builder_code));
+        let salt_key = maker_address.to_ascii_lowercase();
         Ok(Self {
             signing_key, signer_address, maker_address,
             exchange_address, builder_code, signature_type: sig_type,
             funder: None,
+            domain_sep, builder_hex, salt_key,
         })
     }
 
@@ -175,6 +210,7 @@ impl OrderSignerV2 {
     pub fn with_funder(mut self, funder: &str) -> Self {
         if !funder.trim().is_empty() {
             let f = funder.trim().to_string();
+            self.salt_key = f.to_ascii_lowercase();
             self.maker_address = f.clone();
             self.funder = Some(f);
         }
@@ -203,10 +239,15 @@ impl OrderSignerV2 {
     }
 
     pub fn sign_order(&self, order: &OrderV2) -> Result<String> {
+        self.sign_digest(&self.order_digest(order))
+    }
+
+    /// Sign a precomputed digest — split out so the build paths hash the
+    /// order struct exactly once for both signature and orderID.
+    fn sign_digest(&self, digest: &[u8; 32]) -> Result<String> {
         let _t = crate::latency::TimedStage::new("polymarket.signer_v2.sign");
-        let digest = self.order_digest(order);
         let (sig, recid) = self.signing_key
-            .sign_prehash_recoverable(&digest)
+            .sign_prehash_recoverable(digest)
             .map_err(|e| anyhow!("Signing failed: {}", e))?;
         let mut sig_bytes = [0u8; 65];
         sig_bytes[..64].copy_from_slice(&sig.to_bytes());
@@ -250,7 +291,7 @@ impl OrderSignerV2 {
             .unwrap_or(0);
 
         let order = OrderV2 {
-            salt: account_salt(&self.maker_address),
+            salt: account_salt_prekeyed(&self.salt_key),
             maker: self.maker_address.clone(),
             signer: self.signer_address.clone(),
             token_id: token_id.to_string(),
@@ -259,15 +300,16 @@ impl OrderSignerV2 {
             side: clob_side,
             signature_type: self.signature_type as u8,
             timestamp: now_ms.to_string(),
-            metadata: format!("0x{}", hex::encode([0u8; 32])),
-            builder: format!("0x{}", hex::encode(self.builder_code)),
+            metadata: METADATA_ZERO_HEX.to_string(),
+            builder: self.builder_hex.clone(),
             // wire-only
             taker: "0x0000000000000000000000000000000000000000".to_string(),
             expiration: "0".to_string(),
         };
 
-        let signature = self.sign_order(&order)?;
-        let order_hash = self.order_hash_hex(&order);
+        let digest = self.order_digest(&order);
+        let signature = self.sign_digest(&digest)?;
+        let order_hash = format!("0x{}", hex::encode(digest));
         Ok(SignedOrderV2 { order, signature, order_hash })
     }
 
@@ -294,8 +336,16 @@ impl OrderSignerV2 {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        // `salt_key` was derived from the funder in `with_funder`; guard
+        // against a direct call with a different funder (dispatch always
+        // passes `self.funder`, which matches).
+        let salt = if funder.eq_ignore_ascii_case(&self.salt_key) {
+            account_salt_prekeyed(&self.salt_key)
+        } else {
+            super::signer::account_salt(funder)
+        };
         let order = OrderV2 {
-            salt: account_salt(funder),
+            salt,
             maker: funder.to_string(),
             signer: funder.to_string(),
             token_id: token_id.to_string(),
@@ -304,14 +354,23 @@ impl OrderSignerV2 {
             side: clob_side,
             signature_type: SignatureType::Poly1271 as u8,
             timestamp: now_ms.to_string(),
-            metadata: format!("0x{}", hex::encode([0u8; 32])),
-            builder: format!("0x{}", hex::encode(self.builder_code)),
+            metadata: METADATA_ZERO_HEX.to_string(),
+            builder: self.builder_hex.clone(),
             taker: "0x0000000000000000000000000000000000000000".to_string(),
             expiration: "0".to_string(),
         };
 
-        let signature = self.sign_order_poly1271(&order)?;
-        let order_hash = self.order_hash_hex(&order);
+        // The ERC-7739 signature and the orderID share the same struct
+        // hash — compute it once (previously the whole struct was hashed
+        // a second time inside `order_hash_hex`).
+        let contents_hash = order_v2_struct_hash(&order);
+        let signature = self.sign_order_poly1271(&order, contents_hash)?;
+        let mut digest_in = Vec::with_capacity(2 + 64);
+        digest_in.push(0x19);
+        digest_in.push(0x01);
+        digest_in.extend_from_slice(&self.domain_sep);
+        digest_in.extend_from_slice(&contents_hash);
+        let order_hash = format!("0x{}", hex::encode(keccak256(&digest_in)));
         Ok(SignedOrderV2 { order, signature, order_hash })
     }
 
@@ -321,15 +380,14 @@ impl OrderSignerV2 {
     /// `0x || inner(65) || appDomainSep(32) || contentsHash(32) ||
     ///  ORDER_TYPE_STRING || uint16(len)`. The wallet "app domain"
     /// verifyingContract is `order.signer` (= the deposit wallet).
-    fn sign_order_poly1271(&self, order: &OrderV2) -> Result<String> {
-        let contents_hash = order_v2_struct_hash(order);
+    fn sign_order_poly1271(&self, order: &OrderV2, contents_hash: [u8; 32]) -> Result<String> {
         let app_domain_sep = self.domain_separator();
 
         let mut tds = Vec::with_capacity(7 * 32);
-        tds.extend_from_slice(&keccak256(SOLADY_ORDER_TYPE_STRING.as_bytes()));
+        tds.extend_from_slice(&solady_order_type_hash());
         tds.extend_from_slice(&contents_hash);
-        tds.extend_from_slice(&keccak256(DEPOSIT_WALLET_NAME.as_bytes()));
-        tds.extend_from_slice(&keccak256(DEPOSIT_WALLET_VERSION.as_bytes()));
+        tds.extend_from_slice(&deposit_wallet_name_hash());
+        tds.extend_from_slice(&deposit_wallet_version_hash());
         tds.extend_from_slice(&u256_bytes(CHAIN_ID as u128));
         tds.extend_from_slice(&address_to_bytes32(&order.signer));
         tds.extend_from_slice(&[0u8; 32]);
@@ -363,20 +421,26 @@ impl OrderSignerV2 {
     }
 
     fn domain_separator(&self) -> [u8; 32] {
-        let type_hash = eip712_domain_type_hash();
-        let name_hash = keccak256(b"Polymarket CTF Exchange");
-        let version_hash = keccak256(b"2");
-        let chain_id = u256_bytes(CHAIN_ID as u128);
-        let contract = address_to_bytes32(&self.exchange_address);
-
-        let mut buf = Vec::with_capacity(5 * 32);
-        buf.extend_from_slice(&type_hash);
-        buf.extend_from_slice(&name_hash);
-        buf.extend_from_slice(&version_hash);
-        buf.extend_from_slice(&chain_id);
-        buf.extend_from_slice(&contract);
-        keccak256(&buf)
+        self.domain_sep
     }
+}
+
+/// v2 domain separator (version "2"). Constant per exchange address;
+/// computed once in `OrderSignerV2::new` and cached.
+fn compute_domain_separator_v2(exchange_address: &str) -> [u8; 32] {
+    let type_hash = eip712_domain_type_hash();
+    let name_hash = keccak256(b"Polymarket CTF Exchange");
+    let version_hash = keccak256(b"2");
+    let chain_id = u256_bytes(CHAIN_ID as u128);
+    let contract = address_to_bytes32(exchange_address);
+
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&chain_id);
+    buf.extend_from_slice(&contract);
+    keccak256(&buf)
 }
 
 // ════════════════════════════════════════════════════════════════
