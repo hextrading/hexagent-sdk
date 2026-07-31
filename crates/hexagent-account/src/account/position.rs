@@ -734,6 +734,27 @@ mod tests {
         assert!((pm.available_inventory("TOK") - 6.0).abs() < 1e-9,
             "SELL shares stay reserved");
 
+        // CancelUncertain (fast ambiguous DELETE reply) must behave
+        // identically — the split from CancelOrderTimeout is observability
+        // only, never a semantic difference in reservation handling.
+        pm.sync_pending_from_update(&ou(
+            "buy",
+            Side::Buy,
+            OrderStatus::CancelUncertain,
+            0.0,
+            0.0,
+        ));
+        pm.sync_pending_from_update(&ou(
+            "sell",
+            Side::Sell,
+            OrderStatus::CancelUncertain,
+            0.0,
+            0.0,
+        ));
+        assert_eq!(pm.pending_orders().len(), 2, "CancelUncertain keeps both locks");
+        assert!((pm.available_cash() - 98.0).abs() < 1e-9);
+        assert!((pm.available_inventory("TOK") - 6.0).abs() < 1e-9);
+
         // Only an authoritative terminal update releases each resource.
         pm.sync_pending_from_update(&ou("buy", Side::Buy, OrderStatus::Cancelled, 0.0, 0.0));
         assert!((pm.available_cash() - 100.0).abs() < 1e-9);
