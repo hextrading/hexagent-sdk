@@ -70,6 +70,17 @@ pub enum OrderStatus {
     /// HTTP DELETE /order or /orders timed out. Outcome unknown — strategy
     /// should re-query the specific order_id's status.
     CancelOrderTimeout,
+    /// DELETE /order got a fast, healthy reply whose wording is ambiguous
+    /// (canonically "order can't be found - already canceled or matched"),
+    /// or reconcile evidence that is not yet authoritative. The order is no
+    /// longer cancelable but Cancelled-vs-Filled is undecided. Consumers
+    /// MUST handle this exactly like [`OrderStatus::CancelOrderTimeout`]
+    /// (orphan reconcile, worst-case reservation kept). The split exists so
+    /// transport timeouts (2 s cap-hits) and healthy-but-ambiguous replies
+    /// stay separable in logs, metrics, and sim latency calibration —
+    /// 2026-07-31 live: 91% of "CancelOrderTimeout" were actually ~50 ms
+    /// not-found replies.
+    CancelUncertain,
 }
 
 /// Request to place a new order

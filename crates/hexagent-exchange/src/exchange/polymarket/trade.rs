@@ -246,7 +246,7 @@ fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
 /// Outcome of mapping a `not_canceled` reason returned by Polymarket
 /// CLOB. Three categories: definite Cancelled, definite Filled, or
 /// **Uncertain** (server's own wording is ambiguous — both states are
-/// possible). Every caller maps Uncertain to `CancelOrderTimeout`, keeping the
+/// possible). Every caller maps Uncertain to `CancelUncertain`, keeping the
 /// order in orphan-cancel state until an authoritative exchange response says
 /// CANCELED / MATCHED / FILLED. The one bounded exception is the exact
 /// "order can't be found - already canceled or matched" DELETE response:
@@ -416,7 +416,7 @@ fn cancel_reason_order_status(reason: &str) -> OrderStatus {
     match cancel_not_canceled_outcome(reason) {
         CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
         CancelReasonOutcome::Filled => OrderStatus::Filled,
-        CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+        CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
     }
 }
 
@@ -2583,13 +2583,21 @@ impl PolymarketTrade {
 
     /// Make a timeout OrderUpdate for a cancel whose HTTP call timed out.
     fn make_timeout_cancel(coid: &str, symbol: &str, side: Side, order_id: Option<String>) -> OrderUpdate {
+        Self::make_orphan_cancel(coid, symbol, side, order_id, OrderStatus::CancelOrderTimeout)
+    }
+
+    /// Orphan-cancel update with an explicit status: `CancelOrderTimeout`
+    /// for transport timeouts, `CancelUncertain` for healthy-but-ambiguous
+    /// replies. Downstream handling is identical; the split is for
+    /// observability (logs / metrics / sim calibration).
+    fn make_orphan_cancel(coid: &str, symbol: &str, side: Side, order_id: Option<String>, status: OrderStatus) -> OrderUpdate {
         OrderUpdate {
             client_order_id: coid.to_string(),
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
             side,
             exchange_order_id: order_id,
-            status: OrderStatus::CancelOrderTimeout,
+            status,
             liquidity: None,
             filled_quantity: 0.0,
             remaining_quantity: 0.0,
@@ -2971,7 +2979,7 @@ impl PolymarketTrade {
                             let status = match outcome {
                                 CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                                 CancelReasonOutcome::Filled => OrderStatus::Filled,
-                                CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
                             };
                             info!("[PolymarketTrade] Reconcile DELETE retry coid={} orderID={} → {:?} (reason={})",
                                 coid, order_id, status, reason.unwrap_or("<omitted>"));
@@ -3022,19 +3030,26 @@ impl PolymarketTrade {
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
                     match &fetch_result {
-                        FetchOrderResult::NotFound => warn!(
-                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=explicit_not_found attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
-                            coid, order_id, attempts, pending_delayed, backoff_ms,
-                        ),
-                        FetchOrderResult::Unavailable(kind) => warn!(
-                            "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=unavailable kind={:?} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
-                            coid, order_id, kind, attempts, pending_delayed, backoff_ms,
-                        ),
+                        FetchOrderResult::NotFound => {
+                            warn!(
+                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=explicit_not_found attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
+                                coid, order_id, attempts, pending_delayed, backoff_ms,
+                            );
+                            // Replica answered (not-found): transport healthy,
+                            // state ambiguous.
+                            OrderStatus::CancelUncertain
+                        }
+                        FetchOrderResult::Unavailable(kind) => {
+                            warn!(
+                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=unavailable kind={:?} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
+                                coid, order_id, kind, attempts, pending_delayed, backoff_ms,
+                            );
+                            OrderStatus::CancelOrderTimeout
+                        }
                         FetchOrderResult::Found(_) => unreachable!(
                             "a fetched order with a status cannot reach the empty-status arm"
                         ),
                     }
-                    OrderStatus::CancelOrderTimeout
                 }
                 other => {
                     // A future/unknown server status is operationally serious,
@@ -3051,7 +3066,7 @@ impl PolymarketTrade {
                         "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}, retry_ms={}) — keeping orphan and worst-case reservation",
                         coid, order_id, other, attempts, backoff_ms,
                     );
-                    OrderStatus::CancelOrderTimeout
+                    OrderStatus::CancelUncertain
                 }
             };
             if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
@@ -3584,7 +3599,7 @@ impl PolymarketTrade {
         // Worst-case default: the order is still live. Only an explicit
         // terminal response below is allowed to remove tracking.
         let mut should_remove = false;
-        let mut timed_out = false;
+        let mut orphan_status: Option<OrderStatus> = None;
         let mut ok_status = OrderStatus::Accepted;
 
         if let Some(reply) = reply {
@@ -3643,7 +3658,9 @@ impl PolymarketTrade {
                                     warn!("[PolymarketTrade] Cancel response omitted coid={} orderID={}... → orphan",
                                         client_order_id, oid_short);
                                 }
-                                timed_out = true;
+                                // Reply received but ambiguous — orphan as
+                                // CancelUncertain, NOT a transport timeout.
+                                orphan_status = Some(OrderStatus::CancelUncertain);
                             }
                         }
                     } else {
@@ -3667,7 +3684,7 @@ impl PolymarketTrade {
                         self.shared.note_http_425_backoff(client_order_id);
                     }
                     should_remove = false;
-                    timed_out = true;
+                    orphan_status = Some(OrderStatus::CancelOrderTimeout);
                 }
                 Err(e) => {
                     // Genuine 4xx rejection (post-425-routing): no dedup —
@@ -3679,8 +3696,8 @@ impl PolymarketTrade {
             }
         }
 
-        if timed_out {
-            return Self::make_timeout_cancel(client_order_id, &symbol, side, local_oid);
+        if let Some(status) = orphan_status {
+            return Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, status);
         }
         if should_remove {
             self.shared.remove_order(client_order_id);
@@ -3757,7 +3774,9 @@ impl ExchangeTrade for PolymarketTrade {
                 let nc_n = resp.get("not_canceled").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
                 info!("[PolymarketTrade] Cancel all result for {}: canceled={} not_canceled={}",
                     symbol, canceled_n, nc_n);
-                (Some(resp), OrderStatus::CancelOrderTimeout)
+                // Reply received; orders the response doesn't explicitly
+                // resolve are ambiguous, not timed out.
+                (Some(resp), OrderStatus::CancelUncertain)
             }
             Err(e) if e.is_unknown_state() => {
                 if matches!(e, HttpErr::Status(425, _)) {
@@ -3787,10 +3806,10 @@ impl ExchangeTrade for PolymarketTrade {
                 match cancel_delete_response_outcome(resp, order_id) {
                     CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                     CancelReasonOutcome::Filled => OrderStatus::Filled,
-                    CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                    CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
                 }
             }).unwrap_or(fallback_status);
-            if status == OrderStatus::CancelOrderTimeout {
+            if matches!(status, OrderStatus::CancelUncertain | OrderStatus::CancelOrderTimeout) {
                 if let Some(reason) = response.as_ref()
                     .and_then(|resp| resp.get("not_canceled"))
                     .and_then(|v| v.as_object())
@@ -4179,9 +4198,9 @@ impl ExchangeTrade for PolymarketTrade {
                                 let s = match outcome {
                                     CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                                     CancelReasonOutcome::Filled => OrderStatus::Filled,
-                                    CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                    CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
                                 };
-                                if s == OrderStatus::CancelOrderTimeout
+                                if s == OrderStatus::CancelUncertain
                                     && is_pending_delayed_reason(reason_str)
                                 {
                                     self.shared.pending_delayed_orphans
@@ -4192,8 +4211,9 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     // A successful batch response that omits an orderID says
-                    // nothing authoritative about that order's state.
-                    OrderStatus::CancelOrderTimeout
+                    // nothing authoritative about that order's state — but
+                    // the reply itself was healthy: ambiguous, not timed out.
+                    OrderStatus::CancelUncertain
                 }
                 Err(e) if e.is_unknown_state() => {
                     if self.shared.should_warn_unknown_state(&e) {
@@ -4215,7 +4235,7 @@ impl ExchangeTrade for PolymarketTrade {
                     .get(coid).cloned();
                 let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
                 let mut outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
-                if outcome == OrderStatus::CancelOrderTimeout && order_id.is_none() {
+                if matches!(outcome, OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain) && order_id.is_none() {
                     // Cannot reconcile an orphan without an exchange OID.
                     // Revert to live/Accepted so OrderManager retries instead
                     // of wedging forever in Cancelling or releasing the lock.
@@ -4597,9 +4617,9 @@ impl ExchangeTrade for PolymarketTrade {
                                     let s = match outcome {
                                         CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
                                         CancelReasonOutcome::Filled => OrderStatus::Filled,
-                                        CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+                                        CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
                                     };
-                                    if s == OrderStatus::CancelOrderTimeout
+                                    if s == OrderStatus::CancelUncertain
                                         && is_pending_delayed_reason(reason_str)
                                     {
                                         self.shared.pending_delayed_orphans
@@ -4609,7 +4629,8 @@ impl ExchangeTrade for PolymarketTrade {
                                 }
                             }
                         }
-                        OrderStatus::CancelOrderTimeout
+                        // Healthy reply; unresolved orders are ambiguous.
+                        OrderStatus::CancelUncertain
                     }
                     Err(e) if e.is_unknown_state() => {
                         if self.shared.should_warn_unknown_state(&e) {
@@ -4633,7 +4654,7 @@ impl ExchangeTrade for PolymarketTrade {
                 let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
                 let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
                 let mut outcome = per_coid_outcome.get(coid).copied().unwrap_or(fallback_outcome);
-                if outcome == OrderStatus::CancelOrderTimeout && order_id.is_none() {
+                if matches!(outcome, OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain) && order_id.is_none() {
                     outcome = OrderStatus::Accepted;
                 }
                 // Drop local tracking for terminal (Cancelled / Filled)
@@ -5096,16 +5117,16 @@ mod tests {
         let emitted = match outcome {
             CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
             CancelReasonOutcome::Filled => OrderStatus::Filled,
-            CancelReasonOutcome::Uncertain => OrderStatus::CancelOrderTimeout,
+            CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
         };
-        assert_eq!(emitted, OrderStatus::CancelOrderTimeout);
+        assert_eq!(emitted, OrderStatus::CancelUncertain);
         assert_eq!(
             cancel_reason_order_status("order can't be found - already canceled or matched"),
-            OrderStatus::CancelOrderTimeout,
+            OrderStatus::CancelUncertain,
         );
         assert_eq!(
             cancel_reason_order_status("can't be canceled because it is pending/delayed"),
-            OrderStatus::CancelOrderTimeout,
+            OrderStatus::CancelUncertain,
         );
         assert_eq!(
             cancel_reason_order_status("the order is already canceled"),
