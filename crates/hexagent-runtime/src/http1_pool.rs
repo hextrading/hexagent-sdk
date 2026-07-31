@@ -44,12 +44,14 @@
 //!
 //! ## Warmth
 //!
-//! * **Prewarm**: [`spawn_keep_warm`] fires an immediate warm round so
-//!   TCP+TLS handshakes complete before the first real order.
-//! * **Keep-warm**: the same task then re-warms every client for its
-//!   host on an interval, covering quiet stretches (feed gates, closed
-//!   sessions) where business traffic alone would let connections go
-//!   idle/evicted. Both live venues spawn it: Polymarket against
+//! * **Prewarm**: venue startup explicitly establishes TCP+TLS state before
+//!   the first real order.
+//! * **Keep-warm**: an activity-aware scheduler revisits one eligible slot at
+//!   a time, spreading one full sweep over the configured interval. A slot is
+//!   eligible only after 30 s without any business or keep-warm request, and
+//!   every probe owns the slot's admission permit. Per-pool and process-wide
+//!   guards cap probes at one and two respectively. Both live venues spawn it:
+//!   Polymarket against
 //!   `{clob}/time` (engine, after the SharedStates are built) and Aster
 //!   against `/fapi/v3/time`. (Polymarket's `/heartbeats` loop does NOT
 //!   fan out — it sends one request per 10 s on a single Query slot, so
@@ -76,6 +78,30 @@ use anyhow::{Context, Result};
 const ORDER_TIMEOUT_CEILING: Duration = Duration::from_millis(2000);
 const MISC_TIMEOUT: Duration = Duration::from_secs(5);
 const GAP_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEP_WARM_IDLE: Duration = Duration::from_secs(30);
+const KEEP_WARM_TIMEOUT: Duration = Duration::from_millis(500);
+const KEEP_WARM_GLOBAL_LIMIT: usize = 2;
+
+static ACTIVITY_EPOCH: OnceLock<Instant> = OnceLock::new();
+static KEEP_WARM_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+fn activity_now_ns() -> u64 {
+    // The positive base keeps unit tests able to install an artificial
+    // "older than 30 s" timestamp without waiting for the process uptime to
+    // cross that boundary. Only differences are observed in production.
+    let elapsed = ACTIVITY_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos();
+    let base = KEEP_WARM_IDLE.as_nanos();
+    base.saturating_add(elapsed).min(u64::MAX as u128) as u64
+}
+
+fn keep_warm_tick(full_sweep: Duration, n_slots: usize) -> Duration {
+    let n_slots = n_slots.max(1) as u128;
+    let nanos = (full_sweep.as_nanos() / n_slots).clamp(1, u64::MAX as u128);
+    Duration::from_nanos(nanos as u64)
+}
 
 /// Request roles. Since 2026-07-31 roles map onto MERGED pools —
 /// Fast+Cancel share one "order" pool (a place burst can use cancel's
@@ -109,7 +135,11 @@ pub struct PoolSizes {
 
 impl Default for PoolSizes {
     fn default() -> Self {
-        Self { order: 3, misc: 2, gap_replay: 2 }
+        Self {
+            order: 3,
+            misc: 2,
+            gap_replay: 2,
+        }
     }
 }
 
@@ -244,25 +274,22 @@ pub fn pooled_client(role: Role) -> PooledClient {
     global_role(role).exempt_pooled_client()
 }
 
-/// All clients across every role — for prewarm / keep-warm fan-out that
-/// must touch *every* underlying connection, not just one pick.
+/// All clients across every role — for startup prewarm fan-out that must
+/// touch *every* underlying connection, not just one pick. Steady-state
+/// keep-warm uses exact-slot permits instead.
 pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     let p = pools();
     let mut all = p.order.clients();
     all.extend(p.misc.clients());
     all.extend(p.gap_replay.clients());
-    // Include the per-instance admission-pool connections so prewarm /
-    // keep-warm / heartbeat fan-out holds them open too — they carry real
-    // order traffic but go idle between quote waves, and a cold reserved
-    // connection would defeat the whole point of admission control.
+    // Include the per-instance admission-pool connections so startup prewarm
+    // reaches them too. They carry real order traffic but go idle between
+    // quote waves, and a cold reserved connection would defeat the whole
+    // point of admission control.
     if let Some(m) = INSTANCE_POOLS.get() {
         for inst in m.values() {
             for rp in [&inst.order, &inst.misc] {
-                all.extend(
-                    rp.slots
-                        .iter()
-                        .map(|s| s.client.read().unwrap().clone()),
-                );
+                all.extend(rp.slots.iter().map(|s| s.client.read().unwrap().clone()));
             }
         }
     }
@@ -349,34 +376,170 @@ pub async fn prewarm_role(role: Role, warm_url: &str) -> PrewarmReport {
         match result {
             Ok(Ok(status)) if (200..400).contains(&status) => ok += 1,
             Ok(Ok(status)) => {
-                if first_error.is_none() { first_error = Some(format!("HTTP {}", status)); }
+                if first_error.is_none() {
+                    first_error = Some(format!("HTTP {}", status));
+                }
             }
             Ok(Err(error)) => {
-                if first_error.is_none() { first_error = Some(error.to_string()); }
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
             }
             Err(error) => {
-                if first_error.is_none() { first_error = Some(error.to_string()); }
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
             }
         }
     }
     log::info!(
         "[http1_pool] role={:?} prewarm: {}/{} connections up{}",
-        role, ok, total,
-        first_error.as_deref()
+        role,
+        ok,
+        total,
+        first_error
+            .as_deref()
             .map(|e| format!(" (first err: {})", e))
             .unwrap_or_default(),
     );
-    PrewarmReport { total, ok, first_error }
+    PrewarmReport {
+        total,
+        ok,
+        first_error,
+    }
 }
 
-/// Spawn a warm task for `host`: an **immediate** round (prewarm — TCP+TLS
-/// up before the first real request) and then one cheap `GET warm_url` per
-/// client every `interval`, so every connection stays established through
-/// quiet stretches. `warm_url` should be a free, unauthenticated endpoint
-/// (e.g. Aster's `/fapi/v3/time`, Polymarket's `{clob}/time`).
+#[derive(Clone, Copy)]
+struct KeepWarmTarget {
+    pool: &'static RolePool,
+    slot: usize,
+}
+
+impl KeepWarmTarget {
+    fn eligible_at(&self, now_ns: u64) -> bool {
+        let last = self.pool.slots[self.slot]
+            .last_activity_ns
+            .load(Ordering::Acquire);
+        now_ns.saturating_sub(last) >= KEEP_WARM_IDLE.as_nanos() as u64
+    }
+
+    fn try_acquire(&self) -> Option<KeepWarmLease> {
+        if !self.eligible_at(activity_now_ns()) {
+            return None;
+        }
+        let global = GlobalKeepWarmLease::try_acquire()?;
+        if self
+            .pool
+            .keep_warm_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            drop(global);
+            return None;
+        }
+        // Recheck after taking both concurrency guards. A business request
+        // could have completed between the initial eligibility read and here.
+        if !self.eligible_at(activity_now_ns()) {
+            self.pool.keep_warm_inflight.store(false, Ordering::Release);
+            drop(global);
+            return None;
+        }
+        match self.pool.try_acquire_slot(self.slot) {
+            Some(permit) => Some(KeepWarmLease {
+                permit: Some(permit),
+                pool_inflight: self.pool.keep_warm_inflight.clone(),
+                _global: global,
+            }),
+            None => {
+                self.pool.keep_warm_inflight.store(false, Ordering::Release);
+                drop(global);
+                None
+            }
+        }
+    }
+}
+
+struct GlobalKeepWarmLease;
+
+impl GlobalKeepWarmLease {
+    fn try_acquire() -> Option<Self> {
+        let mut current = KEEP_WARM_INFLIGHT.load(Ordering::Acquire);
+        loop {
+            if current >= KEEP_WARM_GLOBAL_LIMIT {
+                return None;
+            }
+            match KEEP_WARM_INFLIGHT.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for GlobalKeepWarmLease {
+    fn drop(&mut self) {
+        KEEP_WARM_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct KeepWarmLease {
+    permit: Option<Permit>,
+    pool_inflight: Arc<AtomicBool>,
+    _global: GlobalKeepWarmLease,
+}
+
+impl KeepWarmLease {
+    fn pooled_client(&self) -> PooledClient {
+        self.permit
+            .as_ref()
+            .expect("keep-warm permit missing")
+            .pooled_client()
+    }
+}
+
+impl Drop for KeepWarmLease {
+    fn drop(&mut self) {
+        // Release the slot first. A new keep-warm for this pool must not pass
+        // its pool guard until business admission can observe the free slot.
+        drop(self.permit.take());
+        self.pool_inflight.store(false, Ordering::Release);
+    }
+}
+
+fn keep_warm_targets() -> Vec<KeepWarmTarget> {
+    let p = pools();
+    let mut targets = Vec::new();
+    for pool in [&p.order, &p.misc, &p.gap_replay] {
+        targets.extend((0..pool.slots.len()).map(|slot| KeepWarmTarget { pool, slot }));
+    }
+    if let Some(instances) = INSTANCE_POOLS.get() {
+        let mut ids: Vec<&String> = instances.keys().collect();
+        ids.sort();
+        for id in ids {
+            let instance = &instances[id];
+            for pool in [&instance.order, &instance.misc] {
+                targets.extend((0..pool.slots.len()).map(|slot| KeepWarmTarget { pool, slot }));
+            }
+        }
+    }
+    targets
+}
+
+/// Spawn an activity-aware warm task for `host`.
 ///
-/// One task per host — repeated calls for the same label are refused.
-pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration) {
+/// Startup keeps its one-shot prewarm fan-out because it runs before live
+/// order flow. Steady-state probes are different: `full_sweep` is divided by
+/// the total slot count and every tick selects at most one slot that has seen
+/// no request for 30 s. The probe owns the exact slot permit, uses a 500 ms
+/// deadline, and is bounded to one in-flight probe per pool and two globally.
+/// `warm_url` should be a cheap unauthenticated endpoint such as `/time`.
+/// Repeated calls for the same label are refused.
+pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Duration) {
     use std::sync::Mutex;
     static SPAWNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     {
@@ -391,54 +554,137 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
     // reactor so hot-path requests reusing them aren't woken through the
     // busy feed reactor.
     crate::async_rt::order_handle().spawn(async move {
-        let mut first = true;
-        loop {
-            if !first {
-                tokio::time::sleep(interval).await;
-            }
-            let t0 = std::time::Instant::now();
-            let clients = clients_all();
-            let n = clients.len();
-            let mut set = tokio::task::JoinSet::new();
-            for c in clients {
-                let url = warm_url.clone();
-                set.spawn(async move {
-                    let response = c.get(&url).send().await?;
-                    let status = response.status().as_u16();
-                    response.bytes().await?;
-                    Ok::<u16, reqwest::Error>(status)
-                });
-            }
-            let mut ok = 0usize;
-            let mut first_err: Option<String> = None;
-            while let Some(res) = set.join_next().await {
-                match res {
-                    Ok(Ok(status)) if (200..400).contains(&status) => ok += 1,
-                    Ok(Ok(status)) => {
-                        if first_err.is_none() { first_err = Some(format!("HTTP {}", status)); }
-                    }
-                    Ok(Err(e)) => {
-                        if first_err.is_none() { first_err = Some(e.to_string()); }
-                    }
-                    Err(e) => {
-                        if first_err.is_none() { first_err = Some(e.to_string()); }
-                    }
+        let targets = keep_warm_targets();
+        if targets.is_empty() {
+            log::warn!("[http1_pool] {} keep-warm disabled: no slots", label);
+            return;
+        }
+
+        // Preserve the historical one-shot startup prewarm. This is not a
+        // steady-state keep-warm probe: venue startup invokes it before live
+        // order flow, so establishing all TCP+TLS connections concurrently is
+        // intentional. Once it completes, every periodic request below is
+        // permit-bound and concurrency-limited.
+        let t0 = Instant::now();
+        let clients = clients_all();
+        let n = clients.len();
+        let mut set = tokio::task::JoinSet::new();
+        for client in clients {
+            let url = warm_url.clone();
+            set.spawn(async move {
+                let response = client.get(&url).send().await?;
+                let status = response.status().as_u16();
+                response.bytes().await?;
+                Ok::<u16, reqwest::Error>(status)
+            });
+        }
+        let mut ok = 0usize;
+        let mut first_error = None;
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok(status)) if (200..400).contains(&status) => ok += 1,
+                Ok(Ok(status)) => {
+                    if first_error.is_none() { first_error = Some(format!("HTTP {}", status)); }
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() { first_error = Some(error.to_string()); }
+                }
+                Err(error) => {
+                    if first_error.is_none() { first_error = Some(error.to_string()); }
                 }
             }
-            if first {
-                log::info!(
-                    "[http1_pool] {} prewarm: {}/{} connections up in {:.0}ms{}",
-                    label, ok, n, t0.elapsed().as_secs_f64() * 1000.0,
-                    first_err.as_deref().map(|e| format!(" (first err: {})", e)).unwrap_or_default(),
-                );
-                first = false;
-            } else if ok < n {
-                log::warn!(
-                    "[http1_pool] {} keep-warm: {}/{} ok ({})",
-                    label, ok, n, first_err.as_deref().unwrap_or("?"),
-                );
-            } else {
-                log::trace!("[http1_pool] {} keep-warm: {}/{} ok", label, ok, n);
+        }
+        let prewarm_completed_ns = activity_now_ns();
+        for target in &targets {
+            target.pool.slots[target.slot]
+                .last_activity_ns
+                .store(prewarm_completed_ns, Ordering::Release);
+        }
+        log::info!(
+            "[http1_pool] {} prewarm: {}/{} connections up in {:.0}ms{}",
+            label,
+            ok,
+            n,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            first_error.as_deref()
+                .map(|error| format!(" (first err: {})", error))
+                .unwrap_or_default(),
+        );
+
+        let tick = keep_warm_tick(full_sweep, targets.len());
+        log::info!(
+            "[http1_pool] {} keep-warm scheduler: slots={} sweep_ms={} tick_ms={:.3} idle_s={} timeout_ms={} per_pool=1 global={}",
+            label,
+            targets.len(),
+            full_sweep.as_millis(),
+            tick.as_secs_f64() * 1000.0,
+            KEEP_WARM_IDLE.as_secs(),
+            KEEP_WARM_TIMEOUT.as_millis(),
+            KEEP_WARM_GLOBAL_LIMIT,
+        );
+
+        let mut cursor = 0usize;
+        loop {
+            tokio::time::sleep(tick).await;
+            let now_ns = activity_now_ns();
+            let mut dispatched = false;
+            for offset in 0..targets.len() {
+                let index = (cursor + offset) % targets.len();
+                let target = targets[index];
+                if !target.eligible_at(now_ns) {
+                    continue;
+                }
+                let Some(lease) = target.try_acquire() else {
+                    continue;
+                };
+                cursor = (index + 1) % targets.len();
+                dispatched = true;
+                let url = warm_url.clone();
+                tokio::spawn(async move {
+                    let client = lease.pooled_client();
+                    let outcome = async {
+                        let response = client
+                            .client()
+                            .get(&url)
+                            .timeout(KEEP_WARM_TIMEOUT)
+                            .send()
+                            .await?;
+                        let status = response.status().as_u16();
+                        response.bytes().await?;
+                        Ok::<u16, reqwest::Error>(status)
+                    }.await;
+                    match outcome {
+                        Ok(status) => {
+                            client.note_transport_success();
+                            if (200..400).contains(&status) {
+                                log::trace!(
+                                    "[http1_pool] {} keep-warm ok role={:?} slot={} status={}",
+                                    label, target.pool.role, target.slot, status,
+                                );
+                            } else {
+                                log::warn!(
+                                    "[http1_pool] {} keep-warm HTTP {} role={:?} slot={}",
+                                    label, status, target.pool.role, target.slot,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            client.note_transport_failure(url.clone());
+                            log::warn!(
+                                "[http1_pool] {} keep-warm failed role={:?} slot={}: {}",
+                                label, target.pool.role, target.slot, error,
+                            );
+                        }
+                    }
+                    drop(lease);
+                });
+                break;
+            }
+            if !dispatched {
+                // Move the scan origin even when every eligible target was
+                // busy or concurrency-limited, avoiding a permanently hot
+                // first candidate once capacity returns.
+                cursor = (cursor + 1) % targets.len();
             }
         }
     });
@@ -468,7 +714,7 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 //     are busy. Cancellation uses `acquire`: it retains the request and is
 //     woken immediately by permit release instead of waiting for a quote tick.
 //   * `exempt_client` is the escape hatch for must-complete traffic
-//     (heartbeat / keep-warm / cancel-all): it always returns a client
+//     (heartbeat / cancel-all): it always returns a client
 //     WITHOUT a permit, accepting a possible cold connection because
 //     *completing* the request matters more than avoiding one.
 
@@ -477,6 +723,7 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, interval: Duration
 struct Slot {
     client: Arc<RwLock<Arc<reqwest::Client>>>,
     busy: Arc<AtomicBool>,
+    last_activity_ns: Arc<AtomicU64>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
@@ -519,7 +766,10 @@ impl ConnectionHealth {
         }
         let now = Instant::now();
         let mut last = self.last_rebuild.lock().unwrap();
-        if last.map(|t| now.duration_since(t) < cooldown).unwrap_or(false) {
+        if last
+            .map(|t| now.duration_since(t) < cooldown)
+            .unwrap_or(false)
+        {
             return None;
         }
         *last = Some(now);
@@ -581,15 +831,17 @@ impl ConnectionHealth {
             }
             response.bytes().await.map_err(|error| error.to_string())?;
             Ok::<(), String>(())
-        }.await;
+        }
+        .await;
         match prewarm_result {
             Ok(()) => {
-                if let Some(generation) =
-                    self.install_replacement(candidate, failures)
-                {
+                if let Some(generation) = self.install_replacement(candidate, failures) {
                     log::info!(
                         "[http1_pool] role={:?} slot={} rebuilt and prewarmed generation={} url={}",
-                        self.role, self.slot, generation, prewarm_url,
+                        self.role,
+                        self.slot,
+                        generation,
+                        prewarm_url,
                     );
                 }
             }
@@ -628,9 +880,7 @@ impl PooledClient {
     /// quarantines the slot and starts background rebuild + prewarm. Returns
     /// true when this call claimed the rebuild.
     pub fn note_transport_failure(&self, prewarm_url: String) -> bool {
-        let Some(failures) =
-            self.health.claim_rebuild(2, Duration::from_secs(30))
-        else {
+        let Some(failures) = self.health.claim_rebuild(2, Duration::from_secs(30)) else {
             return false;
         };
         let health = self.health.clone();
@@ -650,6 +900,7 @@ pub struct Permit {
     slot: usize,
     acquired_generation: u64,
     flag: Arc<AtomicBool>,
+    last_activity_ns: Arc<AtomicU64>,
     client: Arc<reqwest::Client>,
     slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
     quarantined: Arc<AtomicBool>,
@@ -666,9 +917,15 @@ impl Permit {
         &self.client
     }
 
-    pub fn role(&self) -> Role { self.role }
-    pub fn slot(&self) -> usize { self.slot }
-    pub fn generation(&self) -> u64 { self.acquired_generation }
+    pub fn role(&self) -> Role {
+        self.role
+    }
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+    pub fn generation(&self) -> u64 {
+        self.acquired_generation
+    }
 
     fn health(&self, generation_at_pick: u64) -> ConnectionHealth {
         ConnectionHealth {
@@ -705,7 +962,6 @@ impl Permit {
             health: self.health(generation),
         }
     }
-
 }
 
 impl Drop for Permit {
@@ -715,6 +971,10 @@ impl Drop for Permit {
         // race while the atomic flag keeps the uncontended try path lock-free.
         let (lock, ready) = &*self.availability;
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Eligibility is measured from request completion. Every permit user
+        // (business and keep-warm) refreshes the same slot activity clock.
+        self.last_activity_ns
+            .store(activity_now_ns(), Ordering::Release);
         self.flag.store(false, Ordering::Release);
         ready.notify_one();
     }
@@ -729,6 +989,7 @@ struct RolePool {
     slots: Vec<Slot>,
     rr: AtomicUsize, // round-robin cursor for exempt (no-permit) picks
     availability: Arc<(Mutex<()>, Condvar)>,
+    keep_warm_inflight: Arc<AtomicBool>,
     // Admission counters per LOGICAL role sharing this pool:
     // index 0 = primary (Fast / Reconcile / GapReplay), 1 = secondary
     // (Cancel / Query). Slots are shared; the split keeps the
@@ -746,6 +1007,7 @@ impl RolePool {
             slots.push(Slot {
                 client: Arc::new(RwLock::new(Arc::new(build_h1_client(timeout)?))),
                 busy: Arc::new(AtomicBool::new(false)),
+                last_activity_ns: Arc::new(AtomicU64::new(activity_now_ns())),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 transport_failures: Arc::new(AtomicUsize::new(0)),
                 generation: Arc::new(AtomicU64::new(0)),
@@ -758,6 +1020,7 @@ impl RolePool {
             slots,
             rr: AtomicUsize::new(0),
             availability: Arc::new((Mutex::new(()), Condvar::new())),
+            keep_warm_inflight: Arc::new(AtomicBool::new(false)),
             acquires: [AtomicU64::new(0), AtomicU64::new(0)],
             skips: [AtomicU64::new(0), AtomicU64::new(0)],
             waits: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -807,30 +1070,9 @@ impl RolePool {
         let start = self.rr.fetch_add(1, Ordering::Relaxed);
         for offset in 0..self.slots.len() {
             let slot = (start + offset) % self.slots.len();
-            let s = &self.slots[slot];
-            if s.quarantined.load(Ordering::Acquire) {
-                continue;
-            }
-            if s.busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            if let Some(permit) = self.try_acquire_slot(slot) {
                 self.acquires[ctr].fetch_add(1, Ordering::Relaxed);
-                let acquired_generation = s.generation.load(Ordering::Acquire);
-                return Some(Permit {
-                    role: self.role,
-                    slot,
-                    acquired_generation,
-                    flag: s.busy.clone(),
-                    client: s.client.read().unwrap().clone(),
-                    slot_client: s.client.clone(),
-                    quarantined: s.quarantined.clone(),
-                    transport_failures: s.transport_failures.clone(),
-                    generation: s.generation.clone(),
-                    last_rebuild: s.last_rebuild.clone(),
-                    availability: self.availability.clone(),
-                    timeout: s.timeout,
-                });
+                return Some(permit);
             }
         }
         if count_skip {
@@ -839,9 +1081,46 @@ impl RolePool {
         None
     }
 
+    /// Reserve one exact slot without touching business admission counters.
+    /// Used by keep-warm so round-robin eligibility cannot silently bind the
+    /// probe to a different, recently active connection.
+    fn try_acquire_slot(&self, slot: usize) -> Option<Permit> {
+        let s = self.slots.get(slot)?;
+        if s.quarantined.load(Ordering::Acquire) {
+            return None;
+        }
+        if s.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        // Mark request start as well as completion. This closes the small
+        // window where another scheduler observes an old timestamp while the
+        // newly acquired slot has not begun socket I/O yet.
+        s.last_activity_ns
+            .store(activity_now_ns(), Ordering::Release);
+        let acquired_generation = s.generation.load(Ordering::Acquire);
+        Some(Permit {
+            role: self.role,
+            slot,
+            acquired_generation,
+            flag: s.busy.clone(),
+            last_activity_ns: s.last_activity_ns.clone(),
+            client: s.client.read().unwrap().clone(),
+            slot_client: s.client.clone(),
+            quarantined: s.quarantined.clone(),
+            transport_failures: s.transport_failures.clone(),
+            generation: s.generation.clone(),
+            last_rebuild: s.last_rebuild.clone(),
+            availability: self.availability.clone(),
+            timeout: s.timeout,
+        })
+    }
+
     /// Exempt path: a client via round-robin WITHOUT a permit. Always
     /// returns — may cold-connect if every warm connection is busy. For
-    /// heartbeat / keep-warm / cancel-all only.
+    /// heartbeat / cancel-all only. Keep-warm must use an exact-slot permit.
     fn exempt_client(&self) -> Arc<reqwest::Client> {
         self.exempt_pooled_client().client
     }
@@ -871,16 +1150,24 @@ impl RolePool {
         for offset in 0..self.slots.len() {
             let slot = (start + offset) % self.slots.len();
             if !self.slots[slot].quarantined.load(Ordering::Acquire) {
+                self.slots[slot]
+                    .last_activity_ns
+                    .store(activity_now_ns(), Ordering::Release);
                 return self.pooled_client_for_slot(slot);
             }
         }
         // Must-complete traffic retains the historical escape hatch when all
         // slots are quarantined; its outcome still feeds health tracking.
-        self.pooled_client_for_slot(start % self.slots.len())
+        let slot = start % self.slots.len();
+        self.slots[slot]
+            .last_activity_ns
+            .store(activity_now_ns(), Ordering::Release);
+        self.pooled_client_for_slot(slot)
     }
 
     fn clients(&self) -> Vec<Arc<reqwest::Client>> {
-        self.slots.iter()
+        self.slots
+            .iter()
             .map(|s| s.client.read().unwrap().clone())
             .collect()
     }
@@ -973,14 +1260,24 @@ pub fn instance_pools_ready() -> bool {
 ///   * `None`         → all warm connections busy OR unknown instance;
 ///                      the caller must SKIP (no cold connection).
 pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
-    INSTANCE_POOLS.get()?.get(instance)?.role(role)?.try_acquire_as(role_ctr_index(role))
+    INSTANCE_POOLS
+        .get()?
+        .get(instance)?
+        .role(role)?
+        .try_acquire_as(role_ctr_index(role))
 }
 
 /// Event-driven admission for a request that must not be dropped. Returns
 /// `None` only for an unknown instance/role; ordinary saturation waits for the
 /// next permit release and dispatches immediately.
 pub fn acquire(instance: &str, role: Role) -> Option<Permit> {
-    Some(INSTANCE_POOLS.get()?.get(instance)?.role(role)?.acquire_as(role_ctr_index(role)))
+    Some(
+        INSTANCE_POOLS
+            .get()?
+            .get(instance)?
+            .role(role)?
+            .acquire_as(role_ctr_index(role)),
+    )
 }
 
 /// Reserve a process-global GapReplay slot with the same exclusive
@@ -992,10 +1289,10 @@ pub fn try_acquire_global(role: Role) -> Option<Permit> {
     }
 }
 
-/// Exempt dispatch for must-complete traffic (heartbeat / keep-warm /
-/// cancel-all): never blocked by admission, may cold-connect. Falls back
-/// to the shared global pool when the instance is unknown / pools not yet
-/// initialised.
+/// Exempt dispatch for must-complete traffic (heartbeat / cancel-all): never
+/// blocked by admission, may cold-connect. Keep-warm deliberately does not use
+/// this escape hatch. Falls back to the shared global pool when the instance
+/// is unknown / pools not yet initialised.
 pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
     if let Some(p) = INSTANCE_POOLS.get().and_then(|m| m.get(instance)) {
         if let Some(pool) = p.role(role) {
@@ -1015,8 +1312,7 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, usize)> {
         for id in ids {
             let p = &m[id];
             for role in [Role::Fast, Role::Cancel, Role::Reconcile, Role::Query] {
-                let (a, s, w, b) =
-                    p.role(role).unwrap().stats_as(role_ctr_index(role));
+                let (a, s, w, b) = p.role(role).unwrap().stats_as(role_ctr_index(role));
                 out.push((id.clone(), role, a, s, w, b));
             }
         }
@@ -1029,13 +1325,18 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, usize)> {
 pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize, bool)>) {
     let pool = &pools().gap_replay;
     let (acquires, skips, _, busy) = pool.stats();
-    let slots = pool.slots.iter().enumerate()
-        .map(|(i, s)| (
-            i,
-            s.generation.load(Ordering::Acquire),
-            s.transport_failures.load(Ordering::Acquire),
-            s.quarantined.load(Ordering::Acquire),
-        ))
+    let slots = pool
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            (
+                i,
+                s.generation.load(Ordering::Acquire),
+                s.transport_failures.load(Ordering::Acquire),
+                s.quarantined.load(Ordering::Acquire),
+            )
+        })
         .collect();
     (acquires, skips, busy, slots)
 }
@@ -1062,6 +1363,104 @@ mod tests {
         assert_eq!((d.order, d.misc, d.gap_replay), (3, 2, 2));
     }
 
+    #[test]
+    fn keep_warm_tick_spreads_one_sweep_across_all_slots() {
+        assert_eq!(
+            keep_warm_tick(Duration::from_secs(20), 1),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            keep_warm_tick(Duration::from_secs(20), 45),
+            Duration::from_nanos(444_444_444),
+        );
+    }
+
+    #[test]
+    fn keep_warm_requires_thirty_seconds_without_any_slot_activity() {
+        let pool = Box::leak(Box::new(pool(1)));
+        let target = KeepWarmTarget { pool, slot: 0 };
+        let last = 10_000u64;
+        pool.slots[0]
+            .last_activity_ns
+            .store(last, Ordering::Release);
+        let idle_ns = KEEP_WARM_IDLE.as_nanos() as u64;
+        assert!(!target.eligible_at(last + idle_ns - 1));
+        assert!(target.eligible_at(last + idle_ns));
+
+        pool.slots[0].last_activity_ns.store(0, Ordering::Release);
+        let permit = pool.try_acquire().unwrap();
+        let at_start = pool.slots[0].last_activity_ns.load(Ordering::Acquire);
+        assert!(at_start > 0, "business acquisition refreshes activity");
+        drop(permit);
+        assert!(
+            pool.slots[0].last_activity_ns.load(Ordering::Acquire) >= at_start,
+            "permit release refreshes activity at request completion",
+        );
+    }
+
+    #[test]
+    fn keep_warm_enforces_exact_slot_pool_and_global_limits() {
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        let _serial = TEST_LOCK.lock().unwrap();
+        assert_eq!(KEEP_WARM_INFLIGHT.load(Ordering::Acquire), 0);
+
+        let first_pool = Box::leak(Box::new(pool(2)));
+        let second_pool = Box::leak(Box::new(pool(1)));
+        let third_pool = Box::leak(Box::new(pool(1)));
+        for pool in [&*first_pool, &*second_pool, &*third_pool] {
+            for slot in &pool.slots {
+                slot.last_activity_ns.store(0, Ordering::Release);
+            }
+        }
+
+        let first = KeepWarmTarget {
+            pool: first_pool,
+            slot: 0,
+        }
+        .try_acquire()
+        .expect("first global keep-warm lease");
+        assert!(first_pool.slots[0].busy.load(Ordering::Acquire));
+        assert!(
+            KeepWarmTarget {
+                pool: first_pool,
+                slot: 1
+            }
+            .try_acquire()
+            .is_none(),
+            "one pool permits only one concurrent keep-warm",
+        );
+
+        let second = KeepWarmTarget {
+            pool: second_pool,
+            slot: 0,
+        }
+        .try_acquire()
+        .expect("second global keep-warm lease");
+        assert_eq!(KEEP_WARM_INFLIGHT.load(Ordering::Acquire), 2);
+        assert!(
+            KeepWarmTarget {
+                pool: third_pool,
+                slot: 0
+            }
+            .try_acquire()
+            .is_none(),
+            "the process-wide keep-warm limit is two",
+        );
+
+        drop(first);
+        let third = KeepWarmTarget {
+            pool: third_pool,
+            slot: 0,
+        }
+        .try_acquire()
+        .expect("global capacity returns after lease release");
+        drop(second);
+        drop(third);
+        assert_eq!(KEEP_WARM_INFLIGHT.load(Ordering::Acquire), 0);
+        assert!(!first_pool.keep_warm_inflight.load(Ordering::Acquire));
+        assert!(!first_pool.slots[0].busy.load(Ordering::Acquire));
+    }
+
     // ── admission control ──────────────────────────────────────────
 
     fn pool(n: usize) -> RolePool {
@@ -1081,7 +1480,10 @@ mod tests {
         let a = p.try_acquire();
         let b = p.try_acquire();
         assert!(a.is_some() && b.is_some(), "first 2 acquires succeed");
-        assert!(p.try_acquire().is_none(), "3rd acquire on a size-2 pool must skip");
+        assert!(
+            p.try_acquire().is_none(),
+            "3rd acquire on a size-2 pool must skip"
+        );
 
         let (acquires, skips, waits, busy) = p.stats();
         assert_eq!(busy, 2, "both slots busy");
@@ -1161,8 +1563,7 @@ mod tests {
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
-        *permit.last_rebuild.lock().unwrap() =
-            Some(Instant::now() - Duration::from_secs(31));
+        *permit.last_rebuild.lock().unwrap() = Some(Instant::now() - Duration::from_secs(31));
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
     }
 
@@ -1170,8 +1571,10 @@ mod tests {
     fn gap_replay_role_rotates_slots_and_tracks_generation() {
         let p = RolePool::new(2, Duration::from_secs(5), Role::GapReplay).unwrap();
         let first = p.try_acquire().unwrap();
-        assert_eq!((first.role(), first.slot(), first.generation()),
-                   (Role::GapReplay, 0, 0));
+        assert_eq!(
+            (first.role(), first.slot(), first.generation()),
+            (Role::GapReplay, 0, 0)
+        );
         drop(first);
         let second = p.try_acquire().unwrap();
         assert_eq!((second.slot(), second.generation()), (1, 0));
@@ -1257,7 +1660,10 @@ mod tests {
         assert_eq!((a1, s1), (1, 1), "role-1 sees its own acquire + skip");
         assert_eq!(busy, 2, "busy_now reflects the shared slots");
         drop(held);
-        assert!(p.try_acquire_as(1).is_some(), "released slot serves either role");
+        assert!(
+            p.try_acquire_as(1).is_some(),
+            "released slot serves either role"
+        );
     }
 
     #[test]
@@ -1265,8 +1671,8 @@ mod tests {
         let p = pool(1);
         let _held = p.try_acquire().unwrap(); // the only slot is busy
         assert!(p.try_acquire().is_none(), "admission is exhausted");
-        // Exempt traffic (heartbeat / keep-warm / cancel-all) must still
-        // get a client even when every warm connection is busy.
+        // Exempt traffic (heartbeat / cancel-all) must still get a client
+        // even when every warm connection is busy. Keep-warm is not exempt.
         let _c1 = p.exempt_client();
         let _c2 = p.exempt_client();
         // (returns without panicking is the assertion; may cold-connect
