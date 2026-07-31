@@ -35,6 +35,12 @@ pub struct OsTuneConfig {
     #[serde(default = "default_true")]
     pub enable_fifo: bool,
     pub async_rt_core: Option<usize>,
+    /// Core for the dedicated order-I/O tokio runtime thread
+    /// (`hexbot-async-ord`, hosts CLOB place/cancel HTTP futures so WS
+    /// feed bursts on `async_rt_core` can't head-of-line-block them).
+    /// Unset = thread floats unpinned at normal priority; set a core to
+    /// pin it and (with `enable_fifo`) raise it to `fifo_async_rt`.
+    pub async_ord_core: Option<usize>,
     pub strategy_core: Option<usize>,
     /// Per-instance strategy-worker cores for live/paper multi-instance
     /// runs: `instance_id → core`. A polymaker instance listed here gets
@@ -78,6 +84,7 @@ impl Default for OsTuneConfig {
             enable_pin: true,
             enable_fifo: true,
             async_rt_core: None,
+            async_ord_core: None,
             strategy_core: None,
             strategy_cores: HashMap::new(),
             execution_core: None,
@@ -846,7 +853,7 @@ pub struct ExchangeConfig {
     /// its `?after=` window from now. Larger = more overlap per sweep (a fill
     /// is covered by multiple sweeps). Quantised to whole seconds for the
     /// second-granular API. Default 5000 ms.
-    #[serde(default = "default_gap_replay_rewind_ms")]
+    #[serde(default = "default_gap_replay_periodic_rewind_ms")]
     pub gap_replay_periodic_rewind_ms: u64,
     /// Polymarket-only — how far back (ms) the *reconnect* gap-replay rewinds
     /// its `?after=` window from the last-seen match_time, so a fill landing
@@ -881,6 +888,9 @@ pub struct ExchangeConfig {
 fn default_hl_network() -> String { "testnet".to_string() }
 fn default_http_timeout_ms() -> u64 { 1000 }
 fn default_gap_replay_interval_ms() -> u64 { 2000 }
+/// Periodic-sweep rewind FLOOR (the sweep also reaches back to the last
+/// server-timestamped trade seen — see user_feed.rs).
+fn default_gap_replay_periodic_rewind_ms() -> u64 { 10_000 }
 fn default_gap_replay_rewind_ms() -> u64 { 5000 }
 fn default_executor_workers() -> usize { 8 }
 

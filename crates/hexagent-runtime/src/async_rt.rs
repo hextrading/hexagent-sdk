@@ -1,12 +1,26 @@
 //! Async runtime infrastructure for latency-sensitive I/O paths.
 //!
 //! Architecture:
-//!   - Single `tokio::runtime::Runtime` with `current_thread` scheduler
-//!   - Runtime runs on its own dedicated OS thread (not the main thread)
-//!   - Latency-critical I/O (Polymarket HTTP order submit, WS feeds) is
-//!     spawned onto this runtime via `spawn` / `block_on_runtime`
-//!   - Sync callers bridge via `block_on_runtime` (a `oneshot::channel`
-//!     round-trip); async callers use the handle directly
+//!   - TWO `tokio::runtime::Runtime`s, each `current_thread` on its own
+//!     dedicated OS thread:
+//!       * `hexbot-async-rt`  — general runtime: WS feeds, gap replay,
+//!         heartbeats, queries. Pinned + FIFO via `os_tune::pin_async_rt`.
+//!       * `hexbot-async-ord` — order-I/O runtime: CLOB place/cancel HTTP
+//!         futures, plus everything that ESTABLISHES pool connections
+//!         (prewarm, keep-warm, slot repair). Split out 2026-07-31: on the
+//!         shared runtime a book-snapshot burst or a gap-replay JSON parse
+//!         serialised ahead of order socket polls (live p95/p99 tail).
+//!         Connection ownership matters: a tokio socket registers with the
+//!         reactor of the runtime that CREATED it, so warm/repair rounds
+//!         must run here too or order requests would reuse sockets whose
+//!         readiness events still route through the busy feed reactor.
+//!         Optional pinning via `[os_tune] async_ord_core` (default:
+//!         unpinned, normal priority).
+//!   - Latency-critical order I/O is spawned via `order_handle` /
+//!     `block_on_order_runtime`; feeds and misc I/O via `handle` /
+//!     `block_on_runtime`
+//!   - Sync callers bridge via the `block_on_*` helpers (a
+//!     `oneshot::channel` round-trip); async callers use the handles
 //!   - Strategy engine and other CPU-bound threads stay sync, they just
 //!     dispatch I/O onto the async side
 //!
@@ -17,33 +31,21 @@
 //!
 //! Shared globals:
 //!   - `RUNTIME_HANDLE`: `OnceLock` of the tokio Handle
-//!   - Five role-specific HTTP/1.1 client pools (see [`crate::http1_pool`]),
-//!     each with its own per-request deadline tuned to the endpoint it
-//!     serves. h1.1 has no multiplexing, so role isolation — a slow query
-//!     can never occupy the connection an order needs — comes from the
-//!     pools being disjoint sets of TCP connections. (Formerly h2
-//!     prior-knowledge pools; Aster's h2 frontend rejects signed requests
-//!     with spurious -2019s, and splitting transports per venue buys
-//!     nothing, so all REST pools are h1.1 now.)
-//!       * `HTTP_CLIENTS_FAST`    — POST /order, POST /orders. 500 ms
-//!         timeout. Tail requests past 500 ms are almost certainly stale
-//!         (p50 ≈ 30 ms against the CLOB); failing fast lets the orphan
-//!         reconciler engage sooner than a 1.5 s ceiling allows.
-//!       * `HTTP_CLIENTS_CANCEL`  — DELETE /order, /orders, /cancel-all.
-//!         500 ms timeout. Same reasoning — a cancel that hasn't landed
-//!         at 500 ms is racing against a fill, and we'd rather surface the
-//!         timeout so reconcile can retry.
-//!       * `HTTP_CLIENTS_RECONCILE` — orphan-path GET /data/order/{id}
-//!         and reconcile DELETE retries. 1000 ms timeout. Larger than the
-//!         hot-path budget so that a brief server wobble doesn't re-orphan
-//!         the order we're trying to resolve.
-//!       * `HTTP_CLIENTS_QUERY`   — everything else: data-api snapshots,
-//!         /positions, wallet relayer, heartbeats. 5 s
-//!         timeout — these responses can be large
-//!         (positions, open orders) and aren't latency-critical.
-//!       * `HTTP_CLIENTS_GAP_REPLAY` — authenticated Polymarket /trades
-//!         recovery. 5 s timeout, with exclusive slots and transport-aware
-//!         replacement isolated from ordinary queries.
+//!   - Merged HTTP/1.1 client pools (see [`crate::http1_pool`]). h1.1
+//!     has no multiplexing, so pool isolation — a slow query can never
+//!     occupy the connection an order needs — comes from the pools being
+//!     disjoint sets of TCP connections. (Formerly h2 prior-knowledge
+//!     pools; Aster's h2 frontend rejects signed requests with spurious
+//!     -2019s, so all REST pools are h1.1 now.)
+//!       * ORDER (Fast+Cancel merged) — POST /order(s) + all DELETEs.
+//!         2 s client ceiling; per-request deadline from
+//!         `current_fast_timeout()` / `current_cancel_timeout()`.
+//!       * MISC (Reconcile+Query merged) — orphan GET /data/order/{id}
+//!         (2 s per-request), data-api snapshots, /positions, wallet
+//!         relayer, heartbeats (5 s client ceiling).
+//!       * GAP_REPLAY — authenticated Polymarket /trades recovery. 5 s,
+//!         exclusive slots, isolated so replay stalls can't consume
+//!         query or order connections.
 //!
 //!     Round-robin within each pool spreads concurrent traffic across
 //!     distinct TCP connections so packet loss on one doesn't stall others.
@@ -56,6 +58,7 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 
 static RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
+static ORDER_RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 
 /// Number of HTTP/2 clients per role. Each client owns its own connection
 /// pool → in practice one h2 TCP connection per host, per client.
@@ -220,6 +223,32 @@ pub fn init() -> Result<()> {
 
     let handle = handle_rx.recv().context("receive runtime handle")?;
 
+    // Second runtime, dedicated to order I/O (see module doc). Same
+    // current_thread shape; pinning is optional (`async_ord_core`).
+    let (ord_tx, ord_rx) = std::sync::mpsc::sync_channel::<Handle>(1);
+    std::thread::Builder::new()
+        .name("hexbot-async-ord".into())
+        .spawn(move || {
+            crate::os_tune::pin_async_ord("hexbot-async-ord");
+            let rt = match Builder::new_current_thread()
+                .enable_all()
+                .thread_name("hexbot-async-ord")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("Failed to build order tokio runtime: {}", e);
+                    return;
+                }
+            };
+            let handle = rt.handle().clone();
+            let _ = ord_tx.send(handle);
+            rt.block_on(futures_util::future::pending::<()>());
+        })
+        .context("spawn order runtime thread")?;
+
+    let ord_handle = ord_rx.recv().context("receive order runtime handle")?;
+
     // Role-separated HTTP/1.1 client pools — construction, sizing (config /
     // instance-count scaled via `http1_pool::set_sizes`), round-robin and
     // keep-warm all live in `crate::http1_pool`; the getters below delegate.
@@ -230,12 +259,24 @@ pub fn init() -> Result<()> {
 
     RUNTIME_HANDLE.set(handle)
         .map_err(|_| anyhow!("runtime handle already initialised"))?;
+    ORDER_RUNTIME_HANDLE.set(ord_handle)
+        .map_err(|_| anyhow!("order runtime handle already initialised"))?;
     Ok(())
 }
 
 /// Get the runtime handle. Panics if `init()` hasn't been called.
 pub fn handle() -> &'static Handle {
     RUNTIME_HANDLE.get().expect("async_rt::init() not called")
+}
+
+/// Get the order-I/O runtime handle (`hexbot-async-ord`). All CLOB
+/// place/cancel dispatch AND every path that establishes pool
+/// connections (prewarm, keep-warm, slot repair) must use this handle —
+/// mixed ownership would route order socket readiness through the busy
+/// general reactor. Falls back to the general handle if the order
+/// runtime never came up (its spawn failed non-fatally).
+pub fn order_handle() -> &'static Handle {
+    ORDER_RUNTIME_HANDLE.get().unwrap_or_else(handle)
 }
 
 /// Get one of the fast (hot-path submit) HTTP/2 clients, round-robin across
@@ -426,10 +467,43 @@ where
     rx.blocking_recv().expect("async task dropped before sending")
 }
 
+/// `block_on_runtime` against the order-I/O runtime. Use for sync paths
+/// that establish or exercise pool connections (transport prewarm,
+/// heartbeat prewarm) so the sockets they create are owned by the order
+/// reactor, not the general one.
+pub fn block_on_order_runtime<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel::<T>();
+    order_handle().spawn(async move {
+        let val = fut.await;
+        let _ = tx.send(val);
+    });
+    rx.blocking_recv().expect("async task dropped before sending")
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both runtimes come up from one `init()` and futures land on the
+    /// right dedicated thread — the order-I/O split depends on this
+    /// (order futures must never share the feed runtime's event loop).
+    #[test]
+    fn init_spawns_general_and_order_runtimes() {
+        init().expect("async_rt::init");
+        let general = block_on_runtime(async {
+            std::thread::current().name().map(str::to_string)
+        });
+        let order = block_on_order_runtime(async {
+            std::thread::current().name().map(str::to_string)
+        });
+        assert_eq!(general.as_deref(), Some("hexbot-async-rt"));
+        assert_eq!(order.as_deref(), Some("hexbot-async-ord"));
+    }
 
     /// `init_http_timeout` must clamp values above the FAST client
     /// pool ceiling so a misconfiguration can't silently exceed what the

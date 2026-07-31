@@ -180,10 +180,11 @@ fn preload_hist_bars(
 
 fn polymarket_instance_pool_sizes() -> hexagent_runtime::http1_pool::PoolSizes {
     hexagent_runtime::http1_pool::PoolSizes {
-        fast: 3,
-        cancel: 3,
-        reconcile: 1,
-        query: 1,
+        // Merged pools (2026-07-31): place + cancel share 6 slots (was
+        // 3 + 3 partitioned — a burst of either type can now use all 6),
+        // reconcile + query share 2 (was 1 + 1).
+        order: 6,
+        misc: 2,
         // GapReplay is process-global; this field is ignored by
         // `init_instance_pools` but kept explicit for forward compatibility.
         gap_replay: 2,
@@ -4099,6 +4100,20 @@ impl Engine {
             "[Engine] Built {} Polymarket SharedState(s) across {} account(s) for {} instance(s)",
             by_account.len(), by_account.len(), out.len(),
         );
+        // Keep every pooled CLOB connection warm through quiet stretches
+        // (event rollovers, closed sessions). The one-shot staggered
+        // prewarm in `prewarm_connections()` only covers startup — idle
+        // slots evicted later (hyper pool_idle_timeout, or the LB's own
+        // idle close) would otherwise pay DNS+TCP+TLS inside the 2000 ms
+        // order budget on their next pick. `/time` is free and
+        // unauthenticated, same endpoint the prewarm uses.
+        if !by_account.is_empty() {
+            hexagent_runtime::http1_pool::spawn_keep_warm(
+                "clob",
+                format!("{}/time", poly_cfg.api_url_prefix.trim_end_matches('/')),
+                std::time::Duration::from_secs(20),
+            );
+        }
         out
     }
 
@@ -4428,7 +4443,7 @@ impl Engine {
                     // (Σ per-instance fast+cancel) + slack, so a fired request
                     // never waits for a drainer while holding its permit. Derived
                     // from `sizes` so it auto-scales when the pool sizes change.
-                    let n_drainers = iids.len() * (sizes.fast + sizes.cancel) + 4;
+                    let n_drainers = iids.len() * sizes.order + 4;
                     for i in 0..n_drainers {
                         let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_done_rx.clone();

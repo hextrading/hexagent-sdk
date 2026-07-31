@@ -789,7 +789,9 @@ async fn user_feed_loop(
     // call never pauses WS reads, and it keeps recovering fills *across*
     // reconnects (including while the main loop is reconnecting). Cadence and
     // rewind window are config-driven (`gap_replay.interval_ms` /
-    // `periodic_rewind_ms`; defaults 2s / 5s). The status dedup in
+    // `periodic_rewind_ms`; defaults 2s / 10s — the rewind is a FLOOR,
+    // the sweep also always reaches back to the last server-timestamped
+    // trade seen, so longer WS gaps stay covered). The status dedup in
     // upsert_trade / update_trade makes already-seen fills no-ops, so only
     // genuinely-dropped ones reach the ledger. A rewind larger than the
     // cadence means a fill is covered by ≥2 sweeps even with match_time
@@ -828,7 +830,21 @@ async fn user_feed_loop(
                     did_startup_deep = true;
                     (now_ms / 1000).saturating_sub(300)            // startup → deep catch-up
                 } else {
-                    now_ms.saturating_sub(rewind_ms) / 1000        // rewind (ms) → floor to sec
+                    // Dynamic rewind: max(configured floor, now − last trade
+                    // the feed actually delivered, on the SERVER match_time
+                    // axis) — i.e. `after = min(now − floor, last_trade − 1)`.
+                    // A WS drop longer than the floor is then still covered:
+                    // the window always reaches back to the last fill we have
+                    // seen. −1 s guards Polymarket's strict-`>` semantics on
+                    // `?after=T`; the overlap is deduped by trade_id.
+                    let floor_after = now_ms.saturating_sub(rewind_ms) / 1000; // rewind (ms) → floor to sec
+                    let last_trade_secs =
+                        shared.live_position.lock().unwrap().last_match_time_secs();
+                    if last_trade_secs > 0 {
+                        floor_after.min(last_trade_secs.saturating_sub(1))
+                    } else {
+                        floor_after
+                    }
                 };
                 let after = periodic_window_start(&mut periodic_after_secs, after);
                 let replay_result = {

@@ -28,14 +28,18 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 /// EIP-712 domain type hash:
 /// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+/// Constant — memoized so the per-order struct-hash path doesn't re-keccak it.
 fn eip712_domain_type_hash() -> [u8; 32] {
-    keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"))
 }
 
 /// Order struct type hash:
 /// keccak256("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
+/// Constant — memoized (recomputing it per order doubled the keccak work).
 fn order_type_hash() -> [u8; 32] {
-    keccak256(b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| keccak256(b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"))
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -113,6 +117,11 @@ pub struct OrderSigner {
     pub maker_address: String,
     exchange_address: String,
     pub signature_type: SignatureType,
+    /// EIP-712 domain separator — constant per (exchange, chain), so it is
+    /// computed once here instead of 4 keccaks per signed order.
+    domain_sep: [u8; 32],
+    /// Pre-lowercased maker key for `account_salt_prekeyed`.
+    salt_key: String,
 }
 
 impl OrderSigner {
@@ -138,17 +147,24 @@ impl OrderSigner {
             CTF_EXCHANGE.to_string()
         };
 
-        Ok(Self { signing_key, signer_address, maker_address, exchange_address, signature_type: sig_type })
+        let domain_sep = compute_domain_separator(&exchange_address);
+        let salt_key = maker_address.to_ascii_lowercase();
+        Ok(Self { signing_key, signer_address, maker_address, exchange_address, signature_type: sig_type, domain_sep, salt_key })
     }
 
     /// Sign an order, returning the hex-encoded signature with 0x prefix.
     pub fn sign_order(&self, order: &ClobOrder) -> Result<String> {
-        let _t = crate::latency::TimedStage::new("polymarket.signer.sign");
-        let digest = self.order_digest(order);
+        self.sign_digest(&self.order_digest(order))
+    }
 
+    /// Sign a precomputed `order_digest`, returning the hex-encoded
+    /// r||s||v signature. Split out so `build_signed_order` computes the
+    /// digest exactly once for both the signature and the orderID.
+    fn sign_digest(&self, digest: &[u8; 32]) -> Result<String> {
+        let _t = crate::latency::TimedStage::new("polymarket.signer.sign");
         // Sign with secp256k1
         let (sig, recid) = self.signing_key
-            .sign_prehash_recoverable(&digest)
+            .sign_prehash_recoverable(digest)
             .map_err(|e| anyhow!("Signing failed: {}", e))?;
 
         // Encode as r (32) + s (32) + v (1) where v = recid + 27
@@ -202,7 +218,7 @@ impl OrderSigner {
         };
 
         let order = ClobOrder {
-            salt: account_salt(&self.maker_address),
+            salt: account_salt_prekeyed(&self.salt_key),
             maker: self.maker_address.clone(),   // Safe proxy or EOA
             signer: self.signer_address.clone(), // always EOA
             taker: ZERO_ADDRESS.to_string(),
@@ -216,27 +232,37 @@ impl OrderSigner {
             signature_type: self.signature_type as u8,
         };
 
-        let signature = self.sign_order(&order)?;
-        let order_hash = self.order_hash_hex(&order);
+        // One digest serves both the signature and the orderID — the
+        // previous sign_order + order_hash_hex pair hashed the full
+        // struct twice per order.
+        let digest = self.order_digest(&order);
+        let signature = self.sign_digest(&digest)?;
+        let order_hash = format!("0x{}", hex::encode(digest));
         Ok(SignedOrder { order, signature, order_hash })
     }
 
     fn domain_separator(&self) -> [u8; 32] {
-        let type_hash = eip712_domain_type_hash();
-        let name_hash = keccak256(b"Polymarket CTF Exchange");
-        let version_hash = keccak256(b"1");
-        let chain_id = u256_bytes(CHAIN_ID as u128);
-        let contract = address_to_bytes32(&self.exchange_address);
-
-        // abi.encode(typeHash, nameHash, versionHash, chainId, verifyingContract)
-        let mut buf = Vec::with_capacity(5 * 32);
-        buf.extend_from_slice(&type_hash);
-        buf.extend_from_slice(&name_hash);
-        buf.extend_from_slice(&version_hash);
-        buf.extend_from_slice(&chain_id);
-        buf.extend_from_slice(&contract);
-        keccak256(&buf)
+        self.domain_sep
     }
+}
+
+/// abi.encode(typeHash, nameHash, versionHash, chainId, verifyingContract)
+/// → keccak. Constant per exchange address; called once from
+/// `OrderSigner::new` and cached.
+fn compute_domain_separator(exchange_address: &str) -> [u8; 32] {
+    let type_hash = eip712_domain_type_hash();
+    let name_hash = keccak256(b"Polymarket CTF Exchange");
+    let version_hash = keccak256(b"1");
+    let chain_id = u256_bytes(CHAIN_ID as u128);
+    let contract = address_to_bytes32(exchange_address);
+
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&chain_id);
+    buf.extend_from_slice(&contract);
+    keccak256(&buf)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -318,10 +344,20 @@ fn salt_counters() -> &'static Mutex<HashMap<String, u64>> {
 ///   - The 32-bit counter wraps only after 2^32 (~4.3e9) orders for one account
 ///     within one run — never reached in practice.
 pub fn account_salt(maker: &str) -> String {
-    let key = maker.to_ascii_lowercase();
+    account_salt_prekeyed(&maker.to_ascii_lowercase())
+}
+
+/// [`account_salt`] for an already-lowercased maker key. Hot-path
+/// variant: the signers cache the lowercased key so the per-order
+/// allocation + case-fold disappear; the map key is only allocated on
+/// an account's first order.
+pub fn account_salt_prekeyed(key_lower: &str) -> String {
     let counter = {
         let mut map = salt_counters().lock().unwrap_or_else(|e| e.into_inner());
-        let c = map.entry(key).or_insert(0);
+        if !map.contains_key(key_lower) {
+            map.insert(key_lower.to_string(), 0);
+        }
+        let c = map.get_mut(key_lower).expect("key inserted above");
         let v = *c;
         *c = c.wrapping_add(1);
         v

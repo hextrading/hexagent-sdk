@@ -510,11 +510,13 @@ impl RateLimiter {
 }
 
 // ─── Async HTTP dispatch ────────────────────────────────────────────
-// All Polymarket REST calls run on the shared tokio runtime
-// (`async_rt::handle()`) via the shared `reqwest::Client`
-// (HTTP/2, keepalive, multiplexed). No dedicated worker threads — tokio
-// schedules the futures on its current_thread runtime. Parallel cancel+
-// place is realised by kicking off two `spawn` calls without waiting.
+// All Polymarket REST calls run on the dedicated order-I/O runtime
+// (`async_rt::order_handle()`) via the shared `reqwest::Client`
+// (h1.1, keepalive). No dedicated worker threads — tokio schedules the
+// futures on that current_thread runtime, isolated from the WS-feed
+// runtime so book bursts can't head-of-line-block order polls. Parallel
+// cancel+place is realised by kicking off two `spawn` calls without
+// waiting.
 
 type HttpReply = std::result::Result<serde_json::Value, HttpErr>;
 
@@ -762,15 +764,20 @@ fn pick_client(method: &reqwest::Method, path: &str) -> crate::http1_pool::Poole
 }
 
 /// Per-request timeout for `(method, path)`. Returns `Some(d)` for the
-/// FAST + CANCEL paths so the session-of-day timeout takes effect; `None`
-/// for paths that should keep their client-level timeout (reconcile uses
-/// its dedicated 2 s pool, query uses 5 s, neither benefits from
-/// session-aware tuning since the upstream stalls hitting them are rare
-/// and already absorbed by their longer ceiling).
+/// FAST + CANCEL paths so the session-of-day timeout takes effect and
+/// for reconcile GETs (2 s, preserving the pre-merge reconcile pool
+/// deadline); `None` for paths that keep the client-level timeout
+/// (query 5 s — rare upstream stalls are absorbed by the ceiling).
 fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time::Duration> {
     match (method.as_str(), path) {
         ("POST", "/order") | ("POST", "/orders") => Some(async_rt::current_fast_timeout()),
         ("DELETE", _) => Some(async_rt::current_cancel_timeout()),
+        // Reconcile order-state GETs keep their historical 2 s deadline:
+        // the merged reconcile+query pool's client-level timeout is the
+        // Query ceiling (5 s), which would let a reconcile attempt hang
+        // 2.5× longer than the retry ladder expects.
+        ("GET", p) if p.starts_with("/data/order/") =>
+            Some(std::time::Duration::from_millis(2000)),
         _ => None,
     }
 }
@@ -808,14 +815,18 @@ async fn execute_http_on(
     headers: super::auth::AuthHeaders,
     body: String,
 ) -> HttpReply {
-    let prewarm_url = reqwest::Url::parse(&url)
-        .map(|mut parsed| {
-            parsed.set_path("/time");
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string()
-        })
-        .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string());
+    // Lazily derived — only the error branches need it, and parsing the
+    // URL eagerly cost a full `Url::parse` + allocs on every request.
+    let prewarm_url = |u: &str| {
+        reqwest::Url::parse(u)
+            .map(|mut parsed| {
+                parsed.set_path("/time");
+                parsed.set_query(None);
+                parsed.set_fragment(None);
+                parsed.to_string()
+            })
+            .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string())
+    };
     let req_timeout = per_request_timeout(&method, &path);
     let mut req = client.client().request(method.clone(), &url)
         .header("Content-Type", "application/json")
@@ -835,7 +846,7 @@ async fn execute_http_on(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            client.note_transport_failure(prewarm_url);
+            client.note_transport_failure(prewarm_url(&url));
             return Err(map_reqwest_err(e));
         }
     };
@@ -847,7 +858,7 @@ async fn execute_http_on(
                 Err(HttpErr::Status(status.as_u16(), body))
             }
             Err(error) => {
-                client.note_transport_failure(prewarm_url);
+                client.note_transport_failure(prewarm_url(&url));
                 Err(map_reqwest_err(error))
             }
         };
@@ -861,12 +872,98 @@ async fn execute_http_on(
             bytes
         }
         Err(error) => {
-            client.note_transport_failure(prewarm_url);
+            client.note_transport_failure(prewarm_url(&url));
             return Err(map_reqwest_err(error));
         }
     };
     serde_json::from_slice(&bytes)
         .map_err(|e| HttpErr::Other(format!("json parse: {}", e)))
+}
+
+
+/// Typed `POST /order` wire bodies. Serialized in one pass with
+/// `serde_json::to_string` on the hot path (the legacy `json!{…}` +
+/// `.to_string()` pair built and then re-walked a full `Value` tree per
+/// order). Key NAMES must stay wire-exact; key order is irrelevant to
+/// the server (JSON object).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum PolyOrderBody {
+    V1(WireBodyV1),
+    V2(WireBodyV2),
+}
+
+/// One-pass `DELETE /order` body for the hot cancel path.
+#[derive(serde::Serialize)]
+struct CancelBody<'a> {
+    #[serde(rename = "orderID")]
+    order_id: &'a str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct WireBodyV1 {
+    pub owner: String,
+    #[serde(rename = "orderType")]
+    pub order_type: &'static str,
+    #[serde(rename = "postOnly")]
+    pub post_only: bool,
+    pub order: WireOrderV1,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct WireOrderV1 {
+    pub salt: u64,
+    pub maker: String,
+    pub signer: String,
+    pub taker: String,
+    #[serde(rename = "tokenId")]
+    pub token_id: String,
+    #[serde(rename = "makerAmount")]
+    pub maker_amount: String,
+    #[serde(rename = "takerAmount")]
+    pub taker_amount: String,
+    pub expiration: String,
+    pub nonce: String,
+    #[serde(rename = "feeRateBps")]
+    pub fee_rate_bps: String,
+    pub side: &'static str,
+    pub signature: String,
+    #[serde(rename = "signatureType")]
+    pub signature_type: u8,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct WireBodyV2 {
+    pub owner: String,
+    #[serde(rename = "orderType")]
+    pub order_type: &'static str,
+    #[serde(rename = "postOnly")]
+    pub post_only: bool,
+    #[serde(rename = "deferExec")]
+    pub defer_exec: bool,
+    pub order: WireOrderV2,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct WireOrderV2 {
+    pub salt: u64,
+    pub maker: String,
+    pub signer: String,
+    pub taker: String,
+    #[serde(rename = "tokenId")]
+    pub token_id: String,
+    #[serde(rename = "makerAmount")]
+    pub maker_amount: String,
+    #[serde(rename = "takerAmount")]
+    pub taker_amount: String,
+    pub side: &'static str,
+    #[serde(rename = "signatureType")]
+    pub signature_type: u8,
+    pub timestamp: String,
+    pub expiration: String,
+    pub metadata: String,
+    pub builder: String,
+    pub signature: String,
 }
 
 /// User-feed gap-replay tuning (sourced from `exchanges[polymarket]`). All
@@ -885,7 +982,7 @@ pub struct GapReplayConfig {
 
 impl Default for GapReplayConfig {
     fn default() -> Self {
-        Self { interval_ms: 2000, periodic_rewind_ms: 5000, reconnect_rewind_ms: 5000 }
+        Self { interval_ms: 2000, periodic_rewind_ms: 10_000, reconnect_rewind_ms: 5000 }
     }
 }
 
@@ -1561,7 +1658,7 @@ impl SharedState {
             let method_owned = method.clone();
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
-            async_rt::handle().spawn(async move {
+            async_rt::order_handle().spawn(async move {
                 let reply = execute_http(method_owned.clone(), url_owned, path_owned.clone(), headers, body_owned).await;
                 // Capture the CSV status before `reply` is moved into the
                 // channel (only when we'll actually record).
@@ -1619,7 +1716,7 @@ impl SharedState {
             let url_a = url.clone();
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
-            async_rt::handle().spawn(async move {
+            async_rt::order_handle().spawn(async move {
                 let reply =
                     execute_http_on(client, method_a.clone(), url_a, path_a.clone(), headers, body_a)
                         .await;
@@ -1905,7 +2002,10 @@ impl PolymarketTrade {
         // `.instrument()`. `SharedState.instance_id` holds the account_id.
         use tracing::Instrument as _;
         let hb_span = tracing::info_span!("heartbeat", acct = %self.shared.instance_id);
-        let task_handle = async_rt::handle()
+        // Order runtime: any connection the heartbeat (re)establishes on
+        // its Query slot must be owned by the order reactor, matching
+        // keep-warm/prewarm ownership. Load is one request per 10 s.
+        let task_handle = async_rt::order_handle()
             .spawn(heartbeat_loop(auth, shutdown, base_url).instrument(hb_span));
         // Return a std JoinHandle so existing engine shutdown code can
         // .join() it. The handle's thread awaits the tokio task to
@@ -1945,7 +2045,7 @@ impl PolymarketTrade {
                 PREWARM_CONCURRENCY,
                 PREWARM_STAGGER_MS,
             );
-            async_rt::block_on_runtime(async move {
+            async_rt::block_on_order_runtime(async move {
                 prewarm_clients_staggered(
                     "clob",
                     clob_clients,
@@ -1968,7 +2068,7 @@ impl PolymarketTrade {
         let heartbeat_url =
             format!("{}/heartbeats", self.shared.clob_base_url.trim_end_matches('/'));
         let client = crate::async_rt::http_client_query();
-        let heartbeat_status = async_rt::block_on_runtime(async move {
+        let heartbeat_status = async_rt::block_on_order_runtime(async move {
             let mut request = client
                 .post(&heartbeat_url)
                 .header("Content-Type", "application/json")
@@ -2304,7 +2404,7 @@ impl PolymarketTrade {
     fn sign_and_build_body(
         &self,
         order: &OrderRequest,
-    ) -> Result<(String /* order_hash */, serde_json::Value)> {
+    ) -> Result<(String /* order_hash */, PolyOrderBody)> {
         let price = order.price.unwrap_or(0.0);
         if price <= 0.0 || price >= 1.0 {
             return Err(anyhow!("Invalid price: {}", price));
@@ -2317,6 +2417,8 @@ impl PolymarketTrade {
     }
 
     /// Translate `OrderRequest::order_type` to Polymarket's wire string.
+    /// (Wire-body structs for the typed one-pass serialization live just
+    /// below `sign_and_build_body_v2`.)
     /// `Limit` (the default) maps to `"GTC"` (Good-Till-Cancel — resting
     /// limit). `Fak` / `Fok` pass through verbatim. `Market`,
     /// `LimitMaker` aren't valid for Polymarket and degrade to `"GTC"`
@@ -2333,7 +2435,7 @@ impl PolymarketTrade {
         &self,
         order: &OrderRequest,
         price: f64,
-    ) -> Result<(String, serde_json::Value)> {
+    ) -> Result<(String, PolyOrderBody)> {
         let signed = self.shared.signer.build_signed_order(
             &order.symbol,
             price,
@@ -2344,27 +2446,31 @@ impl PolymarketTrade {
 
         let salt_u64: u64 = signed.order.salt.parse::<u128>()
             .map(|v| v as u64).unwrap_or(0);
-        let salt_num = serde_json::json!(salt_u64);
 
-        let body = serde_json::json!({
-            "owner": self.owner,
-            "orderType": Self::poly_order_type_str(order.order_type),
-            "postOnly": order.post_only,
-            "order": {
-                "salt": salt_num,
-                "maker": signed.order.maker,
-                "signer": signed.order.signer,
-                "taker": signed.order.taker,
-                "tokenId": signed.order.token_id,
-                "makerAmount": signed.order.maker_amount,
-                "takerAmount": signed.order.taker_amount,
-                "expiration": signed.order.expiration,
-                "nonce": signed.order.nonce,
-                "feeRateBps": signed.order.fee_rate_bps,
-                "side": if order.side == Side::Buy { "BUY" } else { "SELL" },
-                "signature": signed.signature,
-                "signatureType": signed.order.signature_type,
-            }
+        // Typed wire body — serialized in ONE pass at dispatch
+        // (`serde_json::to_string`). The previous `json!{…}` built a
+        // full `Value` tree that `.to_string()` then re-walked. String
+        // fields move out of `signed.order` — no clones.
+        let o = signed.order;
+        let body = PolyOrderBody::V1(WireBodyV1 {
+            owner: self.owner.clone(),
+            order_type: Self::poly_order_type_str(order.order_type),
+            post_only: order.post_only,
+            order: WireOrderV1 {
+                salt: salt_u64,
+                maker: o.maker,
+                signer: o.signer,
+                taker: o.taker,
+                token_id: o.token_id,
+                maker_amount: o.maker_amount,
+                taker_amount: o.taker_amount,
+                expiration: o.expiration,
+                nonce: o.nonce,
+                fee_rate_bps: o.fee_rate_bps,
+                side: if order.side == Side::Buy { "BUY" } else { "SELL" },
+                signature: signed.signature,
+                signature_type: o.signature_type,
+            },
         });
         Ok((signed.order_hash, body))
     }
@@ -2373,7 +2479,7 @@ impl PolymarketTrade {
         &self,
         order: &OrderRequest,
         price: f64,
-    ) -> Result<(String, serde_json::Value)> {
+    ) -> Result<(String, PolyOrderBody)> {
         let signer_v2 = self.shared.signer_v2.as_ref()
             .ok_or_else(|| anyhow!("clob_version=v2 but signer_v2 is None — constructor bug"))?;
         let signed = signer_v2.build_signed_order_dispatch(
@@ -2382,33 +2488,34 @@ impl PolymarketTrade {
 
         let salt_u64: u64 = signed.order.salt.parse::<u128>()
             .map(|v| v as u64).unwrap_or(0);
-        let salt_num = serde_json::json!(salt_u64);
 
-        // v2 wire body — field set + order matches `orderToJsonV2` in
+        // v2 wire body — field set matches `orderToJsonV2` in
         // clob-client-v2/src/types/ordersV2.ts exactly. No `nonce`, no
         // `feeRateBps` (both removed in v2). `taker` and `expiration`
-        // are wire-only (NOT in the signed struct).
-        let body = serde_json::json!({
-            "owner": self.owner,
-            "orderType": Self::poly_order_type_str(order.order_type),
-            "postOnly": order.post_only,
-            "deferExec": false,
-            "order": {
-                "salt": salt_num,
-                "maker": signed.order.maker,
-                "signer": signed.order.signer,
-                "taker": signed.order.taker,
-                "tokenId": signed.order.token_id,
-                "makerAmount": signed.order.maker_amount,
-                "takerAmount": signed.order.taker_amount,
-                "side": if order.side == Side::Buy { "BUY" } else { "SELL" },
-                "signatureType": signed.order.signature_type,
-                "timestamp": signed.order.timestamp,
-                "expiration": signed.order.expiration,
-                "metadata": signed.order.metadata,
-                "builder": signed.order.builder,
-                "signature": signed.signature,
-            }
+        // are wire-only (NOT in the signed struct). Typed struct →
+        // one-pass serialization at dispatch; strings move, no clones.
+        let o = signed.order;
+        let body = PolyOrderBody::V2(WireBodyV2 {
+            owner: self.owner.clone(),
+            order_type: Self::poly_order_type_str(order.order_type),
+            post_only: order.post_only,
+            defer_exec: false,
+            order: WireOrderV2 {
+                salt: salt_u64,
+                maker: o.maker,
+                signer: o.signer,
+                taker: o.taker,
+                token_id: o.token_id,
+                maker_amount: o.maker_amount,
+                taker_amount: o.taker_amount,
+                side: if order.side == Side::Buy { "BUY" } else { "SELL" },
+                signature_type: o.signature_type,
+                timestamp: o.timestamp,
+                expiration: o.expiration,
+                metadata: o.metadata,
+                builder: o.builder,
+                signature: signed.signature,
+            },
         });
         Ok((signed.order_hash, body))
     }
@@ -3264,7 +3371,9 @@ impl PolymarketTrade {
             order.client_order_id, &local_oid[..18.min(local_oid.len())], order.timestamp_ns);
         log::debug!("[PolymarketTrade] Order body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-        Ok((local_oid, body.to_string()))
+        let body_json = serde_json::to_string(&body)
+            .map_err(|e| Self::make_rejected(order, &format!("body serialize: {}", e)))?;
+        Ok((local_oid, body_json))
     }
 
     /// Parse the `POST /order` reply and produce an `OrderUpdate`.
@@ -3451,7 +3560,8 @@ impl PolymarketTrade {
                 // (dispatch wall-clock − gen_ns). 0 = non-quote origin.
                 info!("[PolymarketTrade] Cancel request orderID={}... coid={} gen_ns={}",
                     oid_short, client_order_id, self.gen_ns_hint);
-                let body_str = serde_json::json!({ "orderID": oid }).to_string();
+                let body_str = serde_json::to_string(&CancelBody { order_id: &oid })
+                    .unwrap_or_else(|_| format!("{{\"orderID\":\"{}\"}}", oid));
                 (ctx, Some(body_str))
             }
             None => {
@@ -3773,6 +3883,7 @@ impl ExchangeTrade for PolymarketTrade {
             for (idx, o) in chunk.iter().enumerate() {
                 match self.sign_and_build_body(o) {
                     Ok((order_hash, b)) => {
+                        let b = serde_json::to_value(&b).unwrap_or_default();
                         // Pre-register BEFORE the HTTP call so the map
                         // survives a timeout / dropped ack. Same
                         // open_orders insert as `submit_kickoff` —
@@ -4339,6 +4450,7 @@ impl ExchangeTrade for PolymarketTrade {
         for (idx, o) in place_chunk.iter().enumerate() {
             match self.sign_and_build_body(o) {
                 Ok((order_hash, b)) => {
+                    let b = serde_json::to_value(&b).unwrap_or_default();
                     self.shared.register_order_id(&o.client_order_id, &order_hash, &o.symbol);
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share

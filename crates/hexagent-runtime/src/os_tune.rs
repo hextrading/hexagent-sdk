@@ -85,6 +85,11 @@ pub struct CorePlan {
     pub enable_pin: bool,
     pub enable_fifo: bool,
     pub async_rt: usize,
+    /// Core for the order-I/O runtime thread (`hexbot-async-ord`).
+    /// `None` = leave the thread unpinned at normal priority (safe
+    /// default — pinning it onto an already-claimed core with FIFO
+    /// would starve one of the two).
+    pub async_ord: Option<usize>,
     pub strategy: usize,
     /// Per-instance strategy-worker cores (live/paper multi-instance):
     /// `instance_id → core`. A polymaker instance whose `instance_id`
@@ -110,6 +115,7 @@ impl CorePlan {
             enable_pin: true,
             enable_fifo: true,
             async_rt: DEFAULT_ASYNC_RT_CORE,
+            async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -133,6 +139,7 @@ impl CorePlan {
             enable_pin: cfg.enable_pin,
             enable_fifo: cfg.enable_fifo,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
+            async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -192,8 +199,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={}",
-        plan.async_rt, plan.strategy, plan.execution,
+        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={}",
+        plan.async_rt, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
         plan.enable_pin, plan.enable_fifo,
@@ -331,6 +338,20 @@ pub fn pin_async_rt(thread_name: &str) {
     let p = plan();
     pin_current(p.async_rt, thread_name);
     set_fifo(p.fifo_async_rt, thread_name);
+}
+
+/// Pin the order-I/O runtime thread (`hexbot-async-ord`) when
+/// `async_ord_core` is configured; otherwise leave it floating at
+/// normal priority. Deliberately NOT defaulted onto `async_rt`'s core:
+/// two SCHED_FIFO threads at equal priority on one core would let a
+/// feed batch on the general runtime starve order wakeups — the exact
+/// head-of-line problem the split removes.
+pub fn pin_async_ord(thread_name: &str) {
+    let p = plan();
+    if let Some(core) = p.async_ord {
+        pin_current(core, thread_name);
+        set_fifo(p.fifo_async_rt, thread_name);
+    }
 }
 
 /// Pin the strategy decision thread to its dedicated core with
