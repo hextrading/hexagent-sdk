@@ -218,9 +218,7 @@ pub const SEGMENT_BOUNDARY_SECS: u64 = 60;
 /// sorted order and carrying the previous event's PLACE-ONLY p60
 /// forward — matching the strategy's gate config (`rtt_percentile =
 /// 0.60`) AND the gate's place-only sample source.
-pub fn extract_per_event_rtt(
-    paths: &[String],
-) -> std::io::Result<HashMap<u64, EventRttOverride>> {
+pub fn extract_per_event_rtt(paths: &[String]) -> std::io::Result<HashMap<u64, EventRttOverride>> {
     if paths.is_empty() {
         return Ok(HashMap::new());
     }
@@ -236,12 +234,12 @@ pub fn extract_per_event_rtt(
     // `*_early` / `*_late` (or neither, if the submit is in the
     // lock-in window — those samples are dropped entirely for parity
     // with the gate's p60).
-    let mut place_all:   HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut place_all: HashMap<u64, Vec<f64>> = HashMap::new();
     let mut place_early: HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut place_late:  HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut cancel_all:   HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut place_late: HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut cancel_all: HashMap<u64, Vec<f64>> = HashMap::new();
     let mut cancel_early: HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut cancel_late:  HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut cancel_late: HashMap<u64, Vec<f64>> = HashMap::new();
     // Per-event timeout RATE counters (right-censored tail). A request that
     // exceeds client_timeout emits a `*OrderTimeout` line and NO ack, so it
     // is absent from the `*_all` quantile vectors above — those describe
@@ -254,20 +252,22 @@ pub fn extract_per_event_rtt(
     // timeout (undercounts ~10×). Raw counts are exact and robust. Drives
     // the sampler's exceedance anchor (latency.rs) — without it the sim
     // draws ~0 cancel timeouts vs ~1.3 % in live.
-    let mut place_req:  HashMap<u64, usize> = HashMap::new();
+    let mut place_req: HashMap<u64, usize> = HashMap::new();
     let mut cancel_req: HashMap<u64, usize> = HashMap::new();
-    let mut place_to:   HashMap<u64, usize> = HashMap::new();
-    let mut cancel_to:  HashMap<u64, usize> = HashMap::new();
+    let mut place_to: HashMap<u64, usize> = HashMap::new();
+    let mut cancel_to: HashMap<u64, usize> = HashMap::new();
     // Set of event_secs we've seen evidence of (from Submit ts or from
     // `Event ended:` lines). Used to seed events that had no fills
     // (still present in the table with all-None quantiles, so prev_p85
     // walk handles them).
-    let mut observed_events: std::collections::BTreeSet<u64> =
-        std::collections::BTreeSet::new();
+    let mut observed_events: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
     for path in paths {
         for line in calib_lines(path)? {
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
 
             // Detect explicit event boundary — adds to observed_events.
             if let Some(secs) = parse_event_ended_line(&line) {
@@ -276,9 +276,7 @@ pub fn extract_per_event_rtt(
 
             // Submit / Cancel request: stash log_ts by coid.
             if line.contains("] Submit ") {
-                if let (Some(ts), Some(coid)) =
-                    (parse_iso_ts_ms(&line), parse_coid(&line))
-                {
+                if let (Some(ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     // observed_events tracks any event that had strategy
                     // activity — for the prev_p carry-over walk to chain
                     // through "trade happened" gaps. Skip the lock-in
@@ -296,9 +294,7 @@ pub fn extract_per_event_rtt(
                 continue;
             }
             if line.contains("] Cancel request ") {
-                if let (Some(ts), Some(coid)) =
-                    (parse_iso_ts_ms(&line), parse_coid(&line))
-                {
+                if let (Some(ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     // Rate denominator: every cancel request is one cancel op.
                     let event_secs = (ts / 1000 / EVENT_PERIOD_SECS) * EVENT_PERIOD_SECS;
                     *cancel_req.entry(event_secs).or_default() += 1;
@@ -318,11 +314,11 @@ pub fn extract_per_event_rtt(
             // their accompanying status=matched row, no separate
             // matcher needed.
             if line.contains("] Order accepted:") {
-                if let (Some(accept_ts), Some(coid)) =
-                    (parse_iso_ts_ms(&line), parse_coid(&line))
-                {
+                if let (Some(accept_ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     if let Some(submit) = submit_ts.remove(&coid) {
-                        if let Some((evt, offset_secs)) = submit_ts_to_event_secs_with_offset(submit) {
+                        if let Some((evt, offset_secs)) =
+                            submit_ts_to_event_secs_with_offset(submit)
+                        {
                             let rtt = (accept_ts.saturating_sub(submit)) as f64;
                             place_all.entry(evt).or_default().push(rtt);
                             if offset_secs < SEGMENT_BOUNDARY_SECS {
@@ -336,9 +332,7 @@ pub fn extract_per_event_rtt(
                 continue;
             }
             if line.contains("] Cancel result ") {
-                if let (Some(reply_ts), Some(coid)) =
-                    (parse_iso_ts_ms(&line), parse_coid(&line))
-                {
+                if let (Some(reply_ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     if let Some(req) = cancel_req_ts.remove(&coid) {
                         if let Some((evt, offset_secs)) = submit_ts_to_event_secs_with_offset(req) {
                             let rtt = (reply_ts.saturating_sub(req)) as f64;
@@ -364,11 +358,11 @@ pub fn extract_per_event_rtt(
             // but the inclusion keeps the distribution shape
             // strictly aligned.
             if line.contains("] Order failed") {
-                if let (Some(failed_ts), Some(coid)) =
-                    (parse_iso_ts_ms(&line), parse_coid(&line))
-                {
+                if let (Some(failed_ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     if let Some(submit) = submit_ts.remove(&coid) {
-                        if let Some((evt, offset_secs)) = submit_ts_to_event_secs_with_offset(submit) {
+                        if let Some((evt, offset_secs)) =
+                            submit_ts_to_event_secs_with_offset(submit)
+                        {
                             let rtt = (failed_ts.saturating_sub(submit)) as f64;
                             place_all.entry(evt).or_default().push(rtt);
                             if offset_secs < SEGMENT_BOUNDARY_SECS {
@@ -412,12 +406,12 @@ pub fn extract_per_event_rtt(
     let mut out: HashMap<u64, EventRttOverride> = HashMap::new();
     let mut prev_place_p60: Option<u32> = None;
     for &evt in &observed_events {
-        let place      = place_all  .get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
-        let cancel     = cancel_all .get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
-        let p_early    = place_early.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
-        let p_late     = place_late .get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
-        let c_early    = cancel_early.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
-        let c_late     = cancel_late .get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let place = place_all.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let cancel = cancel_all.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let p_early = place_early.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let p_late = place_late.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let c_early = cancel_early.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
+        let c_late = cancel_late.get(&evt).map(|v| v.as_slice()).unwrap_or(&[]);
         let (p_p50, p_p85, p_p95, p_p99) = quantiles(place);
         let (c_p50, c_p85, c_p95, c_p99) = quantiles(cancel);
         let (pe_p50, pe_p85, pe_p95, pe_p99) = quantiles(p_early);
@@ -604,7 +598,10 @@ pub fn extract_taker_overhead(paths: &[String]) -> std::io::Result<Option<(f64, 
     let mut takers: Vec<(u64, f64)> = Vec::new();
     for path in paths {
         for line in calib_lines(path)? {
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             if line.contains("] Submit ") {
                 if let (Some(ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
                     if submit_ts.len() < MAX_PENDING {
@@ -657,10 +654,125 @@ pub fn extract_taker_overhead(paths: &[String]) -> std::io::Result<Option<(f64, 
     Ok(Some((pct(0.50), pct(0.95), pct(0.99))))
 }
 
+/// Build causal per-event TAKER matching-overhead anchors from live logs.
+///
+/// Each raw sample is the accepted RTT of a `status=matched` Submit minus the
+/// concurrent maker (`status=live`) median for the same minute. Samples are
+/// grouped by the Submit's 5-minute event.  The anchors assigned to event `E`
+/// use only samples from completed events in `[E-lookback, E)`, so a table may
+/// safely be constructed from a log that also contains the validation period:
+/// no current-event or future-event observation can enter `E`.
+///
+/// `instance_id` filters on the coid prefix (for example `btc03-`). Empty means
+/// all instances. `blend` shrinks noisy rolling estimates toward `base`.
+pub fn extract_dynamic_taker_overhead(
+    paths: &[String],
+    instance_id: &str,
+    lookback_events: usize,
+    min_samples: usize,
+    blend: f64,
+    base: (f64, f64, f64),
+) -> std::io::Result<HashMap<u64, (f64, f64, f64)>> {
+    let mut submit_ts: HashMap<u64, (u64, u64)> = HashMap::new();
+    let mut maker_by_min: HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut takers: Vec<(u64, u64, f64)> = Vec::new();
+    let mut observed = std::collections::BTreeSet::new();
+
+    for path in paths {
+        for line in calib_lines(path)? {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.contains("] Submit ") {
+                if !coid_matches_instance(&line, instance_id) {
+                    continue;
+                }
+                if let (Some(ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
+                    let event = (ts / 1000 / EVENT_PERIOD_SECS) * EVENT_PERIOD_SECS;
+                    observed.insert(event);
+                    if submit_ts.len() < MAX_PENDING {
+                        submit_ts.insert(coid, (ts, event));
+                    }
+                }
+                continue;
+            }
+            if line.contains("] Order accepted:") {
+                if let (Some(ts), Some(coid)) = (parse_iso_ts_ms(&line), parse_coid(&line)) {
+                    if let Some((submit, event)) = submit_ts.remove(&coid) {
+                        let rtt = ts.saturating_sub(submit) as f64;
+                        if rtt > 15_000.0 {
+                            continue;
+                        }
+                        let minute = ts / 60_000;
+                        if line.contains("status=matched") {
+                            takers.push((event, minute, rtt));
+                        } else if line.contains("status=live") {
+                            maker_by_min.entry(minute).or_default().push(rtt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut maker_med = HashMap::new();
+    for (minute, mut samples) in maker_by_min {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        maker_med.insert(minute, samples[samples.len() / 2]);
+    }
+    let mut by_event: std::collections::BTreeMap<u64, Vec<f64>> = std::collections::BTreeMap::new();
+    for (event, minute, rtt) in takers {
+        let network = maker_med
+            .get(&minute)
+            .or_else(|| maker_med.get(&minute.saturating_sub(1)))
+            .or_else(|| maker_med.get(&(minute + 1)));
+        if let Some(&network) = network {
+            let overhead = rtt - network;
+            if overhead >= 0.0 {
+                by_event.entry(event).or_default().push(overhead);
+            }
+        }
+    }
+
+    let lookback_secs = (lookback_events.max(1) as u64).saturating_mul(EVENT_PERIOD_SECS);
+    let min_samples = min_samples.max(1);
+    let blend = blend.clamp(0.0, 1.0);
+    let mut table = HashMap::new();
+    for &event in &observed {
+        let floor = event.saturating_sub(lookback_secs);
+        let mut rolling = Vec::new();
+        for (_, samples) in by_event.range(floor..event) {
+            rolling.extend_from_slice(samples);
+        }
+        if rolling.len() < min_samples {
+            continue;
+        }
+        rolling.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q = |p: f64| {
+            let idx = ((p * rolling.len() as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(rolling.len() - 1);
+            rolling[idx]
+        };
+        let raw = (q(0.50), q(0.95), q(0.99));
+        let mix = |fixed: f64, dynamic: f64| fixed + blend * (dynamic - fixed);
+        let p50 = mix(base.0, raw.0).max(1.0);
+        let p95 = mix(base.1, raw.1).max(p50 + 1.0);
+        let p99 = mix(base.2, raw.2).max(p95 + 1.0);
+        table.insert(event, (p50, p95, p99));
+    }
+    Ok(table)
+}
+
 fn parse_iso_ts_ms(line: &str) -> Option<u64> {
-    if line.len() < 24 { return None; }
+    if line.len() < 24 {
+        return None;
+    }
     let prefix = &line[..24];
-    if !prefix.ends_with('Z') { return None; }
+    if !prefix.ends_with('Z') {
+        return None;
+    }
     chrono::DateTime::parse_from_rfc3339(prefix)
         .ok()
         .map(|dt| dt.timestamp_millis().max(0) as u64)
@@ -677,8 +789,24 @@ fn parse_coid(line: &str) -> Option<u64> {
     // bare digits ("1779286506589") — `rsplit('-')` yields the whole token.
     let tok_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let digits = rest[..tok_end].rsplit('-').next().unwrap_or("");
-    if digits.is_empty() { return None; }
+    if digits.is_empty() {
+        return None;
+    }
     digits.parse().ok()
+}
+
+fn coid_matches_instance(line: &str, instance_id: &str) -> bool {
+    if instance_id.is_empty() {
+        return true;
+    }
+    let Some(idx) = line.find(" coid=") else {
+        return false;
+    };
+    let rest = &line[idx + " coid=".len()..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest[..end]
+        .strip_prefix(instance_id)
+        .is_some_and(|tail| tail.starts_with('-'))
 }
 
 /// Compute a single quantile at the given probability on a slice of
@@ -709,11 +837,17 @@ fn quantiles(samples: &[f64]) -> (Option<u32>, Option<u32>, Option<u32>, Option<
     let mut s: Vec<f64> = samples.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let nrank = |q: f64| -> u32 {
-        let idx = ((q * s.len() as f64).ceil() as usize).saturating_sub(1)
+        let idx = ((q * s.len() as f64).ceil() as usize)
+            .saturating_sub(1)
             .min(s.len() - 1);
         s[idx].max(0.0).min(u32::MAX as f64) as u32
     };
-    (Some(nrank(0.50)), Some(nrank(0.85)), Some(nrank(0.95)), Some(nrank(0.99)))
+    (
+        Some(nrank(0.50)),
+        Some(nrank(0.85)),
+        Some(nrank(0.95)),
+        Some(nrank(0.99)),
+    )
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -749,13 +883,70 @@ mod tests {
 
     #[test]
     fn parse_coid_finds_digits() {
-        assert_eq!(parse_coid("[...] Submit BUY @ 0.5 coid=1779286506589 oid=0x..."), Some(1779286506589));
-        assert_eq!(parse_coid("[...] Order accepted: orderID=0x... status=live coid=42"), Some(42));
+        assert_eq!(
+            parse_coid("[...] Submit BUY @ 0.5 coid=1779286506589 oid=0x..."),
+            Some(1779286506589)
+        );
+        assert_eq!(
+            parse_coid("[...] Order accepted: orderID=0x... status=live coid=42"),
+            Some(42)
+        );
         assert_eq!(parse_coid("no coid"), None);
         // Live/paper prefixed form "{instance_id}-{counter}": the counter
         // (after the last '-') is the unique numeric key.
-        assert_eq!(parse_coid("[...] Submit BUY @ 0.5 coid=btc01-1779286506589 oid=0x..."), Some(1779286506589));
+        assert_eq!(
+            parse_coid("[...] Submit BUY @ 0.5 coid=btc01-1779286506589 oid=0x..."),
+            Some(1779286506589)
+        );
         assert_eq!(parse_coid("[...] status=live coid=btc-02-42"), Some(42));
+    }
+
+    #[test]
+    fn dynamic_taker_overhead_is_iid_filtered_causal_and_shrunk() {
+        let mut log = String::new();
+        for i in 0..30 {
+            // Same-minute maker baseline = 10 ms, taker RTT = 110 ms.
+            log.push_str(&format!(
+                "2026-07-31T17:36:00.000Z INFO x ] Submit BUY coid=btc03-{} oid=x\n",
+                1_000 + i
+            ));
+            log.push_str(&format!(
+                "2026-07-31T17:36:00.010Z INFO x ] Order accepted: status=live coid=btc03-{}\n",
+                1_000 + i
+            ));
+            log.push_str(&format!(
+                "2026-07-31T17:36:01.000Z INFO x ] Submit BUY coid=btc03-{} oid=x\n",
+                2_000 + i
+            ));
+            log.push_str(&format!(
+                "2026-07-31T17:36:01.110Z INFO x ] Order accepted: status=matched coid=btc03-{}\n",
+                2_000 + i
+            ));
+        }
+        // Large foreign-account sample must not contaminate btc03.
+        log.push_str("2026-07-31T17:36:02.000Z INFO x ] Submit BUY coid=btc01-9001 oid=x\n");
+        log.push_str(
+            "2026-07-31T17:36:04.000Z INFO x ] Order accepted: status=matched coid=btc01-9001\n",
+        );
+        // Seed the next event. Its own sample is intentionally incomplete and
+        // therefore cannot enter the anchors assigned to that event.
+        log.push_str("2026-07-31T17:40:00.000Z INFO x ] Submit BUY coid=btc03-9999 oid=x\n");
+        let f = write_log(&log);
+        let paths = vec![f.path().to_string_lossy().to_string()];
+        let table =
+            extract_dynamic_taker_overhead(&paths, "btc03", 36, 30, 0.5, (200.0, 500.0, 800.0))
+                .unwrap();
+        let current =
+            (parse_iso_ts_ms("2026-07-31T17:40:00.000Z").unwrap() / 1000 / EVENT_PERIOD_SECS)
+                * EVENT_PERIOD_SECS;
+        let q = table.get(&current).expect("prior event supplies anchors");
+        assert!((q.0 - 150.0).abs() < 1e-9);
+        assert!((q.1 - 300.0).abs() < 1e-9);
+        assert!((q.2 - 450.0).abs() < 1e-9);
+        assert!(
+            table.get(&(current - EVENT_PERIOD_SECS)).is_none(),
+            "an event must not use its own samples"
+        );
     }
 
     #[test]
@@ -768,9 +959,15 @@ mod tests {
     fn submit_ts_to_event_secs_floors_to_5min() {
         // 14:20:06.618 = 1779286806618 ms = 1779286806 secs.
         // event_start = 1779286800, offset = 6s, within first 270s → Some.
-        assert_eq!(submit_ts_to_event_secs_with_offset(1779286806618), Some((1779286800, 6)));
+        assert_eq!(
+            submit_ts_to_event_secs_with_offset(1779286806618),
+            Some((1779286800, 6))
+        );
         // Exact boundary (offset=0) → Some.
-        assert_eq!(submit_ts_to_event_secs_with_offset(1779286500_000), Some((1779286500, 0)));
+        assert_eq!(
+            submit_ts_to_event_secs_with_offset(1779286500_000),
+            Some((1779286500, 0))
+        );
         // Just before next boundary (offset=299s, in last 30s) → None.
         assert_eq!(submit_ts_to_event_secs_with_offset(1779286499_999), None);
     }
@@ -793,7 +990,10 @@ mod tests {
         assert_eq!(submit_ts_to_event_secs_with_offset(ts_ms), None);
         // Next event boundary — Some again.
         let ts_ms = (evt + 300) * 1000;
-        assert_eq!(submit_ts_to_event_secs_with_offset(ts_ms), Some((evt + 300, 0)));
+        assert_eq!(
+            submit_ts_to_event_secs_with_offset(ts_ms),
+            Some((evt + 300, 0))
+        );
     }
 
     /// **Segmented bucketing** (2026-05-28): offset < SEGMENT_BOUNDARY_SECS
@@ -926,11 +1126,22 @@ mod tests {
         assert_eq!(e.place_n_samples, 2, "timed-out place is not an ack sample");
         // Cancel: the late result for coid 1003 pairs into the quantiles
         // (the timeout branch only counts the rate, doesn't touch pairing).
-        assert_eq!(e.cancel_n_samples, 3, "late cancel result pairs as a sample");
+        assert_eq!(
+            e.cancel_n_samples, 3,
+            "late cancel result pairs as a sample"
+        );
         // rate = 1 timeout / 3 requests = 1/3 on each side.
         let third = 1.0 / 3.0;
-        assert!((e.place_timeout_rate.unwrap() - third).abs() < 1e-9, "place rate {:?}", e.place_timeout_rate);
-        assert!((e.cancel_timeout_rate.unwrap() - third).abs() < 1e-9, "cancel rate {:?}", e.cancel_timeout_rate);
+        assert!(
+            (e.place_timeout_rate.unwrap() - third).abs() < 1e-9,
+            "place rate {:?}",
+            e.place_timeout_rate
+        );
+        assert!(
+            (e.cancel_timeout_rate.unwrap() - third).abs() < 1e-9,
+            "cancel rate {:?}",
+            e.cancel_timeout_rate
+        );
     }
 
     /// No timeouts but enough samples → rate is `Some(0.0)`, not `None`.
@@ -1000,9 +1211,7 @@ mod tests {
 2026-05-20T14:25:00.000Z  INFO [polymaker] Event ended: btc-updown-5m-1779286800 outcome=Up
 ";
         let f = write_log(log);
-        let table = extract_per_event_rtt(
-            &[f.path().to_str().unwrap().to_string()],
-        ).unwrap();
+        let table = extract_per_event_rtt(&[f.path().to_str().unwrap().to_string()]).unwrap();
         let e1 = table[&1779286500];
         // Sanity: place p85 alone of event1 = nearest-rank q=0.85 on
         // sorted [100,200,300,400,500] → idx = ceil(4.25)-1 = 4 → 500.
@@ -1013,9 +1222,12 @@ mod tests {
         let e2 = table[&1779286800];
         // Place-only sorted = [100,200,300,400,500].
         // q=0.60: idx = ceil(0.6*5)-1 = 2 → 300ms.
-        assert_eq!(e2.prev_event_p_ms, Some(300),
+        assert_eq!(
+            e2.prev_event_p_ms,
+            Some(300),
             "prev_p must be place-only p60 (300), not place p85 (500) \
-             nor pooled p60 (200)");
+             nor pooled p60 (200)"
+        );
     }
 
     /// **Lock-in cut + Order failed inclusion verification** (2026-05-21).
@@ -1039,14 +1251,14 @@ mod tests {
 2026-05-20T14:20:06.000Z  INFO [polymaker] Event ended: btc-updown-5m-1779286500 outcome=Up
 ";
         let f = write_log(log);
-        let table = extract_per_event_rtt(
-            &[f.path().to_str().unwrap().to_string()],
-        ).unwrap();
+        let table = extract_per_event_rtt(&[f.path().to_str().unwrap().to_string()]).unwrap();
         let e = table[&1779286500];
         // 3 kept (offsets 60s, 120s, 90s) — drop the offset 280s sample.
-        assert_eq!(e.place_n_samples, 3,
+        assert_eq!(
+            e.place_n_samples, 3,
             "expected 3 samples (2 Accepted within 270s + 1 Order failed within 270s); \
-             the Submit at offset 280s in the lock-in window must be dropped");
+             the Submit at offset 280s in the lock-in window must be dropped"
+        );
         // RTTs sorted: 100, 200, 300 ms (the 999ms one was dropped).
         assert_eq!(e.place_p50_ms, Some(200));
         assert_eq!(e.place_p85_ms, Some(300));
@@ -1072,8 +1284,11 @@ mod tests {
         let engine_pushes: f64 = (parser_p60 as f64) * factor;
 
         // Verify the math — the gate will see 405 ms, not 300 ms.
-        assert!((engine_pushes - 405.0).abs() < 1e-9,
-            "expected 300 × 1.35 = 405.0, got {}", engine_pushes);
+        assert!(
+            (engine_pushes - 405.0).abs() < 1e-9,
+            "expected 300 × 1.35 = 405.0, got {}",
+            engine_pushes
+        );
 
         // Legacy default (factor=1.0) is a no-op.
         let legacy = (parser_p60 as f64) * 1.0;
@@ -1097,9 +1312,7 @@ mod tests {
 2026-05-20T14:25:00.000Z  INFO [polymaker] Event ended: btc-updown-5m-1779286800 outcome=Down
 ";
         let f = write_log(log);
-        let table = extract_per_event_rtt(
-            &[f.path().to_str().unwrap().to_string()],
-        ).unwrap();
+        let table = extract_per_event_rtt(&[f.path().to_str().unwrap().to_string()]).unwrap();
         assert_eq!(table.len(), 2);
         let e = table[&1779286500];
         assert_eq!(e.place_n_samples, 0);
@@ -1116,9 +1329,7 @@ mod tests {
 2026-05-20T14:20:00.000Z  INFO [polymaker] Event ended: btc-updown-5m-1779286500 outcome=Up
 ";
         let f = write_log(log);
-        let table = extract_per_event_rtt(
-            &[f.path().to_str().unwrap().to_string()],
-        ).unwrap();
+        let table = extract_per_event_rtt(&[f.path().to_str().unwrap().to_string()]).unwrap();
         // Event present (Submit ts seeded observed_events), but with
         // zero RTT samples and all-None quantiles.
         let e = table[&1779286500];

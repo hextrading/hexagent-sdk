@@ -332,6 +332,71 @@ impl SideRecords {
         self.max_epoch_ms
     }
 
+    /// Build a causal event-level RTT state for dynamic execution windows.
+    ///
+    /// Samples are grouped into wall-clock `bucket_secs` buckets.  Each
+    /// bucket is reduced to `quantile`, winsorised at `cap_ms`, and the state
+    /// assigned to event `t` is the mean of at most `lookback_events`
+    /// *completed* buckets strictly before `t`.  Consequently neither the
+    /// current event nor a future event can leak into its simulated windows.
+    /// Missing buckets retain the available prior-history state without
+    /// manufacturing an RTT observation.
+    pub fn causal_rolling_event_quantile(
+        &self,
+        bucket_secs: u64,
+        lookback_events: usize,
+        quantile: f64,
+        cap_ms: f64,
+    ) -> std::collections::HashMap<u64, f64> {
+        use std::collections::{BTreeMap, HashMap, VecDeque};
+
+        if self.by_epoch.is_empty() || bucket_secs == 0 || lookback_events == 0 {
+            return HashMap::new();
+        }
+        let q = if quantile.is_finite() { quantile.clamp(0.0, 1.0) } else { 0.60 };
+        let cap = if cap_ms.is_finite() && cap_ms > 0.0 { cap_ms } else { f64::INFINITY };
+        let mut grouped: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
+        for &(epoch_ms, rtt_ms) in &self.by_epoch {
+            let epoch_secs = epoch_ms / 1000;
+            let event = (epoch_secs / bucket_secs) * bucket_secs;
+            grouped.entry(event).or_default().push(rtt_ms);
+        }
+        let mut reduced: BTreeMap<u64, f64> = BTreeMap::new();
+        for (event, values) in grouped.iter_mut() {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = ((q * values.len() as f64).floor() as usize).min(values.len() - 1);
+            reduced.insert(*event, (values[idx] as f64).min(cap));
+        }
+
+        let first = *reduced.keys().next().expect("non-empty reduced RTT table");
+        // One extra event lets a replay starting immediately after the last
+        // recorded bucket still consume the last completed observation.
+        let last = reduced.keys().next_back().copied().unwrap().saturating_add(bucket_secs);
+        let mut history: VecDeque<f64> = VecDeque::with_capacity(lookback_events);
+        let mut sum = 0.0;
+        let mut out = HashMap::new();
+        let mut event = first;
+        while event <= last {
+            // Publish before appending this event: strict causality.
+            if !history.is_empty() {
+                out.insert(event, sum / history.len() as f64);
+            }
+            if let Some(value) = reduced.get(&event).copied() {
+                history.push_back(value);
+                sum += value;
+                if history.len() > lookback_events {
+                    sum -= history.pop_front().unwrap();
+                }
+            }
+            let next = event.saturating_add(bucket_secs);
+            if next <= event {
+                break;
+            }
+            event = next;
+        }
+        out
+    }
+
     /// Resolve an RTT (ms) for an order placed at `now_ms` (Unix-epoch
     /// ms), using `u ∈ [0,1)` only when the lookup falls to the tier-3
     /// distribution draw. See the module doc for the three tiers.
@@ -575,6 +640,25 @@ mod tests {
         let r = SideRecords::from_samples(vec![]);
         assert_eq!(r.n(), 0);
         assert!(r.lookup(123_456, 0.5, &RecordReplayParams::default()).is_none());
+    }
+
+    #[test]
+    fn rolling_event_quantile_is_strictly_causal_and_gap_safe() {
+        // Three samples per 5-minute event; q=0.60 picks the middle/high
+        // empirical slot under the same floor(q*n) convention as replay.
+        let r = SideRecords::from_samples(vec![
+            (0, 10.0), (1_000, 20.0), (2_000, 30.0),
+            (300_000, 40.0), (301_000, 50.0), (302_000, 60.0),
+            // event 600 is intentionally missing
+            (900_000, 70.0), (901_000, 80.0), (902_000, 90.0),
+        ]);
+        let state = r.causal_rolling_event_quantile(300, 2, 0.60, 75.0);
+        assert_eq!(state.get(&0), None, "first event has no completed history");
+        assert_eq!(state.get(&300), Some(&20.0), "event 300 only sees event 0");
+        assert_eq!(state.get(&600), Some(&35.0), "missing event retains [20,50]");
+        assert_eq!(state.get(&900), Some(&35.0), "event 900 must not see its own RTT");
+        // event 900 q is 80, winsorised to 75; next event sees rolling [50,75].
+        assert_eq!(state.get(&1200), Some(&62.5));
     }
 
     #[test]

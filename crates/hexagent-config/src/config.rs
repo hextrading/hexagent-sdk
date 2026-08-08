@@ -222,6 +222,11 @@ pub struct BacktestConfig {
     /// sit ahead of our resting order.
     #[serde(default = "default_sim_v2_ahead_frac")]
     pub sim_v2_ahead_frac: f64,
+    /// sim_v2 only — blend the fixed `ahead_frac` override toward the causal,
+    /// order-local queue-position estimate `q_ahead / level_depth` at every
+    /// resync. 0 (default) is the historical fixed model; 1 is fully dynamic.
+    #[serde(default)]
+    pub sim_v2_dynamic_ahead_frac_strength: f64,
     /// sim_v2 only — ws fill-push latency multiplier applied to the half-RTT
     /// when delivering fills back to the strategy (v1 calibrated ≈ 1.5).
     #[serde(default = "default_sim_v2_fill_push_mult")]
@@ -237,6 +242,26 @@ pub struct BacktestConfig {
     pub sim_v2_taker_overhead_p95_ms: f64,
     #[serde(default = "default_sim_v2_taker_overhead_p99_ms")]
     pub sim_v2_taker_overhead_p99_ms: f64,
+    /// sim_v2 only — opt-in causal dynamic TAKER matching overhead.  The
+    /// source is a live log (kept separate from `sim_latency_calibrate_from`
+    /// so exact HTTP RTT can continue to use the server latency directory).
+    /// Each event receives p50/p95/p99 estimated from completed prior events.
+    #[serde(default)]
+    pub sim_v2_dynamic_taker_overhead: bool,
+    #[serde(default)]
+    pub sim_v2_taker_overhead_calibrate_from: String,
+    /// Restrict Submit/accepted pairs to one live instance (for example
+    /// `btc03`). Empty accepts every instance for backward compatibility.
+    #[serde(default)]
+    pub sim_v2_taker_overhead_instance_id: String,
+    #[serde(default = "default_sim_v2_dynamic_taker_overhead_lookback_events")]
+    pub sim_v2_dynamic_taker_overhead_lookback_events: u64,
+    #[serde(default = "default_sim_v2_dynamic_taker_overhead_min_samples")]
+    pub sim_v2_dynamic_taker_overhead_min_samples: u64,
+    /// Shrink rolling quantiles toward the configured fixed anchors:
+    /// effective = fixed + blend * (rolling - fixed). 0 is fixed, 1 is raw.
+    #[serde(default = "default_sim_v2_dynamic_taker_overhead_blend")]
+    pub sim_v2_dynamic_taker_overhead_blend: f64,
     /// sim_v2 only — MAKER one-step "race" rate ∈ [0,1] (0 = off). When a
     /// resting order's queue GROWS in the next book snapshot, init q_ahead =
     /// rate·next + (1−rate)·now: favorable moves build the queue → we fill less
@@ -273,6 +298,29 @@ pub struct BacktestConfig {
     /// for the markout haircut. Data: adverse selection is sharp at 1-5s.
     #[serde(default = "default_sim_v2_fill_markout_horizon_ms")]
     pub sim_v2_fill_markout_horizon_ms: u64,
+    /// sim_v2 only — opt-in causal volatility scaling for the forward-markout
+    /// strength. The fixed `fill_markout_vn` remains the anchor/default.
+    #[serde(default)]
+    pub sim_v2_dynamic_fill_markout: bool,
+    /// Use causal Binance BTCUSDT realised volatility instead of the
+    /// Polymarket option-book range as the dynamic markout state.
+    #[serde(default)]
+    pub sim_v2_dynamic_markout_spot_vol: bool,
+    /// Causal canonical-book lookback used to measure pre-trade mid range.
+    #[serde(default = "default_sim_v2_dynamic_markout_lookback_ms")]
+    pub sim_v2_dynamic_markout_lookback_ms: u64,
+    /// Training-period state reference; ticks for option-book range and basis
+    /// points for BTC spot realised volatility. Explicit to prevent
+    /// recomputing a normaliser from OOS data.
+    #[serde(default = "default_sim_v2_dynamic_markout_vol_ref_ticks")]
+    pub sim_v2_dynamic_markout_vol_ref_ticks: f64,
+    /// `vn(t) = base_vn * (vol_state/ref)^elasticity`.
+    #[serde(default)]
+    pub sim_v2_dynamic_markout_vol_elasticity: f64,
+    #[serde(default = "default_sim_v2_dynamic_markout_min_mult")]
+    pub sim_v2_dynamic_markout_min_mult: f64,
+    #[serde(default = "default_sim_v2_dynamic_markout_max_mult")]
+    pub sim_v2_dynamic_markout_max_mult: f64,
     /// sim_v2 only — TAKER one-step "race" rate ∈ [0,1] (0 = off). When fillable
     /// volume SHRINKS in the next snapshot, cap the fill at rate·next +
     /// (1−rate)·now: liquidity recedes in-flight → taker misses.
@@ -292,6 +340,30 @@ pub struct BacktestConfig {
     /// Removes the cross-outcome double-count of the old complement-merge.
     #[serde(default = "default_sim_v2_fold_outcomes")]
     pub sim_v2_fold_outcomes: bool,
+    /// sim_v2 only — fail-closed matching guard for a cached full orderbook.
+    /// An order/trade cannot fill when either the last accepted book's local
+    /// receive timestamp or its exchange timestamp is older than this many ms.
+    /// Limit orders may rest and are queue-rebased on the next fresh book;
+    /// market/FAK/FOK orders cancel without a fill. 0 disables the gate and
+    /// preserves the historical matching model exactly.
+    #[serde(default)]
+    pub sim_v2_book_stale_after_ms: u64,
+    /// Emit one compact per-event/per-instance fill-attribution row at the end
+    /// of a sim_v2 replay. This is diagnostic-only and does not change matching.
+    #[serde(default)]
+    pub sim_v2_fill_audit: bool,
+    /// sim_v2 only — remove non-causal post-arrival book peeks from maker queue
+    /// entry and taker matching. The order still experiences its sampled
+    /// outbound latency and taker matching overhead; matching uses only market
+    /// state already observed at the simulated engine clock.
+    #[serde(default)]
+    pub sim_v2_causal_matching: bool,
+    /// sim_v2 only — for already-resting maker orders, a stale local full-book
+    /// receive clock alone does not prevent a real exchange trade from filling
+    /// the order. New order admission remains protected by the complete
+    /// dual-clock gate; existing maker matching still checks exchange-book age.
+    #[serde(default)]
+    pub sim_v2_stale_resting_exchange_only: bool,
     /// sim_v2 only — TRADE-FLOW taker competition rate ∈ [0,1] (0 = off). A
     /// marketable order competes for the touch with same-direction taker TRADES in
     /// its in-flight window — that volume was consumed by takers who beat us to the
@@ -305,6 +377,43 @@ pub struct BacktestConfig {
     /// exposure (how long the order is in flight, exposed to competitors).
     #[serde(default = "default_sim_v2_taker_comp_window_ms")]
     pub sim_v2_taker_comp_window_ms: u64,
+    /// sim_v2 only — treat the forward-book taker race and recent-trade
+    /// competition as overlapping observations of the same liquidity loss.
+    /// When both are enabled, apply the less restrictive of their two
+    /// independently computed caps once, instead of the historical stricter
+    /// `min(race_cap, competition_cap)`. Disabled by default.
+    #[serde(default)]
+    pub sim_v2_taker_overlap_dedup: bool,
+    /// sim_v2 only — opt-in causal dynamic taker windows.  When enabled with
+    /// a latency-record directory, each 5-minute event scales the fixed race
+    /// and competition windows from a rolling summary of *prior* place RTTs.
+    /// Disabled by default, preserving the fixed-window model exactly.
+    #[serde(default)]
+    pub sim_v2_dynamic_taker_windows: bool,
+    /// Number of completed 5-minute RTT buckets in the causal rolling state.
+    #[serde(default = "default_sim_v2_dynamic_window_rtt_lookback_events")]
+    pub sim_v2_dynamic_window_rtt_lookback_events: u64,
+    /// Per-event place-RTT quantile used before rolling (0..1).
+    #[serde(default = "default_sim_v2_dynamic_window_rtt_quantile")]
+    pub sim_v2_dynamic_window_rtt_quantile: f64,
+    /// Winsorisation cap for each event's RTT quantile (ms).
+    #[serde(default = "default_sim_v2_dynamic_window_rtt_cap_ms")]
+    pub sim_v2_dynamic_window_rtt_cap_ms: f64,
+    /// Training-period reference RTT state (ms).  This is explicit rather
+    /// than inferred from the replay directory, preventing OOS leakage.
+    #[serde(default = "default_sim_v2_dynamic_window_rtt_ref_ms")]
+    pub sim_v2_dynamic_window_rtt_ref_ms: f64,
+    /// Elasticities in `window = base * (rolling_rtt / ref)^elasticity`.
+    /// Race and competition remain separately calibratable mechanisms.
+    #[serde(default)]
+    pub sim_v2_dynamic_race_rtt_elasticity: f64,
+    #[serde(default)]
+    pub sim_v2_dynamic_comp_rtt_elasticity: f64,
+    /// Hard multiplier bounds for both dynamic windows.
+    #[serde(default = "default_sim_v2_dynamic_window_min_mult")]
+    pub sim_v2_dynamic_window_min_mult: f64,
+    #[serde(default = "default_sim_v2_dynamic_window_max_mult")]
+    pub sim_v2_dynamic_window_max_mult: f64,
     /// sim_v2 only — deep-queue model for a resting price BEYOND the recorded
     /// 5-level book window: `0` = least-squares linear extrapolation (legacy);
     /// `>0` = project from the OUTERMOST recorded level as `q_edge·decay^(ticks
@@ -313,6 +422,12 @@ pub struct BacktestConfig {
     /// this models the unobserved deeper queue our order joins.
     #[serde(default = "default_sim_v2_deep_queue_decay")]
     pub sim_v2_deep_queue_decay: f64,
+    /// Blend the fixed deep-queue decay toward the causal geometric slope of
+    /// the currently visible L2 ladder. 0 (default) preserves the fixed model.
+    #[serde(default)]
+    pub sim_v2_dynamic_deep_queue_strength: f64,
+    #[serde(default = "default_sim_v2_dynamic_deep_queue_min_decay")]
+    pub sim_v2_dynamic_deep_queue_min_decay: f64,
     /// Backtest start time in ISO 8601 (e.g. "2026-02-13T00:00:00Z").
     #[serde(default)]
     pub start_date: String,
@@ -601,39 +716,129 @@ pub struct BacktestConfig {
     ///
     /// Unknown → `pooled`. With a single recorded day all three are identical.
     /// (Renamed from `sim_latency_record_fallback`, still accepted as alias.)
-    #[serde(default = "default_rtt_sim_fallback", alias = "sim_latency_record_fallback")]
+    #[serde(
+        default = "default_rtt_sim_fallback",
+        alias = "sim_latency_record_fallback"
+    )]
     pub rtt_sim_fallback: String,
-
 }
 
 /// Default median RTT = 60 ms (2026-04-27 live calibration —
 /// per-minute median p50 across the trading session).
-fn default_sim_v2_ahead_frac() -> f64 { -1.0 }
-fn default_sim_v2_fill_push_mult() -> f64 { 1.5 }
-fn default_sim_v2_taker_overhead_p50_ms() -> f64 { 267.0 }
-fn default_sim_v2_taker_overhead_p95_ms() -> f64 { 910.0 }
-fn default_sim_v2_taker_overhead_p99_ms() -> f64 { 1612.0 }
-fn default_sim_v2_maker_race_rate() -> f64 { 0.0 }
-fn default_sim_v2_adverse_sel_rate() -> f64 { 0.0 }
-fn default_sim_v2_adverse_scale_ticks() -> f64 { 1.0 }
-fn default_sim_v2_book_through_rate() -> f64 { 0.0 }
-fn default_sim_v2_fill_markout_vn() -> f64 { 0.0 }
-fn default_sim_v2_fill_markout_horizon_ms() -> u64 { 2000 }
-fn default_sim_v2_taker_race_rate() -> f64 { 0.0 }
-fn default_sim_v2_maker_race_horizon_ms() -> u64 { 100 }
-fn default_sim_v2_taker_race_horizon_ms() -> u64 { 150 }
-fn default_sim_v2_fold_outcomes() -> bool { true }
-fn default_sim_v2_taker_comp_rate() -> f64 { 0.0 }
-fn default_sim_v2_taker_comp_window_ms() -> u64 { 250 }
-fn default_sim_v2_deep_queue_decay() -> f64 { 0.0 }
-fn default_sim_latency_p50_ms() -> u64 { 60 }
+fn default_sim_v2_ahead_frac() -> f64 {
+    -1.0
+}
+fn default_sim_v2_fill_push_mult() -> f64 {
+    1.5
+}
+fn default_sim_v2_taker_overhead_p50_ms() -> f64 {
+    267.0
+}
+fn default_sim_v2_taker_overhead_p95_ms() -> f64 {
+    910.0
+}
+fn default_sim_v2_taker_overhead_p99_ms() -> f64 {
+    1612.0
+}
+fn default_sim_v2_dynamic_taker_overhead_lookback_events() -> u64 {
+    36
+}
+fn default_sim_v2_dynamic_taker_overhead_min_samples() -> u64 {
+    30
+}
+fn default_sim_v2_dynamic_taker_overhead_blend() -> f64 {
+    1.0
+}
+fn default_sim_v2_maker_race_rate() -> f64 {
+    0.0
+}
+fn default_sim_v2_adverse_sel_rate() -> f64 {
+    0.0
+}
+fn default_sim_v2_adverse_scale_ticks() -> f64 {
+    1.0
+}
+fn default_sim_v2_book_through_rate() -> f64 {
+    0.0
+}
+fn default_sim_v2_fill_markout_vn() -> f64 {
+    0.0
+}
+fn default_sim_v2_fill_markout_horizon_ms() -> u64 {
+    2000
+}
+fn default_sim_v2_dynamic_markout_lookback_ms() -> u64 {
+    5_000
+}
+fn default_sim_v2_dynamic_markout_vol_ref_ticks() -> f64 {
+    1.0
+}
+fn default_sim_v2_dynamic_markout_min_mult() -> f64 {
+    0.50
+}
+fn default_sim_v2_dynamic_markout_max_mult() -> f64 {
+    2.00
+}
+fn default_sim_v2_taker_race_rate() -> f64 {
+    0.0
+}
+fn default_sim_v2_maker_race_horizon_ms() -> u64 {
+    100
+}
+fn default_sim_v2_taker_race_horizon_ms() -> u64 {
+    150
+}
+fn default_sim_v2_fold_outcomes() -> bool {
+    true
+}
+fn default_sim_v2_taker_comp_rate() -> f64 {
+    0.0
+}
+fn default_sim_v2_taker_comp_window_ms() -> u64 {
+    250
+}
+fn default_sim_v2_dynamic_window_rtt_lookback_events() -> u64 {
+    36
+}
+fn default_sim_v2_dynamic_window_rtt_quantile() -> f64 {
+    0.60
+}
+fn default_sim_v2_dynamic_window_rtt_cap_ms() -> f64 {
+    500.0
+}
+fn default_sim_v2_dynamic_window_rtt_ref_ms() -> f64 {
+    60.0
+}
+fn default_sim_v2_dynamic_window_min_mult() -> f64 {
+    0.50
+}
+fn default_sim_v2_dynamic_window_max_mult() -> f64 {
+    2.00
+}
+fn default_sim_v2_deep_queue_decay() -> f64 {
+    0.0
+}
+fn default_sim_v2_dynamic_deep_queue_min_decay() -> f64 {
+    0.5
+}
+fn default_sim_latency_p50_ms() -> u64 {
+    60
+}
 /// Default 95th-percentile RTT = 331 ms (2026-04-27 live).
-fn default_sim_latency_p95_ms() -> u64 { 331 }
+fn default_sim_latency_p95_ms() -> u64 {
+    331
+}
 /// Default 99th-percentile RTT = 700 ms (lognormal extrapolation
 /// from the censored 2026-04-27 live p99 = 501 ms cap).
-fn default_sim_latency_p99_ms() -> u64 { 700 }
-fn default_sim_latency_seed() -> u64 { 42 }
-fn default_sim_latency_correlation() -> f64 { 0.65 }
+fn default_sim_latency_p99_ms() -> u64 {
+    700
+}
+fn default_sim_latency_seed() -> u64 {
+    42
+}
+fn default_sim_latency_correlation() -> f64 {
+    0.65
+}
 /// Default cross-correlation between place and cancel latent AR(1)
 /// states. Empirical Pearson corr(log(place_p99), log(cancel_p99))
 /// across 225 per-minute rows in 2026-04-30 live2.log = **0.631**
@@ -642,38 +847,90 @@ fn default_sim_latency_correlation() -> f64 { 0.65 }
 /// server work is lighter, so its tail is somewhat decoupled).
 /// Setting this to 0.0 reproduces the legacy independent-samplers
 /// behaviour for back-compat.
-fn default_sim_latency_cross_correlation() -> f64 { 0.63 }
-fn default_sim_client_timeout_ms() -> u64 { 500 }
-fn default_sim_matched_cant_cancel_window_ms() -> u64 { 2_000 }
-fn default_sim_per_event_rtt_overhead_factor() -> f64 { 1.0 }
-fn default_sim_latency_record_abs_tol_ms() -> u64 { 300_000 }
-fn default_sim_latency_record_tod_tol_secs() -> u64 { 120 }
-fn default_sim_latency_record_tod_bucket_secs() -> u64 { 300 }
-fn default_rtt_sim_fallback() -> String { "nearest_day_dow".to_string() }
-fn default_sim_rtt_mode() -> String { "predict".to_string() }
+fn default_sim_latency_cross_correlation() -> f64 {
+    0.63
+}
+fn default_sim_client_timeout_ms() -> u64 {
+    500
+}
+fn default_sim_matched_cant_cancel_window_ms() -> u64 {
+    2_000
+}
+fn default_sim_per_event_rtt_overhead_factor() -> f64 {
+    1.0
+}
+fn default_sim_latency_record_abs_tol_ms() -> u64 {
+    300_000
+}
+fn default_sim_latency_record_tod_tol_secs() -> u64 {
+    120
+}
+fn default_sim_latency_record_tod_bucket_secs() -> u64 {
+    300
+}
+fn default_rtt_sim_fallback() -> String {
+    "nearest_day_dow".to_string()
+}
+fn default_sim_rtt_mode() -> String {
+    "predict".to_string()
+}
 
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             data_dir: default_output_dir(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
+            sim_v2_dynamic_ahead_frac_strength: 0.0,
             sim_v2_fill_push_mult: default_sim_v2_fill_push_mult(),
             sim_v2_taker_overhead_p50_ms: default_sim_v2_taker_overhead_p50_ms(),
             sim_v2_taker_overhead_p95_ms: default_sim_v2_taker_overhead_p95_ms(),
             sim_v2_taker_overhead_p99_ms: default_sim_v2_taker_overhead_p99_ms(),
+            sim_v2_dynamic_taker_overhead: false,
+            sim_v2_taker_overhead_calibrate_from: String::new(),
+            sim_v2_taker_overhead_instance_id: String::new(),
+            sim_v2_dynamic_taker_overhead_lookback_events:
+                default_sim_v2_dynamic_taker_overhead_lookback_events(),
+            sim_v2_dynamic_taker_overhead_min_samples:
+                default_sim_v2_dynamic_taker_overhead_min_samples(),
+            sim_v2_dynamic_taker_overhead_blend: default_sim_v2_dynamic_taker_overhead_blend(),
             sim_v2_maker_race_rate: default_sim_v2_maker_race_rate(),
             sim_v2_adverse_sel_rate: default_sim_v2_adverse_sel_rate(),
             sim_v2_adverse_scale_ticks: default_sim_v2_adverse_scale_ticks(),
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
             sim_v2_fill_markout_horizon_ms: default_sim_v2_fill_markout_horizon_ms(),
+            sim_v2_dynamic_fill_markout: false,
+            sim_v2_dynamic_markout_spot_vol: false,
+            sim_v2_dynamic_markout_lookback_ms: default_sim_v2_dynamic_markout_lookback_ms(),
+            sim_v2_dynamic_markout_vol_ref_ticks: default_sim_v2_dynamic_markout_vol_ref_ticks(),
+            sim_v2_dynamic_markout_vol_elasticity: 0.0,
+            sim_v2_dynamic_markout_min_mult: default_sim_v2_dynamic_markout_min_mult(),
+            sim_v2_dynamic_markout_max_mult: default_sim_v2_dynamic_markout_max_mult(),
             sim_v2_taker_race_rate: default_sim_v2_taker_race_rate(),
             sim_v2_maker_race_horizon_ms: default_sim_v2_maker_race_horizon_ms(),
             sim_v2_taker_race_horizon_ms: default_sim_v2_taker_race_horizon_ms(),
             sim_v2_fold_outcomes: default_sim_v2_fold_outcomes(),
+            sim_v2_book_stale_after_ms: 0,
+            sim_v2_fill_audit: false,
+            sim_v2_causal_matching: false,
+            sim_v2_stale_resting_exchange_only: false,
             sim_v2_taker_comp_rate: default_sim_v2_taker_comp_rate(),
             sim_v2_taker_comp_window_ms: default_sim_v2_taker_comp_window_ms(),
+            sim_v2_taker_overlap_dedup: false,
+            sim_v2_dynamic_taker_windows: false,
+            sim_v2_dynamic_window_rtt_lookback_events:
+                default_sim_v2_dynamic_window_rtt_lookback_events(),
+            sim_v2_dynamic_window_rtt_quantile: default_sim_v2_dynamic_window_rtt_quantile(),
+            sim_v2_dynamic_window_rtt_cap_ms: default_sim_v2_dynamic_window_rtt_cap_ms(),
+            sim_v2_dynamic_window_rtt_ref_ms: default_sim_v2_dynamic_window_rtt_ref_ms(),
+            sim_v2_dynamic_race_rtt_elasticity: 0.0,
+            sim_v2_dynamic_comp_rtt_elasticity: 0.0,
+            sim_v2_dynamic_window_min_mult: default_sim_v2_dynamic_window_min_mult(),
+            sim_v2_dynamic_window_max_mult: default_sim_v2_dynamic_window_max_mult(),
             sim_v2_deep_queue_decay: default_sim_v2_deep_queue_decay(),
+            sim_v2_dynamic_deep_queue_strength: 0.0,
+            sim_v2_dynamic_deep_queue_min_decay:
+                default_sim_v2_dynamic_deep_queue_min_decay(),
             start_date: String::new(),
             end_date: String::new(),
             simulate_config: String::new(),
@@ -885,14 +1142,26 @@ pub struct ExchangeConfig {
     pub network: String,
 }
 
-fn default_hl_network() -> String { "testnet".to_string() }
-fn default_http_timeout_ms() -> u64 { 1000 }
-fn default_gap_replay_interval_ms() -> u64 { 2000 }
+fn default_hl_network() -> String {
+    "testnet".to_string()
+}
+fn default_http_timeout_ms() -> u64 {
+    1000
+}
+fn default_gap_replay_interval_ms() -> u64 {
+    2000
+}
 /// Periodic-sweep rewind FLOOR (the sweep also reaches back to the last
 /// server-timestamped trade seen — see user_feed.rs).
-fn default_gap_replay_periodic_rewind_ms() -> u64 { 10_000 }
-fn default_gap_replay_rewind_ms() -> u64 { 5000 }
-fn default_executor_workers() -> usize { 8 }
+fn default_gap_replay_periodic_rewind_ms() -> u64 {
+    10_000
+}
+fn default_gap_replay_rewind_ms() -> u64 {
+    5000
+}
+fn default_executor_workers() -> usize {
+    8
+}
 
 fn default_use_batch_orders() -> bool {
     true
@@ -1019,10 +1288,13 @@ impl Config {
         // Policy: external file's keys OVERRIDE inline `[backtest]`
         // values when both are present. The external file is the
         // single source of truth once `simulate_config` is set.
-        let config_dir = path.parent().map(|p| p.to_path_buf())
+        let config_dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let mut root_value: toml::Value = toml::from_str(&content)?;
-        if let Some(sim_path_str) = root_value.get("backtest")
+        if let Some(sim_path_str) = root_value
+            .get("backtest")
             .and_then(|bt| bt.get("simulate_config"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -1036,26 +1308,34 @@ impl Config {
             let raw = std::fs::read_to_string(&resolved).map_err(|e| {
                 anyhow::anyhow!(
                     "simulate_config: failed to read {}: {}",
-                    resolved.display(), e,
+                    resolved.display(),
+                    e,
                 )
             })?;
             let expanded = resolve_env_vars(&raw);
-            let sim_value: toml::Value = toml::from_str(&expanded)
-                .map_err(|e| anyhow::anyhow!(
+            let sim_value: toml::Value = toml::from_str(&expanded).map_err(|e| {
+                anyhow::anyhow!(
                     "simulate_config: parse error in {}: {}",
-                    resolved.display(), e,
-                ))?;
-            let sim_table = sim_value.as_table().ok_or_else(|| anyhow::anyhow!(
-                "simulate_config: {} must contain a flat key-value table at the top level",
-                resolved.display(),
-            ))?;
+                    resolved.display(),
+                    e,
+                )
+            })?;
+            let sim_table = sim_value.as_table().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "simulate_config: {} must contain a flat key-value table at the top level",
+                    resolved.display(),
+                )
+            })?;
             // Splice sim_table's top-level keys into root[backtest].
-            let bt_table = root_value.get_mut("backtest")
+            let bt_table = root_value
+                .get_mut("backtest")
                 .and_then(|v| v.as_table_mut())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "main config has no [backtest] table — \
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "main config has no [backtest] table — \
                      simulate_config requires it"
-                ))?;
+                    )
+                })?;
             // Track how many keys we merged so the engine startup log
             // can surface the indirection (handy for debugging which
             // file actually configured a given knob).
@@ -1064,16 +1344,20 @@ impl Config {
                 // Don't let the external file set `simulate_config`
                 // recursively — block that key to avoid surprise
                 // chains (and to keep the parse linear).
-                if k == "simulate_config" { continue; }
+                if k == "simulate_config" {
+                    continue;
+                }
                 bt_table.insert(k.clone(), v.clone());
                 merged += 1;
             }
             log::info!(
                 "[config] simulate_config: merged {} key(s) from {} into [backtest]",
-                merged, resolved.display(),
+                merged,
+                resolved.display(),
             );
         }
-        let mut config: Config = root_value.try_into()
+        let mut config: Config = root_value
+            .try_into()
             .map_err(|e| anyhow::anyhow!("config deserialise error: {}", e))?;
 
         // Per-strategy params_file: load + merge.
@@ -1096,13 +1380,14 @@ impl Config {
         if !config.general.secrets_file.is_empty() {
             let p = std::path::Path::new(&config.general.secrets_file);
             if !p.is_absolute() {
-                config.general.secrets_file = config_dir.join(p)
-                    .to_string_lossy().into_owned();
+                config.general.secrets_file = config_dir.join(p).to_string_lossy().into_owned();
             }
         }
 
         for s in config.strategies.iter_mut() {
-            if s.params_file.is_empty() { continue; }
+            if s.params_file.is_empty() {
+                continue;
+            }
             let resolved = if std::path::Path::new(&s.params_file).is_absolute() {
                 std::path::PathBuf::from(&s.params_file)
             } else {
@@ -1111,15 +1396,21 @@ impl Config {
             let raw = std::fs::read_to_string(&resolved).map_err(|e| {
                 anyhow::anyhow!(
                     "strategy '{}': failed to read params_file {}: {}",
-                    s.name, resolved.display(), e,
+                    s.name,
+                    resolved.display(),
+                    e,
                 )
             })?;
             let expanded = resolve_env_vars(&raw);
-            let file_params: HashMap<String, toml::Value> = toml::from_str(&expanded)
-                .map_err(|e| anyhow::anyhow!(
-                    "strategy '{}': parse {} as TOML key-value map: {}",
-                    s.name, resolved.display(), e,
-                ))?;
+            let file_params: HashMap<String, toml::Value> =
+                toml::from_str(&expanded).map_err(|e| {
+                    anyhow::anyhow!(
+                        "strategy '{}': parse {} as TOML key-value map: {}",
+                        s.name,
+                        resolved.display(),
+                        e,
+                    )
+                })?;
             // Merge: file values first, then inline overrides (so the
             // inline block from the main config wins). Cheaper to
             // assemble a fresh map than to splice into the existing
@@ -1137,14 +1428,28 @@ impl Config {
         // the migration path if any forbidden field is set on a
         // polymarket exchange entry.
         for e in &config.exchanges {
-            if e.name != "polymarket" { continue; }
+            if e.name != "polymarket" {
+                continue;
+            }
             let mut leaks: Vec<&'static str> = Vec::new();
-            if !e.api_key.is_empty()        { leaks.push("api_key"); }
-            if !e.api_secret.is_empty()     { leaks.push("api_secret"); }
-            if !e.api_passphrase.is_empty() { leaks.push("api_passphrase"); }
-            if !e.private_key.is_empty()    { leaks.push("private_key"); }
-            if !e.signature_type.is_empty() { leaks.push("signature_type"); }
-            if !e.builder_code.is_empty()   { leaks.push("builder_code"); }
+            if !e.api_key.is_empty() {
+                leaks.push("api_key");
+            }
+            if !e.api_secret.is_empty() {
+                leaks.push("api_secret");
+            }
+            if !e.api_passphrase.is_empty() {
+                leaks.push("api_passphrase");
+            }
+            if !e.private_key.is_empty() {
+                leaks.push("private_key");
+            }
+            if !e.signature_type.is_empty() {
+                leaks.push("signature_type");
+            }
+            if !e.builder_code.is_empty() {
+                leaks.push("builder_code");
+            }
             if !leaks.is_empty() {
                 return Err(anyhow::anyhow!(
                     "config error: `[[exchanges]] polymarket` carries forbidden \
@@ -1152,7 +1457,8 @@ impl Config {
                      under `[poly.<instance_id>]` and reference them via \
                      each `[[strategies]]` block's `params.instance_id`. See \
                      comment block above SecretsFile in src/config.rs for the \
-                     expected layout.", leaks,
+                     expected layout.",
+                    leaks,
                 ));
             }
         }
@@ -1497,7 +1803,8 @@ impl SecretsFile {
             return if p.is_absolute() {
                 p.to_path_buf()
             } else {
-                config_path.parent()
+                config_path
+                    .parent()
                     .map(|d| d.join(p))
                     .unwrap_or_else(|| p.to_path_buf())
             };
@@ -1524,12 +1831,12 @@ impl SecretsFile {
             anyhow::anyhow!(
                 "secrets.toml: no `[poly.{}]` block found. \
                  Available poly instance_ids: {:?}",
-                instance_id, available,
+                instance_id,
+                available,
             )
         })
     }
 }
-
 
 /// Substitute `${ENV_VAR}` patterns in a string with environment variable values.
 /// Unset variables are replaced with empty strings.
@@ -1541,7 +1848,9 @@ fn resolve_env_vars(input: &str) -> String {
             chars.next(); // consume '{'
             let mut var_name = String::new();
             for c in chars.by_ref() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
                 var_name.push(c);
             }
             if !var_name.is_empty() {
@@ -1596,7 +1905,8 @@ mod shared_secrets_tests {
     /// block, and (b) push `[builder]` / `[polygon]` into their env vars.
     #[test]
     fn config_load_pulls_shared_secrets_from_secrets_file() {
-        let dir = std::env::temp_dir().join(format!("hexbot_shared_secrets_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hexbot_shared_secrets_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("cfg.toml");
         let sec_path = dir.join("secrets.toml");
@@ -1620,15 +1930,28 @@ mod shared_secrets_tests {
         let cfg = Config::load(&cfg_path).expect("config loads");
 
         // (a) chainlink `${VAR}` refs resolved FROM the secrets file.
-        let cl = cfg.exchanges.iter().find(|e| e.name == "chainlink").expect("chainlink exchange");
-        assert_eq!(cl.api_key, "cl-KEY-123", "chainlink api_key from secrets [chainlink]");
+        let cl = cfg
+            .exchanges
+            .iter()
+            .find(|e| e.name == "chainlink")
+            .expect("chainlink exchange");
+        assert_eq!(
+            cl.api_key, "cl-KEY-123",
+            "chainlink api_key from secrets [chainlink]"
+        );
         assert_eq!(cl.api_secret, "cl-SEC-123");
 
         // (b) builder + polygon pushed into the legacy env vars.
         assert_eq!(std::env::var("POLY_BUILDER_API_KEY").unwrap(), "bk-XYZ");
         assert_eq!(std::env::var("POLY_BUILDER_PASSPHRASE").unwrap(), "bp-XYZ");
-        assert_eq!(std::env::var("POLYGON_RPC").unwrap(), "https://rpc-primary.example");
-        assert_eq!(std::env::var("POLYGON_RPC_2").unwrap(), "https://rpc-failover.example");
+        assert_eq!(
+            std::env::var("POLYGON_RPC").unwrap(),
+            "https://rpc-primary.example"
+        );
+        assert_eq!(
+            std::env::var("POLYGON_RPC_2").unwrap(),
+            "https://rpc-failover.example"
+        );
         // Scalars also populate the pool list (in order), for the new path.
         assert_eq!(
             std::env::var("POLYGON_RPC_LIST").unwrap(),
@@ -1653,7 +1976,10 @@ mod shared_secrets_tests {
         };
         assert_eq!(
             p.endpoints(),
-            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
         );
 
         // Empty rpc_list → fall back to scalars (empties dropped).

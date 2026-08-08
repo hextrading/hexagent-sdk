@@ -7,7 +7,7 @@
 //! any acks/fills now due for strategy delivery) and `submit()` (which schedules
 //! a strategy signal's outbound effect with L1 latency).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use crate::types::{Exchange, Instrument, OrderStatus, OrderUpdate, Side, Signal}
 
 use super::clock::Scheduler;
 use super::event::{ReachAction, SimEvent};
-use super::exchange::SimExchangeV2;
+use super::exchange::{FillAuditRow, SimExchangeV2};
 use super::feed::ServerFeed;
 use super::latency::LatencyModel;
 use crate::exchange::sim::latency::LatencyProfile;
@@ -46,6 +46,7 @@ pub struct SimV2Config {
     pub split_by_iid: HashMap<String, f64>,
     /// Cancel-attribution ahead-fraction override; `None` = proportional (§5).
     pub ahead_frac: Option<f64>,
+    pub dynamic_ahead_frac_strength: f64,
     /// Adverse-selection conditioning of the cancel attribution: `rate` (0 = off)
     /// + `scale_ticks` (adverse mid-move mapping to full tilt). See `exchange.rs`.
     pub adverse_sel_rate: f64,
@@ -60,6 +61,13 @@ pub struct SimV2Config {
     /// matches live's −0.75¢. See `exchange.rs`.
     pub fill_markout_vn: f64,
     pub fill_markout_horizon_ns: u64,
+    pub dynamic_fill_markout: bool,
+    pub dynamic_markout_spot_vol: bool,
+    pub dynamic_markout_lookback_ns: u64,
+    pub dynamic_markout_vol_ref_ticks: f64,
+    pub dynamic_markout_vol_elasticity: f64,
+    pub dynamic_markout_min_mult: f64,
+    pub dynamic_markout_max_mult: f64,
     /// WS fill-push latency multiplier on the half-RTT.
     pub fill_push_mult: f64,
     /// matched-can't-cancel window (ns).
@@ -71,6 +79,8 @@ pub struct SimV2Config {
     pub taker_overhead_p50_ms: f64,
     pub taker_overhead_p95_ms: f64,
     pub taker_overhead_p99_ms: f64,
+    /// Causal rolling p50/p95/p99 overhead anchors keyed by event start.
+    pub dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
     /// Maker/taker "race" rates in [0,1] (0 = off). See `exchange.rs`.
     pub maker_race_rate: f64,
     pub taker_race_rate: f64,
@@ -82,16 +92,35 @@ pub struct SimV2Config {
     /// book (down mapped p↔1−p, bid↔ask / buy↔sell). Removes the cross-outcome
     /// double-count. See `exchange.rs`.
     pub fold_outcomes: bool,
+    /// Fail-closed max age for both full-book clocks. 0 disables the gate.
+    pub book_stale_after_ns: u64,
+    /// Disable book lookahead after an order reaches the simulated engine.
+    pub causal_matching: bool,
+    /// Existing resting maker fills ignore local-clock-only staleness.
+    pub stale_resting_exchange_only: bool,
     /// Trade-flow taker competition rate ∈ [0,1] (0 = off): fraction of competing
     /// in-flight taker trade volume consumed ahead of us — we fill only the
     /// overflow. With the taker race, the taker-volume model. See `exchange.rs`.
     pub taker_comp_rate: f64,
     /// Taker competition in-flight window (ns) ≈ taker overhead exposure.
     pub taker_comp_window_ns: u64,
+    /// Collapse overlapping race/competition liquidity-loss observations into
+    /// one cap (the less restrictive independent cap).
+    pub taker_overlap_dedup: bool,
+    /// Causal rolling place-RTT state keyed by 5-minute event start. `None`
+    /// keeps the historical fixed-window model byte-identical.
+    pub dynamic_window_rtt_by_event: Option<HashMap<u64, f64>>,
+    pub dynamic_window_rtt_ref_ms: f64,
+    pub dynamic_race_rtt_elasticity: f64,
+    pub dynamic_comp_rtt_elasticity: f64,
+    pub dynamic_window_min_mult: f64,
+    pub dynamic_window_max_mult: f64,
     /// Deep-queue model for resting prices beyond the recorded 5-level window:
     /// 0 = legacy least-squares linear extrapolation; >0 = outermost-level
     /// flat/geometric-decay (1.0 = flat, <1 = decay). See `book.rs`.
     pub deep_queue_decay: f64,
+    pub dynamic_deep_queue_strength: f64,
+    pub dynamic_deep_queue_min_decay: f64,
     /// Mirror of `exchanges[polymarket].use_batch_orders`. When `false`,
     /// each place / cancel in a batch is dispatched as its OWN API call
     /// with its OWN RTT draw + timeout (matching the live executor's
@@ -119,17 +148,60 @@ pub struct Simulator {
     client_timeout_ns: u64,
     timeouts: u64,
     per_event_rtt: Option<HashMap<u64, EventRttOverride>>,
+    dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
+    last_dynamic_overhead_event: Option<u64>,
+    dynamic_overhead_n: u64,
+    dynamic_overhead_p50_sum_ms: f64,
+    dynamic_overhead_p95_sum_ms: f64,
+    dynamic_overhead_p99_sum_ms: f64,
     /// Cached `core.race_enabled()` — skips the peek when the race is off.
     race_enabled: bool,
+    /// Matching uses only state observed by the simulated engine clock.
+    causal_matching: bool,
     /// Maker / taker race lookahead horizons (ns).
     maker_race_horizon_ns: u64,
     taker_race_horizon_ns: u64,
+    base_taker_race_horizon_ns: u64,
+    base_taker_comp_window_ns: u64,
+    taker_comp_rate: f64,
+    dynamic_window_rtt_by_event: Option<HashMap<u64, f64>>,
+    dynamic_window_rtt_ref_ms: f64,
+    dynamic_race_rtt_elasticity: f64,
+    dynamic_comp_rtt_elasticity: f64,
+    dynamic_window_min_mult: f64,
+    dynamic_window_max_mult: f64,
+    last_dynamic_window_event: Option<u64>,
+    dynamic_window_n: u64,
+    dynamic_window_rtt_sum_ms: f64,
+    dynamic_race_window_sum_ns: u128,
+    dynamic_comp_window_sum_ns: u128,
+    dynamic_window_mult_min: f64,
+    dynamic_window_mult_max: f64,
     /// See `SimV2Config::use_batch_orders`.
     use_batch_orders: bool,
     /// Forward horizon (ns) for the markout fill haircut; peek the canonical mid
     /// this far past each trade. `markout_on` gates the peek (vn>0 && horizon>0).
     fill_markout_horizon_ns: u64,
     markout_on: bool,
+    base_fill_markout_vn: f64,
+    dynamic_fill_markout: bool,
+    dynamic_markout_spot_vol: bool,
+    dynamic_markout_lookback_ns: u64,
+    dynamic_markout_vol_ref_ticks: f64,
+    dynamic_markout_vol_elasticity: f64,
+    dynamic_markout_min_mult: f64,
+    dynamic_markout_max_mult: f64,
+    markout_mid_history: HashMap<String, VecDeque<(u64, f64)>>,
+    markout_last_book_ts: HashMap<String, u64>,
+    markout_tick_by_symbol: HashMap<String, f64>,
+    markout_symbol_fifo: VecDeque<String>,
+    /// One-second Binance BTCUSDT closes with cumulative squared log returns.
+    /// The cumulative representation makes rolling realised volatility O(1).
+    markout_spot_rv: VecDeque<(u64, f64, f64)>,
+    dynamic_markout_states: Vec<f32>,
+    dynamic_markout_vn_sum: f64,
+    dynamic_markout_vn_min: f64,
+    dynamic_markout_vn_max: f64,
 }
 
 /// Floor an ISO-8601 event_start_time to its 5-min boundary unix-secs key
@@ -146,16 +218,95 @@ fn parse_event_start_ts_secs(iso: &str) -> Option<u64> {
     Some(((secs as u64) / 300) * 300)
 }
 
+/// Scale a fixed execution window with a power-law RTT elasticity.  A power
+/// law is dimensionless, monotone and anchored exactly at the training
+/// reference.  Bounds keep sparse/extreme latency episodes from producing an
+/// implausible zero or multi-second runaway window.
+fn dynamic_window_ns(
+    base_ns: u64,
+    rtt_state_ms: f64,
+    ref_ms: f64,
+    elasticity: f64,
+    min_mult: f64,
+    max_mult: f64,
+) -> (u64, f64) {
+    if base_ns == 0
+        || !rtt_state_ms.is_finite()
+        || rtt_state_ms <= 0.0
+        || !ref_ms.is_finite()
+        || ref_ms <= 0.0
+        || !elasticity.is_finite()
+    {
+        return (base_ns, 1.0);
+    }
+    let lo = if min_mult.is_finite() && min_mult > 0.0 {
+        min_mult
+    } else {
+        0.5
+    };
+    let hi = if max_mult.is_finite() && max_mult >= lo {
+        max_mult
+    } else {
+        lo.max(2.0)
+    };
+    let mult = (rtt_state_ms / ref_ms).powf(elasticity).clamp(lo, hi);
+    let scaled = ((base_ns as f64) * mult)
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64;
+    (scaled, mult)
+}
+
+fn dynamic_markout_strength(
+    base_vn: f64,
+    vol_state_ticks: f64,
+    ref_ticks: f64,
+    elasticity: f64,
+    min_mult: f64,
+    max_mult: f64,
+) -> (f64, f64) {
+    if base_vn <= 0.0
+        || !vol_state_ticks.is_finite()
+        || vol_state_ticks <= 0.0
+        || !ref_ticks.is_finite()
+        || ref_ticks <= 0.0
+        || !elasticity.is_finite()
+    {
+        return (base_vn.max(0.0), 1.0);
+    }
+    let lo = if min_mult.is_finite() && min_mult > 0.0 {
+        min_mult
+    } else {
+        0.5
+    };
+    let hi = if max_mult.is_finite() && max_mult >= lo {
+        max_mult
+    } else {
+        lo.max(2.0)
+    };
+    let mult = (vol_state_ticks / ref_ticks).powf(elasticity).clamp(lo, hi);
+    (base_vn * mult, mult)
+}
+
 impl Simulator {
     pub fn new(cfg: SimV2Config) -> Result<Self> {
         let feed = ServerFeed::new(Path::new(&cfg.data_dir), &cfg.sources, cfg.start, cfg.end)?;
         // Record-replay (or any pre-built) profile wins; otherwise build the
         // legacy scalar Empirical from the calibrated p50/p95/p99 anchors.
         let place = cfg.place_profile.clone().unwrap_or_else(|| {
-            LatencyModel::empirical_profile(cfg.place_p50_ms, cfg.place_p95_ms, cfg.place_p99_ms, cfg.rho)
+            LatencyModel::empirical_profile(
+                cfg.place_p50_ms,
+                cfg.place_p95_ms,
+                cfg.place_p99_ms,
+                cfg.rho,
+            )
         });
         let cancel = cfg.cancel_profile.clone().unwrap_or_else(|| {
-            LatencyModel::empirical_profile(cfg.cancel_p50_ms, cfg.cancel_p95_ms, cfg.cancel_p99_ms, cfg.rho)
+            LatencyModel::empirical_profile(
+                cfg.cancel_p50_ms,
+                cfg.cancel_p95_ms,
+                cfg.cancel_p99_ms,
+                cfg.rho,
+            )
         });
         let mut latency = LatencyModel::new(place, cancel, cfg.rho_cross, cfg.seed);
         latency.set_fill_push_mult(cfg.fill_push_mult);
@@ -167,15 +318,27 @@ impl Simulator {
             cfg.taker_overhead_p95_ms,
             cfg.taker_overhead_p99_ms,
         );
-        let mut core = SimExchangeV2::new(cfg.client_timeout_ns, cfg.wallet_usdc_by_iid, cfg.split_by_iid);
+        let mut core = SimExchangeV2::new(
+            cfg.client_timeout_ns,
+            cfg.wallet_usdc_by_iid,
+            cfg.split_by_iid,
+        );
         core.configure(cfg.ahead_frac, cfg.matched_cant_cancel_window_ns);
+        core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
         core.set_fold_outcomes(cfg.fold_outcomes);
+        core.configure_book_stale_gate(cfg.book_stale_after_ns);
+        core.configure_stale_resting_exchange_only(cfg.stale_resting_exchange_only);
         core.configure_taker_comp(cfg.taker_comp_rate, cfg.taker_comp_window_ns);
+        core.configure_taker_overlap_dedup(cfg.taker_overlap_dedup);
         core.set_deep_queue_decay(cfg.deep_queue_decay);
+        core.set_dynamic_deep_queue(
+            cfg.dynamic_deep_queue_strength,
+            cfg.dynamic_deep_queue_min_decay,
+        );
         let race_enabled = core.race_enabled();
         Ok(Self {
             sched: Scheduler::new(),
@@ -185,12 +348,52 @@ impl Simulator {
             client_timeout_ns: cfg.client_timeout_ns,
             timeouts: 0,
             per_event_rtt: cfg.per_event_rtt,
+            dynamic_taker_overhead_by_event: cfg.dynamic_taker_overhead_by_event,
+            last_dynamic_overhead_event: None,
+            dynamic_overhead_n: 0,
+            dynamic_overhead_p50_sum_ms: 0.0,
+            dynamic_overhead_p95_sum_ms: 0.0,
+            dynamic_overhead_p99_sum_ms: 0.0,
             race_enabled,
+            causal_matching: cfg.causal_matching,
             maker_race_horizon_ns: cfg.maker_race_horizon_ns,
             taker_race_horizon_ns: cfg.taker_race_horizon_ns,
+            base_taker_race_horizon_ns: cfg.taker_race_horizon_ns,
+            base_taker_comp_window_ns: cfg.taker_comp_window_ns,
+            taker_comp_rate: cfg.taker_comp_rate,
+            dynamic_window_rtt_by_event: cfg.dynamic_window_rtt_by_event,
+            dynamic_window_rtt_ref_ms: cfg.dynamic_window_rtt_ref_ms,
+            dynamic_race_rtt_elasticity: cfg.dynamic_race_rtt_elasticity,
+            dynamic_comp_rtt_elasticity: cfg.dynamic_comp_rtt_elasticity,
+            dynamic_window_min_mult: cfg.dynamic_window_min_mult,
+            dynamic_window_max_mult: cfg.dynamic_window_max_mult,
+            last_dynamic_window_event: None,
+            dynamic_window_n: 0,
+            dynamic_window_rtt_sum_ms: 0.0,
+            dynamic_race_window_sum_ns: 0,
+            dynamic_comp_window_sum_ns: 0,
+            dynamic_window_mult_min: f64::INFINITY,
+            dynamic_window_mult_max: f64::NEG_INFINITY,
             use_batch_orders: cfg.use_batch_orders,
             fill_markout_horizon_ns: cfg.fill_markout_horizon_ns,
             markout_on: cfg.fill_markout_vn > 0.0 && cfg.fill_markout_horizon_ns > 0,
+            base_fill_markout_vn: cfg.fill_markout_vn.max(0.0),
+            dynamic_fill_markout: cfg.dynamic_fill_markout,
+            dynamic_markout_spot_vol: cfg.dynamic_markout_spot_vol,
+            dynamic_markout_lookback_ns: cfg.dynamic_markout_lookback_ns.max(1),
+            dynamic_markout_vol_ref_ticks: cfg.dynamic_markout_vol_ref_ticks,
+            dynamic_markout_vol_elasticity: cfg.dynamic_markout_vol_elasticity,
+            dynamic_markout_min_mult: cfg.dynamic_markout_min_mult,
+            dynamic_markout_max_mult: cfg.dynamic_markout_max_mult,
+            markout_mid_history: HashMap::new(),
+            markout_last_book_ts: HashMap::new(),
+            markout_tick_by_symbol: HashMap::new(),
+            markout_symbol_fifo: VecDeque::new(),
+            markout_spot_rv: VecDeque::new(),
+            dynamic_markout_states: Vec::new(),
+            dynamic_markout_vn_sum: 0.0,
+            dynamic_markout_vn_min: f64::INFINITY,
+            dynamic_markout_vn_max: f64::NEG_INFINITY,
         })
     }
 
@@ -202,7 +405,8 @@ impl Simulator {
     /// Maker (single-snapshot): the queue the resting order faces just past the
     /// entry horizon — peek the first book strictly after `when+horizon`.
     fn prime_next_books(&mut self, token: &str, when: u64, horizon_ns: u64) {
-        if !self.race_enabled {
+        if !self.race_enabled || self.causal_matching {
+            self.core.clear_next_books();
             return;
         }
         let at = when.saturating_add(horizon_ns);
@@ -214,7 +418,9 @@ impl Simulator {
             let canon = self.core.canonical_token(token);
             let from_canon = self.feed.peek_next_book(&canon, at);
             let sibling = self.core.fold_sibling_of(&canon);
-            let from_sib = sibling.as_ref().and_then(|s| self.feed.peek_next_book(s, at));
+            let from_sib = sibling
+                .as_ref()
+                .and_then(|s| self.feed.peek_next_book(s, at));
             match (from_canon, from_sib) {
                 (Some((tc, bc, ac)), Some((ts, bs, as_))) => {
                     if tc <= ts {
@@ -245,7 +451,8 @@ impl Simulator {
     /// instant counts as a miss, not just the endpoint. Folding only; mirrors
     /// sibling-stream snapshots into the canonical frame. No-op when race off.
     fn prime_taker_window(&mut self, token: &str, when: u64, horizon_ns: u64) {
-        if !self.race_enabled {
+        if !self.race_enabled || self.causal_matching {
+            self.core.clear_next_books();
             return;
         }
         let at = when.saturating_add(horizon_ns);
@@ -285,7 +492,11 @@ impl Simulator {
 
     /// (taker_fills, maker_fills, rejects) from the matching core.
     pub fn core_stats(&self) -> (u64, u64, u64) {
-        (self.core.taker_fills, self.core.maker_fills, self.core.rejects)
+        (
+            self.core.taker_fills,
+            self.core.maker_fills,
+            self.core.rejects,
+        )
     }
 
     /// Final gating-wallet USDC for an instance (diagnostic: detect the
@@ -298,9 +509,13 @@ impl Simulator {
     /// Per-reason reject breakdown: (taker_buy, taker_sell, rest_buy,
     /// rest_sell, rest_sell_short_sum) — diagnostic for size/seed mismatch.
     pub fn reject_breakdown(&self) -> (u64, u64, u64, u64, f64) {
-        (self.core.rej_taker_buy, self.core.rej_taker_sell,
-         self.core.rej_rest_buy, self.core.rej_rest_sell,
-         self.core.rej_rest_sell_short_sum)
+        (
+            self.core.rej_taker_buy,
+            self.core.rej_taker_sell,
+            self.core.rej_rest_buy,
+            self.core.rej_rest_sell,
+            self.core.rej_rest_sell_short_sum,
+        )
     }
 
     /// (timeouts, matched_cant_cancel) for the summary.
@@ -311,6 +526,24 @@ impl Simulator {
     /// (post_only_rejects, post_only_seen) for the summary.
     pub fn post_only_stats(&self) -> (u64, u64) {
         (self.core.post_only_rejects, self.core.post_only_seen)
+    }
+
+    pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
+        self.core.fill_audit_rows()
+    }
+
+    /// Double-clock full-book stale gate diagnostics:
+    /// `(order blocks, trade blocks, exchange-clock hits, local-clock hits,
+    /// queue rebases on recovery)`.
+    pub fn book_stale_stats(&self) -> (u64, u64, u64, u64, u64) {
+        let c = &self.core;
+        (
+            c.book_stale_order_blocks,
+            c.book_stale_trade_blocks,
+            c.book_stale_exchange_hits,
+            c.book_stale_local_hits,
+            c.book_stale_rebases,
+        )
     }
 
     /// Phase-A diagnostics: (mean maker fill-age ms, frac fills on orders >1s,
@@ -360,6 +593,17 @@ impl Simulator {
         self.core.adverse_advanced
     }
 
+    /// Dynamic ahead-fraction diagnostics: cancel-resync count, mean and range.
+    pub fn dynamic_ahead_frac_stats(&self) -> Option<(u64, f64, f64, f64)> {
+        let c = &self.core;
+        (c.dynamic_ahead_frac_n > 0).then(|| (
+            c.dynamic_ahead_frac_n,
+            c.dynamic_ahead_frac_sum / c.dynamic_ahead_frac_n as f64,
+            c.dynamic_ahead_frac_min,
+            c.dynamic_ahead_frac_max,
+        ))
+    }
+
     /// # book-through adverse fills produced (diagnostic for
     /// `sim_v2_book_through_rate`).
     pub fn book_through_fills(&self) -> u64 {
@@ -385,7 +629,17 @@ impl Simulator {
             let q = |p: f64| a[((p * n as f64) as usize).min(n - 1)];
             let mean = a.iter().sum::<f64>() / n as f64;
             let zero = a.iter().filter(|x| **x < 1e-6).count() as f64 / n as f64;
-            vec![n as f64, mean, q(0.10), q(0.25), q(0.50), q(0.75), q(0.90), q(0.99), zero]
+            vec![
+                n as f64,
+                mean,
+                q(0.10),
+                q(0.25),
+                q(0.50),
+                q(0.75),
+                q(0.90),
+                q(0.99),
+                zero,
+            ]
         }
         (pcts(&self.core.maker_q_init), pcts(&self.core.taker_avail))
     }
@@ -394,7 +648,12 @@ impl Simulator {
     /// (improve, join, behind, nobook). Explains the zero-queue share.
     pub fn placement_buckets(&self) -> [[u64; 2]; 4] {
         let c = &self.core;
-        [c.place_improve, c.place_join, c.place_behind, c.place_nobook]
+        [
+            c.place_improve,
+            c.place_join,
+            c.place_behind,
+            c.place_nobook,
+        ]
     }
 
     /// q_init=0 fallback split: (extrapolated beyond-window, in-window best-rule).
@@ -402,12 +661,88 @@ impl Simulator {
         (self.core.q0_extrapolated, self.core.q0_bestrule)
     }
 
+    pub fn dynamic_deep_queue_stats(&self) -> Option<(u64, f64, f64, f64)> {
+        let c = &self.core;
+        (c.dynamic_deep_queue_n > 0).then(|| (
+            c.dynamic_deep_queue_n,
+            c.dynamic_deep_queue_decay_sum / c.dynamic_deep_queue_n as f64,
+            c.dynamic_deep_queue_decay_min,
+            c.dynamic_deep_queue_decay_max,
+        ))
+    }
+
     /// Trade-flow taker competition diagnostics:
     /// (capped, capped_to_zero, mean competing volume seen at a marketable match).
     pub fn taker_comp_stats(&self) -> (u64, u64, f64) {
         let c = &self.core;
-        let mean = if c.taker_comp_n > 0 { c.taker_comp_vol_sum / c.taker_comp_n as f64 } else { 0.0 };
+        let mean = if c.taker_comp_n > 0 {
+            c.taker_comp_vol_sum / c.taker_comp_n as f64
+        } else {
+            0.0
+        };
         (c.taker_comp_capped, c.taker_comp_capped_zero, mean)
+    }
+
+    /// Dynamic-window diagnostics: event count, mean RTT state, mean race and
+    /// competition windows (ms), and the observed multiplier range.
+    pub fn dynamic_window_stats(&self) -> Option<(u64, f64, f64, f64, f64, f64)> {
+        let n = self.dynamic_window_n;
+        if n == 0 {
+            return None;
+        }
+        Some((
+            n,
+            self.dynamic_window_rtt_sum_ms / n as f64,
+            self.dynamic_race_window_sum_ns as f64 / n as f64 / 1e6,
+            self.dynamic_comp_window_sum_ns as f64 / n as f64 / 1e6,
+            self.dynamic_window_mult_min,
+            self.dynamic_window_mult_max,
+        ))
+    }
+
+    /// Dynamic matching-overhead diagnostics: event count and mean anchors.
+    pub fn dynamic_taker_overhead_stats(&self) -> Option<(u64, f64, f64, f64)> {
+        let n = self.dynamic_overhead_n;
+        (n > 0).then(|| {
+            (
+                n,
+                self.dynamic_overhead_p50_sum_ms / n as f64,
+                self.dynamic_overhead_p95_sum_ms / n as f64,
+                self.dynamic_overhead_p99_sum_ms / n as f64,
+            )
+        })
+    }
+
+    /// Dynamic-markout diagnostics:
+    /// `[n, state_mean, p50, p75, p90, p99, vn_mean, vn_min, vn_max]`.
+    pub fn dynamic_markout_stats(&self) -> Option<Vec<f64>> {
+        if self.dynamic_markout_states.is_empty() {
+            return None;
+        }
+        let mut states = self.dynamic_markout_states.clone();
+        states.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = states.len();
+        let q = |p: f64| states[((p * n as f64).floor() as usize).min(n - 1)] as f64;
+        let mean = states.iter().map(|x| *x as f64).sum::<f64>() / n as f64;
+        Some(vec![
+            n as f64,
+            mean,
+            q(0.50),
+            q(0.75),
+            q(0.90),
+            q(0.99),
+            self.dynamic_markout_vn_sum / n as f64,
+            self.dynamic_markout_vn_min,
+            self.dynamic_markout_vn_max,
+        ])
+    }
+
+    pub fn dynamic_markout_state_unit(&self) -> &'static str {
+        if self.dynamic_markout_spot_vol {
+            "bps"
+        } else {
+            "ticks"
+        }
     }
 
     /// Sample a synthetic place RTT (ms) for the strategy's RTT-gate probe loop.
@@ -463,11 +798,336 @@ impl Simulator {
         let Some(secs) = parse_event_start_ts_secs(&bo.event_start_time) else {
             return;
         };
-        let entry = self.per_event_rtt.as_ref().and_then(|t| t.get(&secs).copied());
+        let entry = self
+            .per_event_rtt
+            .as_ref()
+            .and_then(|t| t.get(&secs).copied());
         match entry {
             Some(e) => self.latency.apply_per_event_override(&e, secs),
             None => self.latency.clear_per_event_override(),
         }
+    }
+
+    /// Apply the causal RTT state once per 5-minute event.  A missing state
+    /// explicitly falls back to the configured fixed windows.
+    fn apply_dynamic_taker_windows(&mut self, inst: &Instrument) {
+        if self.dynamic_window_rtt_by_event.is_none() {
+            return;
+        }
+        let Instrument::BinaryOption(bo) = inst else {
+            return;
+        };
+        let Some(secs) = parse_event_start_ts_secs(&bo.event_start_time) else {
+            return;
+        };
+        if self.last_dynamic_window_event == Some(secs) {
+            return;
+        }
+        self.last_dynamic_window_event = Some(secs);
+        let state = self
+            .dynamic_window_rtt_by_event
+            .as_ref()
+            .and_then(|t| t.get(&secs).copied());
+        let Some(rtt_ms) = state else {
+            self.taker_race_horizon_ns = self.base_taker_race_horizon_ns;
+            self.core
+                .configure_taker_comp(self.taker_comp_rate, self.base_taker_comp_window_ns);
+            return;
+        };
+        let (race_ns, race_mult) = dynamic_window_ns(
+            self.base_taker_race_horizon_ns,
+            rtt_ms,
+            self.dynamic_window_rtt_ref_ms,
+            self.dynamic_race_rtt_elasticity,
+            self.dynamic_window_min_mult,
+            self.dynamic_window_max_mult,
+        );
+        let (comp_ns, comp_mult) = dynamic_window_ns(
+            self.base_taker_comp_window_ns,
+            rtt_ms,
+            self.dynamic_window_rtt_ref_ms,
+            self.dynamic_comp_rtt_elasticity,
+            self.dynamic_window_min_mult,
+            self.dynamic_window_max_mult,
+        );
+        self.taker_race_horizon_ns = race_ns;
+        self.core
+            .configure_taker_comp(self.taker_comp_rate, comp_ns);
+        self.dynamic_window_n += 1;
+        self.dynamic_window_rtt_sum_ms += rtt_ms;
+        self.dynamic_race_window_sum_ns += race_ns as u128;
+        self.dynamic_comp_window_sum_ns += comp_ns as u128;
+        self.dynamic_window_mult_min = self.dynamic_window_mult_min.min(race_mult).min(comp_mult);
+        self.dynamic_window_mult_max = self.dynamic_window_mult_max.max(race_mult).max(comp_mult);
+    }
+
+    /// Apply event-specific overhead anchors without resetting the RNG/AR state.
+    /// Missing coverage falls back explicitly to the configured fixed CDF.
+    fn apply_dynamic_taker_overhead(&mut self, inst: &Instrument) {
+        if self.dynamic_taker_overhead_by_event.is_none() {
+            return;
+        }
+        let Instrument::BinaryOption(bo) = inst else {
+            return;
+        };
+        let Some(secs) = parse_event_start_ts_secs(&bo.event_start_time) else {
+            return;
+        };
+        if self.last_dynamic_overhead_event == Some(secs) {
+            return;
+        }
+        self.last_dynamic_overhead_event = Some(secs);
+        match self
+            .dynamic_taker_overhead_by_event
+            .as_ref()
+            .and_then(|t| t.get(&secs).copied())
+        {
+            Some((p50, p95, p99)) => {
+                self.latency.apply_taker_overhead_override(p50, p95, p99);
+                self.dynamic_overhead_n += 1;
+                self.dynamic_overhead_p50_sum_ms += p50;
+                self.dynamic_overhead_p95_sum_ms += p95;
+                self.dynamic_overhead_p99_sum_ms += p99;
+            }
+            None => self.latency.clear_taker_overhead_override(),
+        }
+    }
+
+    fn observe_markout_instrument(&mut self, inst: &Instrument) {
+        if !self.dynamic_fill_markout || self.dynamic_markout_spot_vol {
+            return;
+        }
+        let Instrument::BinaryOption(bo) = inst else {
+            return;
+        };
+        if bo.clob_token_ids.is_empty() {
+            return;
+        }
+        let canon = self.core.canonical_token(&bo.clob_token_ids[0]);
+        self.markout_tick_by_symbol
+            .insert(canon.clone(), bo.tick_size.max(1e-6));
+        if !self
+            .markout_symbol_fifo
+            .iter()
+            .any(|symbol| symbol == &canon)
+        {
+            self.markout_symbol_fifo.push_back(canon);
+        }
+        // Mirror the matching core's bounded event retention. Old event tokens
+        // never reappear, so retaining their 5-second book histories would make
+        // memory grow linearly in a long backtest.
+        while self.markout_symbol_fifo.len() > 16 {
+            if let Some(old) = self.markout_symbol_fifo.pop_front() {
+                self.markout_mid_history.remove(&old);
+                self.markout_last_book_ts.remove(&old);
+                self.markout_tick_by_symbol.remove(&old);
+            }
+        }
+    }
+
+    /// Record a canonical mid from a server-axis book snapshot. The history is
+    /// causal: it is updated only when the book event reaches the simulator.
+    fn observe_markout_book(&mut self, ob: &crate::types::OrderBookSnapshot) {
+        if !self.dynamic_fill_markout || self.dynamic_markout_spot_vol {
+            return;
+        }
+        let finite = |l: &&crate::types::PriceLevel| {
+            l.quantity > 0.0 && l.price.is_finite() && l.price > 0.0 && l.price < 1.0
+        };
+        let bid = ob
+            .bids
+            .iter()
+            .filter(finite)
+            .map(|l| l.price)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ask = ob
+            .asks
+            .iter()
+            .filter(finite)
+            .map(|l| l.price)
+            .fold(f64::INFINITY, f64::min);
+        if !bid.is_finite() || !ask.is_finite() {
+            return;
+        }
+        let canon = self.core.canonical_token(&ob.symbol);
+        let ts = ob.exchange_timestamp_ns;
+        if self
+            .markout_last_book_ts
+            .get(&canon)
+            .is_some_and(|last| ts < *last)
+        {
+            return;
+        }
+        self.markout_last_book_ts.insert(canon.clone(), ts);
+        let raw_mid = 0.5 * (bid + ask);
+        let mid = if self.core.fold_on() && canon != ob.symbol {
+            1.0 - raw_mid
+        } else {
+            raw_mid
+        };
+        let cutoff = ts.saturating_sub(self.dynamic_markout_lookback_ns);
+        let history = self.markout_mid_history.entry(canon).or_default();
+        history.push_back((ts, mid));
+        while history
+            .front()
+            .is_some_and(|(front_ts, _)| *front_ts < cutoff)
+        {
+            history.pop_front();
+        }
+    }
+
+    /// Observe the Binance BTCUSDT BBO on the strategy-visible clock and build
+    /// one-second closes. The state is realised volatility in basis points:
+    /// `sqrt(sum(log(close_t / close_t-1)^2)) * 10_000`.
+    ///
+    /// Bucketing prevents a change in websocket update cadence from changing
+    /// the measured volatility. This method is called only after the snapshot
+    /// reaches the strategy lane, so the factor cannot see future spot data.
+    pub fn observe_dynamic_markout_spot_book(
+        &mut self,
+        ob: &crate::types::OrderBookSnapshot,
+        observed_at: u64,
+    ) {
+        if !self.dynamic_fill_markout
+            || !self.dynamic_markout_spot_vol
+            || ob.exchange != Exchange::Binance
+            || !ob.symbol.eq_ignore_ascii_case("BTCUSDT")
+        {
+            return;
+        }
+        let best_bid = ob
+            .bids
+            .iter()
+            .filter(|l| l.quantity > 0.0 && l.price.is_finite() && l.price > 0.0)
+            .map(|l| l.price)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let best_ask = ob
+            .asks
+            .iter()
+            .filter(|l| l.quantity > 0.0 && l.price.is_finite() && l.price > 0.0)
+            .map(|l| l.price)
+            .fold(f64::INFINITY, f64::min);
+        if !best_bid.is_finite() || !best_ask.is_finite() || best_bid > best_ask {
+            return;
+        }
+        let price = 0.5 * (best_bid + best_ask);
+        let second = (observed_at / 1_000_000_000) * 1_000_000_000;
+        let len = self.markout_spot_rv.len();
+        if let Some(&(last_second, last_price, last_cum_sq)) = self.markout_spot_rv.back() {
+            if second < last_second {
+                return;
+            }
+            if second == last_second {
+                let (prev_price, prev_cum_sq) = if len >= 2 {
+                    let &(_, p, c) = self.markout_spot_rv.get(len - 2).unwrap();
+                    (p, c)
+                } else {
+                    (price, 0.0)
+                };
+                let ret = (price / prev_price).ln();
+                if let Some(last) = self.markout_spot_rv.back_mut() {
+                    *last = (second, price, prev_cum_sq + ret * ret);
+                }
+            } else {
+                let ret = (price / last_price).ln();
+                self.markout_spot_rv
+                    .push_back((second, price, last_cum_sq + ret * ret));
+            }
+        } else {
+            self.markout_spot_rv.push_back((second, price, 0.0));
+        }
+
+        // Keep one point at or immediately before the cutoff as the return
+        // anchor; all later state reads are then constant-time.
+        let cutoff = observed_at.saturating_sub(self.dynamic_markout_lookback_ns);
+        while self.markout_spot_rv.len() > 2
+            && self
+                .markout_spot_rv
+                .get(1)
+                .is_some_and(|(ts, _, _)| *ts <= cutoff)
+        {
+            self.markout_spot_rv.pop_front();
+        }
+    }
+
+    /// Observe a full-book snapshot on the local/strategy clock. Kept separate
+    /// from the server feed so the stale gate cannot see a future receive time.
+    pub fn observe_local_orderbook(
+        &mut self,
+        ob: &crate::types::OrderBookSnapshot,
+        observed_at: u64,
+    ) {
+        self.core.on_local_orderbook(ob, observed_at);
+    }
+
+    fn spot_realised_vol_bps(&mut self, when: u64) -> Option<f64> {
+        let cutoff = when.saturating_sub(self.dynamic_markout_lookback_ns);
+        while self.markout_spot_rv.len() > 2
+            && self
+                .markout_spot_rv
+                .get(1)
+                .is_some_and(|(ts, _, _)| *ts <= cutoff)
+        {
+            self.markout_spot_rv.pop_front();
+        }
+        let first = self.markout_spot_rv.front()?;
+        let last = self.markout_spot_rv.back()?;
+        (last.0 > first.0).then(|| (last.2 - first.2).max(0.0).sqrt() * 10_000.0)
+    }
+
+    /// Set `fill_markout_vn` immediately before a trade is matched, using only
+    /// canonical mids already observed in the preceding lookback window.
+    fn apply_dynamic_markout(&mut self, trade: &crate::types::TradeTick, when: u64) {
+        if !self.dynamic_fill_markout {
+            return;
+        }
+        let state = if self.dynamic_markout_spot_vol {
+            self.spot_realised_vol_bps(when)
+        } else {
+            let canon = self.core.canonical_token(&trade.symbol);
+            let cutoff = when.saturating_sub(self.dynamic_markout_lookback_ns);
+            self.markout_mid_history.get_mut(&canon).and_then(|history| {
+                while history
+                    .front()
+                    .is_some_and(|(front_ts, _)| *front_ts < cutoff)
+                {
+                    history.pop_front();
+                }
+                if history.is_empty() {
+                    return None;
+                }
+                let (lo, hi) = history
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, mid)| {
+                        (lo.min(*mid), hi.max(*mid))
+                    });
+                let tick = self
+                    .markout_tick_by_symbol
+                    .get(&canon)
+                    .copied()
+                    .unwrap_or(0.01)
+                    .max(1e-6);
+                Some(1.0 + (hi - lo).max(0.0) / tick)
+            })
+        };
+        let Some(vol_state) = state else {
+            self.core
+                .configure_fill_markout_vn(self.base_fill_markout_vn);
+            return;
+        };
+        let (vn, _) = dynamic_markout_strength(
+            self.base_fill_markout_vn,
+            vol_state,
+            self.dynamic_markout_vol_ref_ticks,
+            self.dynamic_markout_vol_elasticity,
+            self.dynamic_markout_min_mult,
+            self.dynamic_markout_max_mult,
+        );
+        self.core.configure_fill_markout_vn(vn);
+        self.dynamic_markout_states.push(vol_state as f32);
+        self.dynamic_markout_vn_sum += vn;
+        self.dynamic_markout_vn_min = self.dynamic_markout_vn_min.min(vn);
+        self.dynamic_markout_vn_max = self.dynamic_markout_vn_max.max(vn);
     }
 
     /// Peek the canonical token's mid `(best_bid+best_ask)/2` from the first book
@@ -480,8 +1140,16 @@ impl Simulator {
         // the owned `peek_next_book` path.
         let (_, bids, asks) = self.feed.peek_next_book_ref(&canon, at)?;
         let fin = |l: &crate::types::PriceLevel| l.quantity > 0.0 && l.price > 0.0 && l.price < 1.0;
-        let best_bid = bids.iter().filter(|l| fin(l)).map(|l| l.price).fold(f64::NEG_INFINITY, f64::max);
-        let best_ask = asks.iter().filter(|l| fin(l)).map(|l| l.price).fold(f64::INFINITY, f64::min);
+        let best_bid = bids
+            .iter()
+            .filter(|l| fin(l))
+            .map(|l| l.price)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let best_ask = asks
+            .iter()
+            .filter(|l| fin(l))
+            .map(|l| l.price)
+            .fold(f64::INFINITY, f64::min);
         (best_bid.is_finite() && best_ask.is_finite()).then(|| 0.5 * (best_bid + best_ask))
     }
 
@@ -493,6 +1161,7 @@ impl Simulator {
                     // swept through) surface here, delivered like trade fills
                     // after a ws fill-push delay. Empty unless book_through_rate>0.
                     let fills = self.core.on_orderbook(&ob);
+                    self.observe_markout_book(&ob);
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
                         let deliver = when.saturating_add(push);
@@ -506,8 +1175,12 @@ impl Simulator {
                     // per fill), so it surfaces via FillToStrategy later.
                     // Forward-markout haircut: peek the canonical mid `horizon`
                     // past the trade so the core can downweight favorable fills.
+                    self.apply_dynamic_markout(&t, when);
                     let fwd_mid = if self.markout_on {
-                        self.peek_fwd_canonical_mid(&t.symbol, when.saturating_add(self.fill_markout_horizon_ns))
+                        self.peek_fwd_canonical_mid(
+                            &t.symbol,
+                            when.saturating_add(self.fill_markout_horizon_ns),
+                        )
                     } else {
                         None
                     };
@@ -521,7 +1194,10 @@ impl Simulator {
                 }
                 SimEvent::ServerInstrument(i) => {
                     self.core.on_instrument(&i);
+                    self.observe_markout_instrument(&i);
                     self.apply_per_event_rtt(&i);
+                    self.apply_dynamic_taker_windows(&i);
+                    self.apply_dynamic_taker_overhead(&i);
                 }
                 SimEvent::ServerTickSize(tsc) => self.core.on_tick_size_change(&tsc),
                 _ => {}
@@ -546,11 +1222,15 @@ impl Simulator {
             return Vec::new();
         };
         match ev {
-            SimEvent::OrderReachesEngine { action, l2_ns, suppress_ack } => {
+            SimEvent::OrderReachesEngine {
+                action,
+                l2_ns,
+                suppress_ack,
+            } => {
                 // core uses `when` (server time) for matching + recent_fills.
                 match action {
                     ReachAction::Place(o) => {
-                        if self.core.would_cross(&o) {
+                        if self.core.would_cross(&o, when) {
                             // Genuine taker: defer the actual book-match to the
                             // MIDPOINT of the matching window (reach + overhead/2)
                             // so the book can move in-flight (natural taker miss).
@@ -558,7 +1238,12 @@ impl Simulator {
                             let match_at = when.saturating_add(overhead / 2);
                             self.sched.push(
                                 match_at,
-                                SimEvent::TakerMatch { order: o, l2_ns, overhead_ns: overhead, suppress_ack },
+                                SimEvent::TakerMatch {
+                                    order: o,
+                                    l2_ns,
+                                    overhead_ns: overhead,
+                                    suppress_ack,
+                                },
                             );
                         } else {
                             // Maker race: peek the queue `maker_race_horizon` ahead
@@ -569,7 +1254,10 @@ impl Simulator {
                             self.deliver_ack(u, when.saturating_add(l2_ns), suppress_ack);
                         }
                     }
-                    ReachAction::Cancel { exchange, client_order_id } => {
+                    ReachAction::Cancel {
+                        exchange,
+                        client_order_id,
+                    } => {
                         let u = self.core.cancel_order(exchange, &client_order_id, when);
                         self.deliver_ack(u, when.saturating_add(l2_ns), suppress_ack);
                     }
@@ -582,7 +1270,12 @@ impl Simulator {
                 }
                 Vec::new()
             }
-            SimEvent::TakerMatch { order, l2_ns, overhead_ns, suppress_ack } => {
+            SimEvent::TakerMatch {
+                order,
+                l2_ns,
+                overhead_ns,
+                suppress_ack,
+            } => {
                 // Re-match against the (now possibly moved) book: still crossing
                 // → taker fill; moved away → rests (miss) or cancels per type.
                 // Taker race: take the MIN available volume over EVERY book in
@@ -590,7 +1283,8 @@ impl Simulator {
                 // liquidity-recede check than a single endpoint snapshot.
                 self.prime_taker_window(&order.symbol, when, self.taker_race_horizon_ns);
                 let u = self.core.submit_order(&order, when);
-                let is_fill = matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
+                let is_fill =
+                    matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
                 // Filled taker: residual overhead/2 + L2 to the ack. Missed→rest:
                 // just L2 (a resting order doesn't traverse the matching engine).
                 let deliver = if is_fill {
@@ -614,10 +1308,18 @@ impl Simulator {
     pub fn submit(&mut self, sig: &Signal, t_emit: u64) {
         // Reconcile: resolve orphans against current core state; deliver after a
         // (cancel-side) round trip.
-        if let Signal::ReconcilePolymarket { pending_places, pending_cancels, .. } = sig {
+        if let Signal::ReconcilePolymarket {
+            pending_places,
+            pending_cancels,
+            ..
+        } = sig
+        {
             let (l1, l2) = self.latency.sample_cancel_split(t_emit);
             let deliver = t_emit.saturating_add(l1).saturating_add(l2);
-            for u in self.core.reconcile(pending_places, pending_cancels, deliver) {
+            for u in self
+                .core
+                .reconcile(pending_places, pending_cancels, deliver)
+            {
                 self.sched.push(deliver, SimEvent::AckToStrategy(u));
             }
             return;
@@ -675,7 +1377,11 @@ impl Simulator {
         }
         self.sched.push(
             reach,
-            SimEvent::OrderReachesEngine { action, l2_ns: l2, suppress_ack: timed_out },
+            SimEvent::OrderReachesEngine {
+                action,
+                l2_ns: l2,
+                suppress_ack: timed_out,
+            },
         );
     }
 
@@ -693,7 +1399,9 @@ impl Simulator {
                 // NewOrderTimeout handler doesn't need one).
                 None,
             ),
-            ReachAction::Cancel { client_order_id, .. } => {
+            ReachAction::Cancel {
+                client_order_id, ..
+            } => {
                 let (symbol, side) = self
                     .core
                     .order_symbol_side(client_order_id)
@@ -740,7 +1448,10 @@ impl Simulator {
 /// `use_batch_orders=false` split path to pick the cancel vs place RTT
 /// sampler per action.
 fn action_is_cancel(a: &ReachAction) -> bool {
-    matches!(a, ReachAction::Cancel { .. } | ReachAction::CancelAll { .. })
+    matches!(
+        a,
+        ReachAction::Cancel { .. } | ReachAction::CancelAll { .. }
+    )
 }
 
 /// Expand a `Signal` into reach actions + whether it is a cancel-only signal
@@ -834,7 +1545,7 @@ fn expand_signal(sig: &Signal) -> (Vec<ReachAction>, bool) {
 mod tests {
     use super::*;
     use crate::exchange::sim::latency::LatencyProfile;
-    use crate::types::{Exchange, OrderRequest, OrderStatus, Side};
+    use crate::types::{Exchange, OrderBookSnapshot, OrderRequest, OrderStatus, PriceLevel, Side};
 
     /// Build a Simulator with an empty feed and a deterministic fixed RTT so
     /// ack-delivery timing is exact.
@@ -855,17 +1566,61 @@ mod tests {
         Simulator {
             sched: Scheduler::new(),
             feed,
-            core: SimExchangeV2::new(500_000_000, std::collections::HashMap::new(), std::collections::HashMap::new()),
+            core: SimExchangeV2::new(
+                500_000_000,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
             latency,
             client_timeout_ns: 500_000_000,
             timeouts: 0,
             per_event_rtt: None,
+            dynamic_taker_overhead_by_event: None,
+            last_dynamic_overhead_event: None,
+            dynamic_overhead_n: 0,
+            dynamic_overhead_p50_sum_ms: 0.0,
+            dynamic_overhead_p95_sum_ms: 0.0,
+            dynamic_overhead_p99_sum_ms: 0.0,
             race_enabled: false,
+            causal_matching: false,
             maker_race_horizon_ns: 0,
             taker_race_horizon_ns: 0,
+            base_taker_race_horizon_ns: 0,
+            base_taker_comp_window_ns: 0,
+            taker_comp_rate: 0.0,
+            dynamic_window_rtt_by_event: None,
+            dynamic_window_rtt_ref_ms: 60.0,
+            dynamic_race_rtt_elasticity: 0.0,
+            dynamic_comp_rtt_elasticity: 0.0,
+            dynamic_window_min_mult: 0.5,
+            dynamic_window_max_mult: 2.0,
+            last_dynamic_window_event: None,
+            dynamic_window_n: 0,
+            dynamic_window_rtt_sum_ms: 0.0,
+            dynamic_race_window_sum_ns: 0,
+            dynamic_comp_window_sum_ns: 0,
+            dynamic_window_mult_min: f64::INFINITY,
+            dynamic_window_mult_max: f64::NEG_INFINITY,
             use_batch_orders: true,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            base_fill_markout_vn: 0.0,
+            dynamic_fill_markout: false,
+            dynamic_markout_spot_vol: false,
+            dynamic_markout_lookback_ns: 5_000_000_000,
+            dynamic_markout_vol_ref_ticks: 1.0,
+            dynamic_markout_vol_elasticity: 0.0,
+            dynamic_markout_min_mult: 0.5,
+            dynamic_markout_max_mult: 2.0,
+            markout_mid_history: HashMap::new(),
+            markout_last_book_ts: HashMap::new(),
+            markout_tick_by_symbol: HashMap::new(),
+            markout_symbol_fifo: VecDeque::new(),
+            markout_spot_rv: VecDeque::new(),
+            dynamic_markout_states: Vec::new(),
+            dynamic_markout_vn_sum: 0.0,
+            dynamic_markout_vn_min: f64::INFINITY,
+            dynamic_markout_vn_max: f64::NEG_INFINITY,
         }
     }
 
@@ -873,24 +1628,76 @@ mod tests {
     /// `use_batch_orders` flag — for exercising the split-dispatch path.
     fn sim_split_rtt(place_ms: u64, cancel_ms: u64, use_batch_orders: bool) -> Simulator {
         let feed = ServerFeed::new(
-            Path::new("/nonexistent"), &[],
+            Path::new("/nonexistent"),
+            &[],
             DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
             DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let latency = LatencyModel::new(
             LatencyProfile::Fixed(place_ms),
             LatencyProfile::Fixed(cancel_ms),
-            0.0, 1,
+            0.0,
+            1,
         );
         Simulator {
-            sched: Scheduler::new(), feed,
-            core: SimExchangeV2::new(500_000_000, std::collections::HashMap::new(), std::collections::HashMap::new()),
-            latency, client_timeout_ns: 500_000_000, timeouts: 0,
-            per_event_rtt: None, race_enabled: false,
-            maker_race_horizon_ns: 0, taker_race_horizon_ns: 0,
+            sched: Scheduler::new(),
+            feed,
+            core: SimExchangeV2::new(
+                500_000_000,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
+            latency,
+            client_timeout_ns: 500_000_000,
+            timeouts: 0,
+            per_event_rtt: None,
+            dynamic_taker_overhead_by_event: None,
+            last_dynamic_overhead_event: None,
+            dynamic_overhead_n: 0,
+            dynamic_overhead_p50_sum_ms: 0.0,
+            dynamic_overhead_p95_sum_ms: 0.0,
+            dynamic_overhead_p99_sum_ms: 0.0,
+            race_enabled: false,
+            causal_matching: false,
+            maker_race_horizon_ns: 0,
+            taker_race_horizon_ns: 0,
+            base_taker_race_horizon_ns: 0,
+            base_taker_comp_window_ns: 0,
+            taker_comp_rate: 0.0,
+            dynamic_window_rtt_by_event: None,
+            dynamic_window_rtt_ref_ms: 60.0,
+            dynamic_race_rtt_elasticity: 0.0,
+            dynamic_comp_rtt_elasticity: 0.0,
+            dynamic_window_min_mult: 0.5,
+            dynamic_window_max_mult: 2.0,
+            last_dynamic_window_event: None,
+            dynamic_window_n: 0,
+            dynamic_window_rtt_sum_ms: 0.0,
+            dynamic_race_window_sum_ns: 0,
+            dynamic_comp_window_sum_ns: 0,
+            dynamic_window_mult_min: f64::INFINITY,
+            dynamic_window_mult_max: f64::NEG_INFINITY,
             use_batch_orders,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            base_fill_markout_vn: 0.0,
+            dynamic_fill_markout: false,
+            dynamic_markout_spot_vol: false,
+            dynamic_markout_lookback_ns: 5_000_000_000,
+            dynamic_markout_vol_ref_ticks: 1.0,
+            dynamic_markout_vol_elasticity: 0.0,
+            dynamic_markout_min_mult: 0.5,
+            dynamic_markout_max_mult: 2.0,
+            markout_mid_history: HashMap::new(),
+            markout_last_book_ts: HashMap::new(),
+            markout_tick_by_symbol: HashMap::new(),
+            markout_symbol_fifo: VecDeque::new(),
+            markout_spot_rv: VecDeque::new(),
+            dynamic_markout_states: Vec::new(),
+            dynamic_markout_vn_sum: 0.0,
+            dynamic_markout_vn_min: f64::INFINITY,
+            dynamic_markout_vn_max: f64::NEG_INFINITY,
         }
     }
 
@@ -928,7 +1735,9 @@ mod tests {
             }
         }
         assert!(
-            statuses.iter().any(|(c, s)| c == "old" && *s == OrderStatus::CancelOrderTimeout),
+            statuses
+                .iter()
+                .any(|(c, s)| c == "old" && *s == OrderStatus::CancelOrderTimeout),
             "split: cancel must time out on the cancel RTT, got {statuses:?}",
         );
         // The CancelOrderTimeout must carry a non-None exchange_order_id, else
@@ -938,7 +1747,9 @@ mod tests {
             "cancel timeout must carry exchange_order_id, got {oids:?}",
         );
         assert!(
-            !statuses.iter().any(|(_, s)| *s == OrderStatus::NewOrderTimeout),
+            !statuses
+                .iter()
+                .any(|(_, s)| *s == OrderStatus::NewOrderTimeout),
             "split: fast place must NOT time out, got {statuses:?}",
         );
         assert_eq!(split.timeout_stats().0, 1, "exactly one (cancel) timeout");
@@ -946,8 +1757,14 @@ mod tests {
         // Batched: same RTTs, whole reprice uses the fast place RTT → none.
         let mut batched = sim_split_rtt(100, 1200, true);
         batched.submit(&reprice_signal("old", "new"), 1_000_000_000);
-        while batched.peek_when().is_some() { for _ in batched.step() {} }
-        assert_eq!(batched.timeout_stats().0, 0, "batched reprice shares the fast place RTT → no timeout");
+        while batched.peek_when().is_some() {
+            for _ in batched.step() {}
+        }
+        assert_eq!(
+            batched.timeout_stats().0,
+            0,
+            "batched reprice shares the fast place RTT → no timeout"
+        );
     }
 
     fn place_signal(coid: &str) -> Signal {
@@ -999,7 +1816,10 @@ mod tests {
                 statuses.push((u.client_order_id.clone(), u.status));
             }
         }
-        assert_eq!(statuses, vec![("a".to_string(), OrderStatus::NewOrderTimeout)]);
+        assert_eq!(
+            statuses,
+            vec![("a".to_string(), OrderStatus::NewOrderTimeout)]
+        );
         assert_eq!(sim.timeout_stats().0, 1);
 
         // Order rests in core → reconcile resolves it to Accepted.
@@ -1032,5 +1852,73 @@ mod tests {
             }
         }
         assert_eq!(acks, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn dynamic_window_power_law_is_anchored_and_bounded() {
+        let base = 1_000_000_000;
+        assert_eq!(
+            dynamic_window_ns(base, 40.0, 40.0, 2.0, 0.5, 2.0),
+            (base, 1.0)
+        );
+        assert_eq!(
+            dynamic_window_ns(base, 20.0, 40.0, 1.0, 0.5, 2.0),
+            (500_000_000, 0.5)
+        );
+        assert_eq!(
+            dynamic_window_ns(base, 100.0, 40.0, 2.0, 0.5, 2.0),
+            (2_000_000_000, 2.0)
+        );
+        assert_eq!(
+            dynamic_window_ns(base, f64::NAN, 40.0, 1.0, 0.5, 2.0),
+            (base, 1.0)
+        );
+    }
+
+    #[test]
+    fn dynamic_markout_power_law_is_anchored_and_bounded() {
+        assert_eq!(
+            dynamic_markout_strength(0.35, 2.0, 2.0, 1.0, 0.5, 2.0),
+            (0.35, 1.0)
+        );
+        assert_eq!(
+            dynamic_markout_strength(0.35, 1.0, 2.0, 1.0, 0.5, 2.0),
+            (0.175, 0.5)
+        );
+        assert_eq!(
+            dynamic_markout_strength(0.35, 10.0, 2.0, 2.0, 0.5, 2.0),
+            (0.70, 2.0)
+        );
+    }
+
+    #[test]
+    fn spot_markout_vol_uses_one_second_closes() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.dynamic_fill_markout = true;
+        sim.dynamic_markout_spot_vol = true;
+        sim.dynamic_markout_lookback_ns = 5_000_000_000;
+        let book = |price: f64, ts: u64| OrderBookSnapshot {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".into(),
+            bids: vec![PriceLevel {
+                price: price - 0.5,
+                quantity: 1.0,
+            }],
+            asks: vec![PriceLevel {
+                price: price + 0.5,
+                quantity: 1.0,
+            }],
+            exchange_timestamp_ns: ts,
+            local_timestamp_ns: ts,
+        };
+        sim.observe_dynamic_markout_spot_book(&book(100.0, 1_000_000_000), 1_000_000_000);
+        sim.observe_dynamic_markout_spot_book(&book(101.0, 2_000_000_000), 2_000_000_000);
+        // A later update in the same second replaces that second's close; it
+        // must not add a second intrasecond return to realised volatility.
+        sim.observe_dynamic_markout_spot_book(&book(102.0, 2_500_000_000), 2_500_000_000);
+        sim.observe_dynamic_markout_spot_book(&book(102.0, 3_000_000_000), 3_000_000_000);
+        let got = sim.spot_realised_vol_bps(3_000_000_000).unwrap();
+        let expected = (102.0_f64 / 100.0).ln().abs() * 10_000.0;
+        assert!((got - expected).abs() < 1e-9, "got={got} expected={expected}");
     }
 }
