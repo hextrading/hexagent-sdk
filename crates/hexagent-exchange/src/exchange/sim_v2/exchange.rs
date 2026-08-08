@@ -57,6 +57,10 @@ struct RestingOrder {
     traded_since_sync: f64,
     /// Server-time this order rested (for lifetime / fill-age diagnostics).
     placed_ns: u64,
+    /// The order reached the engine while its cached full book was stale. It
+    /// cannot maker-fill until the next accepted full book re-bases its queue
+    /// at the then-visible level depth.
+    await_fresh_book: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +92,42 @@ struct MakerFill {
     fully: bool,
 }
 
+/// Diagnostic-only attribution for one strategy instance in one binary event.
+/// Quantities are deliberately kept separate from decision counts: a gate that
+/// blocks many tiny probes is materially different from one that suppresses a
+/// single large executable order. None of these fields feed matching decisions.
+#[derive(Clone, Debug, Default)]
+pub struct FillAuditRow {
+    pub slug: String,
+    pub iid: String,
+    pub place_orders: u64,
+    pub place_qty: f64,
+    pub cancel_before_place_orders: u64,
+    pub cancel_before_place_qty: f64,
+    pub stale_order_blocks: u64,
+    pub stale_order_qty: f64,
+    pub post_only_rejects: u64,
+    pub post_only_reject_qty: f64,
+    pub maker_rests: u64,
+    pub maker_rest_qty: f64,
+    pub maker_q_init_sum: f64,
+    pub maker_race_added_q: f64,
+    pub maker_trade_matches: u64,
+    pub maker_trade_qty: f64,
+    pub maker_queue_drained_qty: f64,
+    pub maker_candidate_qty: f64,
+    pub maker_fill_qty: f64,
+    pub stale_trade_matches: u64,
+    pub stale_trade_candidate_qty: f64,
+    pub taker_candidates: u64,
+    pub taker_requested_qty: f64,
+    pub taker_available_qty: f64,
+    pub taker_race_suppressed_qty: f64,
+    pub taker_comp_suppressed_qty: f64,
+    pub taker_zero_fills: u64,
+    pub taker_fill_qty: f64,
+}
+
 fn flip(s: Side) -> Side {
     match s {
         Side::Buy => Side::Sell,
@@ -117,15 +157,41 @@ pub struct SimExchangeV2 {
     /// canon`; canonical token (clob_token_ids[0]) is absent from the map.
     fold_outcomes: bool,
     fold_to: HashMap<String, String>,
+    /// Token → event slug, retained only while the token is live. Audit rows
+    /// themselves are retained for the complete replay and emitted at exit.
+    event_slug_by_token: HashMap<String, String>,
+    fill_audit: BTreeMap<(String, String), FillAuditRow>,
     /// Symmetric outcome-sibling map (a↔b) for the race lookahead (peek the
     /// canonical frame's next book from EITHER outcome stream).
     fold_sibling: HashMap<String, String>,
-    /// Last applied book exchange_ts per canonical token (book staleness guard:
-    /// an incoming snapshot older than this is dropped).
+    /// Last applied full-book exchange timestamp per canonical token. This is
+    /// both the folded out-of-order guard and one clock of the matching stale
+    /// gate.
     last_book_ts: HashMap<String, u64>,
+    /// Local receive timestamp carried by the last accepted full book. Together
+    /// with `last_book_ts` this detects both a silent recorder/client feed and a
+    /// server snapshot whose own timestamp stopped advancing.
+    last_book_local_ts: HashMap<String, u64>,
+    /// Shared max age for both clocks. 0 preserves the historical model.
+    book_stale_after_ns: u64,
+    /// Existing resting makers remain live at the exchange when only the local
+    /// full-book receive clock is stale. Order admission still uses both clocks.
+    stale_resting_exchange_only: bool,
+    pub book_stale_order_blocks: u64,
+    pub book_stale_trade_blocks: u64,
+    pub book_stale_exchange_hits: u64,
+    pub book_stale_local_hits: u64,
+    pub book_stale_rebases: u64,
     /// Fraction of attributed cancels that sit ahead of us. `None` = the
     /// default proportional model (`q_ahead / level`); `Some(f)` pins it.
     ahead_frac_override: Option<f64>,
+    /// Blend from the configured fixed override toward the causal queue-position
+    /// fraction (`q_ahead / level depth`) on every queue resync.
+    dynamic_ahead_frac_strength: f64,
+    pub dynamic_ahead_frac_n: u64,
+    pub dynamic_ahead_frac_sum: f64,
+    pub dynamic_ahead_frac_min: f64,
+    pub dynamic_ahead_frac_max: f64,
     /// **Adverse-selection conditioning** of the cancel attribution (2026-05-31).
     /// Cancellations are informed: when the canonical mid moves AGAINST a resting
     /// order between snapshots, the level's cancels are concentrated AHEAD of us
@@ -190,6 +256,10 @@ pub struct SimExchangeV2 {
     recent_trades: HashMap<String, std::collections::VecDeque<(u64, Side, f64, f64)>>,
     taker_comp_rate: f64,
     taker_comp_window_ns: u64,
+    /// If true, race and trade-flow competition are assumed to overlap fully:
+    /// compute both caps from the original request and apply the less
+    /// restrictive cap once. False preserves the historical stricter cap.
+    taker_overlap_dedup: bool,
     /// # taker fills the competition model capped (competing vol < now within limit).
     pub taker_comp_capped: u64,
     /// Subset capped to ~0 (competition consumed the whole touch → full miss).
@@ -269,6 +339,10 @@ pub struct SimExchangeV2 {
     /// q_init=0 fallback split: # resolved by beyond-window extrapolation vs the
     /// in-window best-level default rule.
     pub q0_extrapolated: u64,
+    pub dynamic_deep_queue_n: u64,
+    pub dynamic_deep_queue_decay_sum: f64,
+    pub dynamic_deep_queue_decay_min: f64,
+    pub dynamic_deep_queue_decay_max: f64,
     pub q0_bestrule: u64,
 }
 
@@ -292,9 +366,24 @@ impl SimExchangeV2 {
             seeded_conditions: HashSet::new(),
             fold_outcomes: false,
             fold_to: HashMap::new(),
+            event_slug_by_token: HashMap::new(),
+            fill_audit: BTreeMap::new(),
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
+            last_book_local_ts: HashMap::new(),
+            book_stale_after_ns: 0,
+            stale_resting_exchange_only: false,
+            book_stale_order_blocks: 0,
+            book_stale_trade_blocks: 0,
+            book_stale_exchange_hits: 0,
+            book_stale_local_hits: 0,
+            book_stale_rebases: 0,
             ahead_frac_override: None,
+            dynamic_ahead_frac_strength: 0.0,
+            dynamic_ahead_frac_n: 0,
+            dynamic_ahead_frac_sum: 0.0,
+            dynamic_ahead_frac_min: f64::INFINITY,
+            dynamic_ahead_frac_max: f64::NEG_INFINITY,
             adverse_sel_rate: 0.0,
             adverse_scale_ticks: 1.0,
             adverse_advanced: 0,
@@ -308,6 +397,7 @@ impl SimExchangeV2 {
             recent_trades: HashMap::new(),
             taker_comp_rate: 0.0,
             taker_comp_window_ns: 0,
+            taker_overlap_dedup: false,
             taker_comp_capped: 0,
             taker_comp_capped_zero: 0,
             taker_comp_vol_sum: 0.0,
@@ -340,6 +430,10 @@ impl SimExchangeV2 {
             place_behind: [0; 2],
             place_nobook: [0; 2],
             q0_extrapolated: 0,
+            dynamic_deep_queue_n: 0,
+            dynamic_deep_queue_decay_sum: 0.0,
+            dynamic_deep_queue_decay_min: f64::INFINITY,
+            dynamic_deep_queue_decay_max: f64::NEG_INFINITY,
             q0_bestrule: 0,
             maker_race_inflated: 0,
             maker_race_placements: 0,
@@ -405,6 +499,154 @@ impl SimExchangeV2 {
         }
     }
 
+    pub fn configure_dynamic_ahead_frac(&mut self, strength: f64) {
+        self.dynamic_ahead_frac_strength = strength.clamp(0.0, 1.0);
+    }
+
+    fn audit_key(&self, token: &str, iid: &str) -> Option<(String, String)> {
+        let slug = self
+            .event_slug_by_token
+            .get(token)
+            .or_else(|| self.event_slug_by_token.get(self.canonical_of(token)))?
+            .clone();
+        Some((slug, iid.to_string()))
+    }
+
+    fn audit_row_mut(&mut self, token: &str, iid: &str) -> Option<&mut FillAuditRow> {
+        let key = self.audit_key(token, iid)?;
+        Some(self.fill_audit.entry(key.clone()).or_insert_with(|| FillAuditRow {
+            slug: key.0,
+            iid: key.1,
+            ..FillAuditRow::default()
+        }))
+    }
+
+    pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
+        self.fill_audit.values().cloned().collect()
+    }
+
+    /// Configure the fail-closed full-book age gate. A single threshold is
+    /// applied independently to the last local receive timestamp and the last
+    /// exchange timestamp; either clock expiring makes the book unusable for a
+    /// fill. 0 disables the gate byte-for-byte at the decision points.
+    pub fn configure_book_stale_gate(&mut self, stale_after_ns: u64) {
+        self.book_stale_after_ns = stale_after_ns;
+    }
+
+    pub fn configure_stale_resting_exchange_only(&mut self, enabled: bool) {
+        self.stale_resting_exchange_only = enabled;
+    }
+
+    fn resting_trade_is_stale(&self, exchange_stale: bool, local_stale: bool) -> bool {
+        exchange_stale || (!self.stale_resting_exchange_only && local_stale)
+    }
+
+    fn book_stale_reasons(&self, token: &str, now_ns: u64) -> (bool, bool) {
+        let max_age = self.book_stale_after_ns;
+        if max_age == 0 {
+            return (false, false);
+        }
+        let canon = self.canonical_of(token);
+        let exchange_stale = self
+            .last_book_ts
+            .get(canon)
+            .is_none_or(|ts| now_ns.saturating_sub(*ts) > max_age);
+        let local_stale = self
+            .last_book_local_ts
+            .get(canon)
+            .is_none_or(|ts| now_ns.saturating_sub(*ts) > max_age);
+        (exchange_stale, local_stale)
+    }
+
+    fn count_book_stale_block(&mut self, exchange_stale: bool, local_stale: bool, order: bool) {
+        if order {
+            self.book_stale_order_blocks += 1;
+        } else {
+            self.book_stale_trade_blocks += 1;
+        }
+        self.book_stale_exchange_hits += exchange_stale as u64;
+        self.book_stale_local_hits += local_stale as u64;
+    }
+
+    /// Estimate how much maker volume the stale gate suppressed without
+    /// mutating queue state. This mirrors only the price/side/queue predicate of
+    /// `match_trade`; it is attribution, not a counterfactual fill injection.
+    fn audit_stale_trade(&mut self, symbol: &str, side: Side, price: f64, qty: f64) {
+        let Some(slug) = self.event_slug_by_token.get(symbol).cloned() else {
+            return;
+        };
+        let tick = self.tick_of(symbol);
+        let trade_ticks = price_to_ticks(price, tick);
+        let audits = &mut self.fill_audit;
+        for o in self.orders.values() {
+            if o.match_symbol != symbol {
+                continue;
+            }
+            let order_ticks = price_to_ticks(o.match_price, tick);
+            let matches = match o.match_side {
+                Side::Buy => side == Side::Sell && trade_ticks <= order_ticks,
+                Side::Sell => side == Side::Buy && trade_ticks >= order_ticks,
+            };
+            if !matches {
+                continue;
+            }
+            let candidate = (qty - o.q_ahead).max(0.0).min(o.remaining);
+            let key = (slug.clone(), o.request.instance_id.clone());
+            let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0,
+                iid: key.1,
+                ..FillAuditRow::default()
+            });
+            a.stale_trade_matches += 1;
+            a.stale_trade_candidate_qty += candidate;
+        }
+    }
+
+    /// Orders admitted while stale join behind the complete visible queue on
+    /// the first fresh full book. This avoids carrying a queue position derived
+    /// from the stale cached ladder into future maker matching.
+    fn rebase_stale_orders(&mut self, canon: &str) {
+        let books = &self.books;
+        let mut rebased = 0u64;
+        for o in self.orders.values_mut() {
+            if !o.await_fresh_book || o.match_symbol != canon {
+                continue;
+            }
+            let depth = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
+            o.q_ahead = depth;
+            o.level_qty_at_sync = depth;
+            o.mid_at_sync = books.eff_mid(&o.match_symbol);
+            o.traded_since_sync = 0.0;
+            o.await_fresh_book = false;
+            rebased += 1;
+        }
+        self.book_stale_rebases += rebased;
+    }
+
+    fn maybe_rebase_stale_orders(&mut self, canon: &str, now_ns: u64) {
+        let (exchange_stale, local_stale) = self.book_stale_reasons(canon, now_ns);
+        if !exchange_stale && !local_stale {
+            self.rebase_stale_orders(canon);
+        }
+    }
+
+    /// Advance the independent strategy-visible full-book clock. Server books
+    /// are applied at exchange time, which can precede `local_timestamp_ns`;
+    /// updating this clock from `on_orderbook` would therefore leak a future
+    /// local receipt into matching decisions. The engine calls this only when
+    /// the same snapshot actually reaches the local/strategy lane.
+    pub fn on_local_orderbook(&mut self, ob: &OrderBookSnapshot, observed_at_ns: u64) {
+        if ob.exchange != Exchange::Polymarket {
+            return;
+        }
+        let canon = self.canonical_of(&ob.symbol).to_string();
+        self.last_book_local_ts
+            .entry(canon.clone())
+            .and_modify(|ts| *ts = (*ts).max(observed_at_ns))
+            .or_insert(observed_at_ns);
+        self.maybe_rebase_stale_orders(&canon, observed_at_ns);
+    }
+
     /// Configure adverse-selection conditioning of the cancel attribution.
     /// `rate=0` disables it (pure proportional/override ahead_frac). `scale_ticks`
     /// is the adverse mid-move (ticks) mapping to full conditioning; clamped to a
@@ -441,6 +683,10 @@ impl SimExchangeV2 {
         self.books.set_deep_queue_decay(d);
     }
 
+    pub fn set_dynamic_deep_queue(&mut self, strength: f64, min_decay: f64) {
+        self.books.set_dynamic_deep_queue(strength, min_decay);
+    }
+
     /// Maker/taker one-step "race" rates (0 = off). See the struct fields.
     pub fn configure_race(&mut self, maker_race: f64, taker_race: f64) {
         self.maker_race_rate = maker_race.clamp(0.0, 1.0);
@@ -453,6 +699,10 @@ impl SimExchangeV2 {
     pub fn configure_taker_comp(&mut self, rate: f64, window_ns: u64) {
         self.taker_comp_rate = rate.clamp(0.0, 1.0);
         self.taker_comp_window_ns = window_ns;
+    }
+
+    pub fn configure_taker_overlap_dedup(&mut self, on: bool) {
+        self.taker_overlap_dedup = on;
     }
     pub fn race_enabled(&self) -> bool {
         self.maker_race_rate > 0.0 || self.taker_race_rate > 0.0
@@ -528,12 +778,31 @@ impl SimExchangeV2 {
                 let (b, a) = Self::mirror_levels(&ob.bids, &ob.asks);
                 self.books.update(&canon, b, a);
             }
+            self.maybe_rebase_stale_orders(&canon, now_ns);
             self.resync_queues();
-            return self.run_book_through(now_ns);
+            return self.run_book_through_if_fresh(&canon, now_ns);
         }
         self.books.update(&ob.symbol, ob.bids.clone(), ob.asks.clone());
+        self.last_book_ts
+            .entry(ob.symbol.clone())
+            .and_modify(|ts| *ts = (*ts).max(ob.exchange_timestamp_ns))
+            .or_insert(ob.exchange_timestamp_ns);
+        self.maybe_rebase_stale_orders(&ob.symbol, now_ns);
         self.resync_queues();
-        self.run_book_through(now_ns)
+        self.run_book_through_if_fresh(&ob.symbol, now_ns)
+    }
+
+    fn run_book_through_if_fresh(&mut self, token: &str, now_ns: u64) -> Vec<OrderUpdate> {
+        let (exchange_stale, local_stale) = self.book_stale_reasons(token, now_ns);
+        if exchange_stale || local_stale {
+            // A trade-confirmation belongs only to the immediately following
+            // book interval. Do not let a confirmation suppressed by the stale
+            // gate leak forward and fill on a later fresh book.
+            self.pend_cross.clear();
+            Vec::new()
+        } else {
+            self.run_book_through(now_ns)
+        }
     }
 
     /// Book-through adverse fills: a resting order whose price the contra side
@@ -619,20 +888,33 @@ impl SimExchangeV2 {
     fn resync_queues(&mut self) {
         let books = &self.books;
         let af_override = self.ahead_frac_override;
+        let dynamic_af_strength = self.dynamic_ahead_frac_strength;
         let adv_rate = self.adverse_sel_rate;
         let adv_scale = self.adverse_scale_ticks;
         let mut advanced = 0u64;
+        let mut dynamic_n = 0u64;
+        let mut dynamic_sum = 0.0;
+        let mut dynamic_min = f64::INFINITY;
+        let mut dynamic_max = f64::NEG_INFINITY;
         for o in self.orders.values_mut() {
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
             let cancels = (l_prev - o.traded_since_sync - l_now).max(0.0);
             // Baseline (neutral) ahead-fraction: pinned override or proportional.
-            let base = match af_override {
-                Some(f) => f.clamp(0.0, 1.0),
-                None if l_prev > EPS => (o.q_ahead / l_prev).clamp(0.0, 1.0),
-                None => 0.0,
+            let proportional = if l_prev > EPS {
+                (o.q_ahead / l_prev).clamp(0.0, 1.0)
+            } else {
+                0.0
             };
+            let fixed = af_override.unwrap_or(proportional).clamp(0.0, 1.0);
+            let base = (fixed + dynamic_af_strength * (proportional - fixed)).clamp(0.0, 1.0);
+            if dynamic_af_strength > 0.0 && cancels > EPS {
+                dynamic_n += 1;
+                dynamic_sum += base;
+                dynamic_min = dynamic_min.min(base);
+                dynamic_max = dynamic_max.max(base);
+            }
             // Adverse-selection tilt: cancellations are informed. The canonical
             // mid move since the last sync, signed AGAINST the order, says whether
             // the level's cancels were informed (adverse → front makers pull →
@@ -662,6 +944,10 @@ impl SimExchangeV2 {
             o.traded_since_sync = 0.0;
         }
         self.adverse_advanced += advanced;
+        self.dynamic_ahead_frac_n += dynamic_n;
+        self.dynamic_ahead_frac_sum += dynamic_sum;
+        self.dynamic_ahead_frac_min = self.dynamic_ahead_frac_min.min(dynamic_min);
+        self.dynamic_ahead_frac_max = self.dynamic_ahead_frac_max.max(dynamic_max);
     }
 
     /// Maker fills: a trade print drains the resting queue at the matched level
@@ -684,21 +970,58 @@ impl SimExchangeV2 {
             // Fold the trade onto the canonical frame and drain the single
             // canonical queue once (a down trade mirrors: flip side, 1−price).
             let canon = self.canonical_of(&t.symbol).to_string();
+            let (exchange_stale, local_stale) = self.book_stale_reasons(&canon, ts);
             if canon == t.symbol {
                 self.record_trade(&canon, t.side, t.price, t.quantity, ts);
-                self.match_trade(&canon, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                if self.resting_trade_is_stale(exchange_stale, local_stale) {
+                    self.audit_stale_trade(&canon, t.side, t.price, t.quantity);
+                    self.count_book_stale_block(exchange_stale, local_stale, false);
+                } else {
+                    self.match_trade(&canon, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                }
             } else {
                 self.record_trade(&canon, flip(t.side), 1.0 - t.price, t.quantity, ts);
-                self.match_trade(&canon, flip(t.side), 1.0 - t.price, t.quantity, fwd_mid, &mut fills);
+                if self.resting_trade_is_stale(exchange_stale, local_stale) {
+                    self.audit_stale_trade(&canon, flip(t.side), 1.0 - t.price, t.quantity);
+                    self.count_book_stale_block(exchange_stale, local_stale, false);
+                } else {
+                    self.match_trade(
+                        &canon,
+                        flip(t.side),
+                        1.0 - t.price,
+                        t.quantity,
+                        fwd_mid,
+                        &mut fills,
+                    );
+                }
             }
         } else {
             // Direct: aggressor side / price as recorded.
             self.record_trade(&t.symbol, t.side, t.price, t.quantity, ts);
-            self.match_trade(&t.symbol, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+            let (exchange_stale, local_stale) = self.book_stale_reasons(&t.symbol, ts);
+            if self.resting_trade_is_stale(exchange_stale, local_stale) {
+                self.audit_stale_trade(&t.symbol, t.side, t.price, t.quantity);
+                self.count_book_stale_block(exchange_stale, local_stale, false);
+            } else {
+                self.match_trade(&t.symbol, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+            }
             // Cross-outcome mirror: flip side, 1 − price on the complement token.
             if let Some(comp) = self.books.complement(&t.symbol).cloned() {
                 self.record_trade(&comp, flip(t.side), 1.0 - t.price, t.quantity, ts);
-                self.match_trade(&comp, flip(t.side), 1.0 - t.price, t.quantity, fwd_mid.map(|m| 1.0 - m), &mut fills);
+                let (exchange_stale, local_stale) = self.book_stale_reasons(&comp, ts);
+                if self.resting_trade_is_stale(exchange_stale, local_stale) {
+                    self.audit_stale_trade(&comp, flip(t.side), 1.0 - t.price, t.quantity);
+                    self.count_book_stale_block(exchange_stale, local_stale, false);
+                } else {
+                    self.match_trade(
+                        &comp,
+                        flip(t.side),
+                        1.0 - t.price,
+                        t.quantity,
+                        fwd_mid.map(|m| 1.0 - m),
+                        &mut fills,
+                    );
+                }
             }
         }
         self.apply_maker_fills(fills, ts)
@@ -771,6 +1094,8 @@ impl SimExchangeV2 {
         let trade_ticks = price_to_ticks(price, tick);
         let vn = self.fill_markout_vn;
         let mut haircuts = 0u64;
+        let audit_slug = self.event_slug_by_token.get(symbol).cloned();
+        let audits = &mut self.fill_audit;
         for (coid, o) in self.orders.iter_mut() {
             // Match in the canonical frame: `symbol`/`aggressor_side`/`price`
             // are canonical (the caller already folded the trade). Fills settle
@@ -786,7 +1111,20 @@ impl SimExchangeV2 {
             if !matches {
                 continue;
             }
-            let over = qty - o.q_ahead;
+            let q_before = o.q_ahead;
+            let over = qty - q_before;
+            if let Some(slug) = audit_slug.as_ref() {
+                let key = (slug.clone(), o.request.instance_id.clone());
+                let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                    slug: key.0,
+                    iid: key.1,
+                    ..FillAuditRow::default()
+                });
+                a.maker_trade_matches += 1;
+                a.maker_trade_qty += qty;
+                a.maker_queue_drained_qty += qty.min(q_before);
+                a.maker_candidate_qty += over.max(0.0).min(o.remaining);
+            }
             o.q_ahead = (o.q_ahead - qty).max(0.0);
             o.traded_since_sync += qty;
             if over <= EPS {
@@ -846,6 +1184,9 @@ impl SimExchangeV2 {
                 Side::Sell => self.wallets.settle_sell(&f.iid, &f.token, f.fill, f.price * f.fill),
             }
             self.maker_fills += 1;
+            if let Some(a) = self.audit_row_mut(&f.token, &f.iid) {
+                a.maker_fill_qty += f.fill;
+            }
             // Diagnostic: fill-age = how long after placement this maker order
             // filled. High age ⇒ orders linger before filling (race leaking).
             if let Some(placed) = self.orders.get(&f.coid).map(|o| o.placed_ns) {
@@ -924,6 +1265,16 @@ impl SimExchangeV2 {
             if bo.clob_token_ids.len() == 2 {
                 let a = &bo.clob_token_ids[0];
                 let b = &bo.clob_token_ids[1];
+                self.event_slug_by_token.insert(a.clone(), bo.slug.clone());
+                self.event_slug_by_token.insert(b.clone(), bo.slug.clone());
+                for iid in self.split_by_iid.keys() {
+                    let key = (bo.slug.clone(), iid.clone());
+                    self.fill_audit.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                        slug: key.0,
+                        iid: key.1,
+                        ..FillAuditRow::default()
+                    });
+                }
                 if self.fold_outcomes {
                     // Single canonical frame: canonical = clob_token_ids[0],
                     // fold [1] → [0]. Do NOT pair the books — folding maps the
@@ -1013,7 +1364,9 @@ impl SimExchangeV2 {
             self.tick.remove(t);
             self.fold_to.remove(t);
             self.fold_sibling.remove(t);
+            self.event_slug_by_token.remove(t);
             self.last_book_ts.remove(t);
+            self.last_book_local_ts.remove(t);
             self.recent_trades.remove(t);
             self.books.retire_token(t);
             self.wallets.retire_token(t);
@@ -1090,8 +1443,12 @@ impl SimExchangeV2 {
     /// now? (marketable & not post-only). Used to decide whether to defer the
     /// match to the midpoint of the matching window. Post-only / non-marketable
     /// orders take the immediate rest/reject path in `submit_order`.
-    pub fn would_cross(&self, o: &OrderRequest) -> bool {
+    pub fn would_cross(&self, o: &OrderRequest, now_ns: u64) -> bool {
         if o.post_only {
+            return false;
+        }
+        let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
+        if exchange_stale || local_stale {
             return false;
         }
         // Cross-check in the canonical matching frame (folded down → up mirror).
@@ -1112,13 +1469,38 @@ impl SimExchangeV2 {
 
     // ── order entry ──────────────────────────────────────────────
     pub fn submit_order(&mut self, o: &OrderRequest, now_ns: u64) -> OrderUpdate {
+        if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+            a.place_orders += 1;
+            a.place_qty += o.quantity;
+        }
         // Cancel-on-arrival: a cancel for this coid already arrived (it raced
         // ahead of this place ack). Honour the strategy's cancel intent now —
         // return Cancelled WITHOUT booking the order (no rest, no fill), so it
         // never becomes a forgotten orphan resting to settlement. See
         // `pending_cancels`.
         if self.pending_cancels.remove(&o.client_order_id).is_some() {
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.cancel_before_place_orders += 1;
+                a.cancel_before_place_qty += o.quantity;
+            }
             return self.cancelled(o, now_ns, o.quantity);
+        }
+        if o.post_only {
+            self.post_only_seen += 1;
+        }
+        let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
+        if exchange_stale || local_stale {
+            self.count_book_stale_block(exchange_stale, local_stale, true);
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.stale_order_blocks += 1;
+                a.stale_order_qty += o.quantity;
+            }
+            if matches!(o.order_type, OrderType::Market | OrderType::Fak | OrderType::Fok)
+                || o.price.is_none()
+            {
+                return self.cancelled(o, now_ns, o.quantity);
+            }
+            return self.rest_stale(o, now_ns, o.quantity);
         }
         // Match in the CANONICAL frame (folded down → up mirror): the down book
         // is empty under folding, so the ladder / marketable check / sweep must
@@ -1140,12 +1522,13 @@ impl SimExchangeV2 {
             (None, _, _) => false,
         };
 
-        if o.post_only {
-            self.post_only_seen += 1;
-        }
         if marketable && o.post_only {
             self.rejects += 1;
             self.post_only_rejects += 1;
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.post_only_rejects += 1;
+                a.post_only_reject_qty += o.quantity;
+            }
             return self.rejected(o, now_ns, "invalid post-only order: order crosses book");
         }
         if marketable {
@@ -1171,54 +1554,136 @@ impl SimExchangeV2 {
         now_ns: u64,
     ) -> OrderUpdate {
         let folded = msym != o.symbol;
+        let now_available = self.books.available_volume(msym, mside == Side::Buy, lim);
+        if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+            a.taker_candidates += 1;
+            a.taker_requested_qty += o.quantity;
+            a.taker_available_qty += now_available.min(o.quantity);
+        }
         // Distribution sample: fillable volume within our limit at the match
         // moment (what this taker order can actually hit on the current book).
-        self.taker_avail
-            .push(self.books.available_volume(msym, mside == Side::Buy, lim) as f32);
+        self.taker_avail.push(now_available as f32);
         let mut filled = 0.0;
         let mut notional = 0.0; // canonical-frame notional
         let mut fee = 0.0;
-        // Taker race: if the fillable volume within our limit RECEDES in the next
-        // snapshot, liquidity is being pulled away (adverse) — the taker can only
-        // hit the blended volume; the unfilled remainder misses (rests/cancels).
         let mut rem = o.quantity;
-        if self.taker_race_rate > 0.0 {
+        if self.taker_overlap_dedup
+            && self.taker_race_rate > 0.0
+            && self.taker_comp_rate > 0.0
+        {
+            // Race and competition can observe the same touch consumption via
+            // different feeds. Compute both against the ORIGINAL request. If
+            // both independently suppress this order, assume full overlap and
+            // retain only the smaller suppression (the larger cap). If only one
+            // fires, keep it: a healed trade burst can be competition-only, and
+            // a book pull can be race-only.
+            let requested = o.quantity;
             let is_buy = mside == Side::Buy;
+            let mut race_cap = requested;
             if let Some(next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
-                let now_avail = self.books.available_volume(msym, is_buy, lim);
-                if next_avail < now_avail {
+                if next_avail < now_available {
                     let eff = self.taker_race_rate * next_avail
-                        + (1.0 - self.taker_race_rate) * now_avail;
-                    if eff.max(0.0) < rem {
+                        + (1.0 - self.taker_race_rate) * now_available;
+                    race_cap = requested.min(eff.max(0.0));
+                    if race_cap + EPS < requested {
                         self.taker_race_capped += 1;
-                        if eff.max(0.0) <= EPS {
-                            // Capped to ~0: full miss (Limit→rest / FAK→cancel).
+                        if race_cap <= EPS {
                             self.taker_race_capped_zero += 1;
                         }
                     }
-                    rem = rem.min(eff.max(0.0));
                 }
             }
-        }
-        // Trade-flow taker competition (physical replacement for capture_rate):
-        // same-direction takers that traded the touch in our in-flight window
-        // beat us to the engine and consumed that liquidity. We fill only the
-        // overflow `(now_avail − rate·competing_vol)`. Trades reveal burst
-        // competition the book heals between snapshots (invisible to the race).
-        if self.taker_comp_rate > 0.0 {
-            let is_buy = mside == Side::Buy;
-            let now_avail = self.books.available_volume(msym, is_buy, lim);
+
             let comp = self.taker_competition_volume(msym, mside, lim, now_ns);
             self.taker_comp_vol_sum += comp;
             self.taker_comp_n += 1;
-            let eff = (now_avail - self.taker_comp_rate * comp).max(0.0);
-            if eff < rem {
+            let comp_cap = requested.min(
+                (now_available - self.taker_comp_rate * comp).max(0.0),
+            );
+            if comp_cap + EPS < requested {
                 self.taker_comp_capped += 1;
-                if eff <= EPS {
+                if comp_cap <= EPS {
                     self.taker_comp_capped_zero += 1;
                 }
             }
-            rem = rem.min(eff);
+
+            let race_suppressed = (requested - race_cap).max(0.0);
+            let comp_suppressed = (requested - comp_cap).max(0.0);
+            let (final_cap, race_attribution, comp_attribution) =
+                if race_suppressed > EPS && comp_suppressed > EPS {
+                    if race_cap >= comp_cap {
+                        (race_cap, race_suppressed, 0.0)
+                    } else {
+                        (comp_cap, 0.0, comp_suppressed)
+                    }
+                } else {
+                    (
+                        race_cap.min(comp_cap),
+                        race_suppressed,
+                        comp_suppressed,
+                    )
+                };
+            rem = final_cap;
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.taker_race_suppressed_qty += race_attribution;
+                a.taker_comp_suppressed_qty += comp_attribution;
+            }
+        } else {
+            // Taker race: if the fillable volume within our limit RECEDES in the next
+            // snapshot, liquidity is being pulled away (adverse) — the taker can only
+            // hit the blended volume; the unfilled remainder misses (rests/cancels).
+            if self.taker_race_rate > 0.0 {
+                let before = rem;
+                let is_buy = mside == Side::Buy;
+                if let Some(next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+                    let now_avail = self.books.available_volume(msym, is_buy, lim);
+                    if next_avail < now_avail {
+                        let eff = self.taker_race_rate * next_avail
+                            + (1.0 - self.taker_race_rate) * now_avail;
+                        if eff.max(0.0) < rem {
+                            self.taker_race_capped += 1;
+                            if eff.max(0.0) <= EPS {
+                                // Capped to ~0: full miss (Limit→rest / FAK→cancel).
+                                self.taker_race_capped_zero += 1;
+                            }
+                        }
+                        rem = rem.min(eff.max(0.0));
+                    }
+                }
+                let suppressed = (before - rem).max(0.0);
+                if suppressed > EPS {
+                    if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                        a.taker_race_suppressed_qty += suppressed;
+                    }
+                }
+            }
+            // Trade-flow taker competition (physical replacement for capture_rate):
+            // same-direction takers that traded the touch in our in-flight window
+            // beat us to the engine and consumed that liquidity. We fill only the
+            // overflow `(now_avail − rate·competing_vol)`. Trades reveal burst
+            // competition the book heals between snapshots (invisible to the race).
+            if self.taker_comp_rate > 0.0 {
+                let before = rem;
+                let is_buy = mside == Side::Buy;
+                let now_avail = self.books.available_volume(msym, is_buy, lim);
+                let comp = self.taker_competition_volume(msym, mside, lim, now_ns);
+                self.taker_comp_vol_sum += comp;
+                self.taker_comp_n += 1;
+                let eff = (now_avail - self.taker_comp_rate * comp).max(0.0);
+                if eff < rem {
+                    self.taker_comp_capped += 1;
+                    if eff <= EPS {
+                        self.taker_comp_capped_zero += 1;
+                    }
+                }
+                rem = rem.min(eff);
+                let suppressed = (before - rem).max(0.0);
+                if suppressed > EPS {
+                    if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                        a.taker_comp_suppressed_qty += suppressed;
+                    }
+                }
+            }
         }
         for l in ladder {
             if rem <= EPS {
@@ -1266,9 +1731,15 @@ impl SimExchangeV2 {
         }
 
         if matches!(o.order_type, OrderType::Fok) && filled + EPS < o.quantity {
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.taker_zero_fills += 1;
+            }
             return self.cancelled(o, now_ns, o.quantity);
         }
         if filled <= EPS {
+            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+                a.taker_zero_fills += 1;
+            }
             if matches!(o.order_type, OrderType::Limit | OrderType::LimitMaker) {
                 return self.rest(o, now_ns, o.quantity);
             }
@@ -1281,10 +1752,13 @@ impl SimExchangeV2 {
             Side::Sell => self.wallets.settle_sell(iid, &o.symbol, filled, notional_orig - fee),
         }
         self.taker_fills += 1;
+        if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+            a.taker_fill_qty += filled;
+        }
 
         let remainder = (o.quantity - filled).max(0.0);
         if remainder > EPS && matches!(o.order_type, OrderType::Limit) {
-            self.insert_resting(o, remainder, now_ns);
+            self.insert_resting(o, remainder, now_ns, false);
         }
         let taker_tid = format!("simv2-taker-{}", o.client_order_id);
         self.record_recent_fill(&o.client_order_id, taker_tid.clone(), filled, avg, o.side, &o.symbol, now_ns);
@@ -1309,7 +1783,13 @@ impl SimExchangeV2 {
 
     /// Insert a resting maker order, initialising its queue position to the
     /// visible merged depth at its level (§5).
-    fn insert_resting(&mut self, o: &OrderRequest, remaining: f64, now_ns: u64) {
+    fn insert_resting(
+        &mut self,
+        o: &OrderRequest,
+        remaining: f64,
+        now_ns: u64,
+        await_fresh_book: bool,
+    ) {
         let price = o.request_price();
         // Canonical matching frame (folded down → up mirror). q_ahead / level /
         // race peek run against the single canonical book; the original `o` is
@@ -1329,7 +1809,7 @@ impl SimExchangeV2 {
         if self.maker_race_rate > 0.0 {
             self.maker_race_placements += 1;
         }
-        let q_ahead = match self.books.level_depth_next(&msym, mside, match_price, tick) {
+        let race_q_ahead = match self.books.level_depth_next(&msym, mside, match_price, tick) {
             Some(next_depth) if self.maker_race_rate > 0.0 && next_depth > now_depth => {
                 let blended =
                     self.maker_race_rate * next_depth + (1.0 - self.maker_race_rate) * now_depth;
@@ -1339,6 +1819,7 @@ impl SimExchangeV2 {
             }
             _ => now_depth,
         };
+        let maker_race_added_q = (race_q_ahead - now_depth).max(0.0);
         // Data-truncation fallback: the recorded book is only 5 levels deep, so a
         // quote reads level_depth = 0 (empty queue) even though live has real
         // resting size + competition there. Two cases:
@@ -1347,12 +1828,20 @@ impl SimExchangeV2 {
         //         the recorded qty band);
         //   (2) a gap INSIDE the window (inside the spread / between levels)
         //       → keep the best-level default: own side, else opposite side.
-        let q_ahead = if q_ahead < EPS {
-            if let Some(extra) = self
+        let q_ahead = if race_q_ahead < EPS {
+            if let Some((extra, effective_decay)) = self
                 .books
-                .extrapolate_level_depth(&msym, mside, match_price, tick)
+                .extrapolate_level_depth_with_decay(&msym, mside, match_price, tick)
             {
                 self.q0_extrapolated += 1;
+                if effective_decay > 0.0 {
+                    self.dynamic_deep_queue_n += 1;
+                    self.dynamic_deep_queue_decay_sum += effective_decay;
+                    self.dynamic_deep_queue_decay_min =
+                        self.dynamic_deep_queue_decay_min.min(effective_decay);
+                    self.dynamic_deep_queue_decay_max =
+                        self.dynamic_deep_queue_decay_max.max(effective_decay);
+                }
                 extra
             } else {
                 self.q0_bestrule += 1;
@@ -1369,7 +1858,7 @@ impl SimExchangeV2 {
                 if same > EPS { same } else { opp }
             }
         } else {
-            q_ahead
+            race_q_ahead
         };
         // Distribution sample: this resting (maker) order's initial queue length.
         self.maker_q_init.push(q_ahead as f32);
@@ -1406,6 +1895,12 @@ impl SimExchangeV2 {
         }
         let locked = if o.side == Side::Buy { price * remaining } else { 0.0 };
         let mid0 = self.books.eff_mid(&msym);
+        if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
+            a.maker_rests += 1;
+            a.maker_rest_qty += remaining;
+            a.maker_q_init_sum += q_ahead;
+            a.maker_race_added_q += maker_race_added_q;
+        }
         self.orders.insert(
             o.client_order_id.clone(),
             RestingOrder {
@@ -1421,11 +1916,26 @@ impl SimExchangeV2 {
                 mid_at_sync: mid0,
                 traded_since_sync: 0.0,
                 placed_ns: now_ns,
+                await_fresh_book,
             },
         );
     }
 
     fn rest(&mut self, o: &OrderRequest, now_ns: u64, remaining: f64) -> OrderUpdate {
+        self.rest_inner(o, now_ns, remaining, false)
+    }
+
+    fn rest_stale(&mut self, o: &OrderRequest, now_ns: u64, remaining: f64) -> OrderUpdate {
+        self.rest_inner(o, now_ns, remaining, true)
+    }
+
+    fn rest_inner(
+        &mut self,
+        o: &OrderRequest,
+        now_ns: u64,
+        remaining: f64,
+        await_fresh_book: bool,
+    ) -> OrderUpdate {
         let price = o.request_price();
         // Balance gate on resting placement (only when seeded).
         let iid = &o.instance_id;
@@ -1449,7 +1959,7 @@ impl SimExchangeV2 {
                 }
             }
         }
-        self.insert_resting(o, remaining, now_ns);
+        self.insert_resting(o, remaining, now_ns, await_fresh_book);
         OrderUpdate {
             client_order_id: o.client_order_id.clone(),
             exchange: o.exchange,
@@ -1697,13 +2207,23 @@ mod tests {
     }
 
     fn book_ts(symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>, ts: u64) -> OrderBookSnapshot {
+        book_dual_ts(symbol, bids, asks, ts, ts)
+    }
+
+    fn book_dual_ts(
+        symbol: &str,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+        exchange_ts: u64,
+        local_ts: u64,
+    ) -> OrderBookSnapshot {
         OrderBookSnapshot {
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),
             bids: bids.into_iter().map(|(p, q)| PriceLevel { price: p, quantity: q }).collect(),
             asks: asks.into_iter().map(|(p, q)| PriceLevel { price: p, quantity: q }).collect(),
-            exchange_timestamp_ns: ts,
-            local_timestamp_ns: ts,
+            exchange_timestamp_ns: exchange_ts,
+            local_timestamp_ns: local_ts,
         }
     }
 
@@ -1726,14 +2246,18 @@ mod tests {
     }
 
     fn trade(symbol: &str, side: Side, price: f64, qty: f64) -> TradeTick {
+        trade_ts(symbol, side, price, qty, 100)
+    }
+
+    fn trade_ts(symbol: &str, side: Side, price: f64, qty: f64, ts: u64) -> TradeTick {
         TradeTick {
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),
             price,
             quantity: qty,
             side,
-            exchange_timestamp_ns: 100,
-            local_timestamp_ns: 100,
+            exchange_timestamp_ns: ts,
+            local_timestamp_ns: ts,
         }
     }
 
@@ -1760,6 +2284,263 @@ mod tests {
         let u = c.submit_order(&order("a", "up", Side::Buy, 0.61, 10.0, false, OrderType::Limit), 1);
         assert_eq!(u.status, OrderStatus::Filled);
         assert!((u.avg_fill_price - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn disabled_book_stale_gate_preserves_old_book_taker_fill() {
+        let mut c = core();
+        c.configure_book_stale_gate(0);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.58, 100.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+        ));
+        let o = order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Limit);
+        assert!(c.would_cross(&o, 30_000_000_000));
+        let u = c.submit_order(&o, 30_000_000_000);
+        assert_eq!(u.status, OrderStatus::Filled);
+        assert_eq!(c.book_stale_order_blocks, 0);
+    }
+
+    #[test]
+    fn exchange_clock_stale_blocks_taker_while_local_clock_is_fresh() {
+        let mut c = core();
+        c.configure_book_stale_gate(2_000_000_000);
+        // The recorder received this snapshot recently, but its exchange
+        // timestamp stopped advancing three seconds ago.
+        let ob = book_dual_ts(
+            "up",
+            vec![(0.58, 100.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+            3_000_000_000,
+        );
+        c.on_orderbook(&ob);
+        c.on_local_orderbook(&ob, 3_000_000_000);
+        let o = order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Limit);
+        assert!(!c.would_cross(&o, 4_000_000_000));
+        let u = c.submit_order(&o, 4_000_000_000);
+        assert_eq!(u.status, OrderStatus::Accepted);
+        assert_eq!(u.filled_quantity, 0.0);
+        assert_eq!(c.book_stale_order_blocks, 1);
+        assert_eq!(c.book_stale_exchange_hits, 1);
+        assert_eq!(c.book_stale_local_hits, 0);
+    }
+
+    #[test]
+    fn local_clock_stale_blocks_fill_under_exchange_clock_skew() {
+        let mut c = core();
+        c.configure_book_stale_gate(2_000_000_000);
+        // A future/skewed exchange timestamp must not mask a silent local feed.
+        let ob = book_dual_ts(
+            "up",
+            vec![(0.58, 100.0)],
+            vec![(0.62, 80.0)],
+            3_500_000_000,
+            1_000_000_000,
+        );
+        c.on_orderbook(&ob);
+        c.on_local_orderbook(&ob, 1_000_000_000);
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Fak),
+            4_000_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Cancelled);
+        assert_eq!(u.filled_quantity, 0.0);
+        assert_eq!(c.book_stale_exchange_hits, 0);
+        assert_eq!(c.book_stale_local_hits, 1);
+    }
+
+    #[test]
+    fn stale_trade_cannot_fill_existing_maker() {
+        let mut c = core();
+        c.set_fold_outcomes(true);
+        c.configure_book_stale_gate(2_000_000_000);
+        let ob = book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+        );
+        c.on_orderbook(&ob);
+        c.on_local_orderbook(&ob, 1_000_000_000);
+        let u = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1_100_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Accepted);
+        let stale = c.on_trade_tick(&trade_ts(
+            "up",
+            Side::Sell,
+            0.60,
+            20.0,
+            4_000_000_000,
+        ));
+        assert!(stale.is_empty());
+        assert_eq!(c.book_stale_trade_blocks, 1);
+        assert!(c.orders.contains_key("m"));
+    }
+
+    #[test]
+    fn local_clock_only_stale_can_fill_existing_maker_when_configured() {
+        let mut c = core();
+        c.set_fold_outcomes(true);
+        c.configure_book_stale_gate(2_000_000_000);
+        c.configure_stale_resting_exchange_only(true);
+        // Exchange book is only 0.5s old at the trade, while the last local
+        // full-book receipt is 3s old. The already-resting exchange order is
+        // still eligible; new order admission would remain dual-clock gated.
+        let ob = book_dual_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            3_500_000_000,
+            1_000_000_000,
+        );
+        c.on_orderbook(&ob);
+        c.on_local_orderbook(&ob, 1_000_000_000);
+        let u = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1_100_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Accepted);
+        let fills = c.on_trade_tick(&trade_ts(
+            "up",
+            Side::Sell,
+            0.60,
+            20.0,
+            4_000_000_000,
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::Filled);
+        assert_eq!(c.book_stale_trade_blocks, 0);
+    }
+
+    #[test]
+    fn local_stale_book_through_cannot_fill_existing_maker() {
+        let mut c = core();
+        c.set_fold_outcomes(true);
+        c.configure_book_stale_gate(2_000_000_000);
+        c.configure_book_through(1.0);
+        let initial = book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+        );
+        c.on_orderbook(&initial);
+        c.on_local_orderbook(&initial, 1_000_000_000);
+        let u = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1_100_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Accepted);
+        // A small fresh trade confirms the price but does not drain q_ahead.
+        assert!(c
+            .on_trade_tick(&trade_ts(
+                "up",
+                Side::Sell,
+                0.60,
+                5.0,
+                1_200_000_000,
+            ))
+            .is_empty());
+        // Exchange book is fresh, but the strategy has received no full book
+        // for three seconds: book-through must not fill and its confirmation
+        // must not carry into the next fresh interval.
+        let through = book_ts(
+            "up",
+            vec![(0.58, 10.0)],
+            vec![(0.59, 100.0)],
+            4_000_000_000,
+        );
+        assert!(c.on_orderbook(&through).is_empty());
+        assert!(c.orders.contains_key("m"));
+        c.on_local_orderbook(&through, 4_000_000_000);
+        let next = book_ts(
+            "up",
+            vec![(0.58, 10.0)],
+            vec![(0.59, 100.0)],
+            4_100_000_000,
+        );
+        assert!(c.on_orderbook(&next).is_empty());
+        assert!(c.orders.contains_key("m"));
+    }
+
+    #[test]
+    fn stale_entry_rebases_behind_next_fresh_visible_queue() {
+        let mut c = core();
+        c.configure_book_stale_gate(2_000_000_000);
+        let initial = book_ts(
+            "up",
+            vec![(0.60, 50.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+        );
+        c.on_orderbook(&initial);
+        c.on_local_orderbook(&initial, 1_000_000_000);
+        let u = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            4_000_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Accepted);
+        assert!(c.orders.get("m").unwrap().await_fresh_book);
+
+        let fresh = book_ts(
+            "up",
+            vec![(0.60, 100.0)],
+            vec![(0.62, 80.0)],
+            5_000_000_000,
+        );
+        c.on_orderbook(&fresh);
+        assert!(c.orders.get("m").unwrap().await_fresh_book);
+        c.on_local_orderbook(&fresh, 5_000_000_000);
+        let resting = c.orders.get("m").unwrap();
+        assert!(!resting.await_fresh_book);
+        assert!((resting.q_ahead - 100.0).abs() < 1e-9);
+        assert_eq!(c.book_stale_rebases, 1);
+
+        assert!(c
+            .on_trade_tick(&trade_ts(
+                "up",
+                Side::Sell,
+                0.60,
+                90.0,
+                5_100_000_000,
+            ))
+            .is_empty());
+        let fills = c.on_trade_tick(&trade_ts(
+            "up",
+            Side::Sell,
+            0.60,
+            20.0,
+            5_200_000_000,
+        ));
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0].filled_quantity - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn server_book_cannot_refresh_local_clock_before_local_receipt() {
+        let mut c = core();
+        c.configure_book_stale_gate(2_000_000_000);
+        let future_local = book_dual_ts(
+            "up",
+            vec![(0.58, 100.0)],
+            vec![(0.62, 80.0)],
+            1_000_000_000,
+            10_000_000_000,
+        );
+        c.on_orderbook(&future_local);
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Fak),
+            1_500_000_000,
+        );
+        assert_eq!(u.status, OrderStatus::Cancelled);
+        assert_eq!(u.filled_quantity, 0.0);
+        assert_eq!(c.book_stale_exchange_hits, 0);
+        assert_eq!(c.book_stale_local_hits, 1);
     }
 
     #[test]
@@ -1882,6 +2663,113 @@ mod tests {
         assert!((u.filled_quantity - 5.0).abs() < 1e-6, "fill {} != 5", u.filled_quantity);
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
         assert_eq!(c.taker_comp_capped, 1);
+    }
+
+    #[test]
+    fn taker_overlap_dedup_applies_one_overlapping_cap() {
+        // Both feeds observe a liquidity loss: race says only 3 remain, while
+        // recent taker trades imply 5 remain. Historical composition takes the
+        // stricter min (=3); overlap de-dup applies one suppression (=5).
+        let mut historical = core();
+        historical.configure_race(0.0, 1.0);
+        historical.configure_taker_comp(1.0, 250_000_000);
+        historical.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
+        let comp = TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "up".into(),
+            price: 0.62,
+            quantity: 20.0,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1_000,
+            local_timestamp_ns: 1_000,
+        };
+        historical.on_trade_tick(&comp);
+        historical.set_next_book(
+            "up",
+            vec![],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 3.0,
+            }],
+        );
+        let old = historical.submit_order(
+            &order("old", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
+        assert!((old.filled_quantity - 3.0).abs() < 1e-6);
+
+        let mut dedup = core();
+        dedup.configure_race(0.0, 1.0);
+        dedup.configure_taker_comp(1.0, 250_000_000);
+        dedup.configure_taker_overlap_dedup(true);
+        dedup.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
+        dedup.on_trade_tick(&comp);
+        dedup.set_next_book(
+            "up",
+            vec![],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 3.0,
+            }],
+        );
+        let new = dedup.submit_order(
+            &order("new", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
+        assert!((new.filled_quantity - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn taker_overlap_dedup_keeps_non_overlapping_signals() {
+        // Competition-only observation: the future book does not recede.
+        let mut competition_only = core();
+        competition_only.configure_race(0.0, 1.0);
+        competition_only.configure_taker_comp(1.0, 250_000_000);
+        competition_only.configure_taker_overlap_dedup(true);
+        competition_only.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
+        let comp = TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "up".into(),
+            price: 0.62,
+            quantity: 20.0,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1_000,
+            local_timestamp_ns: 1_000,
+        };
+        competition_only.on_trade_tick(&comp);
+        competition_only.set_next_book(
+            "up",
+            vec![],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 25.0,
+            }],
+        );
+        let comp_fill = competition_only.submit_order(
+            &order("comp", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
+        assert!((comp_fill.filled_quantity - 5.0).abs() < 1e-6);
+
+        // Race-only observation: no recent competing trade exists.
+        let mut race_only = core();
+        race_only.configure_race(0.0, 1.0);
+        race_only.configure_taker_comp(1.0, 250_000_000);
+        race_only.configure_taker_overlap_dedup(true);
+        race_only.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
+        race_only.set_next_book(
+            "up",
+            vec![],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 3.0,
+            }],
+        );
+        let race_fill = race_only.submit_order(
+            &order("race", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
+        assert!((race_fill.filled_quantity - 3.0).abs() < 1e-6);
     }
 
     #[test]
@@ -2121,6 +3009,29 @@ mod tests {
         let f = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 45.0));
         assert_eq!(f.len(), 1);
         assert!((f[0].filled_quantity - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dynamic_ahead_frac_blends_fixed_override_to_queue_position() {
+        let remaining = |strength: f64| {
+            let mut c = core();
+            c.configure(Some(1.0), 2_000_000_000);
+            c.configure_dynamic_ahead_frac(strength);
+            c.on_orderbook(&book("up", vec![(0.60, 100.0)], vec![(0.62, 100.0)]));
+            let _ = c.submit_order(
+                &order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            );
+            // q_ahead 100→50 via trade. Then level 100→30 means 20 cancels.
+            assert!(c
+                .on_trade_tick(&trade("up", Side::Sell, 0.60, 50.0))
+                .is_empty());
+            c.on_orderbook(&book("up", vec![(0.60, 30.0)], vec![(0.62, 100.0)]));
+            c.orders.get("a").unwrap().q_ahead
+        };
+        assert!((remaining(0.0) - 30.0).abs() < 1e-9, "fixed af=1");
+        assert!((remaining(0.5) - 35.0).abs() < 1e-9, "half blend af=.75");
+        assert!((remaining(1.0) - 40.0).abs() < 1e-9, "dynamic af=.50");
     }
 
     #[test]

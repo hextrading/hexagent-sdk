@@ -69,6 +69,8 @@ pub struct BookSet {
     /// `q_edge · decay^(ticks beyond window)` (`1.0` = flat at the outermost
     /// depth, `<1` = geometric thinning).
     deep_queue_decay: f64,
+    dynamic_deep_queue_strength: f64,
+    dynamic_deep_queue_min_decay: f64,
     /// Per-token cached merged ladders (see [`LadderCache`]). Interior-mutable so
     /// the `&self` ladder queries can memoise; invalidated by `update` /
     /// `set_pair` / `set_folded` / `set_deep_queue_decay`. Does NOT depend on the
@@ -187,6 +189,11 @@ impl BookSet {
     pub fn set_deep_queue_decay(&mut self, d: f64) {
         self.deep_queue_decay = d.max(0.0);
         self.ladder_cache.get_mut().clear();
+    }
+
+    pub fn set_dynamic_deep_queue(&mut self, strength: f64, min_decay: f64) {
+        self.dynamic_deep_queue_strength = strength.clamp(0.0, 1.0);
+        self.dynamic_deep_queue_min_decay = min_decay.clamp(1e-6, 1.0);
     }
 
     /// Drop the cached merged ladders for `token` and its complement — the
@@ -388,6 +395,17 @@ impl BookSet {
     ///     distance and clamped to the recorded [min, max] qty band (so the
     ///     projection stays within observed depths and never goes ≤ 0).
     pub fn extrapolate_level_depth(&self, token: &str, side: Side, price: f64, tick: f64) -> Option<f64> {
+        self.extrapolate_level_depth_with_decay(token, side, price, tick)
+            .map(|(qty, _)| qty)
+    }
+
+    pub fn extrapolate_level_depth_with_decay(
+        &self,
+        token: &str,
+        side: Side,
+        price: f64,
+        tick: f64,
+    ) -> Option<(f64, f64)> {
         // Merged resting ladder on our side, grouped per tick (price→qty).
         let ladder = match side {
             Side::Sell => self.buy_ladder(token),  // asks, ascending
@@ -425,7 +443,26 @@ impl BookSet {
         // thinning per tick beyond the window. Needs only the edge level.
         if self.deep_queue_decay > 0.0 {
             let q_edge = levels.iter().find(|(t, _)| dist(*t) as f64 == edge_d).map(|(_, q)| *q)?;
-            return Some(q_edge * self.deep_queue_decay.powf(our_d - edge_d));
+            let mut ratios = Vec::new();
+            for pair in levels.windows(2) {
+                let d0 = dist(pair[0].0) as f64;
+                let d1 = dist(pair[1].0) as f64;
+                let gap = d1 - d0;
+                if gap > 0.0 && pair[0].1 > 0.0 && pair[1].1 > 0.0 {
+                    ratios.push((pair[1].1 / pair[0].1).powf(1.0 / gap));
+                }
+            }
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let local = ratios
+                .get(ratios.len() / 2)
+                .copied()
+                .unwrap_or(self.deep_queue_decay)
+                .clamp(self.dynamic_deep_queue_min_decay.max(1e-6), 1.0);
+            let strength = self.dynamic_deep_queue_strength.clamp(0.0, 1.0);
+            let effective = (self.deep_queue_decay
+                + strength * (local - self.deep_queue_decay))
+                .max(1e-6);
+            return Some((q_edge * effective.powf(our_d - edge_d), effective));
         }
         if levels.len() < 2 {
             return None;
@@ -443,7 +480,7 @@ impl BookSet {
         let est = a + b * our_d;
         let qmin = ys.iter().cloned().fold(f64::MAX, f64::min);
         let qmax = ys.iter().cloned().fold(0.0_f64, f64::max);
-        Some(est.clamp(qmin, qmax))
+        Some((est.clamp(qmin, qmax), 0.0))
     }
 }
 
@@ -501,5 +538,27 @@ mod tests {
         let ladder = bs.buy_ladder("up");
         assert_eq!(ladder.len(), 1);
         assert_eq!(bs.eff_best_ask("up"), Some(0.62));
+    }
+
+    #[test]
+    fn dynamic_deep_queue_uses_visible_per_tick_geometric_slope() {
+        let projected = |strength: f64| {
+            let mut bs = BookSet::new();
+            bs.set_deep_queue_decay(1.0);
+            bs.set_dynamic_deep_queue(strength, 0.5);
+            bs.update(
+                "up",
+                vec![lvl(0.60, 80.0)],
+                vec![lvl(0.62, 100.0), lvl(0.63, 50.0), lvl(0.64, 25.0)],
+            );
+            bs.extrapolate_level_depth_with_decay("up", Side::Sell, 0.65, 0.01)
+                .unwrap()
+        };
+        let fixed = projected(0.0);
+        let half = projected(0.5);
+        let dynamic = projected(1.0);
+        assert!((fixed.0 - 25.0).abs() < 1e-9 && (fixed.1 - 1.0).abs() < 1e-9);
+        assert!((half.0 - 18.75).abs() < 1e-9 && (half.1 - 0.75).abs() < 1e-9);
+        assert!((dynamic.0 - 12.5).abs() < 1e-9 && (dynamic.1 - 0.5).abs() < 1e-9);
     }
 }

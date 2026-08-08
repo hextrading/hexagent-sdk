@@ -16,17 +16,17 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use crate::config::{Config, RunMode};
+use crate::exchange::aster::AsterTrade;
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
-use crate::exchange::polymarket::{PolymarketMarket, PolymarketTrade};
-use crate::exchange::aster::AsterTrade;
 use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::lighter::LighterTrade;
+use crate::exchange::polymarket::{PolymarketMarket, PolymarketTrade};
 use crate::exchange::{ExchangeMarket, ExchangeTrade};
 use crate::recorder::{MarketRecorder, MarketReplayer};
 use crate::strategy::Strategy;
-use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 use crate::types::*;
+use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
 
@@ -168,11 +168,7 @@ fn preload_hist_bars(
         }
         warn!(
             "[Strategy] Failed to preload hist bars for {}/{} {} [{}..{})",
-            req.exchange,
-            req.symbol,
-            req.interval,
-            req.start_date_ns,
-            req.end_date_ns,
+            req.exchange, req.symbol, req.interval, req.start_date_ns, req.end_date_ns,
         );
         None
     })
@@ -245,10 +241,7 @@ fn is_routine_clob_resubscribe(reason: &str) -> bool {
     reason == "CLOB resubscribe requested"
 }
 
-fn forward_recorder_event(
-    recorder_tx: Option<&Sender<MarketEvent>>,
-    event: &MarketEvent,
-) {
+fn forward_recorder_event(recorder_tx: Option<&Sender<MarketEvent>>, event: &MarketEvent) {
     if let Some(tx) = recorder_tx {
         let _ = tx.send(event.clone());
     }
@@ -321,11 +314,22 @@ impl Engine {
 
     /// Backtest start timestamp (ns since epoch); 0 outside backtest mode.
     fn parse_backtest_start_ns(&self) -> u64 {
-        if self.config.general.mode != RunMode::Backtest { return 0; }
+        if self.config.general.mode != RunMode::Backtest {
+            return 0;
+        }
         chrono::DateTime::parse_from_rfc3339(&self.config.backtest.start_date)
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(&self.config.backtest.start_date, "%Y-%m-%dT%H:%M:%SZ")
-                .map(|ndt| ndt.and_utc().fixed_offset()))
-            .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_nanos_opt().unwrap_or(0) as u64)
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &self.config.backtest.start_date,
+                    "%Y-%m-%dT%H:%M:%SZ",
+                )
+                .map(|ndt| ndt.and_utc().fixed_offset())
+            })
+            .map(|dt| {
+                dt.with_timezone(&chrono::Utc)
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0) as u64
+            })
             .unwrap_or(0)
     }
 
@@ -366,7 +370,10 @@ impl Engine {
                 crate::os_tune::pin_background("recorder");
                 let mut recorder = match MarketRecorder::new(PathBuf::from(&output_dir)) {
                     Ok(r) => r,
-                    Err(e) => { error!("[Recorder] Failed to create: {}", e); return; }
+                    Err(e) => {
+                        error!("[Recorder] Failed to create: {}", e);
+                        return;
+                    }
                 };
                 let mut last_flush = std::time::Instant::now();
                 let flush_interval = std::time::Duration::from_secs(60);
@@ -385,13 +392,14 @@ impl Engine {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let mut next_checkpoint_unix_secs = (
-                    (now_secs / CHECKPOINT_INTERVAL_SECS) + 1
-                ) * CHECKPOINT_INTERVAL_SECS;
+                let mut next_checkpoint_unix_secs =
+                    ((now_secs / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
                 loop {
                     match recorder_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(event) => {
-                            if matches!(event, MarketEvent::Exit) { break; }
+                            if matches!(event, MarketEvent::Exit) {
+                                break;
+                            }
                             if let Err(e) = recorder.write_event(&event) {
                                 error!("[Recorder] Write error: {}", e);
                             }
@@ -413,16 +421,18 @@ impl Engine {
                         // Advance past the now-crossed boundary; if the
                         // bot was paused for > 5 min, skip past the
                         // backlog to avoid a checkpoint flood.
-                        next_checkpoint_unix_secs = (
-                            (cur / CHECKPOINT_INTERVAL_SECS) + 1
-                        ) * CHECKPOINT_INTERVAL_SECS;
+                        next_checkpoint_unix_secs =
+                            ((cur / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
                     }
                 }
                 info!("[Recorder] Flushing {} events...", recorder.event_count());
                 if let Err(e) = recorder.flush() {
                     error!("[Recorder] Flush error: {}", e);
                 }
-                info!("[Recorder] Finished: {} events written", recorder.event_count());
+                info!(
+                    "[Recorder] Finished: {} events written",
+                    recorder.event_count()
+                );
             })?;
         Ok((recorder_tx, handle))
     }
@@ -448,7 +458,10 @@ impl Engine {
         let mode = self.config.general.mode;
         let max_gap = self.config.general.live_max_data_gap_secs;
         if max_gap <= 0.0 {
-            info!("[Engine] {} data-freshness pre-flight DISABLED (live_max_data_gap_secs <= 0)", mode);
+            info!(
+                "[Engine] {} data-freshness pre-flight DISABLED (live_max_data_gap_secs <= 0)",
+                mode
+            );
             return Ok(());
         }
         // Same sources the prediction / apv2 warm-up replays. Empty ⇒ no
@@ -478,13 +491,18 @@ impl Engine {
                 .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| "?".to_string())
         };
-        let dirs_label = data_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
+        let dirs_label = data_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut worst: Option<(String, String, f64)> = None;
         for (exchange, symbol) in &sources {
             let mut effective: Option<u64> = None; // first in-window dir → warm-up uses it
             let mut freshest: Option<u64> = None; // newest across all dirs (diagnostic / fallback)
             for dir in &data_dirs {
-                if let Some(latest) = crate::recorder::latest_recorded_ts_ns(dir, exchange, symbol) {
+                if let Some(latest) = crate::recorder::latest_recorded_ts_ns(dir, exchange, symbol)
+                {
                     if freshest.map(|f| latest > f).unwrap_or(true) {
                         freshest = Some(latest);
                     }
@@ -498,7 +516,10 @@ impl Engine {
                     let gap = now_ns.saturating_sub(latest_ns) as f64 / 1e9;
                     info!(
                         "[Engine] data-freshness {}/{}: latest={} gap={:.1}h",
-                        exchange, symbol, fmt_ts(latest_ns), gap / 3600.0
+                        exchange,
+                        symbol,
+                        fmt_ts(latest_ns),
+                        gap / 3600.0
                     );
                     gap
                 }
@@ -510,7 +531,11 @@ impl Engine {
                     f64::INFINITY
                 }
             };
-            if worst.as_ref().map(|(_, _, g)| gap_secs > *g).unwrap_or(true) {
+            if worst
+                .as_ref()
+                .map(|(_, _, g)| gap_secs > *g)
+                .unwrap_or(true)
+            {
                 worst = Some((exchange.clone(), symbol.clone(), gap_secs));
             }
         }
@@ -529,11 +554,19 @@ impl Engine {
                      prediction_wait_for_model). Record fresh data up to now \
                      (mode = \"record\") before starting, or raise / disable \
                      live_max_data_gap_secs.",
-                    mode, ex, sym, gap_label, max_gap / 3600.0,
+                    mode,
+                    ex,
+                    sym,
+                    gap_label,
+                    max_gap / 3600.0,
                 ));
             }
         }
-        info!("[Engine] {} data-freshness pre-flight OK (limit {:.1}h)", mode, max_gap / 3600.0);
+        info!(
+            "[Engine] {} data-freshness pre-flight OK (limit {:.1}h)",
+            mode,
+            max_gap / 3600.0
+        );
         Ok(())
     }
 
@@ -634,27 +667,37 @@ impl Engine {
         let stale_threshold_handles: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>> = {
             let mut m = HashMap::new();
             for sc in &self.config.strategies {
-                if !sc.enabled || !self.registry.capabilities(&sc.name).needs_rtt_probe { continue; }
-                if sc.instance_id.is_empty() { continue; }
+                if !sc.enabled || !self.registry.capabilities(&sc.name).needs_rtt_probe {
+                    continue;
+                }
+                if sc.instance_id.is_empty() {
+                    continue;
+                }
                 let iid = sc.instance_id.clone();
-                let init_ms: u64 = sc.params.get("quote_interval_ms")
+                let init_ms: u64 = sc
+                    .params
+                    .get("quote_interval_ms")
                     .and_then(|v| v.as_integer())
                     .map(|qi| ((qi.max(1) as f64) * 1.5).round() as u64)
                     .unwrap_or(150);
-                m.insert(iid, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(init_ms)));
+                m.insert(
+                    iid,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(init_ms)),
+                );
             }
             m
         };
 
         let exec_handle = self.spawn_execution_thread_with_poly(
-            signal_rx, update_tx.clone(), poly_states.clone(),
+            signal_rx,
+            update_tx.clone(),
+            poly_states.clone(),
             stale_threshold_handles.clone(),
         );
         let user_feed_handle = self.spawn_hex_user_feed(update_tx.clone(), shutdown.clone());
         // Phase 2b: spawn one user_feed per polymarket instance.
-        let poly_feed_handles = self.spawn_poly_user_feeds(
-            update_tx, shutdown.clone(), &poly_states,
-        );
+        let poly_feed_handles =
+            self.spawn_poly_user_feeds(update_tx, shutdown.clone(), &poly_states);
         // Phase 2c: one heartbeat per instance.
         let heartbeat_handles = self.spawn_poly_heartbeats(shutdown.clone(), &poly_states);
 
@@ -683,17 +726,27 @@ impl Engine {
             let mut keys: Vec<&String> = poly_states.keys().collect();
             keys.sort();
             for id in keys {
-                let ps = match poly_states.get(id) { Some(s) => s.clone(), None => continue };
+                let ps = match poly_states.get(id) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
                 // Probe interval is per-strategy: each polymaker entry
                 // may set its own `adaptive_params_v2_probe_interval_secs`
                 // (legacy alias: `rtt_gate_probe_interval_secs`).
-                let interval_secs = self.config.strategies.iter()
+                let interval_secs = self
+                    .config
+                    .strategies
+                    .iter()
                     .find(|s| {
                         self.registry.capabilities(&s.name).needs_rtt_probe
                             && s.enabled
                             && s.instance_id == *id
                     })
-                    .and_then(|s| s.params.get("adaptive_params_v2_probe_interval_secs").or_else(|| s.params.get("rtt_gate_probe_interval_secs")))
+                    .and_then(|s| {
+                        s.params
+                            .get("adaptive_params_v2_probe_interval_secs")
+                            .or_else(|| s.params.get("rtt_gate_probe_interval_secs"))
+                    })
                     .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                     .unwrap_or(2.0)
                     .max(0.1);
@@ -730,7 +783,11 @@ impl Engine {
         }
 
         let strategy_handle = self.spawn_strategy_thread(
-            market_rx, signal_tx, update_rx, false, Some(recorder_tx),
+            market_rx,
+            signal_tx,
+            update_rx,
+            false,
+            Some(recorder_tx),
             probe_install_map,
             stale_threshold_handles.clone(),
             &poly_states,
@@ -740,13 +797,25 @@ impl Engine {
 
         let _ = strategy_handle.join();
         let _ = exec_handle.join();
-        if let Some(h) = user_feed_handle { let _ = h.join(); }
-        for h in poly_feed_handles { let _ = h.join(); }
-        for h in heartbeat_handles { let _ = h.join(); }
-        for h in probe_handles { let _ = h.join(); }
-        for h in feed_handles { let _ = h.join(); }
+        if let Some(h) = user_feed_handle {
+            let _ = h.join();
+        }
+        for h in poly_feed_handles {
+            let _ = h.join();
+        }
+        for h in heartbeat_handles {
+            let _ = h.join();
+        }
+        for h in probe_handles {
+            let _ = h.join();
+        }
+        for h in feed_handles {
+            let _ = h.join();
+        }
         let _ = recorder_handle.join();
-        if let Some(h) = latency_flush_handle { let _ = h.join(); }
+        if let Some(h) = latency_flush_handle {
+            let _ = h.join();
+        }
 
         // Final flush of any buffered latency rows recorded after the
         // flush thread's last tick. No-op when recording is off.
@@ -766,7 +835,10 @@ impl Engine {
         info!("══════════════════════════════════════");
         info!("  Starting PAPER TRADING mode");
         info!("  sim_v2 matching core for Polymarket orders");
-        info!("  sim_latency: {}ms (one-way, = sim_latency_p50_ms/2)", sim_latency_ms);
+        info!(
+            "  sim_latency: {}ms (one-way, = sim_latency_p50_ms/2)",
+            sim_latency_ms
+        );
         info!("══════════════════════════════════════");
 
         // Pre-flight: abort before spawning feeds if recorded spot warm-up
@@ -783,14 +855,18 @@ impl Engine {
         let shutdown_tx = market_tx.clone();
 
         // Live exchange feeds — Polymarket events also sent to sim_feed_tx for the sim_v2 core
-        let feed_handles = self.spawn_exchange_feeds_paper(
-            market_tx, Some(sim_feed_tx), shutdown.clone())?;
+        let feed_handles =
+            self.spawn_exchange_feeds_paper(market_tx, Some(sim_feed_tx), shutdown.clone())?;
 
         // Paper execution: sim_v2 matching core fed by live Polymarket data.
         // `sim_latency_ms` was computed above from sim_latency_p50_ms/2.
         let exec_handle = Self::spawn_paper_execution_thread(
-            signal_rx, sim_feed_rx, update_tx.clone(), sim_latency_ms,
-            self.config.backtest.clone());
+            signal_rx,
+            sim_feed_rx,
+            update_tx.clone(),
+            sim_latency_ms,
+            self.config.backtest.clone(),
+        );
 
         // Spawn recorder for market data persistence (paper data goes to separate dir)
         let (recorder_tx, recorder_handle) =
@@ -800,17 +876,25 @@ impl Engine {
         // Paper mode: no RTT-probe (no real CLOB to probe). No stale-
         // threshold handle either — paper exec doesn't apply the gate.
         let strategy_handle = self.spawn_strategy_thread(
-            market_rx, signal_tx, update_rx, false, Some(recorder_tx),
-            HashMap::new(), HashMap::new(),
+            market_rx,
+            signal_tx,
+            update_rx,
+            false,
+            Some(recorder_tx),
+            HashMap::new(),
+            HashMap::new(),
             // Paper mode has no live PM user feed (fills are sim-driven), so
             // the user-feed-health gates stay inactive (empty map).
-            &HashMap::new());
+            &HashMap::new(),
+        );
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
 
         let _ = strategy_handle.join();
         let _ = exec_handle.join();
-        for h in feed_handles { let _ = h.join(); }
+        for h in feed_handles {
+            let _ = h.join();
+        }
         let _ = recorder_handle.join();
 
         info!("  All threads stopped, exiting");
@@ -867,10 +951,24 @@ impl Engine {
             let mut keys: Vec<&String> = poly_states.keys().collect();
             keys.sort();
             for id in keys {
-                let ps = match poly_states.get(id) { Some(s) => s.clone(), None => continue };
-                let interval_secs = self.config.strategies.iter()
-                    .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe && s.enabled && s.instance_id == *id)
-                    .and_then(|s| s.params.get("adaptive_params_v2_probe_interval_secs").or_else(|| s.params.get("rtt_gate_probe_interval_secs")))
+                let ps = match poly_states.get(id) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let interval_secs = self
+                    .config
+                    .strategies
+                    .iter()
+                    .find(|s| {
+                        self.registry.capabilities(&s.name).needs_rtt_probe
+                            && s.enabled
+                            && s.instance_id == *id
+                    })
+                    .and_then(|s| {
+                        s.params
+                            .get("adaptive_params_v2_probe_interval_secs")
+                            .or_else(|| s.params.get("rtt_gate_probe_interval_secs"))
+                    })
                     .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                     .unwrap_or(2.0)
                     .max(0.1);
@@ -880,15 +978,23 @@ impl Engine {
                 let (tx, _rx) = crossbeam_channel::unbounded::<f64>();
                 let enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
                 match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe(
-                    ps, enable, tx, probe_active_token.clone(),
+                    ps,
+                    enable,
+                    tx,
+                    probe_active_token.clone(),
                     std::time::Duration::from_secs_f64(interval_secs),
-                    shutdown.clone(), true, id.clone(),
+                    shutdown.clone(),
+                    true,
+                    id.clone(),
                 ) {
                     Ok(h) => {
                         info!("[Engine] rtt_probe started for instance_id={} interval={:.1}s all_probe=true", id, interval_secs);
                         probe_handles.push(h);
                     }
-                    Err(e) => warn!("[Engine] rtt_probe spawn failed for instance_id={}: {}", id, e),
+                    Err(e) => warn!(
+                        "[Engine] rtt_probe spawn failed for instance_id={}: {}",
+                        id, e
+                    ),
                 }
             }
         }
@@ -912,7 +1018,11 @@ impl Engine {
         };
         // Handed to the recorder loop so it can keep the probe's target
         // token fresh from Instrument events.
-        let token_for_recorder = if all_probe { Some(probe_active_token.clone()) } else { None };
+        let token_for_recorder = if all_probe {
+            Some(probe_active_token.clone())
+        } else {
+            None
+        };
 
         // all_probe restricts probing to the FIRST configured polymarket
         // series only. The `[[exchanges]] polymarket` `symbols` list may
@@ -924,7 +1034,9 @@ impl Engine {
         // `None` (no polymarket configured) ⇒ no gating (probe-target
         // logic never runs anyway, since token_for_recorder is None).
         let first_poly_series: Option<String> = if all_probe {
-            self.config.exchanges.iter()
+            self.config
+                .exchanges
+                .iter()
                 .find(|e| e.name == "polymarket" && e.enabled)
                 .and_then(|e| e.symbols.first())
                 .cloned()
@@ -1081,12 +1193,18 @@ impl Engine {
         // Drop our copy of market_tx so channel closes when feeds exit
         drop(shutdown_tx);
         // Wait for feed threads to exit first (releases their market_tx clones)
-        for h in feed_handles { let _ = h.join(); }
+        for h in feed_handles {
+            let _ = h.join();
+        }
         // Now recorder sees channel closed or Exit message → flushes and exits
         let _ = recorder_handle.join();
         // All-probe teardown: stop the probes + latency flush, final flush.
-        for h in probe_handles { let _ = h.join(); }
-        if let Some(h) = latency_flush_handle { let _ = h.join(); }
+        for h in probe_handles {
+            let _ = h.join();
+        }
+        if let Some(h) = latency_flush_handle {
+            let _ = h.join();
+        }
         crate::latency_record::flush();
 
         info!("  All threads stopped, exiting");
@@ -1103,8 +1221,8 @@ impl Engine {
     /// (local_ts) against `sim.peek_when()` (unified wall clock: server market
     /// events + my-order arrivals + ack deliveries).
     fn run_backtest(&self) -> Result<()> {
-        use std::collections::BinaryHeap;
         use crate::exchange::sim_v2::{SimV2Config, Simulator};
+        use std::collections::BinaryHeap;
 
         let bt = &self.config.backtest;
 
@@ -1127,9 +1245,17 @@ impl Engine {
         };
         let unbounded_start = parse_dt("2020-01-01T00:00:00Z").unwrap();
         let unbounded_end = parse_dt("2099-12-31T23:59:59Z").unwrap();
-        let start_time = if bt.start_date.is_empty() { unbounded_start } else { parse_dt(&bt.start_date)? };
+        let start_time = if bt.start_date.is_empty() {
+            unbounded_start
+        } else {
+            parse_dt(&bt.start_date)?
+        };
         let end_time = if bt.end_date.is_empty() {
-            if bt.start_date.is_empty() { unbounded_end } else { parse_dt(&bt.start_date)? + chrono::TimeDelta::days(1) }
+            if bt.start_date.is_empty() {
+                unbounded_end
+            } else {
+                parse_dt(&bt.start_date)? + chrono::TimeDelta::days(1)
+            }
         } else {
             parse_dt(&bt.end_date)?
         };
@@ -1138,7 +1264,9 @@ impl Engine {
 
         let mut replay_sources: Vec<(String, String)> = Vec::new();
         for ex_cfg in &self.config.exchanges {
-            if !ex_cfg.enabled { continue; }
+            if !ex_cfg.enabled {
+                continue;
+            }
             for sym in &ex_cfg.symbols {
                 replay_sources.push((ex_cfg.name.clone(), sym.clone()));
             }
@@ -1155,28 +1283,46 @@ impl Engine {
         // ── Strat-lane replayers (local_ts order) — verbatim from v1 ──
         let mut strat_replayers: Vec<MarketReplayer> = Vec::new();
         for (exchange, symbol) in &replay_sources {
-            if symbol.starts_with("rtds:") || exchange == "binance_futures"
-                || exchange == "chainlink" || exchange == "pyth" { continue; }
+            if symbol.starts_with("rtds:")
+                || exchange == "binance_futures"
+                || exchange == "chainlink"
+                || exchange == "pyth"
+            {
+                continue;
+            }
             if let Ok(r) = MarketReplayer::new(&data_path, exchange, symbol, start_dt, end_dt) {
                 strat_replayers.push(r);
             }
         }
         for (_exchange, symbol) in &replay_sources {
-            let rtds_rest = match symbol.strip_prefix("rtds:") { Some(r) => r, None => continue };
+            let rtds_rest = match symbol.strip_prefix("rtds:") {
+                Some(r) => r,
+                None => continue,
+            };
             let parts: Vec<&str> = rtds_rest.splitn(2, ':').collect();
-            if parts.len() != 2 { continue; }
+            if parts.len() != 2 {
+                continue;
+            }
             let source = parts[0];
-            for filter in parts[1].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for filter in parts[1]
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 let sym_lower = filter.to_lowercase().replace('/', "-");
                 let rtds_path = format!("{}/{}", source, sym_lower);
                 let rtds_end_dt = end_dt + chrono::TimeDelta::seconds(10);
-                if let Ok(r) = MarketReplayer::new(&data_path, "rtds", &rtds_path, start_dt, rtds_end_dt) {
+                if let Ok(r) =
+                    MarketReplayer::new(&data_path, "rtds", &rtds_path, start_dt, rtds_end_dt)
+                {
                     strat_replayers.push(r);
                 }
             }
         }
         for (exchange, symbol) in &replay_sources {
-            if exchange != "chainlink" && exchange != "pyth" { continue; }
+            if exchange != "chainlink" && exchange != "pyth" {
+                continue;
+            }
             let sym_lower = symbol.to_lowercase().replace('/', "-");
             let early = if exchange == "chainlink" { 10 } else { 0 };
             let start = start_dt - chrono::TimeDelta::seconds(early);
@@ -1186,16 +1332,21 @@ impl Engine {
             }
         }
         for (exchange, symbol) in &replay_sources {
-            if exchange != "binance_futures" { continue; }
+            if exchange != "binance_futures" {
+                continue;
+            }
             let base_symbol = symbol.split('@').next().unwrap_or(symbol);
-            let sym_lower = if base_symbol.len() > 3 && base_symbol.to_uppercase().ends_with("USD") {
+            let sym_lower = if base_symbol.len() > 3 && base_symbol.to_uppercase().ends_with("USD")
+            {
                 let base = &base_symbol[..base_symbol.len() - 3];
                 format!("{}-usd", base.to_lowercase())
             } else {
                 base_symbol.to_lowercase()
             };
             let end = end_dt + chrono::TimeDelta::seconds(10);
-            if let Ok(r) = MarketReplayer::new(&data_path, "binance_futures", &sym_lower, start_dt, end) {
+            if let Ok(r) =
+                MarketReplayer::new(&data_path, "binance_futures", &sym_lower, start_dt, end)
+            {
                 strat_replayers.push(r);
             }
         }
@@ -1213,9 +1364,16 @@ impl Engine {
         let (bt_probe_tx, bt_probe_rx) = crossbeam_channel::unbounded::<f64>();
         let bt_probe_enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bt_probe_interval_ns: u64 = {
-            let secs = self.config.strategies.iter()
+            let secs = self
+                .config
+                .strategies
+                .iter()
                 .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe)
-                .and_then(|s| s.params.get("adaptive_params_v2_probe_interval_secs").or_else(|| s.params.get("rtt_gate_probe_interval_secs")))
+                .and_then(|s| {
+                    s.params
+                        .get("adaptive_params_v2_probe_interval_secs")
+                        .or_else(|| s.params.get("rtt_gate_probe_interval_secs"))
+                })
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(2.0)
                 .max(0.1);
@@ -1231,18 +1389,30 @@ impl Engine {
                 std::sync::Arc<std::sync::atomic::AtomicBool>,
                 crate::exchange::polymarket::rtt_probe::ActiveTokenHandle,
             ),
-        > = self.config.strategies.iter()
-            .find(|s| self.registry.capabilities(&s.name).needs_rtt_probe && s.enabled && !s.instance_id.is_empty())
+        > = self
+            .config
+            .strategies
+            .iter()
+            .find(|s| {
+                self.registry.capabilities(&s.name).needs_rtt_probe
+                    && s.enabled
+                    && !s.instance_id.is_empty()
+            })
             .map(|s| {
                 let mut m = HashMap::new();
-                m.insert(s.instance_id.clone(), (bt_probe_rx, bt_probe_enable.clone(), bt_probe_active_token));
+                m.insert(
+                    s.instance_id.clone(),
+                    (bt_probe_rx, bt_probe_enable.clone(), bt_probe_active_token),
+                );
                 m
             })
             .unwrap_or_else(HashMap::new);
 
         let mut strategies = self.build_strategies(bt_probe_map, HashMap::new(), &HashMap::new());
         let hist_data_dir = PathBuf::from(&data_dir);
-        for s in &mut strategies { s.on_init(); }
+        for s in &mut strategies {
+            s.on_init();
+        }
 
         // ── Hist bars (binance) — the lookback comes from the strategies
         // themselves via `load_hist_data(start_ns)`, the SAME path live uses
@@ -1250,7 +1420,11 @@ impl Engine {
         // BT and live train vol models on identically-sized windows.
         // Strategies that return no request fall back to the legacy 30-day
         // window. ──
-        let needs_hist_bars = self.config.strategies.iter().any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
+        let needs_hist_bars = self
+            .config
+            .strategies
+            .iter()
+            .any(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars);
         // Compact hist-bar storage (2026-07-26). Formerly every loaded bar
         // became a `(u64, MarketEvent::Bar)` (272 B enum + 2 heap Strings per
         // bar) in one big sorted Vec — a 29d 1s lookback + in-window tail is
@@ -1320,23 +1494,34 @@ impl Engine {
         // produced (push order was source order).
         let mut bar_rows: Vec<(u32, HistBarRow)> = Vec::new();
         if needs_hist_bars {
-            let hist_bar_interval: String = self.config.strategies.iter()
+            let hist_bar_interval: String = self
+                .config
+                .strategies
+                .iter()
                 .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
                 .and_then(|s| s.params.get("hist_bar_interval"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("1m")
                 .to_string();
             let fallback_lookback_ns = 30u64 * 24 * 3_600_000_000_000;
-            let strat_start_ns = strategies.iter()
+            let strat_start_ns = strategies
+                .iter()
                 .flat_map(|s| s.load_hist_data(start_ns))
                 .map(|r| r.start_date_ns)
                 .min();
-            let hist_start_ns = strat_start_ns
-                .unwrap_or_else(|| start_ns.saturating_sub(fallback_lookback_ns));
-            info!("[Replayer v2] hist-bar window: {:.2}d before backtest start ({})",
+            let hist_start_ns =
+                strat_start_ns.unwrap_or_else(|| start_ns.saturating_sub(fallback_lookback_ns));
+            info!(
+                "[Replayer v2] hist-bar window: {:.2}d before backtest start ({})",
                 (start_ns.saturating_sub(hist_start_ns)) as f64 / 86_400e9,
-                if strat_start_ns.is_some() { "strategy-declared" } else { "30d fallback" });
-            let bin_symbols: Vec<String> = replay_sources.iter()
+                if strat_start_ns.is_some() {
+                    "strategy-declared"
+                } else {
+                    "30d fallback"
+                }
+            );
+            let bin_symbols: Vec<String> = replay_sources
+                .iter()
                 .filter(|(exchange, _)| exchange == "binance")
                 .map(|(_, symbol)| symbol.clone())
                 .collect();
@@ -1381,7 +1566,9 @@ impl Engine {
                     // The event ts (former sort key) is close_time_ns.
                     if bar.close_time_ns < start_ns {
                         if single_source {
-                            for s in &mut strategies { s.on_hist_bar(bar); }
+                            for s in &mut strategies {
+                                s.on_hist_bar(bar);
+                            }
                             fed_hist = true;
                         } else {
                             pre.push(HistBarRow::from_bar(bar));
@@ -1393,8 +1580,10 @@ impl Engine {
                     }
                 });
                 if let Err(e) = res {
-                    error!("[Replayer v2] CRITICAL: load_hist_bars failed for binance/{} {}: {}",
-                        symbol, hist_bar_interval, e);
+                    error!(
+                        "[Replayer v2] CRITICAL: load_hist_bars failed for binance/{} {}: {}",
+                        symbol, hist_bar_interval, e
+                    );
                     std::process::exit(2);
                 }
                 pre_rows_by_src.push(pre);
@@ -1422,7 +1611,9 @@ impl Engine {
                 let templates = &bar_templates;
                 merge(pre_rows_by_src, &mut |src, row| {
                     let bar = row.to_bar(&templates[src as usize]);
-                    for s in &mut strategies { s.on_hist_bar(&bar); }
+                    for s in &mut strategies {
+                        s.on_hist_bar(&bar);
+                    }
                     fed_hist = true;
                 });
                 merge(in_rows_by_src, &mut |src, row| {
@@ -1434,7 +1625,9 @@ impl Engine {
                 // strategy's own fit-window-capped resample cache, so BT (a
                 // 30-day prefetch) matches live (fit-window load) — out-of-
                 // window holes auto-drop and don't false-pause.
-                for s in &mut strategies { s.on_hist_data_loaded(start_ns); }
+                for s in &mut strategies {
+                    s.on_hist_data_loaded(start_ns);
+                }
             }
         }
         let mut bar_cursor: usize = 0;
@@ -1445,11 +1638,21 @@ impl Engine {
             if !warmup_sources.is_empty() && warmup_hours > 0.0 {
                 let hour_ns: u64 = 3600 * 1_000_000_000;
                 let warmup_end_ns = (start_ns / hour_ns) * hour_ns;
-                let warmup_end_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(warmup_end_ns as i64);
-                let warmup_start_dt = warmup_end_dt - chrono::TimeDelta::seconds((warmup_hours * 3600.0) as i64);
-                for s in &mut strategies { s.on_prediction_warmup_start(); }
+                let warmup_end_dt =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(warmup_end_ns as i64);
+                let warmup_start_dt =
+                    warmup_end_dt - chrono::TimeDelta::seconds((warmup_hours * 3600.0) as i64);
+                for s in &mut strategies {
+                    s.on_prediction_warmup_start();
+                }
                 for (exchange, symbol) in &warmup_sources {
-                    match crate::recorder::MarketReplayer::new(&data_path, exchange, symbol, warmup_start_dt, warmup_end_dt) {
+                    match crate::recorder::MarketReplayer::new(
+                        &data_path,
+                        exchange,
+                        symbol,
+                        warmup_start_dt,
+                        warmup_end_dt,
+                    ) {
                         Ok(mut replayer) => {
                             while let Ok(Some((_ts, event))) = replayer.next_event() {
                                 for strategy in &mut strategies {
@@ -1461,10 +1664,15 @@ impl Engine {
                                 }
                             }
                         }
-                        Err(e) => warn!("[Backtest v2] Warm-up: no data for {}/{}: {}", exchange, symbol, e),
+                        Err(e) => warn!(
+                            "[Backtest v2] Warm-up: no data for {}/{}: {}",
+                            exchange, symbol, e
+                        ),
                     }
                 }
-                for s in &mut strategies { s.on_prediction_warmup_end(start_ns); }
+                for s in &mut strategies {
+                    s.on_prediction_warmup_end(start_ns);
+                }
             }
         }
 
@@ -1480,51 +1688,88 @@ impl Engine {
             let aw_days = self.apv2_warmup_days();
             let (spot_sources, _) = self.prediction_warmup_sources();
             if aw_days > 0.0 && !spot_sources.is_empty() {
-                let aw_end_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(start_ns as i64);
-                let aw_start_dt = aw_end_dt - chrono::TimeDelta::seconds((aw_days * 86400.0) as i64);
+                let aw_end_dt =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(start_ns as i64);
+                let aw_start_dt =
+                    aw_end_dt - chrono::TimeDelta::seconds((aw_days * 86400.0) as i64);
                 // apv2 warm-up cache: strategies import their cached per-bucket
                 // baseline and narrow the raw replay to the uncached tail gap.
                 // (Live-only by default; a BT strategy returns aw_start ⇒ full
                 // replay ⇒ byte-identical baseline.)
                 let aw_start_ns = aw_start_dt.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
                 let aw_end_ns = aw_end_dt.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
-                let resume_ns = strategies.iter_mut()
+                let resume_ns = strategies
+                    .iter_mut()
                     .map(|s| s.apv2_warmup_resume_ns(aw_start_ns, aw_end_ns))
-                    .min().unwrap_or(aw_start_ns);
-                let replay_start_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
-                info!("[Backtest v2] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
-                    aw_days, aw_start_dt.format("%Y-%m-%d %H:%M"), aw_end_dt.format("%Y-%m-%d %H:%M"),
-                    replay_start_dt.format("%Y-%m-%d %H:%M"));
+                    .min()
+                    .unwrap_or(aw_start_ns);
+                let replay_start_dt =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
+                info!(
+                    "[Backtest v2] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
+                    aw_days,
+                    aw_start_dt.format("%Y-%m-%d %H:%M"),
+                    aw_end_dt.format("%Y-%m-%d %H:%M"),
+                    replay_start_dt.format("%Y-%m-%d %H:%M")
+                );
                 let mut replayers: Vec<crate::recorder::MarketReplayer> = Vec::new();
                 for (exchange, symbol) in &spot_sources {
-                    match crate::recorder::MarketReplayer::new(&data_path, exchange, symbol, replay_start_dt, aw_end_dt) {
+                    match crate::recorder::MarketReplayer::new(
+                        &data_path,
+                        exchange,
+                        symbol,
+                        replay_start_dt,
+                        aw_end_dt,
+                    ) {
                         Ok(r) => replayers.push(r),
-                        Err(e) => warn!("[Backtest v2] apv2 warm-up: no data for {}/{}: {}", exchange, symbol, e),
+                        Err(e) => warn!(
+                            "[Backtest v2] apv2 warm-up: no data for {}/{}: {}",
+                            exchange, symbol, e
+                        ),
                     }
                 }
                 // One buffered event per replayer; repeatedly emit the global
                 // minimum-timestamp event (merge by local_ts, same key the
                 // main replay uses) so apv2's wall-clock buckets see venues
                 // interleaved chronologically.
-                let mut peeked: Vec<Option<(u64, MarketEvent)>> =
-                    replayers.iter_mut().map(|r| r.next_event().ok().flatten()).collect();
+                let mut peeked: Vec<Option<(u64, MarketEvent)>> = replayers
+                    .iter_mut()
+                    .map(|r| r.next_event().ok().flatten())
+                    .collect();
                 let mut fed: u64 = 0;
                 loop {
-                    let best = peeked.iter().enumerate()
+                    let best = peeked
+                        .iter()
+                        .enumerate()
                         .filter_map(|(i, p)| p.as_ref().map(|(ts, _)| (i, *ts)))
                         .min_by_key(|&(_, ts)| ts);
-                    let Some((idx, _)) = best else { break; };
+                    let Some((idx, _)) = best else {
+                        break;
+                    };
                     let (_, event) = peeked[idx].take().unwrap();
                     match &event {
-                        MarketEvent::OrderBook(ob) => { for s in &mut strategies { s.on_apv2_warmup_orderbook(ob); } }
-                        MarketEvent::Trade(t) => { for s in &mut strategies { s.on_apv2_warmup_trade(t); } }
+                        MarketEvent::OrderBook(ob) => {
+                            for s in &mut strategies {
+                                s.on_apv2_warmup_orderbook(ob);
+                            }
+                        }
+                        MarketEvent::Trade(t) => {
+                            for s in &mut strategies {
+                                s.on_apv2_warmup_trade(t);
+                            }
+                        }
                         _ => {}
                     }
                     fed += 1;
                     peeked[idx] = replayers[idx].next_event().ok().flatten();
                 }
-                info!("[Backtest v2] apv2 warm-up complete: {} spot events fed", fed);
-                for s in &mut strategies { s.apv2_warmup_finalize_cache(); }
+                info!(
+                    "[Backtest v2] apv2 warm-up complete: {} spot events fed",
+                    fed
+                );
+                for s in &mut strategies {
+                    s.apv2_warmup_finalize_cache();
+                }
             }
         }
 
@@ -1535,8 +1780,15 @@ impl Engine {
         let mut sim_wallet_usdc_by_iid: HashMap<String, f64> = HashMap::new();
         let mut sim_split_by_iid: HashMap<String, f64> = HashMap::new();
         for s in &self.config.strategies {
-            if !s.enabled || !self.registry.capabilities(&s.name).needs_sim_wallet || s.instance_id.is_empty() { continue; }
-            let bal = s.params.get("init_balance")
+            if !s.enabled
+                || !self.registry.capabilities(&s.name).needs_sim_wallet
+                || s.instance_id.is_empty()
+            {
+                continue;
+            }
+            let bal = s
+                .params
+                .get("init_balance")
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(0.0);
             sim_wallet_usdc_by_iid.insert(s.instance_id.clone(), bal);
@@ -1545,7 +1797,8 @@ impl Engine {
             // as a fallback for unmigrated configs. Must match the same formula
             // used at the live/maintenance read site (search `split_hands`).
             let pf = |key: &str, default: f64| -> f64 {
-                s.params.get(key)
+                s.params
+                    .get(key)
                     .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                     .unwrap_or(default)
             };
@@ -1576,19 +1829,30 @@ impl Engine {
         // (`calibrated`) so the per-hour `HourlyEmpirical` profile can be
         // built below from `place_hourly` / `cancel_hourly`. ──
         const V2_CLIENT_TIMEOUT_DEFAULT_MS: u64 = 500;
-        let dflt_lat = (bt.sim_latency_p50_ms as f64, bt.sim_latency_p95_ms as f64, bt.sim_latency_p99_ms as f64);
+        let dflt_lat = (
+            bt.sim_latency_p50_ms as f64,
+            bt.sim_latency_p95_ms as f64,
+            bt.sim_latency_p99_ms as f64,
+        );
         // Calibrate only for the log/archive source (the directory source
         // carries its own per-sample RTT and skips the analytic fit).
         let calibrated: Option<crate::exchange::sim::latency::CalibratedParams> =
             if calib_from.is_empty() || is_record_dir {
                 None
             } else {
-                let paths: Vec<String> = bt.sim_latency_calibrate_from
-                    .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                let paths: Vec<String> = bt
+                    .sim_latency_calibrate_from
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 match crate::exchange::sim::latency::calibrate_from_logs(&paths) {
                     Ok(cal) => Some(cal),
                     Err(e) => {
-                        warn!("[Backtest v2] RTT calibration failed ({}): using static knobs", e);
+                        warn!(
+                            "[Backtest v2] RTT calibration failed ({}): using static knobs",
+                            e
+                        );
                         None
                     }
                 }
@@ -1613,13 +1877,24 @@ impl Engine {
                     (cal.place.p50_ms, cal.place.p95_ms, cal.place.p99_ms),
                     (cal.cancel.p50_ms, cal.cancel.p95_ms, cal.cancel.p99_ms),
                     cal.place.rho_lag1.unwrap_or(bt.sim_latency_correlation),
-                    cal.cross_corr_log_p99.unwrap_or(bt.sim_latency_cross_correlation),
+                    cal.cross_corr_log_p99
+                        .unwrap_or(bt.sim_latency_cross_correlation),
                     ct,
                 )
             }
-            None => (dflt_lat, dflt_lat, bt.sim_latency_correlation, bt.sim_latency_cross_correlation, bt.sim_client_timeout_ms),
+            None => (
+                dflt_lat,
+                dflt_lat,
+                bt.sim_latency_correlation,
+                bt.sim_latency_cross_correlation,
+                bt.sim_client_timeout_ms,
+            ),
         };
-        let ahead_frac = if bt.sim_v2_ahead_frac >= 0.0 { Some(bt.sim_v2_ahead_frac) } else { None };
+        let ahead_frac = if bt.sim_v2_ahead_frac >= 0.0 {
+            Some(bt.sim_v2_ahead_frac)
+        } else {
+            None
+        };
 
         // ── Record-replay profiles (sim_latency_calibrate_from = directory) ──
         // Load the latency-record CSVs into per-side RecordReplay profiles that
@@ -1635,6 +1910,7 @@ impl Engine {
         // quantiles (esp. the tail), so the pooled CDF + GPD-tail extrapolation
         // is the more reliable RTT model there.
         use crate::exchange::sim::latency_record_replay as rrl;
+        let mut dynamic_window_rtt_by_event: Option<std::collections::HashMap<u64, f64>> = None;
         let (place_profile, cancel_profile): (
             Option<crate::exchange::sim::latency::LatencyProfile>,
             Option<crate::exchange::sim::latency::LatencyProfile>,
@@ -1654,10 +1930,44 @@ impl Engine {
                         data.place.min_epoch_ms(), data.place.max_epoch_ms(), data.cancel.n(),
                         params.abs_tol_ms, params.tod_tol_secs, bucket_secs, params.fallback.as_str(), lat_rho, lat_cross,
                     );
+                    if bt.sim_v2_dynamic_taker_windows {
+                        let table = data.place.causal_rolling_event_quantile(
+                            300,
+                            bt.sim_v2_dynamic_window_rtt_lookback_events.max(1) as usize,
+                            bt.sim_v2_dynamic_window_rtt_quantile,
+                            bt.sim_v2_dynamic_window_rtt_cap_ms,
+                        );
+                        let (min_state, max_state) = table
+                            .values()
+                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+                                (lo.min(*value), hi.max(*value))
+                            });
+                        info!(
+                            "[Backtest v2] dynamic taker windows: {} causal event states, lookback={} events, event_q={:.2}, cap={:.0}ms, ref={:.3}ms, race_elasticity={:.3}, comp_elasticity={:.3}, multiplier=[{:.2},{:.2}], state_range=[{:.1},{:.1}]ms",
+                            table.len(), bt.sim_v2_dynamic_window_rtt_lookback_events,
+                            bt.sim_v2_dynamic_window_rtt_quantile,
+                            bt.sim_v2_dynamic_window_rtt_cap_ms,
+                            bt.sim_v2_dynamic_window_rtt_ref_ms,
+                            bt.sim_v2_dynamic_race_rtt_elasticity,
+                            bt.sim_v2_dynamic_comp_rtt_elasticity,
+                            bt.sim_v2_dynamic_window_min_mult,
+                            bt.sim_v2_dynamic_window_max_mult,
+                            min_state, max_state,
+                        );
+                        dynamic_window_rtt_by_event = Some(table);
+                    }
                     use crate::exchange::sim::latency::LatencyProfile::RecordReplay;
                     (
-                        Some(RecordReplay { records: data.place.clone(),  rho: lat_rho, params }),
-                        Some(RecordReplay { records: data.cancel.clone(), rho: lat_rho, params }),
+                        Some(RecordReplay {
+                            records: data.place.clone(),
+                            rho: lat_rho,
+                            params,
+                        }),
+                        Some(RecordReplay {
+                            records: data.cancel.clone(),
+                            rho: lat_rho,
+                            params,
+                        }),
                     )
                 }
                 Ok(data) => {
@@ -1666,7 +1976,11 @@ impl Engine {
                     (None, None)
                 }
                 Err(e) => {
-                    warn!("[Backtest v2] record-replay load {} failed ({}) → static knobs", dir.display(), e);
+                    warn!(
+                        "[Backtest v2] record-replay load {} failed ({}) → static knobs",
+                        dir.display(),
+                        e
+                    );
                     (None, None)
                 }
             }
@@ -1679,7 +1993,9 @@ impl Engine {
             // simulator falls back to the pooled empirical CDF from the scalar
             // anchors. Per-event override (sim_rtt_mode="exact") still applies
             // on top — it takes priority over the hourly base in the sampler.
-            use crate::exchange::sim::latency::{EmpiricalAnchors, HOURLY_MIN_HOURS, LatencyProfile, SidedParams};
+            use crate::exchange::sim::latency::{
+                EmpiricalAnchors, LatencyProfile, SidedParams, HOURLY_MIN_HOURS,
+            };
             let to_anchors = |s: &SidedParams| EmpiricalAnchors {
                 p50_ms: s.p50_ms,
                 p85_ms_override: s.p85_ms,
@@ -1688,8 +2004,10 @@ impl Engine {
                 p999_ms_override: s.p999_ms_override,
                 gpd_tail: s.gpd_tail,
             };
-            let build_hourly = |hourly: &[Option<SidedParams>; 24], pooled: &SidedParams, side: &str|
-              -> Option<LatencyProfile> {
+            let build_hourly = |hourly: &[Option<SidedParams>; 24],
+                                pooled: &SidedParams,
+                                side: &str|
+             -> Option<LatencyProfile> {
                 let n_pop = hourly.iter().filter(|h| h.is_some()).count();
                 if n_pop < HOURLY_MIN_HOURS {
                     info!("[Backtest v2] {} hourly: only {} populated UTC-hour bucket(s) (<{}) → pooled empirical CDF",
@@ -1713,34 +2031,50 @@ impl Engine {
         } else {
             (None, None)
         };
+        if bt.sim_v2_dynamic_taker_windows && !is_record_dir {
+            warn!("[Backtest v2] dynamic taker windows require sim_latency_calibrate_from to be a latency-record directory; using fixed windows");
+        }
 
         // ── Per-event RTT table (sim_rtt_mode="exact"): per-event live RTT
         // shape (+ intra-event early/late segments) + prev_event p60. None →
         // pooled CDF (predict mode). Used by the sim lane (latency anchors) and
         // the strat lane (gate prev_p override). ──
-        let per_event_rtt_table: Option<std::collections::HashMap<
-            u64, crate::exchange::sim::per_event_rtt::EventRttOverride>> =
-            if crate::exchange::sim::SimRttMode::from_str(&bt.sim_rtt_mode)
-                == crate::exchange::sim::SimRttMode::Exact
-                && !calib_from.is_empty()
-                && !is_record_dir
-            {
-                let paths: Vec<String> = bt.sim_latency_calibrate_from
-                    .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                match crate::exchange::sim::per_event_rtt::extract_per_event_rtt(&paths) {
-                    Ok(t) if !t.is_empty() => {
-                        let n_place = t.values().filter(|e| e.place_p50_ms.is_some()).count();
-                        let n_seg = t.values().filter(|e| e.has_segmented_place()).count();
-                        info!("[Backtest v2] per-event RTT (sim_rtt_mode=exact): {} events, {} with place quantiles, {} segmented",
+        let per_event_rtt_table: Option<
+            std::collections::HashMap<u64, crate::exchange::sim::per_event_rtt::EventRttOverride>,
+        > = if crate::exchange::sim::SimRttMode::from_str(&bt.sim_rtt_mode)
+            == crate::exchange::sim::SimRttMode::Exact
+            && !calib_from.is_empty()
+            && !is_record_dir
+        {
+            let paths: Vec<String> = bt
+                .sim_latency_calibrate_from
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            match crate::exchange::sim::per_event_rtt::extract_per_event_rtt(&paths) {
+                Ok(t) if !t.is_empty() => {
+                    let n_place = t.values().filter(|e| e.place_p50_ms.is_some()).count();
+                    let n_seg = t.values().filter(|e| e.has_segmented_place()).count();
+                    info!("[Backtest v2] per-event RTT (sim_rtt_mode=exact): {} events, {} with place quantiles, {} segmented",
                             t.len(), n_place, n_seg);
-                        Some(t)
-                    }
-                    Ok(_) => { warn!("[Backtest v2] per-event RTT table empty → pooled CDF"); None }
-                    Err(e) => { warn!("[Backtest v2] per-event RTT extract failed ({}) → pooled CDF", e); None }
+                    Some(t)
                 }
-            } else {
-                None
-            };
+                Ok(_) => {
+                    warn!("[Backtest v2] per-event RTT table empty → pooled CDF");
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "[Backtest v2] per-event RTT extract failed ({}) → pooled CDF",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // ── Taker matching-overhead: auto-calibrate from the log when the
         // knobs are at their measured defaults (explicit overrides win). ──
@@ -1748,21 +2082,85 @@ impl Engine {
             let at_default = (bt.sim_v2_taker_overhead_p50_ms - 267.0).abs() < 1e-6
                 && (bt.sim_v2_taker_overhead_p95_ms - 910.0).abs() < 1e-6
                 && (bt.sim_v2_taker_overhead_p99_ms - 1612.0).abs() < 1e-6;
-            let cfg = (bt.sim_v2_taker_overhead_p50_ms, bt.sim_v2_taker_overhead_p95_ms, bt.sim_v2_taker_overhead_p99_ms);
+            let cfg = (
+                bt.sim_v2_taker_overhead_p50_ms,
+                bt.sim_v2_taker_overhead_p95_ms,
+                bt.sim_v2_taker_overhead_p99_ms,
+            );
             if at_default && !calib_from.is_empty() && !is_record_dir {
-                let paths: Vec<String> = bt.sim_latency_calibrate_from
-                    .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                let paths: Vec<String> = bt
+                    .sim_latency_calibrate_from
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 match crate::exchange::sim::per_event_rtt::extract_taker_overhead(&paths) {
                     Ok(Some((a, b, c))) => {
                         info!("[Backtest v2] taker overhead auto-calibrated from log: p50/p95/p99={:.0}/{:.0}/{:.0} ms", a, b, c);
                         (a, b, c)
                     }
-                    Ok(None) => { warn!("[Backtest v2] taker overhead: <30 paired samples → config defaults"); cfg }
-                    Err(e) => { warn!("[Backtest v2] taker overhead extract failed ({}) → config defaults", e); cfg }
+                    Ok(None) => {
+                        warn!("[Backtest v2] taker overhead: <30 paired samples → config defaults");
+                        cfg
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[Backtest v2] taker overhead extract failed ({}) → config defaults",
+                            e
+                        );
+                        cfg
+                    }
                 }
             } else {
                 cfg
             }
+        };
+
+        // ── Causal dynamic taker matching overhead. The live-log source is
+        // deliberately separate from the exact HTTP RTT latency directory.
+        // Rows for event E contain only completed-event samples before E. ──
+        let dynamic_taker_overhead_by_event = if bt.sim_v2_dynamic_taker_overhead {
+            let source = bt.sim_v2_taker_overhead_calibrate_from.trim();
+            if source.is_empty() {
+                warn!("[Backtest v2] dynamic taker overhead enabled without sim_v2_taker_overhead_calibrate_from; using fixed anchors");
+                None
+            } else {
+                let paths: Vec<String> = source
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let base = (tovh_p50, tovh_p95, tovh_p99);
+                match crate::exchange::sim::per_event_rtt::extract_dynamic_taker_overhead(
+                    &paths,
+                    bt.sim_v2_taker_overhead_instance_id.trim(),
+                    bt.sim_v2_dynamic_taker_overhead_lookback_events.max(1) as usize,
+                    bt.sim_v2_dynamic_taker_overhead_min_samples.max(1) as usize,
+                    bt.sim_v2_dynamic_taker_overhead_blend,
+                    base,
+                ) {
+                    Ok(t) if !t.is_empty() => {
+                        info!("[Backtest v2] dynamic taker overhead: {} causal events, iid={}, lookback={}, min_samples={}, blend={:.2}",
+                            t.len(), bt.sim_v2_taker_overhead_instance_id,
+                            bt.sim_v2_dynamic_taker_overhead_lookback_events,
+                            bt.sim_v2_dynamic_taker_overhead_min_samples,
+                            bt.sim_v2_dynamic_taker_overhead_blend);
+                        Some(t)
+                    }
+                    Ok(_) => {
+                        warn!(
+                            "[Backtest v2] dynamic taker overhead table empty; using fixed anchors"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!("[Backtest v2] dynamic taker overhead extract failed ({}); using fixed anchors", e);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
         };
 
         // ── Build the v2 Simulator (owns server-axis feed + DES + RTT) ──
@@ -1784,29 +2182,57 @@ impl Engine {
             wallet_usdc_by_iid: sim_wallet_usdc_by_iid,
             split_by_iid: sim_split_by_iid,
             ahead_frac,
+            dynamic_ahead_frac_strength: bt.sim_v2_dynamic_ahead_frac_strength,
             adverse_sel_rate: bt.sim_v2_adverse_sel_rate,
             adverse_scale_ticks: bt.sim_v2_adverse_scale_ticks,
             book_through_rate: bt.sim_v2_book_through_rate,
             fill_markout_vn: bt.sim_v2_fill_markout_vn,
             fill_markout_horizon_ns: bt.sim_v2_fill_markout_horizon_ms.saturating_mul(1_000_000),
+            dynamic_fill_markout: bt.sim_v2_dynamic_fill_markout,
+            dynamic_markout_spot_vol: bt.sim_v2_dynamic_markout_spot_vol,
+            dynamic_markout_lookback_ns: bt
+                .sim_v2_dynamic_markout_lookback_ms
+                .saturating_mul(1_000_000),
+            dynamic_markout_vol_ref_ticks: bt.sim_v2_dynamic_markout_vol_ref_ticks,
+            dynamic_markout_vol_elasticity: bt.sim_v2_dynamic_markout_vol_elasticity,
+            dynamic_markout_min_mult: bt.sim_v2_dynamic_markout_min_mult,
+            dynamic_markout_max_mult: bt.sim_v2_dynamic_markout_max_mult,
             fill_push_mult: bt.sim_v2_fill_push_mult,
-            matched_cant_cancel_window_ns: bt.sim_matched_cant_cancel_window_ms.saturating_mul(1_000_000),
+            matched_cant_cancel_window_ns: bt
+                .sim_matched_cant_cancel_window_ms
+                .saturating_mul(1_000_000),
             per_event_rtt: per_event_rtt_table.clone(),
             taker_overhead_p50_ms: tovh_p50,
             taker_overhead_p95_ms: tovh_p95,
             taker_overhead_p99_ms: tovh_p99,
+            dynamic_taker_overhead_by_event,
             maker_race_rate: bt.sim_v2_maker_race_rate,
             taker_race_rate: bt.sim_v2_taker_race_rate,
             maker_race_horizon_ns: bt.sim_v2_maker_race_horizon_ms.saturating_mul(1_000_000),
             taker_race_horizon_ns: bt.sim_v2_taker_race_horizon_ms.saturating_mul(1_000_000),
             fold_outcomes: bt.sim_v2_fold_outcomes,
+            book_stale_after_ns: bt.sim_v2_book_stale_after_ms.saturating_mul(1_000_000),
+            causal_matching: bt.sim_v2_causal_matching,
+            stale_resting_exchange_only: bt.sim_v2_stale_resting_exchange_only,
             taker_comp_rate: bt.sim_v2_taker_comp_rate,
             taker_comp_window_ns: bt.sim_v2_taker_comp_window_ms.saturating_mul(1_000_000),
+            taker_overlap_dedup: bt.sim_v2_taker_overlap_dedup,
+            dynamic_window_rtt_by_event,
+            dynamic_window_rtt_ref_ms: bt.sim_v2_dynamic_window_rtt_ref_ms,
+            dynamic_race_rtt_elasticity: bt.sim_v2_dynamic_race_rtt_elasticity,
+            dynamic_comp_rtt_elasticity: bt.sim_v2_dynamic_comp_rtt_elasticity,
+            dynamic_window_min_mult: bt.sim_v2_dynamic_window_min_mult,
+            dynamic_window_max_mult: bt.sim_v2_dynamic_window_max_mult,
             deep_queue_decay: bt.sim_v2_deep_queue_decay,
+            dynamic_deep_queue_strength: bt.sim_v2_dynamic_deep_queue_strength,
+            dynamic_deep_queue_min_decay: bt.sim_v2_dynamic_deep_queue_min_decay,
             // Mirror the polymarket exchange's batch flag so the sim splits
             // reprice cancels onto the cancel RTT when batching is off (the
             // live config sets use_batch_orders=false).
-            use_batch_orders: self.config.exchanges.iter()
+            use_batch_orders: self
+                .config
+                .exchanges
+                .iter()
                 .find(|e| e.name == "polymarket")
                 .map(|e| e.use_batch_orders)
                 .unwrap_or(true),
@@ -1816,20 +2242,33 @@ impl Engine {
             cancel_profile,
         })?;
 
-        info!("[Backtest v2] {} strat replayers, {} bar events", strat_replayers.len(), bar_rows.len());
+        info!(
+            "[Backtest v2] {} strat replayers, {} bar events",
+            strat_replayers.len(),
+            bar_rows.len()
+        );
 
         // ── k-way merge: strat lane (local_ts) + bars + sim (wall clock) ──
         #[derive(Eq, PartialEq)]
-        struct HeapEntry { ts: u64, idx: usize }
+        struct HeapEntry {
+            ts: u64,
+            idx: usize,
+        }
         impl Ord for HeapEntry {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering { other.ts.cmp(&self.ts) }
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.ts.cmp(&self.ts)
+            }
         }
         impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
         }
         let mut strat_heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         for (i, p) in strat_peeked.iter().enumerate() {
-            if let Some((ts, _)) = p { strat_heap.push(HeapEntry { ts: *ts, idx: i }); }
+            if let Some((ts, _)) = p {
+                strat_heap.push(HeapEntry { ts: *ts, idx: i });
+            }
         }
 
         let mut strat_clock_ns: u64 = 0;
@@ -1837,11 +2276,16 @@ impl Engine {
 
         loop {
             let strat_ts = strat_heap.peek().map(|e| e.ts).unwrap_or(u64::MAX);
-            let bar_ts = bar_rows.get(bar_cursor).map(|(_, r)| r.close_time_ns).unwrap_or(u64::MAX);
+            let bar_ts = bar_rows
+                .get(bar_cursor)
+                .map(|(_, r)| r.close_time_ns)
+                .unwrap_or(u64::MAX);
             let strat_min = strat_ts.min(bar_ts);
             let sim_ts = sim.peek_when().unwrap_or(u64::MAX);
             let min_ts = strat_min.min(sim_ts);
-            if min_ts == u64::MAX { break; }
+            if min_ts == u64::MAX {
+                break;
+            }
 
             if min_ts == sim_ts {
                 // Server market event OR my-order lifecycle event (unified wall
@@ -1865,30 +2309,56 @@ impl Engine {
                     // former code cloned a pre-built MarketEvent here).
                     let (src, row) = bar_rows[bar_cursor];
                     bar_cursor += 1;
-                    (row.close_time_ns, MarketEvent::Bar(row.to_bar(&bar_templates[src as usize])))
+                    (
+                        row.close_time_ns,
+                        MarketEvent::Bar(row.to_bar(&bar_templates[src as usize])),
+                    )
                 } else {
                     let entry = strat_heap.pop().unwrap();
                     let best_idx = entry.idx;
                     let pair = strat_peeked[best_idx].take().unwrap();
                     strat_peeked[best_idx] = strat_replayers[best_idx].next_event().ok().flatten();
                     if let Some((ts, _)) = &strat_peeked[best_idx] {
-                        strat_heap.push(HeapEntry { ts: *ts, idx: best_idx });
+                        strat_heap.push(HeapEntry {
+                            ts: *ts,
+                            idx: best_idx,
+                        });
                     }
                     pair
                 };
                 strat_clock_ns = ts;
                 set_sim_clock(strat_clock_ns);
 
+                if let MarketEvent::OrderBook(ob) = &event {
+                    sim.observe_local_orderbook(ob, ts);
+                    sim.observe_dynamic_markout_spot_book(ob, ts);
+                }
+
                 for (i, strategy) in strategies.iter_mut().enumerate() {
                     let signals = match &event {
-                        MarketEvent::OrderBook(ob) => { strategy.on_orderbook(ob); Vec::new() }
-                        MarketEvent::Trade(t) => { strategy.on_trade_tick(t); Vec::new() }
+                        MarketEvent::OrderBook(ob) => {
+                            strategy.on_orderbook(ob);
+                            Vec::new()
+                        }
+                        MarketEvent::Trade(t) => {
+                            strategy.on_trade_tick(t);
+                            Vec::new()
+                        }
                         // Quote / SpotPrice update internal state only — the
                         // quote cadence is driven exclusively by OrderBook
                         // events (see the OrderBook trigger block below).
-                        MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
-                        MarketEvent::Bar(b) => { strategy.on_bar(b); Vec::new() }
-                        MarketEvent::SpotPrice(sp) => { strategy.on_spot_price(sp); Vec::new() }
+                        MarketEvent::Quote(q) => {
+                            strategy.on_quote_tick(q);
+                            Vec::new()
+                        }
+                        MarketEvent::Bar(b) => {
+                            strategy.on_bar(b);
+                            Vec::new()
+                        }
+                        MarketEvent::SpotPrice(sp) => {
+                            strategy.on_spot_price(sp);
+                            Vec::new()
+                        }
                         MarketEvent::Instrument(inst) => {
                             // Hist gap-fill BEFORE on_instrument (matches v1).
                             let hist_reqs = strategy.load_hist_data(ts);
@@ -1899,17 +2369,25 @@ impl Engine {
                                 // Errors fire before the first emitted bar, so the
                                 // fed-nothing-on-error behavior is preserved.
                                 if let Err(e) = crate::recorder::load_hist_bars_streamed(
-                                    &hist_data_dir, req, &mut |bar| { strategy.on_hist_bar(bar); },
+                                    &hist_data_dir,
+                                    req,
+                                    &mut |bar| {
+                                        strategy.on_hist_bar(bar);
+                                    },
                                 ) {
                                     warn!("[Strategy v2] Failed to load hist bars: {}", e);
                                 }
                             }
-                            if !hist_reqs.is_empty() { strategy.on_hist_data_loaded(ts); }
+                            if !hist_reqs.is_empty() {
+                                strategy.on_hist_data_loaded(ts);
+                            }
                             // Per-event prev_p RTT-gate override (sim_rtt_mode=exact):
                             // forward live's prev_event place-p60 (× overhead factor)
                             // so the gate's N matches live at this event start.
-                            if let (Some(ref table), crate::types::instrument::Instrument::BinaryOption(bo)) =
-                                (per_event_rtt_table.as_ref(), inst)
+                            if let (
+                                Some(ref table),
+                                crate::types::instrument::Instrument::BinaryOption(bo),
+                            ) = (per_event_rtt_table.as_ref(), inst)
                             {
                                 let factor = bt.sim_per_event_rtt_overhead_factor.max(0.0);
                                 let override_ms = parse_event_start_ts_secs(&bo.event_start_time)
@@ -1921,9 +2399,15 @@ impl Engine {
                             strategy.on_instrument(inst);
                             Vec::new()
                         }
-                        MarketEvent::TickSizeChange(tsc) => { strategy.on_tick_size_change(tsc) }
-                        MarketEvent::Connected { exchange } => { strategy.on_connected(*exchange); Vec::new() }
-                        MarketEvent::Disconnected { exchange, reason } => { strategy.on_disconnected(*exchange, reason); Vec::new() }
+                        MarketEvent::TickSizeChange(tsc) => strategy.on_tick_size_change(tsc),
+                        MarketEvent::Connected { exchange } => {
+                            strategy.on_connected(*exchange);
+                            Vec::new()
+                        }
+                        MarketEvent::Disconnected { exchange, reason } => {
+                            strategy.on_disconnected(*exchange, reason);
+                            Vec::new()
+                        }
                         _ => Vec::new(),
                     };
                     // OrderBook events are the sole driver of the quote
@@ -1938,8 +2422,7 @@ impl Engine {
                         // the backpressure detector flags congestion (rolling
                         // P(RTT>T) over threshold, decided per-event) — then
                         // fall back to the quote_interval (×N) throttle.
-                        let tbt = strategy.quote_tick_by_tick()
-                            && !strategy.cadence_rtt_throttle();
+                        let tbt = strategy.quote_tick_by_tick() && !strategy.cadence_rtt_throttle();
                         if venue_ok && (tbt || interval > 0) {
                             let fire = if tbt {
                                 true
@@ -1980,17 +2463,28 @@ impl Engine {
         }
 
         let (anchored, fallback) = sim.trade_anchor_stats();
-        info!("  Sim v2:   trade-ts reconstruction: {} anchored, {} fallback (no prior book)", anchored, fallback);
+        info!(
+            "  Sim v2:   trade-ts reconstruction: {} anchored, {} fallback (no prior book)",
+            anchored, fallback
+        );
         let (taker_fills, maker_fills, rejects) = sim.core_stats();
-        info!("  Sim v2:   taker_fills={}  maker_fills={}  rejects={}", taker_fills, maker_fills, rejects);
+        info!(
+            "  Sim v2:   taker_fills={}  maker_fills={}  rejects={}",
+            taker_fills, maker_fills, rejects
+        );
         let (rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short) = sim.reject_breakdown();
         info!("  Sim v2:   reject reasons: taker_buy={} taker_sell={} rest_buy={} rest_sell={} (rest_sell short Σ={:.0} shares, mean={:.1})",
             rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short,
             if rj_rs > 0 { rj_rs_short / rj_rs as f64 } else { 0.0 });
         for s in &self.config.strategies {
-            if s.enabled && self.registry.capabilities(&s.name).needs_sim_wallet && !s.instance_id.is_empty() {
+            if s.enabled
+                && self.registry.capabilities(&s.name).needs_sim_wallet
+                && !s.instance_id.is_empty()
+            {
                 if let Some(bal) = sim.wallet_usdc(&s.instance_id) {
-                    let seed = s.params.get("init_balance")
+                    let seed = s
+                        .params
+                        .get("init_balance")
                         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                         .unwrap_or(0.0);
                     info!("  Sim v2:   gating-wallet USDC [{}]: final={:.2} (seeded={:.2}, net={:.2}) — settlement-aware (split cost debited at seed, payouts credited at retire); net ≈ in-flight seed float, NOT a bleed",
@@ -1999,27 +2493,62 @@ impl Engine {
             }
         }
         let (timeouts, matched_cant_cancel) = sim.timeout_stats();
-        info!("  Sim v2:   timeouts={}  matched_cant_cancel={}", timeouts, matched_cant_cancel);
+        info!(
+            "  Sim v2:   timeouts={}  matched_cant_cancel={}",
+            timeouts, matched_cant_cancel
+        );
         let (po_rejects, po_seen) = sim.post_only_stats();
-        info!("  Sim v2:   post_only_rejects={}/{} ({:.2}% cross at reach)", po_rejects, po_seen,
-            if po_seen > 0 { 100.0 * po_rejects as f64 / po_seen as f64 } else { 0.0 });
+        info!(
+            "  Sim v2:   post_only_rejects={}/{} ({:.2}% cross at reach)",
+            po_rejects,
+            po_seen,
+            if po_seen > 0 {
+                100.0 * po_rejects as f64 / po_seen as f64
+            } else {
+                0.0
+            }
+        );
+        let (stale_orders, stale_trades, stale_exchange, stale_local, stale_rebases) =
+            sim.book_stale_stats();
+        if bt.sim_v2_book_stale_after_ms > 0 {
+            info!(
+                "  Sim v2:   book stale gate={}ms order_blocks={} trade_blocks={} exchange_hits={} local_hits={} recovery_rebases={}",
+                bt.sim_v2_book_stale_after_ms,
+                stale_orders,
+                stale_trades,
+                stale_exchange,
+                stale_local,
+                stale_rebases,
+            );
+        }
         let (mean_age_ms, over1s, mean_life_ms) = sim.fill_timing_stats();
         info!("  Sim v2:   maker fill-age mean={:.0}ms  >1s={:.1}%  | removed-order lifetime mean={:.0}ms", mean_age_ms, 100.0 * over1s, mean_life_ms);
         let (race_infl, race_plc, race_ratio, taker_capped, taker_capped_zero) = sim.race_stats();
         if race_plc > 0 {
-            info!("  Sim v2:   maker race inflated {}/{} ({:.1}%) placements, mean q_ahead×{:.2}",
-                race_infl, race_plc, 100.0 * race_infl as f64 / race_plc as f64, race_ratio);
+            info!(
+                "  Sim v2:   maker race inflated {}/{} ({:.1}%) placements, mean q_ahead×{:.2}",
+                race_infl,
+                race_plc,
+                100.0 * race_infl as f64 / race_plc as f64,
+                race_ratio
+            );
         }
         // Report taker-race caps independently of maker-race (the two are
         // separate knobs; gating this on maker placements hid taker-race effect).
         if taker_capped > 0 {
             let zero_pct = 100.0 * taker_capped_zero as f64 / taker_capped as f64;
-            info!("  Sim v2:   taker race capped {} fills ({} to ~0 = full miss, {:.1}%)",
-                taker_capped, taker_capped_zero, zero_pct);
+            info!(
+                "  Sim v2:   taker race capped {} fills ({} to ~0 = full miss, {:.1}%)",
+                taker_capped, taker_capped_zero, zero_pct
+            );
         }
         let adv_adv = sim.adverse_advanced();
         if adv_adv > 0 {
             info!("  Sim v2:   adverse-sel tilt advanced queue on {} resyncs (cancel-attribution ahead_frac→1 on adverse mid moves)", adv_adv);
+        }
+        if let Some((n, mean, min, max)) = sim.dynamic_ahead_frac_stats() {
+            info!("  Sim v2:   dynamic ahead_frac cancel-resyncs={} mean={:.3} range=[{:.3},{:.3}]",
+                n, mean, min, max);
         }
         let bt_fills = sim.book_through_fills();
         if bt_fills > 0 {
@@ -2036,21 +2565,87 @@ impl Engine {
             tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7], 100.0 * tv[8]);
         let pb = sim.placement_buckets();
         let ptot: u64 = pb.iter().map(|b| b[0]).sum::<u64>().max(1);
-        let pnames = ["improve(inside/new-best)", "join(==best)", "behind(deeper)", "no-book-this-side"];
+        let pnames = [
+            "improve(inside/new-best)",
+            "join(==best)",
+            "behind(deeper)",
+            "no-book-this-side",
+        ];
         info!("  Sim v2:   maker placement price-vs-BBO (why q_init=0):");
         for (b, nm) in pb.iter().zip(pnames) {
-            let q0pct = if b[0] > 0 { 100.0 * b[1] as f64 / b[0] as f64 } else { 0.0 };
-            info!("  Sim v2:     {:<26} {:>7} ({:>4.1}% of placements)  q_init=0 in {:>5.1}%",
-                nm, b[0], 100.0 * b[0] as f64 / ptot as f64, q0pct);
+            let q0pct = if b[0] > 0 {
+                100.0 * b[1] as f64 / b[0] as f64
+            } else {
+                0.0
+            };
+            info!(
+                "  Sim v2:     {:<26} {:>7} ({:>4.1}% of placements)  q_init=0 in {:>5.1}%",
+                nm,
+                b[0],
+                100.0 * b[0] as f64 / ptot as f64,
+                q0pct
+            );
         }
         let (q0_extra, q0_best) = sim.q0_fallback_split();
         info!("  Sim v2:     q_init=0 resolved by: extrapolation(beyond-window)={} | best-level rule(in-window gap)={}",
             q0_extra, q0_best);
+        if let Some((n, mean, min, max)) = sim.dynamic_deep_queue_stats() {
+            info!("  Sim v2:   dynamic deep-queue extrapolations={} mean decay={:.3} range=[{:.3},{:.3}]",
+                n, mean, min, max);
+        }
         let (tcc, tccz, tc_mean) = sim.taker_comp_stats();
         if tcc > 0 {
             let zpct = 100.0 * tccz as f64 / tcc as f64;
             info!("  Sim v2:   taker trade-flow competition capped {} fills ({} to ~0 = full miss, {:.1}%) | mean competing vol={:.1}",
                 tcc, tccz, zpct, tc_mean);
+        }
+        if let Some((n, mean_rtt, mean_race, mean_comp, min_mult, max_mult)) =
+            sim.dynamic_window_stats()
+        {
+            info!("  Sim v2:   dynamic taker windows events={} | RTT state mean={:.2}ms | race mean={:.0}ms comp mean={:.0}ms | multiplier range=[{:.3},{:.3}]",
+                n, mean_rtt, mean_race, mean_comp, min_mult, max_mult);
+        }
+        if let Some((n, p50, p95, p99)) = sim.dynamic_taker_overhead_stats() {
+            info!("[Backtest v2] dynamic taker overhead applied: n={} mean p50/p95/p99={:.1}/{:.1}/{:.1} ms",
+                n, p50, p95, p99);
+        }
+        if let Some(s) = sim.dynamic_markout_stats() {
+            info!("  Sim v2:   dynamic markout state n={:.0} mean={:.2} {} p50/p75/p90/p99={:.2}/{:.2}/{:.2}/{:.2} | vn mean={:.3} range=[{:.3},{:.3}]",
+                s[0], s[1], sim.dynamic_markout_state_unit(), s[2], s[3], s[4], s[5], s[6], s[7], s[8]);
+        }
+        if bt.sim_v2_fill_audit {
+            for a in sim.fill_audit_rows() {
+                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_race_added_q={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
+                    a.slug,
+                    a.iid,
+                    a.place_orders,
+                    a.place_qty,
+                    a.cancel_before_place_orders,
+                    a.cancel_before_place_qty,
+                    a.stale_order_blocks,
+                    a.stale_order_qty,
+                    a.post_only_rejects,
+                    a.post_only_reject_qty,
+                    a.maker_rests,
+                    a.maker_rest_qty,
+                    a.maker_q_init_sum,
+                    a.maker_race_added_q,
+                    a.maker_trade_matches,
+                    a.maker_trade_qty,
+                    a.maker_queue_drained_qty,
+                    a.maker_candidate_qty,
+                    a.maker_fill_qty,
+                    a.stale_trade_matches,
+                    a.stale_trade_candidate_qty,
+                    a.taker_candidates,
+                    a.taker_requested_qty,
+                    a.taker_available_qty,
+                    a.taker_race_suppressed_qty,
+                    a.taker_comp_suppressed_qty,
+                    a.taker_zero_fills,
+                    a.taker_fill_qty,
+                );
+            }
         }
         info!("══════════════════════════════════════");
         info!("  BACKTEST complete (sim_v2)");
@@ -2146,6 +2741,9 @@ impl Engine {
                 sim.configure_adverse_sel(bt.sim_v2_adverse_sel_rate, bt.sim_v2_adverse_scale_ticks);
                 sim.configure_book_through(bt.sim_v2_book_through_rate);
                 sim.set_fold_outcomes(bt.sim_v2_fold_outcomes);
+                sim.configure_book_stale_gate(
+                    bt.sim_v2_book_stale_after_ms.saturating_mul(1_000_000),
+                );
                 sim.set_deep_queue_decay(bt.sim_v2_deep_queue_decay);
                 sim.configure_taker_comp(bt.sim_v2_taker_comp_rate, bt.sim_v2_taker_comp_window_ms.saturating_mul(1_000_000));
                 let latency = std::time::Duration::from_millis(sim_latency_ms);
@@ -2171,6 +2769,7 @@ impl Engine {
                                     // adverse fills directly (empty unless
                                     // sim_v2_book_through_rate > 0).
                                     let fills = sim.on_orderbook(ob);
+                                    sim.on_local_orderbook(ob, ob.local_timestamp_ns);
                                     send_updates(fills, &update_tx, latency);
                                 }
                                 Ok(MarketEvent::Trade(ref t)) => {
@@ -2272,21 +2871,37 @@ impl Engine {
         let mut sources = Vec::new();
         let mut max_hours = 0.0_f64;
         for cfg in &self.config.strategies {
-            if !cfg.enabled { continue; }
+            if !cfg.enabled {
+                continue;
+            }
             // Per-source symbol derives from the strategy's event_series_slug.
-            let asset = cfg.params.get("event_series_slug")
+            let asset = cfg
+                .params
+                .get("event_series_slug")
                 .and_then(|v| v.as_str())
                 .and_then(crate::config::derive_asset_symbols)
                 .map(|s| s.asset);
-            if let Some(arr) = cfg.params.get("prediction_sources").and_then(|v| v.as_array()) {
+            if let Some(arr) = cfg
+                .params
+                .get("prediction_sources")
+                .and_then(|v| v.as_array())
+            {
                 for item in arr {
                     if let Some(t) = item.as_table() {
-                        let ex = t.get("exchange").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let ex = t
+                            .get("exchange")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         // Slug-derived (polymaker) if event_series_slug is set;
                         // else fall back to an explicit `symbol` (hexmaker/legacy).
                         let sym = match asset.as_deref() {
                             Some(a) => crate::config::venue_symbol(a, &ex),
-                            None => t.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            None => t
+                                .get("symbol")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                         };
                         if !ex.is_empty() && !sym.is_empty() {
                             sources.push((ex, sym));
@@ -2294,10 +2909,14 @@ impl Engine {
                     }
                 }
             }
-            let hours = cfg.params.get("prediction_training_period_hours")
+            let hours = cfg
+                .params
+                .get("prediction_training_period_hours")
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(24.0);
-            if hours > max_hours { max_hours = hours; }
+            if hours > max_hours {
+                max_hours = hours;
+            }
         }
         // Order-preserving set dedup. `Vec::dedup` only drops ADJACENT
         // duplicates, but multi-strategy sources are interleaved per-strategy
@@ -2326,20 +2945,36 @@ impl Engine {
         const BUCKETS_PER_DAY: f64 = 288.0;
         let mut max_days = 0.0_f64;
         for cfg in &self.config.strategies {
-            if !cfg.enabled { continue; }
-            let v2_on = cfg.params.get("adaptive_params_v2_enabled")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
-            if !v2_on { continue; }
-            let on = cfg.params.get("apv2_warmup")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
-            if !on { continue; }
+            if !cfg.enabled {
+                continue;
+            }
+            let v2_on = cfg
+                .params
+                .get("adaptive_params_v2_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !v2_on {
+                continue;
+            }
+            let on = cfg
+                .params
+                .get("apv2_warmup")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !on {
+                continue;
+            }
             // full lookback. Default z_window = 2016 (7d).
-            let zwin = cfg.params.get("apv2_z_window")
+            let zwin = cfg
+                .params
+                .get("apv2_z_window")
                 .and_then(|v| v.as_integer())
                 .map(|i| i.max(2) as f64)
                 .unwrap_or(2016.0);
             let days = zwin / BUCKETS_PER_DAY;
-            if days > max_days { max_days = days; }
+            if days > max_days {
+                max_days = days;
+            }
         }
         max_days
     }
@@ -2362,7 +2997,8 @@ impl Engine {
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> thread::JoinHandle<()> {
-        let mut strategies = self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
+        let mut strategies =
+            self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
         let data_dir = PathBuf::from(&self.config.backtest.data_dir);
         // Prediction-warmup data sources.
         //
@@ -2405,8 +3041,8 @@ impl Engine {
         // prediction warm-up continues to read only `backtest.data_dir`.
         if self.config.general.mode == RunMode::Live {
             let recorder_out = PathBuf::from(&self.config.recording.output_dir);
-            let recorder_out_canon = std::fs::canonicalize(&recorder_out)
-                .unwrap_or_else(|_| recorder_out.clone());
+            let recorder_out_canon =
+                std::fs::canonicalize(&recorder_out).unwrap_or_else(|_| recorder_out.clone());
             let unified = data_dirs.iter().any(|d| {
                 let dc = std::fs::canonicalize(d).unwrap_or_else(|_| d.clone());
                 dc == recorder_out_canon
@@ -2460,8 +3096,13 @@ impl Engine {
             if !warmup_sources.is_empty() && warmup_hours > 0.0 {
                 let end = if backtest && !self.config.backtest.start_date.is_empty() {
                     chrono::DateTime::parse_from_rfc3339(&self.config.backtest.start_date)
-                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&self.config.backtest.start_date, "%Y-%m-%dT%H:%M:%SZ")
-                            .map(|ndt| ndt.and_utc().fixed_offset()))
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(
+                                &self.config.backtest.start_date,
+                                "%Y-%m-%dT%H:%M:%SZ",
+                            )
+                            .map(|ndt| ndt.and_utc().fixed_offset())
+                        })
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .unwrap_or_else(|_| chrono::Utc::now())
                 } else {
@@ -2472,12 +3113,16 @@ impl Engine {
                     warmup_hours, warmup_sources.len(), end.format("%Y-%m-%d %H:%M"));
                 // Tell strategies we're entering warm-up so they can suppress
                 // per-hour retrains while samples stream in.
-                for s in &mut strategies { s.on_prediction_warmup_start(); }
+                for s in &mut strategies {
+                    s.on_prediction_warmup_start();
+                }
                 for (exchange, symbol) in &warmup_sources {
                     // Try each data dir in order (primary then fallback)
                     let mut loaded = false;
                     for dir in &data_dirs {
-                        match crate::recorder::MarketReplayer::new(dir, exchange, symbol, start, end) {
+                        match crate::recorder::MarketReplayer::new(
+                            dir, exchange, symbol, start, end,
+                        ) {
                             Ok(mut replayer) => {
                                 let mut count = 0u64;
                                 while let Ok(Some((_ts, event))) = replayer.next_event() {
@@ -2491,7 +3136,13 @@ impl Engine {
                                     count += 1;
                                 }
                                 if count > 0 {
-                                    info!("[Strategy] Warm-up: {} events from {}/{} ({})", count, exchange, symbol, dir.display());
+                                    info!(
+                                        "[Strategy] Warm-up: {} events from {}/{} ({})",
+                                        count,
+                                        exchange,
+                                        symbol,
+                                        dir.display()
+                                    );
                                     loaded = true;
                                     break;
                                 }
@@ -2548,7 +3199,9 @@ impl Engine {
                                     for dir in &data_dirs {
                                         match crate::recorder::load_hist_bars(dir, req) {
                                             Ok(bars) if !bars.is_empty() => {
-                                                for bar in &bars { strategy.on_hist_bar(bar); }
+                                                for bar in &bars {
+                                                    strategy.on_hist_bar(bar);
+                                                }
                                                 break;
                                             }
                                             _ => {}
@@ -2564,8 +3217,12 @@ impl Engine {
                                 strategy.on_instrument(inst);
                             }
                             MarketEvent::Connected { exchange } => strategy.on_connected(*exchange),
-                            MarketEvent::Disconnected { exchange, reason } => strategy.on_disconnected(*exchange, reason),
-                            MarketEvent::TickSizeChange(tsc) => { let _ = strategy.on_tick_size_change(tsc); }
+                            MarketEvent::Disconnected { exchange, reason } => {
+                                strategy.on_disconnected(*exchange, reason)
+                            }
+                            MarketEvent::TickSizeChange(tsc) => {
+                                let _ = strategy.on_tick_size_change(tsc);
+                            }
                             MarketEvent::EventStart { .. } | MarketEvent::Exit => {}
                         }
                     }
@@ -2574,15 +3231,22 @@ impl Engine {
                     // blocking strategy startup indefinitely. One million
                     // events at ~30 bytes each is ~30 MB; if we see this
                     // something is very wrong upstream.
-                    if drained >= 1_000_000 { break; }
+                    if drained >= 1_000_000 {
+                        break;
+                    }
                 }
                 if drained > 0 {
-                    info!("[Strategy] Drained {} live events buffered during warm-up", drained);
+                    info!(
+                        "[Strategy] Drained {} live events buffered during warm-up",
+                        drained
+                    );
                 }
 
                 // Warm-up done — strategies run a single final retrain and
                 // resume normal per-hour retrain cadence.
-                for s in &mut strategies { s.on_prediction_warmup_end(crate::types::now_ns()); }
+                for s in &mut strategies {
+                    s.on_prediction_warmup_end(crate::types::now_ns());
+                }
                 info!("[Strategy] Prediction warm-up complete");
             }
         }
@@ -2603,8 +3267,13 @@ impl Engine {
             if aw_days > 0.0 && !spot_sources.is_empty() {
                 let aw_end = if backtest && !self.config.backtest.start_date.is_empty() {
                     chrono::DateTime::parse_from_rfc3339(&self.config.backtest.start_date)
-                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&self.config.backtest.start_date, "%Y-%m-%dT%H:%M:%SZ")
-                            .map(|ndt| ndt.and_utc().fixed_offset()))
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(
+                                &self.config.backtest.start_date,
+                                "%Y-%m-%dT%H:%M:%SZ",
+                            )
+                            .map(|ndt| ndt.and_utc().fixed_offset())
+                        })
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .unwrap_or_else(|_| chrono::Utc::now())
                 } else {
@@ -2617,13 +3286,20 @@ impl Engine {
                 // usable cache return aw_start ⇒ full replay (unchanged).
                 let aw_start_ns = aw_start.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
                 let aw_end_ns = aw_end.timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
-                let resume_ns = strategies.iter_mut()
+                let resume_ns = strategies
+                    .iter_mut()
                     .map(|s| s.apv2_warmup_resume_ns(aw_start_ns, aw_end_ns))
-                    .min().unwrap_or(aw_start_ns);
-                let replay_start = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
-                info!("[Strategy] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
-                    aw_days, aw_start.format("%Y-%m-%d %H:%M"), aw_end.format("%Y-%m-%d %H:%M"),
-                    replay_start.format("%Y-%m-%d %H:%M"));
+                    .min()
+                    .unwrap_or(aw_start_ns);
+                let replay_start =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(resume_ns as i64);
+                info!(
+                    "[Strategy] apv2 warm-up: {:.1}d window [{} → {}], raw replay from {}",
+                    aw_days,
+                    aw_start.format("%Y-%m-%d %H:%M"),
+                    aw_end.format("%Y-%m-%d %H:%M"),
+                    replay_start.format("%Y-%m-%d %H:%M")
+                );
                 // Per source, pick the first data_dir that actually yields
                 // events (mirrors the prediction warm-up's primary→fallback
                 // selection), priming one buffered event each.
@@ -2631,7 +3307,13 @@ impl Engine {
                 let mut peeked: Vec<Option<(u64, MarketEvent)>> = Vec::new();
                 for (exchange, symbol) in &spot_sources {
                     for dir in &data_dirs {
-                        if let Ok(mut r) = crate::recorder::MarketReplayer::new(dir, exchange, symbol, replay_start, aw_end) {
+                        if let Ok(mut r) = crate::recorder::MarketReplayer::new(
+                            dir,
+                            exchange,
+                            symbol,
+                            replay_start,
+                            aw_end,
+                        ) {
                             let first = r.next_event().ok().flatten();
                             if first.is_some() {
                                 replayers.push(r);
@@ -2645,21 +3327,35 @@ impl Engine {
                 // chronologically, exactly as in the real feed.
                 let mut fed: u64 = 0;
                 loop {
-                    let best = peeked.iter().enumerate()
+                    let best = peeked
+                        .iter()
+                        .enumerate()
                         .filter_map(|(i, p)| p.as_ref().map(|(ts, _)| (i, *ts)))
                         .min_by_key(|&(_, ts)| ts);
-                    let Some((idx, _)) = best else { break; };
+                    let Some((idx, _)) = best else {
+                        break;
+                    };
                     let (_, event) = peeked[idx].take().unwrap();
                     match &event {
-                        MarketEvent::OrderBook(ob) => { for s in &mut strategies { s.on_apv2_warmup_orderbook(ob); } }
-                        MarketEvent::Trade(t) => { for s in &mut strategies { s.on_apv2_warmup_trade(t); } }
+                        MarketEvent::OrderBook(ob) => {
+                            for s in &mut strategies {
+                                s.on_apv2_warmup_orderbook(ob);
+                            }
+                        }
+                        MarketEvent::Trade(t) => {
+                            for s in &mut strategies {
+                                s.on_apv2_warmup_trade(t);
+                            }
+                        }
                         _ => {}
                     }
                     fed += 1;
                     peeked[idx] = replayers[idx].next_event().ok().flatten();
                 }
                 info!("[Strategy] apv2 warm-up complete: {} spot events fed", fed);
-                for s in &mut strategies { s.apv2_warmup_finalize_cache(); }
+                for s in &mut strategies {
+                    s.apv2_warmup_finalize_cache();
+                }
 
                 // Drain live events buffered on `market_rx` during the apv2
                 // warm-up replay above. The earlier prediction-warm-up drain
@@ -2697,7 +3393,9 @@ impl Engine {
                                     for dir in &data_dirs {
                                         match crate::recorder::load_hist_bars(dir, req) {
                                             Ok(bars) if !bars.is_empty() => {
-                                                for bar in &bars { strategy.on_hist_bar(bar); }
+                                                for bar in &bars {
+                                                    strategy.on_hist_bar(bar);
+                                                }
                                                 break;
                                             }
                                             _ => {}
@@ -2710,21 +3408,32 @@ impl Engine {
                                 strategy.on_instrument(inst);
                             }
                             MarketEvent::Connected { exchange } => strategy.on_connected(*exchange),
-                            MarketEvent::Disconnected { exchange, reason } => strategy.on_disconnected(*exchange, reason),
-                            MarketEvent::TickSizeChange(tsc) => { let _ = strategy.on_tick_size_change(tsc); }
+                            MarketEvent::Disconnected { exchange, reason } => {
+                                strategy.on_disconnected(*exchange, reason)
+                            }
+                            MarketEvent::TickSizeChange(tsc) => {
+                                let _ = strategy.on_tick_size_change(tsc);
+                            }
                             MarketEvent::EventStart { .. } | MarketEvent::Exit => {}
                         }
                     }
                     drained += 1;
-                    if drained >= 1_000_000 { break; }
+                    if drained >= 1_000_000 {
+                        break;
+                    }
                 }
                 if drained > 0 {
-                    info!("[Strategy] Drained {} live events buffered during apv2 warm-up", drained);
+                    info!(
+                        "[Strategy] Drained {} live events buffered during apv2 warm-up",
+                        drained
+                    );
                 }
             }
         }
 
-        for s in &mut strategies { s.on_init(); }
+        for s in &mut strategies {
+            s.on_init();
+        }
 
         // ── LIVE/PAPER multi-instance fan-out (P1+P2) ──
         // With more than one strategy instance, run each on its OWN
@@ -2740,7 +3449,12 @@ impl Engine {
         // unaffected.
         if !backtest && strategies.len() > 1 {
             return self.spawn_per_instance_strategy_threads(
-                strategies, market_rx, signal_tx, update_rx, recorder_tx, data_dirs,
+                strategies,
+                market_rx,
+                signal_tx,
+                update_rx,
+                recorder_tx,
+                data_dirs,
             );
         }
 
@@ -2923,7 +3637,9 @@ impl Engine {
             for sym in s.subscribed_symbols() {
                 let key = sym.to_ascii_lowercase();
                 let e = sym_to_instances.entry(key).or_default();
-                if !e.contains(&i) { e.push(i); }
+                if !e.contains(&i) {
+                    e.push(i);
+                }
             }
         }
 
@@ -2941,8 +3657,11 @@ impl Engine {
         // Per-instance channels + move each strategy into a worker spec.
         let mut market_txs: Vec<Sender<MarketEvent>> = Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<OrderUpdate>> = Vec::with_capacity(strategies.len());
-        let mut specs: Vec<(Box<dyn Strategy>, Receiver<MarketEvent>, Receiver<OrderUpdate>)> =
-            Vec::with_capacity(strategies.len());
+        let mut specs: Vec<(
+            Box<dyn Strategy>,
+            Receiver<MarketEvent>,
+            Receiver<OrderUpdate>,
+        )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
             let (utx, urx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
@@ -3067,10 +3786,16 @@ impl Engine {
         market_txs: &[Sender<MarketEvent>],
     ) {
         let broadcast = |txs: &[Sender<MarketEvent>]| {
-            for tx in txs { let _ = tx.send(event.clone()); }
+            for tx in txs {
+                let _ = tx.send(event.clone());
+            }
         };
         let send_to = |idxs: &[usize], txs: &[Sender<MarketEvent>]| {
-            for &i in idxs { if let Some(tx) = txs.get(i) { let _ = tx.send(event.clone()); } }
+            for &i in idxs {
+                if let Some(tx) = txs.get(i) {
+                    let _ = tx.send(event.clone());
+                }
+            }
         };
 
         // Instrument(BinaryOption) → attribute its token_ids to the owner
@@ -3093,23 +3818,40 @@ impl Engine {
             | MarketEvent::Disconnected { .. }
             | MarketEvent::Instrument(_) => None,
             // Polymarket market data keyed by dynamic token_id.
-            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket =>
-                token_to_instances.get(&ob.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket =>
-                token_to_instances.get(&t.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket =>
-                token_to_instances.get(&q.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::TickSizeChange(tsc) =>
-                token_to_instances.get(&tsc.symbol.to_ascii_lowercase()).cloned(),
+            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => token_to_instances
+                .get(&ob.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => token_to_instances
+                .get(&t.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => token_to_instances
+                .get(&q.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::TickSizeChange(tsc) => token_to_instances
+                .get(&tsc.symbol.to_ascii_lowercase())
+                .cloned(),
             // Spot venues keyed by stable symbol.
-            MarketEvent::OrderBook(ob) => sym_to_instances.get(&ob.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::Trade(t) => sym_to_instances.get(&t.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::Quote(q) => sym_to_instances.get(&q.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::Bar(b) => sym_to_instances.get(&b.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::SpotPrice(sp) => sym_to_instances.get(&sp.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::AssetCtx(ac) => sym_to_instances.get(&ac.symbol.to_ascii_lowercase()).cloned(),
-            MarketEvent::EventStart { symbol, .. } =>
-                sym_to_instances.get(&symbol.to_ascii_lowercase()).cloned(),
+            MarketEvent::OrderBook(ob) => sym_to_instances
+                .get(&ob.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::Trade(t) => sym_to_instances
+                .get(&t.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::Quote(q) => sym_to_instances
+                .get(&q.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::Bar(b) => sym_to_instances
+                .get(&b.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::SpotPrice(sp) => sym_to_instances
+                .get(&sp.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::AssetCtx(ac) => sym_to_instances
+                .get(&ac.symbol.to_ascii_lowercase())
+                .cloned(),
+            MarketEvent::EventStart { symbol, .. } => {
+                sym_to_instances.get(&symbol.to_ascii_lowercase()).cloned()
+            }
             MarketEvent::Exit => Some(Vec::new()),
         };
         match targets {
@@ -3135,7 +3877,9 @@ impl Engine {
             | Signal::ReplaceOrder { place_orders, .. } => place_orders,
             _ => return,
         };
-        if places.is_empty() { return; }
+        if places.is_empty() {
+            return;
+        }
         let mut map = coid_owner.lock().unwrap();
         for o in places {
             map.insert(o.client_order_id.clone(), idx);
@@ -3159,9 +3903,7 @@ impl Engine {
         idx: usize,
         coid_owner: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     ) {
-        crate::os_tune::pin_strategy_instance(
-            &format!("strategy-{}", instance_id), instance_id,
-        );
+        crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         // Emit a signal: register its placed coids to this instance, then
         // forward. Returns false if the executor channel is gone.
         let emit = |sig: Signal| -> bool {
@@ -3264,8 +4006,8 @@ impl Engine {
         use signal_hook::iterator::Signals;
 
         let start_time = std::time::Instant::now();
-        let mut signals = Signals::new(&[SIGINT, SIGTERM])
-            .expect("Failed to register signal handlers");
+        let mut signals =
+            Signals::new(&[SIGINT, SIGTERM]).expect("Failed to register signal handlers");
         info!("Press Ctrl-C to stop...");
 
         // Block until a signal arrives
@@ -3285,7 +4027,12 @@ impl Engine {
 
             info!(
                 "Shutdown: signal={}, uptime={}h{}m{}s, rss={:.1}MB, pid={}",
-                sig_name, hours, mins, secs, rss_mb, std::process::id()
+                sig_name,
+                hours,
+                mins,
+                secs,
+                rss_mb,
+                std::process::id()
             );
         }
 
@@ -3313,8 +4060,12 @@ impl Engine {
             // Use mach API via ps as simple fallback
             let output = std::process::Command::new("ps")
                 .args(&["-o", "rss=", "-p", &std::process::id().to_string()])
-                .output().ok()?;
-            let kb: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+                .output()
+                .ok()?;
+            let kb: f64 = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .ok()?;
             Some(kb / 1024.0)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -3358,14 +4109,21 @@ impl Engine {
             }
 
             let tx = market_tx.clone();
-            let sim_tx = if exchange_cfg.name == "polymarket" { sim_feed_tx.clone() } else { None };
+            let sim_tx = if exchange_cfg.name == "polymarket" {
+                sim_feed_tx.clone()
+            } else {
+                None
+            };
             let cfg = exchange_cfg.clone();
             let shutdown = shutdown.clone();
             let feed_readiness = self.feed_readiness.clone();
             // Resolve the spot kline interval BEFORE moving into the
             // feed thread — `self` (or its &refs) can't escape the
             // method into the thread closure's 'static bound.
-            let spot_kline_interval: String = self.config.strategies.iter()
+            let spot_kline_interval: String = self
+                .config
+                .strategies
+                .iter()
                 .find(|s| s.enabled && self.registry.capabilities(&s.name).needs_hist_bars)
                 .and_then(|s| s.params.get("hist_bar_interval"))
                 .and_then(|v| v.as_str())
@@ -3837,7 +4595,11 @@ impl Engine {
         update_tx: Sender<OrderUpdate>,
         shutdown: Arc<AtomicBool>,
     ) -> Option<thread::JoinHandle<()>> {
-        let hex_cfg = self.config.exchanges.iter().find(|e| e.name == "hexmarket" && e.enabled)?;
+        let hex_cfg = self
+            .config
+            .exchanges
+            .iter()
+            .find(|e| e.name == "hexmarket" && e.enabled)?;
         let private_key = &hex_cfg.private_key;
         let mnemonic = &hex_cfg.mnemonic;
         let wss_url = &hex_cfg.wss_url;
@@ -3849,7 +4611,8 @@ impl Engine {
 
         use crate::exchange::hexmarket::auth::{resolve_auth, wss_url_or_default};
         let wss_url = wss_url_or_default(wss_url).to_string();
-        let api_url_prefix = crate::exchange::hexmarket::auth::api_url_prefix_or_default(&hex_cfg.api_url_prefix);
+        let api_url_prefix =
+            crate::exchange::hexmarket::auth::api_url_prefix_or_default(&hex_cfg.api_url_prefix);
 
         match resolve_auth(private_key, mnemonic, api_url_prefix) {
             Ok(auth) => {
@@ -3906,7 +4669,12 @@ impl Engine {
         let mut out: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> =
             HashMap::new();
 
-        let poly_cfg = match self.config.exchanges.iter().find(|e| e.name == "polymarket" && e.enabled) {
+        let poly_cfg = match self
+            .config
+            .exchanges
+            .iter()
+            .find(|e| e.name == "polymarket" && e.enabled)
+        {
             Some(c) => c,
             None => {
                 info!("[Engine] Polymarket exchange disabled; no SharedState built");
@@ -3920,7 +4688,10 @@ impl Engine {
         // their first place/cancel/reconcile/query request paid a cold
         // DNS+TCP+TLS setup despite startup reporting prewarm success.
         if !hexagent_runtime::http1_pool::instance_pools_ready() {
-            let mut instance_ids: Vec<String> = self.config.strategies.iter()
+            let mut instance_ids: Vec<String> = self
+                .config
+                .strategies
+                .iter()
                 .filter(|sc| {
                     sc.enabled
                         && self.registry.capabilities(&sc.name).needs_poly_user_feed
@@ -3967,7 +4738,8 @@ impl Engine {
                 warn!(
                     "[Engine] Failed to load secrets file at {}: {} \
                      — polymaker strategies that reference instance_id will fail to start",
-                    secrets_path.display(), e,
+                    secrets_path.display(),
+                    e,
                 );
                 return out;
             }
@@ -3988,7 +4760,9 @@ impl Engine {
         let mut by_account: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> =
             HashMap::new();
         for sc in &self.config.strategies {
-            if !sc.enabled || !self.registry.capabilities(&sc.name).needs_poly_user_feed { continue; }
+            if !sc.enabled || !self.registry.capabilities(&sc.name).needs_poly_user_feed {
+                continue;
+            }
             let instance_id = if sc.instance_id.is_empty() {
                 warn!(
                     "[Engine] Polymaker strategy missing required `instance_id` \
@@ -4046,21 +4820,31 @@ impl Engine {
             // (P4 — see `spawn_maintenance_thread(account_id)`).
             crate::exchange::polymarket::cli_account::apply_creds_to_env(creds);
             crate::exchange::polymarket::wallet::register_account_wallet(
-                &account_id, &creds.private_key, &creds.signature_type, &creds.funder,
+                &account_id,
+                &creds.private_key,
+                &creds.signature_type,
+                &creds.funder,
             );
             // builder_code is sourced solely from the shared `[builder]`
             // block — one attribution code for all of the operator's
             // wallets (per-instance `[poly.<id>].builder_code` was removed).
-            let builder_code = secrets.builder.as_ref()
+            let builder_code = secrets
+                .builder
+                .as_ref()
                 .map(|b| b.builder_code.clone())
                 .unwrap_or_default();
             let neg_risk = false;
-            let sig_type = crate::exchange::polymarket::signer::parse_signature_type(&creds.signature_type);
+            let sig_type =
+                crate::exchange::polymarket::signer::parse_signature_type(&creds.signature_type);
             let clob_version =
                 crate::exchange::polymarket::trade::ClobVersion::parse(&poly_cfg.clob_version);
             match PolymarketTrade::new_with_pool(
-                &creds.api_key, &creds.api_secret, &creds.api_passphrase,
-                &creds.private_key, neg_risk, poly_cfg.rate_limit_per_second,
+                &creds.api_key,
+                &creds.api_secret,
+                &creds.api_passphrase,
+                &creds.private_key,
+                neg_risk,
+                poly_cfg.rate_limit_per_second,
                 sig_type,
                 clob_version,
                 &builder_code,
@@ -4080,8 +4864,14 @@ impl Engine {
                     info!(
                         "[Engine] Built Polymarket SharedState for account_id={} \
                          (first instance_id={} sig_type={} builder_code={})",
-                        account_id, instance_id, creds.signature_type,
-                        if builder_code.is_empty() { "<none>" } else { &builder_code },
+                        account_id,
+                        instance_id,
+                        creds.signature_type,
+                        if builder_code.is_empty() {
+                            "<none>"
+                        } else {
+                            &builder_code
+                        },
                     );
                     by_account.insert(account_id, shared.clone());
                     out.insert(instance_id, shared);
@@ -4098,7 +4888,9 @@ impl Engine {
 
         info!(
             "[Engine] Built {} Polymarket SharedState(s) across {} account(s) for {} instance(s)",
-            by_account.len(), by_account.len(), out.len(),
+            by_account.len(),
+            by_account.len(),
+            out.len(),
         );
         // Keep every pooled CLOB connection warm through quiet stretches
         // (event rollovers, closed sessions). The one-shot staggered
@@ -4129,13 +4921,16 @@ impl Engine {
         states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> Vec<(String, Arc<crate::exchange::polymarket::trade::SharedState>)> {
         let mut seen: Vec<*const crate::exchange::polymarket::trade::SharedState> = Vec::new();
-        let mut out: Vec<(String, Arc<crate::exchange::polymarket::trade::SharedState>)> = Vec::new();
+        let mut out: Vec<(String, Arc<crate::exchange::polymarket::trade::SharedState>)> =
+            Vec::new();
         let mut keys: Vec<&String> = states.keys().collect();
         keys.sort();
         for k in keys {
             if let Some(s) = states.get(k) {
                 let ptr = Arc::as_ptr(s);
-                if seen.contains(&ptr) { continue; }
+                if seen.contains(&ptr) {
+                    continue;
+                }
                 seen.push(ptr);
                 out.push((k.clone(), s.clone()));
             }
@@ -4149,7 +4944,9 @@ impl Engine {
     /// consume one SharedState until Phase 2b–2e fans them out per
     /// instance. Logs a one-time WARN when more than one instance is
     /// configured (only the first will actually run).
-    pub fn build_poly_shared_state(&self) -> Option<Arc<crate::exchange::polymarket::trade::SharedState>> {
+    pub fn build_poly_shared_state(
+        &self,
+    ) -> Option<Arc<crate::exchange::polymarket::trade::SharedState>> {
         let map = self.build_poly_shared_states_map();
         if map.len() > 1 {
             let ids: Vec<&String> = map.keys().collect();
@@ -4157,7 +4954,8 @@ impl Engine {
                 "[Engine] {} polymaker instances configured but Phase 2b–2e not yet wired \
                  — only one will receive user_feed / heartbeat / rtt_probe / executor traffic. \
                  Instances: {:?}",
-                map.len(), ids,
+                map.len(),
+                ids,
             );
         }
         // BTreeMap-ish stable pick: sort by key so "first" is deterministic
@@ -4193,11 +4991,18 @@ impl Engine {
             let api_secret_b64 = shared.auth.api_secret_b64().to_string();
             let passphrase = shared.auth.passphrase.clone();
             match crate::exchange::polymarket::user_feed::spawn_user_feed(
-                &api_key, &api_secret_b64, &passphrase,
-                shared, update_tx.clone(), shutdown.clone(),
+                &api_key,
+                &api_secret_b64,
+                &passphrase,
+                shared,
+                update_tx.clone(),
+                shutdown.clone(),
             ) {
                 Ok(h) => {
-                    info!("[Engine] Polymarket user feed started for account (lead instance_id={})", id);
+                    info!(
+                        "[Engine] Polymarket user feed started for account (lead instance_id={})",
+                        id
+                    );
                     handles.push(h);
                 }
                 Err(e) => {
@@ -4226,8 +5031,12 @@ impl Engine {
         let api_secret_b64 = shared.auth.api_secret_b64().to_string();
         let passphrase = shared.auth.passphrase.clone();
         match crate::exchange::polymarket::user_feed::spawn_user_feed(
-            &api_key, &api_secret_b64, &passphrase,
-            shared, update_tx, shutdown,
+            &api_key,
+            &api_secret_b64,
+            &passphrase,
+            shared,
+            update_tx,
+            shutdown,
         ) {
             Ok(handle) => {
                 info!("[Engine] Polymarket user feed started");
@@ -4257,7 +5066,10 @@ impl Engine {
             // Heartbeat route places no orders → instance_id unused ("").
             let trade = PolymarketTrade::from_shared(shared, &api_key, "");
             handles.push(trade.spawn_heartbeat(shutdown.clone()));
-            info!("[Engine] Polymarket heartbeat started for account (lead instance_id={})", id);
+            info!(
+                "[Engine] Polymarket heartbeat started for account (lead instance_id={})",
+                id
+            );
         }
         handles
     }
@@ -4286,9 +5098,7 @@ impl Engine {
         // Standalone caller (no live polymaker wiring) — pass an empty
         // per-instance stale-threshold map. The executor's fallback
         // dispatch will use the 150 ms legacy default for every signal.
-        self.spawn_execution_thread_with_poly(
-            signal_rx, update_tx, HashMap::new(), HashMap::new(),
-        )
+        self.spawn_execution_thread_with_poly(signal_rx, update_tx, HashMap::new(), HashMap::new())
     }
 
     /// Same as `spawn_execution_thread` but wires a pre-built Polymarket
@@ -4302,14 +5112,18 @@ impl Engine {
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
     ) -> thread::JoinHandle<()> {
         let config = self.config.clone();
-        let hex_max_connections = config.exchanges.iter()
+        let hex_max_connections = config
+            .exchanges
+            .iter()
             .find(|e| e.name == "hexmarket")
             .map(|e| e.max_connections)
             .unwrap_or(4);
         // Pre-compute (with the registry, before the `move`) which strategies
         // need Hexmarket execution workers, so the spawned thread — which only
         // captures a `config` clone — gates on a capability, not a strategy name.
-        let hex_worker_flags: Vec<bool> = config.strategies.iter()
+        let hex_worker_flags: Vec<bool> = config
+            .strategies
+            .iter()
             .map(|s| self.registry.capabilities(&s.name).needs_hex_workers)
             .collect();
 
@@ -4725,10 +5539,14 @@ fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<us
 /// `per_event_rtt::extract_per_event_rtt`. Returns `None` on parse
 /// failure so the caller can skip the per-event override push.
 fn parse_event_start_ts_secs(iso: &str) -> Option<u64> {
-    if iso.is_empty() { return None; }
+    if iso.is_empty() {
+        return None;
+    }
     let dt = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
     let secs = dt.timestamp();
-    if secs < 0 { return None; }
+    if secs < 0 {
+        return None;
+    }
     let secs = secs as u64;
     // Floor to 5-min boundary so callers see the same key the parser
     // builds. Polymarket events ALWAYS start on the boundary, but the
@@ -4741,18 +5559,40 @@ fn extract_instance_id(signal: &Signal) -> String {
         Signal::NewOrder(order) => order.instance_id.clone(),
         Signal::CancelOrder { instance_id, .. } => instance_id.clone(),
         Signal::CancelAll { instance_id, .. } => instance_id.clone(),
-        Signal::BatchNewOrders { instance_id, orders, .. } => {
+        Signal::BatchNewOrders {
+            instance_id,
+            orders,
+            ..
+        } => {
             // Prefer the explicit field; fall back to the first order's
             // instance_id for backward-compat with emit sites that pre-
             // dated the explicit-field addition.
-            if !instance_id.is_empty() { return instance_id.clone(); }
-            orders.first().map(|o| o.instance_id.clone()).unwrap_or_default()
+            if !instance_id.is_empty() {
+                return instance_id.clone();
+            }
+            orders
+                .first()
+                .map(|o| o.instance_id.clone())
+                .unwrap_or_default()
         }
         Signal::BatchCancelOrders { instance_id, .. } => instance_id.clone(),
-        Signal::BatchUpdateOrders { instance_id, place_orders, .. }
-        | Signal::ReplaceOrder { instance_id, place_orders, .. } => {
-            if !instance_id.is_empty() { return instance_id.clone(); }
-            place_orders.first().map(|o| o.instance_id.clone()).unwrap_or_default()
+        Signal::BatchUpdateOrders {
+            instance_id,
+            place_orders,
+            ..
+        }
+        | Signal::ReplaceOrder {
+            instance_id,
+            place_orders,
+            ..
+        } => {
+            if !instance_id.is_empty() {
+                return instance_id.clone();
+            }
+            place_orders
+                .first()
+                .map(|o| o.instance_id.clone())
+                .unwrap_or_default()
         }
         Signal::ReconcilePolymarket { instance_id, .. } => instance_id.clone(),
         Signal::PolymarketCancelAllOrders { instance_id, .. } => instance_id.clone(),
@@ -4794,10 +5634,9 @@ fn admission_log_snapshot(
                 role, dacq, dsk, dwaits, busy
             ));
         } else {
-            entry.0.push_str(&format!(
-                "{:?}(+{} skip+{} busy{}) ",
-                role, dacq, dsk, busy
-            ));
+            entry
+                .0
+                .push_str(&format!("{:?}(+{} skip+{} busy{}) ", role, dacq, dsk, busy));
         }
     }
     by_inst
@@ -4809,50 +5648,81 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
     // `execute_fallback_signal`.
     let _iid_span = tracing::info_span!("exec", iid = %extract_instance_id(&signal)).entered();
     match signal {
-        Signal::NewOrder(order) => {
-            match worker.submit_order(&order) {
-                Ok(update) => vec![update],
-                Err(e) => {
-                    error!("[Executor] Submit error: {}", e);
-                    vec![OrderUpdate {
-                        client_order_id: order.client_order_id, exchange: order.exchange,
-                        symbol: order.symbol, side: order.side, exchange_order_id: None,
-                        status: OrderStatus::Rejected, liquidity: None,
-                        filled_quantity: 0.0, remaining_quantity: order.quantity,
-                        avg_fill_price: 0.0, timestamp_ns: now_ns(),
-                        trade_id: None,
-                        order_audit: None,
-                        error: None,
-                    }]
-                }
+        Signal::NewOrder(order) => match worker.submit_order(&order) {
+            Ok(update) => vec![update],
+            Err(e) => {
+                error!("[Executor] Submit error: {}", e);
+                vec![OrderUpdate {
+                    client_order_id: order.client_order_id,
+                    exchange: order.exchange,
+                    symbol: order.symbol,
+                    side: order.side,
+                    exchange_order_id: None,
+                    status: OrderStatus::Rejected,
+                    liquidity: None,
+                    filled_quantity: 0.0,
+                    remaining_quantity: order.quantity,
+                    avg_fill_price: 0.0,
+                    timestamp_ns: now_ns(),
+                    trade_id: None,
+                    order_audit: None,
+                    error: None,
+                }]
             }
-        }
-        Signal::CancelOrder { exchange, client_order_id, .. } => {
-            match worker.cancel_order(exchange, &client_order_id) {
-                Ok(update) => vec![update],
-                Err(e) => { error!("[Executor] Cancel error: {}", e); vec![] }
+        },
+        Signal::CancelOrder {
+            exchange,
+            client_order_id,
+            ..
+        } => match worker.cancel_order(exchange, &client_order_id) {
+            Ok(update) => vec![update],
+            Err(e) => {
+                error!("[Executor] Cancel error: {}", e);
+                vec![]
             }
-        }
-        Signal::CancelAll { exchange, symbol, .. } => {
-            worker.cancel_all(exchange, &symbol).unwrap_or_else(|e| {
-                error!("[Executor] Cancel-all error: {}", e); vec![]
-            })
-        }
-        Signal::BatchNewOrders { market_id, orders, .. } => {
-            worker.batch_submit_orders(&market_id, &orders).unwrap_or_else(|e| {
-                error!("[Executor] Batch place error: {}", e); vec![]
-            })
-        }
-        Signal::BatchCancelOrders { exchange, market_id, client_order_ids, .. } => {
-            worker.batch_cancel_orders(exchange, &market_id, &client_order_ids).unwrap_or_else(|e| {
-                error!("[Executor] Batch cancel error: {}", e); vec![]
-            })
-        }
-        Signal::BatchUpdateOrders { exchange, market_id, cancel_client_order_ids, place_orders, .. } => {
-            worker.batch_update_orders(exchange, &market_id, &cancel_client_order_ids, &place_orders).unwrap_or_else(|e| {
-                error!("[Executor] Batch update error: {}", e); vec![]
-            })
-        }
+        },
+        Signal::CancelAll {
+            exchange, symbol, ..
+        } => worker.cancel_all(exchange, &symbol).unwrap_or_else(|e| {
+            error!("[Executor] Cancel-all error: {}", e);
+            vec![]
+        }),
+        Signal::BatchNewOrders {
+            market_id, orders, ..
+        } => worker
+            .batch_submit_orders(&market_id, &orders)
+            .unwrap_or_else(|e| {
+                error!("[Executor] Batch place error: {}", e);
+                vec![]
+            }),
+        Signal::BatchCancelOrders {
+            exchange,
+            market_id,
+            client_order_ids,
+            ..
+        } => worker
+            .batch_cancel_orders(exchange, &market_id, &client_order_ids)
+            .unwrap_or_else(|e| {
+                error!("[Executor] Batch cancel error: {}", e);
+                vec![]
+            }),
+        Signal::BatchUpdateOrders {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            ..
+        } => worker
+            .batch_update_orders(
+                exchange,
+                &market_id,
+                &cancel_client_order_ids,
+                &place_orders,
+            )
+            .unwrap_or_else(|e| {
+                error!("[Executor] Batch update error: {}", e);
+                vec![]
+            }),
         _ => vec![],
     }
 }
@@ -4920,9 +5790,8 @@ fn fire_or_execute(
 ) {
     use hexagent_runtime::http1_pool::{acquire, try_acquire, Role};
     // Same stale semantics as the sync path's `is_stale`.
-    let is_stale = |ts: u64| {
-        ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms
-    };
+    let is_stale =
+        |ts: u64| ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms;
     let iid = extract_instance_id(&signal);
 
     match signal {
@@ -4957,9 +5826,12 @@ fn fire_or_execute(
                 }
             }
         }
-        Signal::CancelOrder { exchange, client_order_id, timestamp_ns, .. }
-            if exchange == Exchange::Polymarket && !iid.is_empty() =>
-        {
+        Signal::CancelOrder {
+            exchange,
+            client_order_id,
+            timestamp_ns,
+            ..
+        } if exchange == Exchange::Polymarket && !iid.is_empty() => {
             // A cancel is monotonic while the order is live: unlike a place,
             // age does not make it unsafe. Retain it across temporary pool
             // saturation and wake on permit release instead of reverting the
@@ -4987,9 +5859,11 @@ fn fire_or_execute(
                     let pending = route.cancel_fire(&client_order_id, client);
                     let iid2 = iid;
                     let f: PolyCompletionFn = Box::new(move |r| {
-                        let u = r
-                            .poly_route_mut(&iid2)
-                            .complete_cancel(exchange, &client_order_id, pending);
+                        let u = r.poly_route_mut(&iid2).complete_cancel(
+                            exchange,
+                            &client_order_id,
+                            pending,
+                        );
                         drop(permit);
                         vec![u]
                     });
@@ -5038,7 +5912,9 @@ fn fire_or_execute(
             let cpending = route.cancel_fire(&coid, cclient);
             let iid_c = iid.clone();
             let cf: PolyCompletionFn = Box::new(move |r| {
-                let u = r.poly_route_mut(&iid_c).complete_cancel(exchange, &coid, cpending);
+                let u = r
+                    .poly_route_mut(&iid_c)
+                    .complete_cancel(exchange, &coid, cpending);
                 drop(cancel_permit);
                 vec![u]
             });
@@ -5123,7 +5999,11 @@ fn fire_or_execute(
     }
 }
 
-fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_threshold_ms: u64) -> Vec<OrderUpdate> {
+fn execute_fallback_signal(
+    executor: &mut LiveRouter,
+    signal: Signal,
+    stale_threshold_ms: u64,
+) -> Vec<OrderUpdate> {
     // Tag every `[Executor]` line emitted while this signal executes
     // (place / cancel / reject / trade-layer errors) with the owning
     // instance_id (`exec{iid=<id>}:`), so multi-instance order logs are
@@ -5151,7 +6031,9 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
         }
     };
     let is_stale = |ts: u64| -> bool {
-        if ts == 0 || stale_threshold_ms == 0 { return false; }
+        if ts == 0 || stale_threshold_ms == 0 {
+            return false;
+        }
         let now = now_ns();
         now.saturating_sub(ts) / 1_000_000 > stale_threshold_ms
     };
@@ -5167,9 +6049,12 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
     match signal {
         Signal::NewOrder(order) => {
             if is_stale(order.timestamp_ns) {
-                warn!("[Executor] Signal stale ({}ms > {}ms), dropping NewOrder coid={}",
-                    (now_ns().saturating_sub(order.timestamp_ns))/1_000_000,
-                    stale_threshold_ms, order.client_order_id);
+                warn!(
+                    "[Executor] Signal stale ({}ms > {}ms), dropping NewOrder coid={}",
+                    (now_ns().saturating_sub(order.timestamp_ns)) / 1_000_000,
+                    stale_threshold_ms,
+                    order.client_order_id
+                );
                 return vec![build_exec_rejected_place(&order)];
             }
             let result = if order.exchange == Exchange::Polymarket {
@@ -5182,11 +6067,17 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 Err(e) => {
                     error!("[Executor] Submit error: {}", e);
                     vec![OrderUpdate {
-                        client_order_id: order.client_order_id, exchange: order.exchange,
-                        symbol: order.symbol, side: order.side, exchange_order_id: None,
-                        status: OrderStatus::Rejected, liquidity: None,
-                        filled_quantity: 0.0, remaining_quantity: order.quantity,
-                        avg_fill_price: 0.0, timestamp_ns: now_ns(),
+                        client_order_id: order.client_order_id,
+                        exchange: order.exchange,
+                        symbol: order.symbol,
+                        side: order.side,
+                        exchange_order_id: None,
+                        status: OrderStatus::Rejected,
+                        liquidity: None,
+                        filled_quantity: 0.0,
+                        remaining_quantity: order.quantity,
+                        avg_fill_price: 0.0,
+                        timestamp_ns: now_ns(),
                         trade_id: None,
                         order_audit: None,
                         error: None,
@@ -5194,7 +6085,12 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 }
             }
         }
-        Signal::CancelOrder { exchange, client_order_id, timestamp_ns, .. } => {
+        Signal::CancelOrder {
+            exchange,
+            client_order_id,
+            timestamp_ns,
+            ..
+        } => {
             // Cancellation is monotonic: age can make a replacement quote
             // stale, but never makes pulling the old order unsafe.
             let result = if exchange == Exchange::Polymarket {
@@ -5206,35 +6102,60 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             };
             match result {
                 Ok(update) => vec![update],
-                Err(e) => { error!("[Executor] Cancel error: {}", e); vec![] }
+                Err(e) => {
+                    error!("[Executor] Cancel error: {}", e);
+                    vec![]
+                }
             }
         }
-        Signal::CancelAll { exchange, symbol, .. } => {
+        Signal::CancelAll {
+            exchange, symbol, ..
+        } => {
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).cancel_all(exchange, &symbol)
+                executor
+                    .poly_route_mut(&instance_id)
+                    .cancel_all(exchange, &symbol)
             } else {
                 executor.cancel_all(exchange, &symbol)
             };
             result.unwrap_or_else(|e| {
-                error!("[Executor] Cancel-all error: {}", e); vec![]
+                error!("[Executor] Cancel-all error: {}", e);
+                vec![]
             })
         }
-        Signal::BatchNewOrders { exchange, market_id, orders, .. } => {
+        Signal::BatchNewOrders {
+            exchange,
+            market_id,
+            orders,
+            ..
+        } => {
             let oldest_ts = orders.iter().map(|o| o.timestamp_ns).min().unwrap_or(0);
             if is_stale(oldest_ts) {
-                warn!("[Executor] Signal stale, dropping BatchNewOrders ({} orders)", orders.len());
+                warn!(
+                    "[Executor] Signal stale, dropping BatchNewOrders ({} orders)",
+                    orders.len()
+                );
                 return orders.iter().map(build_exec_rejected_place).collect();
             }
             let result = if exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).batch_submit_orders(&market_id, &orders)
+                executor
+                    .poly_route_mut(&instance_id)
+                    .batch_submit_orders(&market_id, &orders)
             } else {
                 executor.batch_submit_orders(&market_id, &orders)
             };
             result.unwrap_or_else(|e| {
-                error!("[Executor] Batch place error: {}", e); vec![]
+                error!("[Executor] Batch place error: {}", e);
+                vec![]
             })
         }
-        Signal::BatchCancelOrders { exchange, market_id, client_order_ids, timestamp_ns, .. } => {
+        Signal::BatchCancelOrders {
+            exchange,
+            market_id,
+            client_order_ids,
+            timestamp_ns,
+            ..
+        } => {
             let result = if exchange == Exchange::Polymarket {
                 let route = executor.poly_route_mut(&instance_id);
                 route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
@@ -5243,10 +6164,18 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 executor.batch_cancel_orders(exchange, &market_id, &client_order_ids)
             };
             result.unwrap_or_else(|e| {
-                error!("[Executor] Batch cancel error: {}", e); vec![]
+                error!("[Executor] Batch cancel error: {}", e);
+                vec![]
             })
         }
-        Signal::BatchUpdateOrders { exchange, market_id, cancel_client_order_ids, place_orders, timestamp_ns, .. } => {
+        Signal::BatchUpdateOrders {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            ..
+        } => {
             if is_stale(timestamp_ns) {
                 warn!(
                     "[Executor] Signal stale, retaining {} BatchUpdateOrders cancels and dropping {} places",
@@ -5270,18 +6199,32 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 let route = executor.poly_route_mut(&instance_id);
                 route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
                 route.batch_update_orders(
-                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                    exchange,
+                    &market_id,
+                    &cancel_client_order_ids,
+                    &place_orders,
                 )
             } else {
                 executor.batch_update_orders(
-                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                    exchange,
+                    &market_id,
+                    &cancel_client_order_ids,
+                    &place_orders,
                 )
             };
             result.unwrap_or_else(|e| {
-                error!("[Executor] Batch update error: {}", e); vec![]
+                error!("[Executor] Batch update error: {}", e);
+                vec![]
             })
         }
-        Signal::ReplaceOrder { exchange, market_id, cancel_client_order_ids, place_orders, timestamp_ns, .. } => {
+        Signal::ReplaceOrder {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            ..
+        } => {
             if is_stale(timestamp_ns) {
                 warn!(
                     "[Executor] Signal stale, retaining {} ReplaceOrder cancels and dropping {} places",
@@ -5305,15 +6248,22 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
                 let route = executor.poly_route_mut(&instance_id);
                 route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
                 route.replace_order(
-                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                    exchange,
+                    &market_id,
+                    &cancel_client_order_ids,
+                    &place_orders,
                 )
             } else {
                 executor.replace_order(
-                    exchange, &market_id, &cancel_client_order_ids, &place_orders,
+                    exchange,
+                    &market_id,
+                    &cancel_client_order_ids,
+                    &place_orders,
                 )
             };
             result.unwrap_or_else(|e| {
-                error!("[Executor] Replace error: {}", e); vec![]
+                error!("[Executor] Replace error: {}", e);
+                vec![]
             })
         }
         Signal::ReconcilePolymarket {
@@ -5326,7 +6276,12 @@ fn execute_fallback_signal(executor: &mut LiveRouter, signal: Signal, stale_thre
             &pending_cancels,
             &pending_trade_ids,
         ),
-        Signal::PolymarketCancelAllOrders { reason, market, asset_ids, .. } => {
+        Signal::PolymarketCancelAllOrders {
+            reason,
+            market,
+            asset_ids,
+            ..
+        } => {
             let route = executor.poly_route_mut(&instance_id);
             match market {
                 Some(cid) => {
@@ -5412,7 +6367,10 @@ impl LiveRouter {
             let owner = shared.auth.api_key.clone();
             // Tag the route with its instance_id so orders placed through it
             // carry it (TrackedOrder.instance_id) → instance-scoped cancels.
-            poly_routes.insert((*id).clone(), PolymarketTrade::from_shared(shared, &owner, id));
+            poly_routes.insert(
+                (*id).clone(),
+                PolymarketTrade::from_shared(shared, &owner, id),
+            );
         }
         let poly_default_id = keys.first().map(|s| (*s).clone()).unwrap_or_default();
 
@@ -5438,7 +6396,11 @@ impl LiveRouter {
         let polymarket = if !poly_default_id.is_empty() {
             let shared = states.get(&poly_default_id).cloned().unwrap();
             let owner = shared.auth.api_key.clone();
-            Some(PolymarketTrade::from_shared(shared, &owner, &poly_default_id))
+            Some(PolymarketTrade::from_shared(
+                shared,
+                &owner,
+                &poly_default_id,
+            ))
         } else {
             None
         };
@@ -5451,12 +6413,21 @@ impl LiveRouter {
         // once here; any failure logs and leaves the venue disabled rather than
         // aborting the engine.
         let hyperliquid = {
-            let hl_cfg = config.exchanges.iter().find(|e| e.name == "hyperliquid" && e.enabled);
+            let hl_cfg = config
+                .exchanges
+                .iter()
+                .find(|e| e.name == "hyperliquid" && e.enabled);
             let acct = config
                 .strategies
                 .iter()
                 .find(|s| s.enabled && s.name == "hypermaker")
-                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+                .map(|s| {
+                    if s.account_id.is_empty() {
+                        s.instance_id.clone()
+                    } else {
+                        s.account_id.clone()
+                    }
+                });
             match (hl_cfg, acct) {
                 (Some(hl), Some(acct)) if !acct.is_empty() => {
                     let secrets = crate::config::SecretsFile::load_from_config(config);
@@ -5468,7 +6439,9 @@ impl LiveRouter {
                             &hl.api_url_prefix,
                             &hl.wss_url,
                         ) {
-                            Ok(auth) => match crate::exchange::hyperliquid::info::fetch_meta(&auth.info_url()) {
+                            Ok(auth) => match crate::exchange::hyperliquid::info::fetch_meta(
+                                &auth.info_url(),
+                            ) {
                                 Ok(meta) => {
                                     info!(
                                         "[Hyperliquid] executor ready (account_id={}, network={}, account={}, signer={})",
@@ -5477,7 +6450,10 @@ impl LiveRouter {
                                     Some(HyperliquidTrade::new(auth, meta, &acct))
                                 }
                                 Err(e) => {
-                                    error!("[Hyperliquid] meta fetch failed, venue disabled: {}", e);
+                                    error!(
+                                        "[Hyperliquid] meta fetch failed, venue disabled: {}",
+                                        e
+                                    );
                                     None
                                 }
                             },
@@ -5507,52 +6483,66 @@ impl LiveRouter {
         // fetched once here; any failure logs and leaves the venue disabled
         // rather than aborting the engine.
         let aster = {
-            let as_cfg = config.exchanges.iter().find(|e| e.name == "aster" && e.enabled);
+            let as_cfg = config
+                .exchanges
+                .iter()
+                .find(|e| e.name == "aster" && e.enabled);
             let acct = config
                 .strategies
                 .iter()
                 .find(|s| s.enabled && s.name == "astermaker")
-                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+                .map(|s| {
+                    if s.account_id.is_empty() {
+                        s.instance_id.clone()
+                    } else {
+                        s.account_id.clone()
+                    }
+                });
             match (as_cfg, acct) {
                 (Some(ax), Some(acct)) if !acct.is_empty() => {
                     let secrets = crate::config::SecretsFile::load_from_config(config);
                     match secrets.aster.get(&acct) {
-                        Some(cred) => match crate::exchange::aster::auth::AsterAuth::new(
-                            &cred.private_key,
-                            &cred.user_address,
-                            &ax.network,
-                            &ax.api_url_prefix,
-                            &ax.wss_url,
-                        ) {
-                            Ok(auth) => {
-                                // Prewarm the h1.1 pools against the Aster host
-                                // BEFORE the first REST call (exchangeInfo below,
-                                // positionRisk in the strategy factory), then
-                                // keep every pooled connection warm through
-                                // quiet stretches.
-                                hexagent_runtime::http1_pool::spawn_keep_warm(
-                                    "aster",
-                                    format!("{}/fapi/v3/time", auth.rest_base()),
-                                    std::time::Duration::from_secs(20),
-                                );
-                                match crate::exchange::aster::info::fetch_meta(&auth.rest_base()) {
-                                Ok(meta) => {
-                                    info!(
+                        Some(cred) => {
+                            match crate::exchange::aster::auth::AsterAuth::new(
+                                &cred.private_key,
+                                &cred.user_address,
+                                &ax.network,
+                                &ax.api_url_prefix,
+                                &ax.wss_url,
+                            ) {
+                                Ok(auth) => {
+                                    // Prewarm the h1.1 pools against the Aster host
+                                    // BEFORE the first REST call (exchangeInfo below,
+                                    // positionRisk in the strategy factory), then
+                                    // keep every pooled connection warm through
+                                    // quiet stretches.
+                                    hexagent_runtime::http1_pool::spawn_keep_warm(
+                                        "aster",
+                                        format!("{}/fapi/v3/time", auth.rest_base()),
+                                        std::time::Duration::from_secs(20),
+                                    );
+                                    match crate::exchange::aster::info::fetch_meta(
+                                        &auth.rest_base(),
+                                    ) {
+                                        Ok(meta) => {
+                                            info!(
                                         "[Aster] executor ready (account_id={}, network={}, user={}, signer={})",
                                         acct, ax.network, auth.user_address, auth.signer_address,
                                     );
-                                    Some(AsterTrade::new(auth, meta, &acct))
+                                            Some(AsterTrade::new(auth, meta, &acct))
+                                        }
+                                        Err(e) => {
+                                            error!("[Aster] exchangeInfo fetch failed, venue disabled: {}", e);
+                                            None
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    error!("[Aster] exchangeInfo fetch failed, venue disabled: {}", e);
+                                    error!("[Aster] auth build failed (account_id={}), venue disabled: {}", acct, e);
                                     None
                                 }
-                            }},
-                            Err(e) => {
-                                error!("[Aster] auth build failed (account_id={}), venue disabled: {}", acct, e);
-                                None
                             }
-                        },
+                        }
                         None => {
                             error!(
                                 "[Aster] no `[aster.{}]` block in secrets — venue disabled",
@@ -5574,12 +6564,21 @@ impl LiveRouter {
         // price/size decimals) is fetched once here; any failure logs and
         // leaves the venue disabled rather than aborting the engine.
         let lighter = {
-            let lt_cfg = config.exchanges.iter().find(|e| e.name == "lighter" && e.enabled);
+            let lt_cfg = config
+                .exchanges
+                .iter()
+                .find(|e| e.name == "lighter" && e.enabled);
             let acct = config
                 .strategies
                 .iter()
                 .find(|s| s.enabled && s.name == "litmaker")
-                .map(|s| if s.account_id.is_empty() { s.instance_id.clone() } else { s.account_id.clone() });
+                .map(|s| {
+                    if s.account_id.is_empty() {
+                        s.instance_id.clone()
+                    } else {
+                        s.account_id.clone()
+                    }
+                });
             match (lt_cfg, acct) {
                 (Some(lt), Some(acct)) if !acct.is_empty() => {
                     let secrets = crate::config::SecretsFile::load_from_config(config);
@@ -5592,19 +6591,22 @@ impl LiveRouter {
                             &lt.api_url_prefix,
                             &lt.wss_url,
                         ) {
-                            Ok(auth) => match crate::exchange::lighter::info::fetch_meta(&auth.rest_base()) {
-                                Ok(meta) => {
-                                    info!(
+                            Ok(auth) => {
+                                match crate::exchange::lighter::info::fetch_meta(&auth.rest_base())
+                                {
+                                    Ok(meta) => {
+                                        info!(
                                         "[Lighter] executor ready (account_id={}, network={}, account_index={}, api_key_index={})",
                                         acct, lt.network, auth.account_index(), auth.api_key_index(),
                                     );
-                                    Some(LighterTrade::new(auth, meta, &acct))
+                                        Some(LighterTrade::new(auth, meta, &acct))
+                                    }
+                                    Err(e) => {
+                                        error!("[Lighter] orderBookDetails fetch failed, venue disabled: {}", e);
+                                        None
+                                    }
                                 }
-                                Err(e) => {
-                                    error!("[Lighter] orderBookDetails fetch failed, venue disabled: {}", e);
-                                    None
-                                }
-                            },
+                            }
                             Err(e) => {
                                 error!("[Lighter] auth build failed (account_id={}), venue disabled: {}", acct, e);
                                 None
@@ -5628,8 +6630,12 @@ impl LiveRouter {
             poly_routes,
             poly_default_id,
             polymarket,
-            hexmarket: HexmarketTrade::new(hex_private_key, hex_mnemonic, hex_api_host,
-                hex_cfg.map(|e| e.rate_limit_per_second).unwrap_or(10)),
+            hexmarket: HexmarketTrade::new(
+                hex_private_key,
+                hex_mnemonic,
+                hex_api_host,
+                hex_cfg.map(|e| e.rate_limit_per_second).unwrap_or(10),
+            ),
             hyperliquid,
             aster,
             lighter,
@@ -5643,7 +6649,10 @@ impl LiveRouter {
     #[allow(dead_code)]
     fn poly_route_mut(&mut self, instance_id: &str) -> &mut PolymarketTrade {
         if !instance_id.is_empty() && self.poly_routes.contains_key(instance_id) {
-            return self.poly_routes.get_mut(instance_id).expect("contains_key checked");
+            return self
+                .poly_routes
+                .get_mut(instance_id)
+                .expect("contains_key checked");
         }
         if !instance_id.is_empty() {
             warn!(
@@ -5666,9 +6675,9 @@ impl LiveRouter {
     /// The default `PolymarketTrade`, or a clear error if no polymaker
     /// instance is configured (a hypermaker-only deployment).
     fn poly_mut(&mut self) -> Result<&mut PolymarketTrade> {
-        self.polymarket
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("polymarket venue not configured (no polymaker instances)"))
+        self.polymarket.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("polymarket venue not configured (no polymaker instances)")
+        })
     }
 
     /// The Hyperliquid executor, or a clear error if the venue isn't
@@ -5705,7 +6714,10 @@ impl ExchangeTrade for LiveRouter {
             Exchange::Hyperliquid => self.hl_mut()?.submit_order(order),
             Exchange::Aster => self.aster_mut()?.submit_order(order),
             Exchange::Lighter => self.lighter_mut()?.submit_order(order),
-            _ => Err(anyhow::anyhow!("Trading not supported on {:?}", order.exchange)),
+            _ => Err(anyhow::anyhow!(
+                "Trading not supported on {:?}",
+                order.exchange
+            )),
         }
     }
 
@@ -5733,7 +6745,11 @@ impl ExchangeTrade for LiveRouter {
         }
     }
 
-    fn batch_submit_orders(&mut self, market_id: &str, orders: &[OrderRequest]) -> Result<Vec<OrderUpdate>> {
+    fn batch_submit_orders(
+        &mut self,
+        market_id: &str,
+        orders: &[OrderRequest],
+    ) -> Result<Vec<OrderUpdate>> {
         if let Some(first) = orders.first() {
             match first.exchange {
                 Exchange::Hexmarket => self.hexmarket.batch_submit_orders(market_id, orders),
@@ -5754,13 +6770,33 @@ impl ExchangeTrade for LiveRouter {
         }
     }
 
-    fn batch_cancel_orders(&mut self, exchange: Exchange, market_id: &str, client_order_ids: &[String]) -> Result<Vec<OrderUpdate>> {
+    fn batch_cancel_orders(
+        &mut self,
+        exchange: Exchange,
+        market_id: &str,
+        client_order_ids: &[String],
+    ) -> Result<Vec<OrderUpdate>> {
         match exchange {
-            Exchange::Hexmarket => self.hexmarket.batch_cancel_orders(exchange, market_id, client_order_ids),
-            Exchange::Polymarket => self.poly_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
-            Exchange::Hyperliquid => self.hl_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
-            Exchange::Aster => self.aster_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
-            Exchange::Lighter => self.lighter_mut()?.batch_cancel_orders(exchange, market_id, client_order_ids),
+            Exchange::Hexmarket => {
+                self.hexmarket
+                    .batch_cancel_orders(exchange, market_id, client_order_ids)
+            }
+            Exchange::Polymarket => {
+                self.poly_mut()?
+                    .batch_cancel_orders(exchange, market_id, client_order_ids)
+            }
+            Exchange::Hyperliquid => {
+                self.hl_mut()?
+                    .batch_cancel_orders(exchange, market_id, client_order_ids)
+            }
+            Exchange::Aster => {
+                self.aster_mut()?
+                    .batch_cancel_orders(exchange, market_id, client_order_ids)
+            }
+            Exchange::Lighter => {
+                self.lighter_mut()?
+                    .batch_cancel_orders(exchange, market_id, client_order_ids)
+            }
             _ => {
                 let mut updates = Vec::new();
                 for id in client_order_ids {
@@ -5779,27 +6815,48 @@ impl ExchangeTrade for LiveRouter {
         place_orders: &[OrderRequest],
     ) -> Result<Vec<OrderUpdate>> {
         match exchange {
-            Exchange::Hexmarket => self.hexmarket.batch_update_orders(exchange, market_id, cancel_client_order_ids, place_orders),
+            Exchange::Hexmarket => self.hexmarket.batch_update_orders(
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
+            ),
             // Polymarket has its own parallel cancel+place via thread::scope
             // (uses DELETE /orders and POST /orders batch endpoints in
             // parallel). Route straight through so we don't fall back to a
             // serial cancel_order → submit_order loop.
             Exchange::Polymarket => self.poly_mut()?.batch_update_orders(
-                exchange, market_id, cancel_client_order_ids, place_orders,
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
             ),
             Exchange::Hyperliquid => self.hl_mut()?.batch_update_orders(
-                exchange, market_id, cancel_client_order_ids, place_orders,
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
             ),
             Exchange::Aster => self.aster_mut()?.batch_update_orders(
-                exchange, market_id, cancel_client_order_ids, place_orders,
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
             ),
             Exchange::Lighter => self.lighter_mut()?.batch_update_orders(
-                exchange, market_id, cancel_client_order_ids, place_orders,
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
             ),
             _ => {
                 let mut updates = Vec::new();
                 if !cancel_client_order_ids.is_empty() {
-                    updates.extend(self.batch_cancel_orders(exchange, market_id, cancel_client_order_ids)?);
+                    updates.extend(self.batch_cancel_orders(
+                        exchange,
+                        market_id,
+                        cancel_client_order_ids,
+                    )?);
                 }
                 if !place_orders.is_empty() {
                     updates.extend(self.batch_submit_orders(market_id, place_orders)?);
@@ -5833,8 +6890,12 @@ mod market_router_tests {
     }
 
     impl Strategy for HistTestStrategy {
-        fn name(&self) -> &str { "hist-test" }
-        fn instance_id(&self) -> &str { self.id }
+        fn name(&self) -> &str {
+            "hist-test"
+        }
+        fn instance_id(&self) -> &str {
+            self.id
+        }
 
         fn load_hist_data(&self, ts_event: u64) -> Vec<HistDataRequest> {
             self.state.lock().unwrap().load_anchors.push(ts_event);
@@ -5842,7 +6903,11 @@ mod market_router_tests {
         }
 
         fn on_hist_bar(&mut self, bar: &BarData) {
-            self.state.lock().unwrap().bar_open_times.push(bar.open_time_ns);
+            self.state
+                .lock()
+                .unwrap()
+                .bar_open_times
+                .push(bar.open_time_ns);
         }
 
         fn on_hist_data_loaded(&mut self, end_ns: u64) {
@@ -5957,8 +7022,14 @@ mod market_router_tests {
         assert_eq!(stats.unique_loads, 3);
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(loaded_keys.len(), 3);
-        assert_ne!(loaded_keys[0], loaded_keys[1], "different assets must not share");
-        assert_ne!(loaded_keys[0], loaded_keys[2], "different lookbacks must not share");
+        assert_ne!(
+            loaded_keys[0], loaded_keys[1],
+            "different assets must not share"
+        );
+        assert_ne!(
+            loaded_keys[0], loaded_keys[2],
+            "different lookbacks must not share"
+        );
     }
 
     #[test]
@@ -6066,7 +7137,9 @@ mod market_router_tests {
     /// Drain a receiver into a count (non-blocking).
     fn drain(rx: &Receiver<MarketEvent>) -> usize {
         let mut n = 0;
-        while rx.try_recv().is_ok() { n += 1; }
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
         n
     }
 
@@ -6081,11 +7154,17 @@ mod market_router_tests {
                 ..
             }))
         ));
-        assert!(rx.try_recv().is_err(), "Polymarket event must be enqueued once");
+        assert!(
+            rx.try_recv().is_err(),
+            "Polymarket event must be enqueued once"
+        );
 
         forward_recorder_event(Some(&tx), &spot("btc/usd"));
         assert!(matches!(rx.try_recv(), Ok(MarketEvent::SpotPrice(_))));
-        assert!(rx.try_recv().is_err(), "external event must be enqueued once");
+        assert!(
+            rx.try_recv().is_err(),
+            "external event must be enqueued once"
+        );
 
         forward_recorder_event(Some(&tx), &MarketEvent::Exit);
         assert!(matches!(rx.try_recv(), Ok(MarketEvent::Exit)));
@@ -6095,10 +7174,22 @@ mod market_router_tests {
     fn two_instance_map() -> HashMap<String, Vec<usize>> {
         // Instance 0 = BTC, instance 1 = ETH.
         let mut m: HashMap<String, Vec<usize>> = HashMap::new();
-        for s in ["btcusdt", "btc-usd", "btc/usd", "series:btc-up-or-down-5m", "btc-up-or-down-5m"] {
+        for s in [
+            "btcusdt",
+            "btc-usd",
+            "btc/usd",
+            "series:btc-up-or-down-5m",
+            "btc-up-or-down-5m",
+        ] {
             m.entry(s.to_string()).or_default().push(0);
         }
-        for s in ["ethusdt", "eth-usd", "eth/usd", "series:eth-up-or-down-5m", "eth-up-or-down-5m"] {
+        for s in [
+            "ethusdt",
+            "eth-usd",
+            "eth/usd",
+            "series:eth-up-or-down-5m",
+            "eth-up-or-down-5m",
+        ] {
             m.entry(s.to_string()).or_default().push(1);
         }
         m
@@ -6135,7 +7226,9 @@ mod market_router_tests {
         // and the router learns TOKxyz → [0].
         Engine::route_market_event(
             &MarketEvent::Instrument(binary_option("btc-up-or-down-5m", &["TOKxyz"])),
-            &sym, &mut tok, &txs,
+            &sym,
+            &mut tok,
+            &txs,
         );
         assert_eq!(drain(&rx0), 1, "instrument delivered to owner");
         assert_eq!(drain(&rx1), 0);
@@ -6155,7 +7248,14 @@ mod market_router_tests {
         let txs = [tx0, tx1];
 
         // Connected → all instances.
-        Engine::route_market_event(&MarketEvent::Connected { exchange: Exchange::Binance }, &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            &MarketEvent::Connected {
+                exchange: Exchange::Binance,
+            },
+            &sym,
+            &mut tok,
+            &txs,
+        );
         // Unknown spot symbol → broadcast (never dropped).
         Engine::route_market_event(&spot("dogeusdt"), &sym, &mut tok, &txs);
 
@@ -6196,7 +7296,8 @@ mod market_router_tests {
                 timestamp_ns: 1,
                 instance_id: "eth".into(),
             },
-            1, &reg,
+            1,
+            &reg,
         );
         // Cancel-only signal registers nothing.
         Engine::register_place_coids(
@@ -6207,7 +7308,8 @@ mod market_router_tests {
                 instance_id: "btc".into(),
                 timestamp_ns: 1,
             },
-            0, &reg,
+            0,
+            &reg,
         );
         let map = reg.lock().unwrap();
         assert_eq!(map.get("c1"), Some(&0));
@@ -6222,7 +7324,7 @@ mod market_router_tests {
         m.insert("btc01".into(), 0);
         m.insert("btc02".into(), 1);
         m.insert("zhu-03".into(), 2); // instance_id with an internal dash
-        // Prefixed coid → owning instance index.
+                                      // Prefixed coid → owning instance index.
         assert_eq!(owner_from_coid("btc01-1782840607342", &m), Some(0));
         assert_eq!(owner_from_coid("btc02-9", &m), Some(1));
         // rsplit_once('-') keeps the dash-bearing instance_id intact.
@@ -6238,10 +7340,8 @@ mod market_router_tests {
         use hexagent_runtime::http1_pool::Role;
 
         let mut prev = HashMap::new();
-        let lines = admission_log_snapshot(
-            &mut prev,
-            vec![("btc".into(), Role::Cancel, 10, 0, 4, 3)],
-        );
+        let lines =
+            admission_log_snapshot(&mut prev, vec![("btc".into(), Role::Cancel, 10, 0, 4, 3)]);
         let (line, should_warn) = lines.get("btc").unwrap();
         assert!(!should_warn, "a retained cancel is not shed");
         assert!(line.contains("skip+0 retained_wait+4 busy3"));
