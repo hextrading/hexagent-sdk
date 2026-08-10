@@ -15,6 +15,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EPS: f64 = 1e-9;
 
+/// Canonical lookup form for Polymarket order hashes. The CLOB has returned
+/// the same hash with mixed hex casing and, on some paths, without the `0x`
+/// prefix. Keep the original string on [`OrderOwnership`] for API/audit use,
+/// but use this form for every ownership-map key and equality check.
+pub fn normalize_order_id(order_id: &str) -> String {
+    order_id
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| order_id.trim().strip_prefix("0X"))
+        .unwrap_or(order_id.trim())
+        .to_ascii_lowercase()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InstanceAccountSnapshot {
     pub instance_id: String,
@@ -74,6 +87,12 @@ pub struct AccountMonitoringSnapshot {
     pub recovery_pending_orders: usize,
     pub persistence_path: Option<PathBuf>,
     pub persistence_error: Option<String>,
+    pub persistence_writes: u64,
+    pub persistence_write_last_us: u64,
+    pub persistence_write_max_us: u64,
+    pub persistence_flushes: u64,
+    pub persistence_flush_last_us: u64,
+    pub persistence_flush_max_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,15 +287,27 @@ struct SharedAccountState {
     /// admission blocker rather than silently booking zero fee.
     #[serde(default)]
     fee_attribution_pending: HashSet<String>,
-    /// Orders restored from a previous process whose exchange terminal state
-    /// has not yet been proved. These are a distinct, sticky risk-off reason:
-    /// an otherwise matching wallet snapshot must not clear them.
+    /// Orders whose exchange terminal state/fill audit has not yet been proved,
+    /// including both restored orders and runtime Filled-before-trade races.
+    /// These are a distinct sticky risk-off reason: an otherwise matching
+    /// wallet snapshot must not clear them.
     #[serde(default)]
     recovery_pending_orders: HashSet<String>,
     /// Persisted ownership for an instance no longer present in config cannot
     /// be silently reassigned without moving that instance's PnL/inventory.
     #[serde(default)]
     instance_registry_issue: Option<String>,
+    /// Ownership/invariant failures are durable admission blockers. A clean
+    /// wallet snapshot cannot prove that a private trade was attributed to
+    /// the right instance, so these are cleared only by a correct replay or
+    /// the explicit repair API.
+    #[serde(default)]
+    ownership_anomalies: BTreeMap<String, String>,
+    /// Snapshot generations only order concurrent fan-out inside this
+    /// process. They deliberately do not survive restart because the fetch
+    /// generation counter also restarts.
+    #[serde(skip)]
+    last_physical_snapshot_generation: u64,
 }
 
 const PERSISTENCE_VERSION: u32 = 1;
@@ -298,6 +329,9 @@ struct PersistJob {
 struct PersistenceProgress {
     completed_generation: u64,
     last_error: Option<String>,
+    writes: u64,
+    write_last_us: u64,
+    write_max_us: u64,
 }
 
 /// Latest-value asynchronous writer. Serialization and filesystem I/O stay on
@@ -311,6 +345,9 @@ struct AccountPersistence {
     wake: std::sync::mpsc::SyncSender<()>,
     next_generation: AtomicU64,
     progress: Arc<(Mutex<PersistenceProgress>, Condvar)>,
+    flushes: AtomicU64,
+    flush_last_us: AtomicU64,
+    flush_max_us: AtomicU64,
 }
 
 impl AccountPersistence {
@@ -340,6 +377,9 @@ impl AccountPersistence {
             Mutex::new(PersistenceProgress {
                 completed_generation: 0,
                 last_error: None,
+                writes: 0,
+                write_last_us: 0,
+                write_max_us: 0,
             }),
             Condvar::new(),
         ));
@@ -356,11 +396,16 @@ impl AccountPersistence {
                 while rx.recv().is_ok() {
                     loop {
                         let Some(job) = thread_pending.lock().unwrap().take() else { break; };
+                        let started = std::time::Instant::now();
                         let result = write_persisted_account(&thread_path, &job.snapshot);
+                        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
                         let (lock, cv) = &*thread_progress;
                         let mut state = lock.lock().unwrap();
                         state.completed_generation = state.completed_generation.max(job.generation);
                         state.last_error = result.err();
+                        state.writes = state.writes.saturating_add(1);
+                        state.write_last_us = elapsed_us;
+                        state.write_max_us = state.write_max_us.max(elapsed_us);
                         cv.notify_all();
                     }
                 }
@@ -373,6 +418,9 @@ impl AccountPersistence {
             wake,
             next_generation: AtomicU64::new(0),
             progress,
+            flushes: AtomicU64::new(0),
+            flush_last_us: AtomicU64::new(0),
+            flush_max_us: AtomicU64::new(0),
         })
     }
 
@@ -383,8 +431,18 @@ impl AccountPersistence {
     }
 
     fn flush(&self, timeout: Duration) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let record_latency = || {
+            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            self.flush_last_us.store(elapsed_us, Ordering::Relaxed);
+            self.flush_max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+        };
         let target = self.next_generation.load(Ordering::Relaxed);
-        if target == 0 { return Ok(()); }
+        if target == 0 {
+            record_latency();
+            return Ok(());
+        }
         let _ = self.wake.try_send(());
         let (lock, cv) = &*self.progress;
         let progress = lock.lock().unwrap();
@@ -392,24 +450,50 @@ impl AccountPersistence {
             .wait_timeout_while(progress, timeout, |p| p.completed_generation < target)
             .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
         if progress.completed_generation < target && wait.timed_out() {
+            record_latency();
             return Err(format!(
                 "timed out persisting generation {target} to {}",
                 self.path.display()
             ));
         }
         if let Some(error) = &progress.last_error {
+            record_latency();
             return Err(error.clone());
         }
+        record_latency();
         Ok(())
     }
 
     fn last_error(&self) -> Option<String> {
         self.progress.0.lock().ok().and_then(|p| p.last_error.clone())
     }
+
+    fn metrics(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let (writes, write_last_us, write_max_us) = self
+            .progress
+            .0
+            .lock()
+            .map(|progress| {
+                (
+                    progress.writes,
+                    progress.write_last_us,
+                    progress.write_max_us,
+                )
+            })
+            .unwrap_or_default();
+        (
+            writes,
+            write_last_us,
+            write_max_us,
+            self.flushes.load(Ordering::Relaxed),
+            self.flush_last_us.load(Ordering::Relaxed),
+            self.flush_max_us.load(Ordering::Relaxed),
+        )
+    }
 }
 
 fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(snapshot)
+    let bytes = serde_json::to_vec(snapshot)
         .map_err(|error| format!("serialize account ledger {}: {error}", path.display()))?;
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
@@ -424,7 +508,16 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
             .map_err(|error| format!("sync {}: {error}", tmp.display()))?;
     }
     std::fs::rename(&tmp, path)
-        .map_err(|error| format!("rename {} -> {}: {error}", tmp.display(), path.display()))
+        .map_err(|error| format!("rename {} -> {}: {error}", tmp.display(), path.display()))?;
+    // fsyncing only the file does not make the rename durable across sudden
+    // power loss. Persist the parent directory entry as the final commit step.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync ledger directory {}: {error}", parent.display()))
 }
 
 /// Thread-safe account ledger shared by every strategy instance on one wallet.
@@ -474,7 +567,30 @@ impl SharedAccount {
                     account_id,
                 ));
             }
-            persisted.state
+            let mut state = persisted.state;
+            // `oid_to_coid` used to preserve the API's exact casing/prefix.
+            // Rebuild it from durable orders so old ledgers are migrated to
+            // canonical keys and cannot lose attribution after restart.
+            let mut normalized = HashMap::with_capacity(state.orders.len());
+            for order in state.orders.values() {
+                let oid = normalize_order_id(&order.order_id);
+                if oid.is_empty() {
+                    return Err(format!(
+                        "account ledger {} has empty order id for coid `{}`",
+                        path.display(), order.client_order_id,
+                    ));
+                }
+                if let Some(other) = normalized.insert(oid.clone(), order.client_order_id.clone()) {
+                    if other != order.client_order_id {
+                        return Err(format!(
+                            "account ledger {} maps normalized order id `{}` to both `{}` and `{}`",
+                            path.display(), oid, other, order.client_order_id,
+                        ));
+                    }
+                }
+            }
+            state.oid_to_coid = normalized;
+            state
         } else {
             SharedAccountState::default()
         };
@@ -591,11 +707,31 @@ impl SharedAccount {
     pub fn token_interests(&self) -> Vec<TokenInterest> {
         let mut state = self.state.lock().unwrap();
         let now_ms = wall_clock_ms();
+        // Keep a settled winner in the explicit ERC-1155 query scope until
+        // both physical and virtual quantities have been observed at zero.
+        // Otherwise a platform redemption landing after the normal event grace
+        // can be missed because the Data API omits zero-balance rows.
+        let settled_winners_requiring_zero: HashSet<String> = state
+            .settled_token_values
+            .iter()
+            .filter(|(_, value)| **value == 1.0)
+            .filter_map(|(token, _)| {
+                let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
+                let virtual_qty: f64 = state
+                    .instances
+                    .values()
+                    .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
+                    .sum();
+                (physical > EPS || virtual_qty > EPS).then(|| token.clone())
+            })
+            .collect();
         let mut pruned = false;
         for instance in state.instances.values_mut() {
             let before = instance.token_interests.len();
             instance.token_interests.retain(|_, interest| {
                 interest.retire_after_ms.is_none_or(|deadline| deadline > now_ms)
+                    || settled_winners_requiring_zero.contains(&interest.up_token_id)
+                    || settled_winners_requiring_zero.contains(&interest.down_token_id)
             });
             pruned |= instance.token_interests.len() != before;
         }
@@ -759,7 +895,47 @@ impl SharedAccount {
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
     ) {
+        self.apply_scoped_physical_snapshot_inner(
+            None,
+            cash,
+            positions,
+            authoritative_tokens,
+        );
+    }
+
+    /// Apply one account-level fetch generation at most once. Multiple
+    /// strategy workers may receive the same shared-wallet snapshot; equal or
+    /// older generations must not re-run reconciliation or overwrite a newer
+    /// physical view.
+    pub fn apply_scoped_physical_snapshot_versioned(
+        &self,
+        generation: u64,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+    ) -> bool {
+        self.apply_scoped_physical_snapshot_inner(
+            Some(generation),
+            cash,
+            positions,
+            authoritative_tokens,
+        )
+    }
+
+    fn apply_scoped_physical_snapshot_inner(
+        &self,
+        generation: Option<u64>,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
+        if let Some(generation) = generation {
+            if generation == 0 || generation <= state.last_physical_snapshot_generation {
+                return false;
+            }
+            state.last_physical_snapshot_generation = generation;
+        }
         let cash = finite_nonnegative(cash);
         let positions = positions.into_iter()
             .filter_map(|(token, qty)| {
@@ -776,7 +952,7 @@ impl SharedAccount {
                 .collect();
             redistribute_all(&mut state);
             self.schedule_persist(&state);
-            return;
+            return true;
         }
 
         state.physical_cash = cash;
@@ -795,6 +971,7 @@ impl SharedAccount {
         }
         try_attribute_binary_redeem(&mut state);
         self.schedule_persist(&state);
+        true
     }
 
     pub fn is_seeded(&self) -> bool { self.state.lock().unwrap().seeded }
@@ -831,6 +1008,13 @@ impl SharedAccount {
             recompute_reconciliation(&mut state, "startup order recovery");
             self.schedule_persist(&state);
         }
+    }
+
+    pub fn recovery_pending_order_ids(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut pending: Vec<String> = state.recovery_pending_orders.iter().cloned().collect();
+        pending.sort();
+        pending
     }
 
     /// Attribute an externally-confirmed wallet operation to one instance.
@@ -922,6 +1106,11 @@ impl SharedAccount {
             .persistence
             .as_ref()
             .and_then(AccountPersistence::last_error);
+        let persistence_metrics = self
+            .persistence
+            .as_ref()
+            .map(AccountPersistence::metrics)
+            .unwrap_or_default();
         let mut virtual_positions = HashMap::<String, f64>::new();
         let mut reserved_positions = HashMap::<String, f64>::new();
         let mut instances = Vec::with_capacity(state.instances.len());
@@ -968,6 +1157,12 @@ impl SharedAccount {
             recovery_pending_orders: state.recovery_pending_orders.len(),
             persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
             persistence_error,
+            persistence_writes: persistence_metrics.0,
+            persistence_write_last_us: persistence_metrics.1,
+            persistence_write_max_us: persistence_metrics.2,
+            persistence_flushes: persistence_metrics.3,
+            persistence_flush_last_us: persistence_metrics.4,
+            persistence_flush_max_us: persistence_metrics.5,
         }
     }
 
@@ -1057,7 +1252,9 @@ impl SharedAccount {
         if !state.seeded { return Err(ReservationError::AccountNotSeeded); }
         if state.uncertain { return Err(ReservationError::AccountUncertain); }
         if let Some(existing) = state.orders.get(client_order_id) {
-            if existing.order_id == order_id && existing.instance_id == instance_id {
+            if normalize_order_id(&existing.order_id) == normalize_order_id(order_id)
+                && existing.instance_id == instance_id
+            {
                 let ownership = existing.clone();
                 // Retry the latest durable snapshot if a prior async write
                 // failed; never send the idempotent network order until its
@@ -1071,6 +1268,12 @@ impl SharedAccount {
         }
         if !state.instances.contains_key(instance_id) {
             return Err(ReservationError::UnknownInstance(instance_id.into()));
+        }
+        let normalized_order_id = normalize_order_id(order_id);
+        if let Some(existing_coid) = state.oid_to_coid.get(&normalized_order_id) {
+            return Err(ReservationError::InvalidOrder(format!(
+                "order_id `{order_id}` is already owned by client_order_id `{existing_coid}`",
+            )));
         }
 
         // Fee reserve is deliberately conservative: actual Polymarket fees
@@ -1131,7 +1334,9 @@ impl SharedAccount {
             reserved_quantity: reserve_qty,
             status: OrderStatus::Pending,
         };
-        state.oid_to_coid.insert(order_id.into(), client_order_id.into());
+        state
+            .oid_to_coid
+            .insert(normalized_order_id, client_order_id.into());
         state.orders.insert(client_order_id.into(), ownership.clone());
         self.schedule_persist(&state);
         drop(state);
@@ -1145,7 +1350,7 @@ impl SharedAccount {
             // so a persistence outage cannot leak one lock per quote retry.
             let mut state = self.state.lock().unwrap();
             if let Some(order) = state.orders.remove(client_order_id) {
-                state.oid_to_coid.remove(&order.order_id);
+                state.oid_to_coid.remove(&normalize_order_id(&order.order_id));
                 if let Some(instance) = state.instances.get_mut(&order.instance_id) {
                     instance.reserved_cash =
                         (instance.reserved_cash - order.reserved_cash).max(0.0);
@@ -1164,16 +1369,74 @@ impl SharedAccount {
         Ok(ownership)
     }
 
-    pub fn rebind_order_id(&self, client_order_id: &str, order_id: &str) {
-        if client_order_id.is_empty() || order_id.is_empty() { return; }
+    pub fn rebind_order_id(&self, client_order_id: &str, order_id: &str) -> bool {
+        if client_order_id.is_empty() || order_id.is_empty() { return false; }
         let mut state = self.state.lock().unwrap();
-        let old_order_id = state.orders.get(client_order_id).map(|order| order.order_id.clone());
-        if let Some(old) = old_order_id { state.oid_to_coid.remove(&old); }
+        let Some(old_order_id) = state
+            .orders
+            .get(client_order_id)
+            .map(|order| order.order_id.clone())
+        else {
+            set_ownership_anomaly(
+                &mut state,
+                format!("order_binding:{client_order_id}"),
+                format!("cannot bind oid `{order_id}` to unknown coid `{client_order_id}`"),
+            );
+            self.schedule_persist(&state);
+            return false;
+        };
+        let normalized = normalize_order_id(order_id);
+        if let Some(other) = state.oid_to_coid.get(&normalized).cloned() {
+            if other != client_order_id {
+                set_ownership_anomaly(
+                    &mut state,
+                    format!("order_binding:{client_order_id}"),
+                    format!(
+                        "oid `{order_id}` ownership conflict: coid `{client_order_id}` vs `{other}`"
+                    ),
+                );
+                self.schedule_persist(&state);
+                return false;
+            }
+        }
+        let normalized_old = normalize_order_id(&old_order_id);
+        if let Some(other) = state.oid_to_coid.get(&normalized_old).cloned() {
+            if other != client_order_id {
+                set_ownership_anomaly(
+                    &mut state,
+                    format!("order_binding:{client_order_id}"),
+                    format!(
+                        "stored oid `{old_order_id}` ownership conflict: coid `{client_order_id}` vs `{other}`"
+                    ),
+                );
+                self.schedule_persist(&state);
+                return false;
+            }
+        }
+        state.oid_to_coid.remove(&normalized_old);
         if let Some(order) = state.orders.get_mut(client_order_id) {
             order.order_id = order_id.into();
-            state.oid_to_coid.insert(order_id.into(), client_order_id.into());
         }
+        state.oid_to_coid.insert(normalized, client_order_id.into());
+        state
+            .ownership_anomalies
+            .remove(&format!("order_binding:{client_order_id}"));
+        recompute_reconciliation(&mut state, "corrected order ownership mapping");
         self.schedule_persist(&state);
+        true
+    }
+
+    /// Explicit operator repair hook for an ownership anomaly after external
+    /// audit. Runtime code should prefer a correct order/trade replay, which
+    /// clears its own anomaly automatically.
+    pub fn repair_ownership_anomaly(&self, anomaly_key: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.ownership_anomalies.remove(anomaly_key).is_none() {
+            return false;
+        }
+        recompute_reconciliation(&mut state, "explicit ownership repair");
+        self.schedule_persist(&state);
+        true
     }
 
     pub fn order_owner_by_coid(&self, client_order_id: &str) -> Option<String> {
@@ -1183,7 +1446,7 @@ impl SharedAccount {
 
     pub fn order_owner_by_oid(&self, order_id: &str) -> Option<String> {
         let state = self.state.lock().unwrap();
-        let coid = state.oid_to_coid.get(order_id)?;
+        let coid = state.oid_to_coid.get(&normalize_order_id(order_id))?;
         state.orders.get(coid).map(|order| order.instance_id.clone())
     }
 
@@ -1197,6 +1460,27 @@ impl SharedAccount {
             order.status = status;
             self.schedule_persist(&state);
         }
+    }
+
+    /// A terminal exchange order status does not prove that every fill leg has
+    /// reached the trade ledger. Preserve any unconsumed reservation and enter
+    /// the sticky audit gate until those fills are booked. Returns true while
+    /// an audit is still required.
+    pub fn mark_filled_pending_audit(&self, client_order_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(order) = state.orders.get_mut(client_order_id) else {
+            return false;
+        };
+        order.status = OrderStatus::Filled;
+        let pending = order.reserved_cash > EPS || order.reserved_quantity > EPS;
+        if pending {
+            state
+                .recovery_pending_orders
+                .insert(client_order_id.to_string());
+            recompute_reconciliation(&mut state, "terminal fill audit");
+        }
+        self.schedule_persist(&state);
+        pending
     }
 
     /// Release the still-unfilled reservation after an authoritative terminal
@@ -1512,19 +1796,60 @@ impl SharedAccount {
         quantity: f64,
         price: f64,
     ) -> Option<TradeOwnership> {
-        if trade_key.is_empty() || quantity <= 0.0 { return None; }
         let normalized = status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase();
         if normalized == "RETRYING" { return None; }
-        let mut state = self.state.lock().unwrap();
-        let resolved_coid = if !client_order_id.is_empty() {
-            client_order_id.to_string()
-        } else {
-            state.oid_to_coid.get(order_id).cloned().unwrap_or_default()
+        let lifecycle_rank = match normalized.as_str() {
+            "MATCHED" => 1,
+            "MINED" => 2,
+            "CONFIRMED" | "FAILED" => 3,
+            _ => return None,
         };
-        let owner = state.orders.get(&resolved_coid).map(|order| order.instance_id.clone());
-        let Some(instance_id) = owner else {
-            set_uncertain(
+        let mut state = self.state.lock().unwrap();
+        let anomaly_key = if trade_key.is_empty() {
+            format!("trade:<missing>:{order_id}")
+        } else {
+            format!("trade:{trade_key}")
+        };
+        if trade_key.is_empty()
+            || !quantity.is_finite()
+            || quantity <= 0.0
+            || !price.is_finite()
+            || price <= 0.0
+            || price > 1.0 + EPS
+        {
+            set_ownership_anomaly(
                 &mut state,
+                anomaly_key,
+                format!(
+                    "invalid trade `{trade_key}` numeric payload quantity={quantity} price={price}"
+                ),
+            );
+            self.schedule_persist(&state);
+            return None;
+        }
+        let normalized_order_id = normalize_order_id(order_id);
+        let durable_coid = state.oid_to_coid.get(&normalized_order_id).cloned();
+        if !client_order_id.is_empty()
+            && durable_coid.as_deref().is_some_and(|coid| coid != client_order_id)
+        {
+            set_ownership_anomaly(
+                &mut state,
+                anomaly_key.clone(),
+                format!(
+                    "trade `{trade_key}` ownership mapping conflict oid=`{order_id}` runtime_coid=`{client_order_id}` durable_coid=`{}`",
+                    durable_coid.as_deref().unwrap_or_default(),
+                ),
+            );
+            self.schedule_persist(&state);
+            return None;
+        }
+        let resolved_coid = durable_coid
+            .or_else(|| (!client_order_id.is_empty()).then(|| client_order_id.to_string()))
+            .unwrap_or_default();
+        let Some(order) = state.orders.get(&resolved_coid).cloned() else {
+            set_ownership_anomaly(
+                &mut state,
+                anomaly_key.clone(),
                 format!(
                     "unowned trade `{trade_key}` coid=`{resolved_coid}` oid=`{order_id}`"
                 ),
@@ -1532,18 +1857,106 @@ impl SharedAccount {
             self.schedule_persist(&state);
             return None;
         };
+        let stored_order_id = normalize_order_id(&order.order_id);
+        if normalized_order_id.is_empty()
+            || stored_order_id != normalized_order_id
+            || order.token_id != token_id
+            || order.side != side
+        {
+            set_ownership_anomaly(
+                &mut state,
+                anomaly_key.clone(),
+                format!(
+                    "trade `{trade_key}` order invariant mismatch coid=`{resolved_coid}` incoming=(oid=`{order_id}`,token=`{token_id}`,side={side:?}) stored=(oid=`{}`,token=`{}`,side={:?})",
+                    order.order_id, order.token_id, order.side,
+                ),
+            );
+            self.schedule_persist(&state);
+            return None;
+        }
+        let instance_id = order.instance_id;
 
         let existing = state.trades.get(trade_key).cloned();
+        if let Some(applied) = existing.as_ref() {
+            let prior = &applied.ownership;
+            if prior.client_order_id != resolved_coid
+                || normalize_order_id(&prior.order_id) != normalized_order_id
+                || prior.token_id != token_id
+                || prior.side != side
+            {
+                set_ownership_anomaly(
+                    &mut state,
+                    anomaly_key.clone(),
+                    format!(
+                        "trade `{trade_key}` lifecycle ownership changed incoming=(coid=`{resolved_coid}`,oid=`{order_id}`,token=`{token_id}`,side={side:?}) stored=(coid=`{}`,oid=`{}`,token=`{}`,side={:?})",
+                        prior.client_order_id, prior.order_id, prior.token_id, prior.side,
+                    ),
+                );
+                self.schedule_persist(&state);
+                return None;
+            }
+            let quantity_tolerance = 1e-8_f64.max(prior.quantity.abs() * 1e-8);
+            let price_tolerance = 1e-10_f64.max(prior.price.abs() * 1e-8);
+            if (prior.quantity - quantity).abs() > quantity_tolerance
+                || (prior.price - price).abs() > price_tolerance
+            {
+                set_ownership_anomaly(
+                    &mut state,
+                    anomaly_key.clone(),
+                    format!(
+                        "trade `{trade_key}` lifecycle economics changed incoming=(quantity={quantity},price={price}) stored=(quantity={},price={})",
+                        prior.quantity, prior.price,
+                    ),
+                );
+                self.schedule_persist(&state);
+                return None;
+            }
+            let prior_rank = match applied.ownership.status.as_str() {
+                "MATCHED" => 1,
+                "MINED" => 2,
+                "CONFIRMED" | "FAILED" => 3,
+                _ => 0,
+            };
+            // Mirror the user-feed lifecycle gate inside the durable ledger:
+            // terminal states are immutable and replayed same/earlier stages
+            // cannot regress a CONFIRMED row or re-book inventory.
+            if applied.failed
+                || applied.ownership.status == "CONFIRMED"
+                || lifecycle_rank <= prior_rank
+            {
+                state.ownership_anomalies.remove(&anomaly_key);
+                recompute_reconciliation(&mut state, "corrected trade ownership replay");
+                self.schedule_persist(&state);
+                return Some(applied.ownership.clone());
+            }
+        }
+        let price_tolerance = 1e-10_f64.max(order.price.abs() * 1e-8);
+        let violates_limit = match side {
+            Side::Buy => price > order.price + price_tolerance,
+            Side::Sell => price + price_tolerance < order.price,
+        };
+        let quantity_tolerance = 1e-8_f64.max(order.quantity.abs() * 1e-8);
+        let exceeds_order_quantity = existing.is_none()
+            && order.filled_quantity + quantity > order.quantity + quantity_tolerance;
+        if violates_limit || exceeds_order_quantity {
+            set_ownership_anomaly(
+                &mut state,
+                anomaly_key.clone(),
+                format!(
+                    "trade `{trade_key}` violates owned order bounds side={side:?} fill=(quantity={quantity},price={price}) order=(filled={},quantity={},limit={})",
+                    order.filled_quantity, order.quantity, order.price,
+                ),
+            );
+            self.schedule_persist(&state);
+            return None;
+        }
+        state.ownership_anomalies.remove(&anomaly_key);
+        recompute_reconciliation(&mut state, "corrected trade ownership replay");
         let already_booked = existing.as_ref().map(|trade| trade.booked).unwrap_or(false);
         let physical_booked = existing
             .as_ref()
             .map(|trade| trade.physical_booked)
             .unwrap_or(false);
-        // FAILED is a terminal tombstone. A delayed/replayed earlier status
-        // must never resurrect virtual inventory or physical settlement.
-        if existing.as_ref().is_some_and(|trade| trade.failed) {
-            return existing.map(|trade| trade.ownership);
-        }
         let is_failed = normalized == "FAILED";
         let reaches_physical = matches!(normalized.as_str(), "MINED" | "CONFIRMED");
         let should_book = !is_failed && !already_booked;
@@ -1626,11 +2039,24 @@ impl SharedAccount {
             // reconciles the wallet. Releasing here could let a sibling spend
             // collateral/inventory that the exchange still considers locked.
             let relock = if let Some(order) = state.orders.get_mut(&resolved_coid) {
-                let cash = if side == Side::Buy { quantity * order.price } else { 0.0 };
-                let qty = if side == Side::Sell { quantity } else { 0.0 };
+                // A first-sighting FAILED never consumed the original lock.
+                // Only a previously booked fill reversal needs to restore the
+                // quantity/cash that MATCHED released.
+                let cash = if should_reverse && side == Side::Buy {
+                    quantity * order.price
+                } else {
+                    0.0
+                };
+                let qty = if should_reverse && side == Side::Sell {
+                    quantity
+                } else {
+                    0.0
+                };
                 order.reserved_cash += cash;
                 order.reserved_quantity += qty;
-                order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
+                if should_reverse {
+                    order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
+                }
                 order.status = OrderStatus::Failed;
                 (cash, qty, order.token_id.clone())
             } else { (0.0, 0.0, token_id.to_string()) };
@@ -1864,7 +2290,7 @@ impl SharedAccount {
             .collect();
         for (coid, oid) in &stale_orders {
             state.orders.remove(coid);
-            state.oid_to_coid.remove(oid);
+            state.oid_to_coid.remove(&normalize_order_id(oid));
         }
         let stale_trades: Vec<String> = state
             .trades
@@ -2096,7 +2522,22 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         .filter(|(_, qty)| **qty < -EPS)
         .map(|(token, qty)| format!("{token}:{qty:.6}"))
         .collect();
-    if let Some(reason) = state.instance_registry_issue.clone() {
+    if !state.ownership_anomalies.is_empty() {
+        let details = state
+            .ownership_anomalies
+            .iter()
+            .map(|(key, reason)| format!("{key}={reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        set_uncertain(
+            state,
+            format!(
+                "ownership anomalies pending repair: count={} [{}]",
+                state.ownership_anomalies.len(),
+                details,
+            ),
+        );
+    } else if let Some(reason) = state.instance_registry_issue.clone() {
         set_uncertain(state, reason);
     } else if !state.recovery_pending_orders.is_empty() {
         let mut pending: Vec<&str> = state
@@ -2108,7 +2549,7 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         set_uncertain(
             state,
             format!(
-                "startup order recovery pending: count={} coids=[{}]",
+                "order trade audit pending: count={} coids=[{}]",
                 pending.len(),
                 pending.join(","),
             ),
@@ -2150,6 +2591,11 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         clear_uncertain(state);
     }
 
+}
+
+fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: String) {
+    state.ownership_anomalies.insert(key, reason.clone());
+    set_uncertain(state, reason);
 }
 
 /// Polymarket may redeem a winning binary token outside the bot process. The
@@ -2295,6 +2741,99 @@ mod tests {
     }
 
     #[test]
+    fn terminal_filled_status_keeps_reservation_until_trade_audit() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-fill", "oid-fill", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+
+        assert!(account.mark_filled_pending_audit("a-fill"));
+        let pending = account.instance_snapshot("a").unwrap();
+        assert_eq!(pending.reserved_cash, 5.0);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 1);
+        assert!(account.is_uncertain());
+
+        account
+            .apply_trade_transition(
+                "trade-fill",
+                "MATCHED",
+                "a-fill",
+                "oid-fill",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        let audited = account.instance_snapshot("a").unwrap();
+        assert_eq!(audited.reserved_cash, 0.0);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn durable_trade_lifecycle_rejects_replayed_regressions() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-life", "oid-life", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-life",
+                "CONFIRMED",
+                "a-life",
+                "oid-life",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        let before = account.monitoring_snapshot();
+        let replay = account
+            .apply_trade_transition(
+                "trade-life",
+                "MATCHED",
+                "a-life",
+                "oid-life",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(replay.status, "CONFIRMED");
+        let after = account.monitoring_snapshot();
+        assert_eq!(after.physical_cash, before.physical_cash);
+        assert_eq!(after.physical_positions, before.physical_positions);
+    }
+
+    #[test]
+    fn first_sighting_failed_trade_does_not_double_reserve() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-failed", "oid-failed", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+
+        account
+            .apply_trade_transition(
+                "trade-failed",
+                "FAILED",
+                "a-failed",
+                "oid-failed",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+        assert_eq!(account.order("a-failed").unwrap().reserved_cash, 5.0);
+        assert!(account.is_uncertain());
+    }
+
+    #[test]
     fn sell_inventory_cannot_be_double_reserved() {
         let account = SharedAccount::new("acct");
         account.register_instance("a", 1.0);
@@ -2329,13 +2868,13 @@ mod tests {
         );
         assert!(matched.unallocated_cash.abs() < EPS);
         account.apply_trade_transition(
-            "trade:oid-a", "CONFIRMED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
+            "trade:oid-a", "MINED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
         );
         assert_eq!(account.instance_snapshot("a").unwrap().cash, cash);
-        let confirmed = account.monitoring_snapshot();
-        assert_eq!(confirmed.physical_cash, 395.0);
-        assert_eq!(confirmed.physical_positions["UP"], 50.0);
-        assert!(!confirmed.uncertain);
+        let mined = account.monitoring_snapshot();
+        assert_eq!(mined.physical_cash, 395.0);
+        assert_eq!(mined.physical_positions["UP"], 50.0);
+        assert!(!mined.uncertain);
         account.apply_trade_transition(
             "trade:oid-a", "FAILED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
         );
@@ -2364,6 +2903,363 @@ mod tests {
             100.0,
             "late MATCHED cannot resurrect a FAILED tombstone"
         );
+    }
+
+    #[test]
+    fn order_id_lookup_normalizes_hex_case_and_prefix() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-normalized",
+                "0xAaBbCcDd",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            account.order_owner_by_oid("AABBCCDD").as_deref(),
+            Some("a")
+        );
+        let trade = account
+            .apply_trade_transition(
+                "trade-normalized",
+                "MATCHED",
+                "",
+                "0XaAbBcCdD",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(trade.client_order_id, "a-normalized");
+        assert_eq!(trade.instance_id, "a");
+    }
+
+    #[test]
+    fn trade_invariant_mismatch_is_risk_off_and_never_booked() {
+        for (incoming_token, incoming_side, expected_fragment) in [
+            ("DOWN", Side::Buy, "token=`DOWN`"),
+            ("UP", Side::Sell, "side=Sell"),
+        ] {
+            let account = seeded_account();
+            account
+                .reserve_order(
+                    "a",
+                    "a-guarded",
+                    "0xA1B2",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            let before = account.instance_snapshot("a").unwrap();
+
+            assert!(account
+                .apply_trade_transition(
+                    "trade-mismatch",
+                    "MATCHED",
+                    "a-guarded",
+                    "a1b2",
+                    incoming_token,
+                    incoming_side,
+                    10.0,
+                    0.5,
+                )
+                .is_none());
+
+            let after = account.instance_snapshot("a").unwrap();
+            assert_eq!(after.cash, before.cash);
+            assert_eq!(after.positions, before.positions);
+            assert!(account.trades().is_empty());
+            let monitoring = account.monitoring_snapshot();
+            assert!(monitoring.uncertain);
+            assert!(monitoring
+                .uncertain_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(expected_fragment)));
+        }
+    }
+
+    #[test]
+    fn ownership_anomaly_survives_snapshot_and_correct_replay_clears_it() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-sticky",
+                "oid-sticky",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+
+        assert!(account
+            .apply_trade_transition(
+                "trade-sticky",
+                "MATCHED",
+                "a-sticky",
+                "oid-sticky",
+                "DOWN",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .is_none());
+        account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
+        assert!(account.is_uncertain(), "a wallet snapshot cannot repair ownership");
+        assert!(account
+            .monitoring_snapshot()
+            .uncertain_reason
+            .unwrap_or_default()
+            .contains("ownership anomalies pending repair"));
+
+        assert!(account
+            .apply_trade_transition(
+                "trade-sticky",
+                "MATCHED",
+                "a-sticky",
+                "oid-sticky",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .is_some());
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn trade_numeric_limit_cumulative_and_lifecycle_bounds_are_enforced() {
+        for (trade_key, quantity, price) in [
+            ("nan-quantity", f64::NAN, 0.5),
+            ("zero-price", 1.0, 0.0),
+            ("nan-price", 1.0, f64::NAN),
+            ("above-binary-range", 1.0, 1.01),
+        ] {
+            let account = seeded_account();
+            account
+                .reserve_order("a", "a-num", "oid-num", "UP", Side::Buy, 10.0, 0.5, 0)
+                .unwrap();
+            assert!(account
+                .apply_trade_transition(
+                    trade_key,
+                    "MATCHED",
+                    "a-num",
+                    "oid-num",
+                    "UP",
+                    Side::Buy,
+                    quantity,
+                    price,
+                )
+                .is_none());
+            assert!(account.is_uncertain());
+            assert!(account.trades().is_empty());
+        }
+
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-bounds", "oid-bounds", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        assert!(account
+            .apply_trade_transition(
+                "aggressive-fill",
+                "MATCHED",
+                "a-bounds",
+                "oid-bounds",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.51,
+            )
+            .is_none());
+        assert!(account
+            .apply_trade_transition(
+                "oversized-fill",
+                "MATCHED",
+                "a-bounds",
+                "oid-bounds",
+                "UP",
+                Side::Buy,
+                11.0,
+                0.5,
+            )
+            .is_none());
+
+        let lifecycle = seeded_account();
+        lifecycle
+            .reserve_order("a", "a-life-econ", "oid-life-econ", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        lifecycle
+            .apply_trade_transition(
+                "life-econ",
+                "MATCHED",
+                "a-life-econ",
+                "oid-life-econ",
+                "UP",
+                Side::Buy,
+                5.0,
+                0.49,
+            )
+            .unwrap();
+        assert!(lifecycle
+            .apply_trade_transition(
+                "life-econ",
+                "MINED",
+                "a-life-econ",
+                "oid-life-econ",
+                "UP",
+                Side::Buy,
+                5.1,
+                0.49,
+            )
+            .is_none());
+        assert!(lifecycle.is_uncertain());
+        lifecycle
+            .apply_trade_transition(
+                "life-econ",
+                "MINED",
+                "a-life-econ",
+                "oid-life-econ",
+                "UP",
+                Side::Buy,
+                5.0,
+                0.49,
+            )
+            .unwrap();
+        assert!(!lifecycle.is_uncertain());
+    }
+
+    #[test]
+    fn physical_snapshot_generation_ignores_duplicate_and_stale_fanout() {
+        let account = SharedAccount::new("acct");
+        account.register_instance("a", 1.0);
+        assert!(account.apply_scoped_physical_snapshot_versioned(
+            2,
+            400.0,
+            HashMap::new(),
+            HashSet::new(),
+        ));
+        assert!(!account.apply_scoped_physical_snapshot_versioned(
+            2,
+            100.0,
+            HashMap::new(),
+            HashSet::new(),
+        ));
+        assert!(!account.apply_scoped_physical_snapshot_versioned(
+            1,
+            200.0,
+            HashMap::new(),
+            HashSet::new(),
+        ));
+        assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
+        assert!(account.apply_scoped_physical_snapshot_versioned(
+            3,
+            500.0,
+            HashMap::new(),
+            HashSet::new(),
+        ));
+        assert_eq!(account.monitoring_snapshot().physical_cash, 500.0);
+    }
+
+    #[test]
+    fn runtime_and_durable_order_mapping_conflict_is_never_booked() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-owned", "oid-a", "UP", Side::Buy, 5.0, 0.5, 0)
+            .unwrap();
+        account
+            .reserve_order("b", "b-owned", "oid-b", "UP", Side::Buy, 5.0, 0.5, 0)
+            .unwrap();
+        let before_a = account.instance_snapshot("a").unwrap();
+        let before_b = account.instance_snapshot("b").unwrap();
+
+        assert!(account
+            .apply_trade_transition(
+                "trade-conflict",
+                "MATCHED",
+                "b-owned",
+                "oid-a",
+                "UP",
+                Side::Buy,
+                5.0,
+                0.5,
+            )
+            .is_none());
+
+        assert_eq!(account.instance_snapshot("a").unwrap().cash, before_a.cash);
+        assert_eq!(account.instance_snapshot("b").unwrap().cash, before_b.cash);
+        assert!(account.trades().is_empty());
+        let monitoring = account.monitoring_snapshot();
+        assert!(monitoring.uncertain);
+        assert!(monitoring
+            .uncertain_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("ownership mapping conflict")));
+    }
+
+    #[test]
+    fn trade_lifecycle_cannot_switch_to_another_order_owner() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-owned", "oid-a", "UP", Side::Buy, 5.0, 0.5, 0)
+            .unwrap();
+        account
+            .reserve_order("b", "b-owned", "oid-b", "UP", Side::Buy, 5.0, 0.5, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "one-taker-trade",
+                "MATCHED",
+                "a-owned",
+                "oid-a",
+                "UP",
+                Side::Buy,
+                5.0,
+                0.5,
+            )
+            .unwrap();
+        let before_a = account.instance_snapshot("a").unwrap();
+        let before_b = account.instance_snapshot("b").unwrap();
+
+        assert!(account
+            .apply_trade_transition(
+                "one-taker-trade",
+                "MINED",
+                "b-owned",
+                "oid-b",
+                "UP",
+                Side::Buy,
+                5.0,
+                0.5,
+            )
+            .is_none());
+
+        assert_eq!(account.instance_snapshot("a").unwrap().cash, before_a.cash);
+        assert_eq!(account.instance_snapshot("b").unwrap().cash, before_b.cash);
+        let stored = account
+            .trades()
+            .into_iter()
+            .find(|trade| trade.trade_key == "one-taker-trade")
+            .unwrap();
+        assert_eq!(stored.client_order_id, "a-owned");
+        assert_eq!(stored.status, "MATCHED");
+        let monitoring = account.monitoring_snapshot();
+        assert!(monitoring.uncertain);
+        assert!(monitoring
+            .uncertain_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("lifecycle ownership changed")));
     }
 
     #[test]
@@ -2426,7 +3322,7 @@ mod tests {
         account
             .apply_trade_transition(
                 "trade-fee:oid-fee",
-                "CONFIRMED",
+                "MINED",
                 "a-fee",
                 "oid-fee",
                 "UP",
@@ -2437,13 +3333,13 @@ mod tests {
             .unwrap();
         assert!(account.apply_trade_fee_transition(
             "trade-fee:oid-fee",
-            OrderStatus::Filled,
+            OrderStatus::PartiallyFilled,
             0.0,
             0.2,
         ));
-        let confirmed = account.monitoring_snapshot();
-        assert!((confirmed.physical_positions["UP"] - 49.8).abs() < EPS);
-        assert!(!confirmed.uncertain);
+        let mined = account.monitoring_snapshot();
+        assert!((mined.physical_positions["UP"] - 49.8).abs() < EPS);
+        assert!(!mined.uncertain);
 
         account
             .apply_trade_transition(
@@ -2692,6 +3588,43 @@ mod tests {
     }
 
     #[test]
+    fn expired_interest_is_retained_until_settled_winner_reaches_zero() {
+        let account = SharedAccount::new("late-platform-redeem");
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account.apply_physical_snapshot(
+            100.0,
+            HashMap::from([("BTC-WIN".into(), 30.0)]),
+        );
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0),
+            ("BTC-LOSE".into(), 0.0),
+        ]));
+        {
+            let mut state = account.state.lock().unwrap();
+            state
+                .instances
+                .get_mut("btc")
+                .unwrap()
+                .token_interests
+                .get_mut("btc-event")
+                .unwrap()
+                .retire_after_ms = Some(0);
+        }
+
+        assert_eq!(account.token_interests().len(), 1);
+        account.apply_scoped_physical_snapshot(
+            130.0,
+            HashMap::new(),
+            HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+        );
+        assert!(account.token_interests().is_empty());
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 130.0);
+    }
+
+    #[test]
     fn equal_cash_and_token_delta_is_not_redeem_without_settlement_proof() {
         let account = SharedAccount::new("ordinary-sale");
         account.register_instance("btc", 1.0);
@@ -2756,6 +3689,11 @@ mod tests {
                 "btc", "btc-1", "oid-btc-1", "BTC-UP", Side::Sell, 5.0, 0.5, 0,
             ).unwrap();
             account.flush_persistence(Duration::from_secs(2)).unwrap();
+            let metric = account.monitoring_snapshot();
+            assert!(metric.persistence_writes > 0);
+            assert!(metric.persistence_flushes > 0);
+            assert!(metric.persistence_write_max_us >= metric.persistence_write_last_us);
+            assert!(metric.persistence_flush_max_us >= metric.persistence_flush_last_us);
             assert!(
                 SharedAccount::new_persistent("durable", &path).is_err(),
                 "a second process must not open the live ledger",

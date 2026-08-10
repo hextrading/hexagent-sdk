@@ -3936,6 +3936,11 @@ fn run_split_one(
 pub struct MaintenanceJob {
     pub split_series_id: Option<String>,
     pub split_end_date_min_secs: u64,
+    /// Resolved exact event target. The account worker fills these before
+    /// coalescing so jobs are aggregated only when they will call
+    /// splitPosition for the same condition id.
+    pub split_target_condition_id: Option<String>,
+    pub split_target_token_ids: Vec<String>,
     pub split_amount_usdc: f64,
     pub min_safety_balance_usdc: f64,
     pub gas_via_signer: bool,
@@ -4005,11 +4010,13 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
                     while let Ok(next) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         burst.push(next);
                     }
+                    for (job, _, _) in &mut burst {
+                        resolve_maintenance_split_target(job);
+                    }
                     let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
                     for item in burst {
                         if let Some(group) = groups.iter_mut().find(|group| {
-                            group[0].0.split_series_id == item.0.split_series_id
-                                && group[0].0.gas_via_signer == item.0.gas_via_signer
+                            maintenance_jobs_share_target(&group[0].0, &item.0)
                         }) {
                             group.push(item);
                         } else {
@@ -4033,6 +4040,48 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
     });
     if let Err(e) = tx.send((job, done, std::time::Instant::now())) {
         log::warn!("[Maintenance] enqueue failed (worker gone): {}", e);
+    }
+}
+
+fn maintenance_jobs_share_target(left: &MaintenanceJob, right: &MaintenanceJob) -> bool {
+    if left.gas_via_signer != right.gas_via_signer {
+        return false;
+    }
+    match (
+        left.split_target_condition_id.as_deref(),
+        right.split_target_condition_id.as_deref(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => {
+            left.split_series_id == right.split_series_id
+                && left.split_end_date_min_secs == right.split_end_date_min_secs
+        }
+        _ => false,
+    }
+}
+
+fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
+    if job.split_target_condition_id.as_deref().is_some_and(|cid| !cid.is_empty()) {
+        return;
+    }
+    let Some(series_id) = job.split_series_id.as_deref() else { return; };
+    match super::market::fetch_next_event(series_id, job.split_end_date_min_secs) {
+        Ok(Some(event)) => {
+            if let Some(market) = event
+                .markets
+                .first()
+                .filter(|market| !market.condition_id.is_empty())
+            {
+                job.split_target_condition_id = Some(market.condition_id.clone());
+                job.split_target_token_ids = market.clob_token_ids.clone();
+            }
+        }
+        Ok(None) => {
+            log::info!("[Maintenance] Split skipped: no matching next event.");
+        }
+        Err(error) => {
+            log::warn!("[Maintenance] fetch_next_event failed: {}", error);
+        }
     }
 }
 
@@ -4115,7 +4164,9 @@ fn run_maintenance_job(
 ) {
     let MaintenanceJob {
         split_series_id,
-        split_end_date_min_secs,
+        split_end_date_min_secs: _,
+        split_target_condition_id,
+        split_target_token_ids,
         split_amount_usdc,
         min_safety_balance_usdc,
         gas_via_signer,
@@ -4187,31 +4238,11 @@ fn run_maintenance_job(
             }
             let redeem_ok = redeem_result.all_ok();
 
-            // ── Step 2: look up next event (serial, after redeem) ──
+            // ── Step 2: use the exact event resolved before coalescing ──
             log::info!("[Maintenance] Step 2/2: Split seed inventory for next event");
-            let next_market: Option<(String, Vec<String>)> = match split_series_id.as_deref() {
-                None => {
-                    log::info!("[Maintenance] Split skipped: no series_id provided.");
-                    None
-                }
-                Some(sid) => {
-                    match super::market::fetch_next_event(sid, split_end_date_min_secs) {
-                        Ok(Some(event)) => {
-                            event.markets.first()
-                                .map(|m| (m.condition_id.clone(), m.clob_token_ids.clone()))
-                                .filter(|(condition_id, _)| !condition_id.is_empty())
-                        }
-                        Ok(None) => {
-                            log::info!("[Maintenance] Split skipped: no matching next event.");
-                            None
-                        }
-                        Err(e) => {
-                            log::warn!("[Maintenance] fetch_next_event failed: {}", e);
-                            None
-                        }
-                    }
-                }
-            };
+            let next_market = split_target_condition_id
+                .filter(|condition_id| !condition_id.is_empty())
+                .map(|condition_id| (condition_id, split_target_token_ids));
 
             // ── Step 3: split seed inventory ──
             // Split is the GATING step for whether the next event has
@@ -4439,6 +4470,8 @@ pub fn run_split() -> Result<()> {
     run_maintenance_blocking(MaintenanceJob {
         split_series_id: Some(series_id),
         split_end_date_min_secs: end_date_min_secs,
+        split_target_condition_id: None,
+        split_target_token_ids: Vec::new(),
         split_amount_usdc: amount_usdc,
         min_safety_balance_usdc: amount_usdc,
         gas_via_signer,
@@ -4459,6 +4492,39 @@ pub fn run_split() -> Result<()> {
 #[cfg(test)]
 mod maintenance_status_tests {
     use super::*;
+
+    fn maintenance_job(target: Option<&str>, end_date_min_secs: u64) -> MaintenanceJob {
+        MaintenanceJob {
+            split_series_id: Some("series".to_string()),
+            split_end_date_min_secs: end_date_min_secs,
+            split_target_condition_id: target.map(str::to_string),
+            split_target_token_ids: Vec::new(),
+            split_amount_usdc: 30.0,
+            min_safety_balance_usdc: 30.0,
+            gas_via_signer: false,
+            redeem_enabled: false,
+            status: None,
+            account_id: "account".to_string(),
+            instance_id: "instance".to_string(),
+            account_state: None,
+        }
+    }
+
+    #[test]
+    fn maintenance_coalescing_requires_the_exact_resolved_event() {
+        let event_a_early = maintenance_job(Some("event-a"), 100);
+        let event_a_late = maintenance_job(Some("event-a"), 200);
+        let event_b = maintenance_job(Some("event-b"), 100);
+        assert!(maintenance_jobs_share_target(&event_a_early, &event_a_late));
+        assert!(!maintenance_jobs_share_target(&event_a_early, &event_b));
+
+        let unresolved_early = maintenance_job(None, 100);
+        let unresolved_late = maintenance_job(None, 200);
+        assert!(!maintenance_jobs_share_target(
+            &unresolved_early,
+            &unresolved_late,
+        ));
+    }
 
     #[test]
     fn ctf_position_id_accepts_decimal_and_hex_uint256() {
