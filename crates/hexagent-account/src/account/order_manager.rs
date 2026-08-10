@@ -57,6 +57,8 @@ pub enum LocalOrderStatus {
     /// the whole map is freed when the OM is torn down at event expiry, so
     /// kept-Cancelled entries are bounded to one event.
     Cancelled,
+    /// Fully matched, but retained because a constituent trade may fail.
+    Matched,
 }
 
 /// Outcome of [`OrderManager::on_signal_dropped`] — tells the caller how the
@@ -321,7 +323,8 @@ impl OrderManager {
             }
             LocalOrderStatus::Cancelling
             | LocalOrderStatus::Rejected
-            | LocalOrderStatus::Cancelled => None,
+            | LocalOrderStatus::Cancelled
+            | LocalOrderStatus::Matched => None,
         }
     }
 
@@ -333,7 +336,10 @@ impl OrderManager {
         if !matches!(
             update.status,
             OrderStatus::Accepted | OrderStatus::PartiallyFilled
-        ) || !self.cancel_intents.remove(&update.client_order_id)
+        ) && !(update.status == OrderStatus::Failed
+            && update.filled_quantity > 0.0
+            && update.trade_id.as_deref().is_some_and(|id| !id.is_empty()))
+            || !self.cancel_intents.remove(&update.client_order_id)
         {
             return None;
         }
@@ -447,7 +453,7 @@ impl OrderManager {
                         self.symbol, update.client_order_id, order.side,
                         cumulative.max(update.filled_quantity), order.quantity, tolerance,
                     );
-                    self.orders.remove(&update.client_order_id);
+                    order.status = LocalOrderStatus::Matched;
                     self.cancel_intents.remove(&update.client_order_id);
                 }
             }
@@ -473,6 +479,22 @@ impl OrderManager {
                 );
                 self.orders.remove(&update.client_order_id);
                 self.cancel_intents.remove(&update.client_order_id);
+            }
+            OrderStatus::Failed
+                if update.filled_quantity > 0.0
+                    && update.trade_id.as_deref().is_some_and(|id| !id.is_empty()) =>
+            {
+                let trade_id = update.trade_id.as_deref().unwrap_or_default();
+                order.filled_by_trade.remove(trade_id);
+                let cumulative: f64 = order.filled_by_trade.values().sum();
+                let tolerance = (order.quantity * 0.01).max(1e-9);
+                if !matches!(order.status, LocalOrderStatus::Cancelled | LocalOrderStatus::Rejected) {
+                    order.status = if cumulative >= order.quantity - tolerance {
+                        LocalOrderStatus::Matched
+                    } else {
+                        LocalOrderStatus::Active
+                    };
+                }
             }
             OrderStatus::Failed => {
                 log::warn!(
@@ -977,7 +999,30 @@ mod tests {
         let mut covered = om();
         covered.inject_open_order("covered".into(), Side::Buy, 0.40, 10.0);
         let _ = covered.on_order_update(&fill("covered", "t1", 9.9));
-        assert_eq!(covered.open_count(), 0, "99% retires the local order");
+        assert_eq!(covered.open_count(), 1, "99% retains a reversible tombstone");
+        assert_eq!(covered.live_count(Side::Buy), 0);
+        assert_eq!(covered.orders["covered"].status, LocalOrderStatus::Matched);
+
+        let mut failed = fill("covered", "t1", 9.9);
+        failed.status = OrderStatus::Failed;
+        let _ = covered.on_order_update(&failed);
+        assert_eq!(covered.orders["covered"].status, LocalOrderStatus::Active);
+        assert_eq!(covered.live_count(Side::Buy), 1);
+    }
+
+    #[test]
+    fn private_failed_releases_cancel_intent_for_parent_residual() {
+        let mut m = om();
+        let coid = place(&mut m, Side::Buy, 0.40, 5.0);
+        assert!(m.request_cancel(&coid, 2).is_none());
+        assert!(m.has_cancel_intent(&coid));
+
+        let mut failed = upd(&coid, Side::Buy, OrderStatus::Failed);
+        failed.trade_id = Some("failed-trade".into());
+        failed.filled_quantity = 1.0;
+        let signal = m.on_order_update(&failed).expect("residual must be cancelled");
+        assert!(matches!(signal, Signal::CancelOrder { .. }));
+        assert_eq!(m.orders[&coid].status, LocalOrderStatus::Cancelling);
     }
 
     #[test]

@@ -112,7 +112,7 @@ fn quarantine_strategy_worker(
         instance_id,
     };
     if let Err(error) = signal_tx.send_timeout(cancel, std::time::Duration::from_millis(500)) {
-        error!("[strategy_supervisor] failed to enqueue emergency account cancel for worker index={idx}: {error}");
+        error!("[strategy_supervisor] failed to enqueue emergency instance cancel for worker index={idx}: {error}");
     }
     true
 }
@@ -4013,15 +4013,12 @@ impl Engine {
                                 let owner = coid_owner.lock().unwrap()
                                     .get(&u.client_order_id).copied()
                                     .or_else(|| owner_from_coid(&u.client_order_id, &iid_to_idx));
-                                let terminal = matches!(
-                                    u.status,
-                                    OrderStatus::Filled | OrderStatus::Cancelled
-                                        | OrderStatus::Rejected | OrderStatus::Failed
-                                );
+                                let terminal = matches!(u.status, OrderStatus::Cancelled | OrderStatus::Rejected)
+                                    || (matches!(u.status, OrderStatus::Filled | OrderStatus::Failed)
+                                        && u.trade_id.as_deref().is_none_or(str::is_empty));
                                 let terminal_coid = terminal.then(|| u.client_order_id.clone());
-                                match owner {
-                                    Some(i) if i < update_txs.len()
-                                        && !worker_quarantined[i].load(Ordering::Acquire) => {
+                                match classify_private_update_route(owner, update_txs.len(), &worker_quarantined) {
+                                    PrivateUpdateRoute::Owner(i) => {
                                         // Common path: transfer ownership to
                                         // one worker without cloning payload.
                                         let _ = update_txs[i].send(QueuedOrderUpdate {
@@ -4029,7 +4026,14 @@ impl Engine {
                                             enqueued_at: std::time::Instant::now(),
                                         });
                                     }
-                                    _ => {
+                                    PrivateUpdateRoute::DropQuarantined(i) => {
+                                        warn!("[strategy_router] dropping private update for quarantined owner instance={} coid={}",
+                                            instance_ids.get(i).map(String::as_str).unwrap_or(""), u.client_order_id);
+                                    }
+                                    PrivateUpdateRoute::DropInvalid(i) => {
+                                        error!("[strategy_router] invalid owner index={} coid={}", i, u.client_order_id);
+                                    }
+                                    PrivateUpdateRoute::Broadcast => {
                                         let enqueued_at = std::time::Instant::now();
                                         for (idx, tx) in update_txs.iter().enumerate() {
                                             if worker_quarantined[idx].load(Ordering::Acquire) {
@@ -6204,6 +6208,20 @@ fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<us
     iid_to_idx.get(iid).copied()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateUpdateRoute { Owner(usize), Broadcast, DropQuarantined(usize), DropInvalid(usize) }
+
+fn classify_private_update_route(
+    owner: Option<usize>, worker_count: usize, quarantined: &[Arc<AtomicBool>],
+) -> PrivateUpdateRoute {
+    match owner {
+        Some(i) if i >= worker_count || i >= quarantined.len() => PrivateUpdateRoute::DropInvalid(i),
+        Some(i) if quarantined[i].load(Ordering::Acquire) => PrivateUpdateRoute::DropQuarantined(i),
+        Some(i) => PrivateUpdateRoute::Owner(i),
+        None => PrivateUpdateRoute::Broadcast,
+    }
+}
+
 // ── Signal Execution Helpers ─────────────────────────────────────────────
 
 /// Parse `BinaryOption.event_start_time` (ISO 8601, e.g. `"2026-03-29T06:10:00Z"`)
@@ -6967,8 +6985,15 @@ fn execute_fallback_signal(
                     route.cancel_market_orders(&cid, &asset_ids);
                 }
                 None => {
-                    warn!("[Executor] PolymarketCancelAllOrders account-wide (instance_id={}): reason={}", instance_id, reason);
-                    route.cancel_all_orders();
+                    if instance_id.is_empty() {
+                        warn!("[Executor] PolymarketCancelAllOrders account-wide: reason={}", reason);
+                        route.cancel_all_orders();
+                    } else {
+                        return route.cancel_instance_orders().unwrap_or_else(|error| {
+                            error!("[Executor] instance-scoped emergency cancel failed instance_id={}: {}", instance_id, error);
+                            vec![]
+                        });
+                    }
                 }
             }
             vec![]
@@ -8052,7 +8077,7 @@ mod market_router_tests {
     }
 
     #[test]
-    fn worker_quarantine_is_idempotent_and_enqueues_account_cancel() {
+    fn worker_quarantine_is_idempotent_and_enqueues_instance_cancel() {
         let (signal_tx, signal_rx) = bounded::<Signal>(4);
         let flags = vec![Arc::new(AtomicBool::new(false))];
         let instances = vec!["btc01".to_string()];
@@ -8072,6 +8097,30 @@ mod market_router_tests {
             0, "duplicate", &instances, &flags, &signal_tx,
         ));
         assert!(signal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn known_quarantined_private_owner_never_broadcasts_to_siblings() {
+        let flags = vec![
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        assert_eq!(
+            classify_private_update_route(Some(0), 2, &flags),
+            PrivateUpdateRoute::DropQuarantined(0),
+        );
+        assert_eq!(
+            classify_private_update_route(Some(1), 2, &flags),
+            PrivateUpdateRoute::Owner(1),
+        );
+        assert_eq!(
+            classify_private_update_route(None, 2, &flags),
+            PrivateUpdateRoute::Broadcast,
+        );
+        assert_eq!(
+            classify_private_update_route(Some(9), 2, &flags),
+            PrivateUpdateRoute::DropInvalid(9),
+        );
     }
 
     #[test]

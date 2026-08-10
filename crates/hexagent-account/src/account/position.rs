@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use log::info;
 
 use crate::account::orderbook::OrderbookManager;
+use crate::account::shared_account::RestoredTrade;
 use crate::types::{Liquidity, OrderStatus, OrderUpdate, Side};
 
 /// A single position snapshot for a symbol. Produced on demand from the
@@ -39,6 +40,15 @@ pub enum TradeStatus {
 }
 
 impl TradeStatus {
+    pub fn from_polymarket_str(status: &str) -> Option<Self> {
+        match status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase().as_str() {
+            "MATCHED" => Some(Self::Matched),
+            "MINED" => Some(Self::Mined),
+            "CONFIRMED" => Some(Self::Confirmed),
+            "FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
     pub fn is_terminal(&self) -> bool {
         matches!(self, TradeStatus::Confirmed | TradeStatus::Failed)
     }
@@ -121,6 +131,7 @@ pub struct PendingOrder {
     pub symbol: String,
     pub side: Side,
     pub price: f64,
+    pub original_quantity: f64,
     /// Remaining (unfilled) quantity. Decrements on PartiallyFilled updates
     /// and the entry is removed entirely on Filled / Cancelled / Rejected.
     pub remaining_quantity: f64,
@@ -191,6 +202,52 @@ impl PositionManager {
         Self::with_initial_quantities(initial, balance)
     }
 
+    pub fn with_positions_and_restored_trades(
+        positions: HashMap<String, Position>,
+        balance: f64,
+        rows: impl IntoIterator<Item = RestoredTrade>,
+    ) -> Self {
+        let mut manager = Self::with_positions(positions, balance);
+        for row in rows {
+            let ownership = row.ownership;
+            let Some(status) = TradeStatus::from_polymarket_str(&ownership.status) else { continue; };
+            if ownership.trade_key.trim().is_empty() || ownership.token_id.trim().is_empty()
+                || !ownership.quantity.is_finite() || ownership.quantity <= 0.0
+                || !ownership.price.is_finite() || ownership.price <= 0.0
+                || ownership.price > 1.0 + 1e-8
+                || !row.usdc_fee.is_finite() || row.usdc_fee < 0.0
+                || !row.shares_fee.is_finite() || row.shares_fee < 0.0
+            { continue; }
+            if row.booked && status != TradeStatus::Failed {
+                let cash_delta = match ownership.side {
+                    Side::Buy => -ownership.quantity * ownership.price,
+                    Side::Sell => ownership.quantity * ownership.price - row.usdc_fee,
+                };
+                manager.init_balance -= cash_delta;
+                let position_delta = match ownership.side {
+                    Side::Buy => ownership.quantity - row.shares_fee,
+                    Side::Sell => -ownership.quantity,
+                };
+                *manager.init_positions.entry(ownership.token_id.clone()).or_insert(0.0) -= position_delta;
+                let notional = ownership.quantity * ownership.price;
+                if row.is_maker { manager.maker_volume += notional; }
+                else { manager.taker_volume += notional; }
+            }
+            manager.trades.insert(ownership.trade_key.clone(), TradeRecord {
+                trade_id: ownership.trade_key,
+                asset_id: ownership.token_id,
+                side: ownership.side,
+                size: ownership.quantity,
+                price: ownership.price,
+                status,
+                is_maker: row.is_maker,
+                usdc_fee: row.usdc_fee,
+                shares_fee: row.shares_fee,
+            });
+        }
+        manager
+    }
+
     // ════════════════════════════════════════════════════════════════
     // Ledger mutations
     // ════════════════════════════════════════════════════════════════
@@ -238,11 +295,34 @@ impl PositionManager {
         // pushes that arrive without error metadata).
         error: Option<&str>,
     ) -> UpsertResult {
-        if size <= 0.0 || trade_id.is_empty() {
+        if trade_id.trim().is_empty() || asset_id.trim().is_empty()
+            || !size.is_finite() || size <= 0.0
+            || !price.is_finite() || price <= 0.0 || price > 1.0 + 1e-8
+            || !usdc_fee.is_finite() || usdc_fee < 0.0
+            || !shares_fee.is_finite() || shares_fee < 0.0
+        {
             return UpsertResult::NOOP;
         }
 
-        let prev_status = self.trades.get(trade_id).map(|r| r.status);
+        let existing = self.trades.get(trade_id);
+        if let Some(existing) = existing {
+            let size_tolerance = 1e-8_f64.max(existing.size.abs() * 1e-8);
+            let price_tolerance = 1e-10_f64.max(existing.price.abs() * 1e-8);
+            let usdc_fee_tolerance = 1e-10_f64.max(existing.usdc_fee.abs() * 1e-8);
+            let shares_fee_tolerance = 1e-10_f64.max(existing.shares_fee.abs() * 1e-8);
+            if existing.asset_id != asset_id || existing.side != side
+                || existing.is_maker != is_maker
+                || (existing.size - size).abs() > size_tolerance
+                || (existing.price - price).abs() > price_tolerance
+                || (existing.usdc_fee - usdc_fee).abs() > usdc_fee_tolerance
+                || (existing.shares_fee - shares_fee).abs() > shares_fee_tolerance
+            {
+                log::error!("[PositionManager] rejected invariant change trade={trade_id}");
+                return UpsertResult::NOOP;
+            }
+        }
+
+        let prev_status = existing.map(|r| r.status);
 
         let outcome = match prev_status {
             // Already terminal (Confirmed or Failed) — ignore re-pushes.
@@ -268,17 +348,14 @@ impl PositionManager {
             }
         };
 
-        self.trades.insert(trade_id.to_string(), TradeRecord {
-            trade_id: trade_id.to_string(),
-            asset_id: asset_id.to_string(),
-            side,
-            size,
-            price,
-            status,
-            is_maker,
-            usdc_fee,
-            shares_fee,
-        });
+        if let Some(existing) = self.trades.get_mut(trade_id) {
+            existing.status = status;
+        } else {
+            self.trades.insert(trade_id.to_string(), TradeRecord {
+                trade_id: trade_id.to_string(), asset_id: asset_id.to_string(), side,
+                size, price, status, is_maker, usdc_fee, shares_fee,
+            });
+        }
 
         // Mirror the same sign onto the per-asset volume tracker so it
         // stays consistent with the strategy-side accumulators.
@@ -405,6 +482,7 @@ impl PositionManager {
                         symbol: update.symbol.clone(),
                         side: update.side,
                         price: update.avg_fill_price,
+                        original_quantity: update.remaining_quantity,
                         remaining_quantity: update.remaining_quantity,
                     });
                 }
@@ -584,8 +662,28 @@ impl PositionManager {
             symbol: symbol.to_string(),
             side,
             price,
+            original_quantity: quantity,
             remaining_quantity: quantity,
         });
+    }
+
+    pub fn apply_private_trade_reservation(
+        &mut self,
+        client_order_id: &str,
+        quantity: f64,
+        sign: i8,
+    ) -> bool {
+        if client_order_id.is_empty() || !quantity.is_finite() || quantity <= 0.0 {
+            return false;
+        }
+        let Some(pending) = self.pending_orders.get_mut(client_order_id) else { return false; };
+        match sign {
+            1 => pending.remaining_quantity = (pending.remaining_quantity - quantity).max(0.0),
+            -1 => pending.remaining_quantity =
+                (pending.remaining_quantity + quantity).min(pending.original_quantity),
+            _ => return false,
+        }
+        true
     }
 
     pub fn remove_pending_order(&mut self, client_order_id: &str) {
@@ -654,6 +752,7 @@ impl PositionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::shared_account::TradeOwnership;
 
     fn upsert(pm: &mut PositionManager, id: &str, status: TradeStatus) -> UpsertResult {
         pm.upsert_trade(id, "TOKEN", Side::Buy, 5.0, 0.4, status, true, 0.0, 0.0, None)
@@ -896,5 +995,80 @@ mod tests {
         let r = upsert(&mut pm, "t1", TradeStatus::Failed);
         assert!(!r.applied, "Confirmed→Failed re-push must be rejected");
         assert_eq!(r.accumulator_sign, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_values_and_trade_identity_mutation() {
+        let mut pm = PositionManager::new();
+        assert!(!pm.upsert_trade(
+            "bad", "TOKEN", Side::Buy, f64::NAN, 0.4,
+            TradeStatus::Matched, true, 0.0, 0.0, None,
+        ).applied);
+        assert!(pm.trades().is_empty());
+
+        assert!(upsert(&mut pm, "strict", TradeStatus::Matched).applied);
+        let mutations = [
+            ("OTHER", Side::Buy, 5.0, 0.4, true, 0.0, 0.0),
+            ("TOKEN", Side::Sell, 5.0, 0.4, true, 0.0, 0.0),
+            ("TOKEN", Side::Buy, 5.1, 0.4, true, 0.0, 0.0),
+            ("TOKEN", Side::Buy, 5.0, 0.41, true, 0.0, 0.0),
+            ("TOKEN", Side::Buy, 5.0, 0.4, false, 0.0, 0.0),
+            ("TOKEN", Side::Buy, 5.0, 0.4, true, 0.01, 0.0),
+            ("TOKEN", Side::Buy, 5.0, 0.4, true, 0.0, 0.01),
+        ];
+        for (asset, side, size, price, maker, usdc_fee, shares_fee) in mutations {
+            assert!(!pm.upsert_trade(
+                "strict", asset, side, size, price, TradeStatus::Mined,
+                maker, usdc_fee, shares_fee, None,
+            ).applied);
+        }
+        assert_eq!(pm.trades()["strict"].status, TradeStatus::Matched);
+
+        assert!(pm.upsert_trade(
+            "strict", "TOKEN", Side::Buy, 5.0 + 1e-9, 0.4 + 1e-10,
+            TradeStatus::Mined, true, 5e-11, 5e-11, None,
+        ).applied);
+        assert_eq!(pm.trades()["strict"].size, 5.0);
+        assert_eq!(pm.trades()["strict"].price, 0.4);
+    }
+
+    #[test]
+    fn restored_trade_lifecycle_dedupes_without_double_counting_baseline() {
+        let positions = HashMap::from([("TOKEN".to_string(), Position {
+            quantity: 5.0, avg_price: 0.4, current_value: 2.0,
+        })]);
+        let restored = RestoredTrade {
+            ownership: TradeOwnership {
+                account_id: "acct".into(), instance_id: "a".into(),
+                trade_key: "restored".into(), client_order_id: "a-1".into(),
+                order_id: "oid-1".into(), token_id: "TOKEN".into(),
+                side: Side::Buy, quantity: 5.0, price: 0.4, status: "MATCHED".into(),
+            },
+            booked: true, usdc_fee: 0.0, shares_fee: 0.0,
+            virtual_fee_booked: true, is_maker: true,
+        };
+        let mut pm = PositionManager::with_positions_and_restored_trades(
+            positions, 98.0, [restored],
+        );
+        assert!((pm.balance() - 98.0).abs() < 1e-12);
+        assert!((pm.get_quantity("TOKEN") - 5.0).abs() < 1e-12);
+        assert!(!upsert(&mut pm, "restored", TradeStatus::Matched).applied);
+        assert!(upsert(&mut pm, "restored", TradeStatus::Mined).applied);
+        assert!((pm.balance() - 98.0).abs() < 1e-12);
+        assert_eq!(upsert(&mut pm, "restored", TradeStatus::Failed).accumulator_sign, -1);
+        assert!((pm.balance() - 100.0).abs() < 1e-12);
+        assert!(pm.get_quantity("TOKEN").abs() < 1e-12);
+    }
+
+    #[test]
+    fn private_failed_restores_zero_remaining_reservation() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 100.0);
+        pm.register_pending_order("a-1", "TOKEN", Side::Buy, 0.4, 5.0);
+        assert!(pm.apply_private_trade_reservation("a-1", 5.0, 1));
+        assert_eq!(pm.pending_orders()["a-1"].remaining_quantity, 0.0);
+        assert_eq!(pm.available_cash(), 100.0);
+        assert!(pm.apply_private_trade_reservation("a-1", 5.0, -1));
+        assert_eq!(pm.pending_orders()["a-1"].remaining_quantity, 5.0);
+        assert_eq!(pm.available_cash(), 98.0);
     }
 }

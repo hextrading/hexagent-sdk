@@ -846,9 +846,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         status,
                         true,
                     );
-                    if status == OrderStatus::Failed {
-                        shared.remove_order_as(&coid, OrderStatus::Failed);
-                    } else {
+                    if status != OrderStatus::Failed {
                         shared.finish_filled_order_if_audited(&coid);
                     }
 
@@ -926,9 +924,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     status,
                     false,
                 );
-                if status == OrderStatus::Failed {
-                    shared.remove_order_as(&coid, OrderStatus::Failed);
-                } else {
+                if status != OrderStatus::Failed {
                     shared.finish_filled_order_if_audited(&coid);
                 }
 
@@ -2315,27 +2311,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_trade_is_terminal_and_releases_runtime_order_without_audit() {
+    fn failed_trade_is_terminal_but_does_not_terminalize_parent_order() {
         let shared = owned_taker_shared(0.5);
         let mut event = valid_taker_event();
         event["status"] = serde_json::json!("FAILED");
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, OrderStatus::Failed);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
         assert!(!shared.account_state.is_uncertain());
-        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
 
         let stale_placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
             "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
             "original_size": "10", "size_matched": "0",
         });
-        assert!(parse_user_event(&stale_placement, &shared).is_empty());
-        assert_eq!(shared.account_state.order("owner-1").unwrap().status, OrderStatus::Failed,
-            "a stale order lifecycle must not resurrect a FAILED trade tombstone");
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert_eq!(parse_user_event(&stale_placement, &shared).len(), 1);
+        assert_eq!(shared.account_state.order("owner-1").unwrap().status, OrderStatus::Accepted);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
     }
 
     #[test]

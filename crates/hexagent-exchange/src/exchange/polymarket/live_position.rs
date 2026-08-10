@@ -6,11 +6,12 @@
 //! - `confirmed_position()`: only CONFIRMED trades (for sell inventory checks)
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use log::info;
 
 use crate::types::Side;
+use hexagent_account::account::shared_account::RestoredTrade;
 
 // ════════════════════════════════════════════════════════════════
 // User-feed health (narrow cross-thread handle)
@@ -168,6 +169,24 @@ impl LivePositionManager {
         }
     }
 
+    pub fn from_restored(rows: impl IntoIterator<Item = RestoredTrade>) -> Self {
+        let mut manager = Self::new();
+        for row in rows {
+            let Some(status) = TradeStatus::from_str(&row.ownership.status) else { continue; };
+            manager.update_trade(
+                &row.ownership.trade_key,
+                status,
+                &row.ownership.token_id,
+                row.ownership.side,
+                row.ownership.quantity,
+                row.ownership.price,
+                row.is_maker,
+                None,
+            );
+        }
+        manager
+    }
+
     /// Largest `match_time` (unix seconds) seen so far. Used as the `after=`
     /// lower bound on the REST `/trades` gap-fetch call.
     pub fn last_match_time_secs(&self) -> u64 { self.last_match_time_secs }
@@ -208,7 +227,22 @@ impl LivePositionManager {
         if status == TradeStatus::Retrying {
             return false;
         }
+        if trade_id.trim().is_empty() || asset_id.trim().is_empty()
+            || !size.is_finite() || size <= 0.0
+            || !price.is_finite() || price <= 0.0 || price > 1.0 + 1e-8
+        {
+            return false;
+        }
         if let Some(existing) = self.trades.get(trade_id) {
+            let size_tolerance = 1e-8_f64.max(existing.size.abs() * 1e-8);
+            let price_tolerance = 1e-10_f64.max(existing.price.abs() * 1e-8);
+            if existing.asset_id != asset_id || existing.side != side
+                || existing.is_maker != is_maker
+                || (existing.size - size).abs() > size_tolerance
+                || (existing.price - price).abs() > price_tolerance
+            {
+                return false;
+            }
             // Terminal state — do not update.
             if existing.status.is_terminal() {
                 return false;
@@ -244,6 +278,17 @@ impl LivePositionManager {
 
         true
     }
+
+    pub fn prune_terminal_history(&mut self, tokens: &HashSet<String>) -> usize {
+        let before = self.trades.len();
+        self.trades.retain(|_, trade| {
+            !tokens.contains(&trade.asset_id) || !trade.status.is_terminal()
+        });
+        before.saturating_sub(self.trades.len())
+    }
+
+    #[cfg(test)]
+    fn trade_count(&self) -> usize { self.trades.len() }
 
 }
 
@@ -319,5 +364,61 @@ mod update_trade_dedup_tests {
         assert!(!upd(&mut m, "t1", TradeStatus::Retrying));  // transient, even first sighting
         assert!(upd(&mut m, "t1", TradeStatus::Matched));
         assert!(!upd(&mut m, "t1", TradeStatus::Retrying));  // still skipped
+    }
+
+    #[test]
+    fn rejects_invalid_values_and_trade_identity_mutation() {
+        let mut m = LivePositionManager::new();
+        assert!(!m.update_trade(
+            "bad", TradeStatus::Matched, "TOK", Side::Buy,
+            f64::NAN, 0.4, true, None,
+        ));
+        assert!(m.update_trade(
+            "strict", TradeStatus::Matched, "TOK", Side::Buy,
+            5.0, 0.4, true, None,
+        ));
+        assert!(!m.update_trade(
+            "strict", TradeStatus::Mined, "OTHER", Side::Buy,
+            5.0, 0.4, true, None,
+        ));
+        assert!(!m.update_trade(
+            "strict", TradeStatus::Mined, "TOK", Side::Sell,
+            5.0, 0.4, true, None,
+        ));
+        assert!(!m.update_trade(
+            "strict", TradeStatus::Mined, "TOK", Side::Buy,
+            5.1, 0.4, true, None,
+        ));
+        assert!(!m.update_trade(
+            "strict", TradeStatus::Mined, "TOK", Side::Buy,
+            5.0, 0.41, true, None,
+        ));
+        assert!(!m.update_trade(
+            "strict", TradeStatus::Mined, "TOK", Side::Buy,
+            5.0, 0.4, false, None,
+        ));
+        assert!(m.update_trade(
+            "strict", TradeStatus::Mined, "TOK", Side::Buy,
+            5.0 + 1e-9, 0.4 + 1e-10, true, None,
+        ));
+    }
+
+    #[test]
+    fn prune_removes_only_terminal_rows_in_retired_token_scope() {
+        let mut m = LivePositionManager::new();
+        assert!(m.update_trade(
+            "terminal", TradeStatus::Confirmed, "TOK", Side::Buy,
+            1.0, 0.4, true, None,
+        ));
+        assert!(m.update_trade(
+            "pending", TradeStatus::Matched, "TOK", Side::Buy,
+            1.0, 0.4, true, None,
+        ));
+        assert!(m.update_trade(
+            "other", TradeStatus::Failed, "OTHER", Side::Buy,
+            1.0, 0.4, true, None,
+        ));
+        assert_eq!(m.prune_terminal_history(&HashSet::from(["TOK".into()])), 1);
+        assert_eq!(m.trade_count(), 2);
     }
 }
