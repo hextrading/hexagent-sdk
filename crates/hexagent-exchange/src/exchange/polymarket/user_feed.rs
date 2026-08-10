@@ -352,12 +352,10 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 .and_then(|v| v.as_str())
                 .unwrap_or("").to_string();
 
-            // trader_side / role determines whether we look up by
+            // The authenticated maker address determines whether we use
             // top-level fields (TAKER) or walk `maker_orders[]` (MAKER).
-            // Legacy payloads used `type: "trade"` with top-level order_id
-            // pointing to a specific side; the modern server sends both
-            // `trader_side` and a populated `maker_orders` array — we
-            // handle both via the `is_maker` check below.
+            // `trader_side` is not authoritative and has been empty/wrong in
+            // otherwise valid payloads.
             //
             // IMPORTANT: Polymarket emits one `trade` push per status
             // transition (MATCHED → MINED → CONFIRMED/FAILED); each carries
@@ -382,10 +380,6 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            let trader_side = data.get("trader_side")
-                .or_else(|| data.get("role"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             // maker/taker is decided by whether `maker_orders[]` carries OUR
             // funder leg — NOT the server's `trader_side` field. Verified
             // 100% consistent across 968 live trades, but the address-based
@@ -399,12 +393,6 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     .and_then(|v| v.as_str())
                     .map_or(false, |a| a.eq_ignore_ascii_case(&shared.order_maker_address))))
                 .unwrap_or(false);
-            let liquidity = match trader_side {
-                "MAKER" | "maker" => Some(Liquidity::Maker),
-                "TAKER" | "taker" => Some(Liquidity::Taker),
-                _ => None,
-            };
-
             let status_raw = data.get("status").and_then(|v| v.as_str()).unwrap_or("MATCHED");
             let status_str = status_raw
                 .strip_prefix("TRADE_STATUS_")
@@ -524,6 +512,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         continue;
                     };
                     let coid = ownership.client_order_id;
+                    let _ = shared.account_state.apply_configured_trade_fee(
+                        &leg_id,
+                        status,
+                        true,
+                    );
 
                     updates.push(OrderUpdate {
                         client_order_id: coid,
@@ -532,7 +525,7 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         side: mo_side,
                         exchange_order_id: if mo_order_id.is_empty() { None } else { Some(mo_order_id.to_string()) },
                         status,
-                        liquidity,
+                        liquidity: Some(Liquidity::Maker),
                         filled_quantity: mo_size,
                         remaining_quantity: 0.0,
                         avg_fill_price: mo_price,
@@ -576,6 +569,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     return Vec::new();
                 };
                 let coid = ownership.client_order_id;
+                let _ = shared.account_state.apply_configured_trade_fee(
+                    trade_id,
+                    status,
+                    false,
+                );
 
                 updates.push(OrderUpdate {
                     client_order_id: coid,
@@ -584,7 +582,7 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     side,
                     exchange_order_id: if order_id.is_empty() { None } else { Some(order_id.to_string()) },
                     status,
-                    liquidity,
+                    liquidity: Some(Liquidity::Taker),
                     filled_quantity: matched_amount,
                     remaining_quantity: 0.0,
                     avg_fill_price: price,

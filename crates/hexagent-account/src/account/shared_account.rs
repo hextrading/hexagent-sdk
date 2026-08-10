@@ -210,6 +210,15 @@ struct AppliedTrade {
     /// wallet snapshot proves the reversed ledger is covered.
     #[serde(default)]
     failure_reconciled: bool,
+    /// Private-feed role used to reproduce fee attribution after restart.
+    #[serde(default)]
+    is_maker: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenFeeConfig {
+    rate: f64,
+    exponent: f64,
 }
 
 fn default_true() -> bool {
@@ -251,6 +260,14 @@ struct SharedAccountState {
     /// registered winner (value=1), never merely because quantities match.
     #[serde(default)]
     settled_token_values: HashMap<String, f64>,
+    /// Persisted per-token fee curves make cold trade replay independent of a
+    /// live strategy EventContext.
+    #[serde(default)]
+    token_fee_configs: HashMap<String, TokenFeeConfig>,
+    /// Taker trades seen before their fee curve is available remain a sticky
+    /// admission blocker rather than silently booking zero fee.
+    #[serde(default)]
+    fee_attribution_pending: HashSet<String>,
     /// Orders restored from a previous process whose exchange terminal state
     /// has not yet been proved. These are a distinct, sticky risk-off reason:
     /// an otherwise matching wallet snapshot must not clear them.
@@ -655,6 +672,59 @@ impl SharedAccount {
             }
         }
         self.schedule_persist(&state);
+    }
+
+    /// Persist the exchange fee curve for every outcome token in one event.
+    /// Any cold-replayed taker trade that was waiting on this metadata is
+    /// completed immediately and admission resumes only after all such fees
+    /// have been attributed.
+    pub fn register_token_fee_config(
+        &self,
+        token_ids: &[String],
+        rate: f64,
+        exponent: f64,
+    ) -> Result<(), ReservationError> {
+        if token_ids.is_empty()
+            || token_ids.iter().any(|token| token.is_empty())
+            || !rate.is_finite()
+            || rate < 0.0
+            || !exponent.is_finite()
+            || exponent < 0.0
+        {
+            return Err(ReservationError::InvalidOrder(
+                "token fee config requires tokens and finite nonnegative rate/exponent".into(),
+            ));
+        }
+        let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
+        let mut state = self.state.lock().unwrap();
+        for token in token_ids {
+            state.token_fee_configs.insert(
+                token.clone(),
+                TokenFeeConfig { rate, exponent },
+            );
+        }
+        let retry: Vec<(String, OrderStatus, bool)> = state
+            .fee_attribution_pending
+            .iter()
+            .filter_map(|trade_key| {
+                let trade = state.trades.get(trade_key)?;
+                if !token_set.contains(trade.ownership.token_id.as_str()) {
+                    return None;
+                }
+                let status = match trade.ownership.status.as_str() {
+                    "FAILED" => OrderStatus::Failed,
+                    "CONFIRMED" => OrderStatus::Filled,
+                    _ => OrderStatus::PartiallyFilled,
+                };
+                Some((trade_key.clone(), status, trade.is_maker?))
+            })
+            .collect();
+        self.schedule_persist(&state);
+        drop(state);
+        for (trade_key, status, is_maker) in retry {
+            let _ = self.apply_configured_trade_fee(&trade_key, status, is_maker);
+        }
+        Ok(())
     }
 
     pub fn active_tokens(&self) -> HashSet<String> {
@@ -1606,10 +1676,62 @@ impl SharedAccount {
                 && existing
                     .as_ref()
                     .is_some_and(|trade| trade.failure_reconciled),
+            is_maker: existing.as_ref().and_then(|trade| trade.is_maker),
         });
         recompute_reconciliation(&mut state, "trade lifecycle transition");
         self.schedule_persist(&state);
         Some(ownership)
+    }
+
+    /// Apply a private trade's fee from the durable token curve. Maker fills
+    /// are explicitly zero-fee. A missing taker curve is sticky risk-off and
+    /// is retried automatically by `register_token_fee_config`.
+    pub fn apply_configured_trade_fee(
+        &self,
+        trade_key: &str,
+        status: OrderStatus,
+        is_maker: bool,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.trades.get(trade_key).cloned() else {
+            set_uncertain(&mut state, format!("fee attribution missing owned trade `{trade_key}`"));
+            self.schedule_persist(&state);
+            return false;
+        };
+        if let Some(trade) = state.trades.get_mut(trade_key) {
+            trade.is_maker = Some(is_maker);
+        }
+        let config = (!is_maker)
+            .then(|| state.token_fee_configs.get(&existing.ownership.token_id).cloned())
+            .flatten();
+        if !is_maker && config.is_none() {
+            state.fee_attribution_pending.insert(trade_key.to_string());
+            recompute_reconciliation(&mut state, "missing token fee config");
+            self.schedule_persist(&state);
+            return false;
+        }
+        self.schedule_persist(&state);
+        drop(state);
+
+        let notional = config.map_or(0.0, |config| {
+            let price = existing.ownership.price.clamp(0.0, 1.0);
+            existing.ownership.quantity
+                * config.rate
+                * (price * (1.0 - price)).max(0.0).powf(config.exponent)
+        });
+        let (usdc_fee, shares_fee) = if is_maker {
+            (0.0, 0.0)
+        } else if existing.ownership.side == Side::Buy {
+            let shares = if existing.ownership.price > EPS {
+                notional / existing.ownership.price
+            } else {
+                0.0
+            };
+            (0.0, shares)
+        } else {
+            (notional, 0.0)
+        };
+        self.apply_trade_fee_transition(trade_key, status, usdc_fee, shares_fee)
     }
 
     /// Attach the strategy-resolved taker fee to an already-owned private
@@ -1650,10 +1772,16 @@ impl SharedAccount {
 
         let effective_usdc_fee = if existing.usdc_fee > EPS { existing.usdc_fee } else { usdc_fee };
         let effective_shares_fee = if existing.shares_fee > EPS { existing.shares_fee } else { shares_fee };
+        let upgrades_zero_fee = existing.usdc_fee <= EPS
+            && existing.shares_fee <= EPS
+            && (effective_usdc_fee > EPS || effective_shares_fee > EPS);
         let is_failed = status == OrderStatus::Failed || existing.failed;
-        let book_virtual = !is_failed && !existing.virtual_fee_booked;
+        let book_virtual = !is_failed
+            && (!existing.virtual_fee_booked || upgrades_zero_fee);
         let reverse_virtual = is_failed && existing.virtual_fee_booked;
-        let book_physical = !is_failed && existing.physical_booked && !existing.physical_fee_booked;
+        let book_physical = !is_failed
+            && existing.physical_booked
+            && (!existing.physical_fee_booked || upgrades_zero_fee);
         let reverse_physical = is_failed && existing.physical_fee_booked;
         let multiplier = |book: bool, reverse: bool| {
             if book { 1.0 } else if reverse { -1.0 } else { 0.0 }
@@ -1680,6 +1808,7 @@ impl SharedAccount {
             trade.physical_fee_booked = book_physical
                 || (existing.physical_fee_booked && !reverse_physical);
         }
+        state.fee_attribution_pending.remove(trade_key);
         mark_fully_observed_pending_trades(&mut state);
         recompute_reconciliation(&mut state, "trade fee lifecycle transition");
         self.schedule_persist(&state);
@@ -1737,13 +1866,26 @@ impl SharedAccount {
             state.orders.remove(coid);
             state.oid_to_coid.remove(oid);
         }
-        let before_trades = state.trades.len();
-        state.trades.retain(|_, trade| {
-            !tokens.contains(&trade.ownership.token_id)
-                || (!trade.failed && trade.ownership.status != "CONFIRMED")
-        });
-        let pruned_trades = before_trades - state.trades.len();
-        if !stale_orders.is_empty() || pruned_trades > 0 {
+        let stale_trades: Vec<String> = state
+            .trades
+            .iter()
+            .filter(|(trade_key, trade)| {
+                tokens.contains(&trade.ownership.token_id)
+                    && !state.fee_attribution_pending.contains(*trade_key)
+                    && (trade.failed || trade.ownership.status == "CONFIRMED")
+            })
+            .map(|(trade_key, _)| trade_key.clone())
+            .collect();
+        for trade_key in &stale_trades {
+            state.trades.remove(trade_key);
+            state.fee_attribution_pending.remove(trade_key);
+        }
+        let pruned_fee_configs = tokens
+            .iter()
+            .filter(|token| state.token_fee_configs.remove(*token).is_some())
+            .count();
+        let pruned_trades = stale_trades.len();
+        if !stale_orders.is_empty() || pruned_trades > 0 || pruned_fee_configs > 0 {
             self.schedule_persist(&state);
         }
         (stale_orders.len(), pruned_trades)
@@ -1967,6 +2109,21 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
             state,
             format!(
                 "startup order recovery pending: count={} coids=[{}]",
+                pending.len(),
+                pending.join(","),
+            ),
+        );
+    } else if !state.fee_attribution_pending.is_empty() {
+        let mut pending: Vec<&str> = state
+            .fee_attribution_pending
+            .iter()
+            .map(String::as_str)
+            .collect();
+        pending.sort_unstable();
+        set_uncertain(
+            state,
+            format!(
+                "trade fee attribution pending: count={} trade_ids=[{}]",
                 pending.len(),
                 pending.join(","),
             ),
@@ -2312,6 +2469,61 @@ mod tests {
     }
 
     #[test]
+    fn missing_taker_fee_curve_is_risk_off_then_replayed_from_registry() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-cold-fee", "oid-cold-fee", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-cold-fee",
+                "MATCHED",
+                "a-cold-fee",
+                "oid-cold-fee",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+
+        assert!(!account.apply_configured_trade_fee(
+            "trade-cold-fee",
+            OrderStatus::PartiallyFilled,
+            false,
+        ));
+        assert!(account.is_uncertain());
+        assert!(account
+            .monitoring_snapshot()
+            .uncertain_reason
+            .unwrap_or_default()
+            .contains("fee attribution pending"));
+
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
+            .unwrap();
+        assert!(!account.is_uncertain());
+        assert!((account.instance_snapshot("a").unwrap().positions["UP"] - 19.9).abs() < EPS);
+
+        account.apply_trade_transition(
+            "trade-cold-fee",
+            "CONFIRMED",
+            "a-cold-fee",
+            "oid-cold-fee",
+            "UP",
+            Side::Buy,
+            10.0,
+            0.5,
+        );
+        assert!(account.apply_configured_trade_fee(
+            "trade-cold-fee",
+            OrderStatus::Filled,
+            false,
+        ));
+        assert!((account.monitoring_snapshot().physical_positions["UP"] - 49.9).abs() < EPS);
+    }
+
+    #[test]
     fn aggregate_split_keeps_instance_attribution() {
         let account = SharedAccount::new("acct");
         account.register_instance("a", 1.0);
@@ -2529,6 +2741,13 @@ mod tests {
             account.register_instance("eth", 1.0);
             account.register_token_interest("btc", "btc-event", "BTC-UP", "BTC-DOWN").unwrap();
             account.register_token_interest("eth", "eth-event", "ETH-UP", "ETH-DOWN").unwrap();
+            account
+                .register_token_fee_config(
+                    &["BTC-UP".to_string(), "BTC-DOWN".to_string()],
+                    0.02,
+                    1.0,
+                )
+                .unwrap();
             account.apply_physical_snapshot(
                 200.0,
                 HashMap::from([("BTC-UP".into(), 20.0), ("ETH-UP".into(), 30.0)]),
@@ -2549,6 +2768,27 @@ mod tests {
         assert_eq!(btc.positions["BTC-UP"], 20.0);
         assert_eq!(btc.reserved_positions["BTC-UP"], 5.0);
         assert_eq!(restored.instance_snapshot("eth").unwrap().positions["ETH-UP"], 30.0);
+        restored
+            .reserve_order(
+                "btc", "btc-2", "oid-btc-2", "BTC-UP", Side::Buy, 10.0, 0.5, 0,
+            )
+            .unwrap();
+        restored.apply_trade_transition(
+            "trade-after-restart",
+            "MATCHED",
+            "btc-2",
+            "oid-btc-2",
+            "BTC-UP",
+            Side::Buy,
+            10.0,
+            0.5,
+        );
+        assert!(restored.apply_configured_trade_fee(
+            "trade-after-restart",
+            OrderStatus::PartiallyFilled,
+            false,
+        ));
+        assert!(!restored.is_uncertain());
         drop(restored);
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
