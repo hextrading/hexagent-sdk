@@ -141,28 +141,41 @@ pub fn fetch_balance_and_positions_versioned(
     wallet_address: &str,
     is_v2: bool,
 ) -> (f64, HashMap<String, Position>) {
+    try_fetch_balance_and_positions_versioned(wallet_address, is_v2).unwrap_or_else(|error| {
+        log::warn!(
+            "[Polymarket] complete balance/positions fetch failed — using empty fallback: {}",
+            error,
+        );
+        (0.0, HashMap::new())
+    })
+}
+
+/// Strict account snapshot used by live shared-account reconciliation. Unlike
+/// the compatibility wrapper above, failure of either the collateral balance
+/// or the account-wide positions request fails the entire snapshot. Callers
+/// must retry rather than interpreting a transport failure as a real zero.
+pub fn try_fetch_balance_and_positions_versioned(
+    wallet_address: &str,
+    is_v2: bool,
+) -> Result<(f64, HashMap<String, Position>)> {
     let token = active_collateral_token(is_v2);
     let wb = wallet_address.to_string();
     let tok = token.to_string();
     let t_bal = std::thread::Builder::new()
         .name("poly-fetch-balance".into())
         .spawn(move || fetch_balance_for_token(&wb, &tok))
-        .expect("spawn fetch-balance thread");
+        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
     let wp = wallet_address.to_string();
     let t_pos = std::thread::Builder::new()
         .name("poly-fetch-positions".into())
         .spawn(move || fetch_positions(&wp))
-        .expect("spawn fetch-positions thread");
+        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
 
-    let balance = t_bal.join().ok().and_then(|r| r.ok()).unwrap_or_else(|| {
-        log::warn!("[Polymarket] fetch_balance failed — using 0");
-        0.0
-    });
-    let positions = t_pos.join().ok().and_then(|r| r.ok()).unwrap_or_else(|| {
-        log::warn!("[Polymarket] fetch_positions failed — using empty");
-        HashMap::new()
-    });
-    (balance, positions)
+    let balance = t_bal.join()
+        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
+    let positions = t_pos.join()
+        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    Ok((balance, positions))
 }
 
 /// Legacy bare balance fetch — returns USDC.e. Kept for CLI callers
