@@ -1493,6 +1493,7 @@ const REDEEM_SELECTOR: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
 const GET_COLLECTION_ID_SELECTOR: [u8; 4] = [0x85, 0x62, 0x96, 0xf7]; // getCollectionId(bytes32,bytes32,uint256)
 const GET_POSITION_ID_SELECTOR:   [u8; 4] = [0x39, 0xdd, 0x75, 0x30]; // getPositionId(address,bytes32)
 const ERC1155_BALANCE_OF_SELECTOR: [u8; 4] = [0x00, 0xfd, 0xd5, 0x8e]; // balanceOf(address,uint256)
+const ERC1155_BALANCE_OF_BATCH_SELECTOR: [u8; 4] = [0x4e, 0x12, 0x73, 0xf4]; // balanceOfBatch(address[],uint256[])
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1619,6 +1620,74 @@ pub fn ctf_outcome_token_balances_checked(
     let up = ctf_erc1155_balance_checked(owner, up_token_id)?;
     let down = ctf_erc1155_balance_checked(owner, down_token_id)?;
     Ok((up, down))
+}
+
+/// Read all active CLOB token balances with one ERC-1155 `balanceOfBatch`
+/// call. Shared accounts commonly cover several assets and adjacent events;
+/// batching keeps a complete snapshot at one Polygon RPC request regardless
+/// of that scope size.
+pub fn ctf_token_balances_batch_checked(
+    owner: &str,
+    token_ids: &[String],
+) -> Result<Vec<f64>> {
+    if token_ids.is_empty() { return Ok(Vec::new()); }
+    let count = token_ids.len();
+    let owners_offset = 64_u128;
+    let ids_offset = owners_offset + 32 + 32 * count as u128;
+    let mut data = Vec::with_capacity(4 + 32 * (4 + count * 2));
+    data.extend_from_slice(&ERC1155_BALANCE_OF_BATCH_SELECTOR);
+    data.extend_from_slice(&u256_bytes(owners_offset));
+    data.extend_from_slice(&u256_bytes(ids_offset));
+    data.extend_from_slice(&u256_bytes(count as u128));
+    for _ in 0..count {
+        data.extend_from_slice(&address_to_bytes32(owner));
+    }
+    data.extend_from_slice(&u256_bytes(count as u128));
+    for token_id in token_ids {
+        data.extend_from_slice(&ctf_position_id_bytes(token_id)?);
+    }
+    let result = deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data)))
+        .ok_or_else(|| anyhow::anyhow!("CTF balanceOfBatch RPC failed for {count} tokens"))?;
+    decode_balance_of_batch_result(&result, count)
+}
+
+fn decode_balance_of_batch_result(result: &str, expected: usize) -> Result<Vec<f64>> {
+    let bytes = hex::decode(result.strip_prefix("0x").unwrap_or(result))
+        .map_err(|error| anyhow::anyhow!("invalid CTF balanceOfBatch result: {error}"))?;
+    let read_usize = |word: &[u8]| -> Result<usize> {
+        if word.len() != 32 || word[..24].iter().any(|byte| *byte != 0) {
+            return Err(anyhow::anyhow!("balanceOfBatch offset/length exceeds usize"));
+        }
+        Ok(u64::from_be_bytes(word[24..32].try_into().unwrap()) as usize)
+    };
+    if bytes.len() < 64 {
+        return Err(anyhow::anyhow!("short CTF balanceOfBatch result"));
+    }
+    let offset = read_usize(&bytes[..32])?;
+    if offset.checked_add(32).is_none_or(|end| end > bytes.len()) {
+        return Err(anyhow::anyhow!("invalid CTF balanceOfBatch result offset"));
+    }
+    let count = read_usize(&bytes[offset..offset + 32])?;
+    if count != expected {
+        return Err(anyhow::anyhow!(
+            "CTF balanceOfBatch returned {count} balances, expected {expected}"
+        ));
+    }
+    let values_start = offset + 32;
+    let values_end = values_start.checked_add(count.saturating_mul(32))
+        .ok_or_else(|| anyhow::anyhow!("CTF balanceOfBatch result length overflow"))?;
+    if values_end > bytes.len() {
+        return Err(anyhow::anyhow!("short CTF balanceOfBatch values"));
+    }
+    let mut balances = Vec::with_capacity(count);
+    for word in bytes[values_start..values_end].chunks_exact(32) {
+        if word[..16].iter().any(|byte| *byte != 0) {
+            return Err(anyhow::anyhow!("CTF balance exceeds supported u128 range"));
+        }
+        let raw = u128::from_be_bytes(word[16..32].try_into().unwrap());
+        balances.push(raw as f64 / 1_000_000.0);
+    }
+    Ok(balances)
 }
 
 /// On-chain ERC-1155 balances of the Up (indexSet 1) and Down (indexSet 2)
@@ -4397,6 +4466,17 @@ mod maintenance_status_tests {
         assert_eq!(ctf_position_id_bytes("0x2a").unwrap()[31], 42);
         assert_eq!(ctf_position_id_bytes("2a").unwrap()[31], 42);
         assert!(ctf_position_id_bytes(&"1".repeat(79)).is_err());
+    }
+
+    #[test]
+    fn decodes_erc1155_balance_of_batch_result() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&u256_bytes(32));
+        encoded.extend_from_slice(&u256_bytes(2));
+        encoded.extend_from_slice(&u256_bytes(12_500_000));
+        encoded.extend_from_slice(&u256_bytes(3_000_000));
+        let balances = decode_balance_of_batch_result(&hex::encode(encoded), 2).unwrap();
+        assert_eq!(balances, vec![12.5, 3.0]);
     }
 
     #[test]
