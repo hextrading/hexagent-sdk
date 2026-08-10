@@ -9,13 +9,13 @@
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use crate::config::{Config, RunMode};
+use crate::config::{Config, ExchangeConfig, RunMode};
 use crate::exchange::aster::AsterTrade;
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
@@ -174,19 +174,6 @@ fn preload_hist_bars(
     })
 }
 
-fn polymarket_instance_pool_sizes() -> hexagent_runtime::http1_pool::PoolSizes {
-    hexagent_runtime::http1_pool::PoolSizes {
-        // Merged pools (2026-07-31): place + cancel share 6 slots (was
-        // 3 + 3 partitioned — a burst of either type can now use all 6),
-        // reconcile + query share 2 (was 1 + 1).
-        order: 6,
-        misc: 2,
-        // GapReplay is process-global; this field is ignored by
-        // `init_instance_pools` but kept explicit for forward compatibility.
-        gap_replay: 2,
-    }
-}
-
 /// Current readiness of one configured public market-data feed.
 ///
 /// The state is stored independently from strategy callbacks so operators and
@@ -266,6 +253,89 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, delay: std::time::Duration) -> boo
     false
 }
 
+fn is_public_subscription_exchange(name: &str) -> bool {
+    matches!(
+        name,
+        "binance" | "binance_futures" | "coinbase" | "chainlink" | "bybit"
+            | "kraken" | "okx" | "gate" | "bitget" | "kucoin" | "mexc" | "pyth"
+    )
+}
+
+fn same_public_feed_connection(a: &ExchangeConfig, b: &ExchangeConfig) -> bool {
+    a.name == b.name
+        && a.enabled == b.enabled
+        && a.source == b.source
+        && a.api_url_prefix == b.api_url_prefix
+        && a.wss_url == b.wss_url
+        && a.api_key == b.api_key
+        && a.api_secret == b.api_secret
+        && a.api_passphrase == b.api_passphrase
+        && a.network == b.network
+        && a.feed_ids == b.feed_ids
+}
+
+/// Collapse duplicate public-feed config blocks onto one connection and one
+/// unique symbol set. Strategy routing remains one-to-many, so every sibling
+/// instance still receives the shared event without opening another socket.
+fn coalesce_public_exchange_subscriptions(exchanges: &mut Vec<ExchangeConfig>) {
+    let mut merged: Vec<ExchangeConfig> = Vec::with_capacity(exchanges.len());
+    for mut candidate in exchanges.drain(..) {
+        if is_public_subscription_exchange(&candidate.name) {
+            if let Some(existing) = merged.iter_mut()
+                .find(|existing| same_public_feed_connection(existing, &candidate))
+            {
+                let before = existing.symbols.len();
+                for symbol in candidate.symbols.drain(..) {
+                    if !existing.symbols.iter().any(|current| current.eq_ignore_ascii_case(&symbol)) {
+                        existing.symbols.push(symbol);
+                    }
+                }
+                log::info!(
+                    "[Engine] Coalesced duplicate {} feed block: {} unique symbol(s) (added {})",
+                    existing.name,
+                    existing.symbols.len(),
+                    existing.symbols.len().saturating_sub(before),
+                );
+                continue;
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        candidate.symbols.retain(|symbol| seen.insert(symbol.to_ascii_lowercase()));
+        merged.push(candidate);
+    }
+    *exchanges = merged;
+}
+
+#[cfg(test)]
+mod public_subscription_coalesce_tests {
+    use super::*;
+
+    fn exchange(toml: &str) -> ExchangeConfig {
+        toml::from_str(toml).expect("exchange config")
+    }
+
+    #[test]
+    fn identical_public_blocks_share_one_case_insensitive_symbol_set() {
+        let mut exchanges = vec![
+            exchange("name = 'binance'\nsymbols = ['BTCUSDT', 'ETHUSDT']"),
+            exchange("name = 'binance'\nsymbols = ['btcusdt', 'SOLUSDT']"),
+        ];
+        coalesce_public_exchange_subscriptions(&mut exchanges);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].symbols, vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+    }
+
+    #[test]
+    fn different_connection_settings_remain_separate() {
+        let mut exchanges = vec![
+            exchange("name = 'chainlink'\nsource = 'rtds'\nsymbols = ['btc/usd']"),
+            exchange("name = 'chainlink'\nsource = 'stream'\nsymbols = ['btc/usd']"),
+        ];
+        coalesce_public_exchange_subscriptions(&mut exchanges);
+        assert_eq!(exchanges.len(), 2);
+    }
+}
+
 pub struct Engine {
     config: Config,
     /// Strategy factories the application registered (the engine never names a
@@ -280,6 +350,7 @@ impl Engine {
         // Each registered strategy injects its own required market-data symbols
         // (replaces the engine's old per-strategy-name inject_*_symbols).
         registry.inject_all_config(&mut config);
+        coalesce_public_exchange_subscriptions(&mut config.exchanges);
         let feed_readiness = config
             .exchanges
             .iter()
@@ -3655,15 +3726,19 @@ impl Engine {
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Per-instance channels + move each strategy into a worker spec.
-        let mut market_txs: Vec<Sender<MarketEvent>> = Vec::with_capacity(strategies.len());
+        // Market events are immutable after parsing. Fan out one allocation
+        // through Arc instead of deep-cloning order-book vectors and Strings
+        // once per subscribing strategy instance.
+        let mut market_txs: Vec<Sender<Arc<MarketEvent>>> =
+            Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<OrderUpdate>> = Vec::with_capacity(strategies.len());
         let mut specs: Vec<(
             Box<dyn Strategy>,
-            Receiver<MarketEvent>,
+            Receiver<Arc<MarketEvent>>,
             Receiver<OrderUpdate>,
         )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
-            let (mtx, mrx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
+            let (mtx, mrx) = bounded::<Arc<MarketEvent>>(CHANNEL_CAPACITY);
             let (utx, urx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
             market_txs.push(mtx);
             update_txs.push(utx);
@@ -3689,9 +3764,10 @@ impl Engine {
                     handles.push(h);
                 }
 
-                // Router runs on this thread (shares the `strategy` core
-                // unless an operator carved out a separate slot). Its work
-                // is light: clone + send per event.
+                // Router runs on the fallback strategy core. Production
+                // multi-instance layouts dedicate that core to the router;
+                // every configured instance uses `strategy_cores` instead.
+                // Fan-out below clones only Arc pointers, never event payloads.
                 crate::os_tune::pin_strategy("strategy-router");
                 info!(
                     "[Strategy] Multi-instance fan-out active: {} instances {:?}, {} routed symbols",
@@ -3714,13 +3790,17 @@ impl Engine {
                                 forward_recorder_event(
                                     recorder_tx.as_ref(), &MarketEvent::Exit,
                                 );
-                                for tx in &market_txs { let _ = tx.send(MarketEvent::Exit); }
+                                let exit = Arc::new(MarketEvent::Exit);
+                                for tx in &market_txs { let _ = tx.send(Arc::clone(&exit)); }
                                 break;
                             }
                             Ok(event) => {
                                 forward_recorder_event(recorder_tx.as_ref(), &event);
                                 Self::route_market_event(
-                                    &event, &sym_to_instances, &mut token_to_instances, &market_txs,
+                                    Arc::new(event),
+                                    &sym_to_instances,
+                                    &mut token_to_instances,
+                                    &market_txs,
                                 );
                             }
                             Err(_) => break,
@@ -3741,9 +3821,17 @@ impl Engine {
                                 let owner = coid_owner.lock().unwrap()
                                     .get(&u.client_order_id).copied()
                                     .or_else(|| owner_from_coid(&u.client_order_id, &iid_to_idx));
+                                let terminal = matches!(
+                                    u.status,
+                                    OrderStatus::Filled | OrderStatus::Cancelled
+                                        | OrderStatus::Rejected | OrderStatus::Failed
+                                );
+                                let terminal_coid = terminal.then(|| u.client_order_id.clone());
                                 match owner {
                                     Some(i) if i < update_txs.len() => {
-                                        let _ = update_txs[i].send(u.clone());
+                                        // Common path: transfer ownership to
+                                        // one worker without cloning payload.
+                                        let _ = update_txs[i].send(u);
                                     }
                                     _ => { for tx in &update_txs { let _ = tx.send(u.clone()); } }
                                 }
@@ -3751,12 +3839,8 @@ impl Engine {
                                 // A late duplicate fill (Matched→Mined→Confirmed
                                 // dedup / replay) arriving after removal just
                                 // hits the broadcast fallback — still correct.
-                                if matches!(
-                                    u.status,
-                                    OrderStatus::Filled | OrderStatus::Cancelled
-                                        | OrderStatus::Rejected | OrderStatus::Failed
-                                ) {
-                                    coid_owner.lock().unwrap().remove(&u.client_order_id);
+                                if let Some(coid) = terminal_coid {
+                                    coid_owner.lock().unwrap().remove(&coid);
                                 }
                             }
                             Err(_) => break,
@@ -3780,27 +3864,27 @@ impl Engine {
     /// out internally, exactly as in the single-thread loop). Learns
     /// Polymarket token_id → instance from `Instrument(BinaryOption)`.
     fn route_market_event(
-        event: &MarketEvent,
+        event: Arc<MarketEvent>,
         sym_to_instances: &HashMap<String, Vec<usize>>,
         token_to_instances: &mut HashMap<String, Vec<usize>>,
-        market_txs: &[Sender<MarketEvent>],
+        market_txs: &[Sender<Arc<MarketEvent>>],
     ) {
-        let broadcast = |txs: &[Sender<MarketEvent>]| {
+        let broadcast = |txs: &[Sender<Arc<MarketEvent>>]| {
             for tx in txs {
-                let _ = tx.send(event.clone());
+                let _ = tx.send(Arc::clone(&event));
             }
         };
-        let send_to = |idxs: &[usize], txs: &[Sender<MarketEvent>]| {
+        let send_to = |idxs: &[usize], txs: &[Sender<Arc<MarketEvent>>]| {
             for &i in idxs {
                 if let Some(tx) = txs.get(i) {
-                    let _ = tx.send(event.clone());
+                    let _ = tx.send(Arc::clone(&event));
                 }
             }
         };
 
         // Instrument(BinaryOption) → attribute its token_ids to the owner
         // instance(s) of its slug, then deliver to those owners.
-        if let MarketEvent::Instrument(Instrument::BinaryOption(bo)) = event {
+        if let MarketEvent::Instrument(Instrument::BinaryOption(bo)) = event.as_ref() {
             if let Some(owners) = sym_to_instances.get(&bo.slug.to_ascii_lowercase()).cloned() {
                 for tok in &bo.clob_token_ids {
                     token_to_instances.insert(tok.to_ascii_lowercase(), owners.clone());
@@ -3812,7 +3896,7 @@ impl Engine {
             return;
         }
 
-        let targets: Option<Vec<usize>> = match event {
+        let targets: Option<Vec<usize>> = match event.as_ref() {
             // Lifecycle / spot-instrument → all instances.
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
@@ -3895,7 +3979,7 @@ impl Engine {
     /// routes the resulting fills back to THIS instance (P3).
     fn run_strategy_worker(
         mut strategy: Box<dyn Strategy>,
-        market_rx: Receiver<MarketEvent>,
+        market_rx: Receiver<Arc<MarketEvent>>,
         update_rx: Receiver<OrderUpdate>,
         signal_tx: Sender<Signal>,
         data_dirs: Vec<PathBuf>,
@@ -3914,13 +3998,13 @@ impl Engine {
         loop {
             crossbeam_channel::select! {
                 recv(market_rx) -> msg => match msg {
-                    Ok(MarketEvent::Exit) => {
+                    Ok(event) if matches!(event.as_ref(), MarketEvent::Exit) => {
                         strategy.on_exit();
                         for sig in strategy.on_shutdown() { let _ = emit(sig); }
                         return;
                     }
                     Ok(event) => {
-                        let signals = match &event {
+                        let signals = match event.as_ref() {
                             MarketEvent::OrderBook(ob) => { strategy.on_orderbook(ob); Vec::new() }
                             MarketEvent::Trade(t) => { strategy.on_trade_tick(t); Vec::new() }
                             MarketEvent::Quote(q) => { strategy.on_quote_tick(q); Vec::new() }
@@ -3956,7 +4040,7 @@ impl Engine {
                             MarketEvent::TickSizeChange(tsc) => strategy.on_tick_size_change(tsc),
                             MarketEvent::EventStart { .. } | MarketEvent::Exit => Vec::new(),
                         };
-                        if let MarketEvent::OrderBook(ob) = &event {
+                        if let MarketEvent::OrderBook(ob) = event.as_ref() {
                             let venue_ok = !strategy.quote_trigger_binance_ob_only()
                                 || ob.exchange == Exchange::Binance;
                             let interval = strategy.quote_interval_ms();
@@ -4682,32 +4766,29 @@ impl Engine {
             }
         };
 
-        // Build per-instance role pools before the first SharedState invokes
-        // `prewarm_connections()`. Previously these pools were created later
-        // in the executor thread, after the global prewarm had completed, so
-        // their first place/cancel/reconcile/query request paid a cold
-        // DNS+TCP+TLS setup despite startup reporting prewarm success.
-        if !hexagent_runtime::http1_pool::instance_pools_ready() {
-            let mut instance_ids: Vec<String> = self
-                .config
-                .strategies
-                .iter()
-                .filter(|sc| {
-                    sc.enabled
-                        && self.registry.capabilities(&sc.name).needs_poly_user_feed
-                        && !sc.instance_id.is_empty()
-                })
-                .map(|sc| sc.instance_id.clone())
-                .collect();
-            instance_ids.sort();
-            instance_ids.dedup();
-            if !instance_ids.is_empty() {
-                if let Err(error) = hexagent_runtime::http1_pool::init_instance_pools(
-                    &instance_ids,
-                    polymarket_instance_pool_sizes(),
-                ) {
+        // Build the complete account→instances routing table before the first
+        // SharedState prewarms transport. Every shared wallet receives one
+        // physical pool group sized from N: order=4N, reconcile=2N,
+        // gap_replay=2. Global pools are fixed fallbacks and never duplicate
+        // these account slots.
+        if !hexagent_runtime::http1_pool::account_pools_ready() {
+            let mut accounts: HashMap<String, Vec<String>> = HashMap::new();
+            for sc in self.config.strategies.iter().filter(|sc| {
+                sc.enabled
+                    && self.registry.capabilities(&sc.name).needs_poly_user_feed
+                    && !sc.instance_id.is_empty()
+            }) {
+                accounts
+                    .entry(sc.account_id().to_string())
+                    .or_default()
+                    .push(sc.instance_id.clone());
+            }
+            if !accounts.is_empty() {
+                if let Err(error) =
+                    hexagent_runtime::http1_pool::init_account_pools(&accounts)
+                {
                     warn!(
-                        "[Engine] per-instance admission pools not initialised before prewarm: {}",
+                        "[Engine] account admission pools not initialised before prewarm: {}",
                         error,
                     );
                 }
@@ -4786,6 +4867,10 @@ impl Engine {
             // Another instance already built this account's SharedState
             // → share it (one wallet, one user-feed, one nonce stream).
             if let Some(shared) = by_account.get(&account_id) {
+                shared.account_state.register_instance(
+                    &instance_id,
+                    sc.account_allocation_weight,
+                );
                 info!(
                     "[Engine] instance_id={} shares Polymarket account `{}` \
                      with an earlier instance — reusing its SharedState",
@@ -4861,6 +4946,10 @@ impl Engine {
                 Ok(trade) => {
                     trade.prewarm_connections();
                     let shared = trade.shared_state();
+                    shared.account_state.register_instance(
+                        &instance_id,
+                        sc.account_allocation_weight,
+                    );
                     info!(
                         "[Engine] Built Polymarket SharedState for account_id={} \
                          (first instance_id={} sig_type={} builder_code={})",
@@ -4910,28 +4999,26 @@ impl Engine {
     }
 
     /// Deduplicate an `instance_id → Arc<SharedState>` map down to one
-    /// representative `(instance_id, Arc)` per unique account (= unique
-    /// Arc identity). Used by per-account spawners (user-feed,
+    /// representative `(instance_id, Arc)` per unique `account_id`.
+    /// Used by per-account spawners (user-feed,
     /// heartbeat) so two strategy instances sharing one wallet don't
     /// open two authenticated user streams (which would double-count
     /// fills) or two redundant heartbeats. Deterministic order: sorted
-    /// by the lexicographically-smallest instance_id mapping to each
-    /// Arc.
+    /// by the lexicographically-smallest instance_id mapping to each account.
     fn dedup_states_by_account(
         states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> Vec<(String, Arc<crate::exchange::polymarket::trade::SharedState>)> {
-        let mut seen: Vec<*const crate::exchange::polymarket::trade::SharedState> = Vec::new();
+        let mut seen = HashSet::new();
         let mut out: Vec<(String, Arc<crate::exchange::polymarket::trade::SharedState>)> =
             Vec::new();
         let mut keys: Vec<&String> = states.keys().collect();
         keys.sort();
         for k in keys {
             if let Some(s) = states.get(k) {
-                let ptr = Arc::as_ptr(s);
-                if seen.contains(&ptr) {
+                let account_id = s.account_state.account_id();
+                if !seen.insert(account_id.to_string()) {
                     continue;
                 }
-                seen.push(ptr);
                 out.push((k.clone(), s.clone()));
             }
         }
@@ -4965,12 +5052,10 @@ impl Engine {
         keys.first().and_then(|k| map.get(*k).cloned())
     }
 
-    /// Phase 2b: spawn one user_feed thread per polymaker instance.
-    /// Each WS reads its own credentials off the per-instance
-    /// `SharedState.auth` (set up by `build_poly_shared_states_map`),
-    /// so two instances open two independent authenticated streams
-    /// without sharing nonces. Returns the list of join handles so
-    /// the engine teardown can wait on every one.
+    /// Spawn one authenticated user-feed thread per Polymarket account.
+    /// Shared-wallet instances reuse the same `SharedState`, user stream and
+    /// gap-replay loop; parsed updates then enter the common update router,
+    /// which resolves client_order_id ownership to one strategy instance.
     pub fn spawn_poly_user_feeds(
         &self,
         update_tx: Sender<OrderUpdate>,
@@ -4987,6 +5072,7 @@ impl Engine {
         // on the same wallet would deliver every fill twice and
         // double-count inventory. Deterministic spawn order.
         for (id, shared) in Self::dedup_states_by_account(states) {
+            let account_id = shared.account_state.account_id().to_string();
             let api_key = shared.auth.api_key.clone();
             let api_secret_b64 = shared.auth.api_secret_b64().to_string();
             let passphrase = shared.auth.passphrase.clone();
@@ -5000,15 +5086,16 @@ impl Engine {
             ) {
                 Ok(h) => {
                     info!(
-                        "[Engine] Polymarket user feed started for account (lead instance_id={})",
-                        id
+                        "[Engine] Polymarket user feed started for account_id={} (lead instance_id={})",
+                        account_id,
+                        id,
                     );
                     handles.push(h);
                 }
                 Err(e) => {
                     warn!(
-                        "[Engine] Failed to start Polymarket user feed for account (lead instance_id={}): {}",
-                        id, e,
+                        "[Engine] Failed to start Polymarket user feed for account_id={} (lead instance_id={}): {}",
+                        account_id, id, e,
                     );
                 }
             }
@@ -5233,31 +5320,21 @@ impl Engine {
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let mut poly_stats_handle: Option<thread::JoinHandle<()>> = None;
                 if !poly_states.is_empty() {
-                    // Per-(instance, role) admission pools. Fast=Cancel=3,
-                    // Reconcile=Query=1 per instance → 24 total for 3 instances
-                    // (up from 2/2=18, tuned 2026-07-07: at 2/2 wave-overlap when
-                    // RTT≳quote_interval skipped ~3% of cancels; a third warm
-                    // connection per side absorbs one extra overlapping wave).
-                    // Concurrency is bounded by warm connections *per instance*
-                    // (no cross-instance preemption, no cold connection).
-                    let sizes = polymarket_instance_pool_sizes();
-                    let mut iids: Vec<String> = poly_states.keys().cloned().collect();
-                    iids.sort();
-                    if !hexagent_runtime::http1_pool::instance_pools_ready() {
-                        if let Err(e) =
-                            hexagent_runtime::http1_pool::init_instance_pools(&iids, sizes)
-                        {
-                            warn!(
-                                "[Executor] per-instance admission pools not initialised: {}",
-                                e,
-                            );
-                        }
+                    // Hot-path admission is account-scoped: all instances on
+                    // one wallet share 4N order and 2N reconcile slots; each
+                    // account also owns two gap-replay slots. The pools were
+                    // built before SharedState prewarm.
+                    if !hexagent_runtime::http1_pool::account_pools_ready() {
+                        warn!(
+                            "[Executor] account admission pools are unavailable; hot-path requests will be shed",
+                        );
                     }
                     // One drainer per possible in-flight fired request
-                    // (Σ per-instance fast+cancel) + slack, so a fired request
+                    // (Σ account order slots) + slack, so a fired request
                     // never waits for a drainer while holding its permit. Derived
-                    // from `sizes` so it auto-scales when the pool sizes change.
-                    let n_drainers = iids.len() * sizes.order + 4;
+                    // from the actual registry rather than duplicating sizing.
+                    let n_drainers =
+                        hexagent_runtime::http1_pool::total_account_order_capacity() + 4;
                     for i in 0..n_drainers {
                         let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_done_rx.clone();
@@ -5296,7 +5373,7 @@ impl Engine {
                         poly_worker_n, n_drainers
                     );
                     // Admission-control observability daemon: every 30 s log the
-                    // per-(instance,role) delta — acquires/skips, retained cancel
+                    // per-(account,role) delta — acquires/skips, retained cancel
                     // waits, and current busy. Placement skips shed a business
                     // operation and are WARN; cancel waits remain INFO because
                     // the cancel is retained until a slot becomes available.
@@ -5307,7 +5384,7 @@ impl Engine {
                             .spawn(move || {
                                 crate::os_tune::pin_background("poly-admission-stats");
                                 let mut prev = HashMap::new();
-                                let mut gap_prev = (0u64, 0u64);
+                                let mut gap_prev: HashMap<String, (u64, u64)> = HashMap::new();
                                 loop {
                                     let mut slept = 0;
                                     while slept < 30 {
@@ -5317,38 +5394,52 @@ impl Engine {
                                         thread::sleep(std::time::Duration::from_secs(1));
                                         slept += 1;
                                     }
-                                    let by_inst = admission_log_snapshot(
+                                    let by_account = admission_log_snapshot(
                                         &mut prev,
                                         hexagent_runtime::http1_pool::admission_stats(),
                                     );
-                                    for (iid, (line, primary_skip)) in by_inst {
+                                    for (account_id, (line, primary_skip)) in by_account {
                                         if primary_skip {
-                                            warn!("[admission] {} {}", iid, line.trim_end());
+                                            warn!(
+                                                "[admission] account={} {}",
+                                                account_id,
+                                                line.trim_end(),
+                                            );
                                         } else {
-                                            info!("[admission] {} {}", iid, line.trim_end());
+                                            info!(
+                                                "[admission] account={} {}",
+                                                account_id,
+                                                line.trim_end(),
+                                            );
                                         }
                                     }
-                                    let (gap_acq, gap_skip, gap_busy, gap_slots) =
-                                        hexagent_runtime::http1_pool::gap_replay_stats();
-                                    let gap_acq_delta = gap_acq.saturating_sub(gap_prev.0);
-                                    let gap_skip_delta = gap_skip.saturating_sub(gap_prev.1);
-                                    gap_prev = (gap_acq, gap_skip);
-                                    if gap_skip_delta > 0 {
-                                        warn!(
-                                            "[admission] global GapReplay(+{} skip+{} busy{} slots={:?})",
-                                            gap_acq_delta,
-                                            gap_skip_delta,
-                                            gap_busy,
-                                            gap_slots,
-                                        );
-                                    } else {
-                                        info!(
-                                            "[admission] global GapReplay(+{} skip+{} busy{} slots={:?})",
-                                            gap_acq_delta,
-                                            gap_skip_delta,
-                                            gap_busy,
-                                            gap_slots,
-                                        );
+                                    for (account_id, gap_acq, gap_skip, gap_busy, gap_slots) in
+                                        hexagent_runtime::http1_pool::all_gap_replay_stats()
+                                    {
+                                        let previous = gap_prev
+                                            .insert(account_id.clone(), (gap_acq, gap_skip))
+                                            .unwrap_or((0, 0));
+                                        let gap_acq_delta = gap_acq.saturating_sub(previous.0);
+                                        let gap_skip_delta = gap_skip.saturating_sub(previous.1);
+                                        if gap_skip_delta > 0 {
+                                            warn!(
+                                                "[admission] account={} GapReplay(+{} skip+{} busy{} slots={:?})",
+                                                account_id,
+                                                gap_acq_delta,
+                                                gap_skip_delta,
+                                                gap_busy,
+                                                gap_slots,
+                                            );
+                                        } else {
+                                            info!(
+                                                "[admission] account={} GapReplay(+{} skip+{} busy{} slots={:?})",
+                                                account_id,
+                                                gap_acq_delta,
+                                                gap_skip_delta,
+                                                gap_busy,
+                                                gap_slots,
+                                            );
+                                        }
                                     }
                                 }
                             })
@@ -5775,8 +5866,8 @@ fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
 }
 
 /// Fire-and-track + admission dispatch for the hot single-leg Polymarket
-/// paths (place / cancel / 1×1 replace). Acquires a per-instance admission
-/// permit, fires on the reserved connection WITHOUT blocking, and hands the
+/// paths (place / cancel / 1×1 replace). Maps instance→account, acquires an
+/// account-pool permit, fires on the reserved connection WITHOUT blocking, and hands the
 /// reply-completion closure to a drainer. Placement may be skipped when stale
 /// or saturated; cancellation is retained and woken by permit release.
 /// Everything else (batch, reconcile, cancel-all, non-poly, empty/unknown
@@ -5949,7 +6040,7 @@ fn fire_or_execute(
                 }
             }
         }
-        // Reconcile: concurrency gate on the dedicated per-instance Reconcile
+        // Reconcile: concurrency gate on the dedicated per-account Reconcile
         // pool (NOT full fire-track). The permit's exact client is threaded
         // through every order GET, so this is both admission control and a real
         // connection reservation. Skip (drop) when none free — the strategy's
@@ -5979,16 +6070,15 @@ fn fire_or_execute(
                 }
             }
         }
-        // Batch / cancel-all / non-poly / empty-iid → synchronous, global pool.
+        // Batch / cancel-all / non-poly / empty-iid → synchronous fallback.
         // polymaker's only batch signals are BatchCancelOrders (a leg pulling
         // >1 accumulated/orphan order with no replace — the `live_count >= 2`
         // "cancel-stale-don't-place" cleanup) and the rare BatchNewOrders (a
         // leg seeding both tokens from cold). Both are low-volume edge/cleanup
         // paths (~6/hr live), NOT the hot reprice churn — that is ReplaceOrder
         // 1×1 (leg carries a single token in steady state), already fire-
-        // tracked above. Deliberately NOT admission-gated: gating would reserve
-        // a hot-path Fast/Cancel connection they don't even use (their internals
-        // ride the global pool), starving real places/cancels for no benefit.
+        // tracked above. Their HTTP internals best-effort borrow account slots
+        // and spill to the fixed global fallback-order pool when saturated.
         other => {
             for update in execute_fallback_signal(worker, other, stale_ms) {
                 if utx.send(update).is_err() {
@@ -7135,7 +7225,7 @@ mod market_router_tests {
     }
 
     /// Drain a receiver into a count (non-blocking).
-    fn drain(rx: &Receiver<MarketEvent>) -> usize {
+    fn drain(rx: &Receiver<Arc<MarketEvent>>) -> usize {
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
@@ -7199,16 +7289,26 @@ mod market_router_tests {
     fn spot_and_binance_ob_route_to_owning_instance_only() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<MarketEvent>(64);
-        let (tx1, rx1) = bounded::<MarketEvent>(64);
+        let (tx0, rx0) = bounded::<Arc<MarketEvent>>(64);
+        let (tx1, rx1) = bounded::<Arc<MarketEvent>>(64);
         let txs = [tx0, tx1];
 
         // BTC Binance OB → only instance 0 (fixes cross-asset cadence).
-        Engine::route_market_event(&ob(Exchange::Binance, "BTCUSDT"), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(ob(Exchange::Binance, "BTCUSDT")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
         // BTC chainlink spot (lowercase "btc/usd") → only instance 0.
-        Engine::route_market_event(&spot("btc/usd"), &sym, &mut tok, &txs);
+        Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs);
         // ETH Coinbase OB → only instance 1.
-        Engine::route_market_event(&ob(Exchange::Coinbase, "ETH-USD"), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(ob(Exchange::Coinbase, "ETH-USD")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
 
         assert_eq!(drain(&rx0), 2, "instance 0 should get BTC OB + BTC spot");
         assert_eq!(drain(&rx1), 1, "instance 1 should get ETH OB only");
@@ -7218,14 +7318,17 @@ mod market_router_tests {
     fn polymarket_token_learned_from_instrument_then_routed() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<MarketEvent>(64);
-        let (tx1, rx1) = bounded::<MarketEvent>(64);
+        let (tx0, rx0) = bounded::<Arc<MarketEvent>>(64);
+        let (tx1, rx1) = bounded::<Arc<MarketEvent>>(64);
         let txs = [tx0, tx1];
 
         // Instrument for BTC series carrying token "TOKxyz" → instance 0,
         // and the router learns TOKxyz → [0].
         Engine::route_market_event(
-            &MarketEvent::Instrument(binary_option("btc-up-or-down-5m", &["TOKxyz"])),
+            Arc::new(MarketEvent::Instrument(binary_option(
+                "btc-up-or-down-5m",
+                &["TOKxyz"],
+            ))),
             &sym,
             &mut tok,
             &txs,
@@ -7234,7 +7337,12 @@ mod market_router_tests {
         assert_eq!(drain(&rx1), 0);
 
         // A Polymarket OB on that dynamic token → only instance 0.
-        Engine::route_market_event(&ob(Exchange::Polymarket, "TOKxyz"), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(ob(Exchange::Polymarket, "TOKxyz")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
         assert_eq!(drain(&rx0), 1, "poly OB routed to learned owner");
         assert_eq!(drain(&rx1), 0, "ETH instance must not see BTC poly OB");
     }
@@ -7243,21 +7351,21 @@ mod market_router_tests {
     fn lifecycle_and_unknown_symbols_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<MarketEvent>(64);
-        let (tx1, rx1) = bounded::<MarketEvent>(64);
+        let (tx0, rx0) = bounded::<Arc<MarketEvent>>(64);
+        let (tx1, rx1) = bounded::<Arc<MarketEvent>>(64);
         let txs = [tx0, tx1];
 
         // Connected → all instances.
         Engine::route_market_event(
-            &MarketEvent::Connected {
+            Arc::new(MarketEvent::Connected {
                 exchange: Exchange::Binance,
-            },
+            }),
             &sym,
             &mut tok,
             &txs,
         );
         // Unknown spot symbol → broadcast (never dropped).
-        Engine::route_market_event(&spot("dogeusdt"), &sym, &mut tok, &txs);
+        Engine::route_market_event(Arc::new(spot("dogeusdt")), &sym, &mut tok, &txs);
 
         assert_eq!(drain(&rx0), 2);
         assert_eq!(drain(&rx1), 2);
@@ -7377,17 +7485,29 @@ mod market_router_tests {
     }
 
     #[test]
-    fn shared_symbol_fans_out_to_all_subscribers() {
-        // Two BTC instances (e.g. 5m + 1h) both subscribe BTCUSDT.
+    fn shared_symbol_fans_out_one_allocation_to_five_subscribers() {
+        // Five BTC instances all subscribe BTCUSDT, but the router must not
+        // allocate five copies of the order-book payload.
         let mut sym: HashMap<String, Vec<usize>> = HashMap::new();
-        sym.insert("btcusdt".into(), vec![0, 1]);
+        sym.insert("btcusdt".into(), vec![0, 1, 2, 3, 4]);
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<MarketEvent>(64);
-        let (tx1, rx1) = bounded::<MarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..5)
+            .map(|_| bounded::<Arc<MarketEvent>>(64))
+            .unzip();
 
-        Engine::route_market_event(&ob(Exchange::Binance, "BTCUSDT"), &sym, &mut tok, &txs);
-        assert_eq!(drain(&rx0), 1);
-        assert_eq!(drain(&rx1), 1, "shared BTC feed reaches both BTC instances");
+        Engine::route_market_event(
+            Arc::new(ob(Exchange::Binance, "BTCUSDT")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        let first = rxs[0].try_recv().expect("instance 0 event");
+        for (idx, rx) in rxs.iter().enumerate().skip(1) {
+            let event = rx.try_recv().unwrap_or_else(|_| panic!("instance {idx} event"));
+            assert!(
+                Arc::ptr_eq(&first, &event),
+                "all five subscribers must share one MarketEvent allocation"
+            );
+        }
     }
 }
