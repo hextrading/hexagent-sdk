@@ -1862,6 +1862,7 @@ impl PolymarketTrade {
             "cli",
             "",
             GapReplayConfig::default(),
+            None,
         )
     }
 
@@ -1883,6 +1884,7 @@ impl PolymarketTrade {
         instance_id: &str,
         funder: &str,
         gap_replay: GapReplayConfig,
+        account_ledger_path: Option<&std::path::Path>,
     ) -> Result<Self> {
         let signer = OrderSigner::new(private_key, neg_risk, sig_type)?;
         // Build v2 signer eagerly iff v2 mode — it's tiny (a few keys +
@@ -1957,16 +1959,55 @@ impl PolymarketTrade {
             .map(|s| s.maker_address.clone())
             .unwrap_or_else(|| signer.maker_address.clone());
 
+        let account_state = if let Some(path) = account_ledger_path {
+            Arc::new(
+                hexagent_account::account::shared_account::SharedAccount::new_persistent(
+                    instance_id,
+                    path,
+                ).map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            Arc::new(
+                hexagent_account::account::shared_account::SharedAccount::new(instance_id),
+            )
+        };
+        let recovered_orders = account_state.orders();
+        let mut recovered_open = HashMap::new();
+        let mut recovered_coid_to_oid = HashMap::new();
+        let mut recovered_oid_to_coid = HashMap::new();
+        let mut recovered_coid_to_token = HashMap::new();
+        for order in recovered_orders.iter().filter(|order| matches!(
+            order.status,
+            OrderStatus::Pending | OrderStatus::Accepted | OrderStatus::PartiallyFilled
+                | OrderStatus::NewOrderTimeout | OrderStatus::CancelOrderTimeout
+                | OrderStatus::CancelUncertain
+        )) {
+            recovered_open.insert(order.client_order_id.clone(), TrackedOrder {
+                symbol: order.token_id.clone(),
+                side: order.side,
+                instance_id: order.instance_id.clone(),
+            });
+            recovered_coid_to_oid.insert(order.client_order_id.clone(), order.order_id.clone());
+            recovered_oid_to_coid.insert(order.order_id.clone(), order.client_order_id.clone());
+            recovered_coid_to_token.insert(order.client_order_id.clone(), order.token_id.clone());
+        }
+        if !recovered_open.is_empty() {
+            warn!(
+                "[PolymarketTrade] account={} restored {} potentially-live order(s) and reservations from {}",
+                instance_id,
+                recovered_open.len(),
+                account_ledger_path.map(|path| path.display().to_string()).unwrap_or_default(),
+            );
+        }
+
         Ok(Self {
             shared: Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
-                account_state: Arc::new(
-                    hexagent_account::account::shared_account::SharedAccount::new(instance_id),
-                ),
-                open_orders: Mutex::new(HashMap::new()),
-                coid_to_oid: Mutex::new(HashMap::new()),
-                oid_to_coid: Mutex::new(HashMap::new()),
-                coid_to_token: Mutex::new(HashMap::new()),
+                account_state,
+                open_orders: Mutex::new(recovered_open),
+                coid_to_oid: Mutex::new(recovered_coid_to_oid),
+                oid_to_coid: Mutex::new(recovered_oid_to_coid),
+                coid_to_token: Mutex::new(recovered_coid_to_token),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
                 pending_reclaim: Mutex::new(Vec::new()),
                 auth,

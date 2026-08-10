@@ -1564,25 +1564,61 @@ fn ctf_position_id(condition_id: &str, index_set: u64, collateral: &str) -> Opti
 
 /// ERC-1155 balanceOf(owner, positionId) on the CTF, in token units (6
 /// decimals, matching the collateral). `position_id_hex` is a 0x uint256.
-fn ctf_erc1155_balance(owner: &str, position_id_hex: &str) -> f64 {
-    let pid = position_id_hex.strip_prefix("0x").unwrap_or(position_id_hex);
-    let pid_bytes = match hex::decode(pid) { Ok(b) => b, Err(_) => return 0.0 };
-    let mut pid_padded = [0u8; 32];
+fn ctf_position_id_bytes(position_id: &str) -> Result<[u8; 32]> {
+    let pid_bytes = if let Some(pid) = position_id.strip_prefix("0x") {
+        hex::decode(pid)
+            .map_err(|error| anyhow::anyhow!("invalid CTF position id `{position_id}`: {error}"))?
+    } else if position_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        num_bigint::BigUint::parse_bytes(position_id.as_bytes(), 10)
+            .ok_or_else(|| anyhow::anyhow!("invalid decimal CTF position id `{position_id}`"))?
+            .to_bytes_be()
+    } else {
+        hex::decode(position_id)
+            .map_err(|error| anyhow::anyhow!("invalid CTF position id `{position_id}`: {error}"))?
+    };
+    if pid_bytes.len() > 32 {
+        return Err(anyhow::anyhow!(
+            "CTF position id exceeds uint256: `{position_id}`"
+        ));
+    }
+    let mut padded = [0u8; 32];
     let start = 32 - pid_bytes.len().min(32);
-    pid_padded[start..].copy_from_slice(&pid_bytes[..pid_bytes.len().min(32)]);
+    padded[start..].copy_from_slice(&pid_bytes);
+    Ok(padded)
+}
+
+fn ctf_erc1155_balance_checked(owner: &str, position_id_hex: &str) -> Result<f64> {
+    let pid_padded = ctf_position_id_bytes(position_id_hex)?;
     let mut data = Vec::with_capacity(4 + 32 * 2);
     data.extend_from_slice(&ERC1155_BALANCE_OF_SELECTOR);
     data.extend_from_slice(&address_to_bytes32(owner));
     data.extend_from_slice(&pid_padded);
-    match deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data))) {
-        Some(result) => {
-            let h = result.strip_prefix("0x").unwrap_or(&result);
-            let trimmed = h.trim_start_matches('0');
-            if trimmed.is_empty() { return 0.0; }
-            u128::from_str_radix(trimmed, 16).unwrap_or(0) as f64 / 1_000_000.0
-        }
-        None => 0.0,
-    }
+    let result = deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data)))
+        .ok_or_else(|| anyhow::anyhow!("CTF balanceOf RPC failed for `{position_id_hex}`"))?;
+    let h = result.strip_prefix("0x").unwrap_or(&result);
+    let trimmed = h.trim_start_matches('0');
+    if trimmed.is_empty() { return Ok(0.0); }
+    let raw = u128::from_str_radix(trimmed, 16)
+        .map_err(|error| anyhow::anyhow!("invalid CTF balanceOf result `{result}`: {error}"))?;
+    Ok(raw as f64 / 1_000_000.0)
+}
+
+fn ctf_erc1155_balance(owner: &str, position_id_hex: &str) -> f64 {
+    ctf_erc1155_balance_checked(owner, position_id_hex).unwrap_or(0.0)
+}
+
+/// Strict balances for two already-known CLOB token ids. This is both safer
+/// and cheaper than recomputing position ids from a condition id: two
+/// `balanceOf` calls instead of six view calls. A transport or decode failure
+/// is distinct from a successful zero and must invalidate the whole snapshot.
+pub fn ctf_outcome_token_balances_checked(
+    owner: &str,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Result<(f64, f64)> {
+    let up = ctf_erc1155_balance_checked(owner, up_token_id)?;
+    let down = ctf_erc1155_balance_checked(owner, down_token_id)?;
+    Ok((up, down))
 }
 
 /// On-chain ERC-1155 balances of the Up (indexSet 1) and Down (indexSet 2)
@@ -3862,7 +3898,11 @@ pub struct MaintenanceJob {
 // at the same instant) never run split/redeem concurrently on the same
 // wallet — which would race on the shared USDC pool and the signer's
 // on-chain nonce. Different accounts get different workers → parallel.
-type MaintenanceQueueItem = (MaintenanceJob, Option<crossbeam_channel::Sender<()>>);
+type MaintenanceQueueItem = (
+    MaintenanceJob,
+    Option<crossbeam_channel::Sender<()>>,
+    std::time::Instant,
+);
 
 static MAINTENANCE_QUEUES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>>,
@@ -3922,7 +3962,7 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
             .expect("Failed to spawn maintenance worker");
         tx
     });
-    if let Err(e) = tx.send((job, done)) {
+    if let Err(e) = tx.send((job, done, std::time::Instant::now())) {
         log::warn!("[Maintenance] enqueue failed (worker gone): {}", e);
     }
 }
@@ -3949,7 +3989,12 @@ pub fn run_maintenance_blocking(job: MaintenanceJob) {
 /// closure (now driven by the executor instead of a per-call thread).
 fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     if items.is_empty() { return; }
-    let (mut job, first_done) = items.remove(0);
+    for (item, _, enqueued_at) in &items {
+        if let Some(account) = &item.account_state {
+            account.record_maintenance_queue_wait(enqueued_at.elapsed());
+        }
+    }
+    let (mut job, first_done, _) = items.remove(0);
     let mut done = vec![first_done];
     let mut statuses: Vec<MaintenanceStatusHandle> =
         job.status.iter().cloned().collect();
@@ -3957,7 +4002,7 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     if !job.instance_id.is_empty() && job.split_amount_usdc > 0.0 {
         allocations.insert(job.instance_id.clone(), job.split_amount_usdc);
     }
-    for (sibling, sibling_done) in items {
+    for (sibling, sibling_done, _) in items {
         job.split_amount_usdc += sibling.split_amount_usdc;
         job.split_end_date_min_secs = job.split_end_date_min_secs
             .max(sibling.split_end_date_min_secs);
@@ -4041,14 +4086,15 @@ fn run_maintenance_job(
             // Gated by `redeem_enabled`. When off, redeem is skipped (no
             // on-chain ops) and treated as healthy — `RedeemResult::default()`
             // reports attempted=0 → `all_ok()` is true — so the split-seed
-            // step proceeds and the final status isn't degraded. Operators
-            // redeem manually via the `hexbot redeem` CLI.
+            // step proceeds and the final status isn't degraded. Normal live
+            // redemption is handled by the platform; the explicit CLI remains
+            // an exceptional recovery tool.
             let mut redeem_result = if redeem_enabled {
                 run_redeem_all(&wallet, gas_via_signer)
             } else {
                 log::info!(
                     "[Maintenance] Step 1/2: Redeem SKIPPED (redeem_enabled=false); \
-                     split-seed still runs. Use `hexbot redeem` for manual redeem."
+                     split-seed still runs and platform redemption is expected."
                 );
                 RedeemResult::default()
             };
@@ -4059,7 +4105,9 @@ fn run_maintenance_job(
                             "[Maintenance] Redeem confirmed but virtual attribution failed account={}: {}",
                             account_id, error,
                         );
-                        account.mark_uncertain();
+                        account.mark_uncertain_with_reason(format!(
+                            "confirmed maintenance redeem attribution failed: {error}"
+                        ));
                         if redeem_result.first_failure.is_none() {
                             redeem_result.first_failure = Some(format!(
                                 "virtual redeem attribution: {error}"
@@ -4147,7 +4195,9 @@ fn run_maintenance_job(
                                     "[Maintenance] On-chain split confirmed but virtual allocation failed account={} cid={}: {}",
                                     account_id, cid, error,
                                 );
-                                account.mark_uncertain();
+                                account.mark_uncertain_with_reason(format!(
+                                    "confirmed maintenance split attribution failed cid={cid}: {error}"
+                                ));
                                 outcome = SplitOutcome::PendingTimeout(format!(
                                     "on-chain confirmed; virtual allocation uncertain: {error}"
                                 ));
@@ -4340,6 +4390,14 @@ pub fn run_split() -> Result<()> {
 #[cfg(test)]
 mod maintenance_status_tests {
     use super::*;
+
+    #[test]
+    fn ctf_position_id_accepts_decimal_and_hex_uint256() {
+        assert_eq!(ctf_position_id_bytes("42").unwrap()[31], 42);
+        assert_eq!(ctf_position_id_bytes("0x2a").unwrap()[31], 42);
+        assert_eq!(ctf_position_id_bytes("2a").unwrap()[31], 42);
+        assert!(ctf_position_id_bytes(&"1".repeat(79)).is_err());
+    }
 
     #[test]
     fn offramp_calldata_routes_bridged_usdc() {

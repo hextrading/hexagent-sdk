@@ -634,7 +634,9 @@ async fn replay_missed_trades(
     // doesn't silently truncate the replay.
     const MAX_PAGES: usize = 50;
     let mut truncated = false;
+    let mut pages = 0usize;
     for page in 0..MAX_PAGES {
+        pages = page + 1;
         let url = if cursor.is_empty() {
             format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
@@ -745,6 +747,8 @@ async fn replay_missed_trades(
         // fills, so the current event's inventory is unknowable.
         if page == MAX_PAGES - 1 { truncated = true; }
     }
+
+    shared.account_state.record_gap_replay_pages(pages);
 
     if truncated {
         warn!(
@@ -894,6 +898,10 @@ async fn user_feed_loop(
                     }
                     Ok(outcome @ GapReplayOutcome::Truncated { .. }) => {
                         shared.user_feed_health.set_inventory_uncertain(true);
+                        shared.account_state.mark_uncertain_with_reason(format!(
+                            "periodic gap replay truncated after {} records",
+                            outcome.records(),
+                        ));
                         shared.user_feed_health.set_gap_replay_degraded(false);
                         consecutive_failures = 0;
                         periodic_after_secs = None;
@@ -998,6 +1006,12 @@ async fn user_feed_loop(
         };
         match replay_result {
             Ok(outcome) => {
+                if matches!(outcome, GapReplayOutcome::Truncated { .. }) {
+                    shared.account_state.mark_uncertain_with_reason(format!(
+                        "reconnect gap replay truncated after {} records",
+                        outcome.records(),
+                    ));
+                }
                 match outcome {
                     GapReplayOutcome::Complete { records } => {
                         info!(

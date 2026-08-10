@@ -1134,6 +1134,11 @@ pub struct ExchangeConfig {
     /// SharedState, so order tracking stays consistent. Default 8.
     #[serde(default = "default_executor_workers")]
     pub executor_workers: usize,
+    /// Polymarket-only — directory for one durable shared-account ledger per
+    /// `account_id`. Relative paths resolve from cwd. Default:
+    /// `./state/polymarket-ledgers`; explicitly empty disables persistence.
+    #[serde(default = "default_account_ledger_dir")]
+    pub account_ledger_dir: String,
     /// Hyperliquid-only — the master/owner account address (0x-hex, 20 bytes)
     /// whose positions and fills are queried and traded. When signing with an
     /// approved **API agent wallet**, `private_key` is the agent key while
@@ -1168,6 +1173,9 @@ fn default_gap_replay_rewind_ms() -> u64 {
 }
 fn default_executor_workers() -> usize {
     8
+}
+fn default_account_ledger_dir() -> String {
+    "./state/polymarket-ledgers".to_string()
 }
 
 fn default_use_batch_orders() -> bool {
