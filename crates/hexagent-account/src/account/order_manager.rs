@@ -381,7 +381,18 @@ impl OrderManager {
                 }
                 order.status = LocalOrderStatus::Active;
             }
-            OrderStatus::PartiallyFilled => {
+            status
+                if status == OrderStatus::PartiallyFilled
+                    || (status == OrderStatus::Filled
+                        && update.filled_quantity > 0.0
+                        && update.trade_id.as_deref().is_some_and(|id| !id.is_empty())) =>
+            {
+                // A private-trade `Filled` means that this ONE trade reached
+                // CONFIRMED; it is not an order-level terminal. Treat it with
+                // the same cumulative, trade-id-deduplicated semantics as
+                // MATCHED/MINED (`PartiallyFilled`). An authoritative whole-
+                // order terminal has no private trade id and still reaches the
+                // terminal `Filled` arm below.
                 // A confirmed Cancelled state is terminal for order admission.
                 // A delayed trade push may still adjust inventory, but it must
                 // not resurrect the order as Active and trigger another DELETE
@@ -893,6 +904,35 @@ mod tests {
         m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
         let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Filled));
         assert_eq!(m.open_count(), 0, "Filled is removed");
+    }
+
+    #[test]
+    fn confirmed_private_trade_does_not_remove_partially_filled_order() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 40.0);
+
+        let mut matched = upd("x", Side::Buy, OrderStatus::PartiallyFilled);
+        matched.trade_id = Some("trade-1".into());
+        matched.filled_quantity = 5.0;
+        let _ = m.on_order_update(&matched);
+        assert_eq!(m.live_count(Side::Buy), 1);
+
+        let mut confirmed = matched.clone();
+        confirmed.status = OrderStatus::Filled;
+        let _ = m.on_order_update(&confirmed);
+
+        assert_eq!(
+            m.live_count(Side::Buy),
+            1,
+            "CONFIRMED advances one trade lifecycle, not the whole order"
+        );
+        let order = m.active_bid().expect("remaining quantity stays managed");
+        assert_eq!(
+            order.filled_by_trade.len(),
+            1,
+            "MATCHED/CONFIRMED dedupe by trade id"
+        );
+        assert!((order.filled_by_trade["trade-1"] - 5.0).abs() < 1e-9);
     }
 
     #[test]

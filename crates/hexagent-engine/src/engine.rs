@@ -7,7 +7,7 @@
 //! - Paper: live feeds → strategy → sim_v2 matching core
 
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -3745,7 +3745,11 @@ impl Engine {
         )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
-            let (utx, urx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
+            // Private order/trade lifecycle updates are loss-intolerant and
+            // low-volume. An unbounded per-instance queue prevents one slow
+            // strategy from blocking the account-wide router (and therefore
+            // every sibling) while preserving every ownership transition.
+            let (utx, urx) = unbounded::<OrderUpdate>();
             market_txs.push(mtx);
             update_txs.push(utx);
             specs.push((s, mrx, urx));
@@ -3782,6 +3786,8 @@ impl Engine {
 
                 // Learned Polymarket token_id → instances (from Instrument).
                 let mut token_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
+                let mut market_overflow_drops = 0u64;
+                let mut market_overflow_log_at = std::time::Instant::now();
                 // instance_id → worker index, for recovering the owner of a
                 // coid that's no longer in `coid_owner` (late update after its
                 // registry entry was freed). Coids are minted as
@@ -3807,12 +3813,26 @@ impl Engine {
                             }
                             Ok(event) => {
                                 forward_recorder_event(recorder_tx.as_ref(), &event);
-                                Self::route_market_event(
+                                market_overflow_drops = market_overflow_drops.saturating_add(
+                                    Self::route_market_event(
                                     Arc::new(event),
                                     &sym_to_instances,
                                     &mut token_to_instances,
                                     &market_txs,
+                                    ) as u64,
                                 );
+                                if market_overflow_drops > 0
+                                    && market_overflow_log_at.elapsed()
+                                        >= std::time::Duration::from_secs(1)
+                                {
+                                    warn!(
+                                        "[market_queue_metric] router_overflow_drops={} window_ms={} (isolated to full instance queues)",
+                                        market_overflow_drops,
+                                        market_overflow_log_at.elapsed().as_millis(),
+                                    );
+                                    market_overflow_drops = 0;
+                                    market_overflow_log_at = std::time::Instant::now();
+                                }
                             }
                             Err(_) => break,
                         },
@@ -3879,26 +3899,40 @@ impl Engine {
         sym_to_instances: &HashMap<String, Vec<usize>>,
         token_to_instances: &mut HashMap<String, Vec<usize>>,
         market_txs: &[Sender<QueuedMarketEvent>],
-    ) {
+    ) -> usize {
         let broadcast = |txs: &[Sender<QueuedMarketEvent>]| {
             let enqueued_at = std::time::Instant::now();
+            let mut dropped = 0usize;
             for tx in txs {
-                let _ = tx.send(QueuedMarketEvent {
-                    event: Arc::clone(&event),
-                    enqueued_at,
-                });
+                if tx
+                    .try_send(QueuedMarketEvent {
+                        event: Arc::clone(&event),
+                        enqueued_at,
+                    })
+                    .is_err()
+                {
+                    dropped += 1;
+                }
             }
+            dropped
         };
         let send_to = |idxs: &[usize], txs: &[Sender<QueuedMarketEvent>]| {
             let enqueued_at = std::time::Instant::now();
+            let mut dropped = 0usize;
             for &i in idxs {
                 if let Some(tx) = txs.get(i) {
-                    let _ = tx.send(QueuedMarketEvent {
-                        event: Arc::clone(&event),
-                        enqueued_at,
-                    });
+                    if tx
+                        .try_send(QueuedMarketEvent {
+                            event: Arc::clone(&event),
+                            enqueued_at,
+                        })
+                        .is_err()
+                    {
+                        dropped += 1;
+                    }
                 }
             }
+            dropped
         };
 
         // Instrument(BinaryOption) → attribute its token_ids to the owner
@@ -3908,11 +3942,10 @@ impl Engine {
                 for tok in &bo.clob_token_ids {
                     token_to_instances.insert(tok.to_ascii_lowercase(), owners.clone());
                 }
-                send_to(&owners, market_txs);
+                return send_to(&owners, market_txs);
             } else {
-                broadcast(market_txs);
+                return broadcast(market_txs);
             }
-            return;
         }
 
         let targets: Option<Vec<usize>> = match event.as_ref() {
@@ -3959,7 +3992,7 @@ impl Engine {
         };
         match targets {
             Some(idxs) if !idxs.is_empty() => send_to(&idxs, market_txs),
-            Some(_) => {} // Exit handled by caller; empty = drop
+            Some(_) => 0, // Exit handled by caller; empty = drop
             None => broadcast(market_txs),
         }
     }
@@ -5036,6 +5069,39 @@ impl Engine {
             }
         }
 
+        // The persisted account ledger may contain orders that were live when
+        // the previous process stopped. Reconcile them once per account only
+        // after every configured instance has joined the shared state, and
+        // before any strategy worker can quote against the restored balances.
+        for (account_id, shared) in &by_account {
+            let configured_instances: HashSet<String> = self
+                .config
+                .strategies
+                .iter()
+                .filter(|strategy| {
+                    strategy.enabled
+                        && self
+                            .registry
+                            .capabilities(&strategy.name)
+                            .needs_poly_user_feed
+                        && strategy.account_id() == account_id
+                        && !strategy.instance_id.is_empty()
+                })
+                .map(|strategy| strategy.instance_id.clone())
+                .collect();
+            shared
+                .account_state
+                .reconcile_configured_instances(&configured_instances);
+            let recovery = PolymarketTrade::from_shared(shared.clone(), "", "");
+            let unresolved = recovery.reconcile_recovered_orders();
+            if unresolved > 0 {
+                warn!(
+                    "[Engine] Polymarket account={} remains risk-off: {} recovered order(s) unresolved",
+                    account_id, unresolved,
+                );
+            }
+        }
+
         info!(
             "[Engine] Built {} Polymarket SharedState(s) across {} account(s) for {} instance(s)",
             by_account.len(),
@@ -6094,7 +6160,6 @@ fn fire_or_execute(
             && cancel_client_order_ids.len() == 1
             && place_orders.len() == 1 =>
         {
-            let place_is_stale = is_stale(timestamp_ns);
             let coid = cancel_client_order_ids.into_iter().next().unwrap();
             let place = place_orders.into_iter().next().unwrap();
             // Cancel is retained even when the replace signal has aged. The
@@ -6131,7 +6196,11 @@ fn fire_or_execute(
                 vec![u]
             });
             let _ = done_tx.send((cf, utx.clone()));
-            if place_is_stale {
+            // The retained cancel may have waited on a saturated Cancel slot.
+            // Re-check age only after it has actually been dispatched; using
+            // the pre-wait value could place a quote that became stale during
+            // admission wait.
+            if is_stale(timestamp_ns) {
                 let _ = utx.send(exec_rejected_place(&place));
                 return;
             }
@@ -7433,6 +7502,30 @@ mod market_router_tests {
 
         assert_eq!(drain(&rx0), 2, "instance 0 should get BTC OB + BTC spot");
         assert_eq!(drain(&rx1), 1, "instance 1 should get ETH OB only");
+    }
+
+    #[test]
+    fn full_market_queue_drops_only_that_instance_without_blocking_router() {
+        let sym = two_instance_map();
+        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let (tx0, _rx0) = bounded::<QueuedMarketEvent>(1);
+        let (tx1, rx1) = bounded::<QueuedMarketEvent>(1);
+        let txs = [tx0, tx1];
+
+        assert_eq!(
+            Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs,),
+            0
+        );
+        // BTC queue is now full. Routing ETH must remain independent.
+        assert_eq!(
+            Engine::route_market_event(Arc::new(spot("eth/usd")), &sym, &mut tok, &txs,),
+            0
+        );
+        assert_eq!(drain(&rx1), 1);
+        assert_eq!(
+            Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs,),
+            1
+        );
     }
 
     #[test]

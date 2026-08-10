@@ -37,19 +37,44 @@ struct ApiPosition {
 ///
 /// API: `GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0`
 pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>> {
-    let url = format!(
-        "{}/positions?user={}&sizeThreshold=0&limit=500",
-        DATA_API_BASE, wallet_address,
-    );
     info!("[Polymarket] Fetching positions for {}", wallet_address);
 
     // Route through the shared async runtime + HTTP/2 client.
     let client = crate::async_rt::http_client();
+    let wallet = wallet_address.to_string();
     let resp: Vec<ApiPosition> = crate::async_rt::block_on_runtime(async move {
-        let r = client.get(&url).send().await
-            .map_err(|e| anyhow::anyhow!("fetch_positions: {}", e))?;
-        r.json::<Vec<ApiPosition>>().await
-            .map_err(|e| anyhow::anyhow!("fetch_positions parse: {}", e))
+        const PAGE_SIZE: usize = 500;
+        const MAX_PAGES: usize = 100;
+        let mut all = Vec::new();
+        for page in 0..MAX_PAGES {
+            let offset = page * PAGE_SIZE;
+            let url = format!(
+                "{}/positions?user={}&sizeThreshold=0&limit={}&offset={}",
+                DATA_API_BASE, wallet, PAGE_SIZE, offset,
+            );
+            let r = client.get(&url).send().await.map_err(|e| {
+                anyhow::anyhow!("fetch_positions page={} offset={}: {}", page + 1, offset, e)
+            })?;
+            if !r.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "fetch_positions page={} offset={}: status {}",
+                    page + 1, offset, r.status(),
+                ));
+            }
+            let mut rows = r.json::<Vec<ApiPosition>>().await.map_err(|e| {
+                anyhow::anyhow!(
+                    "fetch_positions parse page={} offset={}: {}",
+                    page + 1, offset, e,
+                )
+            })?;
+            let complete = rows.len() < PAGE_SIZE;
+            all.append(&mut rows);
+            if complete { return Ok(all); }
+        }
+        Err(anyhow::anyhow!(
+            "fetch_positions exceeded {} pages; refusing a potentially incomplete authoritative snapshot",
+            MAX_PAGES,
+        ))
     })?;
 
     let mut positions = HashMap::new();
