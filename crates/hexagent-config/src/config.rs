@@ -1136,7 +1136,7 @@ pub struct ExchangeConfig {
     pub executor_workers: usize,
     /// Polymarket-only — directory for one durable shared-account ledger per
     /// `account_id`. Relative paths resolve from cwd. Default:
-    /// `./state/polymarket-ledgers`; explicitly empty disables persistence.
+    /// `./data/state/polymarket-ledgers`; explicitly empty disables persistence.
     #[serde(default = "default_account_ledger_dir")]
     pub account_ledger_dir: String,
     /// Hyperliquid-only — the master/owner account address (0x-hex, 20 bytes)
@@ -1175,7 +1175,7 @@ fn default_executor_workers() -> usize {
     8
 }
 fn default_account_ledger_dir() -> String {
-    "./state/polymarket-ledgers".to_string()
+    "./data/state/polymarket-ledgers".to_string()
 }
 
 fn default_use_batch_orders() -> bool {

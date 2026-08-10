@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use hexagent_account::account::shared_account::normalize_order_id;
 use log::{info, warn};
 
 use crate::async_rt;
@@ -117,6 +118,38 @@ fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
             associate_trades,
         },
     })
+}
+
+fn filled_trade_audit_complete(
+    client_order_id: &str,
+    audit: &AuthoritativeOrderAudit,
+    applied: &[hexagent_account::account::shared_account::TradeOwnership],
+) -> bool {
+    let Some(expected) = audit
+        .size_matched
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    else {
+        return false;
+    };
+    if audit.associate_trades.is_empty() {
+        return expected <= 1e-9;
+    }
+
+    let mut covered = 0.0;
+    for trade_id in &audit.associate_trades {
+        let Some(trade) = applied.iter().find(|trade| {
+            trade.client_order_id == client_order_id
+                && (trade.trade_key == *trade_id
+                    || trade.trade_key.starts_with(&format!("{}:", trade_id)))
+        }) else {
+            return false;
+        };
+        covered += trade.quantity;
+    }
+    let tolerance = (expected.abs() * 1e-6).max(1e-8);
+    (covered - expected).abs() <= tolerance
 }
 
 /// Classify a successful singular-order lookup. Polymarket's live endpoint has
@@ -1289,7 +1322,9 @@ fn reclaim_token_mappings(
         .map(|(coid, _)| coid.clone())
         .collect();
     for coid in &stale {
-        if let Some(oid) = coid_to_oid.remove(coid) { oid_to_coid.remove(&oid); }
+        if let Some(oid) = coid_to_oid.remove(coid) {
+            oid_to_coid.remove(&normalize_order_id(&oid));
+        }
         coid_to_token.remove(coid);
     }
     stale.len()
@@ -1302,20 +1337,33 @@ impl SharedState {
     /// reclaimed now that lifecycle rejects/cancels KEEP them — see
     /// `coid_to_token` field doc).
     pub fn register_order_id(&self, client_order_id: &str, exchange_order_id: &str, token: &str) {
+        // Make the durable ledger authoritative. If it detects an unknown
+        // coid or an oid collision it enters risk-off; never install a runtime
+        // mapping that disagrees with persisted ownership.
+        if !self.account_state.rebind_order_id(client_order_id, exchange_order_id) {
+            warn!(
+                "[PolymarketTrade] Refusing inconsistent order mapping coid={} oid={}",
+                client_order_id, exchange_order_id,
+            );
+            return;
+        }
         self.coid_to_oid.lock().unwrap()
             .insert(client_order_id.to_string(), exchange_order_id.to_string());
         self.oid_to_coid.lock().unwrap()
-            .insert(exchange_order_id.to_string(), client_order_id.to_string());
+            .insert(normalize_order_id(exchange_order_id), client_order_id.to_string());
         if !token.is_empty() {
             self.coid_to_token.lock().unwrap()
                 .insert(client_order_id.to_string(), token.to_string());
         }
-        self.account_state.rebind_order_id(client_order_id, exchange_order_id);
     }
 
     /// Look up client_order_id from Polymarket orderID.
     pub fn lookup_coid(&self, exchange_order_id: &str) -> Option<String> {
-        self.oid_to_coid.lock().unwrap().get(exchange_order_id).cloned()
+        self.oid_to_coid
+            .lock()
+            .unwrap()
+            .get(&normalize_order_id(exchange_order_id))
+            .cloned()
     }
 
     /// Drop the order from the **active-order** tracker.
@@ -1342,6 +1390,30 @@ impl SharedState {
     }
 
     pub fn remove_order_as(&self, client_order_id: &str, status: OrderStatus) {
+        // `MATCHED`/`FILLED` from an order lookup or DELETE response proves the
+        // order is terminal, but it does not prove that every associated trade
+        // has reached the account ledger. Preserve the reservation and keep the
+        // order reconcilable until private-feed/gap-replay trade audit consumes
+        // it. Cancelled/rejected outcomes can release immediately.
+        if status == OrderStatus::Filled
+            && self
+                .account_state
+                .mark_filled_pending_audit(client_order_id)
+        {
+            warn!(
+                "[PolymarketTrade] Filled coid={} awaits complete trade audit; preserving reservation",
+                client_order_id,
+            );
+            return;
+        }
+        self.remove_order_resolved_as(client_order_id, status);
+    }
+
+    /// Final teardown after the exchange audit has proved that every
+    /// associated trade was processed. Unlike the first Filled edge, this may
+    /// release a residual reservation: FAK/partially matched orders can be
+    /// terminal with `size_matched < original quantity`.
+    fn remove_order_resolved_as(&self, client_order_id: &str, status: OrderStatus) {
         self.open_orders.lock().unwrap().remove(client_order_id);
         self.account_state.release_order(client_order_id, status);
         self.account_state.finish_order_recovery(client_order_id);
@@ -1360,6 +1432,26 @@ impl SharedState {
                 "[orphan_metric] http_425_circuit_active={} http_425_active_coids={} coid_425_active=0 coid={} reason=terminal",
                 u8::from(active_count > 0), active_count, client_order_id,
             );
+        }
+    }
+
+    pub(crate) fn complete_filled_order_audit(&self, client_order_id: &str) {
+        self.remove_order_resolved_as(client_order_id, OrderStatus::Filled);
+    }
+
+    /// Remove executor-side tracking after the account ledger has consumed all
+    /// reserved quantity/cash for a terminal fill.
+    pub(crate) fn finish_filled_order_if_audited(&self, client_order_id: &str) {
+        let audited = self
+            .account_state
+            .order(client_order_id)
+            .is_some_and(|order| {
+                order.status == OrderStatus::Filled
+                    && order.reserved_cash <= 1e-9
+                    && order.reserved_quantity <= 1e-9
+            });
+        if audited {
+            self.complete_filled_order_audit(client_order_id);
         }
     }
 
@@ -1982,7 +2074,10 @@ impl PolymarketTrade {
             // must still resolve to the placing instance after restart.
             if !order.client_order_id.is_empty() && !order.order_id.is_empty() {
                 recovered_coid_to_oid.insert(order.client_order_id.clone(), order.order_id.clone());
-                recovered_oid_to_coid.insert(order.order_id.clone(), order.client_order_id.clone());
+                recovered_oid_to_coid.insert(
+                    normalize_order_id(&order.order_id),
+                    order.client_order_id.clone(),
+                );
             }
             if !order.client_order_id.is_empty() && !order.token_id.is_empty() {
                 recovered_coid_to_token.insert(order.client_order_id.clone(), order.token_id.clone());
@@ -1992,7 +2087,9 @@ impl PolymarketTrade {
                 OrderStatus::Pending | OrderStatus::Accepted | OrderStatus::PartiallyFilled
                     | OrderStatus::NewOrderTimeout | OrderStatus::CancelOrderTimeout
                     | OrderStatus::CancelUncertain | OrderStatus::Failed
-            ) {
+            ) || order.reserved_cash > 1e-9
+                || order.reserved_quantity > 1e-9
+            {
                 recovered_open.insert(order.client_order_id.clone(), TrackedOrder {
                     symbol: order.token_id.clone(),
                     side: order.side,
@@ -2087,6 +2184,12 @@ impl PolymarketTrade {
     /// Get a clone of the shared state (for user_feed thread).
     pub fn shared_state(&self) -> Arc<SharedState> {
         self.shared.clone()
+    }
+
+    /// Canonical physical maker/funder identity used for account de-duplication
+    /// at engine startup.
+    pub fn order_maker_address(&self) -> &str {
+        &self.shared.order_maker_address
     }
 
     /// Pre-warm transport pools once per process, then send one signed
@@ -2208,36 +2311,58 @@ impl PolymarketTrade {
     /// race without turning startup into an unbounded wait. Anything still
     /// ambiguous is deliberately left reserved and operator-visible.
     pub fn reconcile_recovered_orders(&self) -> usize {
+        self.reconcile_recovered_orders_with_updates().0
+    }
+
+    /// Runtime variant that also returns the replayed private-trade updates so
+    /// active strategy workers receive the same inventory edges as the account
+    /// ledger. Startup callers may use `reconcile_recovered_orders()` and seed
+    /// strategy state from the recovered virtual snapshot instead.
+    pub fn reconcile_recovered_orders_with_updates(&self) -> (usize, Vec<OrderUpdate>) {
         const RETRY_DELAYS_MS: &[u64] = &[0, 100, 250, 500, 1_000, 2_000];
+        let mut replayed_updates = Vec::new();
 
         for (attempt, delay_ms) in RETRY_DELAYS_MS.iter().copied().enumerate() {
             if delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
-            let pending: Vec<(String, String)> = {
-                let coids: Vec<String> = self
-                    .shared
-                    .open_orders
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .cloned()
-                    .collect();
+            let pending: Vec<(String, String, OrderStatus)> = {
+                let coids = self.shared.account_state.recovery_pending_order_ids();
                 let ids = self.shared.coid_to_oid.lock().unwrap();
                 coids
                     .into_iter()
-                    .filter_map(|coid| ids.get(&coid).map(|oid| (coid, oid.clone())))
+                    .filter_map(|coid| {
+                        let status = self.shared.account_state.order(&coid)?.status;
+                        ids.get(&coid).map(|oid| (coid, oid.clone(), status))
+                    })
                     .collect()
             };
             if pending.is_empty() {
-                return 0;
+                let unresolved = self
+                    .shared
+                    .account_state
+                    .monitoring_snapshot()
+                    .recovery_pending_orders;
+                return (unresolved, replayed_updates);
             }
 
-            for (coid, order_id) in pending {
+            for (coid, order_id, durable_status) in pending {
                 match self.fetch_order_by_id(&coid, &order_id, None) {
                     FetchOrderResult::Found(order) => {
                         match order.status.as_str() {
                             "LIVE" => {
+                                // A runtime Filled edge can race a stale order
+                                // lookup. Once the durable ledger has observed
+                                // Filled, never regress it to LIVE or release
+                                // its reservation through a later cancel ACK;
+                                // wait for the associated trade audit instead.
+                                if durable_status == OrderStatus::Filled {
+                                    warn!(
+                                        "[PolymarketTrade] trade-audit coid={} orderID={} returned stale LIVE; retaining Filled reservation",
+                                        coid, order_id,
+                                    );
+                                    continue;
+                                }
                                 let body = serde_json::json!({ "orderID": order_id });
                                 match self.delete_detailed("/order", &body) {
                                     Ok(response) => match cancel_delete_response_outcome(
@@ -2262,24 +2387,13 @@ impl PolymarketTrade {
                             "MATCHED" | "FILLED" => {
                                 let trade_ids = order.audit.associate_trades.clone();
                                 if !trade_ids.is_empty() {
-                                    // At this point strategy workers have not
-                                    // started yet, so replaying directly into
-                                    // the account ledger cannot race their
-                                    // PositionManager. Their cold snapshot is
-                                    // seeded from this virtual ledger later.
-                                    let _ = self.reconcile_orphans(&[], &[], &trade_ids);
-                                    let applied = self.shared.account_state.trades();
-                                    let all_applied = trade_ids.iter().all(|trade_id| {
-                                        applied.iter().any(|trade| {
-                                            trade.trade_key == *trade_id
-                                                || trade.trade_key.starts_with(
-                                                    &format!("{}:", trade_id),
-                                                )
-                                        })
-                                    });
-                                    if all_applied {
-                                        self.shared.remove_order_as(&coid, OrderStatus::Filled);
-                                    }
+                                    replayed_updates.extend(
+                                        self.reconcile_orphans(&[], &[], &trade_ids),
+                                    );
+                                }
+                                let applied = self.shared.account_state.trades();
+                                if filled_trade_audit_complete(&coid, &order.audit, &applied) {
+                                    self.shared.complete_filled_order_audit(&coid);
                                 }
                             }
                             status if status.starts_with("CANCELED")
@@ -2307,16 +2421,29 @@ impl PolymarketTrade {
                     ),
                 }
             }
+            if self
+                .shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders
+                == 0
+            {
+                return (0, replayed_updates);
+            }
         }
 
-        let unresolved = self.shared.open_orders.lock().unwrap().len();
+        let unresolved = self
+            .shared
+            .account_state
+            .monitoring_snapshot()
+            .recovery_pending_orders;
         if unresolved > 0 {
             warn!(
                 "[PolymarketTrade] startup recovery left {} ambiguous order(s); account admission remains paused",
                 unresolved,
             );
         }
-        unresolved
+        (unresolved, replayed_updates)
     }
 
     /// POST variant that distinguishes timeout / status / other errors so
@@ -2420,7 +2547,9 @@ impl PolymarketTrade {
                             let oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
                             canceled.iter()
                                 .filter_map(|v| v.as_str())
-                                .filter_map(|oid| oid_to_coid.get(oid).cloned())
+                                .filter_map(|oid| {
+                                    oid_to_coid.get(&normalize_order_id(oid)).cloned()
+                                })
                                 .collect()
                         };
                         for coid in coids {
@@ -2760,7 +2889,7 @@ impl PolymarketTrade {
     /// Normalise an `orderID` for comparison — Polymarket's API returns
     /// the hex in mixed case (no checksum); we lowercase both sides.
     fn oid_eq(a: &str, b: &str) -> bool {
-        a.trim_start_matches("0x").eq_ignore_ascii_case(b.trim_start_matches("0x"))
+        normalize_order_id(a) == normalize_order_id(b)
     }
 
     /// Make a rejected OrderUpdate for rate limit or other local errors.
@@ -4510,15 +4639,26 @@ impl ExchangeTrade for PolymarketTrade {
                         .unwrap_or_default();
                     let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
                     for oid in &canceled_oids {
-                        if let Some(coid) = oid_to_coid.get(oid) {
+                        if let Some(coid) = oid_to_coid.get(&normalize_order_id(oid)) {
                             per_coid_outcome.insert(coid.clone(), OrderStatus::Cancelled);
                         }
                     }
                     let canceled_coids: Vec<String> = canceled_oids.iter()
-                        .map(|oid| oid_to_coid.get(oid).cloned().unwrap_or_default()).collect();
+                        .map(|oid| {
+                            oid_to_coid
+                                .get(&normalize_order_id(oid))
+                                .cloned()
+                                .unwrap_or_default()
+                        })
+                        .collect();
                     let not_canceled_coids: Vec<String> = not_canceled
                         .map(|m| m.keys()
-                            .map(|oid| oid_to_coid.get(oid).cloned().unwrap_or_default())
+                            .map(|oid| {
+                                oid_to_coid
+                                    .get(&normalize_order_id(oid))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            })
                             .collect())
                         .unwrap_or_default();
                     info!(
@@ -4527,7 +4667,10 @@ impl ExchangeTrade for PolymarketTrade {
                     );
                     if let Some(nc) = not_canceled {
                         for (id, reason) in nc {
-                            let coid = oid_to_coid.get(id).cloned().unwrap_or_default();
+                            let coid = oid_to_coid
+                                .get(&normalize_order_id(id))
+                                .cloned()
+                                .unwrap_or_default();
                             let reason_str = reason.as_str().unwrap_or("");
                             info!(
                                 "[PolymarketTrade] Cancel rejected: orderID={} reason={} coid={}",
@@ -4931,15 +5074,26 @@ impl ExchangeTrade for PolymarketTrade {
                             .unwrap_or_default();
                         let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
                         for oid in &canceled_oids {
-                            if let Some(coid) = oid_to_coid.get(oid) {
+                            if let Some(coid) = oid_to_coid.get(&normalize_order_id(oid)) {
                                 per_coid_outcome.insert(coid.clone(), OrderStatus::Cancelled);
                             }
                         }
                         let canceled_coids: Vec<String> = canceled_oids.iter()
-                            .map(|oid| oid_to_coid.get(oid).cloned().unwrap_or_default()).collect();
+                            .map(|oid| {
+                                oid_to_coid
+                                    .get(&normalize_order_id(oid))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            })
+                            .collect();
                         let not_canceled_coids: Vec<String> = not_canceled
                             .map(|m| m.keys()
-                                .map(|oid| oid_to_coid.get(oid).cloned().unwrap_or_default())
+                                .map(|oid| {
+                                    oid_to_coid
+                                        .get(&normalize_order_id(oid))
+                                        .cloned()
+                                        .unwrap_or_default()
+                                })
                                 .collect())
                             .unwrap_or_default();
                         info!(
@@ -4948,7 +5102,10 @@ impl ExchangeTrade for PolymarketTrade {
                         );
                         if let Some(nc) = not_canceled {
                             for (id, reason) in nc {
-                                let coid = oid_to_coid.get(id).cloned().unwrap_or_default();
+                                let coid = oid_to_coid
+                                    .get(&normalize_order_id(id))
+                                    .cloned()
+                                    .unwrap_or_default();
                                 let reason_str = reason.as_str().unwrap_or("");
                                 info!(
                                     "[PolymarketTrade] Cancel rejected: orderID={} reason={} coid={}",
@@ -5316,6 +5473,45 @@ mod tests {
         assert_eq!(fetched.audit.size_matched.as_deref(), Some("19.990489"));
     }
 
+    #[test]
+    fn filled_trade_audit_requires_ids_owner_and_matched_quantity_coverage() {
+        let trade = hexagent_account::account::shared_account::TradeOwnership {
+            account_id: "acct".into(),
+            instance_id: "owner".into(),
+            trade_key: "trade-1".into(),
+            client_order_id: "owner-1".into(),
+            order_id: "oid-1".into(),
+            token_id: "TOKEN".into(),
+            side: Side::Buy,
+            quantity: 4.0,
+            price: 0.5,
+            status: "MATCHED".into(),
+        };
+        let complete = AuthoritativeOrderAudit {
+            original_size: Some("10".into()),
+            size_matched: Some("4".into()),
+            associate_trades: vec!["trade-1".into()],
+        };
+        assert!(filled_trade_audit_complete("owner-1", &complete, &[trade.clone()]));
+        assert!(!filled_trade_audit_complete("sibling-1", &complete, &[trade.clone()]));
+
+        let incomplete_quantity = AuthoritativeOrderAudit {
+            size_matched: Some("5".into()),
+            ..complete.clone()
+        };
+        assert!(!filled_trade_audit_complete(
+            "owner-1",
+            &incomplete_quantity,
+            &[trade],
+        ));
+        let no_fill = AuthoritativeOrderAudit {
+            original_size: Some("10".into()),
+            size_matched: Some("0".into()),
+            associate_trades: Vec::new(),
+        };
+        assert!(filled_trade_audit_complete("owner-1", &no_fill, &[]));
+    }
+
     // Event-expiry reclaim purges only the settling event's tokens, leaving
     // other concurrent events' coid↔oid mappings intact — and a coid kept
     // alive past a reject (so a racy late fill still resolves) is reclaimed
@@ -5332,7 +5528,7 @@ mod tests {
             ("c3", "0xb1", "BUP"), // event B — must survive
         ] {
             coid_to_oid.insert(coid.into(), oid.into());
-            oid_to_coid.insert(oid.into(), coid.into());
+            oid_to_coid.insert(normalize_order_id(oid), coid.into());
             coid_to_token.insert(coid.into(), tok.into());
         }
 
@@ -5343,11 +5539,11 @@ mod tests {
         assert_eq!(n, 2, "both event-A coids reclaimed");
         // Event A fully purged from all three maps.
         assert!(!coid_to_oid.contains_key("c1") && !coid_to_oid.contains_key("c2"));
-        assert!(!oid_to_coid.contains_key("0xa1") && !oid_to_coid.contains_key("0xa2"));
+        assert!(!oid_to_coid.contains_key("a1") && !oid_to_coid.contains_key("a2"));
         assert!(!coid_to_token.contains_key("c1"));
         // Event B untouched — its late fill can still map.
         assert_eq!(coid_to_oid.get("c3").map(String::as_str), Some("0xb1"));
-        assert_eq!(oid_to_coid.get("0xb1").map(String::as_str), Some("c3"));
+        assert_eq!(oid_to_coid.get("b1").map(String::as_str), Some("c3"));
         assert_eq!(coid_to_token.get("c3").map(String::as_str), Some("BUP"));
     }
 

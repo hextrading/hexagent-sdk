@@ -6,6 +6,7 @@
 //! async runtime.
 
 use std::error::Error as _;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
+use hexagent_account::account::shared_account::normalize_order_id;
 use log::{debug, info, warn};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -34,13 +36,12 @@ const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapReplayOutcome {
     Complete { records: usize },
-    Truncated { records: usize },
 }
 
 impl GapReplayOutcome {
     fn records(self) -> usize {
         match self {
-            Self::Complete { records } | Self::Truncated { records } => records,
+            Self::Complete { records } => records,
         }
     }
 }
@@ -49,16 +50,26 @@ impl GapReplayOutcome {
 /// never call this helper, so `recovering` stays asserted and quoting remains
 /// paused until the same recovery window has been fetched completely.
 ///
-/// A truncated replay is transport-complete but inventory-incomplete: resume
-/// consuming the WS while keeping trading stopped via `inventory_uncertain`.
 fn accept_reconnect_replay(
     health: &super::live_position::UserFeedHealth,
-    outcome: GapReplayOutcome,
+    _outcome: GapReplayOutcome,
 ) {
-    if matches!(outcome, GapReplayOutcome::Truncated { .. }) {
-        health.set_inventory_uncertain(true);
-    }
     health.set_recovering(false);
+}
+
+fn advance_gap_cursor(
+    cursor: &mut String,
+    seen: &mut HashSet<String>,
+    next: String,
+) -> Result<bool> {
+    if next.is_empty() || next == "LTE=" {
+        return Ok(false);
+    }
+    if !seen.insert(next.clone()) {
+        return Err(anyhow!("Gap-fetch /trades returned repeated cursor `{next}`"));
+    }
+    *cursor = next;
+    Ok(true)
 }
 
 /// Pin the beginning of one reconnect-recovery episode. REST replay updates
@@ -280,7 +291,13 @@ fn record_trade_transition(
     let Some(status) = TradeStatus::from_str(status_str) else {
         return false;
     };
-    if trade_key.is_empty() || size <= 0.0 {
+    if trade_key.is_empty()
+        || !size.is_finite()
+        || size <= 0.0
+        || !price.is_finite()
+        || price <= 0.0
+        || price > 1.0 + f64::EPSILON
+    {
         return false;
     }
     live_position.lock().unwrap().update_trade(
@@ -300,7 +317,9 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
         None => return Vec::new(),
     };
 
-    // Top-level ID resolution for the TAKER branch.
+    // Top-level ID resolution for order-lifecycle events. Trade events use a
+    // role-specific order id below: TAKER must prefer `taker_order_id`, while
+    // MAKER must use each matching `maker_orders[].order_id`.
     //
     // Two historical pitfalls, both addressed here:
     //
@@ -324,13 +343,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
     //         * py-clob-client / wallet.rs's REST `/trades` parser
     //           (shared schema between the WS and REST endpoints)
     //       The top-level `order_id` / `orderID` keys exist on some
-    //       legacy/order-lifecycle payloads but are NOT present on
-    //       trade events for TAKER fills — kept as fallbacks so any
-    //       future schema variant (or non-trade event type taking
-    //       this code path) still gets a chance to map.
+    //       legacy/order-lifecycle payloads. They are handled separately so
+    //       they can never override an authoritative `taker_order_id` when a
+    //       schema variant contains both.
     let order_id = data.get("order_id")
         .or_else(|| data.get("orderID"))
-        .or_else(|| data.get("taker_order_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -347,6 +364,14 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
             Vec::new()
         }
         "trade" => {
+            let taker_order_id = data
+                .get("taker_order_id")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty())
+                .or_else(|| data.get("order_id").and_then(|v| v.as_str()))
+                .filter(|value| !value.is_empty())
+                .or_else(|| data.get("orderID").and_then(|v| v.as_str()))
+                .unwrap_or("");
             let asset_id = data.get("asset_id")
                 .or_else(|| data.get("token_id"))
                 .and_then(|v| v.as_str())
@@ -472,25 +497,18 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     let mo_size: f64 = parse_f(mo.get("matched_amount"));
                     let mo_price: f64 = parse_f(mo.get("price"));
                     let mo_order_id = mo.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let normalized_mo_order_id = normalize_order_id(mo_order_id);
 
-                    let leg_id = if mo_order_id.is_empty() {
+                    let leg_id = if normalized_mo_order_id.is_empty() {
                         trade_id.to_string()
                     } else {
-                        format!("{}:{}", trade_id, mo_order_id)
+                        format!("{}:{}", trade_id, normalized_mo_order_id)
                     };
 
-                    let lifecycle_advanced = record_trade_transition(
-                        &shared.live_position,
-                        &leg_id,
-                        status_str,
-                        &mo_asset_id,
-                        mo_side,
-                        mo_size,
-                        mo_price,
-                        true,
-                        reason_ref,
-                    );
-                    if !lifecycle_advanced {
+                    if TradeStatus::from_str(status_str).is_none()
+                        || leg_id.is_empty()
+                        || mo_size <= 0.0
+                    {
                         continue;
                     }
 
@@ -512,11 +530,29 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         continue;
                     };
                     let coid = ownership.client_order_id;
+                    // Only advance the feed-level dedupe after ownership was
+                    // successfully resolved. An unowned event must remain
+                    // replayable after its order mapping arrives later.
+                    let lifecycle_advanced = record_trade_transition(
+                        &shared.live_position,
+                        &leg_id,
+                        status_str,
+                        &mo_asset_id,
+                        mo_side,
+                        mo_size,
+                        mo_price,
+                        true,
+                        reason_ref,
+                    );
+                    if !lifecycle_advanced {
+                        continue;
+                    }
                     let _ = shared.account_state.apply_configured_trade_fee(
                         &leg_id,
                         status,
                         true,
                     );
+                    shared.finish_filled_order_if_audited(&coid);
 
                     updates.push(OrderUpdate {
                         client_order_id: coid,
@@ -539,6 +575,27 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 let matched_amount: f64 = parse_f(data.get("size").or_else(|| data.get("matched_amount")));
                 let price: f64 = parse_f(data.get("price"));
 
+                if TradeStatus::from_str(status_str).is_none()
+                    || trade_id.is_empty()
+                    || matched_amount <= 0.0
+                {
+                    return Vec::new();
+                }
+
+                let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
+                let Some(ownership) = shared.account_state.apply_trade_transition(
+                    trade_id,
+                    status_str,
+                    &runtime_coid,
+                    taker_order_id,
+                    &asset_id,
+                    side,
+                    matched_amount,
+                    price,
+                ) else {
+                    return Vec::new();
+                };
+                let coid = ownership.client_order_id;
                 let lifecycle_advanced = record_trade_transition(
                     &shared.live_position,
                     trade_id,
@@ -550,37 +607,26 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     false,
                     reason_ref,
                 );
-
                 if !lifecycle_advanced {
                     return Vec::new();
                 }
-
-                let runtime_coid = shared.lookup_coid(order_id).unwrap_or_default();
-                let Some(ownership) = shared.account_state.apply_trade_transition(
-                    trade_id,
-                    status_str,
-                    &runtime_coid,
-                    order_id,
-                    &asset_id,
-                    side,
-                    matched_amount,
-                    price,
-                ) else {
-                    return Vec::new();
-                };
-                let coid = ownership.client_order_id;
                 let _ = shared.account_state.apply_configured_trade_fee(
                     trade_id,
                     status,
                     false,
                 );
+                shared.finish_filled_order_if_audited(&coid);
 
                 updates.push(OrderUpdate {
                     client_order_id: coid,
                     exchange: Exchange::Polymarket,
                     symbol: asset_id,
                     side,
-                    exchange_order_id: if order_id.is_empty() { None } else { Some(order_id.to_string()) },
+                    exchange_order_id: if taker_order_id.is_empty() {
+                        None
+                    } else {
+                        Some(taker_order_id.to_string())
+                    },
                     status,
                     liquidity: Some(Liquidity::Taker),
                     filled_quantity: matched_amount,
@@ -635,16 +681,15 @@ async fn replay_missed_trades(
     // already in the ledger (terminal-state guard, position.rs:171).
     let after_param = after_secs.saturating_sub(1);
 
-    // Up to 50 pages × ~50 trades/page ≈ 2,500 trades of catch-up.
-    // Covers ~30-minute disconnects at the busiest observed fill rate
-    // (≈80 fills/min). Bumped from 20 (~1,000 cap) so a longer outage
-    // — e.g. WS down through a fee-rate change or a region failover —
-    // doesn't silently truncate the replay.
-    const MAX_PAGES: usize = 50;
-    let mut truncated = false;
+    // Never abandon a valid next_cursor merely because a fixed page budget
+    // was reached. Long disconnects are replayed to completion through the
+    // same account-level connection slot. Yield periodically so the runtime
+    // can service the live user feed and other accounts between batches.
+    const PAGES_PER_YIELD: usize = 50;
     let mut pages = 0usize;
-    for page in 0..MAX_PAGES {
-        pages = page + 1;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        pages += 1;
         let url = if cursor.is_empty() {
             format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
@@ -748,27 +793,16 @@ async fn replay_missed_trades(
             count += 1;
         }
 
-        if next.is_empty() || next == "LTE=" { break; }
-        cursor = next;
-        // Hit the page cap with a cursor still pending → there are more
-        // missed trades than we can replay. We may have PERMANENTLY missed
-        // fills, so the current event's inventory is unknowable.
-        if page == MAX_PAGES - 1 { truncated = true; }
+        if !advance_gap_cursor(&mut cursor, &mut seen_cursors, next)? {
+            break;
+        }
+        if pages % PAGES_PER_YIELD == 0 {
+            tokio::task::yield_now().await;
+        }
     }
 
     shared.account_state.record_gap_replay_pages(pages);
-
-    if truncated {
-        warn!(
-            "[PolyUserFeed] Gap replay TRUNCATED at {} pages (~{} trades) with more pending — \
-             inventory may be incomplete; flagging current event inventory-uncertain (will stop \
-             quoting/trading it and ride to settlement)",
-            MAX_PAGES, count,
-        );
-        Ok(GapReplayOutcome::Truncated { records: count })
-    } else {
-        Ok(GapReplayOutcome::Complete { records: count })
-    }
+    Ok(GapReplayOutcome::Complete { records: count })
 }
 
 /// Async WebSocket loop. Spawned as a tokio task on the shared runtime.
@@ -904,21 +938,6 @@ async fn user_feed_loop(
                         periodic_after_secs = None;
                         shared.user_feed_health.set_gap_replay_degraded(false);
                     }
-                    Ok(outcome @ GapReplayOutcome::Truncated { .. }) => {
-                        shared.user_feed_health.set_inventory_uncertain(true);
-                        shared.account_state.mark_uncertain_with_reason(format!(
-                            "periodic gap replay truncated after {} records",
-                            outcome.records(),
-                        ));
-                        shared.user_feed_health.set_gap_replay_degraded(false);
-                        consecutive_failures = 0;
-                        periodic_after_secs = None;
-                        warn!(
-                            "[PolyUserFeed] Periodic gap replay incomplete: {} records fetched; \
-                             inventory remains uncertain",
-                            outcome.records(),
-                        );
-                    }
                     Err(e) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures >= GAP_REPLAY_DEGRADED_AFTER_FAILURES {
@@ -1014,24 +1033,10 @@ async fn user_feed_loop(
         };
         match replay_result {
             Ok(outcome) => {
-                if matches!(outcome, GapReplayOutcome::Truncated { .. }) {
-                    shared.account_state.mark_uncertain_with_reason(format!(
-                        "reconnect gap replay truncated after {} records",
-                        outcome.records(),
-                    ));
-                }
                 match outcome {
                     GapReplayOutcome::Complete { records } => {
                         info!(
                             "[PolyUserFeed] Gap recovery after={} replayed={} trades (complete)",
-                            after_secs,
-                            records,
-                        );
-                    }
-                    GapReplayOutcome::Truncated { records } => {
-                        warn!(
-                            "[PolyUserFeed] Gap recovery after={} replayed={} trades but was \
-                             truncated; WS consumption will continue with trading stopped",
                             after_secs,
                             records,
                         );
@@ -1249,6 +1254,21 @@ pub fn spawn_user_feed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn test_shared() -> Arc<SharedState> {
+        super::super::trade::PolymarketTrade::new(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            super::super::signer::SignatureType::Eoa,
+        )
+        .unwrap()
+        .shared_state()
+    }
 
     fn record(manager: &Mutex<LivePositionManager>, status: &str) -> bool {
         record_trade_transition(
@@ -1290,6 +1310,431 @@ mod tests {
     }
 
     #[test]
+    fn unowned_trade_remains_replayable_after_order_mapping_is_repaired() {
+        let trade = super::super::trade::PolymarketTrade::new(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            super::super::signer::SignatureType::Eoa,
+        )
+        .unwrap();
+        let shared = trade.shared_state();
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new());
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-1",
+                "oid-temporary",
+                "TOKEN",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let event = serde_json::json!({
+            "event_type": "trade",
+            "id": "trade-replayable",
+            "status": "MATCHED",
+            "asset_id": "TOKEN",
+            "side": "BUY",
+            "size": "10",
+            "price": "0.5",
+            "taker_order_id": "oid-final",
+            "maker_orders": [],
+        });
+
+        assert!(parse_user_event(&event, &shared).is_empty());
+        assert!(shared.account_state.is_uncertain());
+
+        shared.account_state.rebind_order_id("owner-1", "oid-final");
+        shared.register_order_id("owner-1", "oid-final", "TOKEN");
+        let updates = parse_user_event(&event, &shared);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].client_order_id, "owner-1");
+        assert!(!shared.account_state.is_uncertain());
+    }
+
+    #[test]
+    fn taker_prefers_taker_order_id_over_conflicting_legacy_order_id() {
+        let shared = test_shared();
+        shared.account_state.register_instance("taker-owner", 1.0);
+        shared.account_state.register_instance("legacy-owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(200.0, HashMap::new());
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "taker-owner",
+                "taker-coid",
+                "0xAaBb",
+                "TOKEN",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "legacy-owner",
+                "legacy-coid",
+                "0xDeAd",
+                "TOKEN",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        shared.register_order_id("taker-coid", "0xAaBb", "TOKEN");
+        shared.register_order_id("legacy-coid", "0xDeAd", "TOKEN");
+
+        let updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-taker-field-priority",
+                "status": "MATCHED",
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "size": "10",
+                "price": "0.5",
+                "taker_order_id": "AABB",
+                "order_id": "0xdead",
+                "maker_orders": [],
+            }),
+            &shared,
+        );
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].client_order_id, "taker-coid");
+        assert_eq!(updates[0].liquidity, Some(Liquidity::Taker));
+        assert_eq!(updates[0].exchange_order_id.as_deref(), Some("AABB"));
+        assert_eq!(
+            shared
+                .account_state
+                .order("legacy-coid")
+                .unwrap()
+                .filled_quantity,
+            0.0,
+        );
+    }
+
+    #[test]
+    fn one_trade_routes_each_owned_maker_leg_to_its_instance() {
+        let shared = test_shared();
+        shared.account_state.register_instance("maker-a", 1.0);
+        shared.account_state.register_instance("maker-b", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(200.0, HashMap::new());
+        shared
+            .account_state
+            .reserve_order(
+                "maker-a",
+                "maker-a-coid",
+                "0xAa01",
+                "TOKEN",
+                Side::Buy,
+                5.0,
+                0.4,
+                0,
+            )
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "maker-b",
+                "maker-b-coid",
+                "0xAa02",
+                "TOKEN",
+                Side::Buy,
+                6.0,
+                0.4,
+                0,
+            )
+            .unwrap();
+        shared.register_order_id("maker-a-coid", "0xAa01", "TOKEN");
+        shared.register_order_id("maker-b-coid", "0xAa02", "TOKEN");
+        let maker = shared.order_maker_address.clone();
+
+        let mut updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-two-maker-legs",
+                "status": "MATCHED",
+                "asset_id": "OTHER",
+                "side": "SELL",
+                "size": "11",
+                "price": "0.6",
+                "taker_order_id": "0xsomeone-else",
+                "maker_orders": [
+                    {
+                        "maker_address": maker,
+                        "asset_id": "TOKEN",
+                        "side": "BUY",
+                        "matched_amount": "5",
+                        "price": "0.4",
+                        "order_id": "AA01"
+                    },
+                    {
+                        "maker_address": shared.order_maker_address.clone(),
+                        "asset_id": "TOKEN",
+                        "side": "BUY",
+                        "matched_amount": "6",
+                        "price": "0.4",
+                        "order_id": "0xaa02"
+                    }
+                ]
+            }),
+            &shared,
+        );
+        updates.sort_by(|a, b| a.client_order_id.cmp(&b.client_order_id));
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].client_order_id, "maker-a-coid");
+        assert_eq!(updates[1].client_order_id, "maker-b-coid");
+        assert!(updates
+            .iter()
+            .all(|update| update.liquidity == Some(Liquidity::Maker)));
+        assert_eq!(
+            updates[0].trade_id.as_deref(),
+            Some("trade-two-maker-legs:aa01")
+        );
+        assert_eq!(
+            updates[1].trade_id.as_deref(),
+            Some("trade-two-maker-legs:aa02")
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .order("maker-a-coid")
+                .unwrap()
+                .filled_quantity,
+            5.0,
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .order("maker-b-coid")
+                .unwrap()
+                .filled_quantity,
+            6.0,
+        );
+
+        let before_a = shared.account_state.instance_snapshot("maker-a").unwrap();
+        let before_b = shared.account_state.instance_snapshot("maker-b").unwrap();
+        let replay_updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-two-maker-legs",
+                "status": "MINED",
+                "asset_id": "OTHER",
+                "side": "SELL",
+                "size": "11",
+                "price": "0.6",
+                "taker_order_id": "0xsomeone-else",
+                "maker_orders": [
+                    {
+                        "maker_address": shared.order_maker_address.clone(),
+                        "asset_id": "TOKEN",
+                        "side": "BUY",
+                        "matched_amount": "5",
+                        "price": "0.4",
+                        "order_id": "0xaa01"
+                    },
+                    {
+                        "maker_address": shared.order_maker_address.clone(),
+                        "asset_id": "TOKEN",
+                        "side": "BUY",
+                        "matched_amount": "6",
+                        "price": "0.4",
+                        "order_id": "AA02"
+                    }
+                ]
+            }),
+            &shared,
+        );
+        assert_eq!(replay_updates.len(), 2);
+        assert_eq!(
+            shared.account_state.instance_snapshot("maker-a").unwrap().cash,
+            before_a.cash,
+            "a casing/prefix-only lifecycle replay must not book twice",
+        );
+        assert_eq!(
+            shared.account_state.instance_snapshot("maker-b").unwrap().cash,
+            before_b.cash,
+            "a casing/prefix-only lifecycle replay must not book twice",
+        );
+    }
+
+    #[test]
+    fn same_token_maker_and_taker_trades_stay_with_their_instances() {
+        let shared = test_shared();
+        shared.account_state.register_instance("maker-owner", 1.0);
+        shared.account_state.register_instance("taker-owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(200.0, HashMap::new());
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        for (instance, coid, oid) in [
+            ("maker-owner", "maker-coid", "0xB001"),
+            ("taker-owner", "taker-coid", "0xB002"),
+        ] {
+            shared
+                .account_state
+                .reserve_order(instance, coid, oid, "TOKEN", Side::Buy, 4.0, 0.5, 0)
+                .unwrap();
+            shared.register_order_id(coid, oid, "TOKEN");
+        }
+
+        let maker_updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-maker-owner",
+                "status": "MATCHED",
+                "asset_id": "OTHER",
+                "side": "SELL",
+                "size": "4",
+                "price": "0.5",
+                "taker_order_id": "other-taker",
+                "maker_orders": [{
+                    "maker_address": shared.order_maker_address.clone(),
+                    "asset_id": "TOKEN",
+                    "side": "BUY",
+                    "matched_amount": "4",
+                    "price": "0.5",
+                    "order_id": "b001"
+                }]
+            }),
+            &shared,
+        );
+        let taker_updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-taker-owner",
+                "status": "MATCHED",
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "size": "4",
+                "price": "0.5",
+                "taker_order_id": "B002",
+                "maker_orders": [{
+                    "maker_address": "0x0000000000000000000000000000000000000002",
+                    "asset_id": "OTHER",
+                    "side": "SELL",
+                    "matched_amount": "4",
+                    "price": "0.5",
+                    "order_id": "other-maker"
+                }]
+            }),
+            &shared,
+        );
+
+        assert_eq!(maker_updates.len(), 1);
+        assert_eq!(maker_updates[0].client_order_id, "maker-coid");
+        assert_eq!(maker_updates[0].liquidity, Some(Liquidity::Maker));
+        assert_eq!(taker_updates.len(), 1);
+        assert_eq!(taker_updates[0].client_order_id, "taker-coid");
+        assert_eq!(taker_updates[0].liquidity, Some(Liquidity::Taker));
+    }
+
+    #[test]
+    fn filled_order_ack_holds_reservation_until_private_trade_audits_it() {
+        let trade = super::super::trade::PolymarketTrade::new(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            super::super::signer::SignatureType::Eoa,
+        )
+        .unwrap();
+        let shared = trade.shared_state();
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new());
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-1",
+                "oid-final",
+                "TOKEN",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        shared.open_orders.lock().unwrap().insert(
+            "owner-1".to_string(),
+            super::super::trade::TrackedOrder {
+                symbol: "TOKEN".to_string(),
+                side: Side::Buy,
+                instance_id: "owner".to_string(),
+            },
+        );
+        shared.register_order_id("owner-1", "oid-final", "TOKEN");
+
+        shared.remove_order_as("owner-1", OrderStatus::Filled);
+        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        assert_eq!(
+            shared.account_state.instance_snapshot("owner").unwrap().reserved_cash,
+            5.0,
+        );
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+
+        let updates = parse_user_event(
+            &serde_json::json!({
+                "event_type": "trade",
+                "id": "trade-filled-audit",
+                "status": "MATCHED",
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "size": "10",
+                "price": "0.5",
+                "taker_order_id": "oid-final",
+                "maker_orders": [],
+            }),
+            &shared,
+        );
+        assert_eq!(updates.len(), 1);
+        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        assert_eq!(
+            shared.account_state.instance_snapshot("owner").unwrap().reserved_cash,
+            0.0,
+        );
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+    }
+
+    #[test]
     fn reconnect_health_clears_only_after_a_successful_replay() {
         let health = super::super::live_position::UserFeedHealth::new();
         assert!(health.is_recovering());
@@ -1313,19 +1758,31 @@ mod tests {
     }
 
     #[test]
-    fn truncated_replay_keeps_trading_stopped_via_inventory_uncertain() {
-        let health = super::super::live_position::UserFeedHealth::new();
+    fn gap_cursor_continues_past_batch_boundaries_and_rejects_loops() {
+        let mut cursor = String::new();
+        let mut seen = HashSet::new();
 
-        accept_reconnect_replay(
-            &health,
-            GapReplayOutcome::Truncated { records: 2_500 },
-        );
-
-        assert!(!health.is_recovering(), "WS consumption may resume");
-        assert!(
-            health.inventory_uncertain(),
-            "quoting must remain stopped after an incomplete replay",
-        );
+        for page in 1..=75 {
+            assert!(advance_gap_cursor(
+                &mut cursor,
+                &mut seen,
+                format!("cursor-{page}"),
+            )
+            .unwrap());
+        }
+        assert_eq!(cursor, "cursor-75");
+        assert!(advance_gap_cursor(
+            &mut cursor,
+            &mut seen,
+            "cursor-75".to_string(),
+        )
+        .is_err());
+        assert!(!advance_gap_cursor(
+            &mut cursor,
+            &mut seen,
+            "LTE=".to_string(),
+        )
+        .unwrap());
     }
 
     #[test]

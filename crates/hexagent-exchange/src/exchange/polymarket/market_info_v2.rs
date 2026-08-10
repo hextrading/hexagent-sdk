@@ -14,10 +14,9 @@
 //!   * Backtest replay (computes fills + PnL offline).
 //!   * PnL accounting post-fill.
 //!
-//! We fetch this **once per event** at `on_instrument` time on a
-//! background thread, then cache on `EventContext`. Falls back to the
-//! gamma-api-supplied `base_fee` / `fee_rate` / `fee_exponent` fields
-//! if the fetch fails.
+//! We fetch this on a background thread and cache it on `EventContext`.
+//! Each worker retries transient failures; the strategy may respawn a worker
+//! later, and keeps taker orders disabled until authoritative metadata lands.
 //!
 //! **Endpoint + schema are provisional**: per the migration doc the
 //! precise URL path + JSON field names weren't published at the time
@@ -113,24 +112,39 @@ pub fn spawn_market_info_v2_fetch(
     let _ = std::thread::Builder::new()
         .name("clob-v2-market-info".into())
         .spawn(move || {
-            let result = match fetch_clob_market_info(&api_url_prefix, &condition_id, &path_template) {
-                Ok(info) => {
-                    info!(
-                        "[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={}",
-                        &condition_id[..condition_id.len().min(16)],
-                        info.fee_rate, info.fee_exponent, info.fee_rate_bps, info.taker_only,
-                    );
-                    Some(info)
+            const ATTEMPTS: u32 = 4;
+            let mut backoff = std::time::Duration::from_millis(200);
+            let mut result = None;
+            for attempt in 1..=ATTEMPTS {
+                match fetch_clob_market_info(&api_url_prefix, &condition_id, &path_template) {
+                    Ok(market_info) => {
+                        info!(
+                            "[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={} attempt={}",
+                            &condition_id[..condition_id.len().min(16)],
+                            market_info.fee_rate,
+                            market_info.fee_exponent,
+                            market_info.fee_rate_bps,
+                            market_info.taker_only,
+                            attempt,
+                        );
+                        result = Some(market_info);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
+                            attempt,
+                            ATTEMPTS,
+                            &condition_id[..condition_id.len().min(16)],
+                            error,
+                        );
+                        if attempt < ATTEMPTS {
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "[market_info_v2] fetch failed cid={}... — strategy will fall back to \
-                         gamma-api base_fee / fee_rate. Error: {}",
-                        &condition_id[..condition_id.len().min(16)], e,
-                    );
-                    None
-                }
-            };
+            }
             let _ = tx.send(result);
         });
     rx
