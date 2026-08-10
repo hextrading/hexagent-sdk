@@ -155,21 +155,24 @@ struct GapAttemptFailure {
     _permit: Option<crate::http1_pool::Permit>,
 }
 
-/// Facade over the process-global, physically isolated GapReplay role.
+/// Facade over one account's physically isolated GapReplay pool.
 ///
-/// The global pool owns clients, admission, counters, generations and rebuild
+/// The account pool owns clients, admission, counters, generations and rebuild
 /// state. This facade owns endpoint auth and primary-to-peer retry policy.
-struct GapReplayTransport;
+struct GapReplayTransport {
+    account_id: String,
+}
 
 impl GapReplayTransport {
-    fn new() -> Self { Self }
+    fn new(account_id: impl Into<String>) -> Self {
+        Self {
+            account_id: account_id.into(),
+        }
+    }
 
     async fn prewarm(&self) -> crate::http1_pool::PrewarmReport {
         let probe_url = format!("{}/time", CLOB_BASE_URL);
-        crate::http1_pool::prewarm_role(
-            crate::http1_pool::Role::GapReplay,
-            &probe_url,
-        ).await
+        crate::http1_pool::prewarm_account_gap_replay(&self.account_id, &probe_url).await
     }
 
     async fn send_once(
@@ -177,7 +180,8 @@ impl GapReplayTransport {
         shared: &SharedState,
         url: &str,
     ) -> std::result::Result<GapHttpResponse, GapAttemptFailure> {
-        let permit = match crate::http1_pool::try_acquire_global(
+        let permit = match crate::http1_pool::try_acquire_account(
+            &self.account_id,
             crate::http1_pool::Role::GapReplay,
         ) {
             Some(permit) => permit,
@@ -503,6 +507,16 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     }
 
                     let coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
+                    shared.account_state.apply_trade_transition(
+                        &leg_id,
+                        status_str,
+                        &coid,
+                        mo_order_id,
+                        &mo_asset_id,
+                        mo_side,
+                        mo_size,
+                        mo_price,
+                    );
 
                     updates.push(OrderUpdate {
                         client_order_id: coid,
@@ -542,6 +556,16 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 }
 
                 let coid = shared.lookup_coid(order_id).unwrap_or_default();
+                shared.account_state.apply_trade_transition(
+                    trade_id,
+                    status_str,
+                    &coid,
+                    order_id,
+                    &asset_id,
+                    side,
+                    matched_amount,
+                    price,
+                );
 
                 updates.push(OrderUpdate {
                     client_order_id: coid,
@@ -758,23 +782,25 @@ async fn user_feed_loop(
         }
     }
     let reconnect_rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
-    let transport = GapReplayTransport::new();
-    // The global role is initialised lazily, so explicitly warm every initial
-    // slot here before the first reconnect/periodic replay can use it. The
-    // role-level helper fans all probes out concurrently.
+    let account_id = shared.account_state.account_id().to_string();
+    let transport = GapReplayTransport::new(account_id.clone());
+    // Warm exactly this account's two replay slots before its first reconnect
+    // or periodic replay. Other accounts own independent replay capacity.
     let prewarm = transport.prewarm().await;
     if prewarm.ok < prewarm.total {
         shared.user_feed_health.set_recovering(true);
         warn!(
-            "[PolyUserFeed] GapReplay role prewarm incomplete: {}/{} slots ready; \
+            "[PolyUserFeed] account={} GapReplay prewarm incomplete: {}/{} slots ready; \
              first_error={}; keeping recovery asserted until catch-up succeeds",
+            account_id,
             prewarm.ok,
             prewarm.total,
             prewarm.first_error.as_deref().unwrap_or("<unknown>"),
         );
     } else {
         info!(
-            "[PolyUserFeed] GapReplay role prewarmed all {} slots",
+            "[PolyUserFeed] account={} GapReplay prewarmed all {} slots",
+            account_id,
             prewarm.total,
         );
     }
@@ -808,7 +834,7 @@ async fn user_feed_loop(
         let gap_transport = gap_transport.clone();
         // New task → won't inherit the loop's span; re-attach the same
         // per-account span so gap-recovery logs are tagged too.
-        let gap_span = tracing::info_span!("user_feed", acct = %shared.instance_id);
+        let gap_span = tracing::info_span!("user_feed", acct = %account_id);
         tokio::spawn(tracing::Instrument::instrument(async move {
             let interval = Duration::from_millis(shared.gap_replay.interval_ms.max(1));
             let rewind_ms = shared.gap_replay.periodic_rewind_ms;
@@ -886,14 +912,16 @@ async fn user_feed_loop(
                             shared.user_feed_health.set_gap_replay_degraded(true);
                             if newly_degraded {
                                 let (acquires, skips, busy, slots) =
-                                    crate::http1_pool::gap_replay_stats();
+                                    crate::http1_pool::gap_replay_stats(&account_id)
+                                        .unwrap_or((0, 0, 0, Vec::new()));
                                 warn!(
                                     "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
                                      consecutive failures; after={} remains pinned and quoting \
                                      will pause until catch-up succeeds; \
-                                     GapReplay pool slots={:?} acquires={} skips={} busy={}",
+                                     account={} GapReplay pool slots={:?} acquires={} skips={} busy={}",
                                     consecutive_failures,
                                     after,
+                                    account_id,
                                     slots,
                                     acquires,
                                     skips,

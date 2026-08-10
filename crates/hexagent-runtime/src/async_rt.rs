@@ -249,8 +249,8 @@ pub fn init() -> Result<()> {
 
     let ord_handle = ord_rx.recv().context("receive order runtime handle")?;
 
-    // Role-separated HTTP/1.1 client pools — construction, sizing (config /
-    // instance-count scaled via `http1_pool::set_sizes`), round-robin and
+    // Role-separated HTTP/1.1 client pools — fixed global fallback/query
+    // construction plus account-scaled admission pools, round-robin and
     // keep-warm all live in `crate::http1_pool`; the getters below delegate.
     // FAST and CANCEL pools keep a HIGH client-level ceiling (2 s) so
     // per-request `current_fast_timeout()` / `current_cancel_timeout()`

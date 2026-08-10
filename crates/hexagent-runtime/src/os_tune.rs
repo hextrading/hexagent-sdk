@@ -1,12 +1,12 @@
 //! OS-level latency tuning: CPU pinning, SCHED_FIFO real-time scheduling,
 //! memory locking.
 //!
-//! All operations are best-effort. On non-Linux platforms (macOS dev
-//! machines) the affinity / real-time calls are no-ops so the binary
-//! compiles and runs without privileges. On Linux the calls require
-//! `CAP_SYS_NICE` (affinity + SCHED_FIFO) and `CAP_IPC_LOCK` (mlockall);
-//! failures are logged as warnings, not errors — the process continues
-//! with degraded tail-latency guarantees rather than refusing to start.
+//! Operations are best-effort by default. With `strict_core_isolation=true`,
+//! topology/env conflicts fail startup and Linux affinity, SCHED_FIFO, or
+//! mlockall failures abort the process rather than trading with degraded
+//! tail-latency guarantees. On non-Linux platforms (macOS dev machines) the
+//! affinity / real-time calls remain no-ops so the binary compiles and runs
+//! without privileges.
 //!
 //! ## Core plan
 //!
@@ -59,11 +59,12 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[allow(unused_imports)]
-use log::{info, warn};
+use log::{error, info, warn};
 
 use crate::config::OsTuneConfig;
 
@@ -84,6 +85,7 @@ const DEFAULT_PRIO_EXECUTION: u8 = 50;
 pub struct CorePlan {
     pub enable_pin: bool,
     pub enable_fifo: bool,
+    pub strict_core_isolation: bool,
     pub async_rt: usize,
     /// Core for the order-I/O runtime thread (`hexbot-async-ord`).
     /// `None` = leave the thread unpinned at normal priority (safe
@@ -114,6 +116,7 @@ impl CorePlan {
         Self {
             enable_pin: true,
             enable_fifo: true,
+            strict_core_isolation: false,
             async_rt: DEFAULT_ASYNC_RT_CORE,
             async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
@@ -138,6 +141,7 @@ impl CorePlan {
         Self {
             enable_pin: cfg.enable_pin,
             enable_fifo: cfg.enable_fifo,
+            strict_core_isolation: cfg.strict_core_isolation,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
             async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
@@ -155,7 +159,7 @@ impl CorePlan {
 
     /// Route an execution-tier thread to its core based on name:
     ///   - `feed-<exchange>`           → `feed_cores[<exchange>]` else execution
-    ///   - `poly-exec-<i>`             → round-robin `poly_exec_cores` else execution
+    ///   - `poly-exec-<i>`/`poly-done-<i>` → round-robin `poly_exec_cores` else execution
     ///   - `<inst_id>-worker-<i>`      → round-robin `hex_worker_cores` else execution
     ///   - anything else               → execution
     fn route_execution(&self, thread_name: &str) -> usize {
@@ -164,7 +168,9 @@ impl CorePlan {
                 return core;
             }
         }
-        if thread_name.starts_with("poly-exec-") && !self.poly_exec_cores.is_empty() {
+        if (thread_name.starts_with("poly-exec-") || thread_name.starts_with("poly-done-"))
+            && !self.poly_exec_cores.is_empty()
+        {
             let i = POLY_EXEC_RR.fetch_add(1, Ordering::Relaxed) % self.poly_exec_cores.len();
             return self.poly_exec_cores[i];
         }
@@ -173,6 +179,117 @@ impl CorePlan {
             return self.hex_worker_cores[i];
         }
         self.execution
+    }
+
+    /// Validate the production invariant that every enabled strategy worker
+    /// has a genuinely dedicated CPU and no latency-critical runtime role can
+    /// silently fall back onto it. Public feeds may intentionally share one
+    /// core with each other (for example Coinbase + Chainlink); worker pools
+    /// may intentionally contain many threads per configured pool core.
+    fn validate_strategy_isolation(&self, instance_ids: &[String]) -> Result<(), String> {
+        if !self.strict_core_isolation {
+            return Ok(());
+        }
+        if !self.enable_pin {
+            return Err("strict_core_isolation requires enable_pin=true".into());
+        }
+        if !self.enable_fifo {
+            return Err("strict_core_isolation requires enable_fifo=true".into());
+        }
+        if self.async_ord.is_none() {
+            return Err("strict_core_isolation requires async_ord_core".into());
+        }
+        if self.poly_exec_cores.len() < 2 {
+            return Err(
+                "strict_core_isolation requires at least two distinct poly_exec_cores".into(),
+            );
+        }
+
+        let mut exclusive: HashMap<usize, String> = HashMap::new();
+        let claim = |core: usize,
+                     role: String,
+                     claims: &mut HashMap<usize, String>|
+         -> Result<(), String> {
+            if let Some(existing) = claims.insert(core, role.clone()) {
+                return Err(format!(
+                    "core {} is assigned to both {} and {}",
+                    core, existing, role
+                ));
+            }
+            Ok(())
+        };
+
+        claim(self.async_rt, "async_rt".into(), &mut exclusive)?;
+        claim(self.async_ord.unwrap(), "async_ord".into(), &mut exclusive)?;
+        claim(
+            self.strategy,
+            "strategy_router_or_fallback".into(),
+            &mut exclusive,
+        )?;
+        claim(self.execution, "execution".into(), &mut exclusive)?;
+
+        let mut seen_ids = HashSet::new();
+        for instance_id in instance_ids {
+            if !seen_ids.insert(instance_id) {
+                return Err(format!("duplicate enabled strategy instance_id `{}`", instance_id));
+            }
+            let core = self.strategy_cores.get(instance_id).copied().ok_or_else(|| {
+                format!(
+                    "enabled strategy `{}` has no strategy_cores entry",
+                    instance_id
+                )
+            })?;
+            claim(core, format!("strategy:{instance_id}"), &mut exclusive)?;
+        }
+
+        // Feed-to-feed sharing is allowed, but a feed may not overlap an
+        // exclusive role. Deduplicate values before checking shared feeds.
+        let feed_cores: HashSet<usize> = self.feed_cores.values().copied().collect();
+        for core in &feed_cores {
+            if let Some(role) = exclusive.get(core) {
+                return Err(format!("feed core {} overlaps {}", core, role));
+            }
+        }
+
+        let mut poly_cores = HashSet::new();
+        for &core in &self.poly_exec_cores {
+            if !poly_cores.insert(core) {
+                return Err(format!("poly_exec_cores contains duplicate core {}", core));
+            }
+            if let Some(role) = exclusive.get(&core) {
+                return Err(format!("poly-exec/done core {} overlaps {}", core, role));
+            }
+            if feed_cores.contains(&core) {
+                return Err(format!("poly-exec/done core {} overlaps a feed core", core));
+            }
+        }
+
+        let mut hex_cores = HashSet::new();
+        for &core in &self.hex_worker_cores {
+            if !hex_cores.insert(core) {
+                return Err(format!("hex_worker_cores contains duplicate core {}", core));
+            }
+            if let Some(role) = exclusive.get(&core) {
+                return Err(format!("hex-worker core {} overlaps {}", core, role));
+            }
+            if feed_cores.contains(&core) || poly_cores.contains(&core) {
+                return Err(format!("hex-worker core {} overlaps another worker pool", core));
+            }
+        }
+
+        let mut latency_cores: HashSet<usize> = exclusive.keys().copied().collect();
+        latency_cores.extend(feed_cores);
+        latency_cores.extend(poly_cores);
+        latency_cores.extend(hex_cores);
+        for &core in &self.background_cores {
+            if latency_cores.contains(&core) {
+                return Err(format!(
+                    "background core {} overlaps a latency-critical core",
+                    core
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Round-robin a background thread across `background_cores` so
@@ -199,11 +316,11 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={}",
+        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={} strict_isolation={}",
         plan.async_rt, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
-        plan.enable_pin, plan.enable_fifo,
+        plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
     );
     let _ = CORE_PLAN.set(plan);
 }
@@ -220,8 +337,45 @@ pub fn init_disabled() {
     let _ = CORE_PLAN.set(plan);
 }
 
+/// Fail-fast validation for production live/paper multi-instance topology.
+/// No-op unless `[os_tune].strict_core_isolation = true`.
+/// Call after [`init_from_config`] and before spawning runtime/feed threads.
+pub fn validate_strategy_isolation(instance_ids: &[String]) -> Result<(), String> {
+    let p = plan();
+    p.validate_strategy_isolation(instance_ids)?;
+    if p.strict_core_isolation {
+        for name in [
+            "HEXBOT_NO_PIN",
+            "HEXBOT_NO_PIN_ASYNC_RT",
+            "HEXBOT_NO_PIN_STRATEGY",
+            "HEXBOT_NO_PIN_EXECUTION",
+            "HEXBOT_NO_PIN_BACKGROUND",
+            "HEXBOT_NO_FIFO",
+        ] {
+            if std::env::var(name).ok().as_deref() == Some("1") {
+                return Err(format!(
+                    "strict_core_isolation is incompatible with {}=1",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plan() -> &'static CorePlan {
     CORE_PLAN.get_or_init(CorePlan::legacy_default)
+}
+
+#[cfg(target_os = "linux")]
+fn abort_if_strict(message: &str) {
+    if plan().strict_core_isolation {
+        error!(
+            "[os_tune] strict core isolation failed: {}; aborting before degraded scheduling can trade",
+            message,
+        );
+        std::process::abort();
+    }
 }
 
 /// Pin the current thread to a specific CPU core.
@@ -250,7 +404,7 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
     let p = plan();
     let skip = if core_id == p.async_rt {
         "HEXBOT_NO_PIN_ASYNC_RT"
-    } else if core_id == p.strategy {
+    } else if core_id == p.strategy || p.strategy_cores.values().any(|&c| c == core_id) {
         "HEXBOT_NO_PIN_STRATEGY"
     } else if core_id == p.execution
         || p.feed_cores.values().any(|&c| c == core_id)
@@ -280,6 +434,10 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
                 "[os_tune] Pin '{}' (tid={}) → core {} FAILED (core out of range or affinity mask restricted)",
                 thread_name, tid, core_id,
             );
+            abort_if_strict(&format!(
+                "pin '{}' (tid={}) to core {}",
+                thread_name, tid, core_id
+            ));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -296,8 +454,9 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
 ///   - kernel has `rt_runtime_us` throttling tight enough to starve
 ///   - debugging whether FIFO is implicated in a specific issue
 ///
-/// Failure of the syscall itself (even when opted in) is non-fatal —
-/// logged as warn and the thread continues as SCHED_OTHER.
+/// Failure is logged and falls back to SCHED_OTHER by default. Under
+/// `strict_core_isolation`, it aborts the process before degraded scheduling
+/// can trade.
 pub fn set_fifo(priority: u8, thread_name: &str) {
     if std::env::var("HEXBOT_NO_FIFO").ok().as_deref() == Some("1") {
         return;
@@ -324,6 +483,10 @@ pub fn set_fifo(priority: u8, thread_name: &str) {
                  falling back to SCHED_OTHER — tail latency guarantees degraded)",
                 priority, thread_name, err,
             );
+            abort_if_strict(&format!(
+                "SCHED_FIFO prio={} for '{}': {}",
+                priority, thread_name, err
+            ));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -376,8 +539,9 @@ pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
 /// Pin a critical execution-path thread (`execution` dispatcher,
 /// `feed-*`, per-instance hex worker pool) with `PRIO_EXECUTION`.
 /// Routing:
-///   - `feed-<exchange>`      → `feed_cores[<exchange>]` else `execution_core`
-///   - `<inst_id>-worker-<i>` → round-robin `hex_worker_cores` else `execution_core`
+///   - `feed-<exchange>`              → `feed_cores[<exchange>]` else execution
+///   - `poly-exec-*` / `poly-done-*`  → round-robin `poly_exec_cores` else execution
+///   - `<inst_id>-worker-<i>`         → round-robin `hex_worker_cores` else execution
 ///   - anything else          → `execution_core`
 pub fn pin_execution(thread_name: &str) {
     let p = plan();
@@ -471,8 +635,73 @@ pub fn mlockall_best_effort() {
                  major page faults may produce multi-ms latency spikes)",
                 errno,
             );
+            abort_if_strict(&format!("mlockall: {}", errno));
         }
     }
     #[cfg(not(target_os = "linux"))]
     {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn five_instance_config() -> OsTuneConfig {
+        let mut cfg = OsTuneConfig::default();
+        cfg.strict_core_isolation = true;
+        cfg.async_ord_core = Some(2);
+        cfg.async_rt_core = Some(3);
+        cfg.execution_core = Some(4);
+        cfg.strategy_core = Some(5);
+        cfg.feed_cores = HashMap::from([
+            ("polymarket".into(), 6),
+            ("binance".into(), 7),
+            ("coinbase".into(), 8),
+            ("chainlink".into(), 8),
+        ]);
+        cfg.strategy_cores = HashMap::from([
+            ("btc01".into(), 9),
+            ("btc02".into(), 10),
+            ("btc03".into(), 11),
+            ("btc04".into(), 12),
+            ("btc05".into(), 13),
+        ]);
+        cfg.poly_exec_cores = vec![14, 15];
+        cfg.background_cores = vec![0, 1];
+        cfg
+    }
+
+    fn five_instances() -> Vec<String> {
+        (1..=5).map(|i| format!("btc{i:02}")).collect()
+    }
+
+    #[test]
+    fn strict_plan_accepts_five_dedicated_strategy_cores() {
+        let plan = CorePlan::from_config(&five_instance_config());
+        assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+    }
+
+    #[test]
+    fn strict_plan_rejects_missing_or_overlapping_strategy_core() {
+        let mut missing = five_instance_config();
+        missing.strategy_cores.remove("btc05");
+        let err = CorePlan::from_config(&missing)
+            .validate_strategy_isolation(&five_instances())
+            .unwrap_err();
+        assert!(err.contains("btc05") && err.contains("no strategy_cores entry"));
+
+        let mut overlap = five_instance_config();
+        overlap.strategy_cores.insert("btc05".into(), 4);
+        let err = CorePlan::from_config(&overlap)
+            .validate_strategy_isolation(&five_instances())
+            .unwrap_err();
+        assert!(err.contains("execution") && err.contains("strategy:btc05"));
+    }
+
+    #[test]
+    fn completion_threads_use_polymarket_worker_pool() {
+        let plan = CorePlan::from_config(&five_instance_config());
+        assert!(plan.poly_exec_cores.contains(&plan.route_execution("poly-exec-0")));
+        assert!(plan.poly_exec_cores.contains(&plan.route_execution("poly-done-0")));
+    }
 }

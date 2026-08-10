@@ -16,12 +16,13 @@
 //! in-flight request. Concurrency therefore equals warm-connection
 //! count, which this module makes explicit:
 //!
-//! * Three pools of independent `reqwest::Client`s: **order**
-//!   (`Fast`+`Cancel` merged — a place burst can borrow cancel's idle
-//!   connections and vice versa; admission counters stay per logical
-//!   role), **misc** (`Reconcile`+`Query` merged), and `GapReplay`
-//!   (physically isolated). Each client keeps its own small connection
-//!   pool per host, so N clients ≈ N warm connections per host per pool.
+//! * Two fixed process-global fallback pools: **fallback-order** (4 slots)
+//!   and **query** (4 slots).
+//! * One pool group per Polymarket account. If N strategy instances share an
+//!   account, that group owns **4·N order** slots (`Fast`+`Cancel`), **2·N
+//!   reconcile** slots, and **2 gap-replay** slots. Instance IDs are mapped to
+//!   their account before admission, so shared-wallet instances borrow the
+//!   same warm capacity without duplicating physical pools.
 //! * Round-robin dispatch spreads a burst (e.g. a two-leg replace: two
 //!   places + cancels) across distinct clients → distinct TCP
 //!   connections → no head-of-line queueing.
@@ -34,13 +35,12 @@
 //!
 //! ## Sizing
 //!
-//! Warm concurrent capacity must cover the peak simultaneous request
-//! burst. With M strategy instances quoting two legs each, a
-//! synchronized replace wave is ~2·M places and ~2·M cancels sharing one
-//! pool, so [`PoolSizes::for_instances`] scales ORDER as `3·M` (clamped
-//! to [3, 16]). Call [`set_sizes`] **before** `async_rt::init()`; later
-//! calls are ignored (pools are built once). `HEXBOT_HTTP_POOL_ORDER` /
-//! `_MISC` / `_GAP_REPLAY` env vars override individually.
+//! Warm concurrent capacity must cover the peak simultaneous request burst.
+//! Account groups scale directly from their registered instance count; global
+//! fallback/query capacity never scales with strategy count. Call
+//! [`set_global_sizes`] **before** `async_rt::init()` to override the fixed
+//! defaults. `HEXBOT_HTTP_POOL_FALLBACK_ORDER` and
+//! `HEXBOT_HTTP_POOL_QUERY` override the two global pools individually.
 //!
 //! ## Warmth
 //!
@@ -71,12 +71,12 @@ use anyhow::{Context, Result};
 // ── Per-pool client-level timeout ceilings ────────────────────────
 // ORDER (Fast+Cancel merged) is a ceiling only: the per-request deadline
 // is chosen by `async_rt::current_fast_timeout()` /
-// `current_cancel_timeout()` and is always ≤ this value. MISC
-// (Reconcile+Query merged) uses the larger Query ceiling as the client
-// value; reconcile's historical 2 s deadline is preserved per-request
-// (`GET /data/order/…` override in the trade dispatch).
+// `current_cancel_timeout()` and is always ≤ this value. QUERY and the
+// account reconcile pools use the larger 5 s client ceiling; reconcile's
+// historical 2 s deadline is preserved per-request (`GET /data/order/…`
+// override in the trade dispatch).
 const ORDER_TIMEOUT_CEILING: Duration = Duration::from_millis(2000);
-const MISC_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT_CEILING: Duration = Duration::from_secs(5);
 const GAP_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEP_WARM_IDLE: Duration = Duration::from_secs(30);
 const KEEP_WARM_TIMEOUT: Duration = Duration::from_millis(500);
@@ -103,11 +103,8 @@ fn keep_warm_tick(full_sweep: Duration, n_slots: usize) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
-/// Request roles. Since 2026-07-31 roles map onto MERGED pools —
-/// Fast+Cancel share one "order" pool (a place burst can use cancel's
-/// idle connections and vice versa; per-role admission counters are kept
-/// separately), Reconcile+Query share one "misc" pool, GapReplay stays
-/// physically isolated.
+/// Request roles. Fast+Cancel share the account's order pool; Reconcile and
+/// GapReplay each have their own account pool. Query is process-global.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// POST /order, /orders — hot-path placements.
@@ -123,81 +120,75 @@ pub enum Role {
     GapReplay,
 }
 
-/// Number of clients (≈ warm connections per host) per merged pool.
+/// Number of clients (≈ warm connections per host) in the two process-global
+/// fallback pools.
 #[derive(Clone, Copy, Debug)]
-pub struct PoolSizes {
-    /// Fast + Cancel merged pool (place and cancel share the slots).
-    pub order: usize,
-    /// Reconcile + Query merged pool.
-    pub misc: usize,
-    pub gap_replay: usize,
+pub struct GlobalPoolSizes {
+    /// Fallback for place/cancel paths that have no account admission permit.
+    pub fallback_order: usize,
+    /// Ordinary queries plus reconcile fallback traffic.
+    pub query: usize,
 }
 
-impl Default for PoolSizes {
+impl Default for GlobalPoolSizes {
     fn default() -> Self {
         Self {
-            order: 3,
-            misc: 2,
-            gap_replay: 2,
+            fallback_order: 4,
+            query: 4,
         }
     }
 }
 
-impl PoolSizes {
-    /// Scale for `n` concurrently-quoting strategy instances: a
-    /// synchronized two-leg replace wave needs ~2·n placements and ~2·n
-    /// cancels in flight at once; sharing one pool lets either op type
-    /// borrow the other's idle connections, so 3·n covers the combined
-    /// wave that previously needed 2·n + 2·n partitioned. Clamped —
-    /// beyond that, rarely-rotated clients would sit cold between picks.
-    pub fn for_instances(n: usize) -> Self {
-        let n = n.max(1);
-        Self {
-            order: (3 * n).clamp(3, 16),
-            misc: (2 * n).clamp(2, 8),
-            // One primary + one failover per configured instance. Account
-            // count is <= instance count, so multi-wallet replay is covered.
-            gap_replay: (2 * n).clamp(2, 16),
-        }
-    }
-
-    /// Apply `HEXBOT_HTTP_POOL_*` env overrides (each var optional).
+impl GlobalPoolSizes {
+    /// Apply global-pool env overrides (each var optional). The old ORDER and
+    /// MISC names remain aliases so an existing deployment does not silently
+    /// change capacity during rollout.
     pub fn with_env_overrides(mut self) -> Self {
-        fn ov(name: &str, cur: usize) -> usize {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|n| (1..=64).contains(n))
+        fn ov(primary: &str, legacy: &str, cur: usize) -> usize {
+            [primary, legacy]
+                .into_iter()
+                .find_map(|name| {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|n| (1..=64).contains(n))
+                })
                 .unwrap_or(cur)
         }
-        self.order = ov("HEXBOT_HTTP_POOL_ORDER", self.order);
-        self.misc = ov("HEXBOT_HTTP_POOL_MISC", self.misc);
-        self.gap_replay = ov("HEXBOT_HTTP_POOL_GAP_REPLAY", self.gap_replay);
+        self.fallback_order = ov(
+            "HEXBOT_HTTP_POOL_FALLBACK_ORDER",
+            "HEXBOT_HTTP_POOL_ORDER",
+            self.fallback_order,
+        );
+        self.query = ov(
+            "HEXBOT_HTTP_POOL_QUERY",
+            "HEXBOT_HTTP_POOL_MISC",
+            self.query,
+        );
         self
     }
 }
 
-static SIZES: OnceLock<PoolSizes> = OnceLock::new();
+static SIZES: OnceLock<GlobalPoolSizes> = OnceLock::new();
 
 /// Set pool sizes. Must be called **before** `async_rt::init()` builds the
 /// pools; later calls are ignored (first write wins). Returns whether the
 /// value was applied.
-pub fn set_sizes(sizes: PoolSizes) -> bool {
+pub fn set_global_sizes(sizes: GlobalPoolSizes) -> bool {
     SIZES.set(sizes.with_env_overrides()).is_ok()
 }
 
-fn sizes() -> PoolSizes {
-    *SIZES.get_or_init(|| PoolSizes::default().with_env_overrides())
+fn sizes() -> GlobalPoolSizes {
+    *SIZES.get_or_init(|| GlobalPoolSizes::default().with_env_overrides())
 }
 
 // ── Pools ─────────────────────────────────────────────────────────
 
 struct Pools {
-    /// Fast + Cancel merged.
-    order: RolePool,
-    /// Reconcile + Query merged.
-    misc: RolePool,
-    gap_replay: RolePool,
+    /// Process-global fallback for Fast + Cancel.
+    fallback_order: RolePool,
+    /// Process-global Query + reconcile fallback.
+    query: RolePool,
 }
 
 static POOLS: OnceLock<Pools> = OnceLock::new();
@@ -246,16 +237,16 @@ fn build_h1_client(timeout: Duration) -> Result<reqwest::Client> {
 pub(crate) fn init_pools() -> Result<()> {
     let s = sizes();
     let pools = Pools {
-        order: RolePool::new(s.order, ORDER_TIMEOUT_CEILING, Role::Fast)?,
-        misc: RolePool::new(s.misc, MISC_TIMEOUT, Role::Reconcile)?,
-        gap_replay: RolePool::new(s.gap_replay, GAP_REPLAY_TIMEOUT, Role::GapReplay)?,
+        fallback_order: RolePool::new(s.fallback_order, ORDER_TIMEOUT_CEILING, Role::Fast)?,
+        query: RolePool::new(s.query, QUERY_TIMEOUT_CEILING, Role::Query)?,
     };
     POOLS
         .set(pools)
         .map_err(|_| anyhow::anyhow!("http1_pool already initialised"))?;
     log::info!(
-        "[http1_pool] initialised (h1.1) order={} [fast+cancel] misc={} [reconcile+query] gap_replay={}",
-        s.order, s.misc, s.gap_replay,
+        "[http1_pool] global pools initialised (h1.1) fallback_order={} query={}",
+        s.fallback_order,
+        s.query,
     );
     Ok(())
 }
@@ -279,16 +270,13 @@ pub fn pooled_client(role: Role) -> PooledClient {
 /// keep-warm uses exact-slot permits instead.
 pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     let p = pools();
-    let mut all = p.order.clients();
-    all.extend(p.misc.clients());
-    all.extend(p.gap_replay.clients());
-    // Include the per-instance admission-pool connections so startup prewarm
-    // reaches them too. They carry real order traffic but go idle between
-    // quote waves, and a cold reserved connection would defeat the whole
-    // point of admission control.
-    if let Some(m) = INSTANCE_POOLS.get() {
-        for inst in m.values() {
-            for rp in [&inst.order, &inst.misc] {
+    let mut all = p.fallback_order.clients();
+    all.extend(p.query.clients());
+    // Include every account admission pool so startup prewarm reaches the
+    // actual place/cancel/reconcile/replay connections, not just fallbacks.
+    if let Some(registry) = ACCOUNT_POOLS.get() {
+        for account in registry.by_account.values() {
+            for rp in [&account.order, &account.reconcile, &account.gap_replay] {
                 all.extend(rp.slots.iter().map(|s| s.client.read().unwrap().clone()));
             }
         }
@@ -301,12 +289,11 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
 /// business requests.
 pub fn pooled_clients_all() -> Vec<PooledClient> {
     let p = pools();
-    let mut all = p.order.pooled_clients();
-    all.extend(p.misc.pooled_clients());
-    all.extend(p.gap_replay.pooled_clients());
-    if let Some(m) = INSTANCE_POOLS.get() {
-        for inst in m.values() {
-            for rp in [&inst.order, &inst.misc] {
+    let mut all = p.fallback_order.pooled_clients();
+    all.extend(p.query.pooled_clients());
+    if let Some(registry) = ACCOUNT_POOLS.get() {
+        for account in registry.by_account.values() {
+            for rp in [&account.order, &account.reconcile, &account.gap_replay] {
                 all.extend(rp.pooled_clients());
             }
         }
@@ -327,9 +314,9 @@ pub struct PrewarmReport {
 fn global_role(role: Role) -> &'static RolePool {
     let p = pools();
     match role {
-        Role::Fast | Role::Cancel => &p.order,
-        Role::Reconcile | Role::Query => &p.misc,
-        Role::GapReplay => &p.gap_replay,
+        Role::Fast | Role::Cancel => &p.fallback_order,
+        Role::Reconcile | Role::Query => &p.query,
+        Role::GapReplay => panic!("GapReplay is account-scoped; use an account pool API"),
     }
 }
 
@@ -356,9 +343,16 @@ pub fn clients_for_role(role: Role) -> Vec<Arc<reqwest::Client>> {
 }
 
 /// Concurrently establish TCP+TLS state for every client in a global role.
-/// Gap replay calls this before its first `/trades` request.
 pub async fn prewarm_role(role: Role, warm_url: &str) -> PrewarmReport {
     let clients = global_role_clients(role);
+    prewarm_clients(&format!("global/{role:?}"), clients, warm_url).await
+}
+
+async fn prewarm_clients(
+    label: &str,
+    clients: Vec<Arc<reqwest::Client>>,
+    warm_url: &str,
+) -> PrewarmReport {
     let total = clients.len();
     let mut set = tokio::task::JoinSet::new();
     for client in clients {
@@ -393,8 +387,8 @@ pub async fn prewarm_role(role: Role, warm_url: &str) -> PrewarmReport {
         }
     }
     log::info!(
-        "[http1_pool] role={:?} prewarm: {}/{} connections up{}",
-        role,
+        "[http1_pool] {} prewarm: {}/{} connections up{}",
+        label,
         ok,
         total,
         first_error
@@ -514,15 +508,15 @@ impl Drop for KeepWarmLease {
 fn keep_warm_targets() -> Vec<KeepWarmTarget> {
     let p = pools();
     let mut targets = Vec::new();
-    for pool in [&p.order, &p.misc, &p.gap_replay] {
+    for pool in [&p.fallback_order, &p.query] {
         targets.extend((0..pool.slots.len()).map(|slot| KeepWarmTarget { pool, slot }));
     }
-    if let Some(instances) = INSTANCE_POOLS.get() {
-        let mut ids: Vec<&String> = instances.keys().collect();
+    if let Some(registry) = ACCOUNT_POOLS.get() {
+        let mut ids: Vec<&String> = registry.by_account.keys().collect();
         ids.sort();
         for id in ids {
-            let instance = &instances[id];
-            for pool in [&instance.order, &instance.misc] {
+            let account = &registry.by_account[id];
+            for pool in [&account.order, &account.reconcile, &account.gap_replay] {
                 targets.extend((0..pool.slots.len()).map(|slot| KeepWarmTarget { pool, slot }));
             }
         }
@@ -691,7 +685,7 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
 }
 
 // ══════════════════════════════════════════════════════════════════
-// Per-instance admission control
+// Per-account admission control
 // ══════════════════════════════════════════════════════════════════
 //
 // The role pools above are process-global and shared across strategy
@@ -700,16 +694,16 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
 // Under overlapping waves that produces cold-connection storms exactly
 // when the endpoint is already slow.
 //
-// This layer replaces "round-robin + hope" with explicit admission
-// control, per (instance, role):
+// This layer replaces "round-robin + hope" with explicit admission control,
+// per (account, role). Instance IDs resolve to their owning account before a
+// hot request is admitted:
 //
 //   * Each warm connection is a `Slot` with an exclusive `busy` flag.
 //     `try_acquire` hands out at most one in-flight request per slot, so
 //     a slot's single warm connection is **never double-dispatched** —
 //     no concurrency-driven cold connection is ever opened.
-//   * Pools are **per-instance**: instance A exhausting its Fast pool
-//     cannot starve or preempt instance B. Roles are independent too
-//     (a saturated Cancel pool never blocks a Fast placement).
+//   * Shared-wallet instances intentionally share order/reconcile capacity.
+//     Different accounts remain physically isolated.
 //   * Placement may use `try_acquire` and hold the quote when all slots
 //     are busy. Cancellation uses `acquire`: it retains the request and is
 //     woken immediately by permit release instead of waiting for a quote tick.
@@ -1030,6 +1024,7 @@ impl RolePool {
     /// Reserve a free slot exclusively, or `None` if all are busy (caller
     /// SKIPS — no cold connection is opened). Binds permit → slot → warm
     /// connection so the connection is never used by two requests at once.
+    #[cfg(test)]
     fn try_acquire(&self) -> Option<Permit> {
         self.try_acquire_as(0)
     }
@@ -1044,6 +1039,7 @@ impl RolePool {
     /// Permit release wakes one waiter immediately, so callers do not poll or
     /// fall back to a strategy cadence. Unlike `try_acquire`, contention here
     /// is counted as a wait rather than a shed business operation.
+    #[cfg(test)]
     fn acquire(&self) -> Permit {
         self.acquire_as(0)
     }
@@ -1201,68 +1197,150 @@ impl RolePool {
     }
 }
 
-/// Merged order/misc pools for one instance (Fast+Cancel share `order`,
-/// Reconcile+Query share `misc`).
-struct InstancePools {
-    order: RolePool,
-    misc: RolePool,
+pub const ACCOUNT_ORDER_SLOTS_PER_INSTANCE: usize = 4;
+pub const ACCOUNT_RECONCILE_SLOTS_PER_INSTANCE: usize = 2;
+pub const ACCOUNT_GAP_REPLAY_SLOTS: usize = 2;
+
+/// Deterministic capacity derived from the number of instances sharing one
+/// Polymarket account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountPoolSizes {
+    pub order: usize,
+    pub reconcile: usize,
+    pub gap_replay: usize,
 }
 
-impl InstancePools {
-    fn role(&self, role: Role) -> Option<&RolePool> {
-        match role {
-            Role::Fast | Role::Cancel => Some(&self.order),
-            Role::Reconcile | Role::Query => Some(&self.misc),
-            Role::GapReplay => None,
+impl AccountPoolSizes {
+    pub fn for_instances(instance_count: usize) -> Self {
+        Self {
+            order: ACCOUNT_ORDER_SLOTS_PER_INSTANCE * instance_count,
+            reconcile: ACCOUNT_RECONCILE_SLOTS_PER_INSTANCE * instance_count,
+            gap_replay: ACCOUNT_GAP_REPLAY_SLOTS,
         }
     }
 }
 
-static INSTANCE_POOLS: OnceLock<HashMap<String, InstancePools>> = OnceLock::new();
+/// Physical pools for one account. Fast+Cancel share `order`; reconciliation
+/// and gap replay are isolated from both orders and process-global queries.
+struct AccountPools {
+    order: RolePool,
+    reconcile: RolePool,
+    gap_replay: RolePool,
+}
 
-/// Build per-(instance, role) admission-controlled pools. `sizes` is the
-/// **per-instance** slot count for each role (not the global `2·M`
-/// figure). Each instance gets fully independent pools — no cross-instance
-/// sharing or preemption. Call once before use; later calls are ignored
-/// (first write wins) and return `Err`.
-pub fn init_instance_pools(instances: &[String], sizes: PoolSizes) -> Result<()> {
-    let mut map = HashMap::with_capacity(instances.len());
-    for id in instances {
-        map.insert(
-            id.clone(),
-            InstancePools {
-                order: RolePool::new(sizes.order, ORDER_TIMEOUT_CEILING, Role::Fast)?,
-                misc: RolePool::new(sizes.misc, MISC_TIMEOUT, Role::Reconcile)?,
-            },
-        );
+impl AccountPools {
+    fn role(&self, role: Role) -> Option<&RolePool> {
+        match role {
+            Role::Fast | Role::Cancel => Some(&self.order),
+            Role::Reconcile => Some(&self.reconcile),
+            Role::GapReplay => Some(&self.gap_replay),
+            Role::Query => None,
+        }
     }
-    INSTANCE_POOLS
-        .set(map)
-        .map_err(|_| anyhow::anyhow!("instance pools already initialised"))?;
+}
+
+struct AccountPoolRegistry {
+    by_account: HashMap<String, AccountPools>,
+    instance_to_account: HashMap<String, String>,
+}
+
+static ACCOUNT_POOLS: OnceLock<AccountPoolRegistry> = OnceLock::new();
+
+/// Build account-level admission pools and the instance→account routing map.
+/// `accounts[account_id]` is the complete set of enabled instance IDs sharing
+/// that wallet. The fixed sizing policy is 4·N order, 2·N reconcile and 2 gap
+/// replay slots per account.
+pub fn init_account_pools(accounts: &HashMap<String, Vec<String>>) -> Result<()> {
+    let registry = build_account_pool_registry(accounts)?;
+    let account_count = registry.by_account.len();
+    let instance_count = registry.instance_to_account.len();
+    ACCOUNT_POOLS
+        .set(registry)
+        .map_err(|_| anyhow::anyhow!("account pools already initialised"))?;
     log::info!(
-        "[http1_pool] per-instance pools initialised: {} instance(s) × (order={} [fast+cancel] misc={} [reconcile+query])",
-        instances.len(),
-        sizes.order,
-        sizes.misc,
+        "[http1_pool] account pools initialised: {} account(s), {} instance(s)",
+        account_count,
+        instance_count,
     );
     Ok(())
 }
 
-/// True once `init_instance_pools` has run (per-instance admission is
-/// active). Callers fall back to the shared global pool when this is
-/// false (e.g. non-poly venues, paper/BT shims).
-pub fn instance_pools_ready() -> bool {
-    INSTANCE_POOLS.get().is_some()
+fn build_account_pool_registry(
+    accounts: &HashMap<String, Vec<String>>,
+) -> Result<AccountPoolRegistry> {
+    let mut by_account = HashMap::with_capacity(accounts.len());
+    let mut instance_to_account = HashMap::new();
+    let mut account_ids: Vec<&String> = accounts.keys().collect();
+    account_ids.sort();
+    for account_id in account_ids {
+        if account_id.is_empty() {
+            anyhow::bail!("account pool id must not be empty");
+        }
+        let mut instances = accounts[account_id].clone();
+        instances.retain(|id| !id.is_empty());
+        instances.sort();
+        instances.dedup();
+        if instances.is_empty() {
+            anyhow::bail!("account `{}` has no strategy instances", account_id);
+        }
+        for instance_id in &instances {
+            if let Some(previous) =
+                instance_to_account.insert(instance_id.clone(), account_id.clone())
+            {
+                anyhow::bail!(
+                    "instance `{}` is assigned to both `{}` and `{}`",
+                    instance_id,
+                    previous,
+                    account_id,
+                );
+            }
+        }
+        let sizes = AccountPoolSizes::for_instances(instances.len());
+        by_account.insert(
+            account_id.clone(),
+            AccountPools {
+                order: RolePool::new(sizes.order, ORDER_TIMEOUT_CEILING, Role::Fast)?,
+                reconcile: RolePool::new(sizes.reconcile, QUERY_TIMEOUT_CEILING, Role::Reconcile)?,
+                gap_replay: RolePool::new(sizes.gap_replay, GAP_REPLAY_TIMEOUT, Role::GapReplay)?,
+            },
+        );
+        log::info!(
+            "[http1_pool] account={} instances={} order={} reconcile={} gap_replay={}",
+            account_id,
+            instances.len(),
+            sizes.order,
+            sizes.reconcile,
+            sizes.gap_replay,
+        );
+    }
+    Ok(AccountPoolRegistry {
+        by_account,
+        instance_to_account,
+    })
 }
 
-/// Admission control: reserve a warm connection for `(instance, role)`.
+/// True once account-level admission has been configured.
+pub fn account_pools_ready() -> bool {
+    ACCOUNT_POOLS.get().is_some()
+}
+
+fn account_for_instance(instance: &str) -> Option<&'static AccountPools> {
+    let registry = ACCOUNT_POOLS.get()?;
+    let account_id = registry.instance_to_account.get(instance)?;
+    registry.by_account.get(account_id)
+}
+
+fn account_by_id(account_id: &str) -> Option<&'static AccountPools> {
+    ACCOUNT_POOLS.get()?.by_account.get(account_id)
+}
+
+/// Admission control: map `instance` to its account and reserve a warm
+/// account connection for the requested hot-path role.
 ///   * `Some(permit)` → dispatch on `permit.client()`, release on drop.
 ///   * `None`         → all warm connections busy OR unknown instance;
 ///                      the caller must SKIP (no cold connection).
 pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
-    INSTANCE_POOLS
-        .get()?
-        .get(instance)?
+    account_for_instance(instance)?
         .role(role)?
         .try_acquire_as(role_ctr_index(role))
 }
@@ -1272,46 +1350,66 @@ pub fn try_acquire(instance: &str, role: Role) -> Option<Permit> {
 /// next permit release and dispatches immediately.
 pub fn acquire(instance: &str, role: Role) -> Option<Permit> {
     Some(
-        INSTANCE_POOLS
-            .get()?
-            .get(instance)?
+        account_for_instance(instance)?
             .role(role)?
             .acquire_as(role_ctr_index(role)),
     )
 }
 
-/// Reserve a process-global GapReplay slot with the same exclusive
-/// no-cold-connect admission guarantee as per-instance order traffic.
-pub fn try_acquire_global(role: Role) -> Option<Permit> {
-    match role {
-        Role::GapReplay => pools().gap_replay.try_acquire(),
-        _ => None,
-    }
+/// Best-effort account-slot borrow for batch/must-complete paths that do not
+/// carry an engine permit. Saturation is not counted as a shed request because
+/// the caller immediately uses the process-global fallback-order pool. This is
+/// deliberately non-blocking: a completion callback may still hold its
+/// original permit while scheduling a defensive cancel.
+pub fn try_borrow_account(account_id: &str, role: Role) -> Option<Permit> {
+    account_by_id(account_id)?
+        .role(role)?
+        .try_acquire_inner(false, role_ctr_index(role))
+}
+
+/// Reserve a slot from one account's physically isolated gap-replay pool.
+pub fn try_acquire_account(account_id: &str, role: Role) -> Option<Permit> {
+    account_by_id(account_id)?
+        .role(role)?
+        .try_acquire_as(role_ctr_index(role))
+}
+
+/// Prewarm exactly one account's two gap-replay connections.
+pub async fn prewarm_account_gap_replay(account_id: &str, warm_url: &str) -> PrewarmReport {
+    let clients = account_by_id(account_id)
+        .map(|account| account.gap_replay.clients())
+        .unwrap_or_default();
+    prewarm_clients(
+        &format!("account={account_id}/GapReplay"),
+        clients,
+        warm_url,
+    )
+    .await
 }
 
 /// Exempt dispatch for must-complete traffic (heartbeat / cancel-all): never
 /// blocked by admission, may cold-connect. Keep-warm deliberately does not use
-/// this escape hatch. Falls back to the shared global pool when the instance
-/// is unknown / pools not yet initialised.
+/// this escape hatch. Falls back to the process-global pool when the instance
+/// is unknown or the role is Query.
 pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
-    if let Some(p) = INSTANCE_POOLS.get().and_then(|m| m.get(instance)) {
-        if let Some(pool) = p.role(role) {
+    if let Some(account) = account_for_instance(instance) {
+        if let Some(pool) = account.role(role) {
             return pool.exempt_client();
         }
     }
     client(role)
 }
 
-/// Observability snapshot: `(instance, role, acquires, skips, waits, busy_now)`
-/// sorted by instance then role. Empty until `init_instance_pools` runs.
+/// Observability snapshot: `(account, role, acquires, skips, waits, busy_now)`
+/// sorted by account then role.
 pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, usize)> {
     let mut out = Vec::new();
-    if let Some(m) = INSTANCE_POOLS.get() {
-        let mut ids: Vec<&String> = m.keys().collect();
+    if let Some(registry) = ACCOUNT_POOLS.get() {
+        let mut ids: Vec<&String> = registry.by_account.keys().collect();
         ids.sort();
         for id in ids {
-            let p = &m[id];
-            for role in [Role::Fast, Role::Cancel, Role::Reconcile, Role::Query] {
+            let p = &registry.by_account[id];
+            for role in [Role::Fast, Role::Cancel, Role::Reconcile] {
                 let (a, s, w, b) = p.role(role).unwrap().stats_as(role_ctr_index(role));
                 out.push((id.clone(), role, a, s, w, b));
             }
@@ -1320,10 +1418,12 @@ pub fn admission_stats() -> Vec<(String, Role, u64, u64, u64, usize)> {
     out
 }
 
-/// GapReplay pool counters and per-slot health:
+/// One account's GapReplay counters and per-slot health:
 /// `(acquires, skips, busy, [(slot, generation, failures, quarantined)])`.
-pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize, bool)>) {
-    let pool = &pools().gap_replay;
+pub fn gap_replay_stats(
+    account_id: &str,
+) -> Option<(u64, u64, usize, Vec<(usize, u64, usize, bool)>)> {
+    let pool = &account_by_id(account_id)?.gap_replay;
     let (acquires, skips, _, busy) = pool.stats();
     let slots = pool
         .slots
@@ -1338,7 +1438,38 @@ pub fn gap_replay_stats() -> (u64, u64, usize, Vec<(usize, u64, usize, bool)>) {
             )
         })
         .collect();
-    (acquires, skips, busy, slots)
+    Some((acquires, skips, busy, slots))
+}
+
+/// GapReplay stats for every configured account, sorted by account ID.
+pub fn all_gap_replay_stats() -> Vec<(String, u64, u64, usize, Vec<(usize, u64, usize, bool)>)> {
+    let Some(registry) = ACCOUNT_POOLS.get() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<&String> = registry.by_account.keys().collect();
+    ids.sort();
+    ids.into_iter()
+        .filter_map(|account_id| {
+            gap_replay_stats(account_id).map(|(acquires, skips, busy, slots)| {
+                (account_id.clone(), acquires, skips, busy, slots)
+            })
+        })
+        .collect()
+}
+
+/// Sum of all account order slots. The completion executor uses this to avoid
+/// queueing an already-fired request while its permit remains held.
+pub fn total_account_order_capacity() -> usize {
+    ACCOUNT_POOLS
+        .get()
+        .map(|registry| {
+            registry
+                .by_account
+                .values()
+                .map(|account| account.order.slots.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1346,21 +1477,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes_scale_with_instances() {
-        let s1 = PoolSizes::for_instances(1);
-        assert_eq!((s1.order, s1.misc, s1.gap_replay), (3, 2, 2));
-        let s3 = PoolSizes::for_instances(3);
-        assert_eq!((s3.order, s3.misc, s3.gap_replay), (9, 6, 6));
-        let s20 = PoolSizes::for_instances(20);
-        assert_eq!(s20.order, 16); // clamped
-        assert_eq!(s20.misc, 8);
-        assert_eq!(s20.gap_replay, 16);
+    fn account_sizes_scale_with_instances() {
+        let s1 = AccountPoolSizes::for_instances(1);
+        assert_eq!((s1.order, s1.reconcile, s1.gap_replay), (4, 2, 2));
+        let s3 = AccountPoolSizes::for_instances(3);
+        assert_eq!((s3.order, s3.reconcile, s3.gap_replay), (12, 6, 2));
+        let s20 = AccountPoolSizes::for_instances(20);
+        assert_eq!((s20.order, s20.reconcile, s20.gap_replay), (80, 40, 2));
     }
 
     #[test]
-    fn default_sizes() {
-        let d = PoolSizes::default();
-        assert_eq!((d.order, d.misc, d.gap_replay), (3, 2, 2));
+    fn global_default_sizes_are_fixed() {
+        let d = GlobalPoolSizes::default();
+        assert_eq!((d.fallback_order, d.query), (4, 4));
+    }
+
+    #[test]
+    fn shared_account_instances_resolve_to_one_sized_pool_group() {
+        let accounts = HashMap::from([
+            (
+                "wallet-a".to_string(),
+                vec![
+                    "btc-2".to_string(),
+                    "btc-1".to_string(),
+                    "btc-1".to_string(),
+                ],
+            ),
+            ("wallet-b".to_string(), vec!["eth-1".to_string()]),
+        ]);
+        let registry = build_account_pool_registry(&accounts).unwrap();
+        assert_eq!(registry.instance_to_account["btc-1"], "wallet-a");
+        assert_eq!(registry.instance_to_account["btc-2"], "wallet-a");
+        assert_eq!(registry.instance_to_account["eth-1"], "wallet-b");
+
+        let wallet_a = &registry.by_account["wallet-a"];
+        assert_eq!(wallet_a.order.slots.len(), 8);
+        assert_eq!(wallet_a.reconcile.slots.len(), 4);
+        assert_eq!(wallet_a.gap_replay.slots.len(), 2);
+        let wallet_b = &registry.by_account["wallet-b"];
+        assert_eq!(wallet_b.order.slots.len(), 4);
+        assert_eq!(wallet_b.reconcile.slots.len(), 2);
+        assert_eq!(wallet_b.gap_replay.slots.len(), 2);
+    }
+
+    #[test]
+    fn instance_cannot_belong_to_two_account_pool_groups() {
+        let accounts = HashMap::from([
+            ("wallet-a".to_string(), vec!["btc".to_string()]),
+            ("wallet-b".to_string(), vec!["btc".to_string()]),
+        ]);
+        let error = build_account_pool_registry(&accounts).err().unwrap();
+        assert!(error.to_string().contains("assigned to both"));
     }
 
     #[test]
@@ -1467,10 +1634,16 @@ mod tests {
         RolePool::new(n, Duration::from_millis(500), Role::Fast).unwrap()
     }
 
-    fn inst(n: usize) -> InstancePools {
-        InstancePools {
+    fn account(n: usize) -> AccountPools {
+        AccountPools {
             order: pool(n),
-            misc: pool(n),
+            reconcile: pool(n),
+            gap_replay: RolePool::new(
+                ACCOUNT_GAP_REPLAY_SLOTS,
+                Duration::from_secs(5),
+                Role::GapReplay,
+            )
+            .unwrap(),
         }
     }
 
@@ -1510,6 +1683,15 @@ mod tests {
             assert!(p.try_acquire().is_none(), "never exceed N in-flight");
         }
         assert_eq!(p.stats().3, 3, "exactly N busy");
+    }
+
+    #[test]
+    fn spillover_probe_does_not_report_a_shed_business_request() {
+        let p = pool(1);
+        let _held = p.try_acquire().unwrap();
+        assert!(p.try_acquire_inner(false, 0).is_none());
+        let (acquires, skips, waits, busy) = p.stats();
+        assert_eq!((acquires, skips, waits, busy), (1, 0, 0, 1));
     }
 
     #[test]
@@ -1609,28 +1791,28 @@ mod tests {
     }
 
     #[test]
-    fn admission_per_instance_isolation() {
-        let a = inst(1);
-        let b = inst(1);
+    fn admission_isolated_between_accounts() {
+        let a = account(1);
+        let b = account(1);
         let held = a.role(Role::Fast).unwrap().try_acquire();
         assert!(held.is_some());
         assert!(
             a.role(Role::Fast).unwrap().try_acquire().is_none(),
-            "instance A's Fast pool is exhausted"
+            "account A's order pool is exhausted"
         );
         assert!(
             b.role(Role::Fast).unwrap().try_acquire().is_some(),
-            "instance B must be unaffected by A's exhaustion — no cross-instance preemption"
+            "account B must be unaffected by account A's exhaustion"
         );
     }
 
     #[test]
     fn admission_merged_pool_semantics() {
-        let i = inst(1);
+        let i = account(1);
         // Fast and Cancel SHARE the order pool: exhausting it via a
         // place blocks a cancel too — the merge trades strict role
-        // isolation for burst capacity (either op type can use every
-        // order slot). Reconcile+Query share misc, independent of order.
+        // isolation for burst capacity. Reconcile is independent; Query is
+        // global and therefore intentionally absent from an account pool.
         let _fast = i.role(Role::Fast).unwrap().try_acquire().unwrap();
         assert!(
             i.role(Role::Fast).unwrap().try_acquire().is_none(),
@@ -1641,11 +1823,8 @@ mod tests {
             "Cancel shares the order pool's slots"
         );
         let _rec = i.role(Role::Reconcile).unwrap().try_acquire().unwrap();
-        assert!(
-            i.role(Role::Query).unwrap().try_acquire().is_none(),
-            "Query shares the misc pool's slots"
-        );
-        assert!(i.role(Role::GapReplay).is_none());
+        assert!(i.role(Role::Query).is_none());
+        assert!(i.role(Role::GapReplay).is_some());
     }
 
     #[test]

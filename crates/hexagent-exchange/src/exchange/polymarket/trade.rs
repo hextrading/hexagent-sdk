@@ -738,7 +738,7 @@ fn latency_record_status(reply: &HttpReply) -> String {
     }
 }
 
-/// Pick the per-role HTTP client for a (method, path) pair. Role isolation
+/// Classify a CLOB request by connection-pool role. Role isolation
 /// ensures a slow query / heartbeat can't back-pressure the hot-path
 /// submit via shared TCP receive windows — each role
 /// owns a distinct TCP connection per host.
@@ -749,17 +749,14 @@ fn latency_record_status(reply: &HttpReply) -> String {
 ///   * GET /data/order/{id}              → reconcile (2000 ms)
 ///   * everything else (heartbeats, generic GET / POST) → query (5000 ms)
 ///
-/// Gap replay bypasses this generic router and explicitly acquires the
-/// process-global `GapReplay` role so it cannot consume Query capacity.
-fn pick_client(method: &reqwest::Method, path: &str) -> crate::http1_pool::PooledClient {
+/// Gap replay bypasses this generic router and explicitly acquires its
+/// account's `GapReplay` role so it cannot consume Query capacity.
+fn request_role(method: &reqwest::Method, path: &str) -> crate::http1_pool::Role {
     match (method.as_str(), path) {
-        ("POST", "/order") | ("POST", "/orders") =>
-            crate::http1_pool::pooled_client(crate::http1_pool::Role::Fast),
-        ("DELETE", _) =>
-            crate::http1_pool::pooled_client(crate::http1_pool::Role::Cancel),
-        ("GET", p) if p.starts_with("/data/order/") =>
-            crate::http1_pool::pooled_client(crate::http1_pool::Role::Reconcile),
-        _ => crate::http1_pool::pooled_client(crate::http1_pool::Role::Query),
+        ("POST", "/order") | ("POST", "/orders") => crate::http1_pool::Role::Fast,
+        ("DELETE", _) => crate::http1_pool::Role::Cancel,
+        ("GET", p) if p.starts_with("/data/order/") => crate::http1_pool::Role::Reconcile,
+        _ => crate::http1_pool::Role::Query,
     }
 }
 
@@ -773,8 +770,8 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
         ("POST", "/order") | ("POST", "/orders") => Some(async_rt::current_fast_timeout()),
         ("DELETE", _) => Some(async_rt::current_cancel_timeout()),
         // Reconcile order-state GETs keep their historical 2 s deadline:
-        // the merged reconcile+query pool's client-level timeout is the
-        // Query ceiling (5 s), which would let a reconcile attempt hang
+        // the account reconcile pool's client-level timeout is the Query
+        // ceiling (5 s), which would let a reconcile attempt hang
         // 2.5× longer than the retry ladder expects.
         ("GET", p) if p.starts_with("/data/order/") =>
             Some(std::time::Duration::from_millis(2000)),
@@ -782,28 +779,8 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
     }
 }
 
-/// Execute a single authenticated POST/DELETE against the CLOB via the
-/// shared reqwest client. Returns the parsed JSON body or a mapped
-/// HttpErr (Timeout / Status / Other). This is the single entry point
-/// — all sync wrappers in `SharedState` call it.
-async fn execute_http(
-    method: reqwest::Method,
-    url: String,
-    path: String,
-    headers: super::auth::AuthHeaders,
-    body: String,
-) -> HttpReply {
-    // Per-(method,path) role-isolated client (FAST for places, CANCEL for
-    // deletes, …) — see `pick_client`. The admission-control / fire-and-track
-    // path bypasses this round-robin pick and dispatches on a specific
-    // permit-reserved connection via `execute_http_on` instead, so a reserved
-    // warm connection is never skipped for a cold one.
-    let client = pick_client(&method, &path);
-    execute_http_on(client, method, url, path, headers, body).await
-}
-
-/// Like [`execute_http`] but dispatches on an explicit `client` — one of a
-/// role pool's connections, typically the one reserved by an admission
+/// Dispatch on an explicit `client` — one of a role pool's connections,
+/// typically the one reserved by an admission
 /// [`http1_pool::Permit`]. Threading the exact connection (rather than a
 /// fresh round-robin pick) is what lets the fire-and-track path guarantee a
 /// request runs on its reserved warm connection instead of opening a cold one.
@@ -992,6 +969,8 @@ pub struct SharedState {
     /// row in the per-request latency CSV so a single file can hold
     /// multiple instances. `"cli"` for one-off CLI subcommands.
     pub(crate) instance_id: String,
+    /// Account-wide physical/virtual ledger shared by every executor route.
+    pub account_state: Arc<hexagent_account::account::shared_account::SharedAccount>,
     /// Local order tracking: client_order_id → TrackedOrder
     pub(crate) open_orders: Mutex<HashMap<String, TrackedOrder>>,
     /// client_order_id → Polymarket orderID (hex hash)
@@ -1331,6 +1310,7 @@ impl SharedState {
             self.coid_to_token.lock().unwrap()
                 .insert(client_order_id.to_string(), token.to_string());
         }
+        self.account_state.rebind_order_id(client_order_id, exchange_order_id);
     }
 
     /// Look up client_order_id from Polymarket orderID.
@@ -1358,7 +1338,12 @@ impl SharedState {
     /// `handle_balance_error`'s (open_orders-based) snapshot from
     /// double-cancelling a just-rejected coid.
     pub fn remove_order(&self, client_order_id: &str) {
+        self.remove_order_as(client_order_id, OrderStatus::Cancelled);
+    }
+
+    pub fn remove_order_as(&self, client_order_id: &str, status: OrderStatus) {
         self.open_orders.lock().unwrap().remove(client_order_id);
+        self.account_state.release_order(client_order_id, status);
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
@@ -1595,9 +1580,9 @@ impl SharedState {
     /// Dispatch an HTTP request onto the shared async runtime. Returns a
     /// crossbeam Receiver so the caller can poll for the response from a
     /// sync context. Kicks off the reqwest call immediately (non-blocking
-    /// from the caller's perspective) — for parallel cancel+place, two
-    /// sequential calls of this method are dispatched concurrently on
-    /// the runtime (HTTP/2 multiplexes them on a single TCP connection).
+    /// from the caller's perspective). Each call best-effort borrows a warm
+    /// slot from the account pool; a busy/missing account pool spills to the
+    /// fixed global fallback-order pool.
     ///
     /// Exactly one HTTP request is sent. Retries and speculative duplicate
     /// requests are deliberately left to explicit reconciliation so place
@@ -1649,6 +1634,23 @@ impl SharedState {
         let auth_path = path.split('?').next().unwrap_or(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
+        // Every authenticated account-owned order/reconcile request uses that
+        // account's physical pool, including batch and cancel-all paths that
+        // bypass the engine's single-order fire-and-track permit. Query stays
+        // process-global. A missing/busy account pool (CLI, embedding, or a
+        // rare edge-path burst) spills into the four-slot fallback-order pool
+        // without blocking a completion callback that may hold another slot.
+        let role = request_role(&method, path);
+        let account_permit = (role != crate::http1_pool::Role::Query)
+            .then(|| {
+                crate::http1_pool::try_borrow_account(self.account_state.account_id(), role)
+            })
+            .flatten();
+        let request_client = account_permit
+            .as_ref()
+            .map(crate::http1_pool::Permit::pooled_client)
+            .unwrap_or_else(|| crate::http1_pool::pooled_client(role));
+
         // Sign once and dispatch exactly one request.
         {
             let headers = self.auth.sign_request(method.as_str(), auth_path, body);
@@ -1659,7 +1661,16 @@ impl SharedState {
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             async_rt::order_handle().spawn(async move {
-                let reply = execute_http(method_owned.clone(), url_owned, path_owned.clone(), headers, body_owned).await;
+                let reply = execute_http_on(
+                    request_client,
+                    method_owned.clone(),
+                    url_owned,
+                    path_owned.clone(),
+                    headers,
+                    body_owned,
+                )
+                .await;
+                drop(account_permit);
                 // Capture the CSV status before `reply` is moved into the
                 // channel (only when we'll actually record).
                 let rec = rec_kind
@@ -1949,6 +1960,9 @@ impl PolymarketTrade {
         Ok(Self {
             shared: Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
+                account_state: Arc::new(
+                    hexagent_account::account::shared_account::SharedAccount::new(instance_id),
+                ),
                 open_orders: Mutex::new(HashMap::new()),
                 coid_to_oid: Mutex::new(HashMap::new()),
                 oid_to_coid: Mutex::new(HashMap::new()),
@@ -2159,6 +2173,7 @@ impl PolymarketTrade {
         self.shared.coid_to_token.lock().unwrap().clear();
         self.shared.pending_reclaim.lock().unwrap().clear();
         self.shared.reconcile_cancel_not_found_counts.lock().unwrap().clear();
+        self.shared.account_state.release_all_orders();
     }
 
     /// Cancel every resting order for ONE market server-side via
@@ -3337,6 +3352,31 @@ impl PolymarketTrade {
     /// Split out of `submit_kickoff` so the kickoff path can prep then
     /// dispatch separately. Returns the synthetic `OrderUpdate` on a
     /// pre-flight reject (rate-limit / backoff / sign).
+    fn reserve_account_order(
+        &self,
+        order: &OrderRequest,
+        local_oid: &str,
+    ) -> std::result::Result<(), OrderUpdate> {
+        // CLI/legacy one-off routes have no strategy instance and therefore
+        // no virtual allocation. Engine-built routes are always registered
+        // in the shared account before strategy startup.
+        if self.instance_id.is_empty() {
+            return Ok(());
+        }
+        self.shared.account_state.reserve_order(
+            &self.instance_id,
+            &order.client_order_id,
+            local_oid,
+            &order.symbol,
+            order.side,
+            order.quantity,
+            order.price.unwrap_or(0.0),
+            order.fee_rate_bps,
+        ).map(|_| ()).map_err(|error| {
+            Self::make_rejected(order, &format!("shared-account admission: {error}"))
+        })
+    }
+
     pub(crate) fn submit_prep(
         &mut self,
         order: &OrderRequest,
@@ -3355,6 +3395,11 @@ impl PolymarketTrade {
             Err(e) => return Err(Self::make_rejected(order, &e.to_string())),
         };
         let local_oid = order_hash;
+        let body_json = match serde_json::to_string(&body) {
+            Ok(body) => body,
+            Err(e) => return Err(Self::make_rejected(order, &format!("body serialize: {}", e))),
+        };
+        self.reserve_account_order(order, &local_oid)?;
         self.shared.register_order_id(&order.client_order_id, &local_oid, &order.symbol);
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
         // point on the order may already be live on the server (a
@@ -3386,8 +3431,6 @@ impl PolymarketTrade {
             order.client_order_id, &local_oid[..18.min(local_oid.len())], order.timestamp_ns);
         log::debug!("[PolymarketTrade] Order body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-        let body_json = serde_json::to_string(&body)
-            .map_err(|e| Self::make_rejected(order, &format!("body serialize: {}", e)))?;
         Ok((local_oid, body_json))
     }
 
@@ -3423,7 +3466,7 @@ impl PolymarketTrade {
                 } else if SharedState::is_invalid_token_error(&err_s) {
                     self.handle_invalid_token(&order.symbol);
                 }
-                self.shared.remove_order(&order.client_order_id);
+                self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
                 warn!("[PolymarketTrade] Order failed: {} coid={}", e, order.client_order_id);
                 return Self::make_rejected(order, &err_s);
             }
@@ -3435,7 +3478,7 @@ impl PolymarketTrade {
         let error_msg = resp.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
 
         if !success {
-            self.shared.remove_order(&order.client_order_id);
+            self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
             if SharedState::is_balance_error(error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
             } else if SharedState::is_invalid_token_error(error_msg) {
@@ -3447,6 +3490,10 @@ impl PolymarketTrade {
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
         self.shared.clear_invalid_token(&order.symbol);
+        self.shared.account_state.mark_order_status(
+            &order.client_order_id,
+            OrderStatus::Accepted,
+        );
 
         if !order_id.is_empty() && !Self::oid_eq(&order_id, local_oid) {
             warn!(
@@ -3749,7 +3796,9 @@ impl ExchangeTrade for PolymarketTrade {
             let open = self.shared.open_orders.lock().unwrap();
             let coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
             for (coid, tracked) in open.iter() {
-                if tracked.symbol == symbol {
+                if tracked.symbol == symbol
+                    && (self.instance_id.is_empty() || tracked.instance_id == self.instance_id)
+                {
                     if let Some(oid) = coid_to_oid.get(coid) {
                         order_ids.push(oid.clone());
                         coids.push(coid.clone());
@@ -3903,6 +3952,10 @@ impl ExchangeTrade for PolymarketTrade {
                 match self.sign_and_build_body(o) {
                     Ok((order_hash, b)) => {
                         let b = serde_json::to_value(&b).unwrap_or_default();
+                        if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                            all_updates.push(rejected);
+                            continue;
+                        }
                         // Pre-register BEFORE the HTTP call so the map
                         // survives a timeout / dropped ack. Same
                         // open_orders insert as `submit_kickoff` —
@@ -3973,6 +4026,10 @@ impl ExchangeTrade for PolymarketTrade {
 
                         if success && !order_id.is_empty() {
                             accepted_coids.push(order.client_order_id.clone());
+                            self.shared.account_state.mark_order_status(
+                                &order.client_order_id,
+                                OrderStatus::Accepted,
+                            );
                             // Cross-check vs our pre-computed hash — if the
                             // server's orderID disagrees, our local hash
                             // algorithm has drifted; re-register under the
@@ -3992,7 +4049,10 @@ impl ExchangeTrade for PolymarketTrade {
                             // reject can still be matched by the server, so a
                             // late fill must still resolve its coid (the map is
                             // reclaimed at the event-expiry sweep).
-                            self.shared.remove_order(&order.client_order_id);
+                            self.shared.remove_order_as(
+                                &order.client_order_id,
+                                OrderStatus::Rejected,
+                            );
                             if SharedState::is_balance_error(error_msg) {
                                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
                             }
@@ -4080,7 +4140,10 @@ impl ExchangeTrade for PolymarketTrade {
                     // the coid↔oid map: an HTTP error is ambiguous (the
                     // chunk may have landed) so a late fill must still map.
                     for order in chunk {
-                        self.shared.remove_order(&order.client_order_id);
+                        self.shared.remove_order_as(
+                            &order.client_order_id,
+                            OrderStatus::Rejected,
+                        );
                         all_updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
@@ -4244,7 +4307,7 @@ impl ExchangeTrade for PolymarketTrade {
                 // Drop local tracking for terminal outcomes; keep for
                 // CancelOrderTimeout so the orphan reconciler can re-query.
                 if matches!(outcome, OrderStatus::Cancelled | OrderStatus::Filled) {
-                    self.shared.remove_order(coid);
+                    self.shared.remove_order_as(coid, outcome);
                 }
                 updates.push(OrderUpdate {
                     client_order_id: coid.clone(),
@@ -4348,11 +4411,10 @@ impl ExchangeTrade for PolymarketTrade {
         // Single-endpoint mode (`use_batch_orders=false`).
         //
         // FULLY CONCURRENT dispatch — cancels AND places kicked off together,
-        // no ordering between them: cancels ride the CANCEL pool, places the
-        // FAST pool (disjoint h1.1 connections), so every request of a
-        // two-leg replace is on the wire immediately after signing and the
-        // signal→wire delay is just the per-request prep. Critical path ≈
-        // max(single RTT).
+        // no ordering between them. Both roles borrow distinct slots from the
+        // account's merged order pool, so every request of a two-leg replace
+        // is on the wire immediately after signing. Critical path ≈ max(single
+        // RTT).
         //
         // History: until 2026-07 a replace (both cancels and places in one
         // batch) took a SERIAL path (all cancels written before all places
@@ -4471,6 +4533,10 @@ impl ExchangeTrade for PolymarketTrade {
             match self.sign_and_build_body(o) {
                 Ok((order_hash, b)) => {
                     let b = serde_json::to_value(&b).unwrap_or_default();
+                    if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                        place_sign_failures.push(rejected);
+                        continue;
+                    }
                     self.shared.register_order_id(&o.client_order_id, &order_hash, &o.symbol);
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share
@@ -4708,6 +4774,10 @@ impl ExchangeTrade for PolymarketTrade {
                         let error_msg = r.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
                         if success && !order_id.is_empty() {
                             accepted_coids.push(order.client_order_id.clone());
+                            self.shared.account_state.mark_order_status(
+                                &order.client_order_id,
+                                OrderStatus::Accepted,
+                            );
                             if !Self::oid_eq(&order_id, local_oid) {
                                 warn!(
                                     "[PolymarketTrade] orderID MISMATCH coid={} local={} server={}",
@@ -4723,7 +4793,10 @@ impl ExchangeTrade for PolymarketTrade {
                             // reject can still be matched by the server, so a
                             // late fill must still resolve its coid (the map is
                             // reclaimed at the event-expiry sweep).
-                            self.shared.remove_order(&order.client_order_id);
+                            self.shared.remove_order_as(
+                                &order.client_order_id,
+                                OrderStatus::Rejected,
+                            );
                             let is_balance_err = SharedState::is_balance_error(error_msg);
                             if is_balance_err {
                                 // Balance rejects in batch_update_orders
@@ -4846,7 +4919,10 @@ impl ExchangeTrade for PolymarketTrade {
                     // HTTP error → orders may be live → late fill must map).
                     for (i, _signed) in place_signed.iter().enumerate() {
                         let order = &place_chunk[place_body_to_chunk[i]];
-                        self.shared.remove_order(&order.client_order_id);
+                        self.shared.remove_order_as(
+                            &order.client_order_id,
+                            OrderStatus::Rejected,
+                        );
                         updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
@@ -4873,6 +4949,26 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clob_request_roles_separate_account_orders_reconcile_and_global_query() {
+        assert_eq!(
+            request_role(&reqwest::Method::POST, "/order"),
+            crate::http1_pool::Role::Fast,
+        );
+        assert_eq!(
+            request_role(&reqwest::Method::DELETE, "/orders"),
+            crate::http1_pool::Role::Cancel,
+        );
+        assert_eq!(
+            request_role(&reqwest::Method::GET, "/data/order/0xabc"),
+            crate::http1_pool::Role::Reconcile,
+        );
+        assert_eq!(
+            request_role(&reqwest::Method::GET, "/balance-allowance"),
+            crate::http1_pool::Role::Query,
+        );
+    }
 
     #[test]
     fn authoritative_order_parser_retains_exact_sizes_and_trade_ids() {

@@ -248,7 +248,7 @@ pub fn spawn_rtt_probe(
                     continue;
                 }
 
-                let place_rtt = fire_full_probe(&shared, &active_token);
+                let place_rtt = fire_full_probe(&shared, &active_token, &instance_id);
                 last_fire = Instant::now();
                 if let Some(rtt_ms) = place_rtt {
                     debug!("[RttProbe] place RTT={:.1}ms", rtt_ms);
@@ -285,6 +285,7 @@ pub fn spawn_rtt_probe(
 fn fire_full_probe(
     shared: &Arc<SharedState>,
     active_token: &ActiveTokenHandle,
+    instance_id: &str,
 ) -> Option<f64> {
     let token = active_token.lock().ok()?.clone()?;
     if token.is_empty() { return None; }
@@ -311,6 +312,23 @@ fn fire_full_probe(
     };
     let salt_u64: u64 = signed.order.salt.parse::<u128>()
         .map(|v| v as u64).unwrap_or(0);
+    let probe_coid = format!("probe:{}:{}", instance_id, signed.order_hash);
+    let account_reserved = shared.account_state.is_seeded();
+    if account_reserved {
+        if let Err(error) = shared.account_state.reserve_order(
+            instance_id,
+            &probe_coid,
+            &signed.order_hash,
+            &token,
+            crate::types::Side::Buy,
+            FULL_PROBE_SIZE,
+            FULL_PROBE_PRICE,
+            0,
+        ) {
+            warn!("[RttProbe] shared-account admission rejected (skip): {}", error);
+            return None;
+        }
+    }
 
     // Wire body mirrors `sign_and_build_body_v2`, but `postOnly: true`
     // so the resting order can never accidentally take a fill.
@@ -387,6 +405,9 @@ fn fire_full_probe(
             // to cancel. Rejection is NOT a healthy probe outcome: warn
             // (rate-limited) with the reason.
             warn_probe_place_rejected(*code, body);
+            if account_reserved {
+                shared.account_state.release_order(&probe_coid, crate::types::OrderStatus::Rejected);
+            }
             (None, true)
         }
         Err(e @ HttpErr::Other(_)) => {
@@ -405,6 +426,12 @@ fn fire_full_probe(
     if let Some(oid) = order_id {
         let cbody = serde_json::json!({ "orderID": oid }).to_string();
         let cres = shared.http_call_sync_rec("DELETE", "/order", &cbody, Some("probe_cancel"));
+        if cres.is_ok() && account_reserved {
+            shared.account_state.release_order(
+                &probe_coid,
+                crate::types::OrderStatus::Cancelled,
+            );
+        }
         debug!(
             "[RttProbe] probe place={:.1}ms cancel_ok={}",
             place_rtt, cres.is_ok(),

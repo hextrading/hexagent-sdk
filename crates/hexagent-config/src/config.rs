@@ -25,15 +25,21 @@ pub struct Config {
 /// legacy 4-core plan so existing deployments / dev machines keep working
 /// without touching the TOML.
 ///
-/// `enable_pin` / `enable_fifo` are master switches; the per-thread
-/// env opt-outs (`HEXBOT_NO_PIN*`, `HEXBOT_NO_FIFO`) still apply and take
-/// precedence over the config.
+/// `enable_pin` / `enable_fifo` are master switches; the per-thread env
+/// opt-outs (`HEXBOT_NO_PIN*`, `HEXBOT_NO_FIFO`) take precedence unless
+/// `strict_core_isolation` is enabled, in which case startup rejects them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OsTuneConfig {
     #[serde(default = "default_true")]
     pub enable_pin: bool,
     #[serde(default = "default_true")]
     pub enable_fifo: bool,
+    /// Fail startup when enabled live strategy instances do not have
+    /// dedicated, non-overlapping CPU cores, or when latency-critical
+    /// runtime roles overlap those cores. Intended for production hosts
+    /// whose isolated-core layout is part of the latency SLO.
+    #[serde(default)]
+    pub strict_core_isolation: bool,
     pub async_rt_core: Option<usize>,
     /// Core for the dedicated order-I/O tokio runtime thread
     /// (`hexbot-async-ord`, hosts CLOB place/cancel HTTP futures so WS
@@ -83,6 +89,7 @@ impl Default for OsTuneConfig {
         Self {
             enable_pin: true,
             enable_fifo: true,
+            strict_core_isolation: false,
             async_rt_core: None,
             async_ord_core: None,
             strategy_core: None,
@@ -1173,6 +1180,9 @@ fn default_max_connections() -> usize {
 fn default_rate_limit() -> u32 {
     10
 }
+fn default_account_allocation_weight() -> f64 {
+    1.0
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StrategyConfig {
@@ -1200,6 +1210,11 @@ pub struct StrategyConfig {
     /// outbound Signal and must be unique across enabled strategies.
     #[serde(default)]
     pub account_id: String,
+    /// Relative share of a shared Polymarket account assigned to this
+    /// strategy instance. The account normalizes all sibling weights;
+    /// omitted/invalid values behave as 1.0 (equal allocation by default).
+    #[serde(default = "default_account_allocation_weight")]
+    pub account_allocation_weight: f64,
     /// Optional path (absolute or relative to the parent config's
     /// directory) to a separate TOML file holding this strategy's
     /// params as top-level keys. Loaded and merged into `params` at
@@ -1876,6 +1891,7 @@ mod account_id_tests {
             enabled: true,
             instance_id: instance_id.into(),
             account_id: account_id.into(),
+            account_allocation_weight: 1.0,
             params_file: String::new(),
             params: HashMap::new(),
         }
@@ -1892,6 +1908,14 @@ mod account_id_tests {
         // Two instances (BTC + ETH) sharing one wallet "main".
         assert_eq!(strat("btc", "main").account_id(), "main");
         assert_eq!(strat("eth", "main").account_id(), "main");
+    }
+
+    #[test]
+    fn account_allocation_weight_defaults_to_equal() {
+        let config: StrategyConfig = toml::from_str(
+            "name = 'polymaker'\ninstance_id = 'btc'\naccount_id = 'main'",
+        ).unwrap();
+        assert_eq!(config.account_allocation_weight, 1.0);
     }
 }
 

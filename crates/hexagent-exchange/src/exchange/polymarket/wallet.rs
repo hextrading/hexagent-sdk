@@ -1498,6 +1498,9 @@ const ERC1155_BALANCE_OF_SELECTOR: [u8; 4] = [0x00, 0xfd, 0xd5, 0x8e]; // balanc
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct PositionRecord {
+    /// CLOB outcome token id used by the account ledger.
+    #[serde(default)]
+    asset: String,
     #[serde(default, rename = "conditionId")]
     condition_id: String,
     #[serde(default)]
@@ -3240,17 +3243,35 @@ struct RedeemResult {
     /// Compact summary of the first failure reason — useful in
     /// MaintenanceStatus::RedeemFailed { reason }.
     first_failure: Option<String>,
+    /// Confirmed `(token_id, burned_quantity, collateral_payout)` legs.
+    confirmed_legs: Vec<(String, f64, f64)>,
 }
 
 impl RedeemResult {
     fn all_ok(&self) -> bool {
-        self.attempted == self.confirmed
+        self.attempted == self.confirmed && self.first_failure.is_none()
     }
     fn summary(&self) -> String {
         format!(
             "attempted={} confirmed={} submit_failed={} pending_timeout={}",
             self.attempted, self.confirmed, self.submit_failed, self.pending_timeout,
         )
+    }
+}
+
+fn record_confirmed_redeem_legs(
+    result: &mut RedeemResult,
+    legs: Option<&Vec<&PositionRecord>>,
+) {
+    let Some(legs) = legs else { return; };
+    for position in legs {
+        if !position.asset.is_empty() && position.size > 0.0 {
+            result.confirmed_legs.push((
+                position.asset.clone(),
+                position.size,
+                position.current_value.max(0.0),
+            ));
+        }
     }
 }
 
@@ -3384,6 +3405,7 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
             ) {
                 Ok(tx) => {
                     result.confirmed += 1;
+                    record_confirmed_redeem_legs(&mut result, grouped.get(cid));
                     log::info!(
                         "[Maintenance] DW redeem [{}/{}] cid={} done tx={}",
                         i + 1, condition_ids.len(), cid_short, tx,
@@ -3481,6 +3503,7 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
                 }
                 if final_state.contains("CONFIRMED") || final_state.contains("MINED") {
                     result.confirmed += 1;
+                    record_confirmed_redeem_legs(&mut result, grouped.get(cid));
                     log::info!(
                         "[Maintenance] Redeem [{}/{}] cid={} done tx=0x{}",
                         i + 1, condition_ids.len(), cid_short, tx_hash.trim_start_matches("0x"),
@@ -3823,6 +3846,13 @@ pub struct MaintenanceJob {
     /// Also the executor key: jobs with the same `account_id` run serially
     /// on one worker; different accounts run in parallel on their own.
     pub account_id: String,
+    /// Concrete strategy instance requesting this operation. Empty for CLI.
+    pub instance_id: String,
+    /// Shared account ledger used to reserve per-instance cash and apply the
+    /// confirmed aggregate split back to the exact virtual owners.
+    pub account_state: Option<std::sync::Arc<
+        hexagent_account::account::shared_account::SharedAccount,
+    >>,
 }
 
 // ── Global maintenance executor ──
@@ -3857,12 +3887,35 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         std::thread::Builder::new()
             .name(format!("poly-maint-{}", worker_label))
             .spawn(move || {
-                // Serial drain: never two on-chain maintenance runs for the
-                // same wallet at once.
-                while let Ok((job, done)) = rx.recv() {
-                    run_maintenance_job(job);
-                    if let Some(d) = done {
-                        let _ = d.send(());
+                // Serial drain with a short coalescing window. Jobs for the
+                // same account + series arriving together (the normal case
+                // for sibling instances on one event boundary) become one
+                // on-chain redeem/split operation.
+                while let Ok(first) = rx.recv() {
+                    let mut burst = vec![first];
+                    while let Ok(next) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        burst.push(next);
+                    }
+                    let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
+                    for item in burst {
+                        if let Some(group) = groups.iter_mut().find(|group| {
+                            group[0].0.split_series_id == item.0.split_series_id
+                                && group[0].0.gas_via_signer == item.0.gas_via_signer
+                        }) {
+                            group.push(item);
+                        } else {
+                            groups.push(vec![item]);
+                        }
+                    }
+                    let mut redeem_claimed = false;
+                    for mut group in groups {
+                        let wants_redeem = group.iter().any(|item| item.0.redeem_enabled);
+                        if redeem_claimed {
+                            for item in &mut group { item.0.redeem_enabled = false; }
+                        } else if wants_redeem {
+                            redeem_claimed = true;
+                        }
+                        run_maintenance_group(group);
                     }
                 }
             })
@@ -3894,7 +3947,58 @@ pub fn run_maintenance_blocking(job: MaintenanceJob) {
 /// redeem (if enabled) → fetch next event → split-seed → write terminal
 /// status. Body is unchanged from the former `spawn_maintenance_thread`
 /// closure (now driven by the executor instead of a per-call thread).
-fn run_maintenance_job(job: MaintenanceJob) {
+fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
+    if items.is_empty() { return; }
+    let (mut job, first_done) = items.remove(0);
+    let mut done = vec![first_done];
+    let mut statuses: Vec<MaintenanceStatusHandle> =
+        job.status.iter().cloned().collect();
+    let mut allocations = std::collections::HashMap::<String, f64>::new();
+    if !job.instance_id.is_empty() && job.split_amount_usdc > 0.0 {
+        allocations.insert(job.instance_id.clone(), job.split_amount_usdc);
+    }
+    for (sibling, sibling_done) in items {
+        job.split_amount_usdc += sibling.split_amount_usdc;
+        job.split_end_date_min_secs = job.split_end_date_min_secs
+            .max(sibling.split_end_date_min_secs);
+        job.min_safety_balance_usdc = job.min_safety_balance_usdc
+            .max(sibling.min_safety_balance_usdc);
+        job.redeem_enabled |= sibling.redeem_enabled;
+        if job.account_state.is_none() {
+            job.account_state = sibling.account_state.clone();
+        }
+        if !sibling.instance_id.is_empty() && sibling.split_amount_usdc > 0.0 {
+            *allocations.entry(sibling.instance_id).or_insert(0.0) +=
+                sibling.split_amount_usdc;
+        }
+        if let Some(status) = sibling.status { statuses.push(status); }
+        done.push(sibling_done);
+    }
+    if job.status.is_none() {
+        job.status = statuses.first().cloned();
+    }
+    log::info!(
+        "[Maintenance] Coalesced {} instance job(s): account={} series={:?} split_total={} allocations={:?}",
+        allocations.len().max(1), job.account_id, job.split_series_id,
+        job.split_amount_usdc, allocations,
+    );
+    run_maintenance_job(job, allocations);
+    let terminal = statuses.first()
+        .map(|status| status.lock().unwrap().clone());
+    if let Some(terminal) = terminal {
+        for status in statuses.iter().skip(1) {
+            *status.lock().unwrap() = terminal.clone();
+        }
+    }
+    for sender in done.into_iter().flatten() {
+        let _ = sender.send(());
+    }
+}
+
+fn run_maintenance_job(
+    job: MaintenanceJob,
+    split_allocations: std::collections::HashMap<String, f64>,
+) {
     let MaintenanceJob {
         split_series_id,
         split_end_date_min_secs,
@@ -3904,6 +4008,8 @@ fn run_maintenance_job(job: MaintenanceJob) {
         redeem_enabled,
         status,
         account_id,
+        instance_id: _,
+        account_state,
     } = job;
     {
             // Write `Running` immediately so the strategy can distinguish
@@ -3937,7 +4043,7 @@ fn run_maintenance_job(job: MaintenanceJob) {
             // reports attempted=0 → `all_ok()` is true — so the split-seed
             // step proceeds and the final status isn't degraded. Operators
             // redeem manually via the `hexbot redeem` CLI.
-            let redeem_result = if redeem_enabled {
+            let mut redeem_result = if redeem_enabled {
                 run_redeem_all(&wallet, gas_via_signer)
             } else {
                 log::info!(
@@ -3946,11 +4052,27 @@ fn run_maintenance_job(job: MaintenanceJob) {
                 );
                 RedeemResult::default()
             };
+            if !redeem_result.confirmed_legs.is_empty() {
+                if let Some(account) = account_state.as_ref() {
+                    if let Err(error) = account.apply_redeemed_legs(&redeem_result.confirmed_legs) {
+                        log::error!(
+                            "[Maintenance] Redeem confirmed but virtual attribution failed account={}: {}",
+                            account_id, error,
+                        );
+                        account.mark_uncertain();
+                        if redeem_result.first_failure.is_none() {
+                            redeem_result.first_failure = Some(format!(
+                                "virtual redeem attribution: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
             let redeem_ok = redeem_result.all_ok();
 
             // ── Step 2: look up next event (serial, after redeem) ──
             log::info!("[Maintenance] Step 2/2: Split seed inventory for next event");
-            let next_cid: Option<String> = match split_series_id.as_deref() {
+            let next_market: Option<(String, Vec<String>)> = match split_series_id.as_deref() {
                 None => {
                     log::info!("[Maintenance] Split skipped: no series_id provided.");
                     None
@@ -3959,8 +4081,8 @@ fn run_maintenance_job(job: MaintenanceJob) {
                     match super::market::fetch_next_event(sid, split_end_date_min_secs) {
                         Ok(Some(event)) => {
                             event.markets.first()
-                                .map(|m| m.condition_id.clone())
-                                .filter(|s| !s.is_empty())
+                                .map(|m| (m.condition_id.clone(), m.clob_token_ids.clone()))
+                                .filter(|(condition_id, _)| !condition_id.is_empty())
                         }
                         Ok(None) => {
                             log::info!("[Maintenance] Split skipped: no matching next event.");
@@ -3979,12 +4101,60 @@ fn run_maintenance_job(job: MaintenanceJob) {
             // seed inventory. Even if redeem failed, a healthy split
             // means trading is viable for the next event (the failed
             // redeem just leaves stale shares we can pick up later).
-            let split_outcome = if let Some(cid) = next_cid {
+            let split_outcome = if let Some((cid, token_ids)) = next_market {
                 if split_amount_usdc > 0.0 {
-                    Some(run_split_one(
-                        &wallet, &cid, split_amount_usdc,
-                        min_safety_balance_usdc, gas_via_signer,
-                    ))
+                    let reservation = account_state.as_ref()
+                        .filter(|_| !split_allocations.is_empty())
+                        .map(|account| account.reserve_split_allocations(&split_allocations));
+                    if let Some(Err(error)) = reservation {
+                        log::warn!(
+                            "[Maintenance] Aggregate split admission rejected account={} cid={}: {}",
+                            account_id, cid, error,
+                        );
+                        Some(SplitOutcome::SubmitFailed(format!(
+                            "shared-account admission: {error}"
+                        )))
+                    } else {
+                        let mut outcome = run_split_one(
+                            &wallet, &cid, split_amount_usdc,
+                            min_safety_balance_usdc, gas_via_signer,
+                        );
+                        if let Some(account) = account_state.as_ref()
+                            .filter(|_| !split_allocations.is_empty())
+                        {
+                            let allocation_error = if matches!(outcome, SplitOutcome::Confirmed) {
+                                token_ids.first().zip(token_ids.get(1))
+                                    .ok_or_else(|| "next market has fewer than two outcome tokens".to_string())
+                                    .and_then(|(up, down)| account
+                                        .confirm_reserved_split(up, down, &split_allocations)
+                                        .map_err(|error| error.to_string()))
+                                    .err()
+                            } else {
+                                None
+                            };
+                            match &outcome {
+                                SplitOutcome::SubmitFailed(_) | SplitOutcome::Skipped(_) => {
+                                    account.release_split_allocations(&split_allocations);
+                                }
+                                // Unknown finality: hold the reservation so
+                                // sibling orders cannot spend collateral that
+                                // may already have become outcome shares.
+                                SplitOutcome::PendingTimeout(_) => {}
+                                SplitOutcome::Confirmed => {}
+                            }
+                            if let Some(error) = allocation_error {
+                                log::error!(
+                                    "[Maintenance] On-chain split confirmed but virtual allocation failed account={} cid={}: {}",
+                                    account_id, cid, error,
+                                );
+                                account.mark_uncertain();
+                                outcome = SplitOutcome::PendingTimeout(format!(
+                                    "on-chain confirmed; virtual allocation uncertain: {error}"
+                                ));
+                            }
+                        }
+                        Some(outcome)
+                    }
                 } else {
                     log::info!("[Maintenance] Split skipped: split_amount_usdc={}.", split_amount_usdc);
                     Some(SplitOutcome::Skipped(format!("amount_usdc={}", split_amount_usdc)))
@@ -4158,6 +4328,8 @@ pub fn run_split() -> Result<()> {
         // CLI: empty account_id → resolve creds from the global POLY_*
         // env (set by `apply_account_to_env` for the `--account` flag).
         account_id: String::new(),
+        instance_id: String::new(),
+        account_state: None,
     });
     println!();
     println!("=== Maintenance complete ===");
