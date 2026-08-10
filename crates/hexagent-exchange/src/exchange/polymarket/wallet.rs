@@ -4151,7 +4151,14 @@ fn cached_maintenance_split_target(
         let mut entries = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         entries.retain(|_, entry| match entry {
             MaintenanceTargetCacheEntry::Fetching => true,
-            MaintenanceTargetCacheEntry::Ready { fetched_at, .. } => fetched_at.elapsed() < CACHE_TTL,
+            MaintenanceTargetCacheEntry::Ready { fetched_at, target } => {
+                let ttl = if target.is_some() {
+                    CACHE_TTL
+                } else {
+                    std::time::Duration::from_secs(1)
+                };
+                fetched_at.elapsed() < ttl
+            }
         });
         match entries.get(&key) {
             Some(MaintenanceTargetCacheEntry::Ready { target, .. }) => return Ok(target.clone()),
