@@ -474,6 +474,14 @@ impl OrderManager {
                 self.orders.remove(&update.client_order_id);
                 self.cancel_intents.remove(&update.client_order_id);
             }
+            OrderStatus::Failed => {
+                log::warn!(
+                    "[OrderManager] {} {} {} removed (FAILED)",
+                    self.symbol, update.client_order_id, order.side,
+                );
+                self.orders.remove(&update.client_order_id);
+                self.cancel_intents.remove(&update.client_order_id);
+            }
             OrderStatus::Cancelled => {
                 // Do NOT remove — keep as `Cancelled` so a late `Accepted`
                 // (pending/delayed race) can resurrect it via the Accepted arm

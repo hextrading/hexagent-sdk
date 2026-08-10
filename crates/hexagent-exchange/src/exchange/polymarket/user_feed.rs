@@ -309,7 +309,7 @@ fn record_trade_transition(
         || size <= 0.0
         || !price.is_finite()
         || price <= 0.0
-        || price > 1.0 + f64::EPSILON
+        || price > 1.0 + 1e-8
     {
         return false;
     }
@@ -318,10 +318,298 @@ fn record_trade_transition(
     )
 }
 
+fn required_string<'a>(
+    data: &'a serde_json::Value,
+    keys: &[&str],
+    field: &str,
+) -> std::result::Result<&'a str, String> {
+    keys.iter().find_map(|key| {
+        data.get(*key).and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|value| !value.is_empty())
+    }).ok_or_else(|| format!("trade field `{field}` is missing or empty"))
+}
+
+fn strict_number(value: Option<&serde_json::Value>, field: &str) -> std::result::Result<f64, String> {
+    let parsed = match value {
+        Some(serde_json::Value::String(value)) => value.trim().parse::<f64>()
+            .map_err(|_| format!("trade field `{field}` is not a finite number"))?,
+        Some(serde_json::Value::Number(value)) => value.as_f64()
+            .ok_or_else(|| format!("trade field `{field}` is not representable as f64"))?,
+        _ => return Err(format!("trade field `{field}` is missing or not numeric")),
+    };
+    if !parsed.is_finite() { return Err(format!("trade field `{field}` is not finite")); }
+    Ok(parsed)
+}
+
+fn strict_side(value: &str, field: &str) -> std::result::Result<Side, String> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "BUY" => Ok(Side::Buy),
+        "SELL" => Ok(Side::Sell),
+        _ => Err(format!("trade field `{field}` has invalid side `{value}`")),
+    }
+}
+
+fn validate_quantity_price(
+    quantity: f64,
+    price: f64,
+    quantity_field: &str,
+    price_field: &str,
+) -> std::result::Result<(), String> {
+    if quantity <= 0.0 { return Err(format!("trade field `{quantity_field}` must be positive")); }
+    let tolerance = 1e-10_f64.max(price.abs() * 1e-8);
+    if price <= 0.0 || price > 1.0 + tolerance {
+        return Err(format!("trade field `{price_field}` is outside (0, 1]"));
+    }
+    Ok(())
+}
+
+/// Validate every role-specific field before booking any maker leg, avoiding a
+/// partially-applied multi-leg trade when a later leg is malformed.
+fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<(), String> {
+    required_string(data, &["id", "trade_id"], "id")?;
+    let status = required_string(data, &["status"], "status")?;
+    let status = status.strip_prefix("TRADE_STATUS_").unwrap_or(status);
+    if !matches!(status, "MATCHED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING") {
+        return Err(format!("trade field `status` has unsupported value `{status}`"));
+    }
+    strict_side(required_string(data, &["side"], "side")?, "side")?;
+    required_string(data, &["asset_id", "token_id"], "asset_id")?;
+    let quantity = strict_number(data.get("size").or_else(|| data.get("matched_amount")), "quantity")?;
+    let price = strict_number(data.get("price"), "price")?;
+    validate_quantity_price(quantity, price, "quantity", "price")?;
+
+    let maker_legs: Vec<&serde_json::Value> = data.get("maker_orders")
+        .and_then(serde_json::Value::as_array).into_iter().flatten()
+        .filter(|order| order.get("maker_address").and_then(serde_json::Value::as_str)
+            .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address)))
+        .collect();
+    if maker_legs.is_empty() {
+        required_string(data, &["taker_order_id", "order_id", "orderID"], "order_id")?;
+    } else {
+        for (index, order) in maker_legs.iter().enumerate() {
+            required_string(order, &["order_id"], &format!("maker_orders[{index}].order_id"))?;
+            required_string(order, &["asset_id"], &format!("maker_orders[{index}].asset_id"))?;
+            strict_side(
+                required_string(order, &["side"], &format!("maker_orders[{index}].side"))?,
+                &format!("maker_orders[{index}].side"),
+            )?;
+            let quantity = strict_number(order.get("matched_amount"), &format!("maker_orders[{index}].matched_amount"))?;
+            let price = strict_number(order.get("price"), &format!("maker_orders[{index}].price"))?;
+            validate_quantity_price(
+                quantity, price,
+                &format!("maker_orders[{index}].matched_amount"),
+                &format!("maker_orders[{index}].price"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn close_enough(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-9_f64.max(left.abs().max(right.abs()) * 1e-8)
+}
+
+fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<Vec<OrderUpdate>, String> {
+    let order_id = required_string(data, &["order_id", "orderID", "id"], "order_id")?;
+    if shared.probe_order_ids.lock().unwrap_or_else(|p| p.into_inner()).iter()
+        .any(|id| normalize_order_id(id) == normalize_order_id(order_id))
+    {
+        debug!("[PolyUserFeed] probe order lifecycle push muted: oid={order_id}");
+        return Ok(Vec::new());
+    }
+    let coid = shared.lookup_coid(order_id)
+        .ok_or_else(|| format!("unowned private order lifecycle event for order_id `{order_id}`"))?;
+    let ownership = shared.account_state.order(&coid)
+        .ok_or_else(|| format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`"))?;
+    let asset_id = required_string(data, &["asset_id", "token_id"], "asset_id")?;
+    let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
+    let price = strict_number(data.get("price"), "price")?;
+    let original_size = strict_number(data.get("original_size").or_else(|| data.get("size")), "original_size")?;
+    let size_matched = strict_number(data.get("size_matched"), "size_matched")?;
+    let tolerance = 1e-9_f64.max(original_size.abs() * 1e-8);
+    if original_size <= 0.0 || size_matched < 0.0 || size_matched > original_size + tolerance
+        || price <= 0.0 || price > 1.0 + 1e-8
+    {
+        return Err(format!("invalid order lifecycle economics order_id={order_id}"));
+    }
+    if normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
+        || ownership.token_id != asset_id || ownership.side != side
+        || !close_enough(ownership.quantity, original_size) || !close_enough(ownership.price, price)
+    {
+        return Err(format!("order lifecycle invariant mismatch coid={coid} order_id={order_id}"));
+    }
+    let lifecycle = required_string(data, &["type"], "type")?.to_ascii_uppercase();
+    let status = match lifecycle.as_str() {
+        "PLACEMENT" => OrderStatus::Accepted,
+        "UPDATE" if size_matched + tolerance >= original_size => OrderStatus::Filled,
+        "UPDATE" if size_matched > tolerance => OrderStatus::PartiallyFilled,
+        "UPDATE" => OrderStatus::Accepted,
+        "CANCELLATION" | "CANCELLED" | "CANCELED" => OrderStatus::Cancelled,
+        _ => return Err(format!("unsupported order lifecycle type `{lifecycle}`")),
+    };
+    if ownership.status == OrderStatus::Failed
+        || (ownership.status == OrderStatus::Filled
+            && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
+    {
+        debug!(
+            "[PolyUserFeed] stale order lifecycle ignored after terminal status: coid={} current={:?} incoming={:?}",
+            coid, ownership.status, status,
+        );
+        return Ok(Vec::new());
+    }
+    match status {
+        OrderStatus::Filled | OrderStatus::Cancelled => shared.remove_order_as(&coid, status),
+        _ => shared.account_state.mark_order_status(&coid, status),
+    }
+    Ok(vec![OrderUpdate {
+        client_order_id: coid,
+        exchange: Exchange::Polymarket,
+        symbol: asset_id.to_string(),
+        side,
+        exchange_order_id: Some(order_id.to_string()),
+        status,
+        liquidity: None,
+        // Inventory remains exclusively trade-driven.
+        filled_quantity: 0.0,
+        remaining_quantity: (original_size - size_matched).max(0.0),
+        avg_fill_price: price,
+        timestamp_ns: now_ns(),
+        trade_id: None,
+        order_audit: None,
+        error: None,
+    }])
+}
+
+fn invalid_payload_key(data: &serde_json::Value) -> String {
+    let is_trade = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str).is_some_and(|kind| kind == "trade");
+    if is_trade {
+        if let Some(id) = data.get("trade_id").or_else(|| data.get("id"))
+            .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+        {
+            return format!("trade:{id}");
+        }
+    }
+    if let Some(id) = data.get("order_id").or_else(|| data.get("orderID")).or_else(|| data.get("id"))
+        .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+    {
+        return format!("order:{}", normalize_order_id(id));
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in data.to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("invalid-payload:{hash:016x}")
+}
+
+fn invalid_replay_anchor_key(data: &serde_json::Value) -> String {
+    let is_trade = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str).is_some_and(|kind| kind == "trade");
+    if is_trade {
+        if let Some(id) = data.get("trade_id").or_else(|| data.get("id"))
+            .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+        {
+            // Successful taker attribution clears the raw trade id, and maker
+            // attribution creates more-specific `{trade_id}:{order_id}` keys.
+            return id.to_string();
+        }
+    }
+    if let Some(id) = data.get("order_id").or_else(|| data.get("orderID")).or_else(|| data.get("id"))
+        .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+    {
+        return format!("private-order:{}", normalize_order_id(id));
+    }
+    invalid_payload_key(data)
+}
+
+fn receipt_time_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs()).unwrap_or(1).max(1)
+}
+
+fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> u64 {
+    let now = receipt_time_secs();
+    let parsed = data.get("match_time").and_then(|value| {
+        value.as_str().and_then(|text| text.parse::<u64>().ok()).or_else(|| value.as_u64())
+    }).filter(|value| *value > 0 && *value <= now.saturating_add(MAX_FUTURE_MATCH_TIME_SECS));
+    if parsed.is_none() {
+        warn!("[PolyUserFeed] trade={} has missing/invalid match_time; pinning replay at receipt_time={}", trade_id, now);
+    }
+    parsed.unwrap_or(now)
+}
+
+fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, error: &str) {
+    let key = invalid_payload_key(data);
+    let event_type = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    if event_type == "trade" {
+        let replay_key = invalid_replay_anchor_key(data);
+        shared.account_state.mark_unresolved_trade_match_time(
+            &replay_key, effective_match_time(data, &key),
+        );
+    }
+    shared.account_state.mark_private_event_anomaly(
+        &key, format!("invalid Polymarket private event `{key}`: {error}"),
+    );
+    shared.user_feed_health.set_inventory_uncertain(true);
+    warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
+}
+
+fn parse_user_event_checked(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<Vec<OrderUpdate>, String> {
+    let event_type = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    match event_type {
+        "order" => parse_order_event(data, shared),
+        "trade" => {
+            validate_trade_event(data, shared)?;
+            Ok(parse_user_event_validated(data, shared))
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn resolve_valid_private_event_anomaly(data: &serde_json::Value, shared: &SharedState) {
+    let key = invalid_payload_key(data);
+    let replay_key = invalid_replay_anchor_key(data);
+    let event_type = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    // Successful trade attribution already clears its exact replay anchor in
+    // `parse_user_event_validated`. Do not clear it generically here: for a
+    // valid but still-unowned taker trade the exact key is also `trade:{id}`.
+    // Maker failures use per-leg anchors (`trade:{id}:{maker_order_id}`), so
+    // the payload-level syntax anchor can safely be cleared after validation.
+    if event_type == "trade" && data.get("maker_orders")
+        .and_then(serde_json::Value::as_array).is_some_and(|orders| orders.iter().any(|order| {
+            order.get("maker_address").and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address))
+        }))
+    {
+        shared.account_state.resolve_unresolved_trade_match_time(&replay_key);
+    }
+    shared.account_state.resolve_private_event_anomaly(&key);
+    if !shared.account_state.is_uncertain() {
+        shared.user_feed_health.set_inventory_uncertain(false);
+    }
+}
+
 /// Parse a Polymarket user WebSocket event into zero-or-more OrderUpdates.
 /// A single "trade" push from a MAKER perspective may expand into multiple
 /// OrderUpdates (one per matching `maker_orders[]` entry owned by us).
 pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
+    match parse_user_event_checked(data, shared) {
+        Ok(updates) => {
+            resolve_valid_private_event_anomaly(data, shared);
+            updates
+        }
+        Err(error) => {
+            flag_invalid_private_event(data, shared, &error);
+            Vec::new()
+        }
+    }
+}
+
+fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
     let event_type = match data.get("event_type")
         .or_else(|| data.get("type"))
@@ -359,23 +647,8 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
     //       legacy/order-lifecycle payloads. They are handled separately so
     //       they can never override an authoritative `taker_order_id` when a
     //       schema variant contains both.
-    let order_id = data.get("order_id")
-        .or_else(|| data.get("orderID"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
     match event_type {
-        "order" => {
-            // Order lifecycle event (placement, cancel) — we already track
-            // these locally via the submit/cancel path. Keep as a silent
-            // ack (no OrderUpdate) to avoid double-counting.
-            if !order_id.is_empty() {
-                if let Some(_coid) = shared.lookup_coid(order_id) {
-                    log::debug!("[PolyUserFeed] order event ack: orderID={}", order_id);
-                }
-            }
-            Vec::new()
-        }
+        "order" => Vec::new(),
         "trade" => {
             let taker_order_id = data
                 .get("taker_order_id")
@@ -436,26 +709,7 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 .strip_prefix("TRADE_STATUS_")
                 .unwrap_or(status_raw);
 
-            let parsed_match_time_secs: u64 = data.get("match_time")
-                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))
-                .unwrap_or(0);
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0);
-            let match_time_secs = if parsed_match_time_secs
-                > now_secs.saturating_add(MAX_FUTURE_MATCH_TIME_SECS)
-            {
-                warn!(
-                    "[PolyUserFeed] ignoring future match_time={} trade={} now={}",
-                    parsed_match_time_secs,
-                    trade_id,
-                    now_secs,
-                );
-                0
-            } else {
-                parsed_match_time_secs
-            };
+            let match_time_secs = effective_match_time(data, trade_id);
 
             let status = match status_str {
                 "MATCHED" | "MINED" => OrderStatus::PartiallyFilled,
@@ -592,7 +846,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         status,
                         true,
                     );
-                    shared.finish_filled_order_if_audited(&coid);
+                    if status == OrderStatus::Failed {
+                        shared.remove_order_as(&coid, OrderStatus::Failed);
+                    } else {
+                        shared.finish_filled_order_if_audited(&coid);
+                    }
 
                     updates.push(OrderUpdate {
                         client_order_id: coid,
@@ -668,7 +926,11 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     status,
                     false,
                 );
-                shared.finish_filled_order_if_audited(&coid);
+                if status == OrderStatus::Failed {
+                    shared.remove_order_as(&coid, OrderStatus::Failed);
+                } else {
+                    shared.finish_filled_order_if_audited(&coid);
+                }
 
                 updates.push(OrderUpdate {
                     client_order_id: coid,
@@ -853,10 +1115,26 @@ async fn replay_missed_trades_inner(
 
         let (records, next) = if let Some(arr) = json.as_array() {
             (arr.clone(), String::new())
-        } else {
-            let data = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let next = json.get("next_cursor").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        } else if let Some(object) = json.as_object() {
+            let data = object.get("data").and_then(serde_json::Value::as_array).cloned()
+                .ok_or_else(|| anyhow!(
+                    "Gap-fetch /trades returned object without an array `data` field after {} records",
+                    checkpoint.records,
+                ))?;
+            let next = match object.get("next_cursor") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(next)) => next.clone(),
+                Some(_) => return Err(anyhow!(
+                    "Gap-fetch /trades returned non-string `next_cursor` after {} records",
+                    checkpoint.records,
+                )),
+            };
             (data, next)
+        } else {
+            return Err(anyhow!(
+                "Gap-fetch /trades returned neither an array nor a paginated object after {} records",
+                checkpoint.records,
+            ));
         };
 
         for mut rec in records {
@@ -864,8 +1142,18 @@ async fn replay_missed_trades_inner(
                 obj.entry("event_type".to_string())
                     .or_insert(serde_json::Value::String("trade".to_string()));
             }
-            for update in parse_user_event(&rec, shared) {
-                let _ = update_tx.send(update);
+            match parse_user_event_checked(&rec, shared) {
+                Ok(updates) => {
+                    resolve_valid_private_event_anomaly(&rec, shared);
+                    for update in updates { let _ = update_tx.send(update); }
+                }
+                Err(error) => {
+                    flag_invalid_private_event(&rec, shared, &error);
+                    return Err(anyhow!(
+                        "Gap-fetch /trades rejected invalid record after {} records: {}",
+                        checkpoint.records, error,
+                    ));
+                }
             }
             checkpoint.records += 1;
         }
@@ -1898,6 +2186,188 @@ mod tests {
             "page-3".to_string(),
         ).unwrap());
         assert_eq!(checkpoint.cursor, "page-3");
+    }
+
+    fn owned_taker_shared(limit_price: f64) -> Arc<SharedState> {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner", 1.0);
+        shared.account_state.apply_physical_snapshot(100.0, HashMap::new());
+        shared.account_state.register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0).unwrap();
+        shared.account_state.reserve_order(
+            "owner", "owner-1", "oid-1", "TOKEN", Side::Buy, 10.0, limit_price, 0,
+        ).unwrap();
+        shared.register_order_id("owner-1", "oid-1", "TOKEN");
+        shared.open_orders.lock().unwrap().insert(
+            "owner-1".to_string(),
+            super::super::trade::TrackedOrder {
+                symbol: "TOKEN".to_string(),
+                side: Side::Buy,
+                instance_id: "owner".to_string(),
+            },
+        );
+        shared
+    }
+
+    fn valid_taker_event() -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "trade", "id": "trade-strict", "status": "MATCHED",
+            "asset_id": "TOKEN", "side": "BUY", "size": "10", "price": "0.5",
+            "match_time": "123", "taker_order_id": "oid-1", "maker_orders": [],
+        })
+    }
+
+    #[test]
+    fn trade_identity_lifecycle_and_economics_are_all_strictly_required() {
+        let shared = test_shared();
+        for field in ["id", "status", "side", "asset_id", "size", "price", "taker_order_id"] {
+            let mut event = valid_taker_event();
+            event.as_object_mut().unwrap().remove(field);
+            assert!(validate_trade_event(&event, &shared).is_err(), "missing `{field}`");
+        }
+        for (field, invalid) in [
+            ("status", serde_json::json!("UNKNOWN")),
+            ("side", serde_json::json!("HOLD")),
+            ("size", serde_json::json!("NaN")),
+            ("price", serde_json::json!("Infinity")),
+        ] {
+            let mut event = valid_taker_event();
+            event[field] = invalid;
+            assert!(validate_trade_event(&event, &shared).is_err(), "invalid `{field}`");
+        }
+    }
+
+    #[test]
+    fn trade_float_validation_allows_only_relative_rounding_noise() {
+        let shared = owned_taker_shared(1.0);
+        let mut event = valid_taker_event();
+        event["price"] = serde_json::json!("1.000000005");
+        let updates = parse_user_event(&event, &shared);
+        assert_eq!(updates.len(), 1);
+        assert!((updates[0].avg_fill_price - 1.000000005).abs() < 1e-12);
+        let mut invalid = valid_taker_event();
+        invalid["price"] = serde_json::json!("1.0001");
+        assert!(validate_trade_event(&invalid, &test_shared()).is_err());
+    }
+
+    #[test]
+    fn order_lifecycle_updates_are_owned_routed_and_release_on_cancel() {
+        let shared = owned_taker_shared(0.5);
+        let placement = serde_json::json!({
+            "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "0",
+        });
+        let updates = parse_user_event(&placement, &shared);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Accepted);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        let mut cancellation = placement;
+        cancellation["type"] = serde_json::json!("CANCELLATION");
+        assert_eq!(parse_user_event(&cancellation, &shared)[0].status, OrderStatus::Cancelled);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+
+        let shared = owned_taker_shared(0.5);
+        let mut update = serde_json::json!({
+            "event_type": "order", "type": "UPDATE", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "4",
+        });
+        assert_eq!(parse_user_event(&update, &shared)[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
+            "order lifecycle must not book or release trade-driven inventory");
+        update["size_matched"] = serde_json::json!("10");
+        assert_eq!(parse_user_event(&update, &shared)[0].status, OrderStatus::Filled);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
+            "whole-order Filled holds the lock until trade rows arrive");
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+    }
+
+    #[test]
+    fn malformed_later_maker_leg_cannot_partially_book_earlier_leg() {
+        let shared = test_shared();
+        shared.account_state.register_instance("maker-a", 1.0);
+        shared.account_state.register_instance("maker-b", 1.0);
+        shared.account_state.apply_physical_snapshot(200.0, HashMap::new());
+        for (instance, coid, oid) in [
+            ("maker-a", "maker-a-1", "oid-a"),
+            ("maker-b", "maker-b-1", "oid-b"),
+        ] {
+            shared.account_state.reserve_order(
+                instance, coid, oid, "TOKEN", Side::Buy, 5.0, 0.5, 0,
+            ).unwrap();
+            shared.register_order_id(coid, oid, "TOKEN");
+        }
+        let event = serde_json::json!({
+            "event_type": "trade", "id": "maker-atomic", "status": "MATCHED",
+            "asset_id": "OTHER", "side": "SELL", "size": "10", "price": "0.5",
+            "taker_order_id": "other", "maker_orders": [
+                {"maker_address": shared.order_maker_address.clone(), "asset_id": "TOKEN",
+                 "side": "BUY", "matched_amount": "5", "price": "0.5", "order_id": "oid-a"},
+                {"maker_address": shared.order_maker_address.clone(), "asset_id": "TOKEN",
+                 "side": "BUY", "matched_amount": "5", "price": "NaN", "order_id": "oid-b"}
+            ]
+        });
+        assert!(parse_user_event(&event, &shared).is_empty());
+        assert_eq!(shared.account_state.order("maker-a-1").unwrap().filled_quantity, 0.0);
+        assert_eq!(shared.account_state.order("maker-b-1").unwrap().filled_quantity, 0.0);
+        assert!(shared.account_state.is_uncertain());
+    }
+
+    #[test]
+    fn failed_trade_is_terminal_and_releases_runtime_order_without_audit() {
+        let shared = owned_taker_shared(0.5);
+        let mut event = valid_taker_event();
+        event["status"] = serde_json::json!("FAILED");
+        let updates = parse_user_event(&event, &shared);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Failed);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+        assert!(!shared.account_state.is_uncertain());
+        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+
+        let stale_placement = serde_json::json!({
+            "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "0",
+        });
+        assert!(parse_user_event(&stale_placement, &shared).is_empty());
+        assert_eq!(shared.account_state.order("owner-1").unwrap().status, OrderStatus::Failed,
+            "a stale order lifecycle must not resurrect a FAILED trade tombstone");
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+    }
+
+    #[test]
+    fn unowned_trade_with_invalid_match_time_keeps_receipt_replay_anchor() {
+        let shared = test_shared();
+        let mut event = valid_taker_event();
+        event["taker_order_id"] = serde_json::json!("unknown-order");
+        event["match_time"] = serde_json::json!("not-a-time");
+        assert!(parse_user_event(&event, &shared).is_empty());
+        assert!(shared.account_state.is_uncertain());
+        assert!(shared.account_state.earliest_unresolved_trade_match_time()
+            .is_some_and(|anchor| anchor > 0));
+    }
+
+    #[test]
+    fn corrected_trade_replay_clears_schema_anomaly_and_receipt_anchor() {
+        let shared = owned_taker_shared(0.5);
+        let mut event = valid_taker_event();
+        event["side"] = serde_json::json!("HOLD");
+        event["match_time"] = serde_json::json!("not-a-time");
+        assert!(parse_user_event(&event, &shared).is_empty());
+        assert!(shared.account_state.is_uncertain());
+        assert!(shared.user_feed_health.inventory_uncertain());
+        assert!(shared.account_state.earliest_unresolved_trade_match_time()
+            .is_some_and(|anchor| anchor > 0));
+
+        event["side"] = serde_json::json!("BUY");
+        let updates = parse_user_event(&event, &shared);
+        assert_eq!(updates.len(), 1);
+        assert!(!shared.account_state.is_uncertain());
+        assert!(!shared.user_feed_health.inventory_uncertain());
+        assert_eq!(shared.account_state.earliest_unresolved_trade_match_time(), None);
     }
 
 }
