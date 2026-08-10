@@ -227,6 +227,7 @@ impl From<PolyMarketInfo> for crate::types::BinaryOption {
             id: m.id,
             question: m.question,
             condition_id: m.condition_id,
+            series_slug: String::new(),
             slug: m.slug,
             clob_token_ids: m.clob_token_ids,
             outcomes: m.outcomes,
@@ -969,6 +970,10 @@ impl PolymarketMarket {
                             if !condition.active || condition.closed { continue; }
                             let mut bo: crate::types::BinaryOption = condition.clone().into();
                             bo.slug = event.slug.clone();
+                            bo.series_slug = series_slug
+                                .strip_prefix("series:")
+                                .unwrap_or(&series_slug)
+                                .to_ascii_lowercase();
                             self.pending_events.push_back(MarketEvent::Instrument(
                                 crate::types::Instrument::BinaryOption(bo),
                             ));
@@ -2156,6 +2161,10 @@ impl ExchangeMarket for PolymarketMarket {
                     }
                     let mut binary_option: crate::types::BinaryOption = condition.clone().into();
                     binary_option.slug = event.slug.clone();
+                    binary_option.series_slug = symbol_str
+                        .strip_prefix("series:")
+                        .unwrap_or(symbol_str)
+                        .to_ascii_lowercase();
                     self.pending_events.push_back(MarketEvent::Instrument(
                         crate::types::Instrument::BinaryOption(binary_option),
                     ));
@@ -2217,6 +2226,10 @@ impl ExchangeMarket for PolymarketMarket {
                 for condition in &event.markets {
                     let mut binary_option: crate::types::BinaryOption = condition.clone().into();
                     binary_option.slug = event.slug.clone();
+                    binary_option.series_slug = symbol_str
+                        .strip_prefix("series:")
+                        .unwrap_or(symbol_str)
+                        .to_ascii_lowercase();
                     self.pending_events.push_back(MarketEvent::Instrument(
                         crate::types::Instrument::BinaryOption(binary_option),
                     ));

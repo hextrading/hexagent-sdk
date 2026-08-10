@@ -42,7 +42,7 @@ pub enum TradeStatus {
 impl TradeStatus {
     pub fn from_polymarket_str(status: &str) -> Option<Self> {
         match status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase().as_str() {
-            "MATCHED" => Some(Self::Matched),
+            "MATCHED" | "MATCHED_NOT_BROADCASTED" => Some(Self::Matched),
             "MINED" => Some(Self::Mined),
             "CONFIRMED" => Some(Self::Confirmed),
             "FAILED" => Some(Self::Failed),
@@ -696,6 +696,9 @@ impl PositionManager {
 
     pub fn maker_volume(&self) -> f64 { self.maker_volume }
     pub fn taker_volume(&self) -> f64 { self.taker_volume }
+    pub fn initial_quantity(&self, symbol: &str) -> f64 {
+        self.init_positions.get(symbol).copied().unwrap_or(0.0)
+    }
 
     /// All positions as a `HashMap<symbol, Position>`, built on demand from
     /// the ledger. Symbols with 0 quantity are included if they ever had a
@@ -1046,10 +1049,12 @@ mod tests {
             },
             booked: true, usdc_fee: 0.0, shares_fee: 0.0,
             virtual_fee_booked: true, is_maker: true,
+            match_time_secs: 1_700_000_000,
         };
         let mut pm = PositionManager::with_positions_and_restored_trades(
             positions, 98.0, [restored],
         );
+        assert!(pm.initial_quantity("TOKEN").abs() < 1e-12);
         assert!((pm.balance() - 98.0).abs() < 1e-12);
         assert!((pm.get_quantity("TOKEN") - 5.0).abs() < 1e-12);
         assert!(!upsert(&mut pm, "restored", TradeStatus::Matched).applied);

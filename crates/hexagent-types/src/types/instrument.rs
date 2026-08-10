@@ -22,6 +22,10 @@ pub struct BinaryOption {
     pub id: String,
     pub question: String,
     pub condition_id: String,
+    /// Stable subscription/series identity. Unlike `slug`, this does not
+    /// rotate with each timed event and is therefore safe for instance routing.
+    #[serde(default)]
+    pub series_slug: String,
     pub slug: String,
     pub clob_token_ids: Vec<String>,
     pub outcomes: Vec<String>,

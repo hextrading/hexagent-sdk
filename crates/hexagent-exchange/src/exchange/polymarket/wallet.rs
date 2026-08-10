@@ -2527,7 +2527,8 @@ pub fn run_active_orders() -> Result<()> {
                     // real open orders.
                     let terminal = matches!(
                         order.status.to_ascii_uppercase().as_str(),
-                        "MATCHED" | "CANCELED" | "CANCELLED" | "FILLED" | "REJECTED"
+                        "MATCHED" | "MATCHED_NOT_BROADCASTED" | "CANCELED" | "CANCELLED"
+                            | "FILLED" | "REJECTED"
                     );
                     if !terminal {
                         all_orders.push(order);

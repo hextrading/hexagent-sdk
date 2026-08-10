@@ -131,6 +131,10 @@ pub struct OrderOwnership {
     pub side: Side,
     pub quantity: f64,
     pub filled_quantity: f64,
+    /// Authoritative terminal `size_matched`. A cancelled order retains only
+    /// the still-unobserved portion of this quantity while trades replay.
+    #[serde(default)]
+    pub terminal_matched_quantity: Option<f64>,
     pub price: f64,
     #[serde(default)]
     pub fee_rate_bps: u32,
@@ -161,6 +165,7 @@ pub struct RestoredTrade {
     pub shares_fee: f64,
     pub virtual_fee_booked: bool,
     pub is_maker: bool,
+    pub match_time_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,6 +267,8 @@ struct AppliedTrade {
     /// Private-feed role used to reproduce fee attribution after restart.
     #[serde(default)]
     is_maker: Option<bool>,
+    #[serde(default)]
+    match_time_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1287,6 +1294,72 @@ impl SharedAccount {
     pub fn startup_snapshot_applied(&self) -> bool {
         self.state.lock().unwrap().startup_snapshot_applied_this_process
     }
+
+    /// Attribute only a proven 1:1 platform redemption. This deliberately
+    /// does not turn a runtime wallet observation into a position snapshot.
+    pub fn observe_platform_binary_redeem(
+        &self,
+        observed_cash: f64,
+        observed_positions: &HashMap<String, f64>,
+        authoritative_tokens: &HashSet<String>,
+    ) -> bool {
+        if !observed_cash.is_finite() || observed_cash < 0.0
+            || observed_positions.values().any(|qty| !qty.is_finite() || *qty < 0.0)
+        { return false; }
+        let mut state = self.state.lock().unwrap();
+        if !state.seeded || has_unsettled_trade_lifecycle(&state)
+            || has_unsettled_maintenance_operation(&state)
+        { return false; }
+        let cash_delta = observed_cash - state.physical_cash;
+        if cash_delta <= EPS { return false; }
+
+        let mut removed = Vec::new();
+        for token in authoritative_tokens {
+            let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
+            let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+            let delta = observed - prior;
+            if delta.abs() <= reconciliation_tolerance(prior, observed) { continue; }
+            if delta < 0.0 && state.settled_token_values.get(token)
+                .is_some_and(|value| (*value - 1.0).abs() <= EPS)
+            {
+                removed.push((token.clone(), -delta));
+            } else {
+                return false;
+            }
+        }
+        if removed.is_empty() { return false; }
+        let removed_total: f64 = removed.iter().map(|(_, qty)| qty).sum();
+        let tolerance = 0.02_f64.max(removed_total.abs().max(cash_delta.abs()) * 0.001);
+        if (removed_total - cash_delta).abs() > tolerance { return false; }
+        for (token, qty) in &removed {
+            let virtual_total: f64 = state.instances.values()
+                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0)).sum();
+            if virtual_total + tolerance < *qty { return false; }
+        }
+
+        state.physical_cash += cash_delta;
+        for (token, qty) in &removed {
+            let physical = state.physical_positions.entry(token.clone()).or_insert(0.0);
+            *physical = (*physical - *qty).max(0.0);
+            let virtual_total: f64 = state.instances.values()
+                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0)).sum();
+            if virtual_total <= EPS { continue; }
+            for instance in state.instances.values_mut() {
+                let owned = instance.positions.get(token).copied().unwrap_or(0.0);
+                if owned <= EPS { continue; }
+                let burned = (owned * *qty / virtual_total).min(owned);
+                *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
+                instance.cash += cash_delta * burned / removed_total;
+            }
+        }
+        recompute_reconciliation(&mut state, "platform automatic binary redeem");
+        self.schedule_persist(&state);
+        log::info!(
+            "[shared_account] attributed platform automatic redeem account={} cash={:.6} removed={:?}",
+            self.account_id, cash_delta, removed,
+        );
+        true
+    }
     pub fn is_uncertain(&self) -> bool {
         self.persistence.as_ref().and_then(AccountPersistence::last_error).is_some()
             || self.state.lock().unwrap().uncertain
@@ -1659,6 +1732,7 @@ impl SharedAccount {
             side,
             quantity,
             filled_quantity: 0.0,
+            terminal_matched_quantity: None,
             price,
             fee_rate_bps,
             reserved_cash: reserve_cash,
@@ -1886,6 +1960,66 @@ impl SharedAccount {
         }
         self.schedule_persist(&state);
         pending
+    }
+
+    pub fn mark_cancelled_pending_trade_audit(
+        &self,
+        client_order_id: &str,
+        size_matched: f64,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.orders.get(client_order_id) else { return false; };
+        let quantity = existing.quantity;
+        let filled = existing.filled_quantity;
+        let tolerance = 1e-8_f64.max(quantity.abs() * 1e-8);
+        if !size_matched.is_finite() || size_matched < -tolerance
+            || size_matched > quantity + tolerance || size_matched + tolerance < filled
+        {
+            set_ownership_anomaly(
+                &mut state,
+                format!("order_cancel_audit:{client_order_id}"),
+                format!("invalid cancellation audit coid={client_order_id} size_matched={size_matched} filled={filled} quantity={quantity}"),
+            );
+            self.schedule_persist(&state);
+            return true;
+        }
+        let order = state.orders.get_mut(client_order_id).expect("checked above");
+        order.status = OrderStatus::Cancelled;
+        order.terminal_matched_quantity = Some(size_matched.clamp(0.0, quantity));
+        let instance_id = order.instance_id.clone();
+        let token_id = order.token_id.clone();
+        let old_cash = order.reserved_cash;
+        let old_qty = order.reserved_quantity;
+        let (desired_cash, desired_qty) = desired_order_reservation(order);
+        order.reserved_cash = desired_cash;
+        order.reserved_quantity = desired_qty;
+        if let Some(instance) = state.instances.get_mut(&instance_id) {
+            instance.reserved_cash = (instance.reserved_cash + desired_cash - old_cash).max(0.0);
+            if (desired_qty - old_qty).abs() > EPS {
+                let reserved = instance.reserved_positions.entry(token_id).or_insert(0.0);
+                *reserved = (*reserved + desired_qty - old_qty).max(0.0);
+            }
+        }
+        state.ownership_anomalies.remove(&format!("order_cancel_audit:{client_order_id}"));
+        let pending = desired_cash > EPS || desired_qty > EPS;
+        if pending { state.recovery_pending_orders.insert(client_order_id.to_string()); }
+        else { state.recovery_pending_orders.remove(client_order_id); }
+        recompute_reconciliation(&mut state, "terminal cancellation trade audit");
+        self.schedule_persist(&state);
+        pending
+    }
+
+    /// DELETE acknowledgements have no matched quantity; preserve the full
+    /// residual lock until an order-specific audit arrives.
+    pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(order) = state.orders.get_mut(client_order_id) else { return false; };
+        order.status = OrderStatus::Cancelled;
+        order.terminal_matched_quantity = None;
+        state.recovery_pending_orders.insert(client_order_id.to_string());
+        recompute_reconciliation(&mut state, "cancellation awaits order audit");
+        self.schedule_persist(&state);
+        true
     }
 
     /// Release the still-unfilled reservation after an authoritative terminal
@@ -2586,7 +2720,52 @@ impl SharedAccount {
         quantity: f64,
         price: f64,
     ) -> Option<TradeOwnership> {
-        let normalized = status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase();
+        self.apply_trade_transition_inner(
+            trade_key, status, client_order_id, order_id, token_id,
+            side, quantity, price, None,
+        )
+    }
+
+    pub fn apply_trade_transition_with_context(
+        &self,
+        trade_key: &str,
+        status: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        is_maker: bool,
+        match_time_secs: u64,
+    ) -> Option<TradeOwnership> {
+        let applied = self.apply_trade_transition_inner(
+            trade_key, status, client_order_id, order_id, token_id,
+            side, quantity, price, Some((is_maker, match_time_secs)),
+        );
+        if applied.is_some() && self.flush_persistence(Duration::from_secs(2)).is_err() {
+            self.mark_uncertain_with_reason(format!(
+                "trade `{trade_key}` atomic persistence failed"
+            ));
+            return None;
+        }
+        applied
+    }
+
+    fn apply_trade_transition_inner(
+        &self,
+        trade_key: &str,
+        status: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        trade_context: Option<(bool, u64)>,
+    ) -> Option<TradeOwnership> {
+        let mut normalized = status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase();
+        if normalized == "MATCHED_NOT_BROADCASTED" { normalized = "MATCHED".to_string(); }
         if normalized == "RETRYING" { return None; }
         let lifecycle_rank = match normalized.as_str() {
             "MATCHED" => 1,
@@ -2716,6 +2895,17 @@ impl SharedAccount {
             {
                 state.ownership_anomalies.remove(&anomaly_key);
                 recompute_reconciliation(&mut state, "corrected trade ownership replay");
+                if let Some((is_maker, match_time_secs)) = trade_context {
+                    if let Some(trade) = state.trades.get_mut(trade_key) {
+                        trade.match_time_secs = trade.match_time_secs.max(match_time_secs);
+                    }
+                    let fee_status = if normalized == "FAILED" {
+                        OrderStatus::Failed
+                    } else { OrderStatus::PartiallyFilled };
+                    let _ = apply_configured_trade_fee_locked(
+                        &mut state, trade_key, fee_status, is_maker,
+                    );
+                }
                 self.schedule_persist(&state);
                 return Some(applied.ownership.clone());
             }
@@ -2761,9 +2951,20 @@ impl SharedAccount {
         {
             if let Some(applied) = state.trades.get_mut(trade_key) {
                 if !applied.failed {
-                    applied.ownership.status = normalized;
+                    applied.ownership.status = normalized.clone();
                 }
                 let ownership = applied.ownership.clone();
+                if let Some((_, match_time_secs)) = trade_context {
+                    applied.match_time_secs = applied.match_time_secs.max(match_time_secs);
+                }
+                if let Some((is_maker, _)) = trade_context {
+                    let fee_status = if normalized == "FAILED" {
+                        OrderStatus::Failed
+                    } else { OrderStatus::PartiallyFilled };
+                    let _ = apply_configured_trade_fee_locked(
+                        &mut state, trade_key, fee_status, is_maker,
+                    );
+                }
                 self.schedule_persist(&state);
                 return Some(ownership);
             }
@@ -2792,6 +2993,7 @@ impl SharedAccount {
         let mut order_fully_filled = false;
         if should_book {
             let (cash_release, qty_release) = if let Some(order) = state.orders.get_mut(&resolved_coid) {
+                let cancellation_audit_pending = order.status == OrderStatus::Cancelled;
                 let mut cash_release = if side == Side::Buy {
                     (quantity * order.price).min(order.reserved_cash)
                 } else { 0.0 };
@@ -2801,14 +3003,18 @@ impl SharedAccount {
                 order.reserved_cash -= cash_release;
                 order.reserved_quantity -= qty_release;
                 order.filled_quantity = (order.filled_quantity + quantity).min(order.quantity);
-                if order.filled_quantity + EPS >= order.quantity {
+                let fill_target = order.terminal_matched_quantity
+                    .unwrap_or(order.quantity).min(order.quantity);
+                if order.filled_quantity + EPS >= fill_target {
                     cash_release += order.reserved_cash;
                     qty_release += order.reserved_quantity;
                     order.reserved_cash = 0.0;
                     order.reserved_quantity = 0.0;
-                    order.status = OrderStatus::Filled;
+                    if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
+                        order.status = OrderStatus::Filled;
+                    }
                     order_fully_filled = true;
-                } else {
+                } else if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
                     order.status = OrderStatus::PartiallyFilled;
                 }
                 (cash_release, qty_release)
@@ -2829,8 +3035,8 @@ impl SharedAccount {
                 if should_reverse {
                     order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
                 }
-                let off_book = matches!(order.status, OrderStatus::Cancelled | OrderStatus::Rejected);
-                if should_reverse && !off_book {
+                let off_book = order.status == OrderStatus::Rejected;
+                if should_reverse && !off_book && order.status != OrderStatus::Cancelled {
                     order.status = if order.filled_quantity > EPS {
                         OrderStatus::PartiallyFilled
                     } else {
@@ -2846,8 +3052,8 @@ impl SharedAccount {
                 let qty_delta = desired_qty - order.reserved_quantity;
                 order.reserved_cash = desired_cash;
                 order.reserved_quantity = desired_qty;
-                (cash_delta, qty_delta, order.token_id.clone())
-            } else { (0.0, 0.0, token_id.to_string()) };
+                (cash_delta, qty_delta, order.token_id.clone(), order.status == OrderStatus::Cancelled)
+            } else { (0.0, 0.0, token_id.to_string(), false) };
             if let Some(instance) = state.instances.get_mut(&instance_id) {
                 instance.reserved_cash = (instance.reserved_cash + reservation_delta.0).max(0.0);
                 if reservation_delta.1.abs() > EPS {
@@ -2855,7 +3061,9 @@ impl SharedAccount {
                     *reserved = (*reserved + reservation_delta.1).max(0.0);
                 }
             }
-            state.recovery_pending_orders.remove(&resolved_coid);
+            if !reservation_delta.3 {
+                state.recovery_pending_orders.remove(&resolved_coid);
+            }
         }
         if order_fully_filled {
             state.recovery_pending_orders.remove(&resolved_coid);
@@ -2888,8 +3096,19 @@ impl SharedAccount {
                 || existing
                     .as_ref()
                     .is_some_and(|trade| trade.failure_reconciled),
-            is_maker: existing.as_ref().and_then(|trade| trade.is_maker),
+            is_maker: trade_context.map(|(maker, _)| maker)
+                .or_else(|| existing.as_ref().and_then(|trade| trade.is_maker)),
+            match_time_secs: trade_context.map(|(_, ts)| ts).unwrap_or_else(|| {
+                existing.as_ref().map(|trade| trade.match_time_secs).unwrap_or(0)
+            }),
         });
+        if let Some((is_maker, _)) = trade_context {
+            let fee_status = if is_failed { OrderStatus::Failed }
+                else { OrderStatus::PartiallyFilled };
+            let _ = apply_configured_trade_fee_locked(
+                &mut state, trade_key, fee_status, is_maker,
+            );
+        }
         recompute_reconciliation(&mut state, "trade lifecycle transition");
         self.schedule_persist(&state);
         Some(ownership)
@@ -3058,6 +3277,7 @@ impl SharedAccount {
                 shares_fee: if trade.virtual_fee_booked { trade.shares_fee } else { 0.0 },
                 virtual_fee_booked: trade.virtual_fee_booked,
                 is_maker: trade.is_maker.unwrap_or(false),
+                match_time_secs: trade.match_time_secs,
             })
             .collect()
     }
@@ -3197,8 +3417,108 @@ fn has_unsettled_maintenance_operation(state: &SharedAccountState) -> bool {
     })
 }
 
+fn apply_configured_trade_fee_locked(
+    state: &mut SharedAccountState,
+    trade_key: &str,
+    status: OrderStatus,
+    is_maker: bool,
+) -> bool {
+    let Some(existing) = state.trades.get(trade_key).cloned() else {
+        set_uncertain(state, format!("fee attribution missing owned trade `{trade_key}`"));
+        return false;
+    };
+    if existing.is_maker.is_some_and(|stored| stored != is_maker) {
+        set_uncertain(state, format!(
+            "trade role replay mismatch trade={trade_key} stored_maker={:?} replay_maker={is_maker}",
+            existing.is_maker,
+        ));
+        return false;
+    }
+    if let Some(trade) = state.trades.get_mut(trade_key) { trade.is_maker = Some(is_maker); }
+    let config = (!is_maker)
+        .then(|| state.token_fee_configs.get(&existing.ownership.token_id).cloned())
+        .flatten();
+    if !is_maker && config.is_none() {
+        state.fee_attribution_pending.insert(trade_key.to_string());
+        recompute_reconciliation(state, "missing token fee config");
+        return false;
+    }
+    let notional = config.map_or(0.0, |config| {
+        let price = existing.ownership.price.clamp(0.0, 1.0);
+        existing.ownership.quantity * config.rate
+            * (price * (1.0 - price)).max(0.0).powf(config.exponent)
+    });
+    let (usdc_fee, shares_fee) = if is_maker {
+        (0.0, 0.0)
+    } else if existing.ownership.side == Side::Buy {
+        (0.0, if existing.ownership.price > EPS {
+            notional / existing.ownership.price
+        } else { 0.0 })
+    } else { (notional, 0.0) };
+    apply_trade_fee_transition_locked(state, trade_key, status, usdc_fee, shares_fee)
+}
+
+fn apply_trade_fee_transition_locked(
+    state: &mut SharedAccountState,
+    trade_key: &str,
+    status: OrderStatus,
+    usdc_fee: f64,
+    shares_fee: f64,
+) -> bool {
+    let Some(existing) = state.trades.get(trade_key).cloned() else {
+        set_uncertain(state, format!("fee attribution missing owned trade `{trade_key}`"));
+        return false;
+    };
+    if (existing.usdc_fee > EPS && (existing.usdc_fee - usdc_fee).abs() > EPS)
+        || (existing.shares_fee > EPS && (existing.shares_fee - shares_fee).abs() > EPS)
+    {
+        set_uncertain(state, format!(
+            "fee replay mismatch trade={trade_key} stored=({:.8},{:.8}) replay=({usdc_fee:.8},{shares_fee:.8})",
+            existing.usdc_fee, existing.shares_fee,
+        ));
+        return false;
+    }
+    let effective_usdc = if existing.usdc_fee > EPS { existing.usdc_fee } else { usdc_fee };
+    let effective_shares = if existing.shares_fee > EPS { existing.shares_fee } else { shares_fee };
+    let upgrades_zero = existing.usdc_fee <= EPS && existing.shares_fee <= EPS
+        && (effective_usdc > EPS || effective_shares > EPS);
+    let failed = status == OrderStatus::Failed || existing.failed;
+    let book_virtual = !failed && (!existing.virtual_fee_booked || upgrades_zero);
+    let reverse_virtual = failed && existing.virtual_fee_booked;
+    let book_physical = !failed && existing.physical_booked
+        && (!existing.physical_fee_booked || upgrades_zero);
+    let reverse_physical = failed && existing.physical_fee_booked;
+    let multiplier = |book, reverse| if book { 1.0 } else if reverse { -1.0 } else { 0.0 };
+    let virtual_multiplier = multiplier(book_virtual, reverse_virtual);
+    if virtual_multiplier != 0.0 {
+        if let Some(instance) = state.instances.get_mut(&existing.ownership.instance_id) {
+            instance.cash -= effective_usdc * virtual_multiplier;
+            *instance.positions.entry(existing.ownership.token_id.clone()).or_insert(0.0)
+                -= effective_shares * virtual_multiplier;
+        }
+    }
+    let physical_multiplier = multiplier(book_physical, reverse_physical);
+    if physical_multiplier != 0.0 {
+        state.physical_cash -= effective_usdc * physical_multiplier;
+        *state.physical_positions.entry(existing.ownership.token_id.clone()).or_insert(0.0)
+            -= effective_shares * physical_multiplier;
+    }
+    if let Some(trade) = state.trades.get_mut(trade_key) {
+        trade.usdc_fee = effective_usdc;
+        trade.shares_fee = effective_shares;
+        trade.virtual_fee_booked = book_virtual
+            || (existing.virtual_fee_booked && !reverse_virtual);
+        trade.physical_fee_booked = book_physical
+            || (existing.physical_fee_booked && !reverse_physical);
+    }
+    state.fee_attribution_pending.remove(trade_key);
+    recompute_reconciliation(state, "trade fee lifecycle transition");
+    true
+}
+
 fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
-    let remaining = (order.quantity - order.filled_quantity).max(0.0);
+    let target = order.terminal_matched_quantity.unwrap_or(order.quantity).min(order.quantity);
+    let remaining = (target - order.filled_quantity).max(0.0);
     match order.side {
         Side::Buy => (
             remaining * order.price * (1.0 + order.fee_rate_bps as f64 / 10_000.0),
@@ -3834,6 +4154,26 @@ mod tests {
             100.0,
             "late MATCHED cannot resurrect a FAILED tombstone"
         );
+    }
+
+    #[test]
+    fn matched_not_broadcasted_persists_role_fee_and_replay_anchor_together() {
+        let account = seeded_account();
+        account.register_token_fee_config(&["UP".to_string()], 0.25, 2.0).unwrap();
+        account.reserve_order(
+            "a", "a-atomic", "oid-atomic", "UP", Side::Buy, 5.0, 0.4, 0,
+        ).unwrap();
+        account.apply_trade_transition_with_context(
+            "trade-atomic", "MATCHED_NOT_BROADCASTED", "a-atomic", "oid-atomic",
+            "UP", Side::Buy, 5.0, 0.4, false, 1_700_000_000,
+        ).unwrap();
+        let restored = account.restored_trades().into_iter()
+            .find(|trade| trade.ownership.trade_key == "trade-atomic").unwrap();
+        assert_eq!(restored.ownership.status, "MATCHED");
+        assert!(!restored.is_maker);
+        assert!(restored.shares_fee > 0.0);
+        assert!(restored.virtual_fee_booked);
+        assert_eq!(restored.match_time_secs, 1_700_000_000);
     }
 
     #[test]
@@ -4750,6 +5090,32 @@ mod tests {
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 80.0);
         assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
         assert_eq!(account.monitoring_snapshot().unallocated_cash, 0.0);
+    }
+
+    #[test]
+    fn runtime_platform_redeem_is_attributed_without_applying_a_snapshot() {
+        let account = SharedAccount::new("runtime-platform-redeem");
+        account.register_instance("btc", 1.0);
+        account.register_instance("eth", 1.0);
+        account.register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE").unwrap();
+        account.register_token_interest("eth", "eth-event", "ETH-UP", "ETH-DOWN").unwrap();
+        account.apply_physical_snapshot(
+            100.0,
+            HashMap::from([("BTC-WIN".into(), 30.0), ("ETH-UP".into(), 20.0)]),
+        );
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0), ("BTC-LOSE".into(), 0.0),
+        ]));
+        assert!(account.observe_platform_binary_redeem(
+            130.0,
+            &HashMap::from([("ETH-UP".into(), 20.0)]),
+            &HashSet::from(["BTC-WIN".into(), "ETH-UP".into()]),
+        ));
+        assert_eq!(account.monitoring_snapshot().physical_cash, 130.0);
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 80.0);
+        assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
+        assert_eq!(account.instance_snapshot("eth").unwrap().positions["ETH-UP"], 20.0);
+        assert!(!account.is_uncertain());
     }
 
     #[test]

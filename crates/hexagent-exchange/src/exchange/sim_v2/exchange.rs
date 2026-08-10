@@ -2184,6 +2184,7 @@ mod tests {
             id: "e".into(),
             question: "q".into(),
             condition_id: "cond1".into(),
+            series_slug: "s".into(),
             slug: "s".into(),
             clob_token_ids: vec!["up".into(), "down".into()],
             outcomes: vec!["Up".into(), "Down".into()],

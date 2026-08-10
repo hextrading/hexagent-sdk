@@ -105,14 +105,25 @@ fn quarantine_strategy_worker(
     if flag.swap(true, Ordering::AcqRel) { return false; }
     let instance_id = instance_ids.get(idx).cloned().unwrap_or_default();
     error!("[strategy_supervisor] instance={} quarantined=1 reason={}", instance_id, reason);
+    enqueue_emergency_instance_cancel(idx, &instance_id, reason, signal_tx);
+    true
+}
+
+fn enqueue_emergency_instance_cancel(
+    idx: usize,
+    instance_id: &str,
+    reason: &str,
+    signal_tx: &Sender<Signal>,
+) -> bool {
     let cancel = Signal::PolymarketCancelAllOrders {
         reason: format!("strategy instance `{instance_id}` quarantined: {reason}"),
         market: None,
         asset_ids: Vec::new(),
-        instance_id,
+        instance_id: instance_id.to_string(),
     };
     if let Err(error) = signal_tx.send_timeout(cancel, std::time::Duration::from_millis(500)) {
         error!("[strategy_supervisor] failed to enqueue emergency instance cancel for worker index={idx}: {error}");
+        return false;
     }
     true
 }
@@ -3930,6 +3941,7 @@ impl Engine {
                 let mut token_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
                 let mut market_overflow_drops = vec![0u64; instance_ids.len()];
                 let mut market_overflow_log_at = std::time::Instant::now();
+                let mut last_emergency_cancel_attempt_ns = vec![0u64; instance_ids.len()];
                 let supervisor_tick = crossbeam_channel::tick(std::time::Duration::from_millis(100));
                 // instance_id → worker index, for recovering the owner of a
                 // coid that's no longer in `coid_owner` (late update after its
@@ -4071,7 +4083,20 @@ impl Engine {
                         recv(supervisor_tick) -> _ => {
                             let now = elapsed_ns(&supervisor_origin);
                             for idx in 0..worker_heartbeats.len() {
-                                if worker_quarantined[idx].load(Ordering::Acquire) { continue; }
+                                if worker_quarantined[idx].load(Ordering::Acquire) {
+                                    if now.saturating_sub(last_emergency_cancel_attempt_ns[idx])
+                                        >= 1_000_000_000
+                                    {
+                                        let _ = enqueue_emergency_instance_cancel(
+                                            idx,
+                                            &instance_ids[idx],
+                                            "periodic quarantine cancel retry",
+                                            &signal_tx,
+                                        );
+                                        last_emergency_cancel_attempt_ns[idx] = now;
+                                    }
+                                    continue;
+                                }
                                 let last = worker_heartbeats[idx].load(Ordering::Acquire);
                                 if now.saturating_sub(last) >= STRATEGY_WORKER_STALL_NS {
                                     quarantine_strategy_worker(
@@ -4155,13 +4180,22 @@ impl Engine {
         // Instrument(BinaryOption) → attribute its token_ids to the owner
         // instance(s) of its slug, then deliver to those owners.
         if let MarketEvent::Instrument(Instrument::BinaryOption(bo)) = event.as_ref() {
-            if let Some(owners) = sym_to_instances.get(&bo.slug.to_ascii_lowercase()).cloned() {
+            let route_key = if bo.series_slug.trim().is_empty() {
+                bo.slug.to_ascii_lowercase()
+            } else {
+                bo.series_slug.to_ascii_lowercase()
+            };
+            if let Some(owners) = sym_to_instances.get(&route_key).cloned() {
                 for tok in &bo.clob_token_ids {
                     token_to_instances.insert(tok.to_ascii_lowercase(), owners.clone());
                 }
                 return send_to(&owners, market_txs);
             } else {
-                return broadcast(market_txs);
+                warn!(
+                    "[strategy_router] dropping unroutable Polymarket instrument series={} event_slug={}",
+                    route_key, bo.slug,
+                );
+                return Vec::new();
             }
         }
 
@@ -7794,6 +7828,7 @@ mod market_router_tests {
             id: "id".into(),
             question: "q".into(),
             condition_id: "cond".into(),
+            series_slug: slug.into(),
             slug: slug.into(),
             clob_token_ids: tokens.iter().map(|s| s.to_string()).collect(),
             outcomes: vec!["Up".into(), "Down".into()],
@@ -7957,11 +7992,11 @@ mod market_router_tests {
 
         // Instrument for BTC series carrying token "TOKxyz" → instance 0,
         // and the router learns TOKxyz → [0].
+        let mut rotating = binary_option("btc-up-or-down-5m", &["TOKxyz"]);
+        let Instrument::BinaryOption(ref mut option) = rotating else { unreachable!() };
+        option.slug = "btc-updown-5m-1782840600".into();
         Engine::route_market_event(
-            Arc::new(MarketEvent::Instrument(binary_option(
-                "btc-up-or-down-5m",
-                &["TOKxyz"],
-            ))),
+            Arc::new(MarketEvent::Instrument(rotating)),
             &sym,
             &mut tok,
             &txs,
@@ -7978,6 +8013,24 @@ mod market_router_tests {
         );
         assert_eq!(drain(&rx0), 1, "poly OB routed to learned owner");
         assert_eq!(drain(&rx1), 0, "ETH instance must not see BTC poly OB");
+    }
+
+    #[test]
+    fn unknown_polymarket_series_is_never_broadcast() {
+        let sym = two_instance_map();
+        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
+        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
+        let txs = [tx0, tx1];
+        Engine::route_market_event(
+            Arc::new(MarketEvent::Instrument(binary_option(
+                "sol-up-or-down-5m", &["SOL-TOKEN"],
+            ))),
+            &sym, &mut tok, &txs,
+        );
+        assert_eq!(drain(&rx0), 0);
+        assert_eq!(drain(&rx1), 0);
+        assert!(!tok.contains_key("sol-token"));
     }
 
     #[test]
@@ -8097,6 +8150,23 @@ mod market_router_tests {
             0, "duplicate", &instances, &flags, &signal_tx,
         ));
         assert!(signal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn emergency_instance_cancel_can_retry_after_queue_saturation() {
+        let (signal_tx, signal_rx) = bounded::<Signal>(1);
+        signal_tx.send(Signal::Exit).unwrap();
+        assert!(!enqueue_emergency_instance_cancel(
+            0, "btc01", "first attempt", &signal_tx,
+        ));
+        assert!(matches!(signal_rx.recv().unwrap(), Signal::Exit));
+        assert!(enqueue_emergency_instance_cancel(
+            0, "btc01", "periodic retry", &signal_tx,
+        ));
+        assert!(matches!(
+            signal_rx.recv().unwrap(),
+            Signal::PolymarketCancelAllOrders { instance_id, .. } if instance_id == "btc01"
+        ));
     }
 
     #[test]
