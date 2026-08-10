@@ -38,6 +38,30 @@ enum GapReplayOutcome {
     Complete { records: usize },
 }
 
+/// In-memory progress for one authenticated `/trades` pagination sweep.
+/// Retaining this value across a transient failure makes the retry request the
+/// exact failed page instead of starting again at the original `after`.
+#[derive(Debug, Clone)]
+struct GapReplayCheckpoint {
+    after_secs: u64,
+    cursor: String,
+    seen_cursors: HashSet<String>,
+    records: usize,
+    pages: usize,
+}
+
+impl GapReplayCheckpoint {
+    fn new(after_secs: u64) -> Self {
+        Self {
+            after_secs,
+            cursor: String::new(),
+            seen_cursors: HashSet::new(),
+            records: 0,
+            pages: 0,
+        }
+    }
+}
+
 impl GapReplayOutcome {
     fn records(self) -> usize {
         match self {
@@ -70,27 +94,6 @@ fn advance_gap_cursor(
     }
     *cursor = next;
     Ok(true)
-}
-
-/// Pin the beginning of one reconnect-recovery episode. REST replay updates
-/// `last_match_time_secs` as it parses each page, including before a later page
-/// fails, so recomputing this value on every attempt could skip the failed gap.
-fn recovery_window_start(
-    current: &mut Option<u64>,
-    last_match_time_secs: u64,
-    rewind_secs: u64,
-) -> u64 {
-    *current.get_or_insert_with(|| last_match_time_secs.saturating_sub(rewind_secs))
-}
-
-/// Pin a periodic replay window until one complete REST sweep succeeds.
-///
-/// The former implementation recomputed `now - rewind` after every failed
-/// request. A five-second timeout with a three-second rewind therefore moved
-/// the next lower bound *past* part of the failed interval, permanently
-/// abandoning fills that the WebSocket may also have dropped.
-fn periodic_window_start(current: &mut Option<u64>, candidate_after_secs: u64) -> u64 {
-    *current.get_or_insert(candidate_after_secs)
 }
 
 #[derive(Debug, Clone)]
@@ -661,7 +664,21 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
 async fn replay_missed_trades(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
-    after_secs: u64,
+    checkpoint: &mut GapReplayCheckpoint,
+    transport: &mut GapReplayTransport,
+) -> Result<GapReplayOutcome> {
+    let pages_before_attempt = checkpoint.pages;
+    let result = replay_missed_trades_inner(shared, update_tx, checkpoint, transport).await;
+    shared.account_state.record_gap_replay_pages(
+        checkpoint.pages.saturating_sub(pages_before_attempt),
+    );
+    result
+}
+
+async fn replay_missed_trades_inner(
+    shared: &SharedState,
+    update_tx: &Sender<OrderUpdate>,
+    checkpoint: &mut GapReplayCheckpoint,
     transport: &mut GapReplayTransport,
 ) -> Result<GapReplayOutcome> {
     // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
@@ -671,37 +688,32 @@ async fn replay_missed_trades(
     // dedups by trade_id + routes by asset_id, so cross-market rows are
     // harmless. (Previously scoped to a single `CurrentMarket` condition_id,
     // which a sibling instance could clobber → wrong-market replay.)
-    let mut cursor = String::new();
-    let mut count = 0usize;
-
     // Roll back 1 s on the boundary so trades sharing the same second as
     // `last_match_time` aren't excluded by Polymarket's strict-`>`
     // semantics on `?after=T`. The overlap is harmless — `trade_id`
     // dedup in `PositionManager::upsert_trade` short-circuits any trade
     // already in the ledger (terminal-state guard, position.rs:171).
-    let after_param = after_secs.saturating_sub(1);
+    let after_param = checkpoint.after_secs.saturating_sub(1);
 
     // Never abandon a valid next_cursor merely because a fixed page budget
     // was reached. Long disconnects are replayed to completion through the
     // same account-level connection slot. Yield periodically so the runtime
     // can service the live user feed and other accounts between batches.
     const PAGES_PER_YIELD: usize = 50;
-    let mut pages = 0usize;
-    let mut seen_cursors = HashSet::new();
+    let mut attempt_pages = 0usize;
     loop {
-        pages += 1;
-        let url = if cursor.is_empty() {
+        let url = if checkpoint.cursor.is_empty() {
             format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
             format!("{}/trades?after={}&next_cursor={}",
-                CLOB_BASE_URL, after_param, cursor)
+                CLOB_BASE_URL, after_param, checkpoint.cursor)
         };
         let gap_response = match transport.get(shared, &url).await {
             Ok(response) => response,
             Err(error) => {
                 return Err(anyhow!(
                     "Gap-fetch /trades request failed after {} records: {}",
-                    count,
+                    checkpoint.records,
                     error,
                 ));
             }
@@ -730,7 +742,7 @@ async fn replay_missed_trades(
                     return Err(anyhow!(
                         "Gap-fetch /trades HTTP {} after {} records: {}",
                         code,
-                        count,
+                        checkpoint.records,
                         detail,
                     ));
                 }
@@ -738,7 +750,7 @@ async fn replay_missed_trades(
             return Err(anyhow!(
                 "Gap-fetch /trades HTTP {} after {} records: {}",
                 code,
-                count,
+                checkpoint.records,
                 body,
             ));
         }
@@ -758,14 +770,14 @@ async fn replay_missed_trades(
                     transport.report_body_failure(permit, failure).await;
                     return Err(anyhow!(
                         "Gap-fetch /trades parse failed after {} records: {}",
-                        count,
+                        checkpoint.records,
                         detail,
                     ));
                 }
                 permit.pooled_client().note_transport_success();
                 return Err(anyhow!(
                     "Gap-fetch /trades parse failed after {} records: {}",
-                    count,
+                    checkpoint.records,
                     failure,
                 ));
             }
@@ -790,19 +802,24 @@ async fn replay_missed_trades(
             for update in parse_user_event(&rec, shared) {
                 let _ = update_tx.send(update);
             }
-            count += 1;
+            checkpoint.records += 1;
         }
 
-        if !advance_gap_cursor(&mut cursor, &mut seen_cursors, next)? {
+        checkpoint.pages += 1;
+        attempt_pages += 1;
+        if !advance_gap_cursor(
+            &mut checkpoint.cursor,
+            &mut checkpoint.seen_cursors,
+            next,
+        )? {
             break;
         }
-        if pages % PAGES_PER_YIELD == 0 {
+        if attempt_pages % PAGES_PER_YIELD == 0 {
             tokio::task::yield_now().await;
         }
     }
 
-    shared.account_state.record_gap_replay_pages(pages);
-    Ok(GapReplayOutcome::Complete { records: count })
+    Ok(GapReplayOutcome::Complete { records: checkpoint.records })
 }
 
 /// Async WebSocket loop. Spawned as a tokio task on the shared runtime.
@@ -851,11 +868,10 @@ async fn user_feed_loop(
         );
     }
     let gap_transport = Arc::new(tokio::sync::Mutex::new(transport));
-    // Fixed lower bound for the current recovery episode. A partial REST
-    // attempt may advance `last_match_time_secs`; recomputing from that cursor
-    // would then skip an earlier page that failed. Retain this floor across
-    // reconnect attempts and clear it only after a successful replay.
-    let mut recovery_after_secs: Option<u64> = None;
+    // Retain both the lower bound and exact next_cursor across reconnects.
+    // A transient failure therefore resumes the failed page without either
+    // skipping the original window or redownloading its completed prefix.
+    let mut recovery_checkpoint: Option<GapReplayCheckpoint> = None;
 
     // Periodic gap-replay task — independent of the WS read loop so its HTTP
     // call never pauses WS reads, and it keeps recovering fills *across*
@@ -890,7 +906,7 @@ async fn user_feed_loop(
             // small rewind. (Was keyed on per-event `CurrentMarket` change,
             // which a sibling instance sharing the wallet could clobber.)
             let mut did_startup_deep = false;
-            let mut periodic_after_secs: Option<u64> = None;
+            let mut periodic_checkpoint: Option<GapReplayCheckpoint> = None;
             let mut consecutive_failures = 0u32;
             loop {
                 sleep(interval).await;
@@ -918,10 +934,12 @@ async fn user_feed_loop(
                         floor_after
                     }
                 };
-                let after = periodic_window_start(&mut periodic_after_secs, after);
+                let checkpoint = periodic_checkpoint
+                    .get_or_insert_with(|| GapReplayCheckpoint::new(after));
+                let after = checkpoint.after_secs;
                 let replay_result = {
                     let mut transport = gap_transport.lock().await;
-                    replay_missed_trades(&shared, &update_tx, after, &mut transport).await
+                    replay_missed_trades(&shared, &update_tx, checkpoint, &mut transport).await
                 };
                 match replay_result {
                     Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
@@ -935,7 +953,7 @@ async fn user_feed_loop(
                             );
                         }
                         consecutive_failures = 0;
-                        periodic_after_secs = None;
+                        periodic_checkpoint = None;
                         shared.user_feed_health.set_gap_replay_degraded(false);
                     }
                     Err(e) => {
@@ -1016,17 +1034,16 @@ async fn user_feed_loop(
         // dedup. Covers ALL active markets on this wallet at once.
         let last_match_time_secs =
             shared.live_position.lock().unwrap().last_match_time_secs();
-        let after_secs = recovery_window_start(
-            &mut recovery_after_secs,
-            last_match_time_secs,
-            reconnect_rewind_secs,
-        );
+        let checkpoint = recovery_checkpoint.get_or_insert_with(|| {
+            GapReplayCheckpoint::new(last_match_time_secs.saturating_sub(reconnect_rewind_secs))
+        });
+        let after_secs = checkpoint.after_secs;
         let replay_result = {
             let mut transport = gap_transport.lock().await;
             replay_missed_trades(
                 &shared,
                 &update_tx,
-                after_secs,
+                checkpoint,
                 &mut transport,
             )
             .await
@@ -1043,13 +1060,13 @@ async fn user_feed_loop(
                     }
                 }
                 accept_reconnect_replay(&shared.user_feed_health, outcome);
-                recovery_after_secs = None;
+                recovery_checkpoint = None;
                 backoff.reset();
             }
             Err(e) => {
                 // Do not enter the WS read loop with an unverified gap. Drop
-                // this socket, retain `recovery_after_secs`, and retry the
-                // complete original window after reconnect.
+                // this socket, retain the exact failed cursor, and retry that
+                // page after reconnect.
                 shared.user_feed_health.set_recovering(true);
                 let delay = backoff.next_delay();
                 warn!(
@@ -1198,11 +1215,9 @@ async fn user_feed_loop(
         shared.user_feed_health.set_recovering(true);
         let last_match_time_secs =
             shared.live_position.lock().unwrap().last_match_time_secs();
-        recovery_window_start(
-            &mut recovery_after_secs,
-            last_match_time_secs,
-            reconnect_rewind_secs,
-        );
+        recovery_checkpoint.get_or_insert_with(|| {
+            GapReplayCheckpoint::new(last_match_time_secs.saturating_sub(reconnect_rewind_secs))
+        });
         if !shutdown.load(Ordering::Relaxed) {
             let delay = backoff.next_delay();
             warn!("[PolyUserFeed] Reconnecting in {:.1}s", delay.as_secs_f64());
@@ -1786,30 +1801,29 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_retries_keep_the_original_recovery_window() {
-        let mut recovery_after = None;
+    fn gap_replay_checkpoint_keeps_window_cursor_and_progress_for_retry() {
+        let mut checkpoint = GapReplayCheckpoint::new(997);
+        assert!(advance_gap_cursor(
+            &mut checkpoint.cursor,
+            &mut checkpoint.seen_cursors,
+            "page-2".to_string(),
+        ).unwrap());
+        checkpoint.records = 100;
+        checkpoint.pages = 1;
 
-        assert_eq!(recovery_window_start(&mut recovery_after, 1_000, 3), 997);
-        // A partial first attempt may have advanced the observed match time,
-        // but its failed later page still requires the original lower bound.
-        assert_eq!(recovery_window_start(&mut recovery_after, 1_100, 3), 997);
+        // A later retry uses this same object, so wall time / last trade
+        // changes cannot move the lower bound and page 1 is not fetched again.
+        assert_eq!(checkpoint.after_secs, 997);
+        assert_eq!(checkpoint.cursor, "page-2");
+        assert_eq!(checkpoint.records, 100);
+        assert_eq!(checkpoint.pages, 1);
 
-        recovery_after = None;
-        assert_eq!(recovery_window_start(&mut recovery_after, 1_100, 3), 1_097);
-    }
-
-    #[test]
-    fn periodic_retries_keep_the_original_failed_window() {
-        let mut periodic_after = None;
-
-        assert_eq!(periodic_window_start(&mut periodic_after, 1_000), 1_000);
-        // Wall time advances while `/trades` times out, but the lower bound
-        // must not move until a complete sweep succeeds.
-        assert_eq!(periodic_window_start(&mut periodic_after, 1_006), 1_000);
-        assert_eq!(periodic_window_start(&mut periodic_after, 1_120), 1_000);
-
-        periodic_after = None; // complete replay
-        assert_eq!(periodic_window_start(&mut periodic_after, 1_120), 1_120);
+        assert!(advance_gap_cursor(
+            &mut checkpoint.cursor,
+            &mut checkpoint.seen_cursors,
+            "page-3".to_string(),
+        ).unwrap());
+        assert_eq!(checkpoint.cursor, "page-3");
     }
 
 }

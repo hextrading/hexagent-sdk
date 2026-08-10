@@ -290,6 +290,11 @@ pub fn apply_account_to_env(account_id: &str) -> Result<Option<String>> {
     secrets.apply_shared_to_env();
     let creds = secrets.poly_for(account_id)?;
     apply_creds_to_env(creds);
+    // Preserve the resolved identity for account-aware subcommands (merge,
+    // ledger repair, etc.).  POLY_* alone identifies credentials but loses
+    // the logical account key needed to select the durable shared ledger.
+    std::env::set_var("HEXBOT_RESOLVED_ACCOUNT_ID", account_id);
+    std::env::remove_var("HEXBOT_RESOLVED_INSTANCE_ID");
     eprintln!("[cli] account='{}' (secrets={})", account_id, path.display());
     Ok(Some(account_id.to_string()))
 }
@@ -363,6 +368,8 @@ pub fn apply_instance_to_env(instance_id: &str, config_path: &str) -> Result<Str
     let secrets = SecretsFile::load(&secrets_path)?;
     let creds = secrets.poly_for(&account_id)?;
     apply_creds_to_env(creds);
+    std::env::set_var("HEXBOT_RESOLVED_ACCOUNT_ID", &account_id);
+    std::env::set_var("HEXBOT_RESOLVED_INSTANCE_ID", instance_id);
     eprintln!(
         "[cli] instance='{}' account='{}' (config={}, secrets={})",
         instance_id, account_id, config_path, secrets_path.display(),

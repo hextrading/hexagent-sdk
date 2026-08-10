@@ -28,6 +28,9 @@
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Parsed per-market fee / flags from the v2 CLOB.
 #[derive(Debug, Clone)]
@@ -74,6 +77,89 @@ pub struct MarketInfoV2 {
 /// the v2 dynamic `fd.r` / `fd.e` / `fd.to` fields we need.
 const DEFAULT_PATH_TEMPLATE: &str = "/clob-markets/{conditionId}";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MarketInfoKey {
+    api_url_prefix: String,
+    condition_id: String,
+    path_template: String,
+}
+
+enum MarketInfoFlight {
+    Fetching(Vec<crossbeam_channel::Sender<Option<MarketInfoV2>>>),
+    Ready {
+        fetched_at: Instant,
+        value: MarketInfoV2,
+    },
+}
+
+static MARKET_INFO_FLIGHTS: OnceLock<Mutex<HashMap<MarketInfoKey, MarketInfoFlight>>> =
+    OnceLock::new();
+
+fn market_info_key(
+    api_url_prefix: String,
+    condition_id: String,
+    path_template: String,
+) -> MarketInfoKey {
+    MarketInfoKey {
+        api_url_prefix: api_url_prefix.trim_end_matches('/').to_string(),
+        condition_id: condition_id.to_ascii_lowercase(),
+        path_template: if path_template.is_empty() {
+            DEFAULT_PATH_TEMPLATE.to_string()
+        } else {
+            path_template
+        },
+    }
+}
+
+fn subscribe_market_info(
+    key: &MarketInfoKey,
+) -> (crossbeam_channel::Receiver<Option<MarketInfoV2>>, bool) {
+    const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let flights = MARKET_INFO_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = flights.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.retain(|_, entry| match entry {
+        MarketInfoFlight::Fetching(_) => true,
+        MarketInfoFlight::Ready { fetched_at, .. } => fetched_at.elapsed() < CACHE_TTL,
+    });
+    match entries.get_mut(key) {
+        Some(MarketInfoFlight::Fetching(waiters)) => {
+            waiters.push(tx);
+            (rx, false)
+        }
+        Some(MarketInfoFlight::Ready { value, .. }) => {
+            let _ = tx.send(Some(value.clone()));
+            (rx, false)
+        }
+        None => {
+            entries.insert(key.clone(), MarketInfoFlight::Fetching(vec![tx]));
+            (rx, true)
+        }
+    }
+}
+
+fn finish_market_info_fetch(key: &MarketInfoKey, result: Option<MarketInfoV2>) {
+    let flights = MARKET_INFO_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = flights.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let waiters = match entries.remove(key) {
+        Some(MarketInfoFlight::Fetching(waiters)) => waiters,
+        Some(MarketInfoFlight::Ready { .. }) | None => Vec::new(),
+    };
+    if let Some(value) = result.as_ref() {
+        // Successful market metadata is immutable for the event. Keep a
+        // bounded time cache so an instance that starts seconds later does
+        // not launch another request after the original flight completed.
+        entries.insert(key.clone(), MarketInfoFlight::Ready {
+            fetched_at: Instant::now(),
+            value: value.clone(),
+        });
+    }
+    drop(entries);
+    for waiter in waiters {
+        let _ = waiter.send(result.clone());
+    }
+}
+
 /// Synchronously fetch market info via the v2 CLOB REST API.
 ///
 /// `api_url_prefix` is the CLOB host root (e.g.
@@ -108,19 +194,28 @@ pub fn spawn_market_info_v2_fetch(
     condition_id: String,
     path_template: String,
 ) -> crossbeam_channel::Receiver<Option<MarketInfoV2>> {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let _ = std::thread::Builder::new()
+    let key = market_info_key(api_url_prefix, condition_id, path_template);
+    let (rx, is_leader) = subscribe_market_info(&key);
+    if !is_leader {
+        return rx;
+    }
+    let worker_key = key.clone();
+    let spawn_result = std::thread::Builder::new()
         .name("clob-v2-market-info".into())
         .spawn(move || {
             const ATTEMPTS: u32 = 4;
             let mut backoff = std::time::Duration::from_millis(200);
             let mut result = None;
             for attempt in 1..=ATTEMPTS {
-                match fetch_clob_market_info(&api_url_prefix, &condition_id, &path_template) {
+                match fetch_clob_market_info(
+                    &worker_key.api_url_prefix,
+                    &worker_key.condition_id,
+                    &worker_key.path_template,
+                ) {
                     Ok(market_info) => {
                         info!(
                             "[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={} attempt={}",
-                            &condition_id[..condition_id.len().min(16)],
+                            &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
                             market_info.fee_rate,
                             market_info.fee_exponent,
                             market_info.fee_rate_bps,
@@ -135,7 +230,7 @@ pub fn spawn_market_info_v2_fetch(
                             "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
                             attempt,
                             ATTEMPTS,
-                            &condition_id[..condition_id.len().min(16)],
+                            &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
                             error,
                         );
                         if attempt < ATTEMPTS {
@@ -145,8 +240,12 @@ pub fn spawn_market_info_v2_fetch(
                     }
                 }
             }
-            let _ = tx.send(result);
+            finish_market_info_fetch(&worker_key, result);
         });
+    if let Err(error) = spawn_result {
+        warn!("[market_info_v2] failed to spawn fetch worker: {}", error);
+        finish_market_info_fetch(&key, None);
+    }
     rx
 }
 
@@ -329,5 +428,33 @@ mod tests {
         let mi = parse_market_info(&json).unwrap();
         assert!((mi.fee_rate - 0.02).abs() < 1e-9);
         assert!((mi.fee_exponent - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn condition_singleflight_fans_out_and_caches_success() {
+        let key = market_info_key(
+            "https://example.invalid/".to_string(),
+            "0xSINGLEFLIGHT-TEST".to_string(),
+            String::new(),
+        );
+        let (first, first_is_leader) = subscribe_market_info(&key);
+        let (second, second_is_leader) = subscribe_market_info(&key);
+        assert!(first_is_leader);
+        assert!(!second_is_leader);
+
+        let expected = MarketInfoV2 {
+            fee_rate: 0.01,
+            fee_exponent: 1.0,
+            fee_rate_bps: 100,
+            taker_only: true,
+            raw: serde_json::json!({"test": true}),
+        };
+        finish_market_info_fetch(&key, Some(expected.clone()));
+        assert_eq!(first.recv().unwrap().unwrap().fee_rate_bps, 100);
+        assert_eq!(second.recv().unwrap().unwrap().fee_rate_bps, 100);
+
+        let (cached, cached_is_leader) = subscribe_market_info(&key);
+        assert!(!cached_is_leader);
+        assert_eq!(cached.recv().unwrap().unwrap().fee_rate_bps, 100);
     }
 }
