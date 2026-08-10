@@ -435,7 +435,8 @@ fn summarize_open_orders(text: &str, probe_oid: Option<&str>) {
     for o in data {
         let status = o.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if matches!(status.to_ascii_uppercase().as_str(),
-            "MATCHED" | "CANCELED" | "CANCELLED" | "FILLED" | "REJECTED") { continue; }
+            "MATCHED" | "MATCHED_NOT_BROADCASTED" | "CANCELED" | "CANCELLED"
+                | "FILLED" | "REJECTED") { continue; }
         let id = o.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let side = o.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let price = o.get("price").and_then(json_num_str).unwrap_or_default();

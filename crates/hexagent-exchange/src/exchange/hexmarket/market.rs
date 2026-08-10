@@ -89,6 +89,7 @@ fn market_detail_to_binary_option(
         id: md.market.id.to_string(),
         question: md.market.title.clone(),
         condition_id: md.market.id.to_string(),
+        series_slug: event.slug.clone(),
         slug: event.slug.clone(),
         clob_token_ids: outcome_ids,
         outcomes: outcome_labels,

@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::async_rt;
 use crate::types::*;
 use super::live_position::{LivePositionManager, TradeStatus};
-use super::trade::SharedState;
+use super::trade::{PolymarketTrade, SharedState};
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
@@ -369,7 +369,7 @@ fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::
     required_string(data, &["id", "trade_id"], "id")?;
     let status = required_string(data, &["status"], "status")?;
     let status = status.strip_prefix("TRADE_STATUS_").unwrap_or(status);
-    if !matches!(status, "MATCHED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING") {
+    if !matches!(status, "MATCHED" | "MATCHED_NOT_BROADCASTED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING") {
         return Err(format!("trade field `status` has unsupported value `{status}`"));
     }
     strict_side(required_string(data, &["side"], "side")?, "side")?;
@@ -450,6 +450,8 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
     if ownership.status == OrderStatus::Failed
         || (ownership.status == OrderStatus::Filled
             && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
+        || (ownership.status == OrderStatus::Cancelled
+            && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
     {
         debug!(
             "[PolyUserFeed] stale order lifecycle ignored after terminal status: coid={} current={:?} incoming={:?}",
@@ -457,8 +459,21 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         );
         return Ok(Vec::new());
     }
+    let associate_trades = data.get("associate_trades")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| values.iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim).filter(|value| !value.is_empty())
+            .map(str::to_string).collect())
+        .unwrap_or_default();
+    let order_audit = AuthoritativeOrderAudit {
+        original_size: Some(original_size.to_string()),
+        size_matched: Some(size_matched.to_string()),
+        associate_trades,
+    };
     match status {
-        OrderStatus::Filled | OrderStatus::Cancelled => shared.remove_order_as(&coid, status),
+        OrderStatus::Filled => shared.remove_order_as(&coid, status),
+        OrderStatus::Cancelled => shared.remove_cancelled_order_with_match(&coid, size_matched),
         _ => shared.account_state.mark_order_status(&coid, status),
     }
     Ok(vec![OrderUpdate {
@@ -475,7 +490,7 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         avg_fill_price: price,
         timestamp_ns: now_ns(),
         trade_id: None,
-        order_audit: None,
+        order_audit: Some(order_audit),
         error: None,
     }])
 }
@@ -708,6 +723,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
             let status_str = status_raw
                 .strip_prefix("TRADE_STATUS_")
                 .unwrap_or(status_raw);
+            let status_str = if status_str == "MATCHED_NOT_BROADCASTED" {
+                "MATCHED"
+            } else { status_str };
 
             let match_time_secs = effective_match_time(data, trade_id);
 
@@ -794,7 +812,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     }
 
                     let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
-                    let Some(ownership) = shared.account_state.apply_trade_transition(
+                    let Some(ownership) = shared.account_state.apply_trade_transition_with_context(
                         &leg_id,
                         status_str,
                         &runtime_coid,
@@ -803,6 +821,8 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         mo_side,
                         mo_size,
                         mo_price,
+                        true,
+                        match_time_secs,
                     ) else {
                         // Never broadcast an unowned private trade. The account
                         // ledger has already entered uncertain with the exact
@@ -841,11 +861,6 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     if !lifecycle_advanced {
                         continue;
                     }
-                    let _ = shared.account_state.apply_configured_trade_fee(
-                        &leg_id,
-                        status,
-                        true,
-                    );
                     if status != OrderStatus::Failed {
                         shared.finish_filled_order_if_audited(&coid);
                     }
@@ -879,7 +894,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 }
 
                 let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
-                let Some(ownership) = shared.account_state.apply_trade_transition(
+                let Some(ownership) = shared.account_state.apply_trade_transition_with_context(
                     trade_id,
                     status_str,
                     &runtime_coid,
@@ -888,6 +903,8 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     side,
                     matched_amount,
                     price,
+                    false,
+                    match_time_secs,
                 ) else {
                     shared
                         .account_state
@@ -919,11 +936,6 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 if !lifecycle_advanced {
                     return Vec::new();
                 }
-                let _ = shared.account_state.apply_configured_trade_fee(
-                    trade_id,
-                    status,
-                    false,
-                );
                 if status != OrderStatus::Failed {
                     shared.finish_filled_order_if_audited(&coid);
                 }
@@ -1408,9 +1420,7 @@ async fn user_feed_loop(
                         );
                     }
                 }
-                accept_reconnect_replay(&shared.user_feed_health, outcome);
                 recovery_checkpoint = None;
-                backoff.reset();
             }
             Err(e) => {
                 // Do not enter the WS read loop with an unverified gap. Drop
@@ -1428,6 +1438,40 @@ async fn user_feed_loop(
                 if !shutdown.load(Ordering::Relaxed) {
                     sleep(delay).await;
                 }
+                continue;
+            }
+        }
+
+        let recovery_executor = PolymarketTrade::from_shared(shared.clone(), "", "");
+        let open_order_recovery = tokio::task::spawn_blocking(move || {
+            recovery_executor.reconcile_runtime_open_orders_with_updates()
+        }).await;
+        match open_order_recovery {
+            Ok(Ok(updates)) => {
+                for update in updates {
+                    if update_tx.send(update).is_err() {
+                        warn!("[PolyUserFeed] order update channel closed during reconnect recovery");
+                        return;
+                    }
+                }
+                accept_reconnect_replay(
+                    &shared.user_feed_health,
+                    GapReplayOutcome::Complete { records: 0 },
+                );
+                backoff.reset();
+            }
+            Ok(Err(error)) => {
+                shared.user_feed_health.set_recovering(true);
+                let delay = backoff.next_delay();
+                warn!("[PolyUserFeed] Open-order recovery failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
+                if !shutdown.load(Ordering::Relaxed) { sleep(delay).await; }
+                continue;
+            }
+            Err(error) => {
+                shared.user_feed_health.set_recovering(true);
+                let delay = backoff.next_delay();
+                warn!("[PolyUserFeed] Open-order recovery task failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
+                if !shutdown.load(Ordering::Relaxed) { sleep(delay).await; }
                 continue;
             }
         }
@@ -2277,6 +2321,27 @@ mod tests {
         assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
             "whole-order Filled holds the lock until trade rows arrive");
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+    }
+
+    #[test]
+    fn partial_fill_cancellation_retains_only_unreplayed_matched_reservation() {
+        let shared = owned_taker_shared(0.5);
+        let cancellation = serde_json::json!({
+            "event_type": "order", "type": "CANCELLATION", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "4",
+            "associate_trades": ["trade-strict"],
+        });
+        let updates = parse_user_event(&cancellation, &shared);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 2.0);
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+
+        let mut trade = valid_taker_event();
+        trade["size"] = serde_json::json!("4");
+        assert_eq!(parse_user_event(&trade, &shared).len(), 1);
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl TradeStatus {
         let upper = s.to_uppercase();
         let normalized = upper.strip_prefix("TRADE_STATUS_").unwrap_or(&upper);
         match normalized {
-            "MATCHED" => Some(Self::Matched),
+            "MATCHED" | "MATCHED_NOT_BROADCASTED" => Some(Self::Matched),
             "MINED" => Some(Self::Mined),
             "CONFIRMED" => Some(Self::Confirmed),
             "RETRYING" => Some(Self::Retrying),
@@ -172,6 +172,7 @@ impl LivePositionManager {
     pub fn from_restored(rows: impl IntoIterator<Item = RestoredTrade>) -> Self {
         let mut manager = Self::new();
         for row in rows {
+            manager.touch_match_time(row.match_time_secs);
             let Some(status) = TradeStatus::from_str(&row.ownership.status) else { continue; };
             manager.update_trade(
                 &row.ownership.trade_key,

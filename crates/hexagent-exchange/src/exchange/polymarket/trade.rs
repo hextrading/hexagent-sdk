@@ -93,7 +93,11 @@ impl FetchOrderResult {
 }
 
 fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
-    let status = json.get("status").and_then(|value| value.as_str())?.to_string();
+    let raw_status = json.get("status").and_then(|value| value.as_str())?;
+    let status = match raw_status.to_ascii_uppercase().as_str() {
+        "MATCHED_NOT_BROADCASTED" => "MATCHED".to_string(),
+        normalized => normalized.to_string(),
+    };
     let string_field = |name: &str| {
         json.get(name).and_then(|value| match value {
             serde_json::Value::String(value) => Some(value.clone()),
@@ -1414,7 +1418,39 @@ impl SharedState {
             );
             return;
         }
+        if status == OrderStatus::Cancelled {
+            self.open_orders.lock().unwrap().remove(client_order_id);
+            if self.account_state.mark_cancelled_pending_audit(client_order_id) {
+                warn!(
+                    "[PolymarketTrade] Cancelled coid={} awaits authoritative size_matched audit; preserving reservation",
+                    client_order_id,
+                );
+            }
+            self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
+            self.reconcile_cancel_not_found_counts.lock().unwrap().remove(client_order_id);
+            self.cancel_reconcile_next_retry_ns.lock().unwrap().remove(client_order_id);
+            return;
+        }
         self.remove_order_resolved_as(client_order_id, status);
+    }
+
+    pub(crate) fn remove_cancelled_order_with_match(
+        &self,
+        client_order_id: &str,
+        size_matched: f64,
+    ) {
+        self.open_orders.lock().unwrap().remove(client_order_id);
+        let pending = self.account_state
+            .mark_cancelled_pending_trade_audit(client_order_id, size_matched);
+        if pending {
+            warn!(
+                "[PolymarketTrade] Cancelled coid={} still awaits trade audit through size_matched={}",
+                client_order_id, size_matched,
+            );
+        }
+        self.pending_delayed_orphans.lock().unwrap().remove(client_order_id);
+        self.reconcile_cancel_not_found_counts.lock().unwrap().remove(client_order_id);
+        self.cancel_reconcile_next_retry_ns.lock().unwrap().remove(client_order_id);
     }
 
     /// Final teardown after the exchange audit has proved that every
@@ -2372,6 +2408,11 @@ impl PolymarketTrade {
                                     );
                                     continue;
                                 }
+                                if !order.audit.associate_trades.is_empty() {
+                                    replayed_updates.extend(self.reconcile_orphans(
+                                        &[], &[], &order.audit.associate_trades,
+                                    ));
+                                }
                                 let body = serde_json::json!({ "orderID": order_id });
                                 match self.delete_detailed("/order", &body) {
                                     Ok(response) => match cancel_delete_response_outcome(
@@ -2393,7 +2434,7 @@ impl PolymarketTrade {
                                     ),
                                 }
                             }
-                            "MATCHED" | "FILLED" => {
+                            "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => {
                                 let trade_ids = order.audit.associate_trades.clone();
                                 if !trade_ids.is_empty() {
                                     replayed_updates.extend(
@@ -2407,7 +2448,19 @@ impl PolymarketTrade {
                             }
                             status if status.starts_with("CANCELED")
                                 || status.starts_with("CANCELLED") => {
-                                self.shared.remove_order_as(&coid, OrderStatus::Cancelled);
+                                if !order.audit.associate_trades.is_empty() {
+                                    replayed_updates.extend(self.reconcile_orphans(
+                                        &[], &[], &order.audit.associate_trades,
+                                    ));
+                                }
+                                let Some(size_matched) = order.audit.size_matched.as_deref()
+                                    .and_then(|value| value.parse::<f64>().ok())
+                                    .filter(|value| value.is_finite() && *value >= 0.0)
+                                else {
+                                    warn!("[PolymarketTrade] startup cancellation audit coid={} omitted valid size_matched; retaining reservation", coid);
+                                    continue;
+                                };
+                                self.shared.remove_cancelled_order_with_match(&coid, size_matched);
                             }
                             "INVALID" => {
                                 self.shared.remove_order_as(&coid, OrderStatus::Rejected);
@@ -2453,6 +2506,110 @@ impl PolymarketTrade {
             );
         }
         (unresolved, replayed_updates)
+    }
+
+    /// Audit every locally live or cancellation-pending order after a user
+    /// feed reconnect, including associated trades missed by the stream.
+    pub(crate) fn reconcile_runtime_open_orders_with_updates(
+        &self,
+    ) -> std::result::Result<Vec<OrderUpdate>, String> {
+        let tracked: Vec<(String, TrackedOrder, String)> = {
+            let open = self.shared.open_orders.lock().unwrap();
+            let ids = self.shared.coid_to_oid.lock().unwrap();
+            let mut rows: HashMap<String, (TrackedOrder, String)> = open.iter()
+                .filter_map(|(coid, tracked)| ids.get(coid)
+                    .map(|oid| (coid.clone(), (tracked.clone(), oid.clone()))))
+                .collect();
+            for coid in self.shared.account_state.recovery_pending_order_ids() {
+                if rows.contains_key(&coid) { continue; }
+                let Some(order) = self.shared.account_state.order(&coid) else { continue; };
+                let Some(order_id) = ids.get(&coid) else { continue; };
+                rows.insert(coid, (TrackedOrder {
+                    symbol: order.token_id,
+                    side: order.side,
+                    instance_id: order.instance_id,
+                }, order_id.clone()));
+            }
+            rows.into_iter().map(|(coid, (tracked, oid))| (coid, tracked, oid)).collect()
+        };
+        let mut updates = Vec::new();
+        for (coid, tracked, order_id) in tracked {
+            let fetched = match self.fetch_order_by_id(&coid, &order_id, None) {
+                FetchOrderResult::Found(order) => order,
+                FetchOrderResult::NotFound => return Err(format!(
+                    "open order coid={coid} orderID={order_id} was not found"
+                )),
+                FetchOrderResult::Unavailable(kind) => return Err(format!(
+                    "open order coid={coid} orderID={order_id} audit unavailable: {kind:?}"
+                )),
+            };
+            let ownership = self.shared.account_state.order(&coid)
+                .ok_or_else(|| format!("open order coid={coid} has no durable ownership row"))?;
+            let status_text = fetched.status.to_ascii_uppercase();
+            let status = match status_text.as_str() {
+                "LIVE" => {
+                    if !fetched.audit.associate_trades.is_empty() {
+                        updates.extend(self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades));
+                    }
+                    let matched = fetched.audit.size_matched.as_deref()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
+                    let live = if matched > 1e-9 { OrderStatus::PartiallyFilled }
+                        else { OrderStatus::Accepted };
+                    self.shared.account_state.mark_order_status(&coid, live);
+                    live
+                }
+                "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => {
+                    self.shared.remove_order_as(&coid, OrderStatus::Filled);
+                    if !fetched.audit.associate_trades.is_empty() {
+                        updates.extend(self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades));
+                    }
+                    if filled_trade_audit_complete(
+                        &coid, &fetched.audit, &self.shared.account_state.trades(),
+                    ) { self.shared.complete_filled_order_audit(&coid); }
+                    OrderStatus::Filled
+                }
+                value if value.starts_with("CANCELED") || value.starts_with("CANCELLED") => {
+                    if !fetched.audit.associate_trades.is_empty() {
+                        updates.extend(self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades));
+                    }
+                    let matched = fetched.audit.size_matched.as_deref()
+                        .ok_or_else(|| format!("cancelled order coid={coid} omitted size_matched"))?
+                        .parse::<f64>()
+                        .map_err(|_| format!("cancelled order coid={coid} has invalid size_matched"))?;
+                    self.shared.remove_cancelled_order_with_match(&coid, matched);
+                    OrderStatus::Cancelled
+                }
+                "INVALID" => {
+                    self.shared.remove_order_as(&coid, OrderStatus::Rejected);
+                    OrderStatus::Rejected
+                }
+                other => return Err(format!(
+                    "open order coid={coid} returned unsupported status={other}"
+                )),
+            };
+            let size_matched = fetched.audit.size_matched.as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(ownership.filled_quantity);
+            updates.push(OrderUpdate {
+                client_order_id: coid,
+                exchange: Exchange::Polymarket,
+                symbol: tracked.symbol,
+                side: tracked.side,
+                exchange_order_id: Some(order_id),
+                status,
+                liquidity: None,
+                filled_quantity: 0.0,
+                remaining_quantity: (ownership.quantity - size_matched).max(0.0),
+                avg_fill_price: ownership.price,
+                timestamp_ns: now_ns(),
+                trade_id: None,
+                order_audit: Some(fetched.audit),
+                error: None,
+            });
+        }
+        Ok(updates)
     }
 
     /// POST variant that distinguishes timeout / status / other errors so
@@ -3191,7 +3348,7 @@ impl PolymarketTrade {
                             error: None,
                         });
                     }
-                    "MATCHED" | "FILLED" => {
+                    "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => {
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
                         self.shared.remove_order_as(coid, OrderStatus::Filled);
@@ -3386,7 +3543,7 @@ impl PolymarketTrade {
                         }
                     }
                 }
-                "MATCHED" | "FILLED" => OrderStatus::Filled,
+                "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => OrderStatus::Filled,
                 // Any `CANCELED*` variant is a terminal "no longer active" status.
                 // Polymarket emits multiple suffixed forms — observed:
                 //   * `CANCELED` / `CANCELLED` — plain user-cancel
@@ -3487,7 +3644,10 @@ impl PolymarketTrade {
                 // Metadata is valid for terminal Filled only when that same
                 // GET returned MATCHED/FILLED. A LIVE snapshot followed by an
                 // ambiguous retry DELETE must trigger another audit.
-                order_audit: matches!(status_str.as_str(), "MATCHED" | "FILLED")
+                order_audit: matches!(
+                    status_str.as_str(),
+                    "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED"
+                )
                     .then(|| order_audit.clone())
                     .flatten(),
                 error: matches!(status, OrderStatus::Cancelled | OrderStatus::Filled)
@@ -4477,7 +4637,10 @@ impl ExchangeTrade for PolymarketTrade {
                         }
 
                         let response_status =
-                            if success && status_str.eq_ignore_ascii_case("matched") {
+                            if success && matches!(
+                                status_str.to_ascii_uppercase().as_str(),
+                                "MATCHED" | "MATCHED_NOT_BROADCASTED"
+                            ) {
                                 OrderStatus::Filled
                             } else if success {
                                 OrderStatus::Accepted
@@ -5328,7 +5491,10 @@ impl ExchangeTrade for PolymarketTrade {
                         let err_field = if !success && !error_msg.is_empty() {
                             Some(error_msg.to_string())
                         } else { None };
-                        let response_status = if success && status_str.eq_ignore_ascii_case("matched") {
+                        let response_status = if success && matches!(
+                            status_str.to_ascii_uppercase().as_str(),
+                            "MATCHED" | "MATCHED_NOT_BROADCASTED"
+                        ) {
                             OrderStatus::Filled
                         } else if success {
                             OrderStatus::Accepted
@@ -5481,6 +5647,18 @@ mod tests {
         assert_eq!(fetched.audit.size_matched.as_deref(), Some("39.993332"));
         assert_eq!(fetched.audit.associate_trades,
             vec!["trade-1", "trade-2", "trade-3", "trade-4"]);
+    }
+
+    #[test]
+    fn authoritative_order_parser_canonicalizes_matched_not_broadcasted() {
+        let json = serde_json::json!({
+            "status": "MATCHED_NOT_BROADCASTED",
+            "original_size": "5",
+            "size_matched": "5",
+            "associate_trades": ["trade-1"]
+        });
+        let fetched = parse_fetched_order(&json).expect("matched order");
+        assert_eq!(fetched.status, "MATCHED");
     }
 
     #[test]
