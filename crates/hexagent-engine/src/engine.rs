@@ -11,7 +11,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -29,6 +29,11 @@ use crate::types::*;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
+const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
+
+fn elapsed_ns(origin: &std::time::Instant) -> u64 {
+    origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
 
 fn register_polymarket_wallet_identity(
     wallet_accounts: &mut HashMap<String, String>,
@@ -69,8 +74,10 @@ fn send_private_update_lossless(
     tx: &Sender<QueuedOrderUpdate>,
     instance_id: &str,
     mut queued: QueuedOrderUpdate,
+    quarantined: &AtomicBool,
 ) -> bool {
     loop {
+        if quarantined.load(Ordering::Acquire) { return false; }
         match tx.send_timeout(queued, std::time::Duration::from_secs(1)) {
             Ok(()) => return true,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
@@ -85,6 +92,29 @@ fn send_private_update_lossless(
             Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
         }
     }
+}
+
+fn quarantine_strategy_worker(
+    idx: usize,
+    reason: &str,
+    instance_ids: &[String],
+    quarantined: &[Arc<AtomicBool>],
+    signal_tx: &Sender<Signal>,
+) -> bool {
+    let Some(flag) = quarantined.get(idx) else { return false; };
+    if flag.swap(true, Ordering::AcqRel) { return false; }
+    let instance_id = instance_ids.get(idx).cloned().unwrap_or_default();
+    error!("[strategy_supervisor] instance={} quarantined=1 reason={}", instance_id, reason);
+    let cancel = Signal::PolymarketCancelAllOrders {
+        reason: format!("strategy instance `{instance_id}` quarantined: {reason}"),
+        market: None,
+        asset_ids: Vec::new(),
+        instance_id,
+    };
+    if let Err(error) = signal_tx.send_timeout(cancel, std::time::Duration::from_millis(500)) {
+        error!("[strategy_supervisor] failed to enqueue emergency account cancel for worker index={idx}: {error}");
+    }
+    true
 }
 
 /// Exact identity of one historical-bars input snapshot.
@@ -3813,6 +3843,13 @@ impl Engine {
             update_dispatch_specs.push((spool_rx, utx));
             specs.push((s, mrx, urx));
         }
+        let supervisor_origin = Arc::new(std::time::Instant::now());
+        let worker_heartbeats: Vec<Arc<AtomicU64>> = (0..instance_ids.len())
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect();
+        let worker_quarantined: Vec<Arc<AtomicBool>> = (0..instance_ids.len())
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
 
         thread::Builder::new()
             .name("strategy-router".into())
@@ -3828,6 +3865,7 @@ impl Engine {
                     update_dispatch_specs.into_iter().enumerate()
                 {
                     let iid = instance_ids[idx].clone();
+                    let quarantined = Arc::clone(&worker_quarantined[idx]);
                     let handle = thread::Builder::new()
                         .name(format!(
                             "private-dispatch-{}",
@@ -3835,7 +3873,7 @@ impl Engine {
                         ))
                         .spawn(move || {
                             while let Ok(queued) = spool_rx.recv() {
-                                if !send_private_update_lossless(&worker_tx, &iid, queued) {
+                                if !send_private_update_lossless(&worker_tx, &iid, queued, &quarantined) {
                                     break;
                                 }
                                 if spool_rx.len() >= CHANNEL_CAPACITY {
@@ -3853,15 +3891,26 @@ impl Engine {
 
                 // Spawn one worker per instance, each on its own core.
                 let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
+                let (worker_status_tx, worker_status_rx) = unbounded::<(usize, bool)>();
                 for (idx, (strategy, mrx, urx)) in specs.into_iter().enumerate() {
                     let stx = signal_tx.clone();
                     let dd = data_dirs.clone();
                     let iid = instance_ids[idx].clone();
                     let reg = coid_owner.clone();
+                    let heartbeat = Arc::clone(&worker_heartbeats[idx]);
+                    let quarantined = Arc::clone(&worker_quarantined[idx]);
+                    let clock_origin = Arc::clone(&supervisor_origin);
+                    let status_tx = worker_status_tx.clone();
                     let h = thread::Builder::new()
                         .name(format!("strategy-{}", if iid.is_empty() { idx.to_string() } else { iid.clone() }))
                         .spawn(move || {
-                            Self::run_strategy_worker(strategy, mrx, urx, stx, dd, &iid, idx, reg);
+                            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                Self::run_strategy_worker(
+                                    strategy, mrx, urx, stx, dd, &iid, idx, reg,
+                                    heartbeat, quarantined, clock_origin,
+                                );
+                            })).is_err();
+                            let _ = status_tx.send((idx, panicked));
                         })
                         .unwrap();
                     handles.push(h);
@@ -3881,6 +3930,7 @@ impl Engine {
                 let mut token_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
                 let mut market_overflow_drops = vec![0u64; instance_ids.len()];
                 let mut market_overflow_log_at = std::time::Instant::now();
+                let supervisor_tick = crossbeam_channel::tick(std::time::Duration::from_millis(100));
                 // instance_id → worker index, for recovering the owner of a
                 // coid that's no longer in `coid_owner` (late update after its
                 // registry entry was freed). Coids are minted as
@@ -3896,7 +3946,10 @@ impl Engine {
                                     recorder_tx.as_ref(), &MarketEvent::Exit,
                                 );
                                 let exit = Arc::new(MarketEvent::Exit);
-                                for tx in &market_txs {
+                                for (idx, tx) in market_txs.iter().enumerate() {
+                                    if worker_quarantined[idx].load(Ordering::Acquire) {
+                                        continue;
+                                    }
                                     let _ = tx.send(QueuedMarketEvent {
                                         event: Arc::clone(&exit),
                                         enqueued_at: std::time::Instant::now(),
@@ -3915,6 +3968,13 @@ impl Engine {
                                     if let Some(drops) = market_overflow_drops.get_mut(idx) {
                                         *drops = drops.saturating_add(1);
                                     }
+                                    quarantine_strategy_worker(
+                                        idx,
+                                        "market queue overflow (event loss)",
+                                        &instance_ids,
+                                        &worker_quarantined,
+                                        &signal_tx,
+                                    );
                                 }
                                 if market_overflow_drops.iter().any(|drops| *drops > 0)
                                     && market_overflow_log_at.elapsed()
@@ -3960,7 +4020,8 @@ impl Engine {
                                 );
                                 let terminal_coid = terminal.then(|| u.client_order_id.clone());
                                 match owner {
-                                    Some(i) if i < update_txs.len() => {
+                                    Some(i) if i < update_txs.len()
+                                        && !worker_quarantined[i].load(Ordering::Acquire) => {
                                         // Common path: transfer ownership to
                                         // one worker without cloning payload.
                                         let _ = update_txs[i].send(QueuedOrderUpdate {
@@ -3970,7 +4031,10 @@ impl Engine {
                                     }
                                     _ => {
                                         let enqueued_at = std::time::Instant::now();
-                                        for tx in &update_txs {
+                                        for (idx, tx) in update_txs.iter().enumerate() {
+                                            if worker_quarantined[idx].load(Ordering::Acquire) {
+                                                continue;
+                                            }
                                             let _ = tx.send(QueuedOrderUpdate {
                                                 update: u.clone(),
                                                 enqueued_at,
@@ -3988,6 +4052,34 @@ impl Engine {
                             }
                             Err(_) => break,
                         },
+                        recv(worker_status_rx) -> msg => {
+                            if let Ok((idx, panicked)) = msg {
+                                let reason = if panicked {
+                                    "strategy worker panicked"
+                                } else {
+                                    "strategy worker exited unexpectedly"
+                                };
+                                quarantine_strategy_worker(
+                                    idx, reason, &instance_ids, &worker_quarantined, &signal_tx,
+                                );
+                            }
+                        },
+                        recv(supervisor_tick) -> _ => {
+                            let now = elapsed_ns(&supervisor_origin);
+                            for idx in 0..worker_heartbeats.len() {
+                                if worker_quarantined[idx].load(Ordering::Acquire) { continue; }
+                                let last = worker_heartbeats[idx].load(Ordering::Acquire);
+                                if now.saturating_sub(last) >= STRATEGY_WORKER_STALL_NS {
+                                    quarantine_strategy_worker(
+                                        idx,
+                                        "strategy worker heartbeat stalled for at least 5s",
+                                        &instance_ids,
+                                        &worker_quarantined,
+                                        &signal_tx,
+                                    );
+                                }
+                            }
+                        },
                     }
                 }
 
@@ -3997,7 +4089,13 @@ impl Engine {
                 for handle in update_dispatch_handles {
                     let _ = handle.join();
                 }
-                for h in handles { let _ = h.join(); }
+                for (idx, handle) in handles.into_iter().enumerate() {
+                    if worker_quarantined[idx].load(Ordering::Acquire) {
+                        drop(handle);
+                    } else {
+                        let _ = handle.join();
+                    }
+                }
                 // Single terminal Exit to the executor (workers don't send it).
                 let _ = signal_tx.send(Signal::Exit);
             })
@@ -4153,11 +4251,15 @@ impl Engine {
         instance_id: &str,
         idx: usize,
         coid_owner: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+        heartbeat: Arc<AtomicU64>,
+        quarantined: Arc<AtomicBool>,
+        clock_origin: Arc<std::time::Instant>,
     ) {
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         // Emit a signal: register its placed coids to this instance, then
         // forward. Returns false if the executor channel is gone.
         let emit = |sig: Signal| -> bool {
+            if quarantined.load(Ordering::Acquire) { return false; }
             Self::register_place_coids(&sig, idx, &coid_owner);
             signal_tx.send(sig).is_ok()
         };
@@ -4174,17 +4276,22 @@ impl Engine {
         loop {
             crossbeam_channel::select! {
                 recv(watchdog_rx) -> _ => {
+                    if quarantined.load(Ordering::Acquire) { return; }
+                    heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                     for sig in strategy.on_watchdog(crate::types::now_ns()) {
                         if !emit(sig) { return; }
                     }
                 },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) if matches!(queued.event.as_ref(), MarketEvent::Exit) => {
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         strategy.on_exit();
                         for sig in strategy.on_shutdown() { let _ = emit(sig); }
                         return;
                     }
                     Ok(queued) => {
+                        if quarantined.load(Ordering::Acquire) { return; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         let queue_last_us = queued.enqueued_at.elapsed().as_micros()
                             .min(u64::MAX as u128) as u64;
                         queue_samples = queue_samples.saturating_add(1);
@@ -4279,6 +4386,8 @@ impl Engine {
                 },
                 recv(update_rx) -> msg => match msg {
                     Ok(queued) => {
+                        if quarantined.load(Ordering::Acquire) { return; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         let queue_last_us = queued.enqueued_at.elapsed().as_micros()
                             .min(u64::MAX as u128) as u64;
                         update_queue_samples = update_queue_samples.saturating_add(1);
@@ -5105,6 +5214,9 @@ impl Engine {
                     &instance_id,
                     sc.account_allocation_weight,
                 );
+                if let Some(scope) = sc.params.get("event_series_slug").and_then(|v| v.as_str()) {
+                    shared.account_state.register_market_scope(&instance_id, scope);
+                }
                 info!(
                     "[Engine] instance_id={} shares Polymarket account `{}` \
                      with an earlier instance — reusing its SharedState",
@@ -5209,6 +5321,9 @@ impl Engine {
                         &instance_id,
                         sc.account_allocation_weight,
                     );
+                    if let Some(scope) = sc.params.get("event_series_slug").and_then(|v| v.as_str()) {
+                        shared.account_state.register_market_scope(&instance_id, scope);
+                    }
                     info!(
                         "[Engine] Built Polymarket SharedState for account_id={} \
                          (first instance_id={} sig_type={} builder_code={})",
@@ -7934,6 +8049,29 @@ mod market_router_tests {
         assert_eq!(owner_from_coid("1782840607342", &m), None);
         // Unknown instance → broadcast.
         assert_eq!(owner_from_coid("eth09-7", &m), None);
+    }
+
+    #[test]
+    fn worker_quarantine_is_idempotent_and_enqueues_account_cancel() {
+        let (signal_tx, signal_rx) = bounded::<Signal>(4);
+        let flags = vec![Arc::new(AtomicBool::new(false))];
+        let instances = vec!["btc01".to_string()];
+        assert!(quarantine_strategy_worker(
+            0, "market queue overflow (event loss)", &instances, &flags, &signal_tx,
+        ));
+        assert!(flags[0].load(Ordering::Acquire));
+        match signal_rx.try_recv().unwrap() {
+            Signal::PolymarketCancelAllOrders { instance_id, market, reason, .. } => {
+                assert_eq!(instance_id, "btc01");
+                assert!(market.is_none());
+                assert!(reason.contains("market queue overflow"));
+            }
+            other => panic!("unexpected supervisor signal: {other:?}"),
+        }
+        assert!(!quarantine_strategy_worker(
+            0, "duplicate", &instances, &flags, &signal_tx,
+        ));
+        assert!(signal_rx.try_recv().is_err());
     }
 
     #[test]

@@ -369,6 +369,17 @@ impl PositionManager {
                 }
             }
             OrderStatus::Filled
+                if update.filled_quantity <= 0.0
+                    && update.trade_id.as_deref().is_none_or(str::is_empty)
+                    && update.order_audit.is_none() =>
+            {
+                // A private order-lifecycle UPDATE can prove that the order is
+                // fully matched before its trade rows arrive. Keep the local
+                // funds/inventory lock until those trade IDs drive accounting;
+                // the shared ledger uses the same trade-audit rule.
+            }
+            OrderStatus::Filled
+            | OrderStatus::Failed
             | OrderStatus::Cancelled
             | OrderStatus::Rejected => {
                 self.pending_orders.remove(coid);
@@ -755,12 +766,21 @@ mod tests {
         assert!((pm.available_cash() - 98.0).abs() < 1e-9);
         assert!((pm.available_inventory("TOK") - 6.0).abs() < 1e-9);
 
-        // Only an authoritative terminal update releases each resource.
+        // Cancelled is authoritative and releases immediately.
         pm.sync_pending_from_update(&ou("buy", Side::Buy, OrderStatus::Cancelled, 0.0, 0.0));
         assert!((pm.available_cash() - 100.0).abs() < 1e-9);
         assert_eq!(pm.pending_orders().len(), 1);
+
+        // A zero-quantity private order-lifecycle Filled can arrive before
+        // its trade rows. It must not release inventory early.
         pm.sync_pending_from_update(&ou("sell", Side::Sell, OrderStatus::Filled, 0.0, 0.0));
+        assert_eq!(pm.pending_orders().len(), 1);
+        assert!((pm.available_inventory("TOK") - 6.0).abs() < 1e-9);
+
+        // FAILED is definitive terminal evidence and needs no GET/audit.
+        pm.sync_pending_from_update(&ou("sell", Side::Sell, OrderStatus::Failed, 0.0, 0.0));
         assert_eq!(pm.pending_orders().len(), 0);
+        assert!((pm.available_inventory("TOK") - 10.0).abs() < 1e-9);
     }
 
     #[test]
