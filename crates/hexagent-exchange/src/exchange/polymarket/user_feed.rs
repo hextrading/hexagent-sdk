@@ -506,17 +506,24 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         continue;
                     }
 
-                    let coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
-                    shared.account_state.apply_trade_transition(
+                    let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
+                    let Some(ownership) = shared.account_state.apply_trade_transition(
                         &leg_id,
                         status_str,
-                        &coid,
+                        &runtime_coid,
                         mo_order_id,
                         &mo_asset_id,
                         mo_side,
                         mo_size,
                         mo_price,
-                    );
+                    ) else {
+                        // Never broadcast an unowned private trade. The account
+                        // ledger has already entered uncertain with the exact
+                        // oid/trade reason; fanning an empty coid to every
+                        // same-token strategy would book the fill N times.
+                        continue;
+                    };
+                    let coid = ownership.client_order_id;
 
                     updates.push(OrderUpdate {
                         client_order_id: coid,
@@ -555,17 +562,20 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     return Vec::new();
                 }
 
-                let coid = shared.lookup_coid(order_id).unwrap_or_default();
-                shared.account_state.apply_trade_transition(
+                let runtime_coid = shared.lookup_coid(order_id).unwrap_or_default();
+                let Some(ownership) = shared.account_state.apply_trade_transition(
                     trade_id,
                     status_str,
-                    &coid,
+                    &runtime_coid,
                     order_id,
                     &asset_id,
                     side,
                     matched_amount,
                     price,
-                );
+                ) else {
+                    return Vec::new();
+                };
+                let coid = ownership.client_order_id;
 
                 updates.push(OrderUpdate {
                     client_order_id: coid,
