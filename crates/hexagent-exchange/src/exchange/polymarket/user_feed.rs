@@ -30,7 +30,7 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
-const GAP_REPLAY_DEGRADED_AFTER_FAILURES: u32 = 3;
+const MAX_FUTURE_MATCH_TIME_SECS: u64 = 300;
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ struct GapReplayCheckpoint {
     seen_cursors: HashSet<String>,
     records: usize,
     pages: usize,
+    cursor_resets: usize,
 }
 
 impl GapReplayCheckpoint {
@@ -58,6 +59,7 @@ impl GapReplayCheckpoint {
             seen_cursors: HashSet::new(),
             records: 0,
             pages: 0,
+            cursor_resets: 0,
         }
     }
 }
@@ -94,6 +96,14 @@ fn advance_gap_cursor(
     }
     *cursor = next;
     Ok(true)
+}
+
+fn replay_match_time_anchor(shared: &SharedState, committed_secs: u64) -> u64 {
+    match shared.account_state.earliest_unresolved_trade_match_time() {
+        Some(unresolved) if committed_secs > 0 => committed_secs.min(unresolved),
+        Some(unresolved) => unresolved,
+        None => committed_secs,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,12 +436,26 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                 .strip_prefix("TRADE_STATUS_")
                 .unwrap_or(status_raw);
 
-            let match_time_secs: u64 = data.get("match_time")
+            let parsed_match_time_secs: u64 = data.get("match_time")
                 .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))
                 .unwrap_or(0);
-            if match_time_secs > 0 {
-                shared.live_position.lock().unwrap().touch_match_time(match_time_secs);
-            }
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let match_time_secs = if parsed_match_time_secs
+                > now_secs.saturating_add(MAX_FUTURE_MATCH_TIME_SECS)
+            {
+                warn!(
+                    "[PolyUserFeed] ignoring future match_time={} trade={} now={}",
+                    parsed_match_time_secs,
+                    trade_id,
+                    now_secs,
+                );
+                0
+            } else {
+                parsed_match_time_secs
+            };
 
             let status = match status_str {
                 "MATCHED" | "MINED" => OrderStatus::PartiallyFilled,
@@ -530,8 +554,21 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                         // ledger has already entered uncertain with the exact
                         // oid/trade reason; fanning an empty coid to every
                         // same-token strategy would book the fill N times.
+                        shared
+                            .account_state
+                            .mark_unresolved_trade_match_time(&leg_id, match_time_secs);
                         continue;
                     };
+                    shared
+                        .account_state
+                        .resolve_unresolved_trade_match_time(&leg_id);
+                    if match_time_secs > 0 {
+                        shared
+                            .live_position
+                            .lock()
+                            .unwrap()
+                            .touch_match_time(match_time_secs);
+                    }
                     let coid = ownership.client_order_id;
                     // Only advance the feed-level dedupe after ownership was
                     // successfully resolved. An unowned event must remain
@@ -596,8 +633,21 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
                     matched_amount,
                     price,
                 ) else {
+                    shared
+                        .account_state
+                        .mark_unresolved_trade_match_time(trade_id, match_time_secs);
                     return Vec::new();
                 };
+                shared
+                    .account_state
+                    .resolve_unresolved_trade_match_time(trade_id);
+                if match_time_secs > 0 {
+                    shared
+                        .live_position
+                        .lock()
+                        .unwrap()
+                        .touch_match_time(match_time_secs);
+                }
                 let coid = ownership.client_order_id;
                 let lifecycle_advanced = record_trade_transition(
                     &shared.live_position,
@@ -665,7 +715,7 @@ async fn replay_missed_trades(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
     checkpoint: &mut GapReplayCheckpoint,
-    transport: &mut GapReplayTransport,
+    transport: &GapReplayTransport,
 ) -> Result<GapReplayOutcome> {
     let pages_before_attempt = checkpoint.pages;
     let result = replay_missed_trades_inner(shared, update_tx, checkpoint, transport).await;
@@ -679,7 +729,7 @@ async fn replay_missed_trades_inner(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
     checkpoint: &mut GapReplayCheckpoint,
-    transport: &mut GapReplayTransport,
+    transport: &GapReplayTransport,
 ) -> Result<GapReplayOutcome> {
     // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
     // account, so we fetch ALL of the wallet's trades since `after` (no
@@ -747,6 +797,21 @@ async fn replay_missed_trades_inner(
                     ));
                 }
             };
+            let invalid_cursor = !checkpoint.cursor.is_empty()
+                && checkpoint.cursor_resets == 0
+                && matches!(code, 400 | 422)
+                && body.to_ascii_lowercase().contains("cursor");
+            if invalid_cursor {
+                warn!(
+                    "[PolyUserFeed] GapReplay cursor rejected with HTTP {}; restarting pinned after={} once",
+                    code,
+                    checkpoint.after_secs,
+                );
+                checkpoint.cursor.clear();
+                checkpoint.seen_cursors.clear();
+                checkpoint.cursor_resets = 1;
+                continue;
+            }
             return Err(anyhow!(
                 "Gap-fetch /trades HTTP {} after {} records: {}",
                 code,
@@ -867,7 +932,10 @@ async fn user_feed_loop(
             prewarm.total,
         );
     }
-    let gap_transport = Arc::new(tokio::sync::Mutex::new(transport));
+    // The transport is stateless; the account pool itself owns its two slot
+    // permits. Let periodic and reconnect replay compete for separate slots
+    // instead of serializing both behind an unrelated process-local mutex.
+    let gap_transport = Arc::new(transport);
     // Retain both the lower bound and exact next_cursor across reconnects.
     // A transient failure therefore resumes the failed page without either
     // skipping the original window or redownloading its completed prefix.
@@ -914,9 +982,9 @@ async fn user_feed_loop(
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64).unwrap_or(0);
-                let after = if !did_startup_deep {
+                let floor_after = if !did_startup_deep {
                     did_startup_deep = true;
-                    (now_ms / 1000).saturating_sub(300)            // startup → deep catch-up
+                    (now_ms / 1000).saturating_sub(300) // startup → deep catch-up
                 } else {
                     // Dynamic rewind: max(configured floor, now − last trade
                     // the feed actually delivered, on the SERVER match_time
@@ -925,22 +993,21 @@ async fn user_feed_loop(
                     // the window always reaches back to the last fill we have
                     // seen. −1 s guards Polymarket's strict-`>` semantics on
                     // `?after=T`; the overlap is deduped by trade_id.
-                    let floor_after = now_ms.saturating_sub(rewind_ms) / 1000; // rewind (ms) → floor to sec
-                    let last_trade_secs =
-                        shared.live_position.lock().unwrap().last_match_time_secs();
-                    if last_trade_secs > 0 {
-                        floor_after.min(last_trade_secs.saturating_sub(1))
-                    } else {
-                        floor_after
-                    }
+                    now_ms.saturating_sub(rewind_ms) / 1000 // rewind (ms) → floor to sec
+                };
+                let committed_secs =
+                    shared.live_position.lock().unwrap().last_match_time_secs();
+                let replay_anchor = replay_match_time_anchor(&shared, committed_secs);
+                let after = if replay_anchor > 0 {
+                    floor_after.min(replay_anchor.saturating_sub(1))
+                } else {
+                    floor_after
                 };
                 let checkpoint = periodic_checkpoint
                     .get_or_insert_with(|| GapReplayCheckpoint::new(after));
                 let after = checkpoint.after_secs;
-                let replay_result = {
-                    let mut transport = gap_transport.lock().await;
-                    replay_missed_trades(&shared, &update_tx, checkpoint, &mut transport).await
-                };
+                let replay_result =
+                    replay_missed_trades(&shared, &update_tx, checkpoint, &gap_transport).await;
                 match replay_result {
                     Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
                         if consecutive_failures > 0 {
@@ -958,7 +1025,7 @@ async fn user_feed_loop(
                     }
                     Err(e) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
-                        if consecutive_failures >= GAP_REPLAY_DEGRADED_AFTER_FAILURES {
+                        {
                             let newly_degraded = !shared
                                 .user_feed_health
                                 .gap_replay_degraded();
@@ -1034,20 +1101,18 @@ async fn user_feed_loop(
         // dedup. Covers ALL active markets on this wallet at once.
         let last_match_time_secs =
             shared.live_position.lock().unwrap().last_match_time_secs();
+        let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         let checkpoint = recovery_checkpoint.get_or_insert_with(|| {
-            GapReplayCheckpoint::new(last_match_time_secs.saturating_sub(reconnect_rewind_secs))
+            GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
         });
         let after_secs = checkpoint.after_secs;
-        let replay_result = {
-            let mut transport = gap_transport.lock().await;
-            replay_missed_trades(
-                &shared,
-                &update_tx,
-                checkpoint,
-                &mut transport,
-            )
-            .await
-        };
+        let replay_result = replay_missed_trades(
+            &shared,
+            &update_tx,
+            checkpoint,
+            &gap_transport,
+        )
+        .await;
         match replay_result {
             Ok(outcome) => {
                 match outcome {
@@ -1215,8 +1280,9 @@ async fn user_feed_loop(
         shared.user_feed_health.set_recovering(true);
         let last_match_time_secs =
             shared.live_position.lock().unwrap().last_match_time_secs();
+        let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         recovery_checkpoint.get_or_insert_with(|| {
-            GapReplayCheckpoint::new(last_match_time_secs.saturating_sub(reconnect_rewind_secs))
+            GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
         });
         if !shutdown.load(Ordering::Relaxed) {
             let delay = backoff.next_delay();
@@ -1366,12 +1432,18 @@ mod tests {
             "side": "BUY",
             "size": "10",
             "price": "0.5",
+            "match_time": "123",
             "taker_order_id": "oid-final",
             "maker_orders": [],
         });
 
         assert!(parse_user_event(&event, &shared).is_empty());
         assert!(shared.account_state.is_uncertain());
+        assert_eq!(
+            shared.account_state.earliest_unresolved_trade_match_time(),
+            Some(123),
+        );
+        assert_eq!(shared.live_position.lock().unwrap().last_match_time_secs(), 0);
 
         shared.account_state.rebind_order_id("owner-1", "oid-final");
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
@@ -1379,6 +1451,8 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].client_order_id, "owner-1");
         assert!(!shared.account_state.is_uncertain());
+        assert_eq!(shared.account_state.earliest_unresolved_trade_match_time(), None);
+        assert_eq!(shared.live_position.lock().unwrap().last_match_time_secs(), 123);
     }
 
     #[test]

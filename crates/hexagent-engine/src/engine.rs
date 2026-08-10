@@ -7,7 +7,7 @@
 //! - Paper: live feeds → strategy → sim_v2 matching core
 
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -3790,6 +3790,10 @@ impl Engine {
             Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<QueuedOrderUpdate>> =
             Vec::with_capacity(strategies.len());
+        let mut update_dispatch_specs: Vec<(
+            Receiver<QueuedOrderUpdate>,
+            Sender<QueuedOrderUpdate>,
+        )> = Vec::with_capacity(strategies.len());
         let mut specs: Vec<(
             Box<dyn Strategy>,
             Receiver<QueuedMarketEvent>,
@@ -3802,15 +3806,51 @@ impl Engine {
             // remains effectively non-blocking in healthy operation; reaching
             // capacity deliberately applies backpressure instead of dropping a
             // fill/cancel transition and corrupting local strategy state.
+            let (spool_tx, spool_rx) = unbounded::<QueuedOrderUpdate>();
             let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
             market_txs.push(mtx);
-            update_txs.push(utx);
+            update_txs.push(spool_tx);
+            update_dispatch_specs.push((spool_rx, utx));
             specs.push((s, mrx, urx));
         }
 
         thread::Builder::new()
             .name("strategy-router".into())
             .spawn(move || {
+                // A private update must never be dropped, but a stalled worker
+                // must also never stop the global market/private router. Each
+                // instance therefore owns an unbounded lossless spool plus one
+                // dispatcher that may backpressure only that instance's bounded
+                // worker lane.
+                let mut update_dispatch_handles =
+                    Vec::<thread::JoinHandle<()>>::with_capacity(update_dispatch_specs.len());
+                for (idx, (spool_rx, worker_tx)) in
+                    update_dispatch_specs.into_iter().enumerate()
+                {
+                    let iid = instance_ids[idx].clone();
+                    let handle = thread::Builder::new()
+                        .name(format!(
+                            "private-dispatch-{}",
+                            if iid.is_empty() { idx.to_string() } else { iid.clone() }
+                        ))
+                        .spawn(move || {
+                            while let Ok(queued) = spool_rx.recv() {
+                                if !send_private_update_lossless(&worker_tx, &iid, queued) {
+                                    break;
+                                }
+                                if spool_rx.len() >= CHANNEL_CAPACITY {
+                                    warn!(
+                                        "[private_update_spool_metric] instance={} depth={} action=instance_isolated_backlog",
+                                        iid,
+                                        spool_rx.len(),
+                                    );
+                                }
+                            }
+                        })
+                        .unwrap();
+                    update_dispatch_handles.push(handle);
+                }
+
                 // Spawn one worker per instance, each on its own core.
                 let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
                 for (idx, (strategy, mrx, urx)) in specs.into_iter().enumerate() {
@@ -3923,29 +3963,18 @@ impl Engine {
                                     Some(i) if i < update_txs.len() => {
                                         // Common path: transfer ownership to
                                         // one worker without cloning payload.
-                                        let _ = send_private_update_lossless(
-                                            &update_txs[i],
-                                            instance_ids.get(i).map(String::as_str).unwrap_or("<unknown>"),
-                                            QueuedOrderUpdate {
-                                                update: u,
-                                                enqueued_at: std::time::Instant::now(),
-                                            },
-                                        );
+                                        let _ = update_txs[i].send(QueuedOrderUpdate {
+                                            update: u,
+                                            enqueued_at: std::time::Instant::now(),
+                                        });
                                     }
                                     _ => {
                                         let enqueued_at = std::time::Instant::now();
-                                        for (idx, tx) in update_txs.iter().enumerate() {
-                                            let _ = send_private_update_lossless(
-                                                tx,
-                                                instance_ids
-                                                    .get(idx)
-                                                    .map(String::as_str)
-                                                    .unwrap_or("<unknown>"),
-                                                QueuedOrderUpdate {
-                                                    update: u.clone(),
-                                                    enqueued_at,
-                                                },
-                                            );
+                                        for tx in &update_txs {
+                                            let _ = tx.send(QueuedOrderUpdate {
+                                                update: u.clone(),
+                                                enqueued_at,
+                                            });
                                         }
                                     }
                                 }
@@ -3965,6 +3994,9 @@ impl Engine {
                 // Close worker channels → workers run on_shutdown and exit.
                 drop(market_txs);
                 drop(update_txs);
+                for handle in update_dispatch_handles {
+                    let _ = handle.join();
+                }
                 for h in handles { let _ = h.join(); }
                 // Single terminal Exit to the executor (workers don't send it).
                 let _ = signal_tx.send(Signal::Exit);
@@ -4138,8 +4170,14 @@ impl Engine {
         let mut update_queue_samples = 0u64;
         let mut update_queue_total_us = 0u128;
         let mut update_queue_max_us = 0u64;
+        let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         loop {
             crossbeam_channel::select! {
+                recv(watchdog_rx) -> _ => {
+                    for sig in strategy.on_watchdog(crate::types::now_ns()) {
+                        if !emit(sig) { return; }
+                    }
+                },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) if matches!(queued.event.as_ref(), MarketEvent::Exit) => {
                         strategy.on_exit();
@@ -5201,7 +5239,7 @@ impl Engine {
         // after every configured instance has joined the shared state, and
         // before any strategy worker can quote against the restored balances.
         for (account_id, shared) in &by_account {
-            let configured_instances: HashSet<String> = self
+            let configured_strategies: Vec<_> = self
                 .config
                 .strategies
                 .iter()
@@ -5213,9 +5251,56 @@ impl Engine {
                             .needs_poly_user_feed
                         && strategy.account_id() == account_id
                         && !strategy.instance_id.is_empty()
+                        && out.contains_key(&strategy.instance_id)
                 })
+                .collect();
+            let configured_instances: HashSet<String> = configured_strategies
+                .iter()
                 .map(|strategy| strategy.instance_id.clone())
                 .collect();
+            let target_weights: std::collections::BTreeMap<String, f64> = configured_strategies
+                .iter()
+                .map(|strategy| {
+                    let weight = if strategy.account_allocation_weight.is_finite()
+                        && strategy.account_allocation_weight > 0.0
+                    {
+                        strategy.account_allocation_weight
+                    } else {
+                        1.0
+                    };
+                    (strategy.instance_id.clone(), weight)
+                })
+                .collect();
+            let migration_ids: HashSet<&str> = configured_strategies
+                .iter()
+                .map(|strategy| strategy.account_allocation_migration_id.trim())
+                .filter(|migration_id| !migration_id.is_empty())
+                .collect();
+            let every_member_acknowledged = configured_strategies.iter().all(|strategy| {
+                !strategy.account_allocation_migration_id.trim().is_empty()
+            });
+            if shared.account_state.is_seeded() && !migration_ids.is_empty() {
+                if migration_ids.len() != 1 || !every_member_acknowledged {
+                    error!(
+                        "[Engine] account={} cash allocation migration rejected: every configured sibling must supply the same non-empty account_allocation_migration_id",
+                        account_id,
+                    );
+                } else if let Some(migration_id) = migration_ids.iter().next() {
+                    match shared
+                        .account_state
+                        .migrate_cash_allocation(migration_id, &target_weights)
+                    {
+                        Ok(migration) => info!(
+                            "[Engine] account={} applied/idempotently recovered cash allocation migration={} targets={:?}",
+                            account_id, migration.operation_id, migration.target_weights,
+                        ),
+                        Err(error) => error!(
+                            "[Engine] account={} cash allocation migration={} rejected: {}",
+                            account_id, migration_id, error,
+                        ),
+                    }
+                }
+            }
             shared
                 .account_state
                 .reconcile_configured_instances(&configured_instances);
@@ -6356,15 +6441,48 @@ fn fire_or_execute(
         {
             let coid = cancel_client_order_ids.into_iter().next().unwrap();
             let place = place_orders.into_iter().next().unwrap();
-            // Cancel is retained even when the replace signal has aged. The
-            // stale place leg is disposable and will be recomputed after the
-            // old order is confirmed off-book.
+            // ReplaceOrder is emitted only for a strictly more-aggressive
+            // replacement. Admit/fire the place leg independently BEFORE a
+            // potentially saturated retained-cancel wait, so Cancel-pool
+            // pressure cannot serialize or stale an otherwise-free Fast leg.
+            // Account admission still requires enough physical + virtual funds
+            // for both old and new reservations at the same time.
+            if is_stale(timestamp_ns) {
+                let _ = utx.send(exec_rejected_place(&place));
+            } else {
+                match try_acquire(&iid, Role::Fast) {
+                    None => {
+                        let _ = utx.send(exec_rejected_place(&place));
+                    }
+                    Some(ppermit) => {
+                        let pclient = ppermit.pooled_client();
+                        match worker.poly_route_mut(&iid).submit_fire(&place, pclient) {
+                            Ok(pending) => {
+                                let iid_p = iid.clone();
+                                let pf: PolyCompletionFn = Box::new(move |r| {
+                                    let u =
+                                        r.poly_route_mut(&iid_p).complete_submit(&place, pending);
+                                    drop(ppermit);
+                                    vec![u]
+                                });
+                                let _ = done_tx.send((pf, utx.clone()));
+                            }
+                            Err(update) => {
+                                drop(ppermit);
+                                let _ = utx.send(update);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Cancel remains monotonic and lossless. It is dispatched on its
+            // own pool even if the place was stale, saturated, or rejected.
             let wait_started = std::time::Instant::now();
             let cancel_permit = match acquire(&iid, Role::Cancel) {
                 Some(p) => p,
                 None => {
                     let _ = utx.send(exec_rejected_cancel(coid, exchange));
-                    let _ = utx.send(exec_rejected_place(&place));
                     return;
                 }
             };
@@ -6390,39 +6508,6 @@ fn fire_or_execute(
                 vec![u]
             });
             let _ = done_tx.send((cf, utx.clone()));
-            // The retained cancel may have waited on a saturated Cancel slot.
-            // Re-check age only after it has actually been dispatched; using
-            // the pre-wait value could place a quote that became stale during
-            // admission wait.
-            if is_stale(timestamp_ns) {
-                let _ = utx.send(exec_rejected_place(&place));
-                return;
-            }
-            // Place: independent Fast permit. If none, skip place only (the
-            // cancel already fired → pull-to-flat on this side, which is safe).
-            match try_acquire(&iid, Role::Fast) {
-                None => {
-                    let _ = utx.send(exec_rejected_place(&place));
-                }
-                Some(ppermit) => {
-                    let pclient = ppermit.pooled_client();
-                    match worker.poly_route_mut(&iid).submit_fire(&place, pclient) {
-                        Ok(pending) => {
-                            let iid_p = iid;
-                            let pf: PolyCompletionFn = Box::new(move |r| {
-                                let u = r.poly_route_mut(&iid_p).complete_submit(&place, pending);
-                                drop(ppermit);
-                                vec![u]
-                            });
-                            let _ = done_tx.send((pf, utx.clone()));
-                        }
-                        Err(update) => {
-                            drop(ppermit);
-                            let _ = utx.send(update);
-                        }
-                    }
-                }
-            }
         }
         // Reconcile: concurrency gate on the dedicated per-account Reconcile
         // pool (NOT full fire-track). The permit's exact client is threaded

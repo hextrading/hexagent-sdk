@@ -61,6 +61,10 @@ pub trait Strategy: Send {
     fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> { Vec::new() }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
+    /// Wall-clock safety callback for live workers. It runs even when every
+    /// market-data source is silent, allowing a strategy to cancel resting
+    /// orders without using a stale quote event as the trigger.
+    fn on_watchdog(&mut self, _now_ns: u64) -> Vec<Signal> { Vec::new() }
     fn on_exit(&mut self) {}
     /// Handle an OrderUpdate arriving from an exchange. Returning a non-empty
     /// `Vec<Signal>` lets the strategy react synchronously — e.g. fire a
