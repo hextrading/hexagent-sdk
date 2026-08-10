@@ -513,6 +513,14 @@ pub(crate) struct TrackedOrder {
     pub instance_id: String,
 }
 
+fn instance_owned_open_coids(open: &HashMap<String, TrackedOrder>, instance_id: &str) -> Vec<String> {
+    let mut coids: Vec<String> = open.iter()
+        .filter(|(_, tracked)| tracked.instance_id == instance_id)
+        .map(|(coid, _)| coid.clone()).collect();
+    coids.sort();
+    coids
+}
+
 /// Sliding-window rate limiter.
 struct RateLimiter {
     max_per_second: u32,
@@ -2065,6 +2073,7 @@ impl PolymarketTrade {
             )
         };
         let recovered_orders = account_state.orders();
+        let recovered_trades = account_state.restored_trades();
         let mut recovered_open = HashMap::new();
         let mut recovered_coid_to_oid = HashMap::new();
         let mut recovered_oid_to_coid = HashMap::new();
@@ -2124,7 +2133,7 @@ impl PolymarketTrade {
                 clob_version,
                 use_batch_orders,
                 clob_base_url,
-                live_position: Mutex::new(LivePositionManager::new()),
+                live_position: Mutex::new(LivePositionManager::from_restored(recovered_trades)),
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
                 gap_replay,
                 rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
@@ -2513,6 +2522,18 @@ impl PolymarketTrade {
         }
     }
 
+    pub fn cancel_instance_orders(&mut self) -> Result<Vec<OrderUpdate>> {
+        if self.instance_id.is_empty() {
+            return Err(anyhow!("instance-scoped cancel requires a non-empty instance_id"));
+        }
+        let coids = instance_owned_open_coids(
+            &self.shared.open_orders.lock().unwrap(),
+            &self.instance_id,
+        );
+        if coids.is_empty() { return Ok(Vec::new()); }
+        self.batch_cancel_orders(Exchange::Polymarket, "", &coids)
+    }
+
     /// Cancel every resting order for ONE market server-side via
     /// `DELETE /cancel-market-orders`. The endpoint requires BOTH `market`
     /// (condition_id) and `asset_id` (token_id) — they are both mandatory —
@@ -2594,9 +2615,11 @@ impl PolymarketTrade {
             };
             let (ledger_orders, ledger_trades) = self.shared.account_state
                 .prune_terminal_history(&retired_tokens);
-            if reclaimed > 0 || ledger_orders > 0 || ledger_trades > 0 {
-                info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} runtime mapping(s), {} ledger order(s), {} ledger trade(s) from {} matured batch(es)",
-                    market_condition_id, reclaimed, ledger_orders, ledger_trades, due.len());
+            let live_trades = self.shared.live_position.lock().unwrap()
+                .prune_terminal_history(&retired_tokens);
+            if reclaimed > 0 || ledger_orders > 0 || ledger_trades > 0 || live_trades > 0 {
+                info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) from {} matured batch(es)",
+                    market_condition_id, reclaimed, ledger_orders, ledger_trades, live_trades, due.len());
             }
         }
     }
@@ -6067,6 +6090,29 @@ mod tests {
         assert_eq!(
             HTTP_425_BACKOFF_NS, 1_000_000_000,
             "425/service-not-ready must use the selected one-second per-coid backoff",
+        );
+    }
+
+    #[test]
+    fn emergency_cancel_selector_excludes_healthy_sibling_orders() {
+        let open = HashMap::from([
+            ("a-2".to_string(), TrackedOrder {
+                symbol: "TOK".into(), side: Side::Buy, instance_id: "a".into(),
+            }),
+            ("b-1".to_string(), TrackedOrder {
+                symbol: "TOK".into(), side: Side::Sell, instance_id: "b".into(),
+            }),
+            ("a-1".to_string(), TrackedOrder {
+                symbol: "OTHER".into(), side: Side::Sell, instance_id: "a".into(),
+            }),
+        ]);
+        assert_eq!(
+            instance_owned_open_coids(&open, "a"),
+            vec!["a-1".to_string(), "a-2".to_string()],
+        );
+        assert_eq!(
+            instance_owned_open_coids(&open, "b"),
+            vec!["b-1".to_string()],
         );
     }
 }

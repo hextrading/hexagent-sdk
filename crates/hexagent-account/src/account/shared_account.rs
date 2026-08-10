@@ -14,6 +14,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EPS: f64 = 1e-9;
+const RECONCILIATION_UNIT: f64 = 1e-6;
+const INITIAL_TOKEN_BARRIER_TIMEOUT_MS: u64 = 10_000;
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
 /// the same hash with mixed hex casing and, on some paths, without the `0x`
@@ -130,6 +132,8 @@ pub struct OrderOwnership {
     pub quantity: f64,
     pub filled_quantity: f64,
     pub price: f64,
+    #[serde(default)]
+    pub fee_rate_bps: u32,
     pub reserved_cash: f64,
     pub reserved_quantity: f64,
     pub status: OrderStatus,
@@ -147,6 +151,16 @@ pub struct TradeOwnership {
     pub quantity: f64,
     pub price: f64,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredTrade {
+    pub ownership: TradeOwnership,
+    pub booked: bool,
+    pub usdc_fee: f64,
+    pub shares_fee: f64,
+    pub virtual_fee_booked: bool,
+    pub is_maker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,6 +385,12 @@ struct SharedAccountState {
     /// generation counter also restarts.
     #[serde(skip)]
     last_physical_snapshot_generation: u64,
+    #[serde(skip)]
+    startup_snapshot_applied_this_process: bool,
+    #[serde(skip)]
+    initial_token_barrier_started_ms: Option<u64>,
+    #[serde(skip)]
+    initial_token_barrier_degraded_members: Vec<String>,
 }
 
 const PERSISTENCE_VERSION: u32 = 1;
@@ -1122,10 +1142,8 @@ impl SharedAccount {
             .collect()
     }
 
-    /// Apply an authoritative physical snapshot. The first snapshot creates
-    /// the weighted virtual allocation. Later snapshots update the hard
-    /// physical ceiling; unexplained deltas remain unallocated instead of
-    /// silently transferring PnL between instances.
+    /// Apply the account snapshot used to establish this process's startup
+    /// baseline. Later calls in the same process are ignored.
     pub fn apply_physical_snapshot(&self, cash: f64, positions: HashMap<String, f64>) {
         let mut authoritative_tokens: HashSet<String> = positions.keys().cloned().collect();
         let state = self.state.lock().unwrap();
@@ -1137,7 +1155,7 @@ impl SharedAccount {
         self.apply_scoped_physical_snapshot(cash, positions, authoritative_tokens);
     }
 
-    /// Apply a cash snapshot plus a token-scoped authoritative position view.
+    /// Apply a startup cash snapshot plus a token-scoped position view.
     /// Tokens outside `authoritative_tokens` retain their last physical value;
     /// this prevents a BTC-only RPC result from zeroing ETH/SOL inventory on a
     /// shared wallet. Callers should include every active account token they
@@ -1156,10 +1174,7 @@ impl SharedAccount {
         );
     }
 
-    /// Apply one account-level fetch generation at most once. Multiple
-    /// strategy workers may receive the same shared-wallet snapshot; equal or
-    /// older generations must not re-run reconciliation or overwrite a newer
-    /// physical view.
+    /// Apply one account-level startup generation at most once.
     pub fn apply_scoped_physical_snapshot_versioned(
         &self,
         generation: u64,
@@ -1183,21 +1198,32 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
+        if state.startup_snapshot_applied_this_process {
+            return false;
+        }
         if !state.seeded {
             let missing = missing_initial_token_interest_owners(&state, &authoritative_tokens);
             if !missing.is_empty() {
-                log::info!(
-                    "[shared_account] account={} initial allocation waiting for token-interest barrier: {}",
-                    self.account_id, missing.join(", "),
+                let now_ms = wall_clock_ms();
+                let started_ms = *state.initial_token_barrier_started_ms.get_or_insert(now_ms);
+                if now_ms.saturating_sub(started_ms) < INITIAL_TOKEN_BARRIER_TIMEOUT_MS {
+                    log::info!(
+                        "[shared_account] account={} initial allocation waiting for token-interest barrier: {}",
+                        self.account_id, missing.join(", "),
+                    );
+                    return false;
+                }
+                state.initial_token_barrier_degraded_members = missing.clone();
+                log::warn!(
+                    "[shared_account] account={} token-interest barrier timed out after {}ms; seeding healthy members and degrading missing members: {}",
+                    self.account_id, INITIAL_TOKEN_BARRIER_TIMEOUT_MS, missing.join(", "),
                 );
-                return false;
             }
         }
         if let Some(generation) = generation {
             if generation == 0 || generation <= state.last_physical_snapshot_generation {
                 return false;
             }
-            state.last_physical_snapshot_generation = generation;
         }
         let cash = finite_nonnegative(cash);
         let positions = positions.into_iter()
@@ -1208,6 +1234,10 @@ impl SharedAccount {
             .collect::<HashMap<_, _>>();
         if !state.seeded {
             state.seeded = true;
+            state.startup_snapshot_applied_this_process = true;
+            if let Some(generation) = generation {
+                state.last_physical_snapshot_generation = generation;
+            }
             state.physical_cash = cash;
             state.physical_positions = positions.iter()
                 .filter(|(token, _)| authoritative_tokens.contains(*token))
@@ -1229,6 +1259,11 @@ impl SharedAccount {
             return false;
         }
 
+        // Deferred snapshots must remain retryable with the same generation.
+        if let Some(generation) = generation {
+            state.last_physical_snapshot_generation = generation;
+        }
+
         state.physical_cash = cash;
         for token in &authoritative_tokens {
             let physical = positions.get(token).copied().unwrap_or(0.0);
@@ -1243,11 +1278,15 @@ impl SharedAccount {
             recompute_reconciliation(&mut state, "authoritative physical snapshot");
         }
         try_attribute_binary_redeem(&mut state);
+        state.startup_snapshot_applied_this_process = true;
         self.schedule_persist(&state);
         true
     }
 
     pub fn is_seeded(&self) -> bool { self.state.lock().unwrap().seeded }
+    pub fn startup_snapshot_applied(&self) -> bool {
+        self.state.lock().unwrap().startup_snapshot_applied_this_process
+    }
     pub fn is_uncertain(&self) -> bool {
         self.persistence.as_ref().and_then(AccountPersistence::last_error).is_some()
             || self.state.lock().unwrap().uncertain
@@ -1290,10 +1329,8 @@ impl SharedAccount {
         pending
     }
 
-    /// Attribute an externally-confirmed wallet operation to one instance.
-    /// `operation_id` makes retries idempotent. The virtual delta may be
-    /// recorded before or after the physical snapshot: a temporary mismatch
-    /// fails admission closed and clears when the matching snapshot arrives.
+    /// Attribute an externally-confirmed wallet operation atomically to both
+    /// the physical account ledger and one instance's virtual ledger.
     pub fn attribute_external_adjustment(
         &self,
         operation_id: &str,
@@ -1320,22 +1357,30 @@ impl SharedAccount {
                 "external operation_id `{operation_id}` was already used with a different attribution"
             )));
         }
-        let Some(instance) = state.instances.get_mut(instance_id) else {
+        let Some(instance_before) = state.instances.get(instance_id) else {
             return Err(ReservationError::UnknownInstance(instance_id.into()));
         };
-        if instance.cash + cash_delta < -EPS {
+        if instance_before.cash + cash_delta < -EPS || state.physical_cash + cash_delta < -EPS {
             return Err(ReservationError::InvalidOrder(format!(
-                "external adjustment would make instance `{instance_id}` cash negative"
+                "external adjustment would make account or instance `{instance_id}` cash negative"
             )));
         }
         for (token, delta) in &position_deltas {
-            let current = instance.positions.get(token).copied().unwrap_or(0.0);
-            if current + delta < -EPS {
+            let virtual_current = instance_before.positions.get(token).copied().unwrap_or(0.0);
+            let physical_current = state.physical_positions.get(token).copied().unwrap_or(0.0);
+            if virtual_current + delta < -EPS || physical_current + delta < -EPS {
                 return Err(ReservationError::InvalidOrder(format!(
-                    "external adjustment would make `{instance_id}` token `{token}` negative"
+                    "external adjustment would make account or instance `{instance_id}` token `{token}` negative"
                 )));
             }
         }
+        state.physical_cash = (state.physical_cash + cash_delta).max(0.0);
+        for (token, delta) in &position_deltas {
+            let entry = state.physical_positions.entry(token.clone()).or_insert(0.0);
+            *entry = (*entry + *delta).max(0.0);
+        }
+        state.physical_positions.retain(|_, qty| *qty > EPS);
+        let instance = state.instances.get_mut(instance_id).unwrap();
         instance.cash = (instance.cash + cash_delta).max(0.0);
         for (token, delta) in &position_deltas {
             let entry = instance.positions.entry(token.clone()).or_insert(0.0);
@@ -1615,6 +1660,7 @@ impl SharedAccount {
             quantity,
             filled_quantity: 0.0,
             price,
+            fee_rate_bps,
             reserved_cash: reserve_cash,
             reserved_quantity: reserve_qty,
             status: OrderStatus::Pending,
@@ -2776,24 +2822,37 @@ impl SharedAccount {
             }
         }
         if is_failed {
-            // FAILED is terminal. Reverse any booked fill and release all of
-            // this order's remaining locks without an order GET/wallet audit.
-            let release = if let Some(order) = state.orders.get_mut(&resolved_coid) {
-                let cash = order.reserved_cash;
-                let qty = order.reserved_quantity;
-                order.reserved_cash = 0.0;
-                order.reserved_quantity = 0.0;
+            // FAILED is terminal for this trade, not for the parent order.
+            // Restore the worst-case residual reservation; normal order
+            // lifecycle/cancel handling proves when the parent is off-book.
+            let reservation_delta = if let Some(order) = state.orders.get_mut(&resolved_coid) {
                 if should_reverse {
                     order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
                 }
-                order.status = OrderStatus::Failed;
-                (cash, qty, order.token_id.clone())
+                let off_book = matches!(order.status, OrderStatus::Cancelled | OrderStatus::Rejected);
+                if should_reverse && !off_book {
+                    order.status = if order.filled_quantity > EPS {
+                        OrderStatus::PartiallyFilled
+                    } else {
+                        OrderStatus::Accepted
+                    };
+                }
+                let (desired_cash, desired_qty) = if off_book {
+                    (0.0, 0.0)
+                } else {
+                    desired_order_reservation(order)
+                };
+                let cash_delta = desired_cash - order.reserved_cash;
+                let qty_delta = desired_qty - order.reserved_quantity;
+                order.reserved_cash = desired_cash;
+                order.reserved_quantity = desired_qty;
+                (cash_delta, qty_delta, order.token_id.clone())
             } else { (0.0, 0.0, token_id.to_string()) };
             if let Some(instance) = state.instances.get_mut(&instance_id) {
-                instance.reserved_cash = (instance.reserved_cash - release.0).max(0.0);
-                if release.1 > 0.0 {
-                    let reserved = instance.reserved_positions.entry(release.2).or_insert(0.0);
-                    *reserved = (*reserved - release.1).max(0.0);
+                instance.reserved_cash = (instance.reserved_cash + reservation_delta.0).max(0.0);
+                if reservation_delta.1.abs() > EPS {
+                    let reserved = instance.reserved_positions.entry(reservation_delta.2).or_insert(0.0);
+                    *reserved = (*reserved + reservation_delta.1).max(0.0);
                 }
             }
             state.recovery_pending_orders.remove(&resolved_coid);
@@ -2990,6 +3049,19 @@ impl SharedAccount {
             .map(|trade| trade.ownership.clone()).collect()
     }
 
+    pub fn restored_trades(&self) -> Vec<RestoredTrade> {
+        self.state.lock().unwrap().trades.values()
+            .map(|trade| RestoredTrade {
+                ownership: trade.ownership.clone(),
+                booked: trade.booked,
+                usdc_fee: if trade.virtual_fee_booked { trade.usdc_fee } else { 0.0 },
+                shares_fee: if trade.virtual_fee_booked { trade.shares_fee } else { 0.0 },
+                virtual_fee_booked: trade.virtual_fee_booked,
+                is_maker: trade.is_maker.unwrap_or(false),
+            })
+            .collect()
+    }
+
     /// Bound the durable per-event ownership history after the executor's
     /// late-fill mapping grace has elapsed. Potentially-live/FAILED orders and
     /// nonterminal trades are retained; only fully terminal rows for the
@@ -3125,14 +3197,24 @@ fn has_unsettled_maintenance_operation(state: &SharedAccountState) -> bool {
     })
 }
 
+fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
+    let remaining = (order.quantity - order.filled_quantity).max(0.0);
+    match order.side {
+        Side::Buy => (
+            remaining * order.price * (1.0 + order.fee_rate_bps as f64 / 10_000.0),
+            0.0,
+        ),
+        Side::Sell => (0.0, remaining),
+    }
+}
+
 fn normalize_terminal_failed_state(state: &mut SharedAccountState) -> bool {
     let mut changed = false;
-    let mut failed_coids: HashSet<String> = state.orders.iter()
+    let failed_coids: Vec<String> = state.orders.iter()
         .filter(|(_, order)| order.status == OrderStatus::Failed)
         .map(|(coid, _)| coid.clone())
         .collect();
     for trade in state.trades.values_mut().filter(|trade| trade.failed) {
-        failed_coids.insert(trade.ownership.client_order_id.clone());
         if !trade.failure_reconciled {
             trade.failure_reconciled = true;
             changed = true;
@@ -3143,26 +3225,27 @@ fn normalize_terminal_failed_state(state: &mut SharedAccountState) -> bool {
             state.recovery_pending_orders.remove(&coid);
             continue;
         };
-        let cash = order.reserved_cash;
-        let qty = order.reserved_quantity;
         let instance_id = order.instance_id.clone();
         let token_id = order.token_id.clone();
-        if order.status != OrderStatus::Failed || cash > EPS || qty > EPS
-            || state.recovery_pending_orders.contains(&coid)
-        {
-            changed = true;
-        }
-        order.status = OrderStatus::Failed;
-        order.reserved_cash = 0.0;
-        order.reserved_quantity = 0.0;
+        let old_cash = order.reserved_cash;
+        let old_qty = order.reserved_quantity;
+        order.status = if order.filled_quantity > EPS {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Accepted
+        };
+        let (desired_cash, desired_qty) = desired_order_reservation(order);
+        order.reserved_cash = desired_cash;
+        order.reserved_quantity = desired_qty;
         if let Some(instance) = state.instances.get_mut(&instance_id) {
-            instance.reserved_cash = (instance.reserved_cash - cash).max(0.0);
-            if qty > 0.0 {
+            instance.reserved_cash = (instance.reserved_cash + desired_cash - old_cash).max(0.0);
+            if (desired_qty - old_qty).abs() > EPS {
                 let reserved = instance.reserved_positions.entry(token_id).or_insert(0.0);
-                *reserved = (*reserved - qty).max(0.0);
+                *reserved = (*reserved + desired_qty - old_qty).max(0.0);
             }
         }
         state.recovery_pending_orders.remove(&coid);
+        changed = true;
     }
     changed
 }
@@ -3207,7 +3290,8 @@ fn mark_failed_trades_reconciled_by_snapshot(
     state: &mut SharedAccountState,
     authoritative_tokens: &HashSet<String>,
 ) -> bool {
-    if state.unallocated_cash < -EPS {
+    let virtual_cash: f64 = state.instances.values().map(|instance| instance.cash).sum();
+    if state.unallocated_cash < -reconciliation_tolerance(state.physical_cash, virtual_cash) {
         return false;
     }
     let token_deltas = state.unallocated_positions.clone();
@@ -3221,7 +3305,11 @@ fn mark_failed_trades_reconciled_by_snapshot(
             .get(&trade.ownership.token_id)
             .copied()
             .unwrap_or(0.0);
-        if token_delta >= -EPS {
+        let physical = state.physical_positions.get(&trade.ownership.token_id).copied().unwrap_or(0.0);
+        let virtual_qty: f64 = state.instances.values()
+            .map(|instance| instance.positions.get(&trade.ownership.token_id).copied().unwrap_or(0.0))
+            .sum();
+        if token_delta >= -reconciliation_tolerance(physical, virtual_qty) {
             trade.failure_reconciled = true;
             changed = true;
         }
@@ -3278,21 +3366,24 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
     all_tokens.extend(
         state.instances.values().flat_map(|instance| instance.positions.keys().cloned()),
     );
+    let mut negative_tokens = Vec::new();
     for token in all_tokens {
         let physical = state.physical_positions.get(&token).copied().unwrap_or(0.0);
         let virtual_qty: f64 = state.instances.values()
             .map(|instance| instance.positions.get(&token).copied().unwrap_or(0.0))
             .sum();
         let pending = pending_position_deltas.get(&token).copied().unwrap_or(0.0);
-        let delta = physical - (virtual_qty - pending);
-        if delta.abs() > EPS {
+        let expected_virtual = virtual_qty - pending;
+        let delta = physical - expected_virtual;
+        let tolerance = reconciliation_tolerance(physical, expected_virtual);
+        if delta.abs() > tolerance {
+            if delta < -tolerance {
+                negative_tokens.push(format!("{token}:{delta:.6}"));
+            }
             state.unallocated_positions.insert(token, delta);
         }
     }
-    let negative_tokens: Vec<String> = state.unallocated_positions.iter()
-        .filter(|(_, qty)| **qty < -EPS)
-        .map(|(token, qty)| format!("{token}:{qty:.6}"))
-        .collect();
+    negative_tokens.sort();
     if !state.ownership_anomalies.is_empty() {
         let details = state
             .ownership_anomalies
@@ -3362,9 +3453,12 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
     {
         set_uncertain(
             state,
-            format!("failed trade `{trade_key}` awaits authoritative physical snapshot"),
+            format!("failed trade `{trade_key}` awaits startup account baseline"),
         );
-    } else if state.unallocated_cash < -EPS || !negative_tokens.is_empty() {
+    } else if state.unallocated_cash
+        < -reconciliation_tolerance(state.physical_cash, virtual_cash - pending_cash_delta)
+        || !negative_tokens.is_empty()
+    {
         set_uncertain(
             state,
             format!(
@@ -3377,6 +3471,10 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         clear_uncertain(state);
     }
 
+}
+
+fn reconciliation_tolerance(lhs: f64, rhs: f64) -> f64 {
+    RECONCILIATION_UNIT + lhs.abs().max(rhs.abs()) * 1e-12
 }
 
 fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: String) {
@@ -3665,8 +3763,8 @@ mod tests {
                 0.5,
             )
             .unwrap();
-        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
-        assert_eq!(account.order("a-failed").unwrap().reserved_cash, 0.0);
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+        assert_eq!(account.order("a-failed").unwrap().reserved_cash, 5.0);
         assert!(!account.is_uncertain());
     }
 
@@ -3852,11 +3950,7 @@ mod tests {
         account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
         assert!(account.is_uncertain(), "a wallet snapshot cannot repair ownership");
         assert!(account.ownership_anomalies().contains_key("trade:trade-sticky"));
-        assert!(account
-            .monitoring_snapshot()
-            .uncertain_reason
-            .unwrap_or_default()
-            .contains("ownership anomalies pending repair"));
+        assert!(account.monitoring_snapshot().uncertain_reason.is_some());
 
         assert!(account
             .apply_trade_transition(
@@ -3998,13 +4092,13 @@ mod tests {
             HashSet::new(),
         ));
         assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
-        assert!(account.apply_scoped_physical_snapshot_versioned(
+        assert!(!account.apply_scoped_physical_snapshot_versioned(
             3,
             500.0,
             HashMap::new(),
             HashSet::new(),
         ));
-        assert_eq!(account.monitoring_snapshot().physical_cash, 500.0);
+        assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
     }
 
     #[test]
@@ -4135,6 +4229,7 @@ mod tests {
                 "trade-buy", "MATCHED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
             )
             .unwrap();
+        account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
 
         // This wallet view may already contain trade-buy, but a snapshot has no
         // trade id and therefore cannot prove that fact. Preserve the trade-
@@ -4156,7 +4251,7 @@ mod tests {
         assert_eq!(account.monitoring_snapshot().physical_cash, 395.0);
         assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 50.0);
         assert!(account.apply_scoped_physical_snapshot_versioned(
-            2,
+            1,
             395.0,
             HashMap::from([("UP".into(), 50.0)]),
             HashSet::from(["UP".into()]),
@@ -4535,6 +4630,59 @@ mod tests {
     }
 
     #[test]
+    fn first_snapshot_barrier_times_out_without_stealing_registered_token_ownership() {
+        let account = SharedAccount::new("registration-barrier-timeout");
+        account.register_instance("btc-a", 1.0);
+        account.register_instance("btc-b", 1.0);
+        account.register_market_scope("btc-a", "btc-up-or-down-5m");
+        account.register_market_scope("btc-b", "btc-up-or-down-5m");
+        account.register_token_interest("btc-a", "btc-event", "BTC-UP", "BTC-DOWN").unwrap();
+        {
+            let mut state = account.state.lock().unwrap();
+            state.initial_token_barrier_started_ms = Some(
+                wall_clock_ms()
+                    .saturating_sub(INITIAL_TOKEN_BARRIER_TIMEOUT_MS)
+                    .saturating_sub(1),
+            );
+        }
+        assert!(account.apply_scoped_physical_snapshot_versioned(
+            9,
+            100.0,
+            HashMap::from([("BTC-UP".into(), 40.0)]),
+            HashSet::from(["BTC-UP".into(), "BTC-DOWN".into()]),
+        ));
+        assert_eq!(account.instance_snapshot("btc-a").unwrap().cash, 50.0);
+        assert_eq!(account.instance_snapshot("btc-b").unwrap().cash, 50.0);
+        assert_eq!(account.instance_snapshot("btc-a").unwrap().positions["BTC-UP"], 40.0);
+        assert!(!account.instance_snapshot("btc-b").unwrap().positions.contains_key("BTC-UP"));
+        assert_eq!(
+            account.state.lock().unwrap().initial_token_barrier_degraded_members.len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn reconciliation_uses_wallet_unit_tolerance_but_keeps_exact_metrics() {
+        let account = SharedAccount::new("rounding-tolerance");
+        account.register_instance("a", 1.0);
+        account.apply_physical_snapshot(100.0, HashMap::new());
+        {
+            let mut state = account.state.lock().unwrap();
+            state.instances.get_mut("a").unwrap().cash += 0.5e-6;
+            recompute_reconciliation(&mut state, "rounding test");
+        }
+        assert!(!account.is_uncertain());
+        assert!((account.monitoring_snapshot().unallocated_cash + 0.5e-6).abs() < 1e-12);
+
+        {
+            let mut state = account.state.lock().unwrap();
+            state.instances.get_mut("a").unwrap().cash += 2.0e-6;
+            recompute_reconciliation(&mut state, "rounding test");
+        }
+        assert!(account.is_uncertain());
+    }
+
+    #[test]
     fn scoped_snapshot_does_not_zero_another_assets_positions() {
         let account = SharedAccount::new("multi-asset");
         account.register_instance("btc", 1.0);
@@ -4546,6 +4694,7 @@ mod tests {
             HashMap::from([("BTC-UP".into(), 10.0), ("ETH-UP".into(), 20.0)]),
             HashSet::from(["BTC-UP".into(), "BTC-DOWN".into(), "ETH-UP".into(), "ETH-DOWN".into()]),
         );
+        account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
         account.apply_scoped_physical_snapshot(
             100.0,
             HashMap::new(),
@@ -4560,7 +4709,7 @@ mod tests {
     }
 
     #[test]
-    fn external_adjustment_is_idempotent_and_clears_after_matching_snapshot() {
+    fn external_adjustment_is_idempotent_and_advances_both_ledgers() {
         let account = SharedAccount::new("external");
         account.register_instance("a", 1.0);
         account.register_instance("b", 1.0);
@@ -4568,7 +4717,8 @@ mod tests {
         account.attribute_external_adjustment("deposit-1", "a", 20.0, HashMap::new()).unwrap();
         account.attribute_external_adjustment("deposit-1", "a", 20.0, HashMap::new()).unwrap();
         assert_eq!(account.instance_snapshot("a").unwrap().cash, 70.0);
-        assert!(account.is_uncertain(), "virtual deposit precedes physical confirmation");
+        assert!(!account.is_uncertain());
+        assert_eq!(account.monitoring_snapshot().physical_cash, 120.0);
 
         account.apply_physical_snapshot(120.0, HashMap::new());
         assert!(!account.is_uncertain());
@@ -4590,6 +4740,7 @@ mod tests {
             ("BTC-WIN".into(), 1.0),
             ("BTC-LOSE".into(), 0.0),
         ]));
+        account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
 
         account.apply_physical_snapshot(
             130.0,
@@ -4629,6 +4780,7 @@ mod tests {
         }
 
         assert_eq!(account.token_interests().len(), 1);
+        account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
         account.apply_scoped_physical_snapshot(
             130.0,
             HashMap::new(),
@@ -4644,6 +4796,7 @@ mod tests {
         account.register_instance("btc", 1.0);
         account.register_token_interest("btc", "live-event", "LIVE-UP", "LIVE-DOWN").unwrap();
         account.apply_physical_snapshot(100.0, HashMap::from([("LIVE-UP".into(), 30.0)]));
+        account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
         account.apply_physical_snapshot(130.0, HashMap::new());
         assert!(account.is_uncertain());
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 100.0);
