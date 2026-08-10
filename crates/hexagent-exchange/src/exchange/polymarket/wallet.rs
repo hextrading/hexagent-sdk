@@ -3982,6 +3982,28 @@ static MAINTENANCE_QUEUES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>>,
 > = std::sync::OnceLock::new();
 
+const MAINTENANCE_COALESCE_IDLE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const MAINTENANCE_COALESCE_MAX: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Cross-operation account lock. Split/redeem and merge have independent
+/// coalescing queues, but transactions for one wallet must still be strictly
+/// serialized so they cannot race on collateral, ERC-1155 inventory, or the
+/// Safe/signer nonce.
+static ACCOUNT_MAINTENANCE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn account_maintenance_lock(account_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let locks = ACCOUNT_MAINTENANCE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(account_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Enqueue a job onto its account's serial worker, spawning the worker on
 /// first use. Writes `Running` to the status handle IMMEDIATELY (before
 /// the worker may even pick it up) so a job that waits in queue behind a
@@ -4001,17 +4023,31 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         std::thread::Builder::new()
             .name(format!("poly-maint-{}", worker_label))
             .spawn(move || {
-                // Serial drain with a short coalescing window. Jobs for the
+                // Serial drain with an idle-debounce coalescing window. Jobs for the
                 // same account + series arriving together (the normal case
                 // for sibling instances on one event boundary) become one
                 // on-chain redeem/split operation.
                 while let Ok(first) = rx.recv() {
                     let mut burst = vec![first];
-                    while let Ok(next) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                        burst.push(next);
+                    let burst_started = std::time::Instant::now();
+                    while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
+                        let remaining = MAINTENANCE_COALESCE_MAX
+                            .saturating_sub(burst_started.elapsed());
+                        match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
+                            Ok(next) => burst.push(next),
+                            Err(_) => break,
+                        }
                     }
-                    for (job, _, _) in &mut burst {
-                        resolve_maintenance_split_target(job);
+                    // Gamma resolution can itself take longer than the idle
+                    // window. Include everything that arrived while it was in
+                    // flight, resolving identical selectors via singleflight.
+                    loop {
+                        for (job, _, _) in &mut burst {
+                            resolve_maintenance_split_target(job);
+                        }
+                        let before = burst.len();
+                        burst.extend(rx.try_iter());
+                        if burst.len() == before { break; }
                     }
                     let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
                     for item in burst {
@@ -4065,16 +4101,10 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
         return;
     }
     let Some(series_id) = job.split_series_id.as_deref() else { return; };
-    match super::market::fetch_next_event(series_id, job.split_end_date_min_secs) {
-        Ok(Some(event)) => {
-            if let Some(market) = event
-                .markets
-                .first()
-                .filter(|market| !market.condition_id.is_empty())
-            {
-                job.split_target_condition_id = Some(market.condition_id.clone());
-                job.split_target_token_ids = market.clob_token_ids.clone();
-            }
+    match cached_maintenance_split_target(series_id, job.split_end_date_min_secs) {
+        Ok(Some(target)) => {
+            job.split_target_condition_id = Some(target.condition_id);
+            job.split_target_token_ids = target.token_ids;
         }
         Ok(None) => {
             log::info!("[Maintenance] Split skipped: no matching next event.");
@@ -4083,6 +4113,85 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
             log::warn!("[Maintenance] fetch_next_event failed: {}", error);
         }
     }
+}
+
+#[derive(Clone)]
+struct ResolvedMaintenanceTarget {
+    condition_id: String,
+    token_ids: Vec<String>,
+}
+
+enum MaintenanceTargetCacheEntry {
+    Fetching,
+    Ready {
+        fetched_at: std::time::Instant,
+        target: Option<ResolvedMaintenanceTarget>,
+    },
+}
+
+type MaintenanceTargetKey = (String, u64);
+type MaintenanceTargetCache = (
+    std::sync::Mutex<std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>>,
+    std::sync::Condvar,
+);
+
+static MAINTENANCE_TARGET_CACHE: std::sync::OnceLock<MaintenanceTargetCache> =
+    std::sync::OnceLock::new();
+
+fn cached_maintenance_split_target(
+    series_id: &str,
+    end_date_min_secs: u64,
+) -> std::result::Result<Option<ResolvedMaintenanceTarget>, String> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+    let key = (series_id.to_string(), end_date_min_secs);
+    let (cache, ready) = MAINTENANCE_TARGET_CACHE.get_or_init(|| {
+        (std::sync::Mutex::new(std::collections::HashMap::new()), std::sync::Condvar::new())
+    });
+    loop {
+        let mut entries = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, entry| match entry {
+            MaintenanceTargetCacheEntry::Fetching => true,
+            MaintenanceTargetCacheEntry::Ready { fetched_at, .. } => fetched_at.elapsed() < CACHE_TTL,
+        });
+        match entries.get(&key) {
+            Some(MaintenanceTargetCacheEntry::Ready { target, .. }) => return Ok(target.clone()),
+            Some(MaintenanceTargetCacheEntry::Fetching) => {
+                drop(ready.wait(entries).unwrap_or_else(|poisoned| poisoned.into_inner()));
+                continue;
+            }
+            None => {
+                entries.insert(key.clone(), MaintenanceTargetCacheEntry::Fetching);
+                break;
+            }
+        }
+    }
+
+    let fetched = super::market::fetch_next_event(series_id, end_date_min_secs)
+        .map_err(|error| error.to_string())
+        .map(|event| {
+            event.and_then(|event| {
+                event.markets.first()
+                    .filter(|market| !market.condition_id.is_empty())
+                    .map(|market| ResolvedMaintenanceTarget {
+                        condition_id: market.condition_id.clone(),
+                        token_ids: market.clob_token_ids.clone(),
+                    })
+            })
+        });
+    let mut entries = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match &fetched {
+        Ok(target) => {
+            entries.insert(key, MaintenanceTargetCacheEntry::Ready {
+                fetched_at: std::time::Instant::now(),
+                target: target.clone(),
+            });
+        }
+        Err(_) => {
+            entries.remove(&key);
+        }
+    }
+    ready.notify_all();
+    fetched
 }
 
 /// Fire-and-forget submit (live strategy). Returns immediately; the
@@ -4145,6 +4254,10 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
         allocations.len().max(1), job.account_id, job.split_series_id,
         job.split_amount_usdc, allocations,
     );
+    let account_lock = account_maintenance_lock(&job.account_id);
+    let _operation_guard = account_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     run_maintenance_job(job, allocations);
     let terminal = statuses.first()
         .map(|status| status.lock().unwrap().clone());
@@ -4156,6 +4269,390 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     for sender in done.into_iter().flatten() {
         let _ = sender.send(());
     }
+}
+
+/// One instance's request to merge equal Up+Down inventory back into account
+/// collateral. Requests for the same account/condition are coalesced before
+/// submission, while `allocations` remain instance-specific in the durable
+/// shared-account ledger.
+pub struct MergeMaintenanceJob {
+    pub condition_id: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    pub amount_usdc: f64,
+    pub gas_via_signer: bool,
+    pub dry_run: bool,
+    pub account_id: String,
+    pub instance_id: String,
+    pub account_state: Option<std::sync::Arc<
+        hexagent_account::account::shared_account::SharedAccount,
+    >>,
+}
+
+type MergeQueueItem = (
+    MergeMaintenanceJob,
+    Option<crossbeam_channel::Sender<std::result::Result<(), String>>>,
+    std::time::Instant,
+);
+
+static MERGE_MAINTENANCE_QUEUES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MergeQueueItem>>>,
+> = std::sync::OnceLock::new();
+
+fn merge_jobs_share_target(left: &MergeMaintenanceJob, right: &MergeMaintenanceJob) -> bool {
+    left.condition_id == right.condition_id
+        && left.up_token_id == right.up_token_id
+        && left.down_token_id == right.down_token_id
+        && left.gas_via_signer == right.gas_via_signer
+        && left.dry_run == right.dry_run
+}
+
+fn enqueue_merge_maintenance(
+    job: MergeMaintenanceJob,
+    done: Option<crossbeam_channel::Sender<std::result::Result<(), String>>>,
+) {
+    let account = job.account_id.clone();
+    let queues = MERGE_MAINTENANCE_QUEUES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tx = map.entry(account.clone()).or_insert_with(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<MergeQueueItem>();
+        let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        std::thread::Builder::new()
+            .name(format!("poly-merge-{}", worker_label))
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut burst = vec![first];
+                    let burst_started = std::time::Instant::now();
+                    while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
+                        let remaining = MAINTENANCE_COALESCE_MAX
+                            .saturating_sub(burst_started.elapsed());
+                        match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
+                            Ok(next) => burst.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut groups: Vec<Vec<MergeQueueItem>> = Vec::new();
+                    for item in burst {
+                        if let Some(group) = groups.iter_mut().find(|group| {
+                            merge_jobs_share_target(&group[0].0, &item.0)
+                        }) {
+                            group.push(item);
+                        } else {
+                            groups.push(vec![item]);
+                        }
+                    }
+                    for group in groups {
+                        run_merge_maintenance_group(group);
+                    }
+                }
+            })
+            .expect("Failed to spawn merge maintenance worker");
+        tx
+    });
+    if let Err(error) = tx.send((job, done, std::time::Instant::now())) {
+        log::warn!("[Maintenance] merge enqueue failed (worker gone): {}", error);
+    }
+}
+
+/// Fire-and-forget merge submission for live callers.
+pub fn submit_merge_maintenance(job: MergeMaintenanceJob) {
+    enqueue_merge_maintenance(job, None);
+}
+
+/// Blocking merge submission for the operator CLI.
+pub fn run_merge_maintenance_blocking(job: MergeMaintenanceJob) -> Result<()> {
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    enqueue_merge_maintenance(job, Some(done_tx));
+    done_rx.recv()
+        .map_err(|error| anyhow!("merge maintenance worker stopped: {}", error))?
+        .map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MergeOutcome {
+    Confirmed,
+    DryRun,
+    SubmitFailed(String),
+    PendingTimeout(String),
+}
+
+fn run_merge_maintenance_group(mut items: Vec<MergeQueueItem>) {
+    if items.is_empty() { return; }
+    for (item, _, enqueued_at) in &items {
+        if let Some(account) = &item.account_state {
+            account.record_maintenance_queue_wait(enqueued_at.elapsed());
+        }
+    }
+    let (mut job, first_done, _) = items.remove(0);
+    let mut done = vec![first_done];
+    let mut allocations = std::collections::HashMap::<String, f64>::new();
+    if !job.instance_id.is_empty() && job.amount_usdc > 0.0 {
+        allocations.insert(job.instance_id.clone(), job.amount_usdc);
+    }
+    for (sibling, sibling_done, _) in items {
+        job.amount_usdc += sibling.amount_usdc;
+        if job.account_state.is_none() {
+            job.account_state = sibling.account_state.clone();
+        }
+        if !sibling.instance_id.is_empty() && sibling.amount_usdc > 0.0 {
+            *allocations.entry(sibling.instance_id).or_insert(0.0) += sibling.amount_usdc;
+        }
+        done.push(sibling_done);
+    }
+    log::info!(
+        "[Maintenance] Coalesced merge: account={} cid={} total={} allocations={:?}",
+        job.account_id, job.condition_id, job.amount_usdc, allocations,
+    );
+    let account_lock = account_maintenance_lock(&job.account_id);
+    let _operation_guard = account_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = run_merge_maintenance_job(job, allocations);
+    if let Err(reason) = &result {
+        log::warn!("[Maintenance] Merge failed: {}", reason);
+    }
+    for sender in done.into_iter().flatten() {
+        let _ = sender.send(result.clone());
+    }
+}
+
+fn run_merge_maintenance_job(
+    job: MergeMaintenanceJob,
+    allocations: std::collections::HashMap<String, f64>,
+) -> std::result::Result<(), String> {
+    if job.condition_id.is_empty() || job.up_token_id.is_empty() || job.down_token_id.is_empty() {
+        return Err("merge requires condition_id and both outcome token ids".to_string());
+    }
+    if !job.amount_usdc.is_finite() || job.amount_usdc <= 0.0 {
+        return Err(format!("merge amount must be positive, got {}", job.amount_usdc));
+    }
+    if !job.dry_run && (job.instance_id.is_empty() || job.account_state.is_none()) {
+        return Err("live merge requires explicit instance ownership and a shared-account ledger".to_string());
+    }
+    if !job.dry_run {
+        if let Some(account) = job.account_state.as_ref() {
+            account.reserve_merge_allocations(
+                &job.up_token_id,
+                &job.down_token_id,
+                &allocations,
+            ).map_err(|error| format!("shared-account merge admission: {}", error))?;
+        }
+    }
+
+    let wallet = match load_wallet_for_account(&job.account_id) {
+        Ok(wallet) => wallet,
+        Err(error) => {
+            if let Some(account) = job.account_state.as_ref() {
+                account.release_merge_allocations(
+                    &job.up_token_id, &job.down_token_id, &allocations,
+                );
+                if let Err(persist_error) =
+                    account.flush_persistence(std::time::Duration::from_secs(2))
+                {
+                    account.mark_uncertain_with_reason(format!(
+                        "merge reservation release persistence failed cid={}: {}",
+                        job.condition_id, persist_error,
+                    ));
+                }
+            }
+            return Err(format!("load_wallet: {}", error));
+        }
+    };
+    let outcome = run_merge_one(
+        &wallet,
+        &job.condition_id,
+        job.amount_usdc,
+        job.gas_via_signer,
+        job.dry_run,
+    );
+    match outcome {
+        MergeOutcome::Confirmed => {
+            if let Some(account) = job.account_state.as_ref() {
+                if let Err(error) = account.confirm_reserved_merge(
+                    &job.up_token_id,
+                    &job.down_token_id,
+                    &allocations,
+                ) {
+                    account.mark_uncertain_with_reason(format!(
+                        "confirmed maintenance merge attribution failed cid={}: {}",
+                        job.condition_id, error,
+                    ));
+                    return Err(format!(
+                        "on-chain merge confirmed but virtual attribution failed: {}", error,
+                    ));
+                }
+                if let Err(error) = account.flush_persistence(std::time::Duration::from_secs(2)) {
+                    account.mark_uncertain_with_reason(format!(
+                        "confirmed maintenance merge persistence failed cid={}: {}",
+                        job.condition_id, error,
+                    ));
+                    return Err(format!(
+                        "on-chain merge confirmed but ledger persistence failed: {}", error,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        MergeOutcome::DryRun => Ok(()),
+        MergeOutcome::SubmitFailed(reason) => {
+            if let Some(account) = job.account_state.as_ref() {
+                account.release_merge_allocations(
+                    &job.up_token_id, &job.down_token_id, &allocations,
+                );
+                if let Err(error) =
+                    account.flush_persistence(std::time::Duration::from_secs(2))
+                {
+                    account.mark_uncertain_with_reason(format!(
+                        "merge reservation release persistence failed cid={}: {}",
+                        job.condition_id, error,
+                    ));
+                    return Err(format!(
+                        "merge submit failed: {}; reservation release persistence failed: {}",
+                        reason, error,
+                    ));
+                }
+            }
+            Err(format!("merge submit failed: {}", reason))
+        }
+        MergeOutcome::PendingTimeout(reason) => {
+            // Keep the durable reservation: the transaction may still land,
+            // so releasing it would let an order double-spend the same legs.
+            if let Some(account) = job.account_state.as_ref() {
+                account.mark_uncertain_with_reason(format!(
+                    "maintenance merge finality uncertain cid={}: {}",
+                    job.condition_id, reason,
+                ));
+                let _ = account.flush_persistence(std::time::Duration::from_secs(2));
+            }
+            Err(format!("merge finality uncertain: {}", reason))
+        }
+    }
+}
+
+fn run_merge_one(
+    wallet: &WalletInfo,
+    condition_id: &str,
+    amount_usdc: f64,
+    gas_via_signer: bool,
+    dry_run: bool,
+) -> MergeOutcome {
+    let amount_wei = (amount_usdc * 1_000_000.0).round().max(0.0) as u128;
+    if amount_wei == 0 {
+        return MergeOutcome::SubmitFailed("amount rounds to zero".to_string());
+    }
+    if let Some(deposit_wallet) = wallet.deposit_wallet_active() {
+        return match super::deposit_wallet::dw_merge(
+            &wallet.signing_key,
+            &wallet.signer_address,
+            deposit_wallet,
+            &wallet.builder_auth,
+            condition_id,
+            amount_wei,
+            dry_run,
+        ) {
+            Ok(_) if dry_run => MergeOutcome::DryRun,
+            Ok(_) => MergeOutcome::Confirmed,
+            Err(error) => MergeOutcome::SubmitFailed(error.to_string()),
+        };
+    }
+
+    let is_v2 = read_clob_v2_flag();
+    let (target_contract, collateral_token) = ctf_target(is_v2, false);
+    let cid_bytes = match hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id)) {
+        Ok(bytes) if bytes.len() <= 32 => bytes,
+        Ok(bytes) => return MergeOutcome::SubmitFailed(format!(
+            "condition_id is {} bytes, expected at most 32", bytes.len(),
+        )),
+        Err(error) => return MergeOutcome::SubmitFailed(format!("condition_id hex: {}", error)),
+    };
+    let mut cid_padded = [0u8; 32];
+    cid_padded[32 - cid_bytes.len()..].copy_from_slice(&cid_bytes);
+    let mut calldata = Vec::with_capacity(4 + 32 * 8);
+    calldata.extend_from_slice(&[0x9e, 0x72, 0x12, 0xad]);
+    calldata.extend_from_slice(&address_to_bytes32(collateral_token));
+    calldata.extend_from_slice(&[0u8; 32]);
+    calldata.extend_from_slice(&cid_padded);
+    calldata.extend_from_slice(&u256_bytes(160));
+    calldata.extend_from_slice(&u256_bytes(amount_wei));
+    calldata.extend_from_slice(&u256_bytes(2));
+    calldata.extend_from_slice(&u256_bytes(1));
+    calldata.extend_from_slice(&u256_bytes(2));
+    let data_hex = format!("0x{}", hex::encode(calldata));
+    log::info!(
+        "[Maintenance] Merge request cid={} amount={} target={} dry_run={}",
+        condition_id, amount_usdc, target_contract, dry_run,
+    );
+    if dry_run {
+        println!("to:   {}", target_contract);
+        println!("data: {}", data_hex);
+        return MergeOutcome::DryRun;
+    }
+
+    let submitted: std::result::Result<(String, String), String> = if wallet.is_eoa() {
+        super::onchain_tx::submit_eoa_tx_onchain(
+            &wallet.signing_key,
+            &wallet.signer_address,
+            target_contract,
+            &data_hex,
+        ).map(|tx| (tx, "PENDING".to_string())).map_err(|error| error.to_string())
+    } else if gas_via_signer {
+        super::onchain_tx::broadcast_with_escalation(
+            &wallet.signing_key,
+            &wallet.signer_address,
+            &wallet.safe_address,
+            target_contract,
+            &data_hex,
+        ).map(|tx| (tx, "PENDING".to_string())).map_err(|error| error.to_string())
+    } else {
+        submit_safe_tx_with_id(
+            &wallet.builder_auth,
+            &wallet.signing_key,
+            &wallet.signer_address,
+            &wallet.safe_address,
+            target_contract,
+            &data_hex,
+            false,
+        ).map_err(|error| error.to_string())
+    };
+    let (tx_id, initial_state) = match submitted {
+        Ok(value) => value,
+        Err(error) => return MergeOutcome::SubmitFailed(error),
+    };
+    if initial_state.contains("CONFIRMED") || initial_state.contains("MINED") {
+        return MergeOutcome::Confirmed;
+    }
+    let mut final_state = initial_state;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match poll_transaction(&wallet.builder_auth, &tx_id) {
+            Ok((state, _)) => {
+                final_state = state;
+                if final_state.contains("CONFIRMED") || final_state.contains("MINED") {
+                    return MergeOutcome::Confirmed;
+                }
+                if final_state.contains("FAILED") {
+                    return MergeOutcome::SubmitFailed(format!("final_state={}", final_state));
+                }
+            }
+            Err(error) => {
+                return MergeOutcome::PendingTimeout(format!("poll error: {}", error));
+            }
+        }
+    }
+    MergeOutcome::PendingTimeout(format!("final_state={}", final_state))
+}
+
+/// Derive the decimal CLOB token ids for a standard binary condition. CLOB
+/// tokens use the USDC.e collateral id-space in both v1 and v2.
+pub(crate) fn ctf_outcome_token_ids(condition_id: &str) -> Result<(String, String)> {
+    let derive = |index_set| -> Result<String> {
+        let position = ctf_position_id(condition_id, index_set, USDCE_ADDRESS)
+            .ok_or_else(|| anyhow!("failed to derive outcome token id for indexSet={}", index_set))?;
+        let bytes = ctf_position_id_bytes(&position)?;
+        Ok(bytes32_to_dec(&bytes))
+    };
+    Ok((derive(1)?, derive(2)?))
 }
 
 fn run_maintenance_job(
@@ -4510,6 +5007,20 @@ mod maintenance_status_tests {
         }
     }
 
+    fn merge_job(condition_id: &str, up: &str, down: &str) -> MergeMaintenanceJob {
+        MergeMaintenanceJob {
+            condition_id: condition_id.to_string(),
+            up_token_id: up.to_string(),
+            down_token_id: down.to_string(),
+            amount_usdc: 30.0,
+            gas_via_signer: false,
+            dry_run: false,
+            account_id: "account".to_string(),
+            instance_id: "instance".to_string(),
+            account_state: None,
+        }
+    }
+
     #[test]
     fn maintenance_coalescing_requires_the_exact_resolved_event() {
         let event_a_early = maintenance_job(Some("event-a"), 100);
@@ -4524,6 +5035,20 @@ mod maintenance_status_tests {
             &unresolved_early,
             &unresolved_late,
         ));
+    }
+
+    #[test]
+    fn merge_coalescing_requires_exact_condition_tokens_and_execution_mode() {
+        let base = merge_job("event-a", "up-a", "down-a");
+        let same = merge_job("event-a", "up-a", "down-a");
+        let other_event = merge_job("event-b", "up-b", "down-b");
+        let wrong_tokens = merge_job("event-a", "up-other", "down-a");
+        let mut direct_gas = merge_job("event-a", "up-a", "down-a");
+        direct_gas.gas_via_signer = true;
+        assert!(merge_jobs_share_target(&base, &same));
+        assert!(!merge_jobs_share_target(&base, &other_event));
+        assert!(!merge_jobs_share_target(&base, &wrong_tokens));
+        assert!(!merge_jobs_share_target(&base, &direct_gas));
     }
 
     #[test]

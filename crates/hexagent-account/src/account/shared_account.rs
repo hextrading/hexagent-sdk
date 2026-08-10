@@ -1429,6 +1429,10 @@ impl SharedAccount {
     /// Explicit operator repair hook for an ownership anomaly after external
     /// audit. Runtime code should prefer a correct order/trade replay, which
     /// clears its own anomaly automatically.
+    pub fn ownership_anomalies(&self) -> BTreeMap<String, String> {
+        self.state.lock().unwrap().ownership_anomalies.clone()
+    }
+
     pub fn repair_ownership_anomaly(&self, anomaly_key: &str) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.ownership_anomalies.remove(anomaly_key).is_none() {
@@ -3018,6 +3022,7 @@ mod tests {
             .is_none());
         account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
         assert!(account.is_uncertain(), "a wallet snapshot cannot repair ownership");
+        assert!(account.ownership_anomalies().contains_key("trade:trade-sticky"));
         assert!(account
             .monitoring_snapshot()
             .uncertain_reason
@@ -3036,6 +3041,7 @@ mod tests {
                 0.5,
             )
             .is_some());
+        assert!(account.ownership_anomalies().is_empty());
         assert!(!account.is_uncertain());
     }
 
