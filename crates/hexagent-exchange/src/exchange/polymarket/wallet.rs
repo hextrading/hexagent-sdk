@@ -3653,7 +3653,78 @@ enum SplitOutcome {
     /// Submitted but didn't reach CONFIRMED/MINED within the poll
     /// window (left as PENDING). Caller should treat as effectively
     /// failed for the immediately-next event.
-    PendingTimeout(String),
+    PendingTimeout { reason: String, tx_id: String },
+}
+
+fn next_maintenance_operation_id(kind: &str, account_id: &str, condition_id: &str) -> String {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{kind}:{account_id}:{condition_id}:{now_ns}")
+}
+
+fn recover_pending_maintenance_operations(
+    wallet: &WalletInfo,
+    account: &hexagent_account::account::shared_account::SharedAccount,
+) -> std::result::Result<(), String> {
+    use hexagent_account::account::shared_account::MaintenanceOperationStatus;
+
+    for operation in account.pending_maintenance_operations() {
+        let Some(tx_id) = operation.tx_id.as_deref() else {
+            let reason = format!(
+                "operation {} was durably reserved but has no tx id; submit finality requires operator audit",
+                operation.operation_id,
+            );
+            account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+            return Err(reason);
+        };
+        let (state, _) = poll_transaction(&wallet.builder_auth, tx_id)
+            .map_err(|error| format!("poll recovered operation {}: {error}", operation.operation_id))?;
+        if state.contains("CONFIRMED") || state.contains("MINED") {
+            account
+                .confirm_maintenance_operation(&operation.operation_id)
+                .map_err(|error| {
+                    format!(
+                        "confirm recovered operation {}: {error}",
+                        operation.operation_id,
+                    )
+                })?;
+            account.flush_persistence(std::time::Duration::from_secs(2))?;
+            log::info!(
+                "[Maintenance] recovered {} {:?} tx={} as CONFIRMED",
+                operation.operation_id,
+                operation.kind,
+                tx_id,
+            );
+            continue;
+        }
+        if state.contains("FAILED") {
+            account.fail_maintenance_operation(
+                &operation.operation_id,
+                format!("recovered final_state={state}"),
+            );
+            account.flush_persistence(std::time::Duration::from_secs(2))?;
+            log::warn!(
+                "[Maintenance] recovered {} {:?} tx={} as FAILED",
+                operation.operation_id,
+                operation.kind,
+                tx_id,
+            );
+            continue;
+        }
+        let reason = format!(
+            "recovered operation {} tx={} remains state={state}",
+            operation.operation_id,
+            tx_id,
+        );
+        if operation.status != MaintenanceOperationStatus::Uncertain {
+            account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+            let _ = account.flush_persistence(std::time::Duration::from_secs(2));
+        }
+        return Err(reason);
+    }
+    Ok(())
 }
 
 /// Run one splitPosition for `condition_id` with `amount_usdc` USDC → equal
@@ -3669,6 +3740,7 @@ fn run_split_one(
     amount_usdc: f64,
     min_safety_balance_usdc: f64,
     gas_via_signer: bool,
+    journal: Option<(&hexagent_account::account::shared_account::SharedAccount, &str)>,
 ) -> SplitOutcome {
     if amount_usdc <= 0.0 {
         log::info!("[Maintenance] Split disabled (amount_usdc={}).", amount_usdc);
@@ -3874,6 +3946,24 @@ fn run_split_one(
 
     match submit_outcome {
         Ok((tx_id, _)) => {
+            if let Some((account, operation_id)) = journal {
+                let persisted = account
+                    .mark_maintenance_operation_submitted(operation_id, &tx_id)
+                    .and_then(|_| {
+                        account
+                            .flush_persistence(std::time::Duration::from_secs(2))
+                    });
+                if let Err(error) = persisted {
+                    account.mark_maintenance_operation_uncertain(
+                        operation_id,
+                        format!("submitted tx={tx_id} but journal persistence failed: {error}"),
+                    );
+                    return SplitOutcome::PendingTimeout {
+                        reason: format!("submission journal persistence failed: {error}"),
+                        tx_id,
+                    };
+                }
+            }
             let mut final_state = String::new();
             let mut tx_hash = String::new();
             for _ in 0..30 {
@@ -3900,7 +3990,10 @@ fn run_split_one(
                     "[Maintenance] Split cid={} final_state={}",
                     cid_short, final_state,
                 );
-                SplitOutcome::PendingTimeout(format!("final_state={}", final_state))
+                SplitOutcome::PendingTimeout {
+                    reason: format!("final_state={}", final_state),
+                    tx_id,
+                }
             }
         }
         Err(e) => {
@@ -3936,6 +4029,10 @@ fn run_split_one(
 pub struct MaintenanceJob {
     pub split_series_id: Option<String>,
     pub split_end_date_min_secs: u64,
+    /// Last wall-clock second at which this split still seeds the intended
+    /// event. A queued job that reaches the worker at/after this deadline is
+    /// rejected before reserving funds or submitting a transaction.
+    pub split_execute_before_secs: Option<u64>,
     /// Resolved exact event target. The account worker fills these before
     /// coalescing so jobs are aggregated only when they will call
     /// splitPosition for the same condition id.
@@ -4087,13 +4184,49 @@ fn maintenance_jobs_share_target(left: &MaintenanceJob, right: &MaintenanceJob) 
         left.split_target_condition_id.as_deref(),
         right.split_target_condition_id.as_deref(),
     ) {
-        (Some(left), Some(right)) => left == right,
+        (Some(left_condition), Some(right_condition)) => {
+            left_condition == right_condition
+                && left.split_target_token_ids == right.split_target_token_ids
+        }
         (None, None) => {
             left.split_series_id == right.split_series_id
                 && left.split_end_date_min_secs == right.split_end_date_min_secs
         }
         _ => false,
     }
+}
+
+fn validate_maintenance_split_target(
+    condition_id: Option<&str>,
+    token_ids: &[String],
+    execute_before_secs: Option<u64>,
+    now_secs: u64,
+) -> std::result::Result<(), String> {
+    if execute_before_secs.is_some_and(|deadline| now_secs >= deadline) {
+        return Err(format!(
+            "target event split deadline elapsed: now={now_secs} execute_before={}",
+            execute_before_secs.unwrap_or_default(),
+        ));
+    }
+    if condition_id.is_some_and(|condition| !condition.is_empty())
+        && (token_ids.len() != 2
+            || token_ids[0].is_empty()
+            || token_ids[1].is_empty()
+            || token_ids[0] == token_ids[1])
+    {
+        return Err(format!(
+            "resolved split target must contain exactly two distinct token ids (got {})",
+            token_ids.len(),
+        ));
+    }
+    Ok(())
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
@@ -4105,6 +4238,9 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
         Ok(Some(target)) => {
             job.split_target_condition_id = Some(target.condition_id);
             job.split_target_token_ids = target.token_ids;
+            if target.execute_before_secs.is_some() {
+                job.split_execute_before_secs = target.execute_before_secs;
+            }
         }
         Ok(None) => {
             log::info!("[Maintenance] Split skipped: no matching next event.");
@@ -4119,6 +4255,7 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
 struct ResolvedMaintenanceTarget {
     condition_id: String,
     token_ids: Vec<String>,
+    execute_before_secs: Option<u64>,
 }
 
 enum MaintenanceTargetCacheEntry {
@@ -4182,6 +4319,11 @@ fn cached_maintenance_split_target(
                     .map(|market| ResolvedMaintenanceTarget {
                         condition_id: market.condition_id.clone(),
                         token_ids: market.clob_token_ids.clone(),
+                        execute_before_secs: chrono::DateTime::parse_from_rfc3339(
+                            &market.event_start_time,
+                        )
+                        .ok()
+                        .and_then(|start| u64::try_from(start.timestamp()).ok()),
                     })
             })
         });
@@ -4240,6 +4382,14 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
         job.split_amount_usdc += sibling.split_amount_usdc;
         job.split_end_date_min_secs = job.split_end_date_min_secs
             .max(sibling.split_end_date_min_secs);
+        job.split_execute_before_secs = match (
+            job.split_execute_before_secs,
+            sibling.split_execute_before_secs,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         job.min_safety_balance_usdc = job.min_safety_balance_usdc
             .max(sibling.min_safety_balance_usdc);
         job.redeem_enabled |= sibling.redeem_enabled;
@@ -4381,7 +4531,7 @@ enum MergeOutcome {
     Confirmed,
     DryRun,
     SubmitFailed(String),
-    PendingTimeout(String),
+    PendingTimeout { reason: String, tx_id: String },
 }
 
 fn run_merge_maintenance_group(mut items: Vec<MergeQueueItem>) {
@@ -4437,54 +4587,49 @@ fn run_merge_maintenance_job(
     if !job.dry_run && (job.instance_id.is_empty() || job.account_state.is_none()) {
         return Err("live merge requires explicit instance ownership and a shared-account ledger".to_string());
     }
+    let wallet = load_wallet_for_account(&job.account_id)
+        .map_err(|error| format!("load_wallet: {error}"))?;
+    if let Some(account) = job.account_state.as_ref() {
+        recover_pending_maintenance_operations(&wallet, account)
+            .map_err(|error| format!("maintenance recovery: {error}"))?;
+    }
+    let operation_id = next_maintenance_operation_id("merge", &job.account_id, &job.condition_id);
     if !job.dry_run {
         if let Some(account) = job.account_state.as_ref() {
-            account.reserve_merge_allocations(
-                &job.up_token_id,
-                &job.down_token_id,
-                &allocations,
-            ).map_err(|error| format!("shared-account merge admission: {}", error))?;
+            account
+                .reserve_maintenance_operation(
+                    &operation_id,
+                    hexagent_account::account::shared_account::MaintenanceOperationKind::Merge,
+                    &job.condition_id,
+                    &job.up_token_id,
+                    &job.down_token_id,
+                    &allocations,
+                )
+                .map_err(|error| format!("shared-account merge admission: {error}"))?;
         }
     }
-
-    let wallet = match load_wallet_for_account(&job.account_id) {
-        Ok(wallet) => wallet,
-        Err(error) => {
-            if let Some(account) = job.account_state.as_ref() {
-                account.release_merge_allocations(
-                    &job.up_token_id, &job.down_token_id, &allocations,
-                );
-                if let Err(persist_error) =
-                    account.flush_persistence(std::time::Duration::from_secs(2))
-                {
-                    account.mark_uncertain_with_reason(format!(
-                        "merge reservation release persistence failed cid={}: {}",
-                        job.condition_id, persist_error,
-                    ));
-                }
-            }
-            return Err(format!("load_wallet: {}", error));
-        }
-    };
+    let journal = (!job.dry_run)
+        .then(|| job.account_state.as_deref().map(|account| (account, operation_id.as_str())))
+        .flatten();
     let outcome = run_merge_one(
         &wallet,
         &job.condition_id,
         job.amount_usdc,
         job.gas_via_signer,
         job.dry_run,
+        journal,
     );
     match outcome {
         MergeOutcome::Confirmed => {
             if let Some(account) = job.account_state.as_ref() {
-                if let Err(error) = account.confirm_reserved_merge(
-                    &job.up_token_id,
-                    &job.down_token_id,
-                    &allocations,
-                ) {
-                    account.mark_uncertain_with_reason(format!(
-                        "confirmed maintenance merge attribution failed cid={}: {}",
-                        job.condition_id, error,
-                    ));
+                if let Err(error) = account.confirm_maintenance_operation(&operation_id) {
+                    account.mark_maintenance_operation_uncertain(
+                        &operation_id,
+                        format!(
+                            "confirmed maintenance merge attribution failed cid={}: {}",
+                            job.condition_id, error,
+                        ),
+                    );
                     return Err(format!(
                         "on-chain merge confirmed but virtual attribution failed: {}", error,
                     ));
@@ -4504,8 +4649,9 @@ fn run_merge_maintenance_job(
         MergeOutcome::DryRun => Ok(()),
         MergeOutcome::SubmitFailed(reason) => {
             if let Some(account) = job.account_state.as_ref() {
-                account.release_merge_allocations(
-                    &job.up_token_id, &job.down_token_id, &allocations,
+                account.fail_maintenance_operation(
+                    &operation_id,
+                    format!("submit failed: {reason}"),
                 );
                 if let Err(error) =
                     account.flush_persistence(std::time::Duration::from_secs(2))
@@ -4522,14 +4668,14 @@ fn run_merge_maintenance_job(
             }
             Err(format!("merge submit failed: {}", reason))
         }
-        MergeOutcome::PendingTimeout(reason) => {
+        MergeOutcome::PendingTimeout { reason, tx_id } => {
             // Keep the durable reservation: the transaction may still land,
             // so releasing it would let an order double-spend the same legs.
             if let Some(account) = job.account_state.as_ref() {
-                account.mark_uncertain_with_reason(format!(
-                    "maintenance merge finality uncertain cid={}: {}",
-                    job.condition_id, reason,
-                ));
+                account.mark_maintenance_operation_uncertain(
+                    &operation_id,
+                    format!("tx={tx_id} {reason}"),
+                );
                 let _ = account.flush_persistence(std::time::Duration::from_secs(2));
             }
             Err(format!("merge finality uncertain: {}", reason))
@@ -4543,6 +4689,7 @@ fn run_merge_one(
     amount_usdc: f64,
     gas_via_signer: bool,
     dry_run: bool,
+    journal: Option<(&hexagent_account::account::shared_account::SharedAccount, &str)>,
 ) -> MergeOutcome {
     let amount_wei = (amount_usdc * 1_000_000.0).round().max(0.0) as u128;
     if amount_wei == 0 {
@@ -4626,6 +4773,21 @@ fn run_merge_one(
         Ok(value) => value,
         Err(error) => return MergeOutcome::SubmitFailed(error),
     };
+    if let Some((account, operation_id)) = journal {
+        let persisted = account
+            .mark_maintenance_operation_submitted(operation_id, &tx_id)
+            .and_then(|_| account.flush_persistence(std::time::Duration::from_secs(2)));
+        if let Err(error) = persisted {
+            account.mark_maintenance_operation_uncertain(
+                operation_id,
+                format!("submitted tx={tx_id} but journal persistence failed: {error}"),
+            );
+            return MergeOutcome::PendingTimeout {
+                reason: format!("submission journal persistence failed: {error}"),
+                tx_id,
+            };
+        }
+    }
     if initial_state.contains("CONFIRMED") || initial_state.contains("MINED") {
         return MergeOutcome::Confirmed;
     }
@@ -4643,11 +4805,17 @@ fn run_merge_one(
                 }
             }
             Err(error) => {
-                return MergeOutcome::PendingTimeout(format!("poll error: {}", error));
+                return MergeOutcome::PendingTimeout {
+                    reason: format!("poll error: {}", error),
+                    tx_id,
+                };
             }
         }
     }
-    MergeOutcome::PendingTimeout(format!("final_state={}", final_state))
+    MergeOutcome::PendingTimeout {
+        reason: format!("final_state={}", final_state),
+        tx_id,
+    }
 }
 
 /// Derive the decimal CLOB token ids for a standard binary condition. CLOB
@@ -4669,6 +4837,7 @@ fn run_maintenance_job(
     let MaintenanceJob {
         split_series_id,
         split_end_date_min_secs: _,
+        split_execute_before_secs,
         split_target_condition_id,
         split_target_token_ids,
         split_amount_usdc,
@@ -4689,6 +4858,19 @@ fn run_maintenance_job(
                 *s.lock().unwrap() = MaintenanceStatus::Running;
             }
 
+            if let Err(reason) = validate_maintenance_split_target(
+                split_target_condition_id.as_deref(),
+                &split_target_token_ids,
+                split_execute_before_secs,
+                unix_now_secs(),
+            ) {
+                log::warn!("[Maintenance] Split rejected before execution: {}", reason);
+                if let Some(s) = status {
+                    *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending { reason };
+                }
+                return;
+            }
+
             log::info!(
                 "[Maintenance] Starting: series_id={:?} split_amount_usdc={} gas_via_signer={} redeem_enabled={}",
                 split_series_id, split_amount_usdc, gas_via_signer, redeem_enabled,
@@ -4697,7 +4879,7 @@ fn run_maintenance_job(
                 Ok(w) => w,
                 Err(e) => {
                     log::warn!("[Maintenance] load_wallet failed: {}", e);
-                    if let Some(s) = status {
+                    if let Some(s) = status.as_ref() {
                         *s.lock().unwrap() = MaintenanceStatus::RedeemFailed {
                             reason: format!("load_wallet: {}", e),
                         };
@@ -4705,6 +4887,21 @@ fn run_maintenance_job(
                     return;
                 }
             };
+            if let Some(account) = account_state.as_ref() {
+                if let Err(error) = recover_pending_maintenance_operations(&wallet, account) {
+                    log::warn!(
+                        "[Maintenance] account={} has unresolved prior operation: {}",
+                        account_id,
+                        error,
+                    );
+                    if let Some(s) = status {
+                        *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending {
+                            reason: format!("maintenance recovery: {error}"),
+                        };
+                    }
+                    return;
+                }
+            }
 
             // ── Step 1: redeem matured positions ──
             // Gated by `redeem_enabled`. When off, redeem is skipped (no
@@ -4755,9 +4952,38 @@ fn run_maintenance_job(
             // redeem just leaves stale shares we can pick up later).
             let split_outcome = if let Some((cid, token_ids)) = next_market {
                 if split_amount_usdc > 0.0 {
-                    let reservation = account_state.as_ref()
+                    if let Err(reason) = validate_maintenance_split_target(
+                        Some(&cid),
+                        &token_ids,
+                        split_execute_before_secs,
+                        unix_now_secs(),
+                    ) {
+                        log::warn!(
+                            "[Maintenance] Split rejected immediately before admission: {}",
+                            reason,
+                        );
+                        Some(SplitOutcome::Skipped(reason))
+                    } else {
+                    let token_pair = token_ids.first().zip(token_ids.get(1));
+                    let operation_id = next_maintenance_operation_id("split", &account_id, &cid);
+                    let reservation = account_state
+                        .as_ref()
                         .filter(|_| !split_allocations.is_empty())
-                        .map(|account| account.reserve_split_allocations(&split_allocations));
+                        .map(|account| {
+                            let Some((up, down)) = token_pair else {
+                                return Err(hexagent_account::account::shared_account::ReservationError::InvalidOrder(
+                                    "next market has fewer than two outcome tokens".to_string(),
+                                ));
+                            };
+                            account.reserve_maintenance_operation(
+                                &operation_id,
+                                hexagent_account::account::shared_account::MaintenanceOperationKind::Split,
+                                &cid,
+                                up,
+                                down,
+                                &split_allocations,
+                            )
+                        });
                     if let Some(Err(error)) = reservation {
                         log::warn!(
                             "[Maintenance] Aggregate split admission rejected account={} cid={}: {}",
@@ -4767,31 +4993,41 @@ fn run_maintenance_job(
                             "shared-account admission: {error}"
                         )))
                     } else {
+                        let journal = account_state
+                            .as_deref()
+                            .filter(|_| !split_allocations.is_empty())
+                            .map(|account| (account, operation_id.as_str()));
                         let mut outcome = run_split_one(
                             &wallet, &cid, split_amount_usdc,
-                            min_safety_balance_usdc, gas_via_signer,
+                            min_safety_balance_usdc, gas_via_signer, journal,
                         );
                         if let Some(account) = account_state.as_ref()
                             .filter(|_| !split_allocations.is_empty())
                         {
                             let allocation_error = if matches!(outcome, SplitOutcome::Confirmed) {
-                                token_ids.first().zip(token_ids.get(1))
-                                    .ok_or_else(|| "next market has fewer than two outcome tokens".to_string())
-                                    .and_then(|(up, down)| account
-                                        .confirm_reserved_split(up, down, &split_allocations)
-                                        .map_err(|error| error.to_string()))
+                                account
+                                    .confirm_maintenance_operation(&operation_id)
+                                    .map_err(|error| error.to_string())
                                     .err()
                             } else {
                                 None
                             };
                             match &outcome {
                                 SplitOutcome::SubmitFailed(_) | SplitOutcome::Skipped(_) => {
-                                    account.release_split_allocations(&split_allocations);
+                                    account.fail_maintenance_operation(
+                                        &operation_id,
+                                        format!("terminal outcome: {outcome:?}"),
+                                    );
                                 }
                                 // Unknown finality: hold the reservation so
                                 // sibling orders cannot spend collateral that
                                 // may already have become outcome shares.
-                                SplitOutcome::PendingTimeout(_) => {}
+                                SplitOutcome::PendingTimeout { reason, tx_id } => {
+                                    account.mark_maintenance_operation_uncertain(
+                                        &operation_id,
+                                        format!("tx={tx_id} {reason}"),
+                                    );
+                                }
                                 SplitOutcome::Confirmed => {}
                             }
                             if let Some(error) = allocation_error {
@@ -4802,12 +5038,26 @@ fn run_maintenance_job(
                                 account.mark_uncertain_with_reason(format!(
                                     "confirmed maintenance split attribution failed cid={cid}: {error}"
                                 ));
-                                outcome = SplitOutcome::PendingTimeout(format!(
-                                    "on-chain confirmed; virtual allocation uncertain: {error}"
-                                ));
+                                account.mark_maintenance_operation_uncertain(
+                                    &operation_id,
+                                    format!("on-chain confirmed; virtual allocation uncertain: {error}"),
+                                );
+                                outcome = SplitOutcome::PendingTimeout {
+                                    reason: format!(
+                                        "on-chain confirmed; virtual allocation uncertain: {error}"
+                                    ),
+                                    tx_id: account
+                                        .pending_maintenance_operations()
+                                        .into_iter()
+                                        .find(|operation| operation.operation_id == operation_id)
+                                        .and_then(|operation| operation.tx_id)
+                                        .unwrap_or_default(),
+                                };
                             }
+                            let _ = account.flush_persistence(std::time::Duration::from_secs(2));
                         }
                         Some(outcome)
+                    }
                     }
                 } else {
                     log::info!("[Maintenance] Split skipped: split_amount_usdc={}.", split_amount_usdc);
@@ -4839,7 +5089,7 @@ fn run_maintenance_job(
                         MaintenanceStatus::Succeeded
                     }
                 }
-                Some(SplitOutcome::PendingTimeout(reason)) => {
+                Some(SplitOutcome::PendingTimeout { reason, .. }) => {
                     MaintenanceStatus::SplitFailedOrPending {
                         reason: format!("split pending timeout: {}", reason),
                     }
@@ -4974,6 +5224,7 @@ pub fn run_split() -> Result<()> {
     run_maintenance_blocking(MaintenanceJob {
         split_series_id: Some(series_id),
         split_end_date_min_secs: end_date_min_secs,
+        split_execute_before_secs: None,
         split_target_condition_id: None,
         split_target_token_ids: Vec::new(),
         split_amount_usdc: amount_usdc,
@@ -5001,6 +5252,7 @@ mod maintenance_status_tests {
         MaintenanceJob {
             split_series_id: Some("series".to_string()),
             split_end_date_min_secs: end_date_min_secs,
+            split_execute_before_secs: None,
             split_target_condition_id: target.map(str::to_string),
             split_target_token_ids: Vec::new(),
             split_amount_usdc: 30.0,
@@ -5030,11 +5282,16 @@ mod maintenance_status_tests {
 
     #[test]
     fn maintenance_coalescing_requires_the_exact_resolved_event() {
-        let event_a_early = maintenance_job(Some("event-a"), 100);
-        let event_a_late = maintenance_job(Some("event-a"), 200);
+        let mut event_a_early = maintenance_job(Some("event-a"), 100);
+        event_a_early.split_target_token_ids = vec!["up-a".into(), "down-a".into()];
+        let mut event_a_late = maintenance_job(Some("event-a"), 200);
+        event_a_late.split_target_token_ids = vec!["up-a".into(), "down-a".into()];
         let event_b = maintenance_job(Some("event-b"), 100);
         assert!(maintenance_jobs_share_target(&event_a_early, &event_a_late));
         assert!(!maintenance_jobs_share_target(&event_a_early, &event_b));
+        let mut wrong_tokens = maintenance_job(Some("event-a"), 100);
+        wrong_tokens.split_target_token_ids = vec!["up-other".into(), "down-a".into()];
+        assert!(!maintenance_jobs_share_target(&event_a_early, &wrong_tokens));
 
         let unresolved_early = maintenance_job(None, 100);
         let unresolved_late = maintenance_job(None, 200);
@@ -5042,6 +5299,22 @@ mod maintenance_status_tests {
             &unresolved_early,
             &unresolved_late,
         ));
+    }
+
+    #[test]
+    fn maintenance_split_target_rejects_expiry_and_malformed_tokens() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(101), 100)
+            .is_ok());
+        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(100), 100)
+            .is_err());
+        assert!(validate_maintenance_split_target(
+            Some("cid"),
+            &["same".to_string(), "same".to_string()],
+            None,
+            100,
+        )
+        .is_err());
     }
 
     #[test]

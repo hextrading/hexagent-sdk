@@ -1223,6 +1223,13 @@ pub struct StrategyConfig {
     /// omitted/invalid values behave as 1.0 (equal allocation by default).
     #[serde(default = "default_account_allocation_weight")]
     pub account_allocation_weight: f64,
+    /// Explicit, operator-chosen id for a one-time shared-account cash budget
+    /// migration. Adding/removing an instance or changing a weight on an
+    /// already-active durable ledger is fail-closed unless every configured
+    /// sibling supplies the same non-empty id. Reusing an id is idempotent;
+    /// reusing it with different weights is rejected.
+    #[serde(default)]
+    pub account_allocation_migration_id: String,
     /// Optional path (absolute or relative to the parent config's
     /// directory) to a separate TOML file holding this strategy's
     /// params as top-level keys. Loaded and merged into `params` at
@@ -1900,6 +1907,7 @@ mod account_id_tests {
             instance_id: instance_id.into(),
             account_id: account_id.into(),
             account_allocation_weight: 1.0,
+            account_allocation_migration_id: String::new(),
             params_file: String::new(),
             params: HashMap::new(),
         }
@@ -1924,6 +1932,7 @@ mod account_id_tests {
             "name = 'polymaker'\ninstance_id = 'btc'\naccount_id = 'main'",
         ).unwrap();
         assert_eq!(config.account_allocation_weight, 1.0);
+        assert!(config.account_allocation_migration_id.is_empty());
     }
 }
 

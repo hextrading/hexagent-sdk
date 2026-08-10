@@ -62,6 +62,15 @@ pub struct ExternalAdjustment {
     pub recorded_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CashAllocationMigration {
+    pub operation_id: String,
+    pub target_weights: BTreeMap<String, f64>,
+    pub cash_before: BTreeMap<String, f64>,
+    pub cash_after: BTreeMap<String, f64>,
+    pub recorded_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountMonitoringSnapshot {
     pub account_id: String,
@@ -84,6 +93,7 @@ pub struct AccountMonitoringSnapshot {
     pub maintenance_queue_last_wait_ms: u64,
     pub maintenance_queue_max_wait_ms: u64,
     pub maintenance_queue_jobs: u64,
+    pub pending_maintenance_operations: usize,
     pub recovery_pending_orders: usize,
     pub persistence_path: Option<PathBuf>,
     pub persistence_error: Option<String>,
@@ -234,6 +244,36 @@ struct AppliedTrade {
     is_maker: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceOperationKind {
+    Split,
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceOperationStatus {
+    Reserved,
+    Submitted,
+    Uncertain,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceOperation {
+    pub operation_id: String,
+    pub kind: MaintenanceOperationKind,
+    pub condition_id: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    pub allocations: BTreeMap<String, f64>,
+    pub tx_id: Option<String>,
+    pub status: MaintenanceOperationStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenFeeConfig {
     rate: f64,
@@ -297,12 +337,29 @@ struct SharedAccountState {
     /// be silently reassigned without moving that instance's PnL/inventory.
     #[serde(default)]
     instance_registry_issue: Option<String>,
+    /// A configured member/weight change on an already-seeded account must be
+    /// acknowledged by an explicit, durable cash-budget migration. Token
+    /// inventory is deliberately excluded: trade ownership remains immutable.
+    #[serde(default)]
+    allocation_migration_required: Option<String>,
+    #[serde(default)]
+    cash_allocation_migrations: BTreeMap<String, CashAllocationMigration>,
     /// Ownership/invariant failures are durable admission blockers. A clean
     /// wallet snapshot cannot prove that a private trade was attributed to
     /// the right instance, so these are cleared only by a correct replay or
     /// the explicit repair API.
     #[serde(default)]
     ownership_anomalies: BTreeMap<String, String>,
+    /// Server match_time for private trades whose order ownership could not yet
+    /// be resolved. Gap replay must never advance its `after` lower bound past
+    /// the earliest row in this durable set.
+    #[serde(default)]
+    unresolved_trade_match_times: BTreeMap<String, u64>,
+    /// Durable split/merge operation journal. Reservations and operation state
+    /// change under the same ledger mutex so restart recovery never has to
+    /// guess whether an aggregate reservation belongs to an on-chain submit.
+    #[serde(default)]
+    maintenance_ops: BTreeMap<String, MaintenanceOperation>,
     /// Snapshot generations only order concurrent fan-out inside this
     /// process. They deliberately do not survive restart because the fetch
     /// generation counter also restarts.
@@ -590,6 +647,28 @@ impl SharedAccount {
                 }
             }
             state.oid_to_coid = normalized;
+            let pending_maintenance: Vec<String> = state
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .map(|operation| operation.operation_id.clone())
+                .collect();
+            if !pending_maintenance.is_empty() {
+                set_uncertain(
+                    &mut state,
+                    format!(
+                        "maintenance recovery pending after restart: operation_ids=[{}]",
+                        pending_maintenance.join(","),
+                    ),
+                );
+            }
             state
         } else {
             SharedAccountState::default()
@@ -644,25 +723,135 @@ impl SharedAccount {
 
     /// Register an instance before the first physical snapshot. Non-positive
     /// and non-finite weights are normalized to the default equal weight 1.0.
+    /// Once an account has been seeded, a new member or changed weight never
+    /// silently reallocates PnL: admission becomes fail-closed until an explicit
+    /// [`Self::migrate_cash_allocation`] operation is durably recorded.
     pub fn register_instance(&self, instance_id: &str, weight: f64) {
         if instance_id.is_empty() { return; }
         let weight = if weight.is_finite() && weight > 0.0 { weight } else { 1.0 };
         let mut state = self.state.lock().unwrap();
-        let old_total = total_weight(&state.instances);
-        let seeded = state.seeded;
+        let previous = state.instances.get(instance_id).map(|instance| instance.weight);
         state.instances
             .entry(instance_id.to_string())
             .and_modify(|instance| instance.weight = weight)
             .or_insert_with(|| InstanceLedger::new(weight));
-        // If a worker fetched the first snapshot just before a sibling was
-        // registered, rebalance the still-pristine startup allocation.
-        if seeded && state.orders.is_empty() && state.trades.is_empty()
-            && state.external_adjustments.is_empty()
-        {
-            let new_total = total_weight(&state.instances);
-            if old_total > 0.0 && new_total > 0.0 { redistribute_all(&mut state); }
+        if state.seeded && previous.is_none_or(|old| (old - weight).abs() > EPS) {
+            state.allocation_migration_required = Some(match previous {
+                Some(old) => format!(
+                    "configured weight changed for instance `{instance_id}`: {old:.6} -> {weight:.6}; explicit cash allocation migration required"
+                ),
+                None => format!(
+                    "configured instance `{instance_id}` joined an already-seeded account; explicit cash allocation migration required"
+                ),
+            });
+            recompute_reconciliation(&mut state, "account membership changed");
         }
         self.schedule_persist(&state);
+    }
+
+    /// Explicitly redistribute only virtual USDC across the configured account
+    /// members. Token positions, trades and order ownership never move. The
+    /// operation id is durable and idempotent so an operator can safely retry a
+    /// startup after an fsync or process failure.
+    pub fn migrate_cash_allocation(
+        &self,
+        operation_id: &str,
+        target_weights: &BTreeMap<String, f64>,
+    ) -> Result<CashAllocationMigration, ReservationError> {
+        if operation_id.trim().is_empty() || target_weights.is_empty() {
+            return Err(ReservationError::InvalidOrder(
+                "cash allocation migration requires a non-empty operation id and target weights"
+                    .into(),
+            ));
+        }
+        if target_weights.iter().any(|(instance_id, weight)| {
+            instance_id.is_empty() || !weight.is_finite() || *weight <= 0.0
+        }) {
+            return Err(ReservationError::InvalidOrder(
+                "cash allocation migration weights must have non-empty instance ids and finite positive values"
+                    .into(),
+            ));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.cash_allocation_migrations.get(operation_id) {
+            return if existing.target_weights == *target_weights {
+                Ok(existing.clone())
+            } else {
+                Err(ReservationError::InvalidOrder(format!(
+                    "cash allocation migration id `{operation_id}` was already used with different weights"
+                )))
+            };
+        }
+        if !state.seeded {
+            return Err(ReservationError::AccountNotSeeded);
+        }
+        if target_weights
+            .keys()
+            .any(|instance_id| !state.instances.contains_key(instance_id))
+        {
+            return Err(ReservationError::InvalidOrder(
+                "cash allocation migration references an unregistered instance".into(),
+            ));
+        }
+        let has_reservations = state.instances.values().any(|instance| {
+            instance.reserved_cash > EPS
+                || instance.reserved_positions.values().any(|qty| *qty > EPS)
+        });
+        let has_live_orders = state.orders.values().any(|order| {
+            !matches!(
+                order.status,
+                OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
+            )
+        });
+        if has_reservations
+            || has_live_orders
+            || !state.recovery_pending_orders.is_empty()
+            || has_unsettled_trade_lifecycle(&state)
+            || has_unsettled_maintenance_operation(&state)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "cash allocation migration requires no live reservations, orders, trades, or maintenance operations"
+                    .into(),
+            ));
+        }
+
+        let total_weight: f64 = target_weights.values().sum();
+        let total_cash: f64 = state.instances.values().map(|instance| instance.cash).sum();
+        let cash_before = state
+            .instances
+            .iter()
+            .map(|(id, instance)| (id.clone(), instance.cash))
+            .collect();
+        for (instance_id, instance) in &mut state.instances {
+            if let Some(weight) = target_weights.get(instance_id) {
+                instance.weight = *weight;
+                instance.cash = total_cash * *weight / total_weight;
+            } else {
+                instance.cash = 0.0;
+            }
+        }
+        let cash_after = state
+            .instances
+            .iter()
+            .map(|(id, instance)| (id.clone(), instance.cash))
+            .collect();
+        let migration = CashAllocationMigration {
+            operation_id: operation_id.to_string(),
+            target_weights: target_weights.clone(),
+            cash_before,
+            cash_after,
+            recorded_at_ms: wall_clock_ms(),
+        };
+        state
+            .cash_allocation_migrations
+            .insert(operation_id.to_string(), migration.clone());
+        state.allocation_migration_required = None;
+        recompute_reconciliation(&mut state, "explicit cash allocation migration");
+        self.schedule_persist(&state);
+        drop(state);
+        self.flush_admission_persistence()?;
+        Ok(migration)
     }
 
     /// Register the event/token scope traded by one instance. Token inventory
@@ -692,14 +881,9 @@ impl SharedAccount {
             down_token_id: down_token_id.to_string(),
             retire_after_ms: None,
         });
-        // A pristine startup snapshot may have landed before all sibling
-        // instruments were routed. Re-run only the startup allocation; once an
-        // order/trade exists, ownership must never be silently rebalanced.
-        if state.seeded && state.orders.is_empty() && state.trades.is_empty()
-            && state.external_adjustments.is_empty()
-        {
-            redistribute_all(&mut state);
-        }
+        // Never redistribute an already-seeded ledger here. Live startup
+        // registers every configured instance before the first fetch; a scope
+        // added later must not rewrite cash, PnL, or trade-owned inventory.
         self.schedule_persist(&state);
         Ok(())
     }
@@ -955,6 +1139,17 @@ impl SharedAccount {
             return true;
         }
 
+        // A wallet snapshot has no trade ids. Applying it while a MATCHED trade
+        // is still waiting for MINED/CONFIRMED creates an unavoidable race: the
+        // snapshot may already contain that settlement, and the later lifecycle
+        // edge would then apply the same physical delta a second time. Do not
+        // guess individual trade finality from aggregate wallet equality. Keep
+        // the trade-driven physical ledger unchanged and let the next snapshot
+        // retry after every pending lifecycle has resolved.
+        if has_unsettled_trade_lifecycle(&state) || has_unsettled_maintenance_operation(&state) {
+            return false;
+        }
+
         state.physical_cash = cash;
         for token in &authoritative_tokens {
             let physical = positions.get(token).copied().unwrap_or(0.0);
@@ -964,7 +1159,6 @@ impl SharedAccount {
                 state.physical_positions.remove(token);
             }
         }
-        mark_fully_observed_pending_trades(&mut state);
         recompute_reconciliation(&mut state, "authoritative physical snapshot");
         if mark_failed_trades_reconciled_by_snapshot(&mut state, &authoritative_tokens) {
             recompute_reconciliation(&mut state, "authoritative physical snapshot");
@@ -1154,6 +1348,18 @@ impl SharedAccount {
             maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
             maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
             maintenance_queue_jobs: state.maintenance_queue_jobs,
+            pending_maintenance_operations: state
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .count(),
             recovery_pending_orders: state.recovery_pending_orders.len(),
             persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
             persistence_error,
@@ -1431,6 +1637,44 @@ impl SharedAccount {
     /// clears its own anomaly automatically.
     pub fn ownership_anomalies(&self) -> BTreeMap<String, String> {
         self.state.lock().unwrap().ownership_anomalies.clone()
+    }
+
+    pub fn mark_unresolved_trade_match_time(&self, trade_key: &str, match_time_secs: u64) {
+        if trade_key.is_empty() || match_time_secs == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state
+            .unresolved_trade_match_times
+            .get(trade_key)
+            .is_some_and(|existing| *existing == match_time_secs)
+        {
+            return;
+        }
+        state
+            .unresolved_trade_match_times
+            .insert(trade_key.to_string(), match_time_secs);
+        self.schedule_persist(&state);
+    }
+
+    pub fn resolve_unresolved_trade_match_time(&self, trade_key: &str) {
+        if trade_key.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.unresolved_trade_match_times.remove(trade_key).is_some() {
+            self.schedule_persist(&state);
+        }
+    }
+
+    pub fn earliest_unresolved_trade_match_time(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .unresolved_trade_match_times
+            .values()
+            .copied()
+            .min()
     }
 
     pub fn repair_ownership_anomaly(&self, anomaly_key: &str) -> bool {
@@ -1784,6 +2028,391 @@ impl SharedAccount {
                 Err(error)
             }
         }
+    }
+
+    pub fn reserve_maintenance_operation(
+        &self,
+        operation_id: &str,
+        kind: MaintenanceOperationKind,
+        condition_id: &str,
+        up_token_id: &str,
+        down_token_id: &str,
+        allocations: &HashMap<String, f64>,
+    ) -> Result<(), ReservationError> {
+        self.ensure_admission_persistence()?;
+        if operation_id.is_empty()
+            || condition_id.is_empty()
+            || up_token_id.is_empty()
+            || down_token_id.is_empty()
+            || allocations.is_empty()
+            || allocations
+                .values()
+                .any(|amount| !amount.is_finite() || *amount <= 0.0)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "invalid maintenance operation identity/tokens/allocations".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.maintenance_ops.get(operation_id) {
+            let expected_allocations: BTreeMap<String, f64> = allocations
+                .iter()
+                .map(|(instance, amount)| (instance.clone(), *amount))
+                .collect();
+            if existing.kind == kind
+                && existing.condition_id == condition_id
+                && existing.up_token_id == up_token_id
+                && existing.down_token_id == down_token_id
+                && existing.allocations == expected_allocations
+            {
+                return Ok(());
+            }
+            return Err(ReservationError::InvalidOrder(format!(
+                "maintenance operation id `{operation_id}` was reused with different intent"
+            )));
+        }
+        if !state.seeded {
+            return Err(ReservationError::AccountNotSeeded);
+        }
+        if state.uncertain {
+            return Err(ReservationError::AccountUncertain);
+        }
+        let total: f64 = allocations.values().copied().sum();
+        match kind {
+            MaintenanceOperationKind::Split => {
+                let total_reserved_cash: f64 =
+                    state.instances.values().map(|instance| instance.reserved_cash).sum();
+                let physical_available = (state.physical_cash - total_reserved_cash).max(0.0);
+                if total > physical_available + EPS {
+                    return Err(ReservationError::InsufficientPhysicalCash {
+                        required: total,
+                        available: physical_available,
+                    });
+                }
+                for (instance_id, amount) in allocations {
+                    let Some(instance) = state.instances.get(instance_id) else {
+                        return Err(ReservationError::UnknownInstance(instance_id.clone()));
+                    };
+                    let available = (instance.cash - instance.reserved_cash).max(0.0);
+                    if *amount > available + EPS {
+                        return Err(ReservationError::InsufficientVirtualCash {
+                            required: *amount,
+                            available,
+                        });
+                    }
+                }
+                for (instance_id, amount) in allocations {
+                    state
+                        .instances
+                        .get_mut(instance_id)
+                        .expect("validated")
+                        .reserved_cash += *amount;
+                }
+            }
+            MaintenanceOperationKind::Merge => {
+                for token in [up_token_id, down_token_id] {
+                    let total_reserved: f64 = state
+                        .instances
+                        .values()
+                        .map(|instance| {
+                            instance.reserved_positions.get(token).copied().unwrap_or(0.0)
+                        })
+                        .sum();
+                    let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
+                    let physical_available = (physical - total_reserved).max(0.0);
+                    if total > physical_available + EPS {
+                        return Err(ReservationError::InsufficientPhysicalPosition {
+                            token: token.to_string(),
+                            required: total,
+                            available: physical_available,
+                        });
+                    }
+                    for (instance_id, amount) in allocations {
+                        let Some(instance) = state.instances.get(instance_id) else {
+                            return Err(ReservationError::UnknownInstance(instance_id.clone()));
+                        };
+                        let available = (instance.positions.get(token).copied().unwrap_or(0.0)
+                            - instance.reserved_positions.get(token).copied().unwrap_or(0.0))
+                        .max(0.0);
+                        if *amount > available + EPS {
+                            return Err(ReservationError::InsufficientVirtualPosition {
+                                token: token.to_string(),
+                                required: *amount,
+                                available,
+                            });
+                        }
+                    }
+                }
+                for (instance_id, amount) in allocations {
+                    let instance = state.instances.get_mut(instance_id).expect("validated");
+                    for token in [up_token_id, down_token_id] {
+                        *instance.reserved_positions.entry(token.to_string()).or_insert(0.0) +=
+                            *amount;
+                    }
+                }
+            }
+        }
+        let now_ms = wall_clock_ms();
+        state.maintenance_ops.insert(
+            operation_id.to_string(),
+            MaintenanceOperation {
+                operation_id: operation_id.to_string(),
+                kind,
+                condition_id: condition_id.to_string(),
+                up_token_id: up_token_id.to_string(),
+                down_token_id: down_token_id.to_string(),
+                allocations: allocations
+                    .iter()
+                    .map(|(instance, amount)| (instance.clone(), *amount))
+                    .collect(),
+                tx_id: None,
+                status: MaintenanceOperationStatus::Reserved,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                detail: None,
+            },
+        );
+        self.schedule_persist(&state);
+        drop(state);
+        if let Err(error) = self.flush_admission_persistence() {
+            self.fail_maintenance_operation(operation_id, format!("reservation persistence: {error}"));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn mark_maintenance_operation_submitted(
+        &self,
+        operation_id: &str,
+        tx_id: &str,
+    ) -> Result<(), String> {
+        if tx_id.is_empty() {
+            return Err("maintenance submission returned an empty tx id".to_string());
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(operation) = state.maintenance_ops.get_mut(operation_id) else {
+            return Err(format!("unknown maintenance operation `{operation_id}`"));
+        };
+        if matches!(operation.status, MaintenanceOperationStatus::Confirmed) {
+            return Ok(());
+        }
+        if matches!(operation.status, MaintenanceOperationStatus::Failed) {
+            return Err(format!("maintenance operation `{operation_id}` already failed"));
+        }
+        if operation.tx_id.as_deref().is_some_and(|existing| existing != tx_id) {
+            return Err(format!(
+                "maintenance operation `{operation_id}` tx id conflict: stored={} incoming={tx_id}",
+                operation.tx_id.as_deref().unwrap_or_default(),
+            ));
+        }
+        operation.tx_id = Some(tx_id.to_string());
+        operation.status = MaintenanceOperationStatus::Submitted;
+        operation.updated_at_ms = wall_clock_ms();
+        self.schedule_persist(&state);
+        Ok(())
+    }
+
+    pub fn mark_maintenance_operation_uncertain(
+        &self,
+        operation_id: &str,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        let mut state = self.state.lock().unwrap();
+        if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
+            operation.status = MaintenanceOperationStatus::Uncertain;
+            operation.updated_at_ms = wall_clock_ms();
+            operation.detail = Some(detail.clone());
+        }
+        set_uncertain(
+            &mut state,
+            format!("maintenance operation `{operation_id}` finality uncertain: {detail}"),
+        );
+        self.schedule_persist(&state);
+    }
+
+    pub fn pending_maintenance_operations(&self) -> Vec<MaintenanceOperation> {
+        self.state
+            .lock()
+            .unwrap()
+            .maintenance_ops
+            .values()
+            .filter(|operation| {
+                matches!(
+                    operation.status,
+                    MaintenanceOperationStatus::Reserved
+                        | MaintenanceOperationStatus::Submitted
+                        | MaintenanceOperationStatus::Uncertain
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn maintenance_operation(&self, operation_id: &str) -> Option<MaintenanceOperation> {
+        self.state
+            .lock()
+            .unwrap()
+            .maintenance_ops
+            .get(operation_id)
+            .cloned()
+    }
+
+    pub fn fail_maintenance_operation(&self, operation_id: &str, detail: impl Into<String>) {
+        let detail = detail.into();
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
+            return;
+        };
+        if matches!(
+            existing.status,
+            MaintenanceOperationStatus::Confirmed | MaintenanceOperationStatus::Failed
+        ) {
+            return;
+        }
+        for (instance_id, amount) in &existing.allocations {
+            if let Some(instance) = state.instances.get_mut(instance_id) {
+                match existing.kind {
+                    MaintenanceOperationKind::Split => {
+                        instance.reserved_cash = (instance.reserved_cash - *amount).max(0.0);
+                    }
+                    MaintenanceOperationKind::Merge => {
+                        for token in [&existing.up_token_id, &existing.down_token_id] {
+                            let reserved =
+                                instance.reserved_positions.entry(token.clone()).or_insert(0.0);
+                            *reserved = (*reserved - *amount).max(0.0);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
+            operation.status = MaintenanceOperationStatus::Failed;
+            operation.updated_at_ms = wall_clock_ms();
+            operation.detail = Some(detail);
+        }
+        recompute_reconciliation(&mut state, "maintenance operation failed");
+        self.schedule_persist(&state);
+    }
+
+    pub fn confirm_maintenance_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), ReservationError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
+            return Err(ReservationError::InvalidOrder(format!(
+                "unknown maintenance operation `{operation_id}`"
+            )));
+        };
+        if existing.status == MaintenanceOperationStatus::Confirmed {
+            return Ok(());
+        }
+        if existing.status == MaintenanceOperationStatus::Failed {
+            return Err(ReservationError::InvalidOrder(format!(
+                "maintenance operation `{operation_id}` already failed"
+            )));
+        }
+        let total: f64 = existing.allocations.values().copied().sum();
+        match existing.kind {
+            MaintenanceOperationKind::Split => {
+                if total > state.physical_cash + EPS {
+                    return Err(ReservationError::InsufficientPhysicalCash {
+                        required: total,
+                        available: state.physical_cash,
+                    });
+                }
+                for (instance_id, amount) in &existing.allocations {
+                    let Some(instance) = state.instances.get(instance_id) else {
+                        return Err(ReservationError::UnknownInstance(instance_id.clone()));
+                    };
+                    if *amount > instance.cash.min(instance.reserved_cash) + EPS {
+                        return Err(ReservationError::InsufficientVirtualCash {
+                            required: *amount,
+                            available: instance.cash.min(instance.reserved_cash),
+                        });
+                    }
+                }
+                state.physical_cash -= total;
+                *state
+                    .physical_positions
+                    .entry(existing.up_token_id.clone())
+                    .or_insert(0.0) += total;
+                *state
+                    .physical_positions
+                    .entry(existing.down_token_id.clone())
+                    .or_insert(0.0) += total;
+                for (instance_id, amount) in &existing.allocations {
+                    let instance = state.instances.get_mut(instance_id).expect("validated");
+                    instance.reserved_cash = (instance.reserved_cash - *amount).max(0.0);
+                    instance.cash -= *amount;
+                    *instance
+                        .positions
+                        .entry(existing.up_token_id.clone())
+                        .or_insert(0.0) += *amount;
+                    *instance
+                        .positions
+                        .entry(existing.down_token_id.clone())
+                        .or_insert(0.0) += *amount;
+                }
+            }
+            MaintenanceOperationKind::Merge => {
+                for token in [&existing.up_token_id, &existing.down_token_id] {
+                    let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
+                    if total > physical + EPS {
+                        return Err(ReservationError::InsufficientPhysicalPosition {
+                            token: token.clone(),
+                            required: total,
+                            available: physical,
+                        });
+                    }
+                }
+                for (instance_id, amount) in &existing.allocations {
+                    let Some(instance) = state.instances.get(instance_id) else {
+                        return Err(ReservationError::UnknownInstance(instance_id.clone()));
+                    };
+                    for token in [&existing.up_token_id, &existing.down_token_id] {
+                        let owned = instance.positions.get(token).copied().unwrap_or(0.0);
+                        let reserved =
+                            instance.reserved_positions.get(token).copied().unwrap_or(0.0);
+                        if *amount > owned.min(reserved) + EPS {
+                            return Err(ReservationError::InsufficientVirtualPosition {
+                                token: token.clone(),
+                                required: *amount,
+                                available: owned.min(reserved),
+                            });
+                        }
+                    }
+                }
+                state.physical_cash += total;
+                *state
+                    .physical_positions
+                    .entry(existing.up_token_id.clone())
+                    .or_insert(0.0) -= total;
+                *state
+                    .physical_positions
+                    .entry(existing.down_token_id.clone())
+                    .or_insert(0.0) -= total;
+                for (instance_id, amount) in &existing.allocations {
+                    let instance = state.instances.get_mut(instance_id).expect("validated");
+                    instance.cash += *amount;
+                    for token in [&existing.up_token_id, &existing.down_token_id] {
+                        *instance.positions.entry(token.clone()).or_insert(0.0) -= *amount;
+                        let reserved =
+                            instance.reserved_positions.entry(token.clone()).or_insert(0.0);
+                        *reserved = (*reserved - *amount).max(0.0);
+                    }
+                }
+            }
+        }
+        if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
+            operation.status = MaintenanceOperationStatus::Confirmed;
+            operation.updated_at_ms = wall_clock_ms();
+            operation.detail = None;
+        }
+        recompute_reconciliation(&mut state, "confirmed maintenance operation");
+        self.schedule_persist(&state);
+        Ok(())
     }
 
     /// Attribute one user-feed trade leg. MATCHED/MINED/CONFIRMED book once;
@@ -2239,7 +2868,6 @@ impl SharedAccount {
                 || (existing.physical_fee_booked && !reverse_physical);
         }
         state.fee_attribution_pending.remove(trade_key);
-        mark_fully_observed_pending_trades(&mut state);
         recompute_reconciliation(&mut state, "trade fee lifecycle transition");
         self.schedule_persist(&state);
         true
@@ -2277,11 +2905,26 @@ impl SharedAccount {
             return (0, 0);
         }
         let mut state = self.state.lock().unwrap();
+        // A terminal order is still the durable ownership root for every late
+        // MINED/CONFIRMED/FAILED edge. Retain it (and its oid mapping) until all
+        // trades that reference it are terminal and their fee attribution is
+        // complete.
+        let protected_coids: HashSet<String> = state
+            .trades
+            .iter()
+            .filter(|(trade_key, trade)| {
+                !trade.failed
+                    && (trade.ownership.status != "CONFIRMED"
+                        || state.fee_attribution_pending.contains(*trade_key))
+            })
+            .map(|(_, trade)| trade.ownership.client_order_id.clone())
+            .collect();
         let stale_orders: Vec<(String, String)> = state
             .orders
             .iter()
             .filter(|(coid, order)| {
                 tokens.contains(&order.token_id)
+                    && !protected_coids.contains(*coid)
                     && !state.recovery_pending_orders.contains(*coid)
                     && order.reserved_cash <= EPS
                     && order.reserved_quantity <= EPS
@@ -2310,8 +2953,19 @@ impl SharedAccount {
             state.trades.remove(trade_key);
             state.fee_attribution_pending.remove(trade_key);
         }
+        let protected_fee_tokens: HashSet<String> = state
+            .trades
+            .iter()
+            .filter(|(trade_key, trade)| {
+                !trade.failed
+                    && (trade.ownership.status != "CONFIRMED"
+                        || state.fee_attribution_pending.contains(*trade_key))
+            })
+            .map(|(_, trade)| trade.ownership.token_id.clone())
+            .collect();
         let pruned_fee_configs = tokens
             .iter()
+            .filter(|token| !protected_fee_tokens.contains(*token))
             .filter(|token| state.token_fee_configs.remove(*token).is_some())
             .count();
         let pruned_trades = stale_trades.len();
@@ -2356,81 +3010,24 @@ fn clear_uncertain(state: &mut SharedAccountState) {
     state.uncertain_since_ms = None;
 }
 
-/// A snapshot can observe an on-chain settlement just before its MINED /
-/// CONFIRMED user-feed edge arrives. In the common all-or-none case, recognize
-/// that the wallet already equals the virtual ledger and mark every pending
-/// base delta physical. The later lifecycle edge then advances status without
-/// applying the same cash/token delta twice.
-fn mark_fully_observed_pending_trades(state: &mut SharedAccountState) {
-    let pending_tokens: HashSet<String> = state
-        .trades
-        .values()
-        .filter(|trade| {
-            trade.booked
-                && !trade.failed
-                && (!trade.physical_booked
-                    || (trade.virtual_fee_booked && !trade.physical_fee_booked))
-        })
-        .map(|trade| trade.ownership.token_id.clone())
-        .collect();
-    if pending_tokens.is_empty() {
-        return;
-    }
-    let mut aggregate_cash_delta = 0.0;
-    let mut aggregate_position_deltas = HashMap::<String, f64>::new();
-    for trade in state.trades.values().filter(|trade| {
+fn has_unsettled_trade_lifecycle(state: &SharedAccountState) -> bool {
+    state.trades.values().any(|trade| {
         trade.booked
             && !trade.failed
             && (!trade.physical_booked
                 || (trade.virtual_fee_booked && !trade.physical_fee_booked))
-    }) {
-        if !trade.physical_booked {
-            let sign = if trade.ownership.side == Side::Buy { 1.0 } else { -1.0 };
-            aggregate_cash_delta +=
-                -sign * trade.ownership.quantity * trade.ownership.price;
-            *aggregate_position_deltas
-                .entry(trade.ownership.token_id.clone())
-                .or_insert(0.0) += sign * trade.ownership.quantity;
-        }
-        if trade.virtual_fee_booked && !trade.physical_fee_booked {
-            aggregate_cash_delta -= trade.usdc_fee;
-            *aggregate_position_deltas
-                .entry(trade.ownership.token_id.clone())
-                .or_insert(0.0) -= trade.shares_fee;
-        }
-    }
-    // Aggregate-equal opposing pending fills contain no evidence that either
-    // individual lifecycle reached the wallet. Marking both physical would
-    // make a later FAILED reversal mutate physical state that never changed.
-    if aggregate_cash_delta.abs() <= EPS
-        && aggregate_position_deltas.values().all(|delta| delta.abs() <= EPS)
-    {
-        return;
-    }
-    let virtual_cash: f64 = state.instances.values().map(|instance| instance.cash).sum();
-    if (state.physical_cash - virtual_cash).abs() > EPS {
-        return;
-    }
-    let all_tokens_match = pending_tokens.iter().all(|token| {
-        let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
-        let virtual_qty: f64 = state
-            .instances
-            .values()
-            .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-            .sum();
-        (physical - virtual_qty).abs() <= EPS
-    });
-    if !all_tokens_match {
-        return;
-    }
-    for trade in state.trades.values_mut() {
-        if trade.booked && !trade.physical_booked && !trade.failed {
-            trade.physical_booked = true;
-        }
-        if trade.virtual_fee_booked && !trade.failed {
-            trade.physical_fee_booked = true;
-        }
-    }
+    })
+}
+
+fn has_unsettled_maintenance_operation(state: &SharedAccountState) -> bool {
+    state.maintenance_ops.values().any(|operation| {
+        matches!(
+            operation.status,
+            MaintenanceOperationStatus::Reserved
+                | MaintenanceOperationStatus::Submitted
+                | MaintenanceOperationStatus::Uncertain
+        )
+    })
 }
 
 /// A FAILED tombstone may release risk-off only after an authoritative wallet
@@ -2541,6 +3138,8 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
                 details,
             ),
         );
+    } else if let Some(reason) = state.allocation_migration_required.clone() {
+        set_uncertain(state, reason);
     } else if let Some(reason) = state.instance_registry_issue.clone() {
         set_uncertain(state, reason);
     } else if !state.recovery_pending_orders.is_empty() {
@@ -2571,6 +3170,19 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
                 "trade fee attribution pending: count={} trade_ids=[{}]",
                 pending.len(),
                 pending.join(","),
+            ),
+        );
+    } else if let Some(operation) = state
+        .maintenance_ops
+        .values()
+        .find(|operation| operation.status == MaintenanceOperationStatus::Uncertain)
+    {
+        set_uncertain(
+            state,
+            format!(
+                "maintenance operation `{}` finality uncertain: {}",
+                operation.operation_id,
+                operation.detail.as_deref().unwrap_or("pending recovery"),
             ),
         );
     } else if let Some((trade_key, _)) = state
@@ -2731,6 +3343,57 @@ mod tests {
         equal.apply_physical_snapshot(60.0, HashMap::new());
         assert_eq!(equal.instance_snapshot("a").unwrap().cash, 30.0);
         assert_eq!(equal.instance_snapshot("b").unwrap().cash, 30.0);
+    }
+
+    #[test]
+    fn seeded_membership_change_requires_explicit_cash_only_migration() {
+        let account = SharedAccount::new("membership");
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-UP", "BTC-DOWN")
+            .unwrap();
+        account.apply_physical_snapshot(
+            100.0,
+            HashMap::from([("BTC-UP".to_string(), 20.0)]),
+        );
+
+        account.register_instance("eth", 3.0);
+        account
+            .register_token_interest("eth", "eth-event", "ETH-UP", "ETH-DOWN")
+            .unwrap();
+        assert!(account.is_uncertain());
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 100.0);
+        assert_eq!(account.instance_snapshot("eth").unwrap().cash, 0.0);
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["BTC-UP"],
+            20.0
+        );
+        assert!(account
+            .instance_snapshot("eth")
+            .unwrap()
+            .positions
+            .is_empty());
+
+        let weights = BTreeMap::from([("btc".to_string(), 1.0), ("eth".to_string(), 3.0)]);
+        let first = account
+            .migrate_cash_allocation("add-eth-v1", &weights)
+            .unwrap();
+        let retry = account
+            .migrate_cash_allocation("add-eth-v1", &weights)
+            .unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 25.0);
+        assert_eq!(account.instance_snapshot("eth").unwrap().cash, 75.0);
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["BTC-UP"],
+            20.0
+        );
+        assert!(!account.is_uncertain());
+
+        let changed = BTreeMap::from([("btc".to_string(), 1.0), ("eth".to_string(), 1.0)]);
+        assert!(account
+            .migrate_cash_allocation("add-eth-v1", &changed)
+            .is_err());
     }
 
     #[test]
@@ -3296,6 +3959,79 @@ mod tests {
     }
 
     #[test]
+    fn physical_snapshot_is_deferred_until_trade_lifecycle_resolves() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-buy", "MATCHED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+            )
+            .unwrap();
+
+        // This wallet view may already contain trade-buy, but a snapshot has no
+        // trade id and therefore cannot prove that fact. Preserve the trade-
+        // driven physical ledger until the lifecycle edge arrives.
+        assert!(!account.apply_scoped_physical_snapshot_versioned(
+            1,
+            395.0,
+            HashMap::from([("UP".into(), 50.0)]),
+            HashSet::from(["UP".into()]),
+        ));
+        assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
+        assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 40.0);
+
+        account
+            .apply_trade_transition(
+                "trade-buy", "CONFIRMED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+            )
+            .unwrap();
+        assert_eq!(account.monitoring_snapshot().physical_cash, 395.0);
+        assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 50.0);
+        assert!(account.apply_scoped_physical_snapshot_versioned(
+            2,
+            395.0,
+            HashMap::from([("UP".into(), 50.0)]),
+            HashSet::from(["UP".into()]),
+        ));
+    }
+
+    #[test]
+    fn pruning_retains_order_mapping_and_fee_curve_for_nonterminal_trade() {
+        let account = seeded_account();
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
+            .unwrap();
+        account
+            .reserve_order("a", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-buy", "MATCHED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+            )
+            .unwrap();
+        account.release_order("a-buy", OrderStatus::Filled);
+
+        assert_eq!(
+            account.prune_terminal_history(&HashSet::from(["UP".into()])),
+            (0, 0),
+        );
+        assert_eq!(account.order_owner_by_oid("oid-buy").as_deref(), Some("a"));
+        assert!(account
+            .apply_trade_transition(
+                "trade-buy", "CONFIRMED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+            )
+            .is_some());
+
+        assert_eq!(
+            account.prune_terminal_history(&HashSet::from(["UP".into()])),
+            (1, 1),
+        );
+        assert!(account.order_owner_by_oid("oid-buy").is_none());
+    }
+
+    #[test]
     fn taker_fee_follows_virtual_physical_and_failed_lifecycle() {
         let account = seeded_account();
         account
@@ -3437,6 +4173,84 @@ mod tests {
         assert_eq!(account.instance_snapshot("a").unwrap().cash, 20.0);
         assert_eq!(account.instance_snapshot("a").unwrap().positions["UP"], 30.0);
         assert_eq!(account.instance_snapshot("b").unwrap().positions["DOWN"], 30.0);
+    }
+
+    #[test]
+    fn maintenance_operation_journal_is_atomic_and_idempotent() {
+        let account = seeded_account();
+        let allocations = HashMap::from([("a".into(), 10.0), ("b".into(), 30.0)]);
+        account
+            .reserve_maintenance_operation(
+                "split-op-1",
+                MaintenanceOperationKind::Split,
+                "condition",
+                "UP",
+                "DOWN",
+                &allocations,
+            )
+            .unwrap();
+        assert_eq!(account.monitoring_snapshot().reserved_cash, 40.0);
+        assert_eq!(account.monitoring_snapshot().pending_maintenance_operations, 1);
+        account
+            .mark_maintenance_operation_submitted("split-op-1", "tx-1")
+            .unwrap();
+        assert_eq!(
+            account.maintenance_operation("split-op-1").unwrap().tx_id.as_deref(),
+            Some("tx-1"),
+        );
+
+        account.confirm_maintenance_operation("split-op-1").unwrap();
+        let after = account.monitoring_snapshot();
+        assert_eq!(after.physical_cash, 360.0);
+        assert_eq!(after.reserved_cash, 0.0);
+        assert_eq!(after.pending_maintenance_operations, 0);
+        assert_eq!(account.instance_snapshot("a").unwrap().positions["UP"], 20.0);
+        assert_eq!(account.instance_snapshot("b").unwrap().positions["DOWN"], 30.0);
+
+        // Recovery may observe the same terminal chain state more than once.
+        account.confirm_maintenance_operation("split-op-1").unwrap();
+        assert_eq!(account.monitoring_snapshot().physical_cash, 360.0);
+    }
+
+    #[test]
+    fn persistent_submitted_maintenance_operation_forces_restart_recovery() {
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-maintenance-ledger-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("maintenance", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.apply_physical_snapshot(100.0, HashMap::new());
+            account
+                .reserve_maintenance_operation(
+                    "split-restart",
+                    MaintenanceOperationKind::Split,
+                    "condition",
+                    "UP",
+                    "DOWN",
+                    &HashMap::from([("a".into(), 25.0)]),
+                )
+                .unwrap();
+            account
+                .mark_maintenance_operation_submitted("split-restart", "tx-restart")
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("maintenance", &path).unwrap();
+        assert!(restored.is_uncertain());
+        assert_eq!(restored.monitoring_snapshot().reserved_cash, 25.0);
+        assert_eq!(restored.pending_maintenance_operations().len(), 1);
+        restored.fail_maintenance_operation("split-restart", "test chain failure");
+        assert!(!restored.is_uncertain());
+        assert_eq!(restored.monitoring_snapshot().reserved_cash, 0.0);
+        drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]
