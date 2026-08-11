@@ -17,6 +17,7 @@ use crate::types::*;
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
+const MAX_PUBLIC_EVENT_FUTURE_SKEW_NS: u64 = 2_000_000_000;
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const GAMMA_EVENT_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -205,6 +206,63 @@ pub struct PolyMarketInfo {
     /// Provides `exponent` and `rate`.
     #[serde(default, rename = "feeSchedule")]
     pub fee_schedule: FeeSchedule,
+}
+
+impl PolyMarketInfo {
+    /// Validate the binary-market structure before token IDs can reach a
+    /// strategy. Gamma returns parallel arrays, so accepting an empty,
+    /// duplicate, or length-mismatched response would make outcome identity
+    /// depend on array position alone.
+    pub fn validate_binary_structure(&self) -> Result<()> {
+        if self.condition_id.trim().is_empty() {
+            return Err(anyhow!("missing condition id"));
+        }
+        if self.clob_token_ids.len() != 2 || self.outcomes.len() != 2 {
+            return Err(anyhow!(
+                "expected exactly two tokens and outcomes, got tokens={} outcomes={}",
+                self.clob_token_ids.len(),
+                self.outcomes.len(),
+            ));
+        }
+        let first_token = self.clob_token_ids[0].trim();
+        let second_token = self.clob_token_ids[1].trim();
+        if first_token.is_empty() || second_token.is_empty() || first_token == second_token {
+            return Err(anyhow!("token ids must be non-empty and distinct"));
+        }
+        let first_outcome = self.outcomes[0].trim().to_ascii_lowercase();
+        let second_outcome = self.outcomes[1].trim().to_ascii_lowercase();
+        if first_outcome.is_empty() || second_outcome.is_empty() || first_outcome == second_outcome {
+            return Err(anyhow!("outcome labels must be non-empty and distinct"));
+        }
+        if !self.tick_size.is_finite() || self.tick_size <= 0.0 || self.tick_size >= 1.0 {
+            return Err(anyhow!("invalid tick size {}", self.tick_size));
+        }
+        if !self.order_min_size.is_finite() || self.order_min_size <= 0.0 {
+            return Err(anyhow!("invalid minimum order size {}", self.order_min_size));
+        }
+        Ok(())
+    }
+}
+
+fn accepted_binary_markets<'a>(
+    markets: &'a [PolyMarketInfo],
+    active_only: bool,
+) -> Vec<&'a PolyMarketInfo> {
+    markets.iter()
+        .filter(|market| !active_only || (market.active && !market.closed))
+        .filter(|market| match market.validate_binary_structure() {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    "[Polymarket] Rejecting malformed binary market id={} condition={}: {}",
+                    market.id,
+                    market.condition_id,
+                    error,
+                );
+                false
+            }
+        })
+        .collect()
 }
 
 /// Polymarket fee curve config, nested under each market as `feeSchedule`.
@@ -942,10 +1000,12 @@ impl PolymarketMarket {
                             self.token_to_series.remove(&sym.token_id);
                         }
 
-                        // Build new token list from active markets only
+                        // Build new token list from structurally valid active
+                        // markets only. Reuse the same accepted set for the
+                        // token map and Instrument events.
+                        let active_markets = accepted_binary_markets(&event.markets, true);
                         let mut symbols_state = Vec::new();
-                        for condition in &event.markets {
-                            if !condition.active || condition.closed { continue; }
+                        for condition in &active_markets {
                             for (j, token_id) in condition.clob_token_ids.iter().enumerate() {
                                 self.token_to_series.insert(token_id.clone(), i);
                                 let outcome = condition.outcomes.get(j).cloned().unwrap_or_default();
@@ -966,9 +1026,8 @@ impl PolymarketMarket {
                         });
 
                         // Queue Instrument events for any newly active markets
-                        for condition in &event.markets {
-                            if !condition.active || condition.closed { continue; }
-                            let mut bo: crate::types::BinaryOption = condition.clone().into();
+                        for condition in &active_markets {
+                            let mut bo: crate::types::BinaryOption = (*condition).clone().into();
                             bo.slug = event.slug.clone();
                             bo.series_slug = series_slug
                                 .strip_prefix("series:")
@@ -1769,6 +1828,8 @@ struct TradeFields {
     price: String,
     size: String,
     side: String, // "BUY" | "SELL"
+    #[serde(default)]
+    timestamp: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1778,6 +1839,8 @@ struct TickSizeFields {
     old_tick_size: f64,
     #[serde(default, deserialize_with = "de_str_or_num_f64")]
     new_tick_size: f64,
+    #[serde(default)]
+    timestamp: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1905,7 +1968,7 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
                 if let Some(e) = make_trade_event(t, now) { out.push(e); }
             }
             ClobFrame::Tagged(TaggedMessage::TickSizeChange(t)) => {
-                out.push(make_tick_size_event(t, now));
+                if let Some(event) = make_tick_size_event(t, now) { out.push(event); }
             }
             ClobFrame::Tagged(TaggedMessage::PriceChange {}) => { /* ignored */ }
             ClobFrame::Tagged(TaggedMessage::BestBidAsk(q)) => {
@@ -1965,6 +2028,10 @@ fn make_book_event(b: BookFields, now: u64) -> Option<MarketEvent> {
 }
 
 fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64) -> u64 {
+    normalized_timestamp_ns(timestamp).unwrap_or(fallback_ns)
+}
+
+fn normalized_timestamp_ns(timestamp: Option<&serde_json::Value>) -> Option<u64> {
     let raw = timestamp.and_then(|v| {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
@@ -1973,9 +2040,9 @@ fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64
         // The CLOB protocol defines timestamps as Unix milliseconds. Accept
         // already-normalized nanoseconds too, which is useful for internal
         // replay fixtures without losing the exchange/local distinction.
-        Some(ts) if ts < 1_000_000_000_000_000 => ts.saturating_mul(1_000_000),
-        Some(ts) => ts,
-        None => fallback_ns,
+        Some(ts) if ts < 1_000_000_000_000_000 => Some(ts.saturating_mul(1_000_000)),
+        Some(ts) => Some(ts),
+        None => None,
     }
 }
 
@@ -2013,25 +2080,54 @@ fn make_quote_event(
 fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     let price: f64 = t.price.parse().ok()?;
     let quantity: f64 = t.size.parse().ok()?;
+    if t.asset_id.trim().is_empty()
+        || !price.is_finite() || price <= 0.0 || price >= 1.0
+        || !quantity.is_finite() || quantity <= 0.0
+    {
+        return None;
+    }
+    let side = match t.side.trim().to_ascii_uppercase().as_str() {
+        "BUY" => Side::Buy,
+        "SELL" => Side::Sell,
+        _ => return None,
+    };
+    let exchange_timestamp_ns = timestamp_value_to_ns(t.timestamp.as_ref(), now);
+    if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
+        return None;
+    }
     Some(MarketEvent::Trade(TradeTick {
         exchange: Exchange::Polymarket,
         symbol: t.asset_id,
         price,
         quantity,
-        side: if t.side == "BUY" { Side::Buy } else { Side::Sell },
-        exchange_timestamp_ns: now,
+        side,
+        exchange_timestamp_ns,
         local_timestamp_ns: now,
     }))
 }
 
-fn make_tick_size_event(t: TickSizeFields, now: u64) -> MarketEvent {
-    MarketEvent::TickSizeChange(TickSizeChange {
+fn make_tick_size_event(t: TickSizeFields, now: u64) -> Option<MarketEvent> {
+    if t.asset_id.trim().is_empty()
+        || !t.old_tick_size.is_finite() || t.old_tick_size <= 0.0 || t.old_tick_size >= 1.0
+        || !t.new_tick_size.is_finite() || t.new_tick_size <= 0.0 || t.new_tick_size >= 1.0
+        || t.new_tick_size > t.old_tick_size
+    {
+        return None;
+    }
+    // A missing timestamp cannot participate in the model's source high-water
+    // mark, so fail closed instead of silently assigning receipt time.
+    let exchange_timestamp_ns = normalized_timestamp_ns(t.timestamp.as_ref())?;
+    if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
+        return None;
+    }
+    Some(MarketEvent::TickSizeChange(TickSizeChange {
         exchange: Exchange::Polymarket,
         symbol: t.asset_id,
         old_tick_size: t.old_tick_size,
         new_tick_size: t.new_tick_size,
+        exchange_timestamp_ns,
         local_timestamp_ns: now,
-    })
+    }))
 }
 
 fn make_inline_rtds_event(r: InlineRtdsFields, local_now: u64) -> Option<MarketEvent> {
@@ -2140,12 +2236,11 @@ impl ExchangeMarket for PolymarketMarket {
 
                 let series_idx = self.series.len();
 
+                let active_markets = accepted_binary_markets(&event.markets, true);
+
                 // Register all active market tokens
                 let mut symbols_state = Vec::new();
-                for condition in &event.markets {
-                    if !condition.active || condition.closed {
-                        continue; // skip resolved markets
-                    }
+                for condition in &active_markets {
                     for (i, token_id) in condition.clob_token_ids.iter().enumerate() {
                         self.token_to_series.insert(token_id.clone(), series_idx);
                         let outcome = condition.outcomes.get(i).cloned().unwrap_or_default();
@@ -2166,11 +2261,8 @@ impl ExchangeMarket for PolymarketMarket {
                 });
 
                 // Queue Instrument events for active markets
-                for condition in &event.markets {
-                    if !condition.active || condition.closed {
-                        continue;
-                    }
-                    let mut binary_option: crate::types::BinaryOption = condition.clone().into();
+                for condition in &active_markets {
+                    let mut binary_option: crate::types::BinaryOption = (*condition).clone().into();
                     binary_option.slug = event.slug.clone();
                     binary_option.series_slug = symbol_str
                         .strip_prefix("series:")
@@ -2193,7 +2285,7 @@ impl ExchangeMarket for PolymarketMarket {
                     symbols: symbols_state,
                 };
 
-                let active_count = event.markets.iter().filter(|m| m.active && !m.closed).count();
+                let active_count = active_markets.len();
                 info!(
                     "[Polymarket] Event series '{}': subscribed to {}/{} active markets, {} tokens",
                     series_slug, active_count, event.markets.len(), market.symbols.len()
@@ -2219,9 +2311,11 @@ impl ExchangeMarket for PolymarketMarket {
 
                 let series_idx = self.series.len();
 
+                let accepted_markets = accepted_binary_markets(&event.markets, false);
+
                 // Register all token IDs for WS subscription
                 let mut symbols_state = Vec::new();
-                for condition in &event.markets {
+                for condition in &accepted_markets {
                     for (i, token_id) in condition.clob_token_ids.iter().enumerate() {
                         self.token_to_series.insert(token_id.clone(), series_idx);
                         let outcome = condition.outcomes.get(i).cloned().unwrap_or_default();
@@ -2234,8 +2328,8 @@ impl ExchangeMarket for PolymarketMarket {
                 }
 
                 // Queue Instrument events (override slug to event slug for cross-exchange matching)
-                for condition in &event.markets {
-                    let mut binary_option: crate::types::BinaryOption = condition.clone().into();
+                for condition in &accepted_markets {
+                    let mut binary_option: crate::types::BinaryOption = (*condition).clone().into();
                     binary_option.slug = event.slug.clone();
                     binary_option.series_slug = symbol_str
                         .strip_prefix("series:")
@@ -2563,6 +2657,72 @@ mod pick_current_event_tests {
         ] {
             assert!(parse_clob_frame(invalid).is_empty());
         }
+    }
+
+    #[test]
+    fn public_trade_preserves_source_time_and_rejects_invalid_semantics() {
+        let events = parse_clob_frame(
+            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351"}"#,
+        );
+        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        assert_eq!(trade.exchange_timestamp_ns, 1_757_908_892_351_000_000);
+
+        for invalid in [
+            r#"{"event_type":"trade","asset_id":"up","price":"NaN","size":"2","side":"BUY","timestamp":"1757908892351"}"#,
+            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"0","side":"BUY","timestamp":"1757908892351"}"#,
+            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"UNKNOWN","timestamp":"1757908892351"}"#,
+        ] {
+            assert!(parse_clob_frame(invalid).is_empty());
+        }
+    }
+
+    #[test]
+    fn tick_size_change_requires_valid_narrowing_and_source_time() {
+        let events = parse_clob_frame(
+            r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"1757908892351"}"#,
+        );
+        let MarketEvent::TickSizeChange(change) = &events[0] else {
+            panic!("expected tick size change");
+        };
+        assert_eq!(change.exchange_timestamp_ns, 1_757_908_892_351_000_000);
+        for invalid in [
+            r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.01","new_tick_size":"0.001"}"#,
+            r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.001","new_tick_size":"0.01","timestamp":"1757908892351"}"#,
+            r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.01","new_tick_size":"NaN","timestamp":"1757908892351"}"#,
+        ] {
+            assert!(parse_clob_frame(invalid).is_empty());
+        }
+    }
+
+    #[test]
+    fn binary_market_structure_rejects_ambiguous_token_arrays() {
+        let market = |tokens: Vec<&str>, outcomes: Vec<&str>| PolyMarketInfo {
+            id: "market".into(),
+            question: "question".into(),
+            condition_id: "condition".into(),
+            slug: "slug".into(),
+            clob_token_ids: tokens.into_iter().map(str::to_string).collect(),
+            outcomes: outcomes.into_iter().map(str::to_string).collect(),
+            outcome_prices: vec!["0.5".into(), "0.5".into()],
+            active: true,
+            closed: false,
+            volume: 0.0,
+            liquidity: 0.0,
+            tick_size: 0.01,
+            order_min_size: 5.0,
+            group_item_title: String::new(),
+            event_start_time: String::new(),
+            base_fee: 0,
+            fee_schedule: FeeSchedule::default(),
+        };
+        assert!(market(vec!["up", "down"], vec!["Up", "Down"])
+            .validate_binary_structure().is_ok());
+        assert!(market(vec!["up", "up"], vec!["Up", "Down"])
+            .validate_binary_structure().is_err());
+        assert!(market(vec!["up", "down"], vec!["Up", " up "])
+            .validate_binary_structure().is_err());
+        assert!(market(vec!["up"], vec!["Up"])
+            .validate_binary_structure().is_err());
     }
 
     fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {

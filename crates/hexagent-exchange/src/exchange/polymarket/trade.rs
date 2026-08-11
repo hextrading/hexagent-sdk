@@ -3716,13 +3716,50 @@ impl PolymarketTrade {
                             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
                     }
-                    "CANCELED" | "CANCELLED" => {
+                    value if value.starts_with("CANCELED") || value.starts_with("CANCELLED") => {
+                        let Some(audit) = order_audit.as_ref() else {
+                            warn!(
+                                "[PolymarketTrade] Reconcile placement coid={} orderID={} status={} without order audit — preserving orphan reservation",
+                                coid, oid, value,
+                            );
+                            continue;
+                        };
+
+                        // A cancellation only proves that the residual is off
+                        // book. Replay its trades first so the durable account
+                        // ledger has the latest local filled quantity before
+                        // the authoritative cumulative match is applied.
+                        if !audit.associate_trades.is_empty() {
+                            updates.extend(self.reconcile_orphans_with_permit(
+                                permit, &[], &[], &audit.associate_trades,
+                            ));
+                        }
+                        let Some(ownership) = self.shared.account_state.order(coid) else {
+                            warn!(
+                                "[PolymarketTrade] Reconcile placement coid={} orderID={} status={} without durable ownership — preserving orphan",
+                                coid, oid, value,
+                            );
+                            continue;
+                        };
+                        let (matched, has_valid_size_matched) = effective_audited_match(
+                            audit.size_matched.as_deref(),
+                            ownership.quantity,
+                            ownership.filled_quantity,
+                        );
+                        if !has_valid_size_matched {
+                            warn!(
+                                "[PolymarketTrade] Reconcile placement coid={} orderID={} status={} omitted/invalid size_matched — preserving reservation",
+                                coid, oid, value,
+                            );
+                            continue;
+                        }
+
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
-                        self.shared.remove_order_as(coid, OrderStatus::Cancelled);
+                        self.shared.remove_cancelled_order_with_match(coid, matched);
                         info!(
-                            "[PolymarketTrade] Reconciled placement coid={} orderID={} → Cancelled",
-                            coid, oid,
+                            "[PolymarketTrade] Reconciled placement coid={} orderID={} → Cancelled size_matched={}",
+                            coid, oid, matched,
                         );
                         updates.push(OrderUpdate {
                             client_order_id: coid.clone(),
@@ -3734,7 +3771,7 @@ impl PolymarketTrade {
                             liquidity: None,
                             filled_quantity: 0.0,
                             remaining_quantity: 0.0,
-                            avg_fill_price: 0.0,
+                            avg_fill_price: ownership.price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
                             order_audit: order_audit.clone(),

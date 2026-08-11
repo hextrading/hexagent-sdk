@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use futures_util::{stream, StreamExt};
 use log::info;
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use serde::Deserialize;
 
 use crate::account::position::Position;
 
 const DATA_API_BASE: &str = "https://data-api.polymarket.com";
+const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 
 /// Raw position record from Polymarket Data API.
 #[derive(Debug, Deserialize)]
@@ -29,6 +33,24 @@ struct ApiPosition {
     title: Option<String>,
     #[serde(default)]
     redeemable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClobMarketResolution {
+    #[serde(default, alias = "conditionId")]
+    condition_id: String,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    tokens: Vec<ClobMarketToken>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClobMarketToken {
+    #[serde(default, alias = "tokenId")]
+    token_id: String,
+    #[serde(default)]
+    winner: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -71,6 +93,95 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> PositionSnapshot {
         }
     }
     PositionSnapshot { positions, settled_token_values }
+}
+
+fn authoritative_resolution(
+    expected_condition_id: &str,
+    market: ClobMarketResolution,
+) -> Result<Option<HashMap<String, f64>>> {
+    if market.condition_id.trim() != expected_condition_id.trim() {
+        return Err(anyhow!(
+            "settlement condition mismatch: expected {}, got {}",
+            expected_condition_id,
+            market.condition_id,
+        ));
+    }
+    if !market.closed {
+        return Ok(None);
+    }
+    if market.tokens.len() != 2 {
+        return Err(anyhow!(
+            "closed binary market {} returned {} tokens",
+            expected_condition_id,
+            market.tokens.len(),
+        ));
+    }
+
+    let mut values = HashMap::with_capacity(2);
+    let mut winners = 0usize;
+    for token in market.tokens {
+        let token_id = token.token_id.trim();
+        if token_id.is_empty() {
+            return Err(anyhow!("closed market {} returned an empty token id", expected_condition_id));
+        }
+        let winner = token.winner.ok_or_else(|| anyhow!(
+            "closed market {} has no authoritative winner flag for token {}",
+            expected_condition_id,
+            token_id,
+        ))?;
+        if winner { winners += 1; }
+        if values.insert(token_id.to_string(), if winner { 1.0 } else { 0.0 }).is_some() {
+            return Err(anyhow!("closed market {} returned duplicate token ids", expected_condition_id));
+        }
+    }
+    if winners != 1 {
+        return Err(anyhow!(
+            "closed market {} returned {} winning tokens",
+            expected_condition_id,
+            winners,
+        ));
+    }
+    Ok(Some(values))
+}
+
+async fn fetch_authoritative_resolutions(
+    condition_ids: HashSet<String>,
+) -> HashMap<String, f64> {
+    let client = crate::async_rt::http_client();
+    let results = stream::iter(condition_ids.into_iter().map(|condition_id| {
+        let client = client.clone();
+        async move {
+            let url = format!("{}/markets/{}", CLOB_API_BASE, condition_id);
+            let response = client.get(&url).send().await
+                .map_err(|error| anyhow!("fetch settlement {}: {}", condition_id, error))?;
+            if !response.status().is_success() {
+                return Err(anyhow!(
+                    "fetch settlement {}: status {}",
+                    condition_id,
+                    response.status(),
+                ));
+            }
+            let market = response.json::<ClobMarketResolution>().await
+                .map_err(|error| anyhow!("parse settlement {}: {}", condition_id, error))?;
+            authoritative_resolution(&condition_id, market)
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut values = HashMap::new();
+    for result in results {
+        match result {
+            Ok(Some(resolution)) => values.extend(resolution),
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value: {}",
+                error,
+            ),
+        }
+    }
+    values
 }
 
 /// Fetch current positions from Polymarket Data API.
@@ -121,7 +232,22 @@ pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot>
         ))
     })?;
 
-    let snapshot = position_snapshot_from_rows(&resp);
+    // Query every condition represented by a non-zero historical position.
+    // This is deliberately broader than `redeemable`: after a new process
+    // starts, Data API metadata can be incomplete or rounded, while the CLOB
+    // market endpoint still carries the final winner flags. Failed/active
+    // lookups remain provisional and are retried on the next account refresh.
+    let conditions: HashSet<String> = resp.iter()
+        .filter(|position| position.size.is_finite() && position.size > 0.0)
+        .map(|position| position.condition_id.trim())
+        .filter(|condition_id| !condition_id.is_empty())
+        .map(str::to_string)
+        .collect();
+    let authoritative = crate::async_rt::block_on_runtime(
+        fetch_authoritative_resolutions(conditions),
+    );
+    let mut snapshot = position_snapshot_from_rows(&resp);
+    snapshot.settled_token_values.extend(authoritative);
 
     info!(
         "[Polymarket] Fetched {} positions ({} raw records)",
@@ -147,7 +273,6 @@ pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiBalance {
-    #[serde(default)]
     balance: f64,
 }
 
@@ -273,21 +398,15 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
     let selector: [u8; 4] = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
     let mut calldata = Vec::with_capacity(4 + 32);
     calldata.extend_from_slice(&selector);
-    let addr_hex = wallet_address.strip_prefix("0x").unwrap_or(wallet_address);
-    let addr_bytes = hex::decode(addr_hex).unwrap_or_else(|_| vec![0u8; 20]);
+    let addr_bytes = parse_evm_address(wallet_address)?;
+    parse_evm_address(token).map_err(|error| anyhow!("invalid collateral token address: {error}"))?;
     let mut padded = [0u8; 32];
-    let start = 32 - addr_bytes.len().min(32);
-    padded[start..].copy_from_slice(&addr_bytes[..addr_bytes.len().min(32)]);
+    padded[12..].copy_from_slice(&addr_bytes);
     calldata.extend_from_slice(&padded);
     let data = format!("0x{}", hex::encode(&calldata));
 
     if let Some(result) = super::deploy_wallet::eth_call(token, &data) {
-        let hex_str = result.strip_prefix("0x").unwrap_or(&result);
-        let trimmed = hex_str.trim_start_matches('0');
-        let wei = if trimmed.is_empty() { 0u128 } else {
-            u128::from_str_radix(trimmed, 16).unwrap_or(0)
-        };
-        let balance = wei as f64 / 1_000_000.0; // 6 decimals for both USDC.e and pUSD
+        let balance = parse_erc20_balance_result(&result)?;
         info!("[Polymarket] Balance: {:.4} (on-chain, token={})", balance, token);
         return Ok(balance);
     }
@@ -300,15 +419,12 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
         let balance = crate::async_rt::block_on_runtime(async move {
             let r = client.get(&url).send().await
                 .map_err(|e| anyhow::anyhow!("fetch_balance: {}", e))?;
-            if r.status().as_u16() == 404 {
-                return Ok(0.0);
-            }
             if !r.status().is_success() {
                 return Err(anyhow::anyhow!("fetch_balance: status {}", r.status()));
             }
             let bal: ApiBalance = r.json().await
                 .map_err(|e| anyhow::anyhow!("fetch_balance parse: {}", e))?;
-            Ok::<f64, anyhow::Error>(bal.balance)
+            validate_balance(bal.balance)
         })?;
         info!("[Polymarket] Balance: {:.4} (data-api, USDC.e)", balance);
         return Ok(balance);
@@ -318,6 +434,45 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
         "eth_call balanceOf failed for token {} and no data-api fallback for non-USDC.e tokens",
         token,
     ))
+}
+
+fn parse_evm_address(address: &str) -> Result<[u8; 20]> {
+    let encoded = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(address);
+    if encoded.len() != 40 {
+        return Err(anyhow!("EVM address must contain exactly 40 hex characters"));
+    }
+    let decoded = hex::decode(encoded).map_err(|error| anyhow!("invalid EVM address hex: {error}"))?;
+    decoded.try_into().map_err(|_| anyhow!("EVM address must decode to 20 bytes"))
+}
+
+fn parse_erc20_balance_result(result: &str) -> Result<f64> {
+    let encoded = result
+        .strip_prefix("0x")
+        .or_else(|| result.strip_prefix("0X"))
+        .ok_or_else(|| anyhow!("eth_call balance response is missing 0x prefix"))?;
+    if encoded.len() != 64 {
+        return Err(anyhow!(
+            "eth_call balance response must be one ABI word (64 hex characters), got {}",
+            encoded.len(),
+        ));
+    }
+    let bytes = hex::decode(encoded)
+        .map_err(|error| anyhow!("invalid eth_call balance hex: {error}"))?;
+    let raw = BigUint::from_bytes_be(&bytes);
+    let balance = raw.to_f64()
+        .ok_or_else(|| anyhow!("eth_call balance does not fit in finite f64"))?
+        / 1_000_000.0;
+    validate_balance(balance)
+}
+
+fn validate_balance(balance: f64) -> Result<f64> {
+    if !balance.is_finite() || balance < 0.0 {
+        return Err(anyhow!("balance must be finite and non-negative, got {balance}"));
+    }
+    Ok(balance)
 }
 
 #[cfg(test)]
@@ -351,5 +506,52 @@ mod tests {
         ]);
         assert!(snapshot.settled_token_values.is_empty());
         assert_eq!(snapshot.positions["ambiguous"].quantity, 2.0);
+    }
+
+    #[test]
+    fn closed_market_winner_flags_converge_both_tokens() {
+        let resolution = authoritative_resolution("condition", ClobMarketResolution {
+            condition_id: "condition".to_string(),
+            closed: true,
+            tokens: vec![
+                ClobMarketToken { token_id: "up".to_string(), winner: Some(false) },
+                ClobMarketToken { token_id: "down".to_string(), winner: Some(true) },
+            ],
+        }).unwrap().unwrap();
+        assert_eq!(resolution.get("up"), Some(&0.0));
+        assert_eq!(resolution.get("down"), Some(&1.0));
+    }
+
+    #[test]
+    fn active_or_ambiguous_market_is_not_authoritative() {
+        assert!(authoritative_resolution("condition", ClobMarketResolution {
+            condition_id: "condition".to_string(),
+            closed: false,
+            tokens: vec![],
+        }).unwrap().is_none());
+        assert!(authoritative_resolution("condition", ClobMarketResolution {
+            condition_id: "condition".to_string(),
+            closed: true,
+            tokens: vec![
+                ClobMarketToken { token_id: "up".to_string(), winner: Some(false) },
+                ClobMarketToken { token_id: "down".to_string(), winner: Some(false) },
+            ],
+        }).is_err());
+    }
+
+    #[test]
+    fn abnormal_balance_payloads_are_never_zero_fallbacks() {
+        assert!(parse_evm_address("0x1234").is_err());
+        assert!(parse_evm_address("0x000000000000000000000000000000000000000g").is_err());
+        assert!(parse_erc20_balance_result("0x0").is_err());
+        assert!(parse_erc20_balance_result("not-hex").is_err());
+        assert!(validate_balance(f64::NAN).is_err());
+        assert!(validate_balance(-1.0).is_err());
+    }
+
+    #[test]
+    fn valid_abi_balance_decodes_six_decimals() {
+        let encoded = format!("0x{:064x}", 12_345_678u64);
+        assert_eq!(parse_erc20_balance_result(&encoded).unwrap(), 12.345678);
     }
 }
