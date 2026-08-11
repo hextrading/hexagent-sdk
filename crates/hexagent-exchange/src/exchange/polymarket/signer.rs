@@ -154,6 +154,7 @@ impl OrderSigner {
 
     /// Sign an order, returning the hex-encoded signature with 0x prefix.
     pub fn sign_order(&self, order: &ClobOrder) -> Result<String> {
+        validate_clob_order_numbers(order)?;
         self.sign_digest(&self.order_digest(order))
     }
 
@@ -211,6 +212,10 @@ impl OrderSigner {
         side: crate::types::Side,
         fee_rate_bps: u32,
     ) -> Result<SignedOrder> {
+        validate_signing_inputs(token_id, price, size)?;
+        if fee_rate_bps > 10_000 {
+            return Err(anyhow!("Invalid fee_rate_bps: {}", fee_rate_bps));
+        }
         let (maker_amount, taker_amount) = compute_amounts(price, size, side);
         let clob_side = match side {
             crate::types::Side::Buy => 0u8,
@@ -231,6 +236,7 @@ impl OrderSigner {
             side: clob_side,
             signature_type: self.signature_type as u8,
         };
+        validate_clob_order_numbers(&order)?;
 
         // One digest serves both the signature and the orderID — the
         // previous sign_order + order_hash_hex pair hashed the full
@@ -295,6 +301,77 @@ pub fn compute_amounts(price: f64, size: f64, side: crate::types::Side) -> (Stri
             (maker.to_string(), taker.to_string())
         }
     }
+}
+
+const U256_MAX_DECIMAL: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
+pub(super) fn validate_u256_decimal(name: &str, value: &str, allow_zero: bool) -> Result<()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(anyhow!("Invalid {} decimal: '{}'", name, value));
+    }
+    let normalized = value.trim_start_matches('0');
+    if normalized.is_empty() {
+        if allow_zero {
+            return Ok(());
+        }
+        return Err(anyhow!("Invalid {}: zero is not allowed", name));
+    }
+    if normalized.len() > U256_MAX_DECIMAL.len()
+        || (normalized.len() == U256_MAX_DECIMAL.len()
+            && normalized > U256_MAX_DECIMAL)
+    {
+        return Err(anyhow!("Invalid {}: exceeds uint256", name));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_signing_inputs(token_id: &str, price: f64, size: f64) -> Result<()> {
+    validate_u256_decimal("token_id", token_id, false)?;
+    if !price.is_finite() || price <= 0.0 || price >= 1.0 {
+        return Err(anyhow!("Invalid price: {}", price));
+    }
+    if !size.is_finite() || size <= 0.0 {
+        return Err(anyhow!("Invalid quantity: {}", size));
+    }
+
+    const SCALE: f64 = 1_000_000.0;
+    let max_exclusive = u128::MAX as f64;
+    for (name, scaled) in [
+        ("quantity", size * SCALE),
+        ("notional", size * price * SCALE),
+    ] {
+        if !scaled.is_finite() || scaled.round() < 1.0 || scaled >= max_exclusive {
+            return Err(anyhow!(
+                "Invalid {} after 6-decimal quantization: {}",
+                name,
+                scaled,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_clob_order_numbers(order: &ClobOrder) -> Result<()> {
+    validate_u256_decimal("salt", &order.salt, true)?;
+    validate_u256_decimal("token_id", &order.token_id, false)?;
+    validate_u256_decimal("maker_amount", &order.maker_amount, false)?;
+    validate_u256_decimal("taker_amount", &order.taker_amount, false)?;
+    validate_u256_decimal("expiration", &order.expiration, true)?;
+    validate_u256_decimal("nonce", &order.nonce, true)?;
+    validate_u256_decimal("fee_rate_bps", &order.fee_rate_bps, true)?;
+    let fee_rate_bps = order.fee_rate_bps.parse::<u32>()
+        .map_err(|_| anyhow!("Invalid fee_rate_bps: {}", order.fee_rate_bps))?;
+    if fee_rate_bps > 10_000 {
+        return Err(anyhow!("Invalid fee_rate_bps: {}", fee_rate_bps));
+    }
+    if order.side > 1 {
+        return Err(anyhow!("Invalid side: {}", order.side));
+    }
+    if order.signature_type > SignatureType::Poly1271 as u8 {
+        return Err(anyhow!("Invalid signature_type: {}", order.signature_type));
+    }
+    Ok(())
 }
 
 /// Process start time in whole Unix seconds, captured once. Occupies the salt's
@@ -544,6 +621,23 @@ mod tests {
         let (maker, taker) = compute_amounts(0.55, 100.0, crate::types::Side::Sell);
         assert_eq!(maker, "100000000"); // 100 * 1e6
         assert_eq!(taker, "55000000");  // 100 * 0.55 * 1e6
+    }
+
+    #[test]
+    fn v1_signer_rejects_invalid_numeric_inputs_and_prebuilt_fields() {
+        let signer = fixture_signer();
+        assert!(signer.build_signed_order("invalid-token", 0.5, 1.0,
+            crate::types::Side::Buy, 0).is_err());
+        assert!(signer.build_signed_order("1", f64::NAN, 1.0,
+            crate::types::Side::Buy, 0).is_err());
+        assert!(signer.build_signed_order("1", 0.5, f64::INFINITY,
+            crate::types::Side::Buy, 0).is_err());
+        assert!(signer.build_signed_order("1", 0.5, 1.0,
+            crate::types::Side::Buy, 10_001).is_err());
+
+        let mut order = fixture_order();
+        order.maker_amount = "NaN".to_string();
+        assert!(signer.sign_order(&order).is_err());
     }
 
     /// Helper: build a deterministic ClobOrder + signer so tests can

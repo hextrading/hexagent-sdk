@@ -32,6 +32,8 @@ use super::signer::{
     compute_amounts,
     account_salt_prekeyed,
     derive_addresses,
+    validate_signing_inputs,
+    validate_u256_decimal,
 };
 use std::sync::OnceLock;
 
@@ -239,6 +241,7 @@ impl OrderSignerV2 {
     }
 
     pub fn sign_order(&self, order: &OrderV2) -> Result<String> {
+        validate_order_v2_numbers(order)?;
         self.sign_digest(&self.order_digest(order))
     }
 
@@ -280,6 +283,7 @@ impl OrderSignerV2 {
         size: f64,
         side: crate::types::Side,
     ) -> Result<SignedOrderV2> {
+        validate_signing_inputs(token_id, price, size)?;
         let (maker_amount, taker_amount) = compute_amounts(price, size, side);
         let clob_side = match side {
             crate::types::Side::Buy => 0u8,
@@ -306,6 +310,7 @@ impl OrderSignerV2 {
             taker: "0x0000000000000000000000000000000000000000".to_string(),
             expiration: "0".to_string(),
         };
+        validate_order_v2_numbers(&order)?;
 
         let digest = self.order_digest(&order);
         let signature = self.sign_digest(&digest)?;
@@ -326,6 +331,7 @@ impl OrderSignerV2 {
         size: f64,
         side: crate::types::Side,
     ) -> Result<SignedOrderV2> {
+        validate_signing_inputs(token_id, price, size)?;
         let (maker_amount, taker_amount) = compute_amounts(price, size, side);
         let clob_side = match side {
             crate::types::Side::Buy => 0u8,
@@ -359,6 +365,7 @@ impl OrderSignerV2 {
             taker: "0x0000000000000000000000000000000000000000".to_string(),
             expiration: "0".to_string(),
         };
+        validate_order_v2_numbers(&order)?;
 
         // The ERC-7739 signature and the orderID share the same struct
         // hash — compute it once (previously the whole struct was hashed
@@ -510,6 +517,22 @@ fn u256_from_decimal(s: &str) -> [u8; 32] {
     result
 }
 
+fn validate_order_v2_numbers(order: &OrderV2) -> Result<()> {
+    validate_u256_decimal("salt", &order.salt, true)?;
+    validate_u256_decimal("token_id", &order.token_id, false)?;
+    validate_u256_decimal("maker_amount", &order.maker_amount, false)?;
+    validate_u256_decimal("taker_amount", &order.taker_amount, false)?;
+    validate_u256_decimal("timestamp", &order.timestamp, false)?;
+    validate_u256_decimal("expiration", &order.expiration, true)?;
+    if order.side > 1 {
+        return Err(anyhow!("Invalid side: {}", order.side));
+    }
+    if order.signature_type > SignatureType::Poly1271 as u8 {
+        return Err(anyhow!("Invalid signature_type: {}", order.signature_type));
+    }
+    Ok(())
+}
+
 fn parse_bytes32(s: &str) -> Result<[u8; 32]> {
     if s.is_empty() { return Ok([0u8; 32]); }
     let hex_clean = s.strip_prefix("0x").unwrap_or(s);
@@ -556,6 +579,25 @@ mod tests {
         assert_eq!(signed.order_hash.len(), 66);
         assert!(signed.signature.starts_with("0x"));
         assert_eq!(signed.signature.len(), 132);
+    }
+
+    #[test]
+    fn v2_signer_rejects_invalid_numeric_inputs_and_prebuilt_fields() {
+        let signer = OrderSignerV2::new(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            false,
+            SignatureType::Eoa,
+            "",
+        ).unwrap();
+        assert!(signer.build_signed_order("invalid-token", 0.5, 1.0,
+            crate::types::Side::Buy).is_err());
+        assert!(signer.build_signed_order("1", f64::INFINITY, 1.0,
+            crate::types::Side::Buy).is_err());
+
+        let mut signed = signer.build_signed_order("1", 0.5, 1.0,
+            crate::types::Side::Buy).unwrap();
+        signed.order.timestamp = "not-a-number".to_string();
+        assert!(signer.sign_order(&signed.order).is_err());
     }
 
     #[test]
