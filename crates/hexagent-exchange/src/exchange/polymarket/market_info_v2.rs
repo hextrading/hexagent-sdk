@@ -184,7 +184,8 @@ pub fn fetch_clob_market_info(
         .map_err(|e| anyhow!("market-info fetch {} failed: {}", url, e))?;
     let json: Value = serde_json::from_str(&raw)
         .map_err(|e| anyhow!("market-info parse {} failed: {} (body: {})", url, e, &raw[..raw.len().min(200)]))?;
-    parse_market_info(&json).map_err(|e| anyhow!("{}: url={}  body={}", e, url, &raw[..raw.len().min(200)]))
+    parse_market_info_for_condition(&json, condition_id)
+        .map_err(|e| anyhow!("{}: url={}  body={}", e, url, &raw[..raw.len().min(200)]))
 }
 
 /// Spawn a fetch on a dedicated short-lived thread; return a channel
@@ -264,9 +265,10 @@ pub fn spawn_market_info_v2_fetch(
 /// }
 /// ```
 ///
-/// The `fd` ("fee details") object may be **absent** on markets with
-/// zero fees — the server simply omits it. That's not an error; we
-/// treat missing `fd` as `(fee_rate=0, exponent=1, taker_only=false)`.
+/// The `fd` ("fee details") object may be **absent** on a structurally
+/// complete market response with zero fees — the server simply omits it.
+/// Only that complete shape is treated as
+/// `(fee_rate=0, exponent=1, taker_only=false)`; empty/error payloads are not.
 ///
 /// Accepts alternate field names as fallbacks for robustness in case
 /// Polymarket renames them later:
@@ -278,8 +280,51 @@ pub fn spawn_market_info_v2_fetch(
 ///   - bps (legacy): `feeRateBps`, `takerBaseFee`, `baseFee` — used if
 ///                   no `fee_rate` float is present, divided by 1e4.
 pub fn parse_market_info(json: &Value) -> Result<MarketInfoV2> {
-    // Peel `{ "data": {...} }` wrappers.
-    let root = json.get("data").unwrap_or(json);
+    parse_market_info_inner(json, None)
+}
+
+fn parse_market_info_for_condition(json: &Value, condition_id: &str) -> Result<MarketInfoV2> {
+    parse_market_info_inner(json, Some(condition_id))
+}
+
+fn parse_market_info_inner(json: &Value, expected_condition_id: Option<&str>) -> Result<MarketInfoV2> {
+    let envelope = json.as_object().ok_or_else(|| anyhow!("market-info response is not an object"))?;
+    if envelope.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err(anyhow!("market-info response reports success=false"));
+    }
+    for key in ["error", "errorMsg", "error_message"] {
+        if envelope.get(key).is_some_and(|value| !value.is_null()) {
+            return Err(anyhow!("market-info response contains {}", key));
+        }
+    }
+
+    // Peel `{ "data": {...} }` wrappers, but never turn an explicitly null
+    // data payload into a schema-less fee-free market.
+    let root = match envelope.get("data") {
+        Some(value) => value.as_object()
+            .map(|_| value)
+            .ok_or_else(|| anyhow!("market-info data is not an object"))?,
+        None => json,
+    };
+    let root_obj = root.as_object().ok_or_else(|| anyhow!("market-info payload is not an object"))?;
+    if root_obj.get("fd").is_some_and(|value| !value.is_object()) {
+        return Err(anyhow!("market-info fee details are not an object"));
+    }
+
+    let response_condition_id = ["c", "conditionId", "condition_id"]
+        .iter()
+        .find_map(|key| root_obj.get(*key).and_then(Value::as_str));
+    if let Some(expected) = expected_condition_id {
+        let actual = response_condition_id
+            .ok_or_else(|| anyhow!("market-info payload has no condition id"))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(anyhow!(
+                "market-info condition mismatch: expected {}, got {}",
+                expected,
+                actual,
+            ));
+        }
+    }
 
     // Helpers accept both "root-level key" and "nested path via '.'".
     let lookup = |keys: &[&str]| -> Option<Value> {
@@ -308,8 +353,8 @@ pub fn parse_market_info(json: &Value) -> Result<MarketInfoV2> {
             }))
     };
     let as_u32 = |v: &Value| -> Option<u32> {
-        v.as_u64().map(|u| u as u32)
-            .or_else(|| v.as_f64().map(|f| f.round() as u32))
+        v.as_u64().and_then(|u| u32::try_from(u).ok())
+            .or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && *f <= u32::MAX as f64).map(|f| f.round() as u32))
             .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
     };
 
@@ -326,10 +371,43 @@ pub fn parse_market_info(json: &Value) -> Result<MarketInfoV2> {
         "feeRateBps", "takerBaseFee", "baseFee", "fee_rate_bps",
     ]);
 
-    let fee_rate      = fee_rate_v.as_ref().and_then(as_f64);
-    let fee_exponent  = fee_exp_v.as_ref().and_then(as_f64).unwrap_or(1.0);
-    let taker_only    = taker_only_v.as_ref().and_then(as_bool).unwrap_or(false);
-    let fee_rate_bps  = bps_v.as_ref().and_then(as_u32);
+    let fee_rate = match fee_rate_v.as_ref() {
+        Some(value) => Some(as_f64(value).ok_or_else(|| anyhow!("invalid fee rate"))?),
+        None => None,
+    };
+    let fee_exponent = match fee_exp_v.as_ref() {
+        Some(value) => as_f64(value).ok_or_else(|| anyhow!("invalid fee exponent"))?,
+        None => 1.0,
+    };
+    let taker_only = match taker_only_v.as_ref() {
+        Some(value) => as_bool(value).ok_or_else(|| anyhow!("invalid taker-only flag"))?,
+        None => false,
+    };
+    let fee_rate_bps = match bps_v.as_ref() {
+        Some(value) => Some(as_u32(value).ok_or_else(|| anyhow!("invalid fee rate bps"))?),
+        None => None,
+    };
+
+    if !fee_exponent.is_finite() || fee_exponent <= 0.0 || fee_exponent > 10.0 {
+        return Err(anyhow!("fee exponent out of range: {}", fee_exponent));
+    }
+    if fee_rate.is_some_and(|rate| !rate.is_finite() || !(0.0..=1.0).contains(&rate)) {
+        return Err(anyhow!("fee rate out of range"));
+    }
+    if fee_rate_bps.is_some_and(|bps| bps > 10_000) {
+        return Err(anyhow!("fee rate bps out of range"));
+    }
+
+    if fee_rate.is_none() && fee_rate_bps.is_none() {
+        let has_tokens = ["t", "tokens"].iter().any(|key| {
+            root_obj.get(*key).and_then(Value::as_array).is_some_and(|tokens| !tokens.is_empty())
+        });
+        if response_condition_id.is_none() || !has_tokens {
+            return Err(anyhow!(
+                "market-info payload lacks both fee data and a complete market schema"
+            ));
+        }
+    }
 
     // Derive missing representations, treating "no fee data" as zero
     // (Polymarket omits `fd` on fee-free markets — this is valid).
@@ -337,7 +415,7 @@ pub fn parse_market_info(json: &Value) -> Result<MarketInfoV2> {
         (Some(r), Some(bps)) => (r, bps),
         (Some(r), None)      => (r, (r * 10_000.0).round() as u32),
         (None, Some(bps))    => (bps as f64 / 10_000.0, bps),
-        (None, None)         => (0.0, 0), // fee-free market — explicit zero
+        (None, None)         => (0.0, 0), // complete fee-free market schema
     };
 
     Ok(MarketInfoV2 {
@@ -381,7 +459,11 @@ mod tests {
     /// When `fd` is absent (fee-free market) treat as zero fees.
     #[test]
     fn parse_missing_fd_is_zero_fees() {
-        let json: Value = serde_json::json!({ "c": "0xabc", "ao": true });
+        let json: Value = serde_json::json!({
+            "c": "0xabc",
+            "ao": true,
+            "t": [{ "t": "up" }, { "t": "down" }],
+        });
         let mi = parse_market_info(&json).unwrap();
         assert_eq!(mi.fee_rate, 0.0);
         assert_eq!(mi.fee_rate_bps, 0);
@@ -428,6 +510,41 @@ mod tests {
         let mi = parse_market_info(&json).unwrap();
         assert!((mi.fee_rate - 0.02).abs() < 1e-9);
         assert!((mi.fee_exponent - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_rejects_non_authoritative_zero_fee_payloads() {
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({ "data": null }),
+            serde_json::json!({ "success": false }),
+            serde_json::json!({ "error": "upstream unavailable" }),
+            serde_json::json!({ "c": "0xabc", "ao": true }),
+        ] {
+            assert!(parse_market_info(&json).is_err(), "accepted {json}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_fee_values() {
+        for json in [
+            serde_json::json!({ "fd": { "r": "NaN", "e": 1.0 } }),
+            serde_json::json!({ "fd": { "r": -0.01, "e": 1.0 } }),
+            serde_json::json!({ "fd": { "r": 0.01, "e": 0.0 } }),
+            serde_json::json!({ "feeRateBps": 10001 }),
+        ] {
+            assert!(parse_market_info(&json).is_err(), "accepted {json}");
+        }
+    }
+
+    #[test]
+    fn fetched_market_info_must_name_the_requested_condition() {
+        let json = serde_json::json!({
+            "c": "0xdef",
+            "t": [{ "t": "up" }],
+        });
+        assert!(parse_market_info_for_condition(&json, "0xabc").is_err());
+        assert!(parse_market_info_for_condition(&json, "0xdef").is_ok());
     }
 
     #[test]

@@ -783,6 +783,7 @@ impl Engine {
         let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (signal_tx, signal_rx) = bounded::<Signal>(CHANNEL_CAPACITY);
         let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
+        let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
@@ -857,11 +858,12 @@ impl Engine {
             m
         };
 
-        let exec_handle = self.spawn_execution_thread_with_poly(
+        let exec_handle = self.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
             update_tx.clone(),
             poly_states.clone(),
             stale_threshold_handles.clone(),
+            shutdown_done_tx,
         );
         let user_feed_handle = self.spawn_hex_user_feed(update_tx.clone(), shutdown.clone());
         // Phase 2b: spawn one user_feed per polymarket instance.
@@ -960,6 +962,7 @@ impl Engine {
             probe_install_map,
             stale_threshold_handles.clone(),
             &poly_states,
+            Some(shutdown_done_rx),
         );
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
@@ -1019,6 +1022,7 @@ impl Engine {
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (signal_tx, signal_rx) = bounded::<Signal>(CHANNEL_CAPACITY);
         let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
+        let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
@@ -1035,6 +1039,7 @@ impl Engine {
             update_tx.clone(),
             sim_latency_ms,
             self.config.backtest.clone(),
+            shutdown_done_tx,
         );
 
         // Spawn recorder for market data persistence (paper data goes to separate dir)
@@ -1055,6 +1060,7 @@ impl Engine {
             // Paper mode has no live PM user feed (fills are sim-driven), so
             // the user-feed-health gates stay inactive (empty map).
             &HashMap::new(),
+            Some(shutdown_done_rx),
         );
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
@@ -2883,6 +2889,7 @@ impl Engine {
         update_tx: Sender<OrderUpdate>,
         sim_latency_ms: u64,
         bt: crate::config::BacktestConfig,
+        shutdown_done_tx: Sender<()>,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("paper-exec".into())
@@ -2969,6 +2976,7 @@ impl Engine {
                             // as the sim clock so cancel timestamps and the
                             // matched-cant-cancel age check live on real time.
                             let sim_now = crate::types::now_ns();
+                            let mut acknowledge_shutdown = false;
                             match msg {
                                 Ok(Signal::NewOrder(ref order)) => {
                                     updates.push(sim.submit_order(order, sim_now));
@@ -3017,6 +3025,41 @@ impl Engine {
                                     }
                                     updates.extend(sim.cancel_all(Exchange::Polymarket, "", sim_now));
                                 }
+                                Ok(Signal::BeginShutdown) => {
+                                    info!("[PaperExec] Beginning coordinated shutdown cancel barrier");
+                                    // Public feeds observe the shutdown flag
+                                    // before the strategy emits this signal.
+                                    // Apply anything already buffered so a
+                                    // pre-shutdown fill cannot land after the
+                                    // simulated cancel acknowledgement.
+                                    loop {
+                                        let event = match sim_feed_rx.recv_timeout(
+                                            std::time::Duration::from_millis(20),
+                                        ) {
+                                            Ok(event) => event,
+                                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                                        };
+                                        match event {
+                                            MarketEvent::OrderBook(ref ob) => {
+                                                updates.extend(sim.on_orderbook(ob));
+                                                sim.on_local_orderbook(ob, ob.local_timestamp_ns);
+                                            }
+                                            MarketEvent::Trade(ref trade) => {
+                                                updates.extend(sim.on_trade_tick(trade));
+                                            }
+                                            MarketEvent::TickSizeChange(ref change) => {
+                                                sim.on_tick_size_change(change);
+                                            }
+                                            MarketEvent::Instrument(ref instrument) => {
+                                                sim.on_instrument(instrument);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    updates.extend(sim.cancel_all(Exchange::Polymarket, "", sim_now));
+                                    acknowledge_shutdown = true;
+                                }
                                 Ok(Signal::Exit) => {
                                     info!("[PaperExec] Exit signal from strategy");
                                     break;
@@ -3027,6 +3070,9 @@ impl Engine {
                             // (v2 core has no balance-error cascade-cancel
                             // side-effects to drain.)
                             send_updates(updates, &update_tx, latency);
+                            if acknowledge_shutdown {
+                                let _ = shutdown_done_tx.send(());
+                            }
                         }
                     }
                 }
@@ -3165,6 +3211,7 @@ impl Engine {
         >,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
+        shutdown_done_rx: Option<Receiver<()>>,
     ) -> thread::JoinHandle<()> {
         let mut strategies =
             self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
@@ -3624,6 +3671,7 @@ impl Engine {
                 update_rx,
                 recorder_tx,
                 data_dirs,
+                shutdown_done_rx,
             );
         }
 
@@ -3647,12 +3695,51 @@ impl Engine {
                                     info!("[Strategy] Exit event received");
                                     for s in &mut strategies {
                                         s.on_exit();
-                                        for sig in s.on_shutdown() { let _ = signal_tx.send(sig); }
                                     }
-                                    let _ = signal_tx.send(Signal::Exit);
                                     forward_recorder_event(
                                         recorder_tx.as_ref(), &MarketEvent::Exit,
                                     );
+                                    if backtest || shutdown_done_rx.is_none() {
+                                        for s in &mut strategies {
+                                            for sig in s.on_shutdown() { let _ = signal_tx.send(sig); }
+                                        }
+                                        let _ = signal_tx.send(Signal::Exit);
+                                        return;
+                                    }
+                                    // Live/paper uses a two-phase shutdown:
+                                    // final reports are delayed until all
+                                    // cancels, order audits, and late trades
+                                    // have flowed through normal accounting.
+                                    if signal_tx.send(Signal::BeginShutdown).is_err() {
+                                        warn!("[Strategy] executor disappeared before shutdown barrier");
+                                    } else if let Some(done_rx) = shutdown_done_rx.as_ref() {
+                                        loop {
+                                            crossbeam_channel::select! {
+                                                recv(update_rx) -> update => match update {
+                                                    Ok(update) => {
+                                                        for s in &mut strategies {
+                                                            let _ = s.on_order_update(&update);
+                                                        }
+                                                    }
+                                                    Err(_) => break,
+                                                },
+                                                recv(done_rx) -> _ => break,
+                                            }
+                                        }
+                                        // The acknowledgement is sent after
+                                        // updates are enqueued, but select may
+                                        // observe the independent done channel
+                                        // first. Drain that final tail.
+                                        while let Ok(update) = update_rx.try_recv() {
+                                            for s in &mut strategies {
+                                                let _ = s.on_order_update(&update);
+                                            }
+                                        }
+                                    }
+                                    for s in &mut strategies {
+                                        let _ = s.on_shutdown();
+                                    }
+                                    let _ = signal_tx.send(Signal::Exit);
                                     return;
                                 }
                                 Ok(event) => {
@@ -3794,6 +3881,7 @@ impl Engine {
         update_rx: Receiver<OrderUpdate>,
         recorder_tx: Option<Sender<MarketEvent>>,
         data_dirs: Vec<PathBuf>,
+        shutdown_done_rx: Option<Receiver<()>>,
     ) -> thread::JoinHandle<()> {
         // Static symbol → instance routing map (lowercased keys). A
         // symbol shared by several instances (e.g. two BTC timeframes on
@@ -3861,6 +3949,9 @@ impl Engine {
         let worker_quarantined: Vec<Arc<AtomicBool>> = (0..instance_ids.len())
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
+        let worker_shutdown_requested: Vec<Arc<AtomicBool>> = (0..instance_ids.len())
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
 
         thread::Builder::new()
             .name("strategy-router".into())
@@ -3903,6 +3994,7 @@ impl Engine {
                 // Spawn one worker per instance, each on its own core.
                 let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
                 let (worker_status_tx, worker_status_rx) = unbounded::<(usize, bool)>();
+                let (shutdown_ack_tx, shutdown_ack_rx) = unbounded::<usize>();
                 for (idx, (strategy, mrx, urx)) in specs.into_iter().enumerate() {
                     let stx = signal_tx.clone();
                     let dd = data_dirs.clone();
@@ -3910,15 +4002,18 @@ impl Engine {
                     let reg = coid_owner.clone();
                     let heartbeat = Arc::clone(&worker_heartbeats[idx]);
                     let quarantined = Arc::clone(&worker_quarantined[idx]);
+                    let shutdown_requested = Arc::clone(&worker_shutdown_requested[idx]);
                     let clock_origin = Arc::clone(&supervisor_origin);
                     let status_tx = worker_status_tx.clone();
+                    let ack_tx = shutdown_ack_tx.clone();
                     let h = thread::Builder::new()
                         .name(format!("strategy-{}", if iid.is_empty() { idx.to_string() } else { iid.clone() }))
                         .spawn(move || {
                             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 Self::run_strategy_worker(
                                     strategy, mrx, urx, stx, dd, &iid, idx, reg,
-                                    heartbeat, quarantined, clock_origin,
+                                    heartbeat, quarantined, shutdown_requested,
+                                    ack_tx, clock_origin,
                                 );
                             })).is_err();
                             let _ = status_tx.send((idx, panicked));
@@ -3950,26 +4045,54 @@ impl Engine {
                 // the placing instance.
                 let iid_to_idx: HashMap<String, usize> = instance_ids
                     .iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+                let shutdown_done_rx = shutdown_done_rx
+                    .unwrap_or_else(crossbeam_channel::never);
+                let mut shutdown_in_progress = false;
                 loop {
                     crossbeam_channel::select! {
                         recv(market_rx) -> msg => match msg {
                             Ok(MarketEvent::Exit) => {
+                                if shutdown_in_progress { continue; }
                                 forward_recorder_event(
                                     recorder_tx.as_ref(), &MarketEvent::Exit,
                                 );
-                                let exit = Arc::new(MarketEvent::Exit);
-                                for (idx, tx) in market_txs.iter().enumerate() {
-                                    if worker_quarantined[idx].load(Ordering::Acquire) {
-                                        continue;
-                                    }
-                                    let _ = tx.send(QueuedMarketEvent {
-                                        event: Arc::clone(&exit),
-                                        enqueued_at: std::time::Instant::now(),
-                                    });
+                                let mut waiting: HashSet<usize> = (0..instance_ids.len())
+                                    .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
+                                    .collect();
+                                for idx in &waiting {
+                                    worker_shutdown_requested[*idx].store(true, Ordering::Release);
                                 }
-                                break;
+                                // A worker acknowledges only after its current
+                                // callback has returned and on_exit has run, so
+                                // all order-producing signals are ahead of the
+                                // executor barrier.
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_nanos(STRATEGY_WORKER_STALL_NS);
+                                while !waiting.is_empty() {
+                                    let now = std::time::Instant::now();
+                                    if now >= deadline { break; }
+                                    match shutdown_ack_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                                        Ok(idx) => { waiting.remove(&idx); }
+                                        Err(_) => break,
+                                    }
+                                }
+                                for idx in waiting {
+                                    quarantine_strategy_worker(
+                                        idx,
+                                        "shutdown acknowledgement timed out",
+                                        &instance_ids,
+                                        &worker_quarantined,
+                                        &signal_tx,
+                                    );
+                                }
+                                shutdown_in_progress = true;
+                                if signal_tx.send(Signal::BeginShutdown).is_err() {
+                                    warn!("[Strategy] executor disappeared before shutdown barrier");
+                                    break;
+                                }
                             }
                             Ok(event) => {
+                                if shutdown_in_progress { continue; }
                                 forward_recorder_event(recorder_tx.as_ref(), &event);
                                 for idx in Self::route_market_event(
                                     Arc::new(event),
@@ -4013,60 +4136,35 @@ impl Engine {
                             // P3: route by coid → owning instance. Unknown
                             // coid → broadcast fallback (worker filters).
                             Ok(u) => {
-                                // Primary: coid→instance registry (fast, set
-                                // when the order was placed). Fallback: recover
-                                // the owner from the coid's "{instance_id}-"
-                                // prefix — covers late synthetic updates
-                                // (place-timeout orphans, settlement fills,
-                                // reconcile results) that arrive AFTER the
-                                // registry entry was freed on first terminal
-                                // status. Only truly unresolvable coids (legacy
-                                // un-prefixed, or unknown instance) broadcast.
-                                let owner = coid_owner.lock().unwrap()
-                                    .get(&u.client_order_id).copied()
-                                    .or_else(|| owner_from_coid(&u.client_order_id, &iid_to_idx));
-                                let terminal = matches!(u.status, OrderStatus::Cancelled | OrderStatus::Rejected)
-                                    || (matches!(u.status, OrderStatus::Filled | OrderStatus::Failed)
-                                        && u.trade_id.as_deref().is_none_or(str::is_empty));
-                                let terminal_coid = terminal.then(|| u.client_order_id.clone());
-                                match classify_private_update_route(owner, update_txs.len(), &worker_quarantined) {
-                                    PrivateUpdateRoute::Owner(i) => {
-                                        // Common path: transfer ownership to
-                                        // one worker without cloning payload.
-                                        let _ = update_txs[i].send(QueuedOrderUpdate {
-                                            update: u,
-                                            enqueued_at: std::time::Instant::now(),
-                                        });
-                                    }
-                                    PrivateUpdateRoute::DropQuarantined(i) => {
-                                        warn!("[strategy_router] dropping private update for quarantined owner instance={} coid={}",
-                                            instance_ids.get(i).map(String::as_str).unwrap_or(""), u.client_order_id);
-                                    }
-                                    PrivateUpdateRoute::DropInvalid(i) => {
-                                        error!("[strategy_router] invalid owner index={} coid={}", i, u.client_order_id);
-                                    }
-                                    PrivateUpdateRoute::Broadcast => {
-                                        let enqueued_at = std::time::Instant::now();
-                                        for (idx, tx) in update_txs.iter().enumerate() {
-                                            if worker_quarantined[idx].load(Ordering::Acquire) {
-                                                continue;
-                                            }
-                                            let _ = tx.send(QueuedOrderUpdate {
-                                                update: u.clone(),
-                                                enqueued_at,
-                                            });
-                                        }
-                                    }
-                                }
-                                // Terminal states free the registry entry.
-                                // A late duplicate fill (Matched→Mined→Confirmed
-                                // dedup / replay) arriving after removal just
-                                // hits the broadcast fallback — still correct.
-                                if let Some(coid) = terminal_coid {
-                                    coid_owner.lock().unwrap().remove(&coid);
-                                }
+                                Self::route_private_update(
+                                    u,
+                                    &coid_owner,
+                                    &iid_to_idx,
+                                    &update_txs,
+                                    &worker_quarantined,
+                                    &instance_ids,
+                                );
                             }
                             Err(_) => break,
+                        },
+                        recv(shutdown_done_rx) -> _ => {
+                            if shutdown_in_progress {
+                                // Done is sent after final updates are
+                                // enqueued, but select may see this independent
+                                // channel first. Drain the root tail into the
+                                // same lossless per-instance spools.
+                                while let Ok(u) = update_rx.try_recv() {
+                                    Self::route_private_update(
+                                        u,
+                                        &coid_owner,
+                                        &iid_to_idx,
+                                        &update_txs,
+                                        &worker_quarantined,
+                                        &instance_ids,
+                                    );
+                                }
+                                break;
+                            }
                         },
                         recv(worker_status_rx) -> msg => {
                             if let Ok((idx, panicked)) = msg {
@@ -4112,12 +4210,13 @@ impl Engine {
                     }
                 }
 
-                // Close worker channels → workers run on_shutdown and exit.
-                drop(market_txs);
+                // Close and fully drain the private-update spools before
+                // workers are released to generate their final reports.
                 drop(update_txs);
                 for handle in update_dispatch_handles {
                     let _ = handle.join();
                 }
+                drop(market_txs);
                 for (idx, handle) in handles.into_iter().enumerate() {
                     if worker_quarantined[idx].load(Ordering::Acquire) {
                         drop(handle);
@@ -4129,6 +4228,52 @@ impl Engine {
                 let _ = signal_tx.send(Signal::Exit);
             })
             .unwrap()
+    }
+
+    fn route_private_update(
+        update: OrderUpdate,
+        coid_owner: &std::sync::Mutex<HashMap<String, usize>>,
+        iid_to_idx: &HashMap<String, usize>,
+        update_txs: &[Sender<QueuedOrderUpdate>],
+        worker_quarantined: &[Arc<AtomicBool>],
+        instance_ids: &[String],
+    ) {
+        let owner = coid_owner.lock().unwrap()
+            .get(&update.client_order_id).copied()
+            .or_else(|| owner_from_coid(&update.client_order_id, iid_to_idx));
+        let terminal = matches!(update.status, OrderStatus::Cancelled | OrderStatus::Rejected)
+            || (matches!(update.status, OrderStatus::Filled | OrderStatus::Failed)
+                && update.trade_id.as_deref().is_none_or(str::is_empty));
+        let terminal_coid = terminal.then(|| update.client_order_id.clone());
+
+        match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
+            PrivateUpdateRoute::Owner(i) => {
+                let _ = update_txs[i].send(QueuedOrderUpdate {
+                    update,
+                    enqueued_at: std::time::Instant::now(),
+                });
+            }
+            PrivateUpdateRoute::DropQuarantined(i) => {
+                warn!("[strategy_router] dropping private update for quarantined owner instance={} coid={}",
+                    instance_ids.get(i).map(String::as_str).unwrap_or(""), update.client_order_id);
+            }
+            PrivateUpdateRoute::DropInvalid(i) => {
+                error!("[strategy_router] invalid owner index={} coid={}", i, update.client_order_id);
+            }
+            PrivateUpdateRoute::Broadcast => {
+                let enqueued_at = std::time::Instant::now();
+                for (idx, tx) in update_txs.iter().enumerate() {
+                    if worker_quarantined[idx].load(Ordering::Acquire) { continue; }
+                    let _ = tx.send(QueuedOrderUpdate {
+                        update: update.clone(),
+                        enqueued_at,
+                    });
+                }
+            }
+        }
+        if let Some(coid) = terminal_coid {
+            coid_owner.lock().unwrap().remove(&coid);
+        }
     }
 
     /// Route ONE market event to the subscribing instances' channels.
@@ -4304,6 +4449,8 @@ impl Engine {
         coid_owner: Arc<std::sync::Mutex<HashMap<String, usize>>>,
         heartbeat: Arc<AtomicU64>,
         quarantined: Arc<AtomicBool>,
+        shutdown_requested: Arc<AtomicBool>,
+        shutdown_ack_tx: Sender<usize>,
         clock_origin: Arc<std::time::Instant>,
     ) {
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
@@ -4323,12 +4470,20 @@ impl Engine {
         let mut update_queue_samples = 0u64;
         let mut update_queue_total_us = 0u128;
         let mut update_queue_max_us = 0u64;
+        let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         loop {
+            if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
+                strategy.on_exit();
+                shutdown_started = true;
+                heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                let _ = shutdown_ack_tx.send(idx);
+            }
             crossbeam_channel::select! {
                 recv(watchdog_rx) -> _ => {
                     if quarantined.load(Ordering::Acquire) { return; }
                     heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                    if shutdown_started { continue; }
                     for sig in strategy.on_watchdog(crate::types::now_ns()) {
                         if !emit(sig) { return; }
                     }
@@ -4336,13 +4491,16 @@ impl Engine {
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) if matches!(queued.event.as_ref(), MarketEvent::Exit) => {
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
-                        strategy.on_exit();
-                        for sig in strategy.on_shutdown() { let _ = emit(sig); }
-                        return;
+                        if !shutdown_started {
+                            strategy.on_exit();
+                            shutdown_started = true;
+                        }
+                        break;
                     }
                     Ok(queued) => {
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                        if shutdown_started { continue; }
                         let queue_last_us = queued.enqueued_at.elapsed().as_micros()
                             .min(u64::MAX as u128) as u64;
                         queue_samples = queue_samples.saturating_add(1);
@@ -4465,17 +4623,26 @@ impl Engine {
                             update_queue_total_us = 0;
                             update_queue_max_us = 0;
                         }
-                        for sig in strategy.on_order_update(&queued.update) {
-                            if !emit(sig) { return; }
+                        let signals = strategy.on_order_update(&queued.update);
+                        if !shutdown_started {
+                            for sig in signals {
+                                if !emit(sig) { return; }
+                            }
                         }
                     }
                     Err(_) => break,
                 },
             }
         }
-        for sig in strategy.on_shutdown() {
-            let _ = emit(sig);
+        if !shutdown_started {
+            strategy.on_exit();
         }
+        // Dispatchers are joined before the router closes market_txs, so all
+        // final updates are available here before the report is generated.
+        while let Ok(queued) = update_rx.try_recv() {
+            let _ = strategy.on_order_update(&queued.update);
+        }
+        let _ = strategy.on_shutdown();
     }
 
     fn wait_for_shutdown(shutdown: &Arc<AtomicBool>, shutdown_tx: &Sender<MarketEvent>) {
@@ -5763,6 +5930,24 @@ impl Engine {
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
     ) -> thread::JoinHandle<()> {
+        let (shutdown_done_tx, _shutdown_done_rx) = bounded::<()>(1);
+        self.spawn_execution_thread_with_poly_shutdown(
+            signal_rx,
+            update_tx,
+            poly_states,
+            stale_threshold_handles,
+            shutdown_done_tx,
+        )
+    }
+
+    fn spawn_execution_thread_with_poly_shutdown(
+        &self,
+        signal_rx: Receiver<Signal>,
+        update_tx: Sender<OrderUpdate>,
+        poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
+        stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
+        shutdown_done_tx: Sender<()>,
+    ) -> thread::JoinHandle<()> {
         let config = self.config.clone();
         let hex_max_connections = config
             .exchanges
@@ -6126,48 +6311,52 @@ impl Engine {
                 );
 
                 let mut round_robins: HashMap<String, usize> = HashMap::new();
+                let mut shutdown_finalized = false;
 
                 while let Ok(signal) = signal_rx.recv() {
+                    if shutdown_finalized
+                        && !matches!(&signal, Signal::BeginShutdown | Signal::Exit)
+                    {
+                        warn!("[Executor] dropping signal received after shutdown barrier: {:?}", signal);
+                        continue;
+                    }
                     match &signal {
-                        Signal::Exit => {
-                            // Stop the dispatch pool first: drop the sender so
-                            // workers end their recv loops, then join so any
-                            // in-flight / queued dispatch finishes BEFORE the
-                            // cancel-all below (otherwise a worker could place
-                            // an order after cancel-all snapshots the book).
-                            poly_pool_tx = None;
-                            for h in std::mem::take(&mut poly_worker_handles) { let _ = h.join(); }
-                            // Then drain the fire-and-track completions: drop the
-                            // sender (workers already joined ⇒ their clones are
-                            // gone) and join the drainers so every fired order's
-                            // reply is booked BEFORE cancel-all.
-                            poly_done_tx = None;
-                            for h in std::mem::take(&mut poly_drainer_handles) { let _ = h.join(); }
-                            poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
-                            // Phase 2e-3: walk every per-instance
-                            // PolymarketTrade and wipe its book on
-                            // shutdown — each instance has its own
-                            // server-side book and orderID registry.
-                            info!("[Executor] Exit signal, canceling all Polymarket orders across {} instance(s)...",
-                                fallback.poly_routes.len().max(1));
-                            // Pull keys first to avoid holding an
-                            // immutable borrow while calling &mut self.
-                            let ids: Vec<String> = fallback.poly_routes.keys().cloned().collect();
-                            if ids.is_empty() {
-                                // No instance map populated (paper / BT
-                                // shim path) — fall back to the default if
-                                // polymarket is configured at all.
-                                if let Some(pm) = fallback.polymarket.as_mut() {
-                                    pm.cancel_all_orders();
+                        Signal::BeginShutdown | Signal::Exit => {
+                            let terminal = matches!(&signal, Signal::Exit);
+                            if !shutdown_finalized {
+                                // Stop the dispatch pool first: drop the sender
+                                // and join all in-flight/queued work before
+                                // cancel-all can snapshot the remote book.
+                                poly_pool_tx = None;
+                                for h in std::mem::take(&mut poly_worker_handles) {
+                                    let _ = h.join();
                                 }
-                            } else {
-                                for id in &ids {
-                                    if let Some(trade) = fallback.poly_routes.get_mut(id) {
-                                        info!("[Executor] Exit: cancel_all_orders instance_id={}", id);
-                                        trade.cancel_all_orders();
-                                    }
+                                // Drain every fired completion before the
+                                // account-wide cancellation barrier.
+                                poly_done_tx = None;
+                                for h in std::mem::take(&mut poly_drainer_handles) {
+                                    let _ = h.join();
                                 }
+                                poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
+                                let account_states = Self::dedup_states_by_account(&poly_states);
+                                info!("[Executor] coordinated shutdown: canceling/auditing {} Polymarket account(s) to finality",
+                                    account_states.len());
+                                for (instance_id, shared) in account_states {
+                                    let account_id = shared.account_state.account_id().to_string();
+                                    let trade = PolymarketTrade::from_shared(shared, "", &instance_id);
+                                    info!("[Executor] shutdown cancel barrier account_id={} representative_instance={}",
+                                        account_id, instance_id);
+                                    trade.cancel_all_orders_until_final(|update| {
+                                        let _ = update_tx.send(update);
+                                    });
+                                }
+                                shutdown_finalized = true;
+                            }
+                            if !terminal {
+                                let _ = shutdown_done_tx.send(());
+                                info!("[Executor] coordinated shutdown barrier complete");
+                                continue;
                             }
                             info!("[Executor] Stopping");
                             drop(instance_pools);

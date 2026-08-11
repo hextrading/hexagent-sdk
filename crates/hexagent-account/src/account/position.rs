@@ -137,6 +137,20 @@ pub struct PendingOrder {
     pub remaining_quantity: f64,
 }
 
+fn valid_pending_order_fields(
+    client_order_id: &str,
+    symbol: &str,
+    price: f64,
+    quantity: f64,
+) -> bool {
+    !client_order_id.trim().is_empty()
+        && !symbol.trim().is_empty()
+        && price.is_finite()
+        && price > 0.0
+        && quantity.is_finite()
+        && quantity > 0.0
+}
+
 /// Ledger-backed position / balance tracker.
 ///
 /// The canonical state is the trade list keyed by `trade_id`. Positions and
@@ -476,7 +490,14 @@ impl PositionManager {
                 // (Live-only in practice: the race can't happen in the sim, and
                 // in normal flow the lock is present so the guard skips — BT
                 // byte-identical.)
-                if !self.pending_orders.contains_key(coid) && update.remaining_quantity > 0.0 {
+                if !self.pending_orders.contains_key(coid)
+                    && valid_pending_order_fields(
+                        coid,
+                        &update.symbol,
+                        update.avg_fill_price,
+                        update.remaining_quantity,
+                    )
+                {
                     self.pending_orders.insert(coid.clone(), PendingOrder {
                         client_order_id: coid.clone(),
                         symbol: update.symbol.clone(),
@@ -656,7 +677,7 @@ impl PositionManager {
         price: f64,
         quantity: f64,
     ) {
-        if client_order_id.is_empty() || quantity <= 0.0 { return; }
+        if !valid_pending_order_fields(client_order_id, symbol, price, quantity) { return; }
         self.pending_orders.insert(client_order_id.to_string(), PendingOrder {
             client_order_id: client_order_id.to_string(),
             symbol: symbol.to_string(),
@@ -1077,5 +1098,30 @@ mod tests {
         assert!(pm.apply_private_trade_reservation("a-1", 5.0, -1));
         assert_eq!(pm.pending_orders()["a-1"].remaining_quantity, 5.0);
         assert_eq!(pm.available_cash(), 98.0);
+    }
+
+    #[test]
+    fn pending_order_registration_rejects_invalid_numbers_and_identity() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 100.0);
+        for (coid, symbol, price, quantity) in [
+            ("", "TOKEN", 0.4, 5.0),
+            ("a-1", "", 0.4, 5.0),
+            ("a-1", "TOKEN", f64::NAN, 5.0),
+            ("a-1", "TOKEN", f64::INFINITY, 5.0),
+            ("a-1", "TOKEN", 0.4, f64::NAN),
+            ("a-1", "TOKEN", 0.4, f64::INFINITY),
+            ("a-1", "TOKEN", 0.0, 5.0),
+            ("a-1", "TOKEN", 0.4, 0.0),
+        ] {
+            pm.register_pending_order(coid, symbol, Side::Buy, price, quantity);
+        }
+        assert!(pm.pending_orders().is_empty());
+
+        let mut accepted = ou("a-2", Side::Buy, OrderStatus::Accepted, f64::NAN, 5.0);
+        pm.sync_pending_from_update(&accepted);
+        accepted.avg_fill_price = 0.4;
+        accepted.remaining_quantity = f64::INFINITY;
+        pm.sync_pending_from_update(&accepted);
+        assert!(pm.pending_orders().is_empty());
     }
 }

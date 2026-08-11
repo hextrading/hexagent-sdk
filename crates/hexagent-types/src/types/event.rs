@@ -149,6 +149,11 @@ pub enum Signal {
         /// executor routes to the matching SharedState.
         instance_id: String,
     },
+    /// Begin coordinated shutdown. The executor stops order-producing work,
+    /// cancels/audits orders to finality, and emits all resulting updates
+    /// before acknowledging the strategy.
+    BeginShutdown,
+    /// Terminal executor stop after the coordinated barrier and final report.
     Exit,
 }
 
