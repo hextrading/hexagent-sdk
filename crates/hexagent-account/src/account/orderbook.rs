@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::{OrderBookSnapshot, QuoteTick};
+use crate::types::{Exchange, OrderBookSnapshot, QuoteTick};
 
 /// Maximum tolerated server-clock lead over the local receive timestamp.
 /// Accepting a larger lead would pin this monotonic cache ahead of subsequent
@@ -13,14 +13,36 @@ fn timestamp_too_far_in_future(exchange_timestamp_ns: u64, local_timestamp_ns: u
             > local_timestamp_ns.saturating_add(MAX_EXCHANGE_FUTURE_SKEW_NS)
 }
 
-fn orderbook_values_are_finite(ob: &OrderBookSnapshot) -> bool {
-    ob.bids.iter().chain(ob.asks.iter())
-        .all(|level| level.price.is_finite() && level.quantity.is_finite())
+fn valid_price(exchange: Exchange, price: f64) -> bool {
+    price.is_finite()
+        && price > 0.0
+        && (exchange != Exchange::Polymarket || price < 1.0)
 }
 
-fn quote_values_are_finite(quote: &QuoteTick) -> bool {
-    [quote.bid_price, quote.bid_qty, quote.ask_price, quote.ask_qty]
-        .into_iter().all(f64::is_finite)
+fn orderbook_values_are_semantically_valid(ob: &OrderBookSnapshot) -> bool {
+    if ob.symbol.trim().is_empty()
+        || !ob.bids.iter().chain(ob.asks.iter()).all(|level| {
+            valid_price(ob.exchange, level.price)
+                && level.quantity.is_finite()
+                && level.quantity > 0.0
+        })
+    {
+        return false;
+    }
+    let best_bid = ob.bids.iter().map(|level| level.price).reduce(f64::max);
+    let best_ask = ob.asks.iter().map(|level| level.price).reduce(f64::min);
+    !matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask)
+}
+
+fn quote_values_are_semantically_valid(quote: &QuoteTick) -> bool {
+    !quote.symbol.trim().is_empty()
+        && valid_price(quote.exchange, quote.bid_price)
+        && valid_price(quote.exchange, quote.ask_price)
+        && quote.bid_price < quote.ask_price
+        && quote.bid_qty.is_finite()
+        && quote.bid_qty >= 0.0
+        && quote.ask_qty.is_finite()
+        && quote.ask_qty >= 0.0
 }
 
 /// One nudge per (symbol, side).
@@ -107,8 +129,8 @@ impl OrderbookManager {
     /// generated this snapshot long enough after our nudge moment that
     /// it must reflect the post-move book, so it's authoritative.
     pub fn update(&mut self, ob: &OrderBookSnapshot) {
-        if !orderbook_values_are_finite(ob) {
-            log::warn!("[OrderbookManager] rejected non-finite orderbook symbol={}", ob.symbol);
+        if !orderbook_values_are_semantically_valid(ob) {
+            log::warn!("[OrderbookManager] rejected invalid orderbook symbol={}", ob.symbol);
             return;
         }
         if timestamp_too_far_in_future(ob.exchange_timestamp_ns, ob.local_timestamp_ns) {
@@ -154,8 +176,8 @@ impl OrderbookManager {
     /// or the full book supplies L1 is decided wholesale by exchange
     /// timestamp in `raw_l1`, so bid and ask are never mixed across sources.
     pub fn update_quote(&mut self, quote: &QuoteTick) {
-        if !quote_values_are_finite(quote) {
-            log::warn!("[OrderbookManager] rejected non-finite quote symbol={}", quote.symbol);
+        if !quote_values_are_semantically_valid(quote) {
+            log::warn!("[OrderbookManager] rejected invalid quote symbol={}", quote.symbol);
             return;
         }
         if timestamp_too_far_in_future(
@@ -729,6 +751,40 @@ mod tests {
         invalid_quote.local_timestamp_ns = 301;
         om.update_quote(&invalid_quote);
         assert_eq!(om.best_bid_price("tok"), Some(0.40));
+        assert_eq!(om.best_ask_price("tok"), Some(0.60));
+    }
+
+    #[test]
+    fn semantically_invalid_market_data_cannot_advance_cache_or_clear_nudge() {
+        let mut om = OrderbookManager::new();
+        let mut initial = empty_book("tok");
+        initial.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        initial.asks = vec![PriceLevel { price: 0.60, quantity: 10.0 }];
+        initial.exchange_timestamp_ns = 100;
+        initial.local_timestamp_ns = 101;
+        om.update(&initial);
+        assert!(om.nudge_inferred_top("tok", Side::Sell, 0.45, 150));
+
+        for (bid, bid_qty, ask, ask_qty) in [
+            (0.70, 10.0, 0.60, 10.0), // crossed
+            (1.00, 10.0, 1.10, 10.0), // outside Polymarket bounds
+            (0.50, 0.0, 0.70, 10.0),  // non-positive level quantity
+        ] {
+            let mut invalid = empty_book("tok");
+            invalid.bids = vec![PriceLevel { price: bid, quantity: bid_qty }];
+            invalid.asks = vec![PriceLevel { price: ask, quantity: ask_qty }];
+            invalid.exchange_timestamp_ns = 1_000_000_000;
+            invalid.local_timestamp_ns = 1_000_000_001;
+            om.update(&invalid);
+            assert_eq!(om.l1_timestamp_ns("tok"), Some(100));
+            assert_eq!(om.best_bid_price("tok"), Some(0.45));
+        }
+
+        let mut crossed_quote = quote("tok", 0.80, 0.70, 1_000_000_000);
+        crossed_quote.bid_qty = -1.0;
+        om.update_quote(&crossed_quote);
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(100));
+        assert_eq!(om.best_bid_price("tok"), Some(0.45));
         assert_eq!(om.best_ask_price("tok"), Some(0.60));
     }
 

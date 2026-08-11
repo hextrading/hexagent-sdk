@@ -73,12 +73,13 @@
 //!   rate-limited to once per minute: rejection means the probe has
 //!   degraded to the reject-RTT shape above and its samples are
 //!   biased low, which is otherwise invisible outside the CSV.
-//! * **Timeout / status-less transport failure** (`HttpErr::Timeout` /
-//!   `HttpErr::Transport`) — recorded with the elapsed time as the sample.
+//! * **Timeout / status-less transport failure / malformed 2xx body**
+//!   (`HttpErr::Timeout` / `HttpErr::Transport` /
+//!   `HttpErr::InvalidResponse`) — recorded with the elapsed time as the sample.
 //!   These are primary failure modes the gate exists to detect; suppressing
 //!   them would blind the gate to network degradation. The locally-computed
 //!   order hash is still cancelled because the placement may have landed.
-//! * Local/parse failures (`HttpErr::Other`) — skipped. They are not
+//! * Pre-dispatch/local failures (`HttpErr::Other`) — skipped. They are not
 //!   representative of submit transport latency.
 //!
 //! Per-call timeouts are bounded by the FAST h2 client pool ceiling
@@ -390,7 +391,9 @@ fn fire_full_probe(
                 .unwrap_or_else(|| signed.order_hash.clone());
             (Some(oid), true)
         }
-        Err(HttpErr::Timeout) | Err(HttpErr::Transport(_)) => {
+        Err(HttpErr::Timeout)
+        | Err(HttpErr::Transport(_))
+        | Err(HttpErr::InvalidResponse(_)) => {
             // The order's fate is unknown: the request may have rested
             // server-side and only the response was lost. Best-effort
             // cancel via the locally-computed order_hash (== Polymarket

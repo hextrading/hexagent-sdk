@@ -1955,19 +1955,68 @@ impl SharedAccount {
         status: OrderStatus,
     ) -> Option<OrderStatus> {
         let mut state = self.state.lock().unwrap();
-        if let Some(order) = state.orders.get_mut(client_order_id) {
+        if let Some(current_status) = state.orders.get(client_order_id).map(|order| order.status) {
             // REST placement acknowledgements can arrive after the private
             // feed has already advanced the order. FAILED/FILLED are sticky;
             // PartiallyFilled is also monotonic against the weaker Accepted
             // state because an observed match cannot be undone by a late ACK.
-            if (matches!(order.status, OrderStatus::Failed | OrderStatus::Filled)
-                && status != order.status)
-                || (order.status == OrderStatus::PartiallyFilled
+            if (matches!(current_status, OrderStatus::Failed | OrderStatus::Filled)
+                && status != current_status)
+                || (current_status == OrderStatus::PartiallyFilled
                     && status == OrderStatus::Accepted)
             {
-                return Some(order.status);
+                return Some(current_status);
             }
-            order.status = status;
+
+            // Exchange lifecycle pushes are not ordered. If a cancellation
+            // is followed by an authoritative live status, restore the
+            // reservation from the durable order economics before exposing
+            // Accepted to callers. Merely changing `status` would leave the
+            // account with released collateral while the order is live.
+            if current_status == OrderStatus::Cancelled
+                && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled)
+            {
+                let (instance_id, token_id, old_cash, old_qty, desired_cash, desired_qty) = {
+                    let order = state
+                        .orders
+                        .get_mut(client_order_id)
+                        .expect("order status read above");
+                    order.status = status;
+                    order.terminal_matched_quantity = None;
+                    let old_cash = order.reserved_cash;
+                    let old_qty = order.reserved_quantity;
+                    let (desired_cash, desired_qty) = desired_order_reservation(order);
+                    order.reserved_cash = desired_cash;
+                    order.reserved_quantity = desired_qty;
+                    (
+                        order.instance_id.clone(),
+                        order.token_id.clone(),
+                        old_cash,
+                        old_qty,
+                        desired_cash,
+                        desired_qty,
+                    )
+                };
+                if let Some(instance) = state.instances.get_mut(&instance_id) {
+                    instance.reserved_cash =
+                        (instance.reserved_cash + desired_cash - old_cash).max(0.0);
+                    if (desired_qty - old_qty).abs() > EPS {
+                        let reserved = instance.reserved_positions.entry(token_id).or_insert(0.0);
+                        *reserved = (*reserved + desired_qty - old_qty).max(0.0);
+                    }
+                }
+                state.recovery_pending_orders.remove(client_order_id);
+                state
+                    .ownership_anomalies
+                    .remove(&format!("order_cancel_audit:{client_order_id}"));
+                recompute_reconciliation(&mut state, "cancelled order resurrected live");
+            } else {
+                state
+                    .orders
+                    .get_mut(client_order_id)
+                    .expect("order status read above")
+                    .status = status;
+            }
             self.schedule_persist(&state);
             return Some(status);
         }
@@ -4191,6 +4240,48 @@ mod tests {
             Some(OrderStatus::PartiallyFilled),
         );
         assert_eq!(account.order("a-partial").unwrap().status, OrderStatus::PartiallyFilled);
+    }
+
+    #[test]
+    fn accepted_after_cancelled_restores_remaining_reservation_atomically() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-resurrect",
+                "oid-resurrect",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                1_000,
+            )
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-resurrect",
+                "MATCHED",
+                "a-resurrect",
+                "oid-resurrect",
+                "UP",
+                Side::Buy,
+                4.0,
+                0.5,
+            )
+            .unwrap();
+        assert!(!account.mark_cancelled_pending_trade_audit("a-resurrect", 4.0));
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+
+        assert_eq!(
+            account.mark_order_status_effective("a-resurrect", OrderStatus::Accepted),
+            Some(OrderStatus::Accepted),
+        );
+        let restored = account.order("a-resurrect").unwrap();
+        assert_eq!(restored.status, OrderStatus::Accepted);
+        assert_eq!(restored.terminal_matched_quantity, None);
+        assert!((restored.reserved_cash - 3.3).abs() < 1e-12);
+        assert!((account.instance_snapshot("a").unwrap().reserved_cash - 3.3).abs() < 1e-12);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
     }
 
     #[test]
