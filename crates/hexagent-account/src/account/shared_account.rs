@@ -1931,14 +1931,34 @@ impl SharedAccount {
     }
 
     pub fn mark_order_status(&self, client_order_id: &str, status: OrderStatus) {
+        let _ = self.mark_order_status_effective(client_order_id, status);
+    }
+
+    /// Apply a local lifecycle update and return the state that actually won.
+    /// Callers that emit an OrderUpdate can use this to avoid forwarding a
+    /// stale HTTP acknowledgement after a sticky terminal status.
+    pub fn mark_order_status_effective(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+    ) -> Option<OrderStatus> {
         let mut state = self.state.lock().unwrap();
         if let Some(order) = state.orders.get_mut(client_order_id) {
-            if order.status == OrderStatus::Failed && status != OrderStatus::Failed {
-                return;
+            // REST placement acknowledgements can arrive after the private
+            // feed has already reported a terminal result. FAILED is sticky
+            // because its trade reversal must not be undone; FILLED is sticky
+            // because accepting a late POST response would otherwise make the
+            // order look live again after its fills were booked.
+            if matches!(order.status, OrderStatus::Failed | OrderStatus::Filled)
+                && status != order.status
+            {
+                return Some(order.status);
             }
             order.status = status;
             self.schedule_persist(&state);
+            return Some(status);
         }
+        None
     }
 
     /// A terminal exchange order status does not prove that every fill leg has
@@ -4073,6 +4093,24 @@ mod tests {
         assert_eq!(audited.reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn late_http_ack_cannot_regress_filled_order_status() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-race", "oid-race", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+
+        account.mark_order_status("a-race", OrderStatus::Filled);
+        assert_eq!(
+            account.mark_order_status_effective("a-race", OrderStatus::Accepted),
+            Some(OrderStatus::Filled),
+        );
+        assert_eq!(account.order("a-race").unwrap().status, OrderStatus::Filled);
+
+        account.mark_order_status("a-race", OrderStatus::NewOrderTimeout);
+        assert_eq!(account.order("a-race").unwrap().status, OrderStatus::Filled);
     }
 
     #[test]

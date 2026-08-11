@@ -16,7 +16,7 @@ use crate::exchange::ExchangeTrade;
 use crate::types::*;
 use super::auth::PolyAuth;
 use super::live_position::LivePositionManager;
-use super::signer::{OrderSigner, SignatureType};
+use super::signer::{OrderSigner, SignatureType, validate_signing_inputs};
 use super::user_feed::parse_user_event;
 
 /// CLOB protocol version selector. Threaded through `SharedState` so
@@ -159,6 +159,40 @@ fn filled_trade_audit_complete(
     }
     let tolerance = (expected.abs() * 1e-6).max(1e-8);
     (covered - expected).abs() <= tolerance
+}
+
+/// Reject every malformed numeric field before either v1 or v2 signing can
+/// quantize it. Rust float-to-integer casts saturate, so merely checking the
+/// resulting integer would silently turn NaN/overflow into a valid-looking
+/// zero/MAX order.
+fn validate_order_for_signing(order: &OrderRequest) -> Result<f64> {
+    let price = order.price.ok_or_else(|| anyhow!("Missing order price"))?;
+    validate_signing_inputs(&order.symbol, price, order.quantity)?;
+    if order.fee_rate_bps > 10_000 {
+        return Err(anyhow!("Invalid fee_rate_bps: {}", order.fee_rate_bps));
+    }
+    Ok(price)
+}
+
+fn placement_response_status(
+    success: bool,
+    raw_status: &str,
+    effective_account_status: Option<OrderStatus>,
+) -> OrderStatus {
+    if !success {
+        return OrderStatus::Rejected;
+    }
+    if let Some(status @ (OrderStatus::Filled | OrderStatus::Failed)) = effective_account_status {
+        return status;
+    }
+    if matches!(
+        raw_status.to_ascii_uppercase().as_str(),
+        "MATCHED" | "MATCHED_NOT_BROADCASTED"
+    ) {
+        OrderStatus::Filled
+    } else {
+        OrderStatus::Accepted
+    }
 }
 
 /// Classify a successful singular-order lookup. Polymarket's live endpoint has
@@ -3070,10 +3104,7 @@ impl PolymarketTrade {
         &self,
         order: &OrderRequest,
     ) -> Result<(String /* order_hash */, PolyOrderBody)> {
-        let price = order.price.unwrap_or(0.0);
-        if price <= 0.0 || price >= 1.0 {
-            return Err(anyhow!("Invalid price: {}", price));
-        }
+        let price = validate_order_for_signing(order)?;
 
         match self.shared.clob_version {
             ClobVersion::V1 => self.sign_and_build_body_v1(order, price),
@@ -4159,7 +4190,7 @@ impl PolymarketTrade {
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
         self.shared.clear_invalid_token(&order.symbol);
-        self.shared.account_state.mark_order_status(
+        let effective_ack_status = self.shared.account_state.mark_order_status_effective(
             &order.client_order_id,
             OrderStatus::Accepted,
         );
@@ -4196,7 +4227,7 @@ impl PolymarketTrade {
         // MATCHED/FILLED audit then moves the residual into its
         // `UnauditedMatchedOrders` bridge; the POST response itself does not
         // create a parallel inventory cache.
-        let (status, filled_quantity, remaining_quantity) = match status_str {
+        match status_str {
             "matched" => {
                 let trade_ids = resp
                     .get("tradeIDs")
@@ -4207,13 +4238,17 @@ impl PolymarketTrade {
                        (emitting placeholder Filled for immediate order REST audit; \
                        ledger updated via authoritative trade updates)",
                       order_id, trade_ids);
-                (OrderStatus::Filled, 0.0, 0.0)
             }
             "delayed" => {
                 info!("[PolymarketTrade] Deferred execution: orderID={}", order_id);
-                (OrderStatus::Accepted, 0.0, order.quantity)
             }
-            _ => (OrderStatus::Accepted, 0.0, order.quantity),
+            _ => {}
+        }
+        let status = placement_response_status(true, status_str, effective_ack_status);
+        let (filled_quantity, remaining_quantity) = if status == OrderStatus::Filled {
+            (0.0, 0.0)
+        } else {
+            (0.0, order.quantity)
         };
 
         info!("[PolymarketTrade] Order accepted: orderID={} status={} coid={}",
@@ -4717,9 +4752,10 @@ impl ExchangeTrade for PolymarketTrade {
                             continue;
                         }
 
+                        let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            self.shared.account_state.mark_order_status(
+                            effective_ack_status = self.shared.account_state.mark_order_status_effective(
                                 &order.client_order_id,
                                 OrderStatus::Accepted,
                             );
@@ -4755,17 +4791,11 @@ impl ExchangeTrade for PolymarketTrade {
                             );
                         }
 
-                        let response_status =
-                            if success && matches!(
-                                status_str.to_ascii_uppercase().as_str(),
-                                "MATCHED" | "MATCHED_NOT_BROADCASTED"
-                            ) {
-                                OrderStatus::Filled
-                            } else if success {
-                                OrderStatus::Accepted
-                            } else {
-                                OrderStatus::Rejected
-                            };
+                        let response_status = placement_response_status(
+                            success,
+                            status_str,
+                            effective_ack_status,
+                        );
                         all_updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -5536,9 +5566,10 @@ impl ExchangeTrade for PolymarketTrade {
                             );
                             continue;
                         }
+                        let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            self.shared.account_state.mark_order_status(
+                            effective_ack_status = self.shared.account_state.mark_order_status_effective(
                                 &order.client_order_id,
                                 OrderStatus::Accepted,
                             );
@@ -5610,16 +5641,11 @@ impl ExchangeTrade for PolymarketTrade {
                         let err_field = if !success && !error_msg.is_empty() {
                             Some(error_msg.to_string())
                         } else { None };
-                        let response_status = if success && matches!(
-                            status_str.to_ascii_uppercase().as_str(),
-                            "MATCHED" | "MATCHED_NOT_BROADCASTED"
-                        ) {
-                            OrderStatus::Filled
-                        } else if success {
-                            OrderStatus::Accepted
-                        } else {
-                            OrderStatus::Rejected
-                        };
+                        let response_status = placement_response_status(
+                            success,
+                            status_str,
+                            effective_ack_status,
+                        );
                         updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -5731,6 +5757,65 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_signing_order() -> OrderRequest {
+        OrderRequest::new_limit(
+            Exchange::Polymarket,
+            "123456789".to_string(),
+            Side::Buy,
+            0.5,
+            1.0,
+        )
+    }
+
+    #[test]
+    fn signing_validation_rejects_non_finite_and_unrepresentable_numbers() {
+        for price in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 1.0] {
+            let mut order = valid_signing_order();
+            order.price = Some(price);
+            assert!(validate_order_for_signing(&order).is_err(), "price={price}");
+        }
+
+        for quantity in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut order = valid_signing_order();
+            order.quantity = quantity;
+            assert!(validate_order_for_signing(&order).is_err(), "quantity={quantity}");
+        }
+
+        let mut sub_precision = valid_signing_order();
+        sub_precision.quantity = 0.000_000_1;
+        assert!(validate_order_for_signing(&sub_precision).is_err());
+
+        let mut overflow = valid_signing_order();
+        overflow.quantity = f64::MAX;
+        assert!(validate_order_for_signing(&overflow).is_err());
+
+        let mut invalid_fee = valid_signing_order();
+        invalid_fee.fee_rate_bps = 10_001;
+        assert!(validate_order_for_signing(&invalid_fee).is_err());
+
+        let mut invalid_token = valid_signing_order();
+        invalid_token.symbol = "not-a-token-id".to_string();
+        assert!(validate_order_for_signing(&invalid_token).is_err());
+
+        assert_eq!(validate_order_for_signing(&valid_signing_order()).unwrap(), 0.5);
+    }
+
+    #[test]
+    fn late_http_ack_response_cannot_regress_filled_status() {
+        assert_eq!(
+            placement_response_status(true, "live", Some(OrderStatus::Filled)),
+            OrderStatus::Filled,
+        );
+        assert_eq!(
+            placement_response_status(true, "delayed", Some(OrderStatus::Filled)),
+            OrderStatus::Filled,
+        );
+        assert_eq!(
+            placement_response_status(true, "matched", Some(OrderStatus::Accepted)),
+            OrderStatus::Filled,
+        );
+    }
 
     #[test]
     fn cancel_all_finality_requires_complete_response_schema() {
