@@ -2,6 +2,17 @@ use std::collections::HashMap;
 
 use crate::types::{OrderBookSnapshot, QuoteTick};
 
+/// Maximum tolerated server-clock lead over the local receive timestamp.
+/// Accepting a larger lead would pin this monotonic cache ahead of subsequent
+/// valid updates and make age checks report zero until wall time catches up.
+const MAX_EXCHANGE_FUTURE_SKEW_NS: u64 = 2_000_000_000;
+
+fn timestamp_too_far_in_future(exchange_timestamp_ns: u64, local_timestamp_ns: u64) -> bool {
+    local_timestamp_ns > 0
+        && exchange_timestamp_ns
+            > local_timestamp_ns.saturating_add(MAX_EXCHANGE_FUTURE_SKEW_NS)
+}
+
 /// One nudge per (symbol, side).
 ///
 ///   * `price`       — the asserted top-of-book bound (real bid ≥ price
@@ -86,6 +97,14 @@ impl OrderbookManager {
     /// generated this snapshot long enough after our nudge moment that
     /// it must reflect the post-move book, so it's authoritative.
     pub fn update(&mut self, ob: &OrderBookSnapshot) {
+        if timestamp_too_far_in_future(ob.exchange_timestamp_ns, ob.local_timestamp_ns) {
+            log::warn!(
+                "[OrderbookManager] rejected future orderbook symbol={} exchange_ts={} local_ts={} max_skew_ns={}",
+                ob.symbol, ob.exchange_timestamp_ns, ob.local_timestamp_ns,
+                MAX_EXCHANGE_FUTURE_SKEW_NS,
+            );
+            return;
+        }
         if self
             .books
             .get(&ob.symbol)
@@ -121,6 +140,17 @@ impl OrderbookManager {
     /// or the full book supplies L1 is decided wholesale by exchange
     /// timestamp in `raw_l1`, so bid and ask are never mixed across sources.
     pub fn update_quote(&mut self, quote: &QuoteTick) {
+        if timestamp_too_far_in_future(
+            quote.exchange_timestamp_ns,
+            quote.local_timestamp_ns,
+        ) {
+            log::warn!(
+                "[OrderbookManager] rejected future quote symbol={} exchange_ts={} local_ts={} max_skew_ns={}",
+                quote.symbol, quote.exchange_timestamp_ns, quote.local_timestamp_ns,
+                MAX_EXCHANGE_FUTURE_SKEW_NS,
+            );
+            return;
+        }
         if self
             .quotes
             .get(&quote.symbol)
@@ -631,5 +661,48 @@ mod tests {
             assert_eq!(om.best_bid_price("tok"), Some(0.69),
                 "nudge dropped early at iteration {}", i);
         }
+    }
+
+    #[test]
+    fn future_orderbook_is_rejected_without_pinning_monotonic_cache() {
+        let mut om = OrderbookManager::new();
+        let mut initial = empty_book("tok");
+        initial.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        initial.exchange_timestamp_ns = 100;
+        initial.local_timestamp_ns = 101;
+        om.update(&initial);
+
+        let mut untrusted = initial.clone();
+        untrusted.bids[0].price = 0.99;
+        untrusted.exchange_timestamp_ns = MAX_EXCHANGE_FUTURE_SKEW_NS + 200;
+        untrusted.local_timestamp_ns = 100;
+        om.update(&untrusted);
+        assert_eq!(om.best_bid_price("tok"), Some(0.40));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(100));
+
+        let mut later = initial;
+        later.bids[0].price = 0.45;
+        later.exchange_timestamp_ns = 300;
+        later.local_timestamp_ns = 301;
+        om.update(&later);
+        assert_eq!(om.best_bid_price("tok"), Some(0.45));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+    }
+
+    #[test]
+    fn future_quote_is_rejected_without_pinning_monotonic_cache() {
+        let mut om = OrderbookManager::new();
+        om.update_quote(&quote("tok", 0.40, 0.60, 100));
+
+        let mut untrusted = quote("tok", 0.98, 0.99, 200);
+        untrusted.exchange_timestamp_ns = MAX_EXCHANGE_FUTURE_SKEW_NS + 200;
+        untrusted.local_timestamp_ns = 100;
+        om.update_quote(&untrusted);
+        assert_eq!(om.best_bid_price("tok"), Some(0.40));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(100));
+
+        om.update_quote(&quote("tok", 0.45, 0.55, 300));
+        assert_eq!(om.best_bid_price("tok"), Some(0.45));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
     }
 }

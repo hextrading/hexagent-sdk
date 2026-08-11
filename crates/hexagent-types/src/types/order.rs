@@ -8,6 +8,13 @@ use super::market::{Exchange, Side};
 pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str =
     "orphan_reconcile_authoritative_terminal";
 
+/// Marker attached to an `ExecutorRejected` update when the dedicated
+/// Polymarket reconcile pool had no free permit and therefore sent no HTTP
+/// request. Strategies must treat this as admission feedback only: clear the
+/// reconcile in-flight/backoff state, but do not mutate the ordinary order
+/// lifecycle as if a placement or cancel signal had been rejected.
+pub const ORPHAN_RECONCILE_DEFERRED: &str = "orphan_reconcile_deferred";
+
 fn default_true_fn() -> bool { true }
 
 /// Order type
