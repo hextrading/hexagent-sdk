@@ -16,6 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const EPS: f64 = 1e-9;
 const RECONCILIATION_UNIT: f64 = 1e-6;
 const INITIAL_TOKEN_BARRIER_TIMEOUT_MS: u64 = 10_000;
+const MANUAL_RISK_BLOCKER: &str = "manual";
+const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
 /// the same hash with mixed hex casing and, on some paths, without the `0x`
@@ -172,6 +174,32 @@ pub struct TradeOwnership {
     pub status: String,
 }
 
+/// Result of applying one private-trade lifecycle edge to the durable account.
+/// Ownership/accounting validation is deliberately separate from persistence
+/// confirmation: a slow fsync must not make callers suppress an already-owned
+/// fill, but admission remains risk-off until the scheduled generation lands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TradeTransitionResult {
+    Applied(TradeOwnership),
+    AppliedButPersistencePending(TradeOwnership),
+    Rejected,
+}
+
+impl TradeTransitionResult {
+    pub fn ownership(&self) -> Option<&TradeOwnership> {
+        match self {
+            Self::Applied(ownership) | Self::AppliedButPersistencePending(ownership) => {
+                Some(ownership)
+            }
+            Self::Rejected => None,
+        }
+    }
+
+    pub fn persistence_pending(&self) -> bool {
+        matches!(self, Self::AppliedButPersistencePending(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoredTrade {
     pub ownership: TradeOwnership,
@@ -326,6 +354,12 @@ struct TokenFeeConfig {
     exponent: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RiskBlocker {
+    reason: String,
+    since_ms: u64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -355,6 +389,11 @@ struct SharedAccountState {
     uncertain_reason: Option<String>,
     #[serde(default)]
     uncertain_since_ms: Option<u64>,
+    /// Risk gates owned by subsystems outside account reconciliation. A normal
+    /// balance/trade recomputation cannot clear these; only the source that set
+    /// a key may remove it after proving recovery.
+    #[serde(default)]
+    risk_blockers: BTreeMap<String, RiskBlocker>,
     #[serde(default)]
     external_adjustments: HashMap<String, ExternalAdjustment>,
     #[serde(default)]
@@ -556,6 +595,23 @@ impl AccountPersistence {
         let _ = self.wake.try_send(());
     }
 
+    fn scheduled_generation(&self) -> u64 {
+        self.next_generation.load(Ordering::Acquire)
+    }
+
+    fn generation_is_durable(&self, generation: u64) -> bool {
+        if generation == 0 {
+            return true;
+        }
+        self.progress
+            .0
+            .lock()
+            .map(|progress| {
+                progress.completed_generation >= generation && progress.last_error.is_none()
+            })
+            .unwrap_or(false)
+    }
+
     fn flush(&self, timeout: Duration) -> Result<(), String> {
         let started = std::time::Instant::now();
         let record_latency = || {
@@ -667,6 +723,10 @@ pub struct SharedAccount {
     account_id: String,
     state: Mutex<SharedAccountState>,
     persistence: Option<AccountPersistence>,
+    /// Highest account-persistence generation whose trade mutation timed out
+    /// at the synchronous durability barrier. Non-blocking health reads clear
+    /// the corresponding blocker once the worker proves this generation.
+    trade_persistence_pending_generation: AtomicU64,
 }
 
 impl SharedAccount {
@@ -675,6 +735,7 @@ impl SharedAccount {
             account_id: account_id.into(),
             state: Mutex::new(SharedAccountState::default()),
             persistence: None,
+            trade_persistence_pending_generation: AtomicU64::new(0),
         }
     }
 
@@ -687,7 +748,7 @@ impl SharedAccount {
     ) -> Result<Self, String> {
         let account_id = account_id.into();
         let path = path.into();
-        let (state, migrated_terminal_failures) = if path.exists() {
+        let (state, migrated_state) = if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("read account ledger {}: {error}", path.display()))?;
             let persisted: PersistedAccount = serde_json::from_slice(&bytes)
@@ -753,9 +814,24 @@ impl SharedAccount {
                     ),
                 );
             }
-            let migrated = normalize_terminal_failed_state(&mut state);
+            let mut migrated = normalize_terminal_failed_state(&mut state);
             if migrated {
                 recompute_reconciliation(&mut state, "terminal FAILED ledger migration");
+            }
+            // A persisted trade-persistence blocker proves that the snapshot
+            // containing both the trade and the blocker reached disk. The new
+            // process can therefore clear only this source-owned blocker; all
+            // other subsystem blockers remain fail-closed across restart.
+            if state
+                .risk_blockers
+                .remove(TRADE_PERSISTENCE_RISK_BLOCKER)
+                .is_some()
+            {
+                migrated = true;
+                recompute_reconciliation(
+                    &mut state,
+                    "durable trade-persistence blocker recovery",
+                );
             }
             validate_persisted_state(&account_id, &state)
                 .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
@@ -768,8 +844,9 @@ impl SharedAccount {
             account_id,
             state: Mutex::new(state),
             persistence: Some(persistence),
+            trade_persistence_pending_generation: AtomicU64::new(0),
         };
-        if migrated_terminal_failures {
+        if migrated_state {
             let state = account.state.lock().unwrap();
             account.schedule_persist(&state);
         }
@@ -790,6 +867,29 @@ impl SharedAccount {
 
     pub fn flush_persistence(&self, timeout: Duration) -> Result<(), String> {
         self.persistence.as_ref().map_or(Ok(()), |p| p.flush(timeout))
+    }
+
+    fn refresh_trade_persistence_blocker(&self) {
+        let generation = self
+            .trade_persistence_pending_generation
+            .load(Ordering::Acquire);
+        if generation == 0 {
+            return;
+        }
+        let durable = self
+            .persistence
+            .as_ref()
+            .is_none_or(|persistence| persistence.generation_is_durable(generation));
+        if !durable {
+            return;
+        }
+        if self
+            .trade_persistence_pending_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.clear_risk_blocker(TRADE_PERSISTENCE_RISK_BLOCKER);
+        }
     }
 
     fn flush_rollback_persistence(&self) -> Result<(), String> {
@@ -1463,15 +1563,58 @@ impl SharedAccount {
         true
     }
     pub fn is_uncertain(&self) -> bool {
+        self.refresh_trade_persistence_blocker();
         self.persistence.as_ref().and_then(AccountPersistence::last_error).is_some()
             || self.state.lock().unwrap().uncertain
     }
-    pub fn mark_uncertain(&self) { self.mark_uncertain_with_reason("unspecified account uncertainty"); }
+    pub fn mark_uncertain(&self) {
+        self.mark_uncertain_with_reason("unspecified account uncertainty");
+    }
 
     pub fn mark_uncertain_with_reason(&self, reason: impl Into<String>) {
+        self.set_risk_blocker(MANUAL_RISK_BLOCKER, reason);
+    }
+
+    /// Set a sticky, source-owned admission blocker. Reconciliation may update
+    /// balances and its own derived blockers, but it cannot remove this key.
+    pub fn set_risk_blocker(&self, source: &str, reason: impl Into<String>) {
+        let source = source.trim();
+        if source.is_empty() {
+            return;
+        }
+        let reason = reason.into();
+        let reason = if reason.trim().is_empty() {
+            "unspecified subsystem risk".to_string()
+        } else {
+            reason
+        };
         let mut state = self.state.lock().unwrap();
-        set_uncertain(&mut state, reason.into());
+        let since_ms = state
+            .risk_blockers
+            .get(source)
+            .map_or_else(wall_clock_ms, |blocker| blocker.since_ms);
+        state.risk_blockers.insert(
+            source.to_string(),
+            RiskBlocker {
+                reason: reason.clone(),
+                since_ms,
+            },
+        );
+        set_uncertain(&mut state, format!("{source}: {reason}"));
         self.schedule_persist(&state);
+    }
+
+    /// Clear exactly one subsystem blocker, then re-evaluate every remaining
+    /// derived account invariant. Callers cannot accidentally reopen admission
+    /// for a different source.
+    pub fn clear_risk_blocker(&self, source: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.risk_blockers.remove(source.trim()).is_none() {
+            return false;
+        }
+        recompute_reconciliation(&mut state, "risk blocker cleared");
+        self.schedule_persist(&state);
+        true
     }
 
     /// Mark potentially-live orders restored from disk. Admission remains
@@ -1594,6 +1737,7 @@ impl SharedAccount {
     }
 
     pub fn monitoring_snapshot(&self) -> AccountMonitoringSnapshot {
+        self.refresh_trade_persistence_blocker();
         let state = self.state.lock().unwrap();
         let persistence_error = self
             .persistence
@@ -1691,6 +1835,7 @@ impl SharedAccount {
     }
 
     pub fn availability(&self, instance_id: &str, token: &str) -> Option<AccountAvailability> {
+        self.refresh_trade_persistence_blocker();
         let persistence_failed = self
             .persistence
             .as_ref()
@@ -1745,6 +1890,7 @@ impl SharedAccount {
         price: f64,
         fee_rate_bps: u32,
     ) -> Result<OrderOwnership, ReservationError> {
+        self.refresh_trade_persistence_blocker();
         if client_order_id.is_empty() || order_id.is_empty() || token_id.is_empty()
             || !quantity.is_finite() || quantity <= 0.0
             || !price.is_finite() || price <= 0.0
@@ -2914,23 +3060,35 @@ impl SharedAccount {
         price: f64,
         is_maker: bool,
         match_time_secs: u64,
-    ) -> Option<TradeOwnership> {
+    ) -> TradeTransitionResult {
         let mut persistence_required = false;
         let applied = self.apply_trade_transition_inner(
             trade_key, status, client_order_id, order_id, token_id,
             side, quantity, price, Some((is_maker, match_time_secs)),
             &mut persistence_required,
         );
-        if applied.is_some()
-            && persistence_required
-            && self.flush_persistence(Duration::from_secs(2)).is_err()
-        {
-            self.mark_uncertain_with_reason(format!(
-                "trade `{trade_key}` atomic persistence failed"
-            ));
-            return None;
+        let Some(ownership) = applied else {
+            return TradeTransitionResult::Rejected;
+        };
+        if persistence_required {
+            if let Err(error) = self.flush_persistence(Duration::from_secs(2)) {
+                let generation = self
+                    .persistence
+                    .as_ref()
+                    .map_or(0, AccountPersistence::scheduled_generation);
+                self.trade_persistence_pending_generation
+                    .fetch_max(generation, Ordering::AcqRel);
+                self.set_risk_blocker(
+                    TRADE_PERSISTENCE_RISK_BLOCKER,
+                    format!(
+                        "trade `{trade_key}` applied but generation {generation} is not durable: {error}"
+                    ),
+                );
+                return TradeTransitionResult::AppliedButPersistencePending(ownership);
+            }
+            self.refresh_trade_persistence_blocker();
         }
-        applied
+        TradeTransitionResult::Applied(ownership)
     }
 
     fn apply_trade_transition_inner(
@@ -3951,7 +4109,11 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         }
     }
     negative_tokens.sort();
-    if !state.ownership_anomalies.is_empty() {
+    if let Some((source, blocker)) = state.risk_blockers.iter().next() {
+        state.uncertain = true;
+        state.uncertain_reason = Some(format!("{source}: {}", blocker.reason));
+        state.uncertain_since_ms = Some(blocker.since_ms);
+    } else if !state.ownership_anomalies.is_empty() {
         let details = state
             .ownership_anomalies
             .iter()
@@ -4282,6 +4444,125 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         ));
     }
 
+    // `filled_quantity` and every reservation counter are derived values. A
+    // parseable ledger must not be allowed to invent availability by changing
+    // one side of those relationships. Rebuild the expected values solely
+    // from the durable order/trade/maintenance roots and compare every leaf
+    // and aggregate before the persistence worker can expose the account.
+    let mut booked_quantity_by_order = HashMap::<String, f64>::new();
+    for trade in state.trades.values().filter(|trade| trade.booked && !trade.failed) {
+        *booked_quantity_by_order
+            .entry(trade.ownership.client_order_id.clone())
+            .or_insert(0.0) += trade.ownership.quantity;
+    }
+    let mut expected_cash_by_instance = HashMap::<String, f64>::new();
+    let mut expected_positions_by_instance =
+        HashMap::<String, HashMap<String, f64>>::new();
+    for (coid, order) in &state.orders {
+        let booked = booked_quantity_by_order.get(coid).copied().unwrap_or(0.0);
+        let tolerance = reconciliation_tolerance(booked, order.filled_quantity)
+            .max(order.quantity.abs().max(1.0) * 1e-8);
+        if (booked - order.filled_quantity).abs() > tolerance {
+            return Err(format!(
+                "order `{coid}` filled_quantity={} disagrees with durable trades={booked}",
+                order.filled_quantity,
+            ));
+        }
+        let terminal_and_released = matches!(
+            order.status,
+            OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
+        ) && !state.recovery_pending_orders.contains(coid);
+        let (expected_cash, expected_quantity) = if terminal_and_released {
+            (0.0, 0.0)
+        } else {
+            desired_order_reservation(order)
+        };
+        if (expected_cash - order.reserved_cash).abs()
+            > reconciliation_tolerance(expected_cash, order.reserved_cash)
+            || (expected_quantity - order.reserved_quantity).abs()
+                > reconciliation_tolerance(expected_quantity, order.reserved_quantity)
+        {
+            return Err(format!(
+                "order `{coid}` reservation disagrees with effective remaining quantity: stored_cash={} expected_cash={expected_cash} stored_quantity={} expected_quantity={expected_quantity}",
+                order.reserved_cash, order.reserved_quantity,
+            ));
+        }
+        *expected_cash_by_instance
+            .entry(order.instance_id.clone())
+            .or_insert(0.0) += expected_cash;
+        if expected_quantity > 0.0 {
+            *expected_positions_by_instance
+                .entry(order.instance_id.clone())
+                .or_default()
+                .entry(order.token_id.clone())
+                .or_insert(0.0) += expected_quantity;
+        }
+    }
+
+    for operation in state.maintenance_ops.values().filter(|operation| {
+        matches!(
+            operation.status,
+            MaintenanceOperationStatus::Reserved
+                | MaintenanceOperationStatus::Submitted
+                | MaintenanceOperationStatus::Uncertain
+        )
+    }) {
+        for (instance_id, amount) in &operation.allocations {
+            match operation.kind {
+                MaintenanceOperationKind::Split => {
+                    *expected_cash_by_instance
+                        .entry(instance_id.clone())
+                        .or_insert(0.0) += *amount;
+                }
+                MaintenanceOperationKind::Merge => {
+                    let expected = expected_positions_by_instance
+                        .entry(instance_id.clone())
+                        .or_default();
+                    for token in [&operation.up_token_id, &operation.down_token_id] {
+                        *expected.entry(token.clone()).or_insert(0.0) += *amount;
+                    }
+                }
+            }
+        }
+    }
+
+    for (instance_id, instance) in &state.instances {
+        let expected_cash = expected_cash_by_instance
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0.0);
+        if (expected_cash - instance.reserved_cash).abs()
+            > reconciliation_tolerance(expected_cash, instance.reserved_cash)
+        {
+            return Err(format!(
+                "instance `{instance_id}` reserved_cash={} disagrees with derived aggregate={expected_cash}",
+                instance.reserved_cash,
+            ));
+        }
+        let expected_positions = expected_positions_by_instance.get(instance_id);
+        let mut reservation_tokens: HashSet<String> =
+            instance.reserved_positions.keys().cloned().collect();
+        if let Some(expected) = expected_positions {
+            reservation_tokens.extend(expected.keys().cloned());
+        }
+        for token in reservation_tokens {
+            let stored = instance
+                .reserved_positions
+                .get(&token)
+                .copied()
+                .unwrap_or(0.0);
+            let expected = expected_positions
+                .and_then(|positions| positions.get(&token))
+                .copied()
+                .unwrap_or(0.0);
+            if (stored - expected).abs() > reconciliation_tolerance(stored, expected) {
+                return Err(format!(
+                    "instance `{instance_id}` reserved position `{token}`={stored} disagrees with derived aggregate={expected}",
+                ));
+            }
+        }
+    }
+
     for trade_key in &state.fee_attribution_pending {
         if state.trades.get(trade_key).is_none_or(|trade| {
             trade.failed || !trade.booked || trade.virtual_fee_booked
@@ -4383,12 +4664,48 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
     {
         return Err("invalid durable ownership anomaly".to_string());
     }
+    if state.risk_blockers.iter().any(|(source, blocker)| {
+        source.trim().is_empty() || blocker.reason.trim().is_empty() || blocker.since_ms == 0
+    }) {
+        return Err("invalid durable risk blocker".to_string());
+    }
     if state
         .unresolved_trade_match_times
         .keys()
         .any(|trade_key| trade_key.trim().is_empty())
     {
         return Err("invalid unresolved trade match-time entry".to_string());
+    }
+
+    let mut recomputed = state.clone();
+    recompute_reconciliation(&mut recomputed, "persisted ledger validation");
+    if (recomputed.unallocated_cash - state.unallocated_cash).abs()
+        > reconciliation_tolerance(recomputed.unallocated_cash, state.unallocated_cash)
+    {
+        return Err(format!(
+            "unallocated_cash={} disagrees with recomputed value={}",
+            state.unallocated_cash, recomputed.unallocated_cash,
+        ));
+    }
+    let mut unallocated_tokens: HashSet<String> =
+        state.unallocated_positions.keys().cloned().collect();
+    unallocated_tokens.extend(recomputed.unallocated_positions.keys().cloned());
+    for token in unallocated_tokens {
+        let stored = state
+            .unallocated_positions
+            .get(&token)
+            .copied()
+            .unwrap_or(0.0);
+        let expected = recomputed
+            .unallocated_positions
+            .get(&token)
+            .copied()
+            .unwrap_or(0.0);
+        if (stored - expected).abs() > reconciliation_tolerance(stored, expected) {
+            return Err(format!(
+                "unallocated position `{token}`={stored} disagrees with recomputed value={expected}",
+            ));
+        }
     }
     Ok(())
 
@@ -5019,10 +5336,10 @@ mod tests {
         account.reserve_order(
             "a", "a-atomic", "oid-atomic", "UP", Side::Buy, 5.0, 0.4, 0,
         ).unwrap();
-        account.apply_trade_transition_with_context(
+        assert!(account.apply_trade_transition_with_context(
             "trade-atomic", "MATCHED_NOT_BROADCASTED", "a-atomic", "oid-atomic",
             "UP", Side::Buy, 5.0, 0.4, false, 1_700_000_000,
-        ).unwrap();
+        ).ownership().is_some());
         let restored = account.restored_trades().into_iter()
             .find(|trade| trade.ownership.trade_key == "trade-atomic").unwrap();
         assert_eq!(restored.ownership.status, "MATCHED");
@@ -6121,6 +6438,21 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_risk_blocker_survives_unrelated_reconciliation() {
+        let account = seeded_account();
+        account.set_risk_blocker("sidecar_persistence:maker", "sidecar fsync failed");
+        assert!(account.is_uncertain());
+        account
+            .apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]))
+            .unwrap();
+        assert!(account.is_uncertain());
+        assert!(!account.clear_risk_blocker("order_audit:other"));
+        assert!(account.is_uncertain());
+        assert!(account.clear_risk_blocker("sidecar_persistence:maker"));
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
     fn removed_config_instance_with_owned_funds_fails_closed() {
         let account = seeded_account();
         account.reconcile_configured_instances(&HashSet::from(["a".to_string()]));
@@ -6346,6 +6678,78 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_validator_recomputes_fill_and_reservation_derivatives() {
+        let mut state = SharedAccountState::default();
+        state.physical_cash = 100.0;
+        let mut instance = InstanceLedger::new(1.0);
+        instance.cash = 99.5;
+        instance.reserved_cash = 4.5;
+        instance.positions.insert("UP".to_string(), 1.0);
+        state.instances.insert("maker".to_string(), instance);
+        state.orders.insert(
+            "maker-order".to_string(),
+            OrderOwnership {
+                account_id: "account".to_string(),
+                instance_id: "maker".to_string(),
+                client_order_id: "maker-order".to_string(),
+                order_id: "0xABC".to_string(),
+                token_id: "UP".to_string(),
+                side: Side::Buy,
+                quantity: 10.0,
+                filled_quantity: 1.0,
+                terminal_matched_quantity: None,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 4.5,
+                reserved_quantity: 0.0,
+                status: OrderStatus::PartiallyFilled,
+            },
+        );
+        state
+            .oid_to_coid
+            .insert("abc".to_string(), "maker-order".to_string());
+        state.ledger_generation = 1;
+        state.trades.insert(
+            "trade".to_string(),
+            AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: "account".to_string(),
+                    instance_id: "maker".to_string(),
+                    trade_key: "trade".to_string(),
+                    client_order_id: "maker-order".to_string(),
+                    order_id: "0xABC".to_string(),
+                    token_id: "UP".to_string(),
+                    side: Side::Buy,
+                    quantity: 1.0,
+                    price: 0.5,
+                    status: "MATCHED".to_string(),
+                },
+                booked: true,
+                physical_booked: false,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: false,
+                physical_fee_booked: false,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: 1,
+            },
+        );
+        assert!(validate_persisted_state("account", &state).is_ok());
+
+        state.instances.get_mut("maker").unwrap().reserved_cash = 4.0;
+        let aggregate_error = validate_persisted_state("account", &state).unwrap_err();
+        assert!(aggregate_error.contains("reserved_cash"), "{aggregate_error}");
+        state.instances.get_mut("maker").unwrap().reserved_cash = 4.5;
+
+        state.orders.get_mut("maker-order").unwrap().filled_quantity = 0.5;
+        let fill_error = validate_persisted_state("account", &state).unwrap_err();
+        assert!(fill_error.contains("durable trades"), "{fill_error}");
+    }
+
+    #[test]
     fn provisional_owner_follows_virtual_inventory_across_physical_redemption() {
         let mut state = SharedAccountState::default();
         let mut instance = InstanceLedger::new(1.0);
@@ -6355,6 +6759,10 @@ mod tests {
             "HISTORICAL-WIN".to_string(),
             "maker".to_string(),
         );
+        state
+            .unallocated_positions
+            .insert("HISTORICAL-WIN".to_string(), -7.0);
+        state.uncertain = true;
 
         // A wallet snapshot may no longer contain a redeemed historical token
         // while its virtual owner remains necessary for attribution.
@@ -6389,7 +6797,7 @@ mod tests {
                     "a", "a-duplicate", "oid-duplicate", "UP", Side::Buy, 10.0, 0.5, 0,
                 )
                 .unwrap();
-            account
+            assert!(account
                 .apply_trade_transition_with_context(
                     "trade-duplicate",
                     "MATCHED",
@@ -6402,9 +6810,10 @@ mod tests {
                     false,
                     123,
                 )
-                .unwrap();
+                .ownership()
+                .is_some());
             let before = account.monitoring_snapshot();
-            account
+            assert!(account
                 .apply_trade_transition_with_context(
                     "trade-duplicate",
                     "MATCHED",
@@ -6417,7 +6826,8 @@ mod tests {
                     false,
                     123,
                 )
-                .unwrap();
+                .ownership()
+                .is_some());
             let after = account.monitoring_snapshot();
             assert_eq!(after.persistence_flushes, before.persistence_flushes);
             assert_eq!(after.persistence_writes, before.persistence_writes);
@@ -6426,5 +6836,63 @@ mod tests {
         lock_path.push(".lock");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn applied_trade_survives_persistence_failure_and_blocks_admission() {
+        let _persistence_guard = persistence_test_guard();
+        let root = std::env::temp_dir().join(format!(
+            "hexagent-trade-persistence-failure-{}-{}",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let moved = root.with_extension("moved");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("account.json");
+        let account = SharedAccount::new_persistent("trade-pending", &path).unwrap();
+        account.register_instance("a", 1.0);
+        account.apply_physical_snapshot(100.0, HashMap::new());
+        account
+            .reserve_order(
+                "a", "a-pending", "oid-pending", "UP", Side::Buy, 10.0, 0.5, 0,
+            )
+            .unwrap();
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+
+        // Keep the already-open ledger lock alive but make all future atomic
+        // writes fail deterministically: the parent path is now a plain file.
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::write(&root, b"not-a-directory").unwrap();
+        let result = account.apply_trade_transition_with_context(
+            "trade-pending",
+            "MATCHED",
+            "a-pending",
+            "oid-pending",
+            "UP",
+            Side::Buy,
+            10.0,
+            0.5,
+            false,
+            123,
+        );
+        assert!(matches!(
+            result,
+            TradeTransitionResult::AppliedButPersistencePending(_)
+        ));
+        let snapshot = account.instance_snapshot("a").unwrap();
+        assert_eq!(snapshot.positions.get("UP").copied(), Some(10.0));
+        assert_eq!(snapshot.cash, 95.0);
+        assert!(account.is_uncertain());
+        assert!(matches!(
+            account.reserve_order(
+                "a", "blocked", "oid-blocked", "UP", Side::Buy, 1.0, 0.5, 0,
+            ),
+            Err(ReservationError::PersistenceUnavailable(_))
+                | Err(ReservationError::AccountUncertain)
+        ));
+
+        drop(account);
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 }

@@ -98,10 +98,36 @@ impl FetchOrderResult {
     }
 }
 
-fn parse_fetched_order(json: &serde_json::Value) -> std::result::Result<FetchedOrder, ()> {
-    let raw_status = json
-        .as_object()
-        .and_then(|object| object.get("status"))
+fn parse_fetched_order(
+    json: &serde_json::Value,
+    expected_order_id: &str,
+) -> std::result::Result<FetchedOrder, ()> {
+    let object = json.as_object().ok_or(())?;
+    if object
+        .get("success")
+        .is_some_and(|value| value.as_bool() == Some(false))
+        || ["error", "errorMsg", "error_msg"]
+            .iter()
+            .any(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(());
+    }
+    let identities: Vec<&str> = ["id", "orderID", "order_id"]
+        .iter()
+        .filter_map(|field| object.get(*field).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if expected_order_id.trim().is_empty()
+        || identities.is_empty()
+        || identities.iter().any(|identity| {
+            normalize_order_id(identity) != normalize_order_id(expected_order_id)
+        })
+    {
+        return Err(());
+    }
+    let raw_status = object
+        .get("status")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -119,26 +145,49 @@ fn parse_fetched_order(json: &serde_json::Value) -> std::result::Result<FetchedO
         _ => return Err(()),
     };
     let string_field = |name: &str| {
-        json.get(name).and_then(|value| match value {
+        object.get(name).and_then(|value| match value {
             serde_json::Value::String(value) => Some(value.clone()),
             serde_json::Value::Number(value) => Some(value.to_string()),
             _ => None,
         })
     };
-    let associate_trades = json
+    let original_size = string_field("original_size").ok_or(())?;
+    let size_matched = string_field("size_matched").ok_or(())?;
+    let original_quantity = original_size.parse::<f64>().map_err(|_| ())?;
+    let matched_quantity = size_matched.parse::<f64>().map_err(|_| ())?;
+    let tolerance = original_quantity.abs().max(1.0) * 1e-8;
+    if !original_quantity.is_finite()
+        || original_quantity <= 0.0
+        || !matched_quantity.is_finite()
+        || matched_quantity < -tolerance
+        || matched_quantity > original_quantity + tolerance
+        || matches!(status.as_str(), "MATCHED" | "FILLED") && matched_quantity <= 0.0
+    {
+        return Err(());
+    }
+    let associate_trades = object
         .get("associate_trades")
         .and_then(|value| value.as_array())
-        .map(|values| values.iter()
-            .filter_map(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect())
-        .unwrap_or_default();
+        .ok_or(())?
+        .iter()
+        .map(|value| value.as_str().map(str::trim).filter(|value| !value.is_empty()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(())?
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let unique_associate_trades: HashSet<&str> =
+        associate_trades.iter().map(String::as_str).collect();
+    if unique_associate_trades.len() != associate_trades.len()
+        || (matched_quantity > tolerance && associate_trades.is_empty())
+    {
+        return Err(());
+    }
     Ok(FetchedOrder {
         status,
         audit: AuthoritativeOrderAudit {
-            original_size: string_field("original_size"),
-            size_matched: string_field("size_matched"),
+            original_size: Some(original_size),
+            size_matched: Some(size_matched),
             associate_trades,
         },
     })
@@ -298,8 +347,11 @@ fn placement_response_status(
 /// Only the transport-level 404 branch in `fetch_order_by_id` produces
 /// `NotFound`. Missing fields, error envelopes and unknown future status values
 /// remain unavailable evidence so they cannot advance orphan terminalization.
-fn classify_successful_order_lookup(json: &serde_json::Value) -> FetchOrderResult {
-    match parse_fetched_order(json) {
+fn classify_successful_order_lookup(
+    json: &serde_json::Value,
+    expected_order_id: &str,
+) -> FetchOrderResult {
+    match parse_fetched_order(json, expected_order_id) {
         Ok(order) => FetchOrderResult::Found(order),
         Err(()) => FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse),
     }
@@ -4093,7 +4145,7 @@ impl PolymarketTrade {
                 return FetchOrderResult::Unavailable(unavailable);
             }
         };
-        classify_successful_order_lookup(&json)
+        classify_successful_order_lookup(&json, order_id)
     }
 }
 
@@ -6142,12 +6194,13 @@ mod tests {
     #[test]
     fn authoritative_order_parser_retains_exact_sizes_and_trade_ids() {
         let json = serde_json::json!({
+            "id": "0xabc",
             "status": "MATCHED",
             "original_size": "40",
             "size_matched": "39.993332",
             "associate_trades": ["trade-1", "trade-2", "trade-3", "trade-4"]
         });
-        let fetched = parse_fetched_order(&json).expect("matched order");
+        let fetched = parse_fetched_order(&json, "0xabc").expect("matched order");
         assert_eq!(fetched.status, "MATCHED");
         assert_eq!(fetched.audit.original_size.as_deref(), Some("40"));
         assert_eq!(fetched.audit.size_matched.as_deref(), Some("39.993332"));
@@ -6158,24 +6211,26 @@ mod tests {
     #[test]
     fn authoritative_order_parser_canonicalizes_matched_not_broadcasted() {
         let json = serde_json::json!({
+            "orderID": "0xabc",
             "status": "MATCHED_NOT_BROADCASTED",
             "original_size": "5",
             "size_matched": "5",
             "associate_trades": ["trade-1"]
         });
-        let fetched = parse_fetched_order(&json).expect("matched order");
+        let fetched = parse_fetched_order(&json, "0xabc").expect("matched order");
         assert_eq!(fetched.status, "MATCHED");
     }
 
     #[test]
     fn authoritative_order_parser_preserves_numeric_fixed_point_values() {
         let json = serde_json::json!({
+            "order_id": "0xabc",
             "status": "MATCHED",
             "original_size": 20,
             "size_matched": 19.990489,
             "associate_trades": ["trade-1"]
         });
-        let fetched = parse_fetched_order(&json).expect("matched order");
+        let fetched = parse_fetched_order(&json, "0xabc").expect("matched order");
         assert_eq!(fetched.audit.original_size.as_deref(), Some("20"));
         assert_eq!(fetched.audit.size_matched.as_deref(), Some("19.990489"));
     }
@@ -6608,7 +6663,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    classify_successful_order_lookup(&json),
+                    classify_successful_order_lookup(&json, "0xabc"),
                     FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
                 ),
                 "json={json}",
@@ -6616,18 +6671,85 @@ mod tests {
         }
 
         assert!(matches!(
-            classify_successful_order_lookup(&serde_json::json!({"status": "FUTURE_STATUS"})),
+            classify_successful_order_lookup(
+                &serde_json::json!({
+                    "id": "0xabc",
+                    "status": "FUTURE_STATUS",
+                    "original_size": "10",
+                    "size_matched": "0",
+                    "associate_trades": [],
+                }),
+                "0xabc",
+            ),
             FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
         ));
 
         assert!(matches!(
-            classify_successful_order_lookup(&serde_json::json!({"status": "LIVE"})),
+            classify_successful_order_lookup(&serde_json::json!({"status": "LIVE"}), "0xabc"),
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+        ));
+        assert!(matches!(
+            classify_successful_order_lookup(
+                &serde_json::json!({
+                    "id": "0xabc",
+                    "status": "LIVE",
+                    "original_size": "10",
+                    "size_matched": "0",
+                    "associate_trades": [],
+                }),
+                "0xabc",
+            ),
             FetchOrderResult::Found(FetchedOrder { status, .. }) if status == "LIVE"
         ));
         assert!(matches!(
-            classify_successful_order_lookup(&serde_json::json!({"status": "ORDER_STATUS_MATCHED"})),
+            classify_successful_order_lookup(
+                &serde_json::json!({
+                    "orderID": "0xabc",
+                    "status": "ORDER_STATUS_MATCHED",
+                    "original_size": "10",
+                    "size_matched": "10",
+                    "associate_trades": ["trade-1"],
+                }),
+                "0xabc",
+            ),
             FetchOrderResult::Found(FetchedOrder { status, .. }) if status == "MATCHED"
         ));
+        for json in [
+            serde_json::json!({
+                "id": "different",
+                "status": "LIVE",
+                "original_size": "10",
+                "size_matched": "0",
+                "associate_trades": [],
+            }),
+            serde_json::json!({
+                "id": "0xabc",
+                "status": "LIVE",
+                "original_size": "10",
+                "size_matched": "11",
+                "associate_trades": [],
+            }),
+            serde_json::json!({
+                "id": "0xabc",
+                "status": "LIVE",
+                "original_size": "10",
+                "size_matched": "0",
+                "associate_trades": "trade-1",
+            }),
+            serde_json::json!({
+                "id": "0xabc",
+                "status": "LIVE",
+                "original_size": "10",
+                "size_matched": "0",
+                "associate_trades": [],
+                "error": "upstream envelope",
+            }),
+        ] {
+            assert!(matches!(
+                classify_successful_order_lookup(&json, "0xabc"),
+                FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+            ));
+        }
     }
 
     /// Every placement-orphan provenance uses the same four-result terminal
