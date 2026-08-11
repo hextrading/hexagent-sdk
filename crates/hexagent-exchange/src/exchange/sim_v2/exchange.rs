@@ -2254,6 +2254,7 @@ mod tests {
         TradeTick {
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),
+            exchange_trade_id: None,
             price,
             quantity: qty,
             side,
@@ -2651,6 +2652,7 @@ mod tests {
         let comp = TradeTick {
             exchange: Exchange::Polymarket,
             symbol: "up".into(),
+            exchange_trade_id: None,
             price: 0.62,
             quantity: 20.0,
             side: Side::Buy,
@@ -2678,6 +2680,7 @@ mod tests {
         let comp = TradeTick {
             exchange: Exchange::Polymarket,
             symbol: "up".into(),
+            exchange_trade_id: None,
             price: 0.62,
             quantity: 20.0,
             side: Side::Buy,
@@ -2731,6 +2734,7 @@ mod tests {
         let comp = TradeTick {
             exchange: Exchange::Polymarket,
             symbol: "up".into(),
+            exchange_trade_id: None,
             price: 0.62,
             quantity: 20.0,
             side: Side::Buy,
@@ -2779,7 +2783,7 @@ mod tests {
         let mut c = core();
         c.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
         let comp = TradeTick {
-            exchange: Exchange::Polymarket, symbol: "up".into(), price: 0.62,
+            exchange: Exchange::Polymarket, symbol: "up".into(), exchange_trade_id: None, price: 0.62,
             quantity: 20.0, side: Side::Buy, exchange_timestamp_ns: 1_000, local_timestamp_ns: 1_000,
         };
         c.on_trade_tick(&comp);

@@ -1440,7 +1440,13 @@ const NEG_RISK_CTF_COLLATERAL_ADAPTER_V2: &str = "0xadA2005600Dec949baf300f4C612
 /// unknown — resolves to v2. (Pre-2026-06 this was inverted, defaulting
 /// to v1; the cutover is complete so the legacy chain is opt-in only.)
 pub(crate) fn is_v2_from_str(s: &str) -> bool {
-    !matches!(s.trim().to_ascii_lowercase().as_str(), "v1" | "1")
+    if !matches!(s.trim().to_ascii_lowercase().as_str(), "" | "v2" | "2") {
+        log::error!(
+            "[Polymarket] clob_version={:?} is unsupported; using V2 wallet contracts",
+            s,
+        );
+    }
+    true
 }
 
 /// Read `clob_version` from the polymarket exchange section of the
@@ -1472,12 +1478,9 @@ pub(crate) fn read_clob_v2_flag() -> bool {
 ///   v2 std: → (CtfCollateralAdapter, pUSD)
 ///   v2 neg-risk: → (NegRiskCtfCollateralAdapter, pUSD)
 pub(crate) fn ctf_target(is_v2: bool, neg_risk: bool) -> (&'static str, &'static str) {
-    if is_v2 {
-        let target = if neg_risk { NEG_RISK_CTF_COLLATERAL_ADAPTER_V2 } else { CTF_COLLATERAL_ADAPTER_V2 };
-        (target, PUSD_ADDRESS)
-    } else {
-        (CTF_CONTRACT, USDCE_ADDRESS)
-    }
+    let _ = is_v2;
+    let target = if neg_risk { NEG_RISK_CTF_COLLATERAL_ADAPTER_V2 } else { CTF_COLLATERAL_ADAPTER_V2 };
+    (target, PUSD_ADDRESS)
 }
 // redeemPositions(address,bytes32,bytes32,uint256[]) selector
 const REDEEM_SELECTOR: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];

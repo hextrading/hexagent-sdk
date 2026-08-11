@@ -56,12 +56,35 @@ pub struct BinaryOption {
 }
 
 impl BinaryOption {
+    pub fn validate_polymarket_fee_curve(
+        fee_rate: f64,
+        fee_exponent: f64,
+        fee_rate_bps: u32,
+    ) -> Result<(), String> {
+        if !fee_rate.is_finite() || !(0.0..=1.0).contains(&fee_rate) {
+            return Err(format!("fee rate must be finite and in [0, 1], got {fee_rate}"));
+        }
+        if !fee_exponent.is_finite() || fee_exponent <= 0.0 || fee_exponent > 10.0 {
+            return Err(format!("fee exponent must be finite and in (0, 10], got {fee_exponent}"));
+        }
+        if fee_rate_bps > 10_000 {
+            return Err(format!("fee rate bps must be <= 10000, got {fee_rate_bps}"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_fee_curve(&self) -> Result<(), String> {
+        Self::validate_polymarket_fee_curve(self.fee_rate, self.fee_exponent, self.base_fee)
+    }
+
     /// Polymarket taker fee expressed in USDC, ignoring side:
     ///   `usdc_fee = C × fee_rate × (p × (1 − p)) ^ fee_exponent`
     /// where `C` is the trade size in shares and `p` is the trade price.
     /// Makers pay no fee — callers must gate on the TAKER role.
     pub fn taker_fee_usdc(&self, size: f64, price: f64) -> f64 {
-        if self.fee_rate <= 0.0 || size <= 0.0 {
+        if self.validate_fee_curve().is_err()
+            || !size.is_finite() || size <= 0.0 || !price.is_finite()
+        {
             return 0.0;
         }
         let p = price.clamp(0.0, 1.0);

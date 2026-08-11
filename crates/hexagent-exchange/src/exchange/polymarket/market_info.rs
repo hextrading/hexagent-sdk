@@ -9,7 +9,7 @@
 //!     server (we accept several variants — see `market_info_v2.rs`).
 //!
 //! Usage:
-//!   POLYMARKET_V2_API_URL=https://clob-v2.polymarket.com \
+//!   POLYMARKET_V2_API_URL=https://clob.polymarket.com \
 //!   hexbot market <condition_id> [path_template]
 //!
 //! `path_template` is optional; defaults to `/markets/{conditionId}`.
@@ -34,7 +34,7 @@ pub fn run_market() -> Result<()> {
                  Default: '/clob-markets/{{conditionId}}' (v2 SDK endpoint).\n\
              \n\
              Override API URL via POLYMARKET_V2_API_URL (default:\n\
-             https://clob-v2.polymarket.com).\n\
+             https://clob.polymarket.com).\n\
              \n\
              Examples:\n\
              \thexbot market 0xfd029a...8ce1\n\
@@ -71,7 +71,7 @@ pub fn run_market() -> Result<()> {
     let path_template = args.get(1).cloned().unwrap_or_default();
 
     let api_url = std::env::var("POLYMARKET_V2_API_URL")
-        .unwrap_or_else(|_| "https://clob-v2.polymarket.com".to_string());
+        .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
 
     println!("── Request ──────────────────────────────────────");
     println!("API URL : {}", api_url);

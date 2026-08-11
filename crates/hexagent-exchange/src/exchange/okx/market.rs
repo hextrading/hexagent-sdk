@@ -136,6 +136,7 @@ async fn okx_ws_task(
                                     MarketEvent::Trade(TradeTick {
                                         exchange: Exchange::Okx,
                                         symbol: inst_id.clone(),
+                                        exchange_trade_id: None,
                                         price,
                                         quantity,
                                         side,

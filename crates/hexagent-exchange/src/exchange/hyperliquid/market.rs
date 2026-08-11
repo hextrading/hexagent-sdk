@@ -189,6 +189,7 @@ async fn hyperliquid_ws_task(
                                         let event = MarketEvent::Trade(TradeTick {
                                             exchange: Exchange::Hyperliquid,
                                             symbol: coin,
+                                            exchange_trade_id: None,
                                             price,
                                             quantity,
                                             side,

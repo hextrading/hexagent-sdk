@@ -254,6 +254,7 @@ async fn lighter_ws_task(
                                         let event = MarketEvent::Trade(TradeTick {
                                             exchange: Exchange::Lighter,
                                             symbol: symbol.clone(),
+                                            exchange_trade_id: None,
                                             price,
                                             quantity,
                                             side,

@@ -19,7 +19,6 @@ const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 struct ApiPosition {
     /// CLOB token ID (decimal string representing a 256-bit ERC1155 id).
     /// This is the "symbol" we key by internally — one entry per outcome.
-    #[serde(default)]
     asset: String,
     condition_id: String,
     size: f64,
@@ -27,7 +26,6 @@ struct ApiPosition {
     /// Mark-to-market USDC value = size × cur_price. For settled events the
     /// API returns cur_price = 1 (winner) or 0 (loser), so current_value
     /// reflects the redeemable dollar value directly.
-    #[serde(default)]
     current_value: f64,
     outcome: String,
     title: Option<String>,
@@ -59,7 +57,36 @@ pub struct PositionSnapshot {
     pub settled_token_values: HashMap<String, f64>,
 }
 
-fn position_snapshot_from_rows(resp: &[ApiPosition]) -> PositionSnapshot {
+fn validate_position_row(position: &ApiPosition, row: usize) -> Result<()> {
+    if position.asset.trim().is_empty()
+        || position.condition_id.trim().is_empty()
+        || position.outcome.trim().is_empty()
+    {
+        return Err(anyhow!("position row {row} is missing asset, conditionId, or outcome"));
+    }
+    if !position.size.is_finite() || position.size < 0.0 {
+        return Err(anyhow!("position row {row} has invalid size {}", position.size));
+    }
+    if !position.avg_price.is_finite() || !(0.0..=1.0).contains(&position.avg_price) {
+        return Err(anyhow!("position row {row} has invalid avgPrice {}", position.avg_price));
+    }
+    if !position.current_value.is_finite()
+        || position.current_value < 0.0
+        || position.current_value > position.size + 1e-8
+    {
+        return Err(anyhow!(
+            "position row {row} has invalid currentValue {} for size {}",
+            position.current_value,
+            position.size,
+        ));
+    }
+    Ok(())
+}
+
+fn position_snapshot_from_rows(resp: &[ApiPosition]) -> Result<PositionSnapshot> {
+    for (row, position) in resp.iter().enumerate() {
+        validate_position_row(position, row)?;
+    }
     let resolved_conditions: HashSet<&str> = resp.iter()
         .filter(|position| position.redeemable)
         .map(|position| position.condition_id.as_str())
@@ -68,16 +95,13 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> PositionSnapshot {
     let mut settled_token_values = HashMap::new();
     for p in resp {
         if p.size <= 0.0 { continue; }
-        if p.asset.is_empty() {
-            log::warn!("[Polymarket] Position record missing 'asset' field — skipped (cid={} outcome={})",
-                p.condition_id, p.outcome);
-            continue;
-        }
-        positions.insert(p.asset.clone(), Position {
+        if positions.insert(p.asset.clone(), Position {
             quantity: p.size,
             avg_price: p.avg_price,
             current_value: p.current_value,
-        });
+        }).is_some() {
+            return Err(anyhow!("position snapshot contains duplicate asset {}", p.asset));
+        }
         if resolved_conditions.contains(p.condition_id.as_str()) {
             let unit_value = p.current_value / p.size;
             let settled_value = if unit_value.is_finite() && unit_value.abs() <= 1e-8 {
@@ -92,7 +116,7 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> PositionSnapshot {
             }
         }
     }
-    PositionSnapshot { positions, settled_token_values }
+    Ok(PositionSnapshot { positions, settled_token_values })
 }
 
 fn authoritative_resolution(
@@ -246,7 +270,7 @@ pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot>
     let authoritative = crate::async_rt::block_on_runtime(
         fetch_authoritative_resolutions(conditions),
     );
-    let mut snapshot = position_snapshot_from_rows(&resp);
+    let mut snapshot = position_snapshot_from_rows(&resp)?;
     snapshot.settled_token_values.extend(authoritative);
 
     info!(
@@ -269,65 +293,18 @@ pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>
     Ok(fetch_position_snapshot(wallet_address)?.positions)
 }
 
-/// Raw balance record from Polymarket Data API.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiBalance {
-    balance: f64,
-}
-
-/// USDC.e on Polygon — v1 CLOB collateral (6 decimals).
-pub const USDC_E_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 /// pUSD on Polygon — v2 CLOB collateral (6 decimals).
 pub const PUSD_ADDRESS:   &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 
-/// Pick the active collateral token address for the current CLOB
-/// version. v1 trades against USDC.e, v2 against pUSD. Caller passes
-/// the flag derived from `ExchangeConfig.clob_version`
-/// (`ClobVersion::V2 == is_v2`).
-pub fn active_collateral_token(is_v2: bool) -> &'static str {
-    if is_v2 { PUSD_ADDRESS } else { USDC_E_ADDRESS }
-}
-
-/// Fetch balance AND positions concurrently via the async runtime.
-///
-/// The balance read picks **USDC.e** for v1 and **pUSD** for v2 based
-/// on `is_v2`. Callers with direct access to `ClobVersion` should
-/// forward `version == V2`; CLI / tooling callers without a config
-/// context can use the legacy bare wrappers below which default to
-/// v1 (USDC.e).
-///
-/// Nearly halves the critical path vs calling the two reads
-/// sequentially — the on-chain `eth_call` and the data-api `positions`
-/// request run on the same tokio runtime and pipeline their TLS+request
-/// time. Either side failing yields defaults (0.0 / empty map) rather
-/// than propagating.
-pub fn fetch_balance_and_positions(
-    wallet_address: &str,
-) -> (f64, HashMap<String, Position>) {
-    // Default v1 (USDC.e). Kept for backward compatibility with CLI
-    // callers that don't have a CLOB-version context. `strategy.rs`
-    // and `live_position.rs` should use the `_versioned` variant.
-    fetch_balance_and_positions_versioned(wallet_address, /*is_v2=*/ false)
-}
-
-/// Explicit-version variant. Picks USDC.e or pUSD based on `is_v2`.
-pub fn fetch_balance_and_positions_versioned(
-    wallet_address: &str,
-    is_v2: bool,
-) -> (f64, HashMap<String, Position>) {
-    try_fetch_balance_and_positions_versioned(wallet_address, is_v2).unwrap_or_else(|error| {
-        log::warn!(
-            "[Polymarket] complete balance/positions fetch failed — using empty fallback: {}",
-            error,
-        );
-        (0.0, HashMap::new())
-    })
+/// CLOB V2 collateral. The bool remains in the compatibility-shaped strict
+/// fetch API but can no longer select legacy USDC.e.
+pub fn active_collateral_token(_is_v2: bool) -> &'static str {
+    PUSD_ADDRESS
 }
 
 /// Strict account snapshot used by live shared-account reconciliation. Unlike
-/// the compatibility wrapper above, failure of either the collateral balance
-/// or the account-wide positions request fails the entire snapshot. Callers
+/// the former fallback API, failure of either the collateral balance or the
+/// account-wide positions request fails the entire snapshot. Callers
 /// must retry rather than interpreting a transport failure as a real zero.
 pub fn try_fetch_balance_and_positions_versioned(
     wallet_address: &str,
@@ -379,18 +356,12 @@ pub fn try_fetch_balance_positions_and_settlements_versioned(
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
 
-/// Legacy bare balance fetch — returns USDC.e. Kept for CLI callers
-/// (`wallet.rs` et al.) that don't track CLOB version. Strategy and
-/// live-position paths should use `fetch_balance_for_token` directly
-/// with `active_collateral_token(is_v2)`.
+/// Bare balance fetch for the production CLOB V2 pUSD collateral.
 pub fn fetch_balance(wallet_address: &str) -> Result<f64> {
-    fetch_balance_for_token(wallet_address, USDC_E_ADDRESS)
+    fetch_balance_for_token(wallet_address, PUSD_ADDRESS)
 }
 
-/// Fetch an ERC-20 balance from Polygon via `eth_call balanceOf`,
-/// falling back to Polymarket's `/balance` data-api when the on-chain
-/// read fails (the API only knows USDC.e — fallback is skipped for
-/// non-USDC.e tokens).
+/// Fetch an ERC-20 balance from Polygon via strict `eth_call balanceOf`.
 pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64> {
     info!("[Polymarket] Fetching balance for {} (token={})", wallet_address, token);
 
@@ -411,27 +382,8 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
         return Ok(balance);
     }
 
-    // Fallback data-api: only wired for USDC.e (v1). pUSD / other
-    // tokens skip straight to the error.
-    if token.eq_ignore_ascii_case(USDC_E_ADDRESS) {
-        let url = format!("{}/balance?user={}", DATA_API_BASE, wallet_address);
-        let client = crate::async_rt::http_client();
-        let balance = crate::async_rt::block_on_runtime(async move {
-            let r = client.get(&url).send().await
-                .map_err(|e| anyhow::anyhow!("fetch_balance: {}", e))?;
-            if !r.status().is_success() {
-                return Err(anyhow::anyhow!("fetch_balance: status {}", r.status()));
-            }
-            let bal: ApiBalance = r.json().await
-                .map_err(|e| anyhow::anyhow!("fetch_balance parse: {}", e))?;
-            validate_balance(bal.balance)
-        })?;
-        info!("[Polymarket] Balance: {:.4} (data-api, USDC.e)", balance);
-        return Ok(balance);
-    }
-
     Err(anyhow::anyhow!(
-        "eth_call balanceOf failed for token {} and no data-api fallback for non-USDC.e tokens",
+        "eth_call balanceOf failed for CLOB V2 collateral token {}",
         token,
     ))
 }
@@ -493,7 +445,7 @@ mod tests {
             row("winner", "resolved", 3.0, 3.0, true),
             row("loser", "resolved", 4.0, 0.0, false),
             row("active", "active", 2.0, 1.0, false),
-        ]);
+        ]).unwrap();
         assert_eq!(snapshot.settled_token_values.get("winner"), Some(&1.0));
         assert_eq!(snapshot.settled_token_values.get("loser"), Some(&0.0));
         assert!(!snapshot.settled_token_values.contains_key("active"));
@@ -503,7 +455,7 @@ mod tests {
     fn redeemable_metadata_does_not_authorize_non_binary_unit_values() {
         let snapshot = position_snapshot_from_rows(&[
             row("ambiguous", "resolved", 2.0, 1.0, true),
-        ]);
+        ]).unwrap();
         assert!(snapshot.settled_token_values.is_empty());
         assert_eq!(snapshot.positions["ambiguous"].quantity, 2.0);
     }
@@ -547,6 +499,20 @@ mod tests {
         assert!(parse_erc20_balance_result("not-hex").is_err());
         assert!(validate_balance(f64::NAN).is_err());
         assert!(validate_balance(-1.0).is_err());
+    }
+
+    #[test]
+    fn one_abnormal_position_rejects_the_entire_snapshot() {
+        let mut malformed = row("bad", "active", 2.0, 1.0, false);
+        malformed.current_value = f64::NAN;
+        assert!(position_snapshot_from_rows(&[
+            row("good", "active", 1.0, 0.5, false),
+            malformed,
+        ]).is_err());
+        assert!(position_snapshot_from_rows(&[
+            row("duplicate", "a", 1.0, 0.5, false),
+            row("duplicate", "b", 1.0, 0.5, false),
+        ]).is_err());
     }
 
     #[test]

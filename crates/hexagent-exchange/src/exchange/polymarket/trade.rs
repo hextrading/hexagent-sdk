@@ -23,7 +23,6 @@ use super::user_feed::parse_user_event;
 /// every signing / POST / auth path can dispatch at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClobVersion {
-    V1,
     V2,
 }
 
@@ -36,14 +35,16 @@ impl ClobVersion {
     /// (live/record), so the default flip cannot change backtests — the
     /// strategy reads the raw `clob_version` string directly, which stays
     /// "" (⇒ v1 behaviour) for any backtest config that doesn't set it.
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "v1" | "1" => ClobVersion::V1,
-            _ => ClobVersion::V2,
+            "" | "v2" | "2" => Ok(ClobVersion::V2),
+            value => Err(anyhow!(
+                "unsupported Polymarket clob_version={value:?}; production supports v2 only",
+            )),
         }
     }
     pub fn as_str(&self) -> &'static str {
-        match self { ClobVersion::V1 => "v1", ClobVersion::V2 => "v2" }
+        "v2"
     }
 }
 
@@ -1056,7 +1057,6 @@ async fn execute_http_on(
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub(crate) enum PolyOrderBody {
-    V1(WireBodyV1),
     V2(WireBodyV2),
 }
 
@@ -1065,38 +1065,6 @@ pub(crate) enum PolyOrderBody {
 struct CancelBody<'a> {
     #[serde(rename = "orderID")]
     order_id: &'a str,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct WireBodyV1 {
-    pub owner: String,
-    #[serde(rename = "orderType")]
-    pub order_type: &'static str,
-    #[serde(rename = "postOnly")]
-    pub post_only: bool,
-    pub order: WireOrderV1,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct WireOrderV1 {
-    pub salt: u64,
-    pub maker: String,
-    pub signer: String,
-    pub taker: String,
-    #[serde(rename = "tokenId")]
-    pub token_id: String,
-    #[serde(rename = "makerAmount")]
-    pub maker_amount: String,
-    #[serde(rename = "takerAmount")]
-    pub taker_amount: String,
-    pub expiration: String,
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: String,
-    pub side: &'static str,
-    pub signature: String,
-    #[serde(rename = "signatureType")]
-    pub signature_type: u8,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2179,7 +2147,7 @@ impl PolymarketTrade {
         Self::new_with_pool(
             api_key, api_secret, passphrase, private_key,
             neg_risk, rate_limit_per_second, sig_type,
-            ClobVersion::V1,
+            ClobVersion::V2,
             "",
             "",
             true,
@@ -2215,11 +2183,9 @@ impl PolymarketTrade {
         // strings) and keeps the sign-hot-path branch a simple Option
         // check rather than constructing per-call. For POLY_1271 the
         // deposit-wallet `funder` is the order maker/signer.
-        let signer_v2 = if clob_version == ClobVersion::V2 {
-            Some(super::signer_v2::OrderSignerV2::new(
-                private_key, neg_risk, sig_type, builder_code,
-            )?.with_funder(funder))
-        } else { None };
+        let signer_v2 = Some(super::signer_v2::OrderSignerV2::new(
+            private_key, neg_risk, sig_type, builder_code,
+        )?.with_funder(funder));
 
         // POLY_ADDRESS must be the signer (EOA) address, matching the API key
         let auth = PolyAuth::new(api_key, api_secret, passphrase, &signer.signer_address)?;
@@ -3261,10 +3227,7 @@ impl PolymarketTrade {
     ) -> Result<(String /* order_hash */, PolyOrderBody)> {
         let price = validate_order_for_signing(order)?;
 
-        match self.shared.clob_version {
-            ClobVersion::V1 => self.sign_and_build_body_v1(order, price),
-            ClobVersion::V2 => self.sign_and_build_body_v2(order, price),
-        }
+        self.sign_and_build_body_v2(order, price)
     }
 
     /// Translate `OrderRequest::order_type` to Polymarket's wire string.
@@ -3280,50 +3243,6 @@ impl PolymarketTrade {
             crate::types::OrderType::Fok => "FOK",
             _ => "GTC",
         }
-    }
-
-    fn sign_and_build_body_v1(
-        &self,
-        order: &OrderRequest,
-        price: f64,
-    ) -> Result<(String, PolyOrderBody)> {
-        let signed = self.shared.signer.build_signed_order(
-            &order.symbol,
-            price,
-            order.quantity,
-            order.side,
-            order.fee_rate_bps,
-        )?;
-
-        let salt_u64: u64 = signed.order.salt.parse::<u128>()
-            .map(|v| v as u64).unwrap_or(0);
-
-        // Typed wire body — serialized in ONE pass at dispatch
-        // (`serde_json::to_string`). The previous `json!{…}` built a
-        // full `Value` tree that `.to_string()` then re-walked. String
-        // fields move out of `signed.order` — no clones.
-        let o = signed.order;
-        let body = PolyOrderBody::V1(WireBodyV1 {
-            owner: self.owner.clone(),
-            order_type: Self::poly_order_type_str(order.order_type),
-            post_only: order.post_only,
-            order: WireOrderV1 {
-                salt: salt_u64,
-                maker: o.maker,
-                signer: o.signer,
-                taker: o.taker,
-                token_id: o.token_id,
-                maker_amount: o.maker_amount,
-                taker_amount: o.taker_amount,
-                expiration: o.expiration,
-                nonce: o.nonce,
-                fee_rate_bps: o.fee_rate_bps,
-                side: if order.side == Side::Buy { "BUY" } else { "SELL" },
-                signature: signed.signature,
-                signature_type: o.signature_type,
-            },
-        });
-        Ok((signed.order_hash, body))
     }
 
     fn sign_and_build_body_v2(

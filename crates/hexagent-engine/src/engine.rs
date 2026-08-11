@@ -5486,8 +5486,19 @@ impl Engine {
             let neg_risk = false;
             let sig_type =
                 crate::exchange::polymarket::signer::parse_signature_type(&creds.signature_type);
-            let clob_version =
-                crate::exchange::polymarket::trade::ClobVersion::parse(&poly_cfg.clob_version);
+            let clob_version = match
+                crate::exchange::polymarket::trade::ClobVersion::parse(&poly_cfg.clob_version)
+            {
+                Ok(version) => version,
+                Err(error) => {
+                    log::error!(
+                        "[Engine] refusing Polymarket account {}: {}",
+                        account_id,
+                        error,
+                    );
+                    continue;
+                }
+            };
             let ledger_path = if poly_cfg.account_ledger_dir.trim().is_empty() {
                 None
             } else {
