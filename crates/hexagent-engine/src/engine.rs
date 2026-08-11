@@ -6700,6 +6700,85 @@ fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
     }
 }
 
+/// Build lossless admission feedback for a reconcile signal that never
+/// acquired an HTTP connection. Each coid/trade-id is returned once; trade
+/// backfills use a synthetic instance-prefixed coid for strategy routing.
+fn reconcile_deferred_updates(
+    instance_id: &str,
+    pending_places: &[(String, String, Side, f64, Option<String>)],
+    pending_cancels: &[(String, String)],
+    pending_trade_ids: &[String],
+) -> Vec<OrderUpdate> {
+    let mut updates = Vec::new();
+    let mut coids = HashSet::new();
+    for (coid, symbol, side, price, _) in pending_places {
+        if !coids.insert(coid.clone()) { continue; }
+        updates.push(OrderUpdate {
+            client_order_id: coid.clone(),
+            exchange: Exchange::Polymarket,
+            symbol: symbol.clone(),
+            side: *side,
+            exchange_order_id: None,
+            status: OrderStatus::ExecutorRejected,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: *price,
+            timestamp_ns: now_ns(),
+            trade_id: None,
+            order_audit: None,
+            error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
+        });
+    }
+    for (coid, order_id) in pending_cancels {
+        if !coids.insert(coid.clone()) { continue; }
+        updates.push(OrderUpdate {
+            client_order_id: coid.clone(),
+            exchange: Exchange::Polymarket,
+            symbol: String::new(),
+            side: Side::Buy,
+            exchange_order_id: (!order_id.is_empty()).then(|| order_id.clone()),
+            status: OrderStatus::ExecutorRejected,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns(),
+            trade_id: None,
+            order_audit: None,
+            error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
+        });
+    }
+    let synthetic_coid = if instance_id.is_empty() {
+        "reconcile_deferred".to_string()
+    } else {
+        // Keep the suffix dash-free: owner_from_coid() splits at the final
+        // dash, preserving instance IDs that themselves contain dashes.
+        format!("{instance_id}-reconcile_deferred")
+    };
+    let mut trade_ids = HashSet::new();
+    for trade_id in pending_trade_ids {
+        if !trade_ids.insert(trade_id.clone()) { continue; }
+        updates.push(OrderUpdate {
+            client_order_id: synthetic_coid.clone(),
+            exchange: Exchange::Polymarket,
+            symbol: String::new(),
+            side: Side::Buy,
+            exchange_order_id: None,
+            status: OrderStatus::ExecutorRejected,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns(),
+            trade_id: Some(trade_id.clone()),
+            order_audit: None,
+            error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
+        });
+    }
+    updates
+}
+
 /// Fire-and-track + admission dispatch for the hot single-leg Polymarket
 /// paths (place / cancel / 1×1 replace). Maps instance→account, acquires an
 /// account-pool permit, fires on the reserved connection WITHOUT blocking, and hands the
@@ -6881,9 +6960,9 @@ fn fire_or_execute(
         // Reconcile: concurrency gate on the dedicated per-account Reconcile
         // pool (NOT full fire-track). The permit's exact client is threaded
         // through every order GET, so this is both admission control and a real
-        // connection reservation. Skip (drop) when none free — the strategy's
-        // orphan reconciler re-emits on its own throttle, so a dropped
-        // reconcile simply retries next tick. Gating on the Reconcile pool
+        // connection reservation. When none are free, return explicit
+        // admission feedback so the strategy rolls back the in-flight/backoff
+        // state it committed before emitting. Gating on the Reconcile pool
         // (disjoint from Fast/Cancel) means it never steals hot-path capacity.
         Signal::ReconcilePolymarket {
             pending_places,
@@ -6892,7 +6971,13 @@ fn fire_or_execute(
             ..
         } if !iid.is_empty() => {
             match try_acquire(&iid, Role::Reconcile) {
-                None => {} // shed; reconciler re-emits
+                None => {
+                    for update in reconcile_deferred_updates(
+                        &iid, &pending_places, &pending_cancels, &pending_trade_ids,
+                    ) {
+                        if utx.send(update).is_err() { break; }
+                    }
+                }
                 Some(permit) => {
                     let updates = worker.poly_route_mut(&iid).reconcile_orphans_on(
                         &permit,
@@ -8400,6 +8485,36 @@ mod market_router_tests {
         assert_eq!(owner_from_coid("1782840607342", &m), None);
         // Unknown instance → broadcast.
         assert_eq!(owner_from_coid("eth09-7", &m), None);
+    }
+
+    #[test]
+    fn reconcile_pool_saturation_returns_routeable_deduplicated_feedback() {
+        let places = vec![
+            ("zhu-03-place".to_string(), "UP".to_string(), Side::Buy, 0.41, None),
+            ("zhu-03-place".to_string(), "UP".to_string(), Side::Buy, 0.41, None),
+        ];
+        let cancels = vec![
+            ("zhu-03-cancel".to_string(), "oid-1".to_string()),
+            ("zhu-03-cancel".to_string(), "oid-1".to_string()),
+        ];
+        let trade_ids = vec!["trade-1".to_string(), "trade-1".to_string()];
+
+        let updates = reconcile_deferred_updates("zhu-03", &places, &cancels, &trade_ids);
+        assert_eq!(updates.len(), 3);
+        assert!(updates.iter().all(|update| {
+            update.status == OrderStatus::ExecutorRejected
+                && update.error.as_deref() == Some(ORPHAN_RECONCILE_DEFERRED)
+        }));
+
+        let mut owners = HashMap::new();
+        owners.insert("zhu-03".to_string(), 7usize);
+        assert!(updates.iter().all(|update| {
+            owner_from_coid(&update.client_order_id, &owners) == Some(7)
+        }));
+        assert_eq!(
+            updates.iter().filter_map(|update| update.trade_id.as_deref()).collect::<Vec<_>>(),
+            vec!["trade-1"]
+        );
     }
 
     #[test]
