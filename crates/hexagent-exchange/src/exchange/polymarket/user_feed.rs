@@ -506,9 +506,11 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
             && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
         || (ownership.status == OrderStatus::Cancelled
             && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
+        || (ownership.status == OrderStatus::PartiallyFilled
+            && status == OrderStatus::Accepted)
     {
         debug!(
-            "[PolyUserFeed] stale order lifecycle ignored after terminal status: coid={} current={:?} incoming={:?}",
+            "[PolyUserFeed] stale order lifecycle regression ignored: coid={} current={:?} incoming={:?}",
             coid, ownership.status, status,
         );
         return Ok(Vec::new());
@@ -2452,6 +2454,28 @@ mod tests {
         assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
             "whole-order Filled holds the lock until trade rows arrive");
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+    }
+
+    #[test]
+    fn late_placement_lifecycle_cannot_regress_partial_fill() {
+        let shared = owned_taker_shared(0.5);
+        let partial = serde_json::json!({
+            "event_type": "order", "type": "UPDATE", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "4",
+        });
+        assert_eq!(parse_user_event(&partial, &shared)[0].status, OrderStatus::PartiallyFilled);
+
+        let placement = serde_json::json!({
+            "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "0",
+        });
+        assert!(parse_user_event(&placement, &shared).is_empty());
+        assert_eq!(
+            shared.account_state.order("owner-1").unwrap().status,
+            OrderStatus::PartiallyFilled,
+        );
     }
 
     #[test]

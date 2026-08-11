@@ -5110,6 +5110,13 @@ impl Engine {
                             }
                             match feed.next_event() {
                                 Ok(Some(event)) => {
+                                    if !event.has_finite_market_values() {
+                                        warn!(
+                                            "[feed_health] {} rejected market event with NaN/Infinity before dispatch",
+                                            cfg.name,
+                                        );
+                                        continue;
+                                    }
                                     last_data_at = std::time::Instant::now();
                                     if cfg.name == "polymarket" {
                                         if let Some(state) =

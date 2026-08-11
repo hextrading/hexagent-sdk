@@ -190,6 +190,8 @@ fn placement_response_status(
         "MATCHED" | "MATCHED_NOT_BROADCASTED"
     ) {
         OrderStatus::Filled
+    } else if effective_account_status == Some(OrderStatus::PartiallyFilled) {
+        OrderStatus::PartiallyFilled
     } else {
         OrderStatus::Accepted
     }
@@ -5802,7 +5804,7 @@ mod tests {
     }
 
     #[test]
-    fn late_http_ack_response_cannot_regress_filled_status() {
+    fn late_http_ack_response_cannot_regress_matched_status() {
         assert_eq!(
             placement_response_status(true, "live", Some(OrderStatus::Filled)),
             OrderStatus::Filled,
@@ -5813,6 +5815,14 @@ mod tests {
         );
         assert_eq!(
             placement_response_status(true, "matched", Some(OrderStatus::Accepted)),
+            OrderStatus::Filled,
+        );
+        assert_eq!(
+            placement_response_status(true, "live", Some(OrderStatus::PartiallyFilled)),
+            OrderStatus::PartiallyFilled,
+        );
+        assert_eq!(
+            placement_response_status(true, "matched", Some(OrderStatus::PartiallyFilled)),
             OrderStatus::Filled,
         );
     }

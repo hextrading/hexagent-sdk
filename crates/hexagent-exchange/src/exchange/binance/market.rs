@@ -366,33 +366,34 @@ impl BinanceMarket {
     }
 }
 
+fn parse_finite_text(value: &serde_json::Value) -> Option<f64> {
+    let parsed = value.as_str()?.parse::<f64>().ok()?;
+    parsed.is_finite().then_some(parsed)
+}
+
 /// Parse Diff. Depth Stream ("e":"depthUpdate") — has "s", "b", "a", "E" fields.
 fn parse_depth_update(data: &serde_json::Value) -> Option<MarketEvent> {
     let symbol = data.get("s")?.as_str()?;
     let exchange_ts = data.get("E")?.as_u64()? * 1_000_000;
 
-    let parse_levels = |key: &str| -> Vec<PriceLevel> {
-        data.get(key)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|level| {
-                        let a = level.as_array()?;
-                        Some(PriceLevel {
-                            price: a.first()?.as_str()?.parse().ok()?,
-                            quantity: a.get(1)?.as_str()?.parse().ok()?,
-                        })
-                    })
-                    .collect()
+    let parse_levels = |key: &str| -> Option<Vec<PriceLevel>> {
+        let Some(levels) = data.get(key).and_then(|v| v.as_array()) else {
+            return Some(Vec::new());
+        };
+        levels.iter().map(|level| {
+            let values = level.as_array()?;
+            Some(PriceLevel {
+                price: parse_finite_text(values.first()?)?,
+                quantity: parse_finite_text(values.get(1)?)?,
             })
-            .unwrap_or_default()
+        }).collect()
     };
 
     Some(MarketEvent::OrderBook(OrderBookSnapshot {
         exchange: Exchange::Binance,
         symbol: symbol.to_uppercase(),
-        bids: parse_levels("b"),
-        asks: parse_levels("a"),
+        bids: parse_levels("b")?,
+        asks: parse_levels("a")?,
         exchange_timestamp_ns: exchange_ts,
         local_timestamp_ns: now_ns(),
     }))
@@ -404,28 +405,24 @@ fn parse_partial_depth(data: &serde_json::Value, symbol_hint: &str) -> Option<Ma
     // Partial depth has "lastUpdateId", "bids", "asks" at top level
     data.get("lastUpdateId")?;
 
-    let parse_levels = |key: &str| -> Vec<PriceLevel> {
-        data.get(key)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|level| {
-                        let a = level.as_array()?;
-                        Some(PriceLevel {
-                            price: a.first()?.as_str()?.parse().ok()?,
-                            quantity: a.get(1)?.as_str()?.parse().ok()?,
-                        })
-                    })
-                    .collect()
+    let parse_levels = |key: &str| -> Option<Vec<PriceLevel>> {
+        let Some(levels) = data.get(key).and_then(|v| v.as_array()) else {
+            return Some(Vec::new());
+        };
+        levels.iter().map(|level| {
+            let values = level.as_array()?;
+            Some(PriceLevel {
+                price: parse_finite_text(values.first()?)?,
+                quantity: parse_finite_text(values.get(1)?)?,
             })
-            .unwrap_or_default()
+        }).collect()
     };
 
     Some(MarketEvent::OrderBook(OrderBookSnapshot {
         exchange: Exchange::Binance,
         symbol: symbol_hint.to_uppercase(),
-        bids: parse_levels("bids"),
-        asks: parse_levels("asks"),
+        bids: parse_levels("bids")?,
+        asks: parse_levels("asks")?,
         exchange_timestamp_ns: now_ns(), // no exchange timestamp in partial depth
         local_timestamp_ns: now_ns(),
     }))
@@ -433,8 +430,8 @@ fn parse_partial_depth(data: &serde_json::Value, symbol_hint: &str) -> Option<Ma
 
 fn parse_trade_message(data: &serde_json::Value) -> Option<MarketEvent> {
     let symbol = data.get("s")?.as_str()?;
-    let price: f64 = data.get("p")?.as_str()?.parse().ok()?;
-    let quantity: f64 = data.get("q")?.as_str()?.parse().ok()?;
+    let price = parse_finite_text(data.get("p")?)?;
+    let quantity = parse_finite_text(data.get("q")?)?;
     let is_buyer_maker = data.get("m")?.as_bool()?;
     let exchange_ts = data.get("E")?.as_u64()? * 1_000_000;
 
@@ -451,10 +448,10 @@ fn parse_trade_message(data: &serde_json::Value) -> Option<MarketEvent> {
 
 fn parse_book_ticker_message(data: &serde_json::Value) -> Option<MarketEvent> {
     let symbol = data.get("s")?.as_str()?;
-    let bid_price: f64 = data.get("b")?.as_str()?.parse().ok()?;
-    let bid_qty: f64 = data.get("B")?.as_str()?.parse().ok()?;
-    let ask_price: f64 = data.get("a")?.as_str()?.parse().ok()?;
-    let ask_qty: f64 = data.get("A")?.as_str()?.parse().ok()?;
+    let bid_price = parse_finite_text(data.get("b")?)?;
+    let bid_qty = parse_finite_text(data.get("B")?)?;
+    let ask_price = parse_finite_text(data.get("a")?)?;
+    let ask_qty = parse_finite_text(data.get("A")?)?;
     // bookTicker uses "u" (updateId) rather than "E" (event time) in some streams;
     // fall back to local time if "E" is absent.
     let exchange_ts = data
@@ -487,14 +484,14 @@ fn parse_kline_message(data: &serde_json::Value) -> Option<MarketEvent> {
             interval: k.get("i")?.as_str()?.to_string(),
             open_time_ns: k.get("t")?.as_u64()? * 1_000_000,
             close_time_ns: k.get("T")?.as_u64()? * 1_000_000,
-            open: k.get("o")?.as_str()?.parse().ok()?,
-            high: k.get("h")?.as_str()?.parse().ok()?,
-            low: k.get("l")?.as_str()?.parse().ok()?,
-            close: k.get("c")?.as_str()?.parse().ok()?,
-            volume: k.get("v")?.as_str()?.parse().ok()?,
+            open: parse_finite_text(k.get("o")?)?,
+            high: parse_finite_text(k.get("h")?)?,
+            low: parse_finite_text(k.get("l")?)?,
+            close: parse_finite_text(k.get("c")?)?,
+            volume: parse_finite_text(k.get("v")?)?,
             // Binance ws kline: q=quote_volume, V=taker_buy_base.
-            quote_volume: k.get("q").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0),
-            taker_buy_base: k.get("V").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            quote_volume: k.get("q").map_or(Some(0.0), parse_finite_text)?,
+            taker_buy_base: k.get("V").map_or(Some(0.0), parse_finite_text)?,
             is_closed: k.get("x")?.as_bool()?,
             exchange_timestamp_ns: exchange_ts,
             local_timestamp_ns: now_ns(),
@@ -510,7 +507,7 @@ fn parse_kline_message(data: &serde_json::Value) -> Option<MarketEvent> {
 /// Fields: "e"="assetIndexUpdate", "E"=timestamp_ms, "s"=symbol, "i"=index_price
 fn parse_asset_index(data: &serde_json::Value) -> Option<MarketEvent> {
     let symbol_raw = data.get("s")?.as_str()?;
-    let index_price: f64 = data.get("i")?.as_str()?.parse().ok()?;
+    let index_price = parse_finite_text(data.get("i")?)?;
     let exchange_ts = data.get("E")?.as_u64()? * 1_000_000; // ms → ns
 
     // Convert symbol: "USDTUSD" → "usdt/usd"
@@ -1116,6 +1113,22 @@ mod tests {
     //! JSON and the WS task used a single shared `symbol_hint`) is the
     //! reference scenario that both fixes target.
     use super::*;
+
+    #[test]
+    fn public_string_numbers_reject_nan_and_infinity() {
+        for invalid in ["NaN", "inf", "-inf", "Infinity"] {
+            assert!(parse_finite_text(&serde_json::json!(invalid)).is_none());
+            let trade = serde_json::json!({
+                "s": "BTCUSDT", "p": invalid, "q": "1", "m": false, "E": 1,
+            });
+            assert!(parse_trade_message(&trade).is_none());
+            let depth = serde_json::json!({
+                "s": "BTCUSDT", "E": 1,
+                "b": [[invalid, "1"]], "a": [["101", "1"]],
+            });
+            assert!(parse_depth_update(&depth).is_none());
+        }
+    }
 
     /// Standard Binance stream names: `<symbol_lower>@<stream_type>`,
     /// possibly with multiple `@` (e.g. `@depth10@100ms`).
