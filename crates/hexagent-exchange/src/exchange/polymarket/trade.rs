@@ -259,7 +259,9 @@ fn placement_response_status(
     effective_account_status: Option<OrderStatus>,
 ) -> OrderStatus {
     if !success {
-        return OrderStatus::Rejected;
+        // The signed hash reached the exchange and can still receive a late
+        // match; retain it as a placement orphan until audit proves terminal.
+        return OrderStatus::NewOrderTimeout;
     }
     if let Some(status @ (OrderStatus::Filled | OrderStatus::Failed)) = effective_account_status {
         return status;
@@ -385,6 +387,12 @@ impl HttpErr {
     pub(crate) fn is_submit_unknown_state(&self) -> bool {
         self.is_unknown_state()
             || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
+    }
+
+    /// A signed request received an HTTP response. Even a 4xx response cannot
+    /// prove that no late exchange-side match exists for its deterministic hash.
+    fn reached_server(&self) -> bool {
+        matches!(self, HttpErr::Status(_, _))
     }
 }
 
@@ -3424,6 +3432,16 @@ impl PolymarketTrade {
         }
     }
 
+    fn make_exchange_rejection_pending(
+        order: &OrderRequest,
+        order_hash: Option<&str>,
+        msg: &str,
+    ) -> OrderUpdate {
+        let mut update = Self::make_timeout_place(order, order_hash);
+        update.error = (!msg.is_empty()).then(|| msg.to_string());
+        update
+    }
+
     /// Make a timeout OrderUpdate for a cancel whose HTTP call timed out.
     fn make_timeout_cancel(coid: &str, symbol: &str, side: Side, order_id: Option<String>) -> OrderUpdate {
         Self::make_orphan_cancel(coid, symbol, side, order_id, OrderStatus::CancelOrderTimeout)
@@ -3619,14 +3637,42 @@ impl PolymarketTrade {
                         // so a future unrelated 404 starts fresh.
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.lock().unwrap().remove(coid);
+                        let Some(ownership) = self.shared.account_state.order(coid) else {
+                            warn!(
+                                "[PolymarketTrade] Reconcile placement coid={} orderID={} LIVE without durable ownership — keeping orphan",
+                                coid, oid,
+                            );
+                            continue;
+                        };
+                        let (effective_size_matched, has_valid_size_matched) =
+                            effective_audited_match(
+                                order_audit.as_ref().and_then(|audit| audit.size_matched.as_deref()),
+                                ownership.quantity,
+                                ownership.filled_quantity,
+                            );
+                        if let Some(audit) = order_audit.as_ref() {
+                            if !audit.associate_trades.is_empty() {
+                                updates.extend(self.reconcile_orphans_with_permit(
+                                    permit, &[], &[], &audit.associate_trades,
+                                ));
+                            }
+                        }
+                        if !has_valid_size_matched {
+                            warn!(
+                                "[PolymarketTrade] Reconcile placement coid={} LIVE omitted/invalid size_matched; preserving local filled_quantity={}",
+                                coid, ownership.filled_quantity,
+                            );
+                        }
                         self.shared.register_order_id(coid, oid, symbol);
-                        self.shared.open_orders.lock().unwrap().insert(
-                            coid.clone(),
-                            TrackedOrder { symbol: symbol.clone(), side: *side, instance_id: self.instance_id.clone() },
-                        );
+                        let candidate = if effective_size_matched > 1e-9 {
+                            OrderStatus::PartiallyFilled
+                        } else { OrderStatus::Accepted };
+                        let status = self.shared.mark_order_live(
+                            coid, symbol, *side, &ownership.instance_id, candidate,
+                        ).unwrap_or(candidate);
                         info!(
-                            "[PolymarketTrade] Reconciled placement coid={} orderID={} → LIVE",
-                            coid, oid,
+                            "[PolymarketTrade] Reconciled placement coid={} orderID={} → LIVE status={:?} size_matched={}",
+                            coid, oid, status, effective_size_matched,
                         );
                         updates.push(OrderUpdate {
                             client_order_id: coid.clone(),
@@ -3634,11 +3680,11 @@ impl PolymarketTrade {
                             symbol: symbol.clone(),
                             side: *side,
                             exchange_order_id: Some(oid.to_string()),
-                            status: OrderStatus::Accepted,
+                            status,
                             liquidity: None,
                             filled_quantity: 0.0,
-                            remaining_quantity: 0.0,
-                            avg_fill_price: *price,
+                            remaining_quantity: (ownership.quantity - effective_size_matched).max(0.0),
+                            avg_fill_price: ownership.price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
                             order_audit: order_audit.clone(),
@@ -4290,18 +4336,23 @@ impl PolymarketTrade {
                 return Self::make_timeout_place(order, Some(local_oid));
             }
             Err(e) => {
-                // Explicit HTTP 4xx or a non-transport local/parse error.
-                // Status-less request/body I/O failures cannot reach this
-                // branch: `is_submit_unknown_state` routed them above.
-                // Clear local active tracking before emitting Rejected.
+                let reached_server = e.reached_server();
                 let err_s = e.to_string();
                 if SharedState::is_balance_error(&err_s) {
                     self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
                 } else if SharedState::is_invalid_token_error(&err_s) {
                     self.handle_invalid_token(&order.symbol);
                 }
+                if reached_server {
+                    self.shared.account_state.mark_order_status(
+                        &order.client_order_id, OrderStatus::NewOrderTimeout,
+                    );
+                    warn!("[PolymarketTrade] Order server-rejected: {} coid={} → pending audit",
+                        e, order.client_order_id);
+                    return Self::make_exchange_rejection_pending(order, Some(local_oid), &err_s);
+                }
                 self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-                warn!("[PolymarketTrade] Order failed: {} coid={}", e, order.client_order_id);
+                warn!("[PolymarketTrade] Local order failure: {} coid={}", e, order.client_order_id);
                 return Self::make_rejected(order, &err_s);
             }
         };
@@ -4329,14 +4380,17 @@ impl PolymarketTrade {
         let error_msg = parsed.error_msg;
 
         if !success {
-            self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
+            self.shared.account_state.mark_order_status(
+                &order.client_order_id, OrderStatus::NewOrderTimeout,
+            );
             if SharedState::is_balance_error(&error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
             } else if SharedState::is_invalid_token_error(&error_msg) {
                 self.handle_invalid_token(&order.symbol);
             }
-            warn!("[PolymarketTrade] Order rejected: {} coid={}", error_msg, order.client_order_id);
-            return Self::make_rejected(order, &error_msg);
+            warn!("[PolymarketTrade] Order rejected by server: {} coid={} → pending audit",
+                error_msg, order.client_order_id);
+            return Self::make_exchange_rejection_pending(order, Some(local_oid), &error_msg);
         }
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
@@ -4951,14 +5005,11 @@ impl ExchangeTrade for PolymarketTrade {
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            // Drop local active-order tracking (`open_orders`)
-                            // but KEEP the coid↔orderID mapping: a crosses-book
-                            // reject can still be matched by the server, so a
-                            // late fill must still resolve its coid (the map is
-                            // reclaimed at the event-expiry sweep).
-                            self.shared.remove_order_as(
+                            // Keep reservation and order-id routing until the
+                            // placement orphan receives terminal audit proof.
+                            self.shared.account_state.mark_order_status(
                                 &order.client_order_id,
-                                OrderStatus::Rejected,
+                                OrderStatus::NewOrderTimeout,
                             );
                             if SharedState::is_balance_error(&error_msg) {
                                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
@@ -5001,7 +5052,7 @@ impl ExchangeTrade for PolymarketTrade {
                             } else {
                                 effective_remaining
                             },
-                            avg_fill_price: if response_status == OrderStatus::Accepted {
+                            avg_fill_price: if !success || response_status == OrderStatus::Accepted {
                                 order.price.unwrap_or(0.0)
                             } else {
                                 0.0
@@ -5042,9 +5093,7 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    // HTTP 4xx or a non-transport local/parse error (outside
-                    // this fix's transport scope). Emit Rejected for all
-                    // orders in the chunk.
+                    let reached_server = e.reached_server();
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Use the first chunk order's side+symbol as the
@@ -5063,18 +5112,21 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, chunk_coids);
-                    // Clear local active-order tracking for every chunk
-                    // member — committed to Rejected, so leaving sign-time
-                    // `open_orders` entries behind would mislead the next
-                    // `handle_balance_error` snapshot. `remove_order` KEEPS
-                    // the coid↔oid map: an HTTP error is ambiguous (the
-                    // chunk may have landed) so a late fill must still map.
-                    for order in chunk {
-                        self.shared.remove_order_as(
-                            &order.client_order_id,
-                            OrderStatus::Rejected,
-                        );
-                        all_updates.push(Self::make_rejected(order, &err_s));
+                    for (i, order_hash) in signed_hashes.iter().enumerate() {
+                        let order = &chunk[body_to_chunk[i]];
+                        if reached_server {
+                            self.shared.account_state.mark_order_status(
+                                &order.client_order_id, OrderStatus::NewOrderTimeout,
+                            );
+                            all_updates.push(Self::make_exchange_rejection_pending(
+                                order, Some(order_hash), &err_s,
+                            ));
+                        } else {
+                            self.shared.remove_order_as(
+                                &order.client_order_id, OrderStatus::Rejected,
+                            );
+                            all_updates.push(Self::make_rejected(order, &err_s));
+                        }
                     }
                 }
             }
@@ -5788,14 +5840,9 @@ impl ExchangeTrade for PolymarketTrade {
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            // Drop local active-order tracking (`open_orders`)
-                            // but KEEP the coid↔orderID mapping: a crosses-book
-                            // reject can still be matched by the server, so a
-                            // late fill must still resolve its coid (the map is
-                            // reclaimed at the event-expiry sweep).
-                            self.shared.remove_order_as(
+                            self.shared.account_state.mark_order_status(
                                 &order.client_order_id,
-                                OrderStatus::Rejected,
+                                OrderStatus::NewOrderTimeout,
                             );
                             let is_balance_err = SharedState::is_balance_error(&error_msg);
                             if is_balance_err {
@@ -5917,9 +5964,7 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    // HTTP 4xx or a non-transport local/parse error (outside
-                    // this fix's transport scope). Strategy's OrderManager
-                    // will mark these as Rejected locally.
+                    let reached_server = e.reached_server();
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Pick the first place_chunk order (mapped via
@@ -5936,17 +5981,21 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, place_coids);
-                    // Clear sign-time `open_orders` entries — same
-                    // rationale as `batch_submit_orders` HTTP-error path.
-                    // `remove_order` KEEPS the coid↔oid map (ambiguous
-                    // HTTP error → orders may be live → late fill must map).
-                    for (i, _signed) in place_signed.iter().enumerate() {
+                    for (i, order_hash) in place_signed.iter().enumerate() {
                         let order = &place_chunk[place_body_to_chunk[i]];
-                        self.shared.remove_order_as(
-                            &order.client_order_id,
-                            OrderStatus::Rejected,
-                        );
-                        updates.push(Self::make_rejected(order, &err_s));
+                        if reached_server {
+                            self.shared.account_state.mark_order_status(
+                                &order.client_order_id, OrderStatus::NewOrderTimeout,
+                            );
+                            updates.push(Self::make_exchange_rejection_pending(
+                                order, Some(order_hash), &err_s,
+                            ));
+                        } else {
+                            self.shared.remove_order_as(
+                                &order.client_order_id, OrderStatus::Rejected,
+                            );
+                            updates.push(Self::make_rejected(order, &err_s));
+                        }
                     }
                 }
             }
@@ -6037,6 +6086,11 @@ mod tests {
         assert_eq!(
             placement_response_status(true, "matched", Some(OrderStatus::PartiallyFilled)),
             OrderStatus::Filled,
+        );
+        assert_eq!(
+            placement_response_status(false, "", None),
+            OrderStatus::NewOrderTimeout,
+            "exchange-side rejection must retain reservation pending audit",
         );
     }
 
@@ -6553,7 +6607,7 @@ mod tests {
         );
         assert!(
             !HttpErr::Status(400, "bad request".to_string()).is_unknown_state(),
-            "4xx (non-425) is a definitive client rejection — must NOT be unknown_state"
+            "4xx (non-425) remains a known HTTP result for cancel/GET classification"
         );
         assert!(
             !HttpErr::Status(404, "not found".to_string()).is_unknown_state(),
@@ -6651,8 +6705,10 @@ mod tests {
         assert!(
             !HttpErr::Status(400, "bad request".to_string())
                 .is_submit_unknown_state(),
-            "an explicit HTTP 400 response remains a definitive rejection"
+            "HTTP 400 has a known response, even though its order hash still requires audit"
         );
+        assert!(HttpErr::Status(400, "bad request".to_string()).reached_server());
+        assert!(!HttpErr::Other("local validation".to_string()).reached_server());
     }
 
     /// Four not-found observations use 0.5/1/2 second gaps and reach the

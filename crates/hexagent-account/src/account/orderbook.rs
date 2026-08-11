@@ -128,10 +128,13 @@ impl OrderbookManager {
     /// moment by more than `NUDGE_MIN_HOLD_NS` — i.e. the server
     /// generated this snapshot long enough after our nudge moment that
     /// it must reflect the post-move book, so it's authoritative.
-    pub fn update(&mut self, ob: &OrderBookSnapshot) {
+    /// Returns `true` only when the snapshot was accepted into the cache.
+    /// Callers that feed secondary models must gate those writes on the same
+    /// result so a rejected stale/future snapshot cannot bypass the cache.
+    pub fn update(&mut self, ob: &OrderBookSnapshot) -> bool {
         if !orderbook_values_are_semantically_valid(ob) {
             log::warn!("[OrderbookManager] rejected invalid orderbook symbol={}", ob.symbol);
-            return;
+            return false;
         }
         if timestamp_too_far_in_future(ob.exchange_timestamp_ns, ob.local_timestamp_ns) {
             log::warn!(
@@ -139,7 +142,7 @@ impl OrderbookManager {
                 ob.symbol, ob.exchange_timestamp_ns, ob.local_timestamp_ns,
                 MAX_EXCHANGE_FUTURE_SKEW_NS,
             );
-            return;
+            return false;
         }
         if self
             .books
@@ -148,7 +151,7 @@ impl OrderbookManager {
                 existing.exchange_timestamp_ns > ob.exchange_timestamp_ns
             })
         {
-            return;
+            return false;
         }
 
         // Compare nudge.created_ns (local wall-clock) against
@@ -169,16 +172,18 @@ impl OrderbookManager {
         } else {
             self.books.insert(ob.symbol.clone(), ob.clone());
         }
+        true
     }
 
     /// Update the independent top-of-book cache. Out-of-order quote events
     /// cannot replace a newer quote for the same symbol. Whether this quote
     /// or the full book supplies L1 is decided wholesale by exchange
     /// timestamp in `raw_l1`, so bid and ask are never mixed across sources.
-    pub fn update_quote(&mut self, quote: &QuoteTick) {
+    /// Returns `true` only when the quote was accepted into the cache.
+    pub fn update_quote(&mut self, quote: &QuoteTick) -> bool {
         if !quote_values_are_semantically_valid(quote) {
             log::warn!("[OrderbookManager] rejected invalid quote symbol={}", quote.symbol);
-            return;
+            return false;
         }
         if timestamp_too_far_in_future(
             quote.exchange_timestamp_ns,
@@ -189,7 +194,7 @@ impl OrderbookManager {
                 quote.symbol, quote.exchange_timestamp_ns, quote.local_timestamp_ns,
                 MAX_EXCHANGE_FUTURE_SKEW_NS,
             );
-            return;
+            return false;
         }
         if self
             .quotes
@@ -198,7 +203,7 @@ impl OrderbookManager {
                 existing.exchange_timestamp_ns > quote.exchange_timestamp_ns
             })
         {
-            return;
+            return false;
         }
 
         self.clear_nudges_after_market_update(
@@ -210,6 +215,7 @@ impl OrderbookManager {
         } else {
             self.quotes.insert(quote.symbol.clone(), quote.clone());
         }
+        true
     }
 
     /// Get the latest orderbook for a symbol.

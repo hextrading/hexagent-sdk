@@ -356,6 +356,10 @@ struct SharedAccountState {
     /// registered winner (value=1), never merely because quantities match.
     #[serde(default)]
     settled_token_values: HashMap<String, f64>,
+    /// Monotonic generation for settlement-outcome propagation across
+    /// strategy instances and process restarts.
+    #[serde(default)]
+    settled_token_values_generation: u64,
     /// Persisted per-token fee curves make cold trade replay independent of a
     /// live strategy EventContext.
     #[serde(default)]
@@ -1092,12 +1096,38 @@ impl SharedAccount {
 
     pub fn record_settled_token_values(&self, values: &HashMap<String, f64>) {
         let mut state = self.state.lock().unwrap();
+        let effective_generation = if state.settled_token_values.is_empty() {
+            state.settled_token_values_generation
+        } else {
+            state.settled_token_values_generation.max(1)
+        };
+        let mut changed = false;
         for (token, value) in values {
             if !token.is_empty() && value.is_finite() && (*value == 0.0 || *value == 1.0) {
-                state.settled_token_values.insert(token.clone(), *value);
+                if state.settled_token_values.get(token) != Some(value) {
+                    state.settled_token_values.insert(token.clone(), *value);
+                    changed = true;
+                }
             }
         }
-        self.schedule_persist(&state);
+        if changed {
+            state.settled_token_values_generation = effective_generation.saturating_add(1).max(1);
+            self.schedule_persist(&state);
+        }
+    }
+
+    /// Account-wide authoritative outcome snapshot. Strategies compare the
+    /// generation before cloning the map, then revise active and retained
+    /// settled event baselines.
+    pub fn settled_token_values_snapshot(&self) -> (u64, HashMap<String, f64>) {
+        let state = self.state.lock().unwrap();
+        let generation = if state.settled_token_values.is_empty() {
+            state.settled_token_values_generation
+        } else {
+            // Ledgers written before this field existed load it as zero.
+            state.settled_token_values_generation.max(1)
+        };
+        (generation, state.settled_token_values.clone())
     }
 
     /// Persist the exchange fee curve for every outcome token in one event.
@@ -4063,6 +4093,29 @@ mod tests {
         account.register_instance("b", 3.0);
         account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
         account
+    }
+
+    #[test]
+    fn settled_token_snapshot_generation_advances_only_on_change() {
+        let account = SharedAccount::new("settlement-generation");
+        assert_eq!(account.settled_token_values_snapshot(), (0, HashMap::new()));
+
+        account.record_settled_token_values(&HashMap::from([
+            ("UP".to_string(), 1.0),
+            ("DOWN".to_string(), 0.0),
+        ]));
+        let (generation, values) = account.settled_token_values_snapshot();
+        assert_eq!(generation, 1);
+        assert_eq!(values.get("UP"), Some(&1.0));
+        assert_eq!(values.get("DOWN"), Some(&0.0));
+
+        account.record_settled_token_values(&values);
+        assert_eq!(account.settled_token_values_snapshot().0, generation);
+
+        account.record_settled_token_values(&HashMap::from([("UP".to_string(), 0.0)]));
+        let (revised_generation, revised) = account.settled_token_values_snapshot();
+        assert_eq!(revised_generation, generation + 1);
+        assert_eq!(revised.get("UP"), Some(&0.0));
     }
 
     #[test]

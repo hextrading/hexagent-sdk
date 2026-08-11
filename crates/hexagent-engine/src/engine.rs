@@ -1313,7 +1313,8 @@ impl Engine {
                                     MarketEvent::OrderBook(ob)
                                         if ob.exchange == crate::types::Exchange::Polymarket =>
                                     {
-                                        let ask = ob.asks.first().map(|l| l.price);
+                                        // Polymarket snapshots encode asks worst-to-best.
+                                        let ask = ob.best_ask().map(|l| l.price);
                                         if Some(&ob.symbol) == probe_up.as_ref() {
                                             probe_up_ask = ask;
                                             repick = true;
