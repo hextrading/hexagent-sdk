@@ -1830,9 +1830,28 @@ struct TradeFields {
     side: String, // "BUY" | "SELL"
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
-    /// V2 market-channel execution identity.
-    #[serde(default, alias = "trade_id", alias = "tradeId", alias = "transactionHash")]
+    /// Venue execution identity. A transaction can contain multiple fills, so
+    /// its hash alone is deliberately not accepted as a trade id.
+    #[serde(
+        default,
+        alias = "trade_id",
+        alias = "tradeId",
+        alias = "executionId"
+    )]
+    execution_id: Option<String>,
+    #[serde(default, alias = "transactionHash")]
     transaction_hash: Option<String>,
+    #[serde(default, alias = "logIndex")]
+    log_index: Option<serde_json::Value>,
+    /// Only this explicit field authorizes consumers to fold complementary
+    /// Up/Down public prints into one economic execution.
+    #[serde(
+        default,
+        alias = "mirrorId",
+        alias = "mirror_trade_id",
+        alias = "mirrorTradeId"
+    )]
+    mirror_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2098,9 +2117,32 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
         return None;
     }
-    let exchange_trade_id = t.transaction_hash
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let clean_id = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let log_index = t.log_index.as_ref().and_then(|value| match value {
+        serde_json::Value::Number(value) => value.as_u64().map(|value| value.to_string()),
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok().map(|value| value.to_string())
+            } else {
+                value.parse::<u64>().ok().map(|value| value.to_string())
+            }
+        }
+        _ => None,
+    });
+    let mirror_id = clean_id(t.mirror_id);
+    let execution_id = clean_id(t.execution_id).or_else(|| {
+        clean_id(t.transaction_hash)
+            .zip(log_index)
+            .map(|(hash, index)| format!("{hash}:log:{index}"))
+    });
+    let exchange_trade_id = mirror_id
+        .map(|value| format!("mirror:{value}"))
+        .or_else(|| execution_id.map(|value| format!("execution:{value}")));
     Some(MarketEvent::Trade(TradeTick {
         exchange: Exchange::Polymarket,
         symbol: t.asset_id,
@@ -2673,7 +2715,28 @@ mod pick_current_event_tests {
         );
         let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
         assert_eq!(trade.exchange_timestamp_ns, 1_757_908_892_351_000_000);
-        assert_eq!(trade.exchange_trade_id.as_deref(), Some("0xabc"));
+        assert_eq!(trade.exchange_trade_id, None, "a transaction hash is not a fill id");
+
+        let events = parse_clob_frame(
+            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","trade_id":"fill-7","transaction_hash":"0xabc"}"#,
+        );
+        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        assert_eq!(trade.exchange_trade_id.as_deref(), Some("execution:fill-7"));
+
+        let events = parse_clob_frame(
+            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","transactionHash":"0xabc","logIndex":"0x2"}"#,
+        );
+        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        assert_eq!(
+            trade.exchange_trade_id.as_deref(),
+            Some("execution:0xabc:log:2"),
+        );
+
+        let events = parse_clob_frame(
+            r#"{"event_type":"trade","asset_id":"down","price":"0.49","size":"2","side":"SELL","timestamp":"1757908892351","trade_id":"down-fill","mirrorTradeId":"pair-9"}"#,
+        );
+        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        assert_eq!(trade.exchange_trade_id.as_deref(), Some("mirror:pair-9"));
 
         for invalid in [
             r#"{"event_type":"trade","asset_id":"up","price":"NaN","size":"2","side":"BUY","timestamp":"1757908892351"}"#,

@@ -877,7 +877,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     }
 
                     let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
-                    let Some(ownership) = shared.account_state.apply_trade_transition_with_context(
+                    let transition = shared.account_state.apply_trade_transition_with_context(
                         &leg_id,
                         status_str,
                         &runtime_coid,
@@ -888,7 +888,8 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         mo_price,
                         true,
                         match_time_secs,
-                    ) else {
+                    );
+                    let Some(ownership) = transition.ownership().cloned() else {
                         // Never broadcast an unowned private trade. The account
                         // ledger has already entered uncertain with the exact
                         // oid/trade reason; fanning an empty coid to every
@@ -898,6 +899,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                             .mark_unresolved_trade_match_time(&leg_id, match_time_secs);
                         continue;
                     };
+                    if transition.persistence_pending() {
+                        warn!(
+                            "[PolymarketUserFeed] owned maker trade {} is applied with persistence pending; broadcasting fill while account admission stays blocked",
+                            leg_id,
+                        );
+                    }
                     shared
                         .account_state
                         .resolve_unresolved_trade_match_time(&leg_id);
@@ -959,7 +966,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 }
 
                 let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
-                let Some(ownership) = shared.account_state.apply_trade_transition_with_context(
+                let transition = shared.account_state.apply_trade_transition_with_context(
                     trade_id,
                     status_str,
                     &runtime_coid,
@@ -970,12 +977,19 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     price,
                     false,
                     match_time_secs,
-                ) else {
+                );
+                let Some(ownership) = transition.ownership().cloned() else {
                     shared
                         .account_state
                         .mark_unresolved_trade_match_time(trade_id, match_time_secs);
                     return Vec::new();
                 };
+                if transition.persistence_pending() {
+                    warn!(
+                        "[PolymarketUserFeed] owned taker trade {} is applied with persistence pending; broadcasting fill while account admission stays blocked",
+                        trade_id,
+                    );
+                }
                 shared
                     .account_state
                     .resolve_unresolved_trade_match_time(trade_id);
