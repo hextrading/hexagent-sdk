@@ -158,6 +158,33 @@ pub enum Signal {
 }
 
 impl MarketEvent {
+    /// Reject NaN/±Infinity before public market data crosses the SDK boundary.
+    /// String-valued exchange fields can parse these as valid `f64`s even
+    /// though JSON numbers cannot encode them.
+    pub fn has_finite_market_values(&self) -> bool {
+        match self {
+            MarketEvent::OrderBook(ob) => ob.bids.iter().chain(ob.asks.iter())
+                .all(|level| level.price.is_finite() && level.quantity.is_finite()),
+            MarketEvent::Trade(trade) => trade.price.is_finite() && trade.quantity.is_finite(),
+            MarketEvent::Quote(quote) => [quote.bid_price, quote.bid_qty, quote.ask_price, quote.ask_qty]
+                .into_iter().all(f64::is_finite),
+            MarketEvent::Bar(bar) => [bar.open, bar.high, bar.low, bar.close, bar.volume,
+                bar.taker_buy_base, bar.quote_volume].into_iter().all(f64::is_finite),
+            MarketEvent::TickSizeChange(change) => {
+                change.old_tick_size.is_finite() && change.new_tick_size.is_finite()
+            }
+            MarketEvent::SpotPrice(spot) => spot.price.is_finite(),
+            MarketEvent::AssetCtx(ctx) => [ctx.mark_px, ctx.oracle_px, ctx.mid_px, ctx.funding,
+                ctx.open_interest, ctx.premium, ctx.impact_bid_px, ctx.impact_ask_px,
+                ctx.day_ntl_vlm, ctx.prev_day_px].into_iter().all(f64::is_finite),
+            MarketEvent::Instrument(_)
+            | MarketEvent::Connected { .. }
+            | MarketEvent::Disconnected { .. }
+            | MarketEvent::EventStart { .. }
+            | MarketEvent::Exit => true,
+        }
+    }
+
     pub fn timestamp_ns(&self) -> u64 {
         match self {
             MarketEvent::OrderBook(ob) => ob.local_timestamp_ns,
@@ -207,5 +234,44 @@ impl MarketEvent {
             | MarketEvent::EventStart { exchange, .. } => *exchange,
             MarketEvent::Exit => Exchange::Binance, // placeholder, never used meaningfully
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::PriceLevel;
+
+    #[test]
+    fn market_event_finite_validation_covers_string_parsed_payload_shapes() {
+        let orderbook = MarketEvent::OrderBook(OrderBookSnapshot {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![PriceLevel { price: f64::NAN, quantity: 1.0 }],
+            asks: vec![PriceLevel { price: 100.0, quantity: 1.0 }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        assert!(!orderbook.has_finite_market_values());
+
+        let trade = MarketEvent::Trade(TradeTick {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_string(),
+            price: 100.0,
+            quantity: f64::INFINITY,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        assert!(!trade.has_finite_market_values());
+
+        let valid = MarketEvent::SpotPrice(SpotPrice {
+            source: "chainlink".to_string(),
+            symbol: "btc/usd".to_string(),
+            price: 100.0,
+            timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        assert!(valid.has_finite_market_values());
     }
 }

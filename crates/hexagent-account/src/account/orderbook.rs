@@ -13,6 +13,16 @@ fn timestamp_too_far_in_future(exchange_timestamp_ns: u64, local_timestamp_ns: u
             > local_timestamp_ns.saturating_add(MAX_EXCHANGE_FUTURE_SKEW_NS)
 }
 
+fn orderbook_values_are_finite(ob: &OrderBookSnapshot) -> bool {
+    ob.bids.iter().chain(ob.asks.iter())
+        .all(|level| level.price.is_finite() && level.quantity.is_finite())
+}
+
+fn quote_values_are_finite(quote: &QuoteTick) -> bool {
+    [quote.bid_price, quote.bid_qty, quote.ask_price, quote.ask_qty]
+        .into_iter().all(f64::is_finite)
+}
+
 /// One nudge per (symbol, side).
 ///
 ///   * `price`       — the asserted top-of-book bound (real bid ≥ price
@@ -97,6 +107,10 @@ impl OrderbookManager {
     /// generated this snapshot long enough after our nudge moment that
     /// it must reflect the post-move book, so it's authoritative.
     pub fn update(&mut self, ob: &OrderBookSnapshot) {
+        if !orderbook_values_are_finite(ob) {
+            log::warn!("[OrderbookManager] rejected non-finite orderbook symbol={}", ob.symbol);
+            return;
+        }
         if timestamp_too_far_in_future(ob.exchange_timestamp_ns, ob.local_timestamp_ns) {
             log::warn!(
                 "[OrderbookManager] rejected future orderbook symbol={} exchange_ts={} local_ts={} max_skew_ns={}",
@@ -140,6 +154,10 @@ impl OrderbookManager {
     /// or the full book supplies L1 is decided wholesale by exchange
     /// timestamp in `raw_l1`, so bid and ask are never mixed across sources.
     pub fn update_quote(&mut self, quote: &QuoteTick) {
+        if !quote_values_are_finite(quote) {
+            log::warn!("[OrderbookManager] rejected non-finite quote symbol={}", quote.symbol);
+            return;
+        }
         if timestamp_too_far_in_future(
             quote.exchange_timestamp_ns,
             quote.local_timestamp_ns,
@@ -687,6 +705,31 @@ mod tests {
         om.update(&later);
         assert_eq!(om.best_bid_price("tok"), Some(0.45));
         assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+    }
+
+    #[test]
+    fn non_finite_orderbook_and_quote_are_rejected_without_mutating_cache() {
+        let mut om = OrderbookManager::new();
+        let mut initial = empty_book("tok");
+        initial.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        initial.asks = vec![PriceLevel { price: 0.60, quantity: 10.0 }];
+        initial.exchange_timestamp_ns = 100;
+        initial.local_timestamp_ns = 101;
+        om.update(&initial);
+
+        let mut invalid_book = initial.clone();
+        invalid_book.bids[0].price = f64::NAN;
+        invalid_book.exchange_timestamp_ns = 200;
+        invalid_book.local_timestamp_ns = 201;
+        om.update(&invalid_book);
+        assert_eq!(om.best_bid_price("tok"), Some(0.40));
+        assert_eq!(om.l1_timestamp_ns("tok"), Some(100));
+
+        let mut invalid_quote = quote("tok", 0.50, f64::INFINITY, 300);
+        invalid_quote.local_timestamp_ns = 301;
+        om.update_quote(&invalid_quote);
+        assert_eq!(om.best_bid_price("tok"), Some(0.40));
+        assert_eq!(om.best_ask_price("tok"), Some(0.60));
     }
 
     #[test]

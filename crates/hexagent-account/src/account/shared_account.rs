@@ -1945,12 +1945,13 @@ impl SharedAccount {
         let mut state = self.state.lock().unwrap();
         if let Some(order) = state.orders.get_mut(client_order_id) {
             // REST placement acknowledgements can arrive after the private
-            // feed has already reported a terminal result. FAILED is sticky
-            // because its trade reversal must not be undone; FILLED is sticky
-            // because accepting a late POST response would otherwise make the
-            // order look live again after its fills were booked.
-            if matches!(order.status, OrderStatus::Failed | OrderStatus::Filled)
-                && status != order.status
+            // feed has already advanced the order. FAILED/FILLED are sticky;
+            // PartiallyFilled is also monotonic against the weaker Accepted
+            // state because an observed match cannot be undone by a late ACK.
+            if (matches!(order.status, OrderStatus::Failed | OrderStatus::Filled)
+                && status != order.status)
+                || (order.status == OrderStatus::PartiallyFilled
+                    && status == OrderStatus::Accepted)
             {
                 return Some(order.status);
             }
@@ -4111,6 +4112,20 @@ mod tests {
 
         account.mark_order_status("a-race", OrderStatus::NewOrderTimeout);
         assert_eq!(account.order("a-race").unwrap().status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn late_http_ack_cannot_regress_partially_filled_order_status() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-partial", "oid-partial", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account.mark_order_status("a-partial", OrderStatus::PartiallyFilled);
+        assert_eq!(
+            account.mark_order_status_effective("a-partial", OrderStatus::Accepted),
+            Some(OrderStatus::PartiallyFilled),
+        );
+        assert_eq!(account.order("a-partial").unwrap().status, OrderStatus::PartiallyFilled);
     }
 
     #[test]
