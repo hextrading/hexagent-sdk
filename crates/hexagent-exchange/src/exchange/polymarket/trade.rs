@@ -61,6 +61,11 @@ struct FetchedOrder {
     audit: AuthoritativeOrderAudit,
 }
 
+struct RuntimeOrderAuditPass {
+    updates: Vec<OrderUpdate>,
+    errors: Vec<String>,
+}
+
 /// Result of an orphan order lookup. Keep an explicit server not-found result
 /// separate from transport/service/parse failures: only the former is
 /// authoritative enough to advance the universal four-result placement
@@ -482,6 +487,12 @@ fn cancel_delete_response_outcome(
         // collection mentioning it is an omission. Both remain uncertain.
         (true, Some(_)) | (false, None) => CancelReasonOutcome::Uncertain,
     }
+}
+
+fn validated_cancel_all_counts(json: &serde_json::Value) -> Option<(usize, usize)> {
+    let canceled = json.get("canceled")?.as_array()?.len();
+    let not_canceled = json.get("not_canceled")?.as_object()?.len();
+    Some((canceled, not_canceled))
 }
 
 fn format_order_brief(o: &OrderRequest) -> String {
@@ -2513,6 +2524,18 @@ impl PolymarketTrade {
     pub(crate) fn reconcile_runtime_open_orders_with_updates(
         &self,
     ) -> std::result::Result<Vec<OrderUpdate>, String> {
+        let pass = self.reconcile_runtime_open_orders_pass();
+        if pass.errors.is_empty() {
+            Ok(pass.updates)
+        } else {
+            Err(pass.errors.join("; "))
+        }
+    }
+
+    /// Run a complete runtime order audit without discarding successful rows
+    /// when one sibling order is temporarily unavailable. Shutdown uses the
+    /// partial updates to converge accounting on every retry.
+    fn reconcile_runtime_open_orders_pass(&self) -> RuntimeOrderAuditPass {
         let tracked: Vec<(String, TrackedOrder, String)> = {
             let open = self.shared.open_orders.lock().unwrap();
             let ids = self.shared.coid_to_oid.lock().unwrap();
@@ -2533,18 +2556,30 @@ impl PolymarketTrade {
             rows.into_iter().map(|(coid, (tracked, oid))| (coid, tracked, oid)).collect()
         };
         let mut updates = Vec::new();
+        let mut errors = Vec::new();
         for (coid, tracked, order_id) in tracked {
             let fetched = match self.fetch_order_by_id(&coid, &order_id, None) {
                 FetchOrderResult::Found(order) => order,
-                FetchOrderResult::NotFound => return Err(format!(
-                    "open order coid={coid} orderID={order_id} was not found"
-                )),
-                FetchOrderResult::Unavailable(kind) => return Err(format!(
-                    "open order coid={coid} orderID={order_id} audit unavailable: {kind:?}"
-                )),
+                FetchOrderResult::NotFound => {
+                    errors.push(format!(
+                        "open order coid={coid} orderID={order_id} was not found"
+                    ));
+                    continue;
+                }
+                FetchOrderResult::Unavailable(kind) => {
+                    errors.push(format!(
+                        "open order coid={coid} orderID={order_id} audit unavailable: {kind:?}"
+                    ));
+                    continue;
+                }
             };
-            let ownership = self.shared.account_state.order(&coid)
-                .ok_or_else(|| format!("open order coid={coid} has no durable ownership row"))?;
+            let ownership = match self.shared.account_state.order(&coid) {
+                Some(ownership) => ownership,
+                None => {
+                    errors.push(format!("open order coid={coid} has no durable ownership row"));
+                    continue;
+                }
+            };
             let status_text = fetched.status.to_ascii_uppercase();
             let status = match status_text.as_str() {
                 "LIVE" => {
@@ -2573,10 +2608,18 @@ impl PolymarketTrade {
                     if !fetched.audit.associate_trades.is_empty() {
                         updates.extend(self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades));
                     }
-                    let matched = fetched.audit.size_matched.as_deref()
-                        .ok_or_else(|| format!("cancelled order coid={coid} omitted size_matched"))?
-                        .parse::<f64>()
-                        .map_err(|_| format!("cancelled order coid={coid} has invalid size_matched"))?;
+                    let matched = match fetched.audit.size_matched.as_deref()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                    {
+                        Some(matched) => matched,
+                        None => {
+                            errors.push(format!(
+                                "cancelled order coid={coid} omitted or has invalid size_matched"
+                            ));
+                            continue;
+                        }
+                    };
                     self.shared.remove_cancelled_order_with_match(&coid, matched);
                     OrderStatus::Cancelled
                 }
@@ -2584,9 +2627,12 @@ impl PolymarketTrade {
                     self.shared.remove_order_as(&coid, OrderStatus::Rejected);
                     OrderStatus::Rejected
                 }
-                other => return Err(format!(
-                    "open order coid={coid} returned unsupported status={other}"
-                )),
+                other => {
+                    errors.push(format!(
+                        "open order coid={coid} returned unsupported status={other}"
+                    ));
+                    continue;
+                }
             };
             let size_matched = fetched.audit.size_matched.as_deref()
                 .and_then(|value| value.parse::<f64>().ok())
@@ -2609,7 +2655,7 @@ impl PolymarketTrade {
                 error: None,
             });
         }
-        Ok(updates)
+        RuntimeOrderAuditPass { updates, errors }
     }
 
     /// POST variant that distinguishes timeout / status / other errors so
@@ -2676,6 +2722,79 @@ impl PolymarketTrade {
                     e, tracked.len(),
                 );
             }
+        }
+    }
+
+    /// Graceful-shutdown cancellation barrier. The caller must first stop all
+    /// order-producing dispatchers. This deliberately has no fixed retry
+    /// limit: exiting while the remote account may still have LIVE orders is
+    /// less safe than remaining visibly in a risk-off shutdown state.
+    ///
+    /// A pass is final only when `/cancel-all` has the complete expected
+    /// schema with no failures, all locally known orders were audited (with
+    /// associated trades replayed), and both runtime and durable pending-order
+    /// registries are empty.
+    pub fn cancel_all_orders_until_final(
+        &self,
+        mut emit_update: impl FnMut(OrderUpdate),
+    ) -> usize {
+        let retry_delays_ms = [0_u64, 100, 250, 500, 1_000, 2_000, 5_000];
+        let mut attempt = 0usize;
+        loop {
+            let delay_ms = retry_delays_ms[attempt.min(retry_delays_ms.len() - 1)];
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            attempt = attempt.saturating_add(1);
+
+            let remote_result = self.shared.http_call_sync("DELETE", "/cancel-all", "");
+            let (remote_clean, remote_detail) = match remote_result {
+                Ok(json) => match validated_cancel_all_counts(&json) {
+                    Some((canceled, not_canceled)) => (
+                        not_canceled == 0,
+                        format!("canceled={canceled} not_canceled={not_canceled}"),
+                    ),
+                    None => (
+                        false,
+                        "invalid response schema (expected canceled[] and not_canceled{})"
+                            .to_string(),
+                    ),
+                },
+                Err(error) => (false, format!("request failed: {error}")),
+            };
+
+            let audit = self.reconcile_runtime_open_orders_pass();
+            for update in audit.updates {
+                emit_update(update);
+            }
+            let open_orders = self.shared.open_orders.lock().unwrap().len();
+            let recovery_pending = self
+                .shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders;
+            let local_clean = audit.errors.is_empty()
+                && open_orders == 0
+                && recovery_pending == 0;
+
+            if remote_clean && local_clean {
+                info!(
+                    "[PolymarketTrade] shutdown cancel barrier final after {} attempt(s): {}",
+                    attempt,
+                    remote_detail,
+                );
+                return attempt;
+            }
+
+            warn!(
+                "[PolymarketTrade] shutdown cancel barrier retry attempt={} remote_clean={} remote={} open_orders={} recovery_pending={} audit_errors={:?}",
+                attempt,
+                remote_clean,
+                remote_detail,
+                open_orders,
+                recovery_pending,
+                audit.errors,
+            );
         }
     }
 
@@ -5612,6 +5731,25 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_all_finality_requires_complete_response_schema() {
+        assert_eq!(
+            validated_cancel_all_counts(&serde_json::json!({
+                "canceled": ["oid-1"],
+                "not_canceled": {},
+            })),
+            Some((1, 0)),
+        );
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({ "canceled": [] }),
+            serde_json::json!({ "canceled": null, "not_canceled": {} }),
+            serde_json::json!({ "canceled": [], "not_canceled": [] }),
+        ] {
+            assert_eq!(validated_cancel_all_counts(&json), None);
+        }
+    }
 
     #[test]
     fn clob_request_roles_separate_account_orders_reconcile_and_global_query() {
