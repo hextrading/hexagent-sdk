@@ -43,6 +43,17 @@ pub struct InstanceAccountSnapshot {
     pub reserved_positions: HashMap<String, f64>,
 }
 
+/// Durable checkpoint for a strategy-owned sidecar whose file is committed
+/// before this marker advances. `recovery_payload` is intentionally opaque to
+/// the account crate: the owning strategy can use it to reconstruct a missing
+/// sidecar, then reconcile that snapshot with the account's durable trades.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableSidecarCheckpoint {
+    pub generation: u64,
+    pub expected_entries: usize,
+    pub recovery_payload: String,
+}
+
 /// One event/token scope currently traded by an instance.  These scopes are
 /// the authoritative ownership filter used when a cold account snapshot is
 /// split into virtual inventories.
@@ -90,6 +101,7 @@ pub struct AccountMonitoringSnapshot {
     pub physical_positions: HashMap<String, f64>,
     pub virtual_positions: HashMap<String, f64>,
     pub unallocated_positions: HashMap<String, f64>,
+    pub provisional_position_owners: HashMap<String, String>,
     pub reserved_cash: f64,
     pub reserved_positions: HashMap<String, f64>,
     pub uncertain: bool,
@@ -325,6 +337,12 @@ struct SharedAccountState {
     physical_positions: HashMap<String, f64>,
     unallocated_cash: f64,
     unallocated_positions: HashMap<String, f64>,
+    /// First-start wallet positions whose event scope is not known yet receive
+    /// one deterministic owner instead of disappearing into unallocated state.
+    /// The assignment survives restart and remains explicitly provisional
+    /// until an operator or later ownership migration resolves it.
+    #[serde(default)]
+    provisional_position_owners: HashMap<String, String>,
     instances: BTreeMap<String, InstanceLedger>,
     orders: HashMap<String, OrderOwnership>,
     oid_to_coid: HashMap<String, String>,
@@ -401,6 +419,10 @@ struct SharedAccountState {
     /// guess whether an aggregate reservation belongs to an on-chain submit.
     #[serde(default)]
     maintenance_ops: BTreeMap<String, MaintenanceOperation>,
+    /// Strategy-owned sidecar commit markers. A non-zero marker makes a missing
+    /// sidecar an integrity failure rather than an indistinguishable cold start.
+    #[serde(default)]
+    sidecar_checkpoints: BTreeMap<String, DurableSidecarCheckpoint>,
     /// Snapshot generations only order concurrent fan-out inside this
     /// process. They deliberately do not survive restart because the fetch
     /// generation counter also restarts.
@@ -735,6 +757,8 @@ impl SharedAccount {
             if migrated {
                 recompute_reconciliation(&mut state, "terminal FAILED ledger migration");
             }
+            validate_persisted_state(&account_id, &state)
+                .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
             (state, migrated)
         } else {
             (SharedAccountState::default(), false)
@@ -794,6 +818,48 @@ impl SharedAccount {
 
     pub fn persistence_path(&self) -> Option<&Path> {
         self.persistence.as_ref().map(|p| p.path.as_path())
+    }
+
+    pub fn sidecar_checkpoint(&self, sidecar_id: &str) -> Option<DurableSidecarCheckpoint> {
+        self.state
+            .lock()
+            .unwrap()
+            .sidecar_checkpoints
+            .get(sidecar_id)
+            .cloned()
+    }
+
+    /// Advance a sidecar marker only after the owning strategy has fsynced the
+    /// corresponding generation. Older completions are harmless because the
+    /// asynchronous sidecar writer may coalesce or finish out of callback order.
+    pub fn record_sidecar_checkpoint(
+        &self,
+        sidecar_id: &str,
+        checkpoint: DurableSidecarCheckpoint,
+    ) -> Result<bool, String> {
+        if sidecar_id.trim().is_empty()
+            || checkpoint.generation == 0
+            || checkpoint.expected_entries == 0
+            || checkpoint.recovery_payload.trim().is_empty()
+        {
+            return Err(
+                "sidecar checkpoint requires id, generation, entries and recovery payload"
+                    .to_string(),
+            );
+        }
+        let mut state = self.state.lock().unwrap();
+        if state
+            .sidecar_checkpoints
+            .get(sidecar_id)
+            .is_some_and(|existing| existing.generation >= checkpoint.generation)
+        {
+            return Ok(false);
+        }
+        state
+            .sidecar_checkpoints
+            .insert(sidecar_id.to_string(), checkpoint);
+        self.schedule_persist(&state);
+        Ok(true)
     }
 
     /// Register an instance before the first physical snapshot. Non-positive
@@ -1191,7 +1257,11 @@ impl SharedAccount {
 
     /// Apply the account snapshot used to establish this process's startup
     /// baseline. Later calls in the same process are ignored.
-    pub fn apply_physical_snapshot(&self, cash: f64, positions: HashMap<String, f64>) {
+    pub fn apply_physical_snapshot(
+        &self,
+        cash: f64,
+        positions: HashMap<String, f64>,
+    ) -> Result<bool, String> {
         let mut authoritative_tokens: HashSet<String> = positions.keys().cloned().collect();
         let state = self.state.lock().unwrap();
         authoritative_tokens.extend(state.physical_positions.keys().cloned());
@@ -1199,7 +1269,7 @@ impl SharedAccount {
             state.instances.values().flat_map(|instance| instance.positions.keys().cloned()),
         );
         drop(state);
-        self.apply_scoped_physical_snapshot(cash, positions, authoritative_tokens);
+        self.apply_scoped_physical_snapshot(cash, positions, authoritative_tokens)
     }
 
     /// Apply a startup cash snapshot plus a token-scoped position view.
@@ -1212,13 +1282,8 @@ impl SharedAccount {
         cash: f64,
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
-    ) {
-        self.apply_scoped_physical_snapshot_inner(
-            None,
-            cash,
-            positions,
-            authoritative_tokens,
-        );
+    ) -> Result<bool, String> {
+        self.apply_scoped_physical_snapshot_inner(None, cash, positions, authoritative_tokens)
     }
 
     /// Apply one account-level startup generation at most once.
@@ -1228,7 +1293,7 @@ impl SharedAccount {
         cash: f64,
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         self.apply_scoped_physical_snapshot_inner(
             Some(generation),
             cash,
@@ -1243,10 +1308,11 @@ impl SharedAccount {
         cash: f64,
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
-    ) -> bool {
+    ) -> Result<bool, String> {
+        validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
         let mut state = self.state.lock().unwrap();
         if state.startup_snapshot_applied_this_process {
-            return false;
+            return Ok(false);
         }
         if !state.seeded {
             let missing = missing_initial_token_interest_owners(&state, &authoritative_tokens);
@@ -1258,7 +1324,7 @@ impl SharedAccount {
                         "[shared_account] account={} initial allocation waiting for token-interest barrier: {}",
                         self.account_id, missing.join(", "),
                     );
-                    return false;
+                    return Ok(false);
                 }
                 state.initial_token_barrier_degraded_members = missing.clone();
                 log::warn!(
@@ -1269,15 +1335,11 @@ impl SharedAccount {
         }
         if let Some(generation) = generation {
             if generation == 0 || generation <= state.last_physical_snapshot_generation {
-                return false;
+                return Ok(false);
             }
         }
-        let cash = finite_nonnegative(cash);
         let positions = positions.into_iter()
-            .filter_map(|(token, qty)| {
-                let qty = finite_nonnegative(qty);
-                (qty > EPS).then_some((token, qty))
-            })
+            .filter(|(_, qty)| *qty > EPS)
             .collect::<HashMap<_, _>>();
         if !state.seeded {
             state.seeded = true;
@@ -1292,7 +1354,7 @@ impl SharedAccount {
                 .collect();
             redistribute_all(&mut state);
             self.schedule_persist(&state);
-            return true;
+            return Ok(true);
         }
 
         // A wallet snapshot has no trade ids. Applying it while a MATCHED trade
@@ -1303,7 +1365,7 @@ impl SharedAccount {
         // the trade-driven physical ledger unchanged and let the next snapshot
         // retry after every pending lifecycle has resolved.
         if has_unsettled_trade_lifecycle(&state) || has_unsettled_maintenance_operation(&state) {
-            return false;
+            return Ok(false);
         }
 
         // Deferred snapshots must remain retryable with the same generation.
@@ -1327,7 +1389,7 @@ impl SharedAccount {
         try_attribute_binary_redeem(&mut state);
         state.startup_snapshot_applied_this_process = true;
         self.schedule_persist(&state);
-        true
+        Ok(true)
     }
 
     pub fn is_seeded(&self) -> bool { self.state.lock().unwrap().seeded }
@@ -1571,6 +1633,7 @@ impl SharedAccount {
             physical_positions: state.physical_positions.clone(),
             virtual_positions,
             unallocated_positions: state.unallocated_positions.clone(),
+            provisional_position_owners: state.provisional_position_owners.clone(),
             reserved_cash: state.instances.values().map(|instance| instance.reserved_cash).sum(),
             reserved_positions,
             uncertain: state.uncertain || persistence_error.is_some(),
@@ -3967,6 +4030,253 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
     } else {
         clear_uncertain(state);
     }
+}
+
+fn validate_physical_snapshot(
+    cash: f64,
+    positions: &HashMap<String, f64>,
+    authoritative_tokens: &HashSet<String>,
+) -> Result<(), String> {
+    if !cash.is_finite() || cash < 0.0 {
+        return Err(format!("physical snapshot has invalid cash {cash}"));
+    }
+    for (token, quantity) in positions {
+        if token.trim().is_empty() || !quantity.is_finite() || *quantity < 0.0 {
+            return Err(format!(
+                "physical snapshot has invalid position token={token:?} quantity={quantity}"
+            ));
+        }
+        if !authoritative_tokens.contains(token) {
+            return Err(format!(
+                "physical snapshot position token `{token}` is outside its authoritative scope"
+            ));
+        }
+    }
+    if authoritative_tokens
+        .iter()
+        .any(|token| token.trim().is_empty())
+    {
+        return Err("physical snapshot has an empty authoritative token".to_string());
+    }
+    Ok(())
+}
+
+fn validate_named_values(
+    field: &str,
+    values: &HashMap<String, f64>,
+    nonnegative: bool,
+) -> Result<(), String> {
+    for (key, value) in values {
+        if key.trim().is_empty() || !value.is_finite() || (nonnegative && *value < -EPS) {
+            return Err(format!("{field} contains invalid entry {key:?}={value}"));
+        }
+    }
+    Ok(())
+}
+
+/// A syntactically valid JSON ledger is not necessarily a valid account. This
+/// validator runs before the persistence worker starts so parseable corruption,
+/// incompatible old writers or hand-edited negative reservations fail closed.
+fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Result<(), String> {
+    if !state.physical_cash.is_finite() || state.physical_cash < -EPS {
+        return Err(format!("invalid physical_cash {}", state.physical_cash));
+    }
+    if !state.unallocated_cash.is_finite() {
+        return Err(format!(
+            "invalid unallocated_cash {}",
+            state.unallocated_cash
+        ));
+    }
+    validate_named_values("physical_positions", &state.physical_positions, true)?;
+    validate_named_values("unallocated_positions", &state.unallocated_positions, false)?;
+
+    for (instance_id, instance) in &state.instances {
+        if instance_id.trim().is_empty()
+            || !instance.weight.is_finite()
+            || instance.weight <= 0.0
+            || !instance.cash.is_finite()
+            || instance.cash < -EPS
+            || !instance.reserved_cash.is_finite()
+            || instance.reserved_cash < -EPS
+        {
+            return Err(format!(
+                "instance `{instance_id}` has invalid weight/cash/reservation"
+            ));
+        }
+        validate_named_values(
+            &format!("instance `{instance_id}` positions"),
+            &instance.positions,
+            true,
+        )?;
+        validate_named_values(
+            &format!("instance `{instance_id}` reserved_positions"),
+            &instance.reserved_positions,
+            true,
+        )?;
+        if instance.reserved_cash
+            > instance.cash + reconciliation_tolerance(instance.cash, instance.reserved_cash)
+        {
+            return Err(format!(
+                "instance `{instance_id}` reserves more cash than it owns"
+            ));
+        }
+        for (token, reserved) in &instance.reserved_positions {
+            let owned = instance.positions.get(token).copied().unwrap_or(0.0);
+            if *reserved > owned + reconciliation_tolerance(owned, *reserved) {
+                return Err(format!(
+                    "instance `{instance_id}` reserves more `{token}` than it owns"
+                ));
+            }
+        }
+        for (condition_id, interest) in &instance.token_interests {
+            if condition_id.trim().is_empty()
+                || interest.condition_id != *condition_id
+                || interest.instance_id != *instance_id
+                || interest.up_token_id.trim().is_empty()
+                || interest.down_token_id.trim().is_empty()
+                || interest.up_token_id == interest.down_token_id
+            {
+                return Err(format!(
+                    "instance `{instance_id}` has invalid token interest `{condition_id}`"
+                ));
+            }
+        }
+    }
+
+    for (token, owner) in &state.provisional_position_owners {
+        if token.trim().is_empty()
+            || !state.physical_positions.contains_key(token)
+            || !state.instances.contains_key(owner)
+            || state
+                .instances
+                .get(owner)
+                .and_then(|instance| instance.positions.get(token))
+                .is_none_or(|quantity| *quantity <= EPS)
+        {
+            return Err(format!(
+                "invalid provisional owner token={token:?} owner={owner:?}"
+            ));
+        }
+    }
+
+    for (coid, order) in &state.orders {
+        let tolerance = order.quantity.abs().max(1.0) * 1e-8;
+        if coid.trim().is_empty()
+            || order.client_order_id != *coid
+            || order.account_id != account_id
+            || !state.instances.contains_key(&order.instance_id)
+            || order.order_id.trim().is_empty()
+            || order.token_id.trim().is_empty()
+            || !order.quantity.is_finite()
+            || order.quantity <= 0.0
+            || !order.filled_quantity.is_finite()
+            || order.filled_quantity < -tolerance
+            || order.filled_quantity > order.quantity + tolerance
+            || !order.price.is_finite()
+            || order.price <= 0.0
+            || order.price >= 1.0
+            || !order.reserved_cash.is_finite()
+            || order.reserved_cash < -EPS
+            || !order.reserved_quantity.is_finite()
+            || order.reserved_quantity < -EPS
+            || order.terminal_matched_quantity.is_some_and(|quantity| {
+                !quantity.is_finite()
+                    || quantity < -tolerance
+                    || quantity > order.quantity + tolerance
+            })
+        {
+            return Err(format!(
+                "order `{coid}` contains invalid ownership/accounting fields"
+            ));
+        }
+    }
+
+    let mut max_trade_generation = 0_u64;
+    for (trade_key, trade) in &state.trades {
+        let ownership = &trade.ownership;
+        max_trade_generation = max_trade_generation.max(trade.ledger_generation);
+        if trade_key.trim().is_empty()
+            || ownership.trade_key != *trade_key
+            || ownership.account_id != account_id
+            || !state.instances.contains_key(&ownership.instance_id)
+            || ownership.client_order_id.trim().is_empty()
+            || ownership.order_id.trim().is_empty()
+            || ownership.token_id.trim().is_empty()
+            || !ownership.quantity.is_finite()
+            || ownership.quantity <= 0.0
+            || !ownership.price.is_finite()
+            || ownership.price <= 0.0
+            || ownership.price >= 1.0
+            || !trade.usdc_fee.is_finite()
+            || trade.usdc_fee < -EPS
+            || !trade.shares_fee.is_finite()
+            || trade.shares_fee < -EPS
+        {
+            return Err(format!(
+                "trade `{trade_key}` contains invalid ownership/accounting fields"
+            ));
+        }
+    }
+    if max_trade_generation > state.ledger_generation {
+        return Err(format!(
+            "trade generation {max_trade_generation} exceeds ledger generation {}",
+            state.ledger_generation,
+        ));
+    }
+
+    for (token, config) in &state.token_fee_configs {
+        if token.trim().is_empty()
+            || !config.rate.is_finite()
+            || config.rate < 0.0
+            || !config.exponent.is_finite()
+            || config.exponent < 0.0
+        {
+            return Err(format!("invalid token fee config `{token}`"));
+        }
+    }
+    for (token, value) in &state.settled_token_values {
+        if token.trim().is_empty() || !value.is_finite() || !(*value == 0.0 || *value == 1.0) {
+            return Err(format!("invalid settled token value `{token}`={value}"));
+        }
+    }
+    for (sidecar_id, checkpoint) in &state.sidecar_checkpoints {
+        if sidecar_id.trim().is_empty()
+            || checkpoint.generation == 0
+            || checkpoint.expected_entries == 0
+            || checkpoint.recovery_payload.trim().is_empty()
+        {
+            return Err(format!("invalid sidecar checkpoint `{sidecar_id}`"));
+        }
+    }
+    for (operation_id, operation) in &state.maintenance_ops {
+        if operation_id.trim().is_empty()
+            || operation.operation_id != *operation_id
+            || operation.condition_id.trim().is_empty()
+            || operation.up_token_id.trim().is_empty()
+            || operation.down_token_id.trim().is_empty()
+            || operation.up_token_id == operation.down_token_id
+            || operation.allocations.iter().any(|(instance_id, value)| {
+                !state.instances.contains_key(instance_id) || !value.is_finite() || *value < 0.0
+            })
+        {
+            return Err(format!("invalid maintenance operation `{operation_id}`"));
+        }
+    }
+    for (operation_id, adjustment) in &state.external_adjustments {
+        if operation_id.trim().is_empty()
+            || adjustment.operation_id != *operation_id
+            || !state.instances.contains_key(&adjustment.instance_id)
+            || !adjustment.cash_delta.is_finite()
+        {
+            return Err(format!("invalid external adjustment `{operation_id}`"));
+        }
+        validate_named_values(
+            &format!("external adjustment `{operation_id}` deltas"),
+            &adjustment.position_deltas,
+            false,
+        )?;
+    }
+    Ok(())
 
 }
 
@@ -4045,6 +4355,11 @@ fn redistribute_all(state: &mut SharedAccountState) {
         instance.cash = state.physical_cash * fraction;
         instance.positions.clear();
     }
+    let physical_tokens: HashSet<String> = state.physical_positions.keys().cloned().collect();
+    let instance_ids: HashSet<String> = state.instances.keys().cloned().collect();
+    state
+        .provisional_position_owners
+        .retain(|token, owner| physical_tokens.contains(token) && instance_ids.contains(owner));
     let has_any_interest = state.instances.values()
         .any(|instance| !instance.token_interests.is_empty());
     for (token, qty) in &state.physical_positions {
@@ -4069,9 +4384,31 @@ fn redistribute_all(state: &mut SharedAccountState) {
             .map(|(instance_id, _)| instance_id.clone())
             .collect();
         if owners.is_empty() {
-            state.unallocated_positions.insert(token.clone(), *qty);
+            let owner = state
+                .provisional_position_owners
+                .get(token)
+                .filter(|owner| state.instances.contains_key(*owner))
+                .cloned()
+                .or_else(|| state.instances.keys().next().cloned());
+            if let Some(owner) = owner {
+                state
+                    .provisional_position_owners
+                    .insert(token.clone(), owner.clone());
+                if let Some(instance) = state.instances.get_mut(&owner) {
+                    instance.positions.insert(token.clone(), *qty);
+                }
+                log::warn!(
+                    "[shared_account] provisionally attributed unmatched startup token={} quantity={:.8} owner={}",
+                    token,
+                    qty,
+                    owner,
+                );
+            } else {
+                state.unallocated_positions.insert(token.clone(), *qty);
+            }
             continue;
         }
+        state.provisional_position_owners.remove(token);
         let owner_qty = *qty / owners.len() as f64;
         for instance_id in owners {
             if let Some(instance) = state.instances.get_mut(&instance_id) {
@@ -4086,6 +4423,13 @@ fn redistribute_all(state: &mut SharedAccountState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persistence_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn seeded_account() -> SharedAccount {
         let account = SharedAccount::new("acct");
@@ -4811,32 +5155,102 @@ mod tests {
     fn physical_snapshot_generation_ignores_duplicate_and_stale_fanout() {
         let account = SharedAccount::new("acct");
         account.register_instance("a", 1.0);
-        assert!(account.apply_scoped_physical_snapshot_versioned(
-            2,
-            400.0,
-            HashMap::new(),
-            HashSet::new(),
-        ));
-        assert!(!account.apply_scoped_physical_snapshot_versioned(
-            2,
-            100.0,
-            HashMap::new(),
-            HashSet::new(),
-        ));
-        assert!(!account.apply_scoped_physical_snapshot_versioned(
-            1,
-            200.0,
-            HashMap::new(),
-            HashSet::new(),
-        ));
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(2, 400.0, HashMap::new(), HashSet::new(),)
+            .unwrap());
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(2, 100.0, HashMap::new(), HashSet::new(),)
+            .unwrap());
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(1, 200.0, HashMap::new(), HashSet::new(),)
+            .unwrap());
         assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
-        assert!(!account.apply_scoped_physical_snapshot_versioned(
-            3,
-            500.0,
-            HashMap::new(),
-            HashSet::new(),
-        ));
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(3, 500.0, HashMap::new(), HashSet::new(),)
+            .unwrap());
         assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
+    }
+
+    #[test]
+    fn invalid_physical_snapshot_is_rejected_without_consuming_generation() {
+        let account = SharedAccount::new("strict-snapshot");
+        account.register_instance("a", 1.0);
+        let scope = HashSet::from(["UP".to_string()]);
+
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(1, f64::NAN, HashMap::new(), scope.clone(),)
+            .is_err());
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                100.0,
+                HashMap::from([("UP".to_string(), f64::INFINITY)]),
+                scope.clone(),
+            )
+            .is_err());
+        assert!(!account.is_seeded());
+        assert!(!account.startup_snapshot_applied());
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                100.0,
+                HashMap::from([("UP".to_string(), 5.0)]),
+                scope,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn unmatched_startup_position_gets_persistent_provisional_owner() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-provisional-owner-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("provisional", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.register_instance("b", 1.0);
+            account
+                .register_token_interest("b", "live", "LIVE-UP", "LIVE-DOWN")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([
+                        ("LIVE-UP".to_string(), 10.0),
+                        ("HISTORICAL-WIN".to_string(), 7.0),
+                    ]),
+                )
+                .unwrap();
+            let snapshot = account.monitoring_snapshot();
+            assert_eq!(
+                snapshot.provisional_position_owners.get("HISTORICAL-WIN"),
+                Some(&"a".to_string()),
+            );
+            assert_eq!(
+                account.instance_snapshot("a").unwrap().positions["HISTORICAL-WIN"],
+                7.0,
+            );
+            assert!(!snapshot
+                .unallocated_positions
+                .contains_key("HISTORICAL-WIN"));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("provisional", &path).unwrap();
+        assert_eq!(
+            restored
+                .monitoring_snapshot()
+                .provisional_position_owners
+                .get("HISTORICAL-WIN"),
+            Some(&"a".to_string()),
+        );
+        drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]
@@ -4972,12 +5386,14 @@ mod tests {
         // This wallet view may already contain trade-buy, but a snapshot has no
         // trade id and therefore cannot prove that fact. Preserve the trade-
         // driven physical ledger until the lifecycle edge arrives.
-        assert!(!account.apply_scoped_physical_snapshot_versioned(
-            1,
-            395.0,
-            HashMap::from([("UP".into(), 50.0)]),
-            HashSet::from(["UP".into()]),
-        ));
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                395.0,
+                HashMap::from([("UP".into(), 50.0)]),
+                HashSet::from(["UP".into()]),
+            )
+            .unwrap());
         assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
         assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 40.0);
 
@@ -4988,12 +5404,14 @@ mod tests {
             .unwrap();
         assert_eq!(account.monitoring_snapshot().physical_cash, 395.0);
         assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 50.0);
-        assert!(account.apply_scoped_physical_snapshot_versioned(
-            1,
-            395.0,
-            HashMap::from([("UP".into(), 50.0)]),
-            HashSet::from(["UP".into()]),
-        ));
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                395.0,
+                HashMap::from([("UP".into(), 50.0)]),
+                HashSet::from(["UP".into()]),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -5213,6 +5631,7 @@ mod tests {
 
     #[test]
     fn persistent_submitted_maintenance_operation_forces_restart_recovery() {
+        let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
             "hexagent-maintenance-ledger-{}-{}.json",
             std::process::id(),
@@ -5350,18 +5769,22 @@ mod tests {
         account.register_market_scope("eth", "eth-up-or-down-5m");
         account.register_token_interest("btc-a", "btc-event", "BTC-UP", "BTC-DOWN").unwrap();
         let tokens = HashSet::from(["BTC-UP".to_string(), "BTC-DOWN".to_string()]);
-        assert!(!account.apply_scoped_physical_snapshot_versioned(
-            7, 90.0,
-            HashMap::from([("BTC-UP".into(), 40.0), ("BTC-DOWN".into(), 40.0)]),
-            tokens.clone(),
-        ));
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(
+                7, 90.0,
+                HashMap::from([("BTC-UP".into(), 40.0), ("BTC-DOWN".into(), 40.0)]),
+                tokens.clone(),
+            )
+            .unwrap());
         assert!(!account.monitoring_snapshot().seeded);
         account.register_token_interest("btc-b", "btc-event", "BTC-UP", "BTC-DOWN").unwrap();
-        assert!(account.apply_scoped_physical_snapshot_versioned(
-            7, 90.0,
-            HashMap::from([("BTC-UP".into(), 40.0), ("BTC-DOWN".into(), 40.0)]),
-            tokens,
-        ));
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                7, 90.0,
+                HashMap::from([("BTC-UP".into(), 40.0), ("BTC-DOWN".into(), 40.0)]),
+                tokens,
+            )
+            .unwrap());
         assert_eq!(account.instance_snapshot("btc-a").unwrap().positions["BTC-UP"], 20.0);
         assert_eq!(account.instance_snapshot("btc-b").unwrap().positions["BTC-UP"], 20.0);
         assert!(!account.instance_snapshot("eth").unwrap().positions.contains_key("BTC-UP"));
@@ -5383,12 +5806,14 @@ mod tests {
                     .saturating_sub(1),
             );
         }
-        assert!(account.apply_scoped_physical_snapshot_versioned(
-            9,
-            100.0,
-            HashMap::from([("BTC-UP".into(), 40.0)]),
-            HashSet::from(["BTC-UP".into(), "BTC-DOWN".into()]),
-        ));
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                9,
+                100.0,
+                HashMap::from([("BTC-UP".into(), 40.0)]),
+                HashSet::from(["BTC-UP".into(), "BTC-DOWN".into()]),
+            )
+            .unwrap());
         assert_eq!(account.instance_snapshot("btc-a").unwrap().cash, 50.0);
         assert_eq!(account.instance_snapshot("btc-b").unwrap().cash, 50.0);
         assert_eq!(account.instance_snapshot("btc-a").unwrap().positions["BTC-UP"], 40.0);
@@ -5594,6 +6019,7 @@ mod tests {
 
     #[test]
     fn persistent_ledger_restores_ownership_orders_and_reservations() {
+        let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
             "hexagent-shared-account-{}-{}.json",
             std::process::id(),
@@ -5666,7 +6092,80 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_checkpoint_is_monotonic_and_durable() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-sidecar-checkpoint-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("sidecar", &path).unwrap();
+            assert!(account
+                .record_sidecar_checkpoint(
+                    "maker-a",
+                    DurableSidecarCheckpoint {
+                        generation: 2,
+                        expected_entries: 3,
+                        recovery_payload: "{\"generation\":2}".to_string(),
+                    },
+                )
+                .unwrap());
+            assert!(!account
+                .record_sidecar_checkpoint(
+                    "maker-a",
+                    DurableSidecarCheckpoint {
+                        generation: 1,
+                        expected_entries: 1,
+                        recovery_payload: "stale".to_string(),
+                    },
+                )
+                .unwrap());
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("sidecar", &path).unwrap();
+        let checkpoint = restored.sidecar_checkpoint("maker-a").unwrap();
+        assert_eq!(checkpoint.generation, 2);
+        assert_eq!(checkpoint.expected_entries, 3);
+        drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn parseable_ledger_with_negative_reservation_is_rejected() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-invalid-ledger-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let mut state = SharedAccountState::default();
+        state.seeded = true;
+        state.physical_cash = 100.0;
+        let mut instance = InstanceLedger::new(1.0);
+        instance.cash = 100.0;
+        instance.reserved_cash = -5.0;
+        state.instances.insert("a".to_string(), instance);
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: "invalid".to_string(),
+                state,
+            },
+        )
+        .unwrap();
+        let error = SharedAccount::new_persistent("invalid", &path).unwrap_err();
+        assert!(error.contains("invalid account ledger"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn duplicate_trade_context_replay_does_not_flush_unchanged_ledger() {
+        let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
             "hexagent-duplicate-trade-ledger-{}-{}.json",
             std::process::id(),

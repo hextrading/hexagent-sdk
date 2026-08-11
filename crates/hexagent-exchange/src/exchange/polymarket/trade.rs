@@ -98,11 +98,25 @@ impl FetchOrderResult {
     }
 }
 
-fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
-    let raw_status = json.get("status").and_then(|value| value.as_str())?;
-    let status = match raw_status.to_ascii_uppercase().as_str() {
+fn parse_fetched_order(json: &serde_json::Value) -> std::result::Result<FetchedOrder, ()> {
+    let raw_status = json
+        .as_object()
+        .and_then(|object| object.get("status"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(())?;
+    let normalized = raw_status.to_ascii_uppercase();
+    let normalized = normalized
+        .strip_prefix("ORDER_STATUS_")
+        .unwrap_or(&normalized);
+    let status = match normalized {
+        "LIVE" | "MATCHED" | "FILLED" | "INVALID" => normalized.to_string(),
         "MATCHED_NOT_BROADCASTED" => "MATCHED".to_string(),
-        normalized => normalized.to_string(),
+        value if value.starts_with("CANCELED") || value.starts_with("CANCELLED") => {
+            value.to_string()
+        }
+        _ => return Err(()),
     };
     let string_field = |name: &str| {
         json.get(name).and_then(|value| match value {
@@ -120,7 +134,7 @@ fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
             .map(str::to_string)
             .collect())
         .unwrap_or_default();
-    Some(FetchedOrder {
+    Ok(FetchedOrder {
         status,
         audit: AuthoritativeOrderAudit {
             original_size: string_field("original_size"),
@@ -279,15 +293,15 @@ fn placement_response_status(
     }
 }
 
-/// Classify a successful singular-order lookup. Polymarket's live endpoint has
-/// represented an absent order as null/empty JSON as well as other payloads
-/// without a parseable `status`; all such HTTP-success responses are the
-/// reconcile path's not-found result. Transport/service failures never reach
-/// this classifier.
+/// Classify a successful singular-order lookup. HTTP success proves only that
+/// an intermediary returned 2xx; it does not prove that an order is absent.
+/// Only the transport-level 404 branch in `fetch_order_by_id` produces
+/// `NotFound`. Missing fields, error envelopes and unknown future status values
+/// remain unavailable evidence so they cannot advance orphan terminalization.
 fn classify_successful_order_lookup(json: &serde_json::Value) -> FetchOrderResult {
     match parse_fetched_order(json) {
-        Some(order) => FetchOrderResult::Found(order),
-        None => FetchOrderResult::NotFound,
+        Ok(order) => FetchOrderResult::Found(order),
+        Err(()) => FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse),
     }
 }
 
@@ -6584,7 +6598,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_order_lookup_without_status_is_not_found() {
+    fn successful_order_lookup_requires_documented_status_envelope() {
         for json in [
             serde_json::Value::Null,
             serde_json::json!({}),
@@ -6595,15 +6609,24 @@ mod tests {
             assert!(
                 matches!(
                     classify_successful_order_lookup(&json),
-                    FetchOrderResult::NotFound
+                    FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
                 ),
                 "json={json}",
             );
         }
 
         assert!(matches!(
+            classify_successful_order_lookup(&serde_json::json!({"status": "FUTURE_STATUS"})),
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+        ));
+
+        assert!(matches!(
             classify_successful_order_lookup(&serde_json::json!({"status": "LIVE"})),
             FetchOrderResult::Found(FetchedOrder { status, .. }) if status == "LIVE"
+        ));
+        assert!(matches!(
+            classify_successful_order_lookup(&serde_json::json!({"status": "ORDER_STATUS_MATCHED"})),
+            FetchOrderResult::Found(FetchedOrder { status, .. }) if status == "MATCHED"
         ));
     }
 
