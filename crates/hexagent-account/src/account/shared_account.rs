@@ -4141,6 +4141,13 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 ));
             }
         }
+        if instance
+            .market_scopes
+            .iter()
+            .any(|scope| scope.trim().is_empty())
+        {
+            return Err(format!("instance `{instance_id}` has an empty market scope"));
+        }
     }
 
     for (token, owner) in &state.provisional_position_owners {
@@ -4191,10 +4198,44 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         }
     }
 
+    for (order_id, coid) in &state.oid_to_coid {
+        let Some(order) = state.orders.get(coid) else {
+            return Err(format!(
+                "order-id mapping `{order_id}` points to missing coid `{coid}`"
+            ));
+        };
+        if order_id.trim().is_empty()
+            || normalize_order_id(&order.order_id) != *order_id
+        {
+            return Err(format!(
+                "order-id mapping `{order_id}` disagrees with order `{coid}`"
+            ));
+        }
+    }
+    for (coid, order) in &state.orders {
+        if state
+            .oid_to_coid
+            .get(&normalize_order_id(&order.order_id))
+            .is_none_or(|mapped| mapped != coid)
+        {
+            return Err(format!("order `{coid}` is missing its durable order-id mapping"));
+        }
+    }
+
     let mut max_trade_generation = 0_u64;
     for (trade_key, trade) in &state.trades {
         let ownership = &trade.ownership;
         max_trade_generation = max_trade_generation.max(trade.ledger_generation);
+        let known_status = matches!(
+            ownership.status.as_str(),
+            "MATCHED" | "MINED" | "CONFIRMED" | "FAILED"
+        );
+        let parent_matches = state.orders.get(&ownership.client_order_id).is_some_and(|order| {
+            order.instance_id == ownership.instance_id
+                && normalize_order_id(&order.order_id) == normalize_order_id(&ownership.order_id)
+                && order.token_id == ownership.token_id
+                && order.side == ownership.side
+        });
         if trade_key.trim().is_empty()
             || ownership.trade_key != *trade_key
             || ownership.account_id != account_id
@@ -4211,6 +4252,17 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || trade.usdc_fee < -EPS
             || !trade.shares_fee.is_finite()
             || trade.shares_fee < -EPS
+            || !known_status
+            || trade.failed != (ownership.status == "FAILED")
+            || (trade.failed
+                && (trade.booked
+                    || trade.physical_booked
+                    || trade.virtual_fee_booked
+                    || trade.physical_fee_booked))
+            || (!trade.failed && !trade.booked)
+            || trade.physical_fee_booked && !trade.physical_booked
+            || trade.virtual_fee_booked && !trade.booked
+            || !parent_matches
         {
             return Err(format!(
                 "trade `{trade_key}` contains invalid ownership/accounting fields"
@@ -4222,6 +4274,23 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             "trade generation {max_trade_generation} exceeds ledger generation {}",
             state.ledger_generation,
         ));
+    }
+
+    for trade_key in &state.fee_attribution_pending {
+        if state.trades.get(trade_key).is_none_or(|trade| {
+            trade.failed || !trade.booked || trade.virtual_fee_booked
+        }) {
+            return Err(format!(
+                "fee-attribution pending set contains invalid trade `{trade_key}`"
+            ));
+        }
+    }
+    for coid in &state.recovery_pending_orders {
+        if !state.orders.contains_key(coid) {
+            return Err(format!(
+                "recovery pending set contains missing order `{coid}`"
+            ));
+        }
     }
 
     for (token, config) in &state.token_fee_configs {
@@ -4246,6 +4315,14 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || checkpoint.recovery_payload.trim().is_empty()
         {
             return Err(format!("invalid sidecar checkpoint `{sidecar_id}`"));
+        }
+        if !matches!(
+            serde_json::from_str::<serde_json::Value>(&checkpoint.recovery_payload),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            return Err(format!(
+                "sidecar checkpoint `{sidecar_id}` has an invalid recovery payload"
+            ));
         }
     }
     for (operation_id, operation) in &state.maintenance_ops {
@@ -4275,6 +4352,37 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             &adjustment.position_deltas,
             false,
         )?;
+    }
+    for (operation_id, migration) in &state.cash_allocation_migrations {
+        if operation_id.trim().is_empty()
+            || migration.operation_id != *operation_id
+            || migration.target_weights.is_empty()
+            || migration.target_weights.iter().any(|(instance_id, value)| {
+                instance_id.trim().is_empty() || !value.is_finite() || *value <= 0.0
+            })
+            || migration.cash_before.iter().any(|(instance_id, value)| {
+                instance_id.trim().is_empty() || !value.is_finite() || *value < -EPS
+            })
+            || migration.cash_after.iter().any(|(instance_id, value)| {
+                instance_id.trim().is_empty() || !value.is_finite() || *value < -EPS
+            })
+        {
+            return Err(format!("invalid cash allocation migration `{operation_id}`"));
+        }
+    }
+    if state
+        .ownership_anomalies
+        .iter()
+        .any(|(key, reason)| key.trim().is_empty() || reason.trim().is_empty())
+    {
+        return Err("invalid durable ownership anomaly".to_string());
+    }
+    if state
+        .unresolved_trade_match_times
+        .keys()
+        .any(|trade_key| trade_key.trim().is_empty())
+    {
+        return Err("invalid unresolved trade match-time entry".to_string());
     }
     Ok(())
 
@@ -6161,6 +6269,74 @@ mod tests {
         let error = SharedAccount::new_persistent("invalid", &path).unwrap_err();
         assert!(error.contains("invalid account ledger"), "{error}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisted_state_validator_rejects_dangling_mappings_and_unknown_trade_status() {
+        let mut state = SharedAccountState::default();
+        state.physical_cash = 100.0;
+        let mut instance = InstanceLedger::new(1.0);
+        instance.cash = 100.0;
+        instance.reserved_cash = 5.0;
+        state.instances.insert("maker".to_string(), instance);
+        state.orders.insert(
+            "maker-order".to_string(),
+            OrderOwnership {
+                account_id: "account".to_string(),
+                instance_id: "maker".to_string(),
+                client_order_id: "maker-order".to_string(),
+                order_id: "0xABC".to_string(),
+                token_id: "UP".to_string(),
+                side: Side::Buy,
+                quantity: 10.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 5.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        let mapping_error = validate_persisted_state("account", &state).unwrap_err();
+        assert!(mapping_error.contains("missing its durable order-id mapping"));
+
+        state
+            .oid_to_coid
+            .insert("abc".to_string(), "maker-order".to_string());
+        assert!(validate_persisted_state("account", &state).is_ok());
+
+        state.ledger_generation = 1;
+        state.trades.insert(
+            "trade".to_string(),
+            AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: "account".to_string(),
+                    instance_id: "maker".to_string(),
+                    trade_key: "trade".to_string(),
+                    client_order_id: "maker-order".to_string(),
+                    order_id: "0xABC".to_string(),
+                    token_id: "UP".to_string(),
+                    side: Side::Buy,
+                    quantity: 1.0,
+                    price: 0.5,
+                    status: "FUTURE_STATUS".to_string(),
+                },
+                booked: true,
+                physical_booked: false,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: false,
+                physical_fee_booked: false,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: 1,
+            },
+        );
+        let trade_error = validate_persisted_state("account", &state).unwrap_err();
+        assert!(trade_error.contains("trade `trade` contains invalid"));
     }
 
     #[test]
