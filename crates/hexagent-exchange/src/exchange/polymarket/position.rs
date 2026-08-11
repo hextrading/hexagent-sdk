@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use log::info;
@@ -27,6 +27,50 @@ struct ApiPosition {
     current_value: f64,
     outcome: String,
     title: Option<String>,
+    #[serde(default)]
+    redeemable: bool,
+}
+
+#[derive(Debug)]
+pub struct PositionSnapshot {
+    pub positions: HashMap<String, Position>,
+    pub settled_token_values: HashMap<String, f64>,
+}
+
+fn position_snapshot_from_rows(resp: &[ApiPosition]) -> PositionSnapshot {
+    let resolved_conditions: HashSet<&str> = resp.iter()
+        .filter(|position| position.redeemable)
+        .map(|position| position.condition_id.as_str())
+        .collect();
+    let mut positions = HashMap::new();
+    let mut settled_token_values = HashMap::new();
+    for p in resp {
+        if p.size <= 0.0 { continue; }
+        if p.asset.is_empty() {
+            log::warn!("[Polymarket] Position record missing 'asset' field — skipped (cid={} outcome={})",
+                p.condition_id, p.outcome);
+            continue;
+        }
+        positions.insert(p.asset.clone(), Position {
+            quantity: p.size,
+            avg_price: p.avg_price,
+            current_value: p.current_value,
+        });
+        if resolved_conditions.contains(p.condition_id.as_str()) {
+            let unit_value = p.current_value / p.size;
+            let settled_value = if unit_value.is_finite() && unit_value.abs() <= 1e-8 {
+                Some(0.0)
+            } else if unit_value.is_finite() && (unit_value - 1.0).abs() <= 1e-8 {
+                Some(1.0)
+            } else {
+                None
+            };
+            if let Some(value) = settled_value {
+                settled_token_values.insert(p.asset.clone(), value);
+            }
+        }
+    }
+    PositionSnapshot { positions, settled_token_values }
 }
 
 /// Fetch current positions from Polymarket Data API.
@@ -36,7 +80,7 @@ struct ApiPosition {
 /// separate entries — we do NOT collapse by conditionId.
 ///
 /// API: `GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0`
-pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>> {
+pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot> {
     info!("[Polymarket] Fetching positions for {}", wallet_address);
 
     // Route through the shared async runtime + HTTP/2 client.
@@ -77,37 +121,14 @@ pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>
         ))
     })?;
 
-    let mut positions = HashMap::new();
-    for p in &resp {
-        if p.size <= 0.0 {
-            continue;
-        }
-        // Skip records without an asset field (shouldn't happen against
-        // the public data-api, but defensive).
-        if p.asset.is_empty() {
-            log::warn!("[Polymarket] Position record missing 'asset' field — skipped (cid={} outcome={})",
-                p.condition_id, p.outcome);
-            continue;
-        }
-        // Key by CLOB token id — matches what BinaryOption.clob_token_ids
-        // uses so downstream `PositionManager::get_quantity(token_id)`
-        // lookups hit.
-        positions.insert(
-            p.asset.clone(),
-            Position {
-                quantity: p.size,
-                avg_price: p.avg_price,
-                current_value: p.current_value,
-            },
-        );
-    }
+    let snapshot = position_snapshot_from_rows(&resp);
 
     info!(
         "[Polymarket] Fetched {} positions ({} raw records)",
-        positions.len(),
+        snapshot.positions.len(),
         resp.len(),
     );
-    for (token_id, pos) in &positions {
+    for (token_id, pos) in &snapshot.positions {
         let short: String = token_id.chars().take(16).collect();
         info!(
             "[Polymarket]   token={}... qty={:.4} avg_price={:.4}",
@@ -115,7 +136,11 @@ pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>
         );
     }
 
-    Ok(positions)
+    Ok(snapshot)
+}
+
+pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>> {
+    Ok(fetch_position_snapshot(wallet_address)?.positions)
 }
 
 /// Raw balance record from Polymarket Data API.
@@ -203,6 +228,32 @@ pub fn try_fetch_balance_and_positions_versioned(
     Ok((balance, positions))
 }
 
+/// Strict account snapshot plus authoritative historical 0/1 outcomes from
+/// the same Data API response.
+pub fn try_fetch_balance_positions_and_settlements_versioned(
+    wallet_address: &str,
+    is_v2: bool,
+) -> Result<(f64, HashMap<String, Position>, HashMap<String, f64>)> {
+    let token = active_collateral_token(is_v2);
+    let wb = wallet_address.to_string();
+    let tok = token.to_string();
+    let t_bal = std::thread::Builder::new()
+        .name("poly-fetch-balance".into())
+        .spawn(move || fetch_balance_for_token(&wb, &tok))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
+    let wp = wallet_address.to_string();
+    let t_pos = std::thread::Builder::new()
+        .name("poly-fetch-positions".into())
+        .spawn(move || fetch_position_snapshot(&wp))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
+
+    let balance = t_bal.join()
+        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
+    let snapshot = t_pos.join()
+        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    Ok((balance, snapshot.positions, snapshot.settled_token_values))
+}
+
 /// Legacy bare balance fetch — returns USDC.e. Kept for CLI callers
 /// (`wallet.rs` et al.) that don't track CLOB version. Strategy and
 /// live-position paths should use `fetch_balance_for_token` directly
@@ -267,4 +318,38 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
         "eth_call balanceOf failed for token {} and no data-api fallback for non-USDC.e tokens",
         token,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
+        ApiPosition {
+            asset: asset.to_string(), condition_id: condition.to_string(), size,
+            avg_price: 0.4, current_value: value, outcome: asset.to_string(),
+            title: None, redeemable,
+        }
+    }
+
+    #[test]
+    fn redeemable_condition_discovers_zero_and_one_outcomes() {
+        let snapshot = position_snapshot_from_rows(&[
+            row("winner", "resolved", 3.0, 3.0, true),
+            row("loser", "resolved", 4.0, 0.0, false),
+            row("active", "active", 2.0, 1.0, false),
+        ]);
+        assert_eq!(snapshot.settled_token_values.get("winner"), Some(&1.0));
+        assert_eq!(snapshot.settled_token_values.get("loser"), Some(&0.0));
+        assert!(!snapshot.settled_token_values.contains_key("active"));
+    }
+
+    #[test]
+    fn redeemable_metadata_does_not_authorize_non_binary_unit_values() {
+        let snapshot = position_snapshot_from_rows(&[
+            row("ambiguous", "resolved", 2.0, 1.0, true),
+        ]);
+        assert!(snapshot.settled_token_values.is_empty());
+        assert_eq!(snapshot.positions["ambiguous"].quantity, 2.0);
+    }
 }
