@@ -8184,6 +8184,7 @@ mod market_router_tests {
             symbol: symbol.into(),
             old_tick_size: 0.01,
             new_tick_size: 0.001,
+            exchange_timestamp_ns: 1,
             local_timestamp_ns: 1,
         })
     }

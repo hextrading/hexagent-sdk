@@ -678,6 +678,7 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                         symbol: symbol.to_string(),
                         old_tick_size: quantity_col.map(|c| c.value(i)).unwrap_or(0.0),
                         new_tick_size: price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                        exchange_timestamp_ns: exchange_ts,
                         local_timestamp_ns: local_ts,
                     })
                 }

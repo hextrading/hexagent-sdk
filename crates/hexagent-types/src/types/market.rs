@@ -179,6 +179,10 @@ pub struct TickSizeChange {
     pub symbol: String,
     pub old_tick_size: f64,
     pub new_tick_size: f64,
+    /// Exchange event time. Legacy recordings deserialize this as zero and
+    /// readers should substitute their recorded event timestamp.
+    #[serde(default)]
+    pub exchange_timestamp_ns: u64,
     pub local_timestamp_ns: u64,
 }
 

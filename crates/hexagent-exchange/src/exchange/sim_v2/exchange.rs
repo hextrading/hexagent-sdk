@@ -2805,6 +2805,7 @@ mod tests {
             symbol: "up".into(),
             old_tick_size: 0.01,
             new_tick_size: 0.001,
+            exchange_timestamp_ns: 2,
             local_timestamp_ns: 2,
         };
         c.on_tick_size_change(&tsc);
@@ -2833,6 +2834,7 @@ mod tests {
             symbol: "down".into(),
             old_tick_size: 0.01,
             new_tick_size: 0.001,
+            exchange_timestamp_ns: 1,
             local_timestamp_ns: 1,
         };
         c.on_tick_size_change(&tsc);
