@@ -196,6 +196,63 @@ fn validate_order_for_signing(order: &OrderRequest) -> Result<f64> {
     Ok(price)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementResponse {
+    success: bool,
+    order_id: String,
+    status: String,
+    error_msg: String,
+}
+
+/// Validate the minimum response envelope needed to make an irreversible
+/// placement decision. HTTP 2xx only proves that an intermediary returned a
+/// successful status; missing/wrongly-typed fields leave server-side order
+/// state unknown and must be reconciled rather than released as Rejected.
+fn parse_placement_response(value: &serde_json::Value) -> std::result::Result<PlacementResponse, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "placement response is not an object".to_string())?;
+    let success = object
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "placement response is missing boolean success".to_string())?;
+    let order_id = object
+        .get("orderID")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let error_msg = object
+        .get("errorMsg")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if success && order_id.is_empty() {
+        return Err("successful placement response is missing orderID".to_string());
+    }
+    if !success
+        && object
+            .get("errorMsg")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err("rejected placement response is missing string errorMsg".to_string());
+    }
+
+    Ok(PlacementResponse {
+        success,
+        order_id,
+        status,
+        error_msg,
+    })
+}
+
 fn placement_response_status(
     success: bool,
     raw_status: &str,
@@ -242,6 +299,11 @@ pub(crate) enum HttpErr {
     /// server may still have accepted the signed order, so submit callers
     /// must reconcile it instead of treating it as a definitive rejection.
     Transport(String),
+    /// An HTTP-success response was received, but its body could not be
+    /// decoded into the documented JSON representation. Placement callers
+    /// must treat this as ambiguous: the server may have committed the order
+    /// before returning a truncated/proxy-corrupted body.
+    InvalidResponse(String),
     Other(String),
 }
 
@@ -251,6 +313,7 @@ impl std::fmt::Display for HttpErr {
             HttpErr::Timeout => write!(f, "timeout"),
             HttpErr::Status(code, body) => write!(f, "status {} ({})", code, body),
             HttpErr::Transport(s) => write!(f, "transport: {}", s),
+            HttpErr::InvalidResponse(s) => write!(f, "invalid response: {}", s),
             HttpErr::Other(s) => write!(f, "{}", s),
         }
     }
@@ -278,7 +341,9 @@ impl HttpErr {
             HttpErr::Timeout => FetchUnavailable::Timeout,
             HttpErr::Transport(_) => FetchUnavailable::Transport,
             HttpErr::Status(code, _) => FetchUnavailable::Http(*code),
-            HttpErr::Other(_) => FetchUnavailable::InvalidResponse,
+            HttpErr::InvalidResponse(_) | HttpErr::Other(_) => {
+                FetchUnavailable::InvalidResponse
+            }
         }
     }
 
@@ -307,6 +372,7 @@ impl HttpErr {
             HttpErr::Timeout => true,
             HttpErr::Status(code, _) => *code >= 500 || *code == 425,
             HttpErr::Transport(_) => false,
+            HttpErr::InvalidResponse(_) => false,
             HttpErr::Other(_) => false,
         }
     }
@@ -317,7 +383,8 @@ impl HttpErr {
     /// response reached us. Keep this separate from `is_unknown_state` so
     /// adding the transport case does not change cancel/GET semantics.
     pub(crate) fn is_submit_unknown_state(&self) -> bool {
-        self.is_unknown_state() || matches!(self, HttpErr::Transport(_))
+        self.is_unknown_state()
+            || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
     }
 }
 
@@ -848,6 +915,7 @@ fn latency_record_status(reply: &HttpReply) -> String {
         Err(HttpErr::Timeout) => "timeout".to_string(),
         Err(HttpErr::Status(code, _)) => format!("http_{}", code),
         Err(HttpErr::Transport(_)) => "transport_error".to_string(),
+        Err(HttpErr::InvalidResponse(_)) => "invalid_response".to_string(),
         Err(HttpErr::Other(_)) => "error".to_string(),
     }
 }
@@ -968,7 +1036,7 @@ async fn execute_http_on(
         }
     };
     serde_json::from_slice(&bytes)
-        .map_err(|e| HttpErr::Other(format!("json parse: {}", e)))
+        .map_err(|e| HttpErr::InvalidResponse(format!("json parse: {}", e)))
 }
 
 
@@ -1445,6 +1513,48 @@ impl SharedState {
             .unwrap()
             .get(&normalize_order_id(exchange_order_id))
             .cloned()
+    }
+
+    /// Apply a live order status and restore every runtime structure that a
+    /// preceding terminal update may have torn down. Polymarket lifecycle
+    /// messages are not ordered, so Cancelled → Accepted is a valid
+    /// resurrection and must re-lock collateral and re-enter `open_orders`
+    /// as one cross-layer operation.
+    pub(crate) fn mark_order_live(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        side: Side,
+        instance_id: &str,
+        status: OrderStatus,
+    ) -> Option<OrderStatus> {
+        debug_assert!(matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled));
+        let effective = self
+            .account_state
+            .mark_order_status_effective(client_order_id, status);
+        if matches!(effective, Some(OrderStatus::Accepted | OrderStatus::PartiallyFilled)) {
+            self.open_orders.lock().unwrap().insert(
+                client_order_id.to_string(),
+                TrackedOrder {
+                    symbol: symbol.to_string(),
+                    side,
+                    instance_id: instance_id.to_string(),
+                },
+            );
+            self.pending_delayed_orphans
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+            self.reconcile_cancel_not_found_counts
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+            self.cancel_reconcile_next_retry_ns
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+        }
+        effective
     }
 
     /// Drop the order from the **active-order** tracker.
@@ -1969,7 +2079,7 @@ impl SharedState {
     ) -> HttpReply {
         self.http_call_async(method, path, body)
             .recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 
     /// Permit-bound synchronous request. Unlike [`Self::http_call_sync`], this
@@ -1984,7 +2094,7 @@ impl SharedState {
     ) -> HttpReply {
         self.http_call_async_on(client, method, path, body)
             .recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 
     /// [`http_call_sync`] with a latency-CSV kind override — see
@@ -1998,7 +2108,7 @@ impl SharedState {
     ) -> HttpReply {
         self.http_call_async_rec(method, path, body, rec_kind_override)
             .recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 }
 
@@ -2657,8 +2767,15 @@ impl PolymarketTrade {
                     let candidate = if effective_size_matched > 1e-9 {
                         OrderStatus::PartiallyFilled
                     } else { OrderStatus::Accepted };
-                    let live = self.shared.account_state
-                        .mark_order_status_effective(&coid, candidate)
+                    let live = self
+                        .shared
+                        .mark_order_live(
+                            &coid,
+                            &tracked.symbol,
+                            tracked.side,
+                            &tracked.instance_id,
+                            candidate,
+                        )
                         .unwrap_or(candidate);
                     live
                 }
@@ -4025,7 +4142,7 @@ impl PolymarketTrade {
         let PendingSubmit { local_oid, rx } = pending;
         let reply = rx
             .recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
         self.handle_submit_reply(order, &local_oid, reply)
     }
 
@@ -4056,7 +4173,7 @@ impl PolymarketTrade {
         let PendingCancel { ctx, rx } = pending;
         let reply = rx.map(|rx| {
             rx.recv()
-                .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())))
+                .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
         });
         self.handle_cancel_reply(exchange, client_order_id, ctx, reply)
     }
@@ -4189,39 +4306,46 @@ impl PolymarketTrade {
             }
         };
 
-        let success = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-        let order_id = resp.get("orderID").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let status_str = resp.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let error_msg = resp.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
+        let parsed = match parse_placement_response(&resp) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                self.shared.account_state.mark_order_status(
+                    &order.client_order_id,
+                    OrderStatus::NewOrderTimeout,
+                );
+                warn!(
+                    "[PolymarketTrade] ambiguous HTTP 2xx placement response coid={} local={} reason={} body={} → NewOrderTimeout",
+                    order.client_order_id,
+                    local_oid,
+                    reason,
+                    resp,
+                );
+                return Self::make_timeout_place(order, Some(local_oid));
+            }
+        };
+        let success = parsed.success;
+        let order_id = parsed.order_id;
+        let status_str = parsed.status;
+        let error_msg = parsed.error_msg;
 
         if !success {
             self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-            if SharedState::is_balance_error(error_msg) {
+            if SharedState::is_balance_error(&error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
-            } else if SharedState::is_invalid_token_error(error_msg) {
+            } else if SharedState::is_invalid_token_error(&error_msg) {
                 self.handle_invalid_token(&order.symbol);
             }
             warn!("[PolymarketTrade] Order rejected: {} coid={}", error_msg, order.client_order_id);
-            return Self::make_rejected(order, error_msg);
-        }
-        if order_id.is_empty() {
-            // A syntactically successful reply without the authoritative id
-            // is incomplete evidence. Keep the deterministic local hash and
-            // reservation as an orphan instead of reporting Accepted.
-            self.shared
-                .account_state
-                .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
-            warn!(
-                "[PolymarketTrade] success reply missing orderID coid={} local={} → NewOrderTimeout",
-                order.client_order_id, local_oid,
-            );
-            return Self::make_timeout_place(order, Some(local_oid));
+            return Self::make_rejected(order, &error_msg);
         }
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
         self.shared.clear_invalid_token(&order.symbol);
-        let effective_ack_status = self.shared.account_state.mark_order_status_effective(
+        let effective_ack_status = self.shared.mark_order_live(
             &order.client_order_id,
+            &order.symbol,
+            order.side,
+            &self.instance_id,
             OrderStatus::Accepted,
         );
 
@@ -4233,8 +4357,8 @@ impl PolymarketTrade {
             self.shared.register_order_id(&order.client_order_id, &order_id, &order.symbol);
         }
 
-        // `open_orders` was already populated by `submit_kickoff` at
-        // sign time; on success there's nothing further to track.
+        // `mark_order_live` idempotently restores `open_orders` and account
+        // collateral if an out-of-order cancellation arrived first.
 
         // Map HTTP `status` → local OrderStatus and book-keeping fields.
         //
@@ -4257,7 +4381,7 @@ impl PolymarketTrade {
         // MATCHED/FILLED audit then moves the residual into its
         // `UnauditedMatchedOrders` bridge; the POST response itself does not
         // create a parallel inventory cache.
-        match status_str {
+        match status_str.as_str() {
             "matched" => {
                 let trade_ids = resp
                     .get("tradeIDs")
@@ -4274,11 +4398,17 @@ impl PolymarketTrade {
             }
             _ => {}
         }
-        let status = placement_response_status(true, status_str, effective_ack_status);
+        let status = placement_response_status(true, &status_str, effective_ack_status);
+        let effective_remaining = self
+            .shared
+            .account_state
+            .order(&order.client_order_id)
+            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
+            .unwrap_or(order.quantity);
         let (filled_quantity, remaining_quantity) = if status == OrderStatus::Filled {
             (0.0, 0.0)
         } else {
-            (0.0, order.quantity)
+            (0.0, effective_remaining)
         };
 
         info!("[PolymarketTrade] Order accepted: orderID={} status={} coid={}",
@@ -4511,14 +4641,14 @@ impl ExchangeTrade for PolymarketTrade {
             Err(update) => return Ok(update),
         };
         let reply = rx.recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
         Ok(self.handle_submit_reply(order, &local_oid, reply))
     }
 
     fn cancel_order(&mut self, exchange: Exchange, client_order_id: &str) -> Result<OrderUpdate> {
         let (ctx, rx_opt) = self.cancel_kickoff(client_order_id);
         let reply = rx_opt.map(|rx| rx.recv()
-            .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string()))));
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string()))));
         Ok(self.handle_cancel_reply(exchange, client_order_id, ctx, reply))
     }
 
@@ -4659,7 +4789,7 @@ impl ExchangeTrade for PolymarketTrade {
             }
             for (idx, local_oid, rx) in waiters {
                 let reply = rx.recv()
-                    .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
+                    .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
                 slots[idx] = Some(self.handle_submit_reply(&orders[idx], &local_oid, reply));
             }
             for slot in slots {
@@ -4764,10 +4894,25 @@ impl ExchangeTrade for PolymarketTrade {
                             );
                             continue;
                         };
-                        let success = r.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let order_id = r.get("orderID").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let status_str = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let error_msg = r.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
+                        let parsed = match parse_placement_response(r) {
+                            Ok(parsed) => parsed,
+                            Err(reason) => {
+                                self.shared.account_state.mark_order_status(
+                                    &order.client_order_id,
+                                    OrderStatus::NewOrderTimeout,
+                                );
+                                all_updates.push(Self::make_timeout_place(order, Some(local_oid)));
+                                warn!(
+                                    "[PolymarketTrade] ambiguous batch HTTP 2xx placement response index={} coid={} reason={} body={} → NewOrderTimeout",
+                                    i, order.client_order_id, reason, r,
+                                );
+                                continue;
+                            }
+                        };
+                        let success = parsed.success;
+                        let order_id = parsed.order_id;
+                        let status_str = parsed.status;
+                        let error_msg = parsed.error_msg;
 
                         if success && order_id.is_empty() {
                             self.shared.account_state.mark_order_status(
@@ -4785,8 +4930,11 @@ impl ExchangeTrade for PolymarketTrade {
                         let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            effective_ack_status = self.shared.account_state.mark_order_status_effective(
+                            effective_ack_status = self.shared.mark_order_live(
                                 &order.client_order_id,
+                                &order.symbol,
+                                order.side,
+                                &self.instance_id,
                                 OrderStatus::Accepted,
                             );
                             // Cross-check vs our pre-computed hash — if the
@@ -4812,7 +4960,7 @@ impl ExchangeTrade for PolymarketTrade {
                                 &order.client_order_id,
                                 OrderStatus::Rejected,
                             );
-                            if SharedState::is_balance_error(error_msg) {
+                            if SharedState::is_balance_error(&error_msg) {
                                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
                             }
                             warn!(
@@ -4823,9 +4971,15 @@ impl ExchangeTrade for PolymarketTrade {
 
                         let response_status = placement_response_status(
                             success,
-                            status_str,
+                            &status_str,
                             effective_ack_status,
                         );
+                        let effective_remaining = self
+                            .shared
+                            .account_state
+                            .order(&order.client_order_id)
+                            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
+                            .unwrap_or(order.quantity);
                         all_updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -4845,14 +4999,17 @@ impl ExchangeTrade for PolymarketTrade {
                             remaining_quantity: if response_status == OrderStatus::Filled {
                                 0.0
                             } else {
-                                order.quantity
+                                effective_remaining
                             },
-                            avg_fill_price: 0.0,
+                            avg_fill_price: if response_status == OrderStatus::Accepted {
+                                order.price.unwrap_or(0.0)
+                            } else {
+                                0.0
+                            },
                             timestamp_ns: now_ns(),
                             trade_id: None,
                             order_audit: None,
-                            error: (!success && !error_msg.is_empty())
-                                .then(|| error_msg.to_string()),
+                            error: (!success && !error_msg.is_empty()).then_some(error_msg),
                         });
                     }
                     info!(
@@ -4939,7 +5096,7 @@ impl ExchangeTrade for PolymarketTrade {
             let mut updates: Vec<OrderUpdate> = Vec::with_capacity(client_order_ids.len());
             for (idx, ctx, rx_opt) in waiters {
                 let reply = rx_opt.map(|rx| rx.recv()
-                    .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string()))));
+                    .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string()))));
                 updates.push(self.handle_cancel_reply(
                     exchange, &client_order_ids[idx], ctx, reply,
                 ));
@@ -5243,14 +5400,14 @@ impl ExchangeTrade for PolymarketTrade {
             //    in-flight requests. ─────────────────────────────────
             for (idx, ctx, rx_opt) in cancel_waiters {
                 let reply = rx_opt.map(|rx| rx.recv()
-                    .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string()))));
+                    .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string()))));
                 updates.push(self.handle_cancel_reply(
                     exchange, &cancel_client_order_ids[idx], ctx, reply,
                 ));
             }
             for (idx, local_oid, rx) in place_waiters {
                 let reply = rx.recv()
-                    .unwrap_or_else(|_| Err(HttpErr::Other("async reply dropped".to_string())));
+                    .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
                 place_slots[idx] = Some(self.handle_submit_reply(
                     &place_orders[idx], &local_oid, reply,
                 ));
@@ -5429,7 +5586,7 @@ impl ExchangeTrade for PolymarketTrade {
                 // every coid gets the fallback outcome.
                 let mut per_coid_outcome: std::collections::HashMap<String, OrderStatus>
                     = std::collections::HashMap::new();
-                let fallback = match rx.recv().unwrap_or_else(|_| Err(HttpErr::Other("reply dropped".into()))) {
+                let fallback = match rx.recv().unwrap_or_else(|_| Err(HttpErr::Transport("reply dropped".into()))) {
                     Ok(resp) => {
                         // Both /order and /orders return { canceled: [...], not_canceled: {...} }.
                         let oid_to_coid = self.shared.oid_to_coid.lock().unwrap().clone();
@@ -5551,7 +5708,7 @@ impl ExchangeTrade for PolymarketTrade {
 
         // ─── Await + parse place ────────────────────────────────────────
         if let Some(rx) = place_rx {
-            match rx.recv().unwrap_or_else(|_| Err(HttpErr::Other("reply dropped".into()))) {
+            match rx.recv().unwrap_or_else(|_| Err(HttpErr::Transport("reply dropped".into()))) {
                 Ok(resp) => {
                     // POST /order returns a single object; POST /orders
                     // returns an array. Normalize to Vec<&Value>.
@@ -5580,10 +5737,25 @@ impl ExchangeTrade for PolymarketTrade {
                             );
                             continue;
                         };
-                        let success = r.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let order_id = r.get("orderID").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let status_str = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let error_msg = r.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("");
+                        let parsed = match parse_placement_response(r) {
+                            Ok(parsed) => parsed,
+                            Err(reason) => {
+                                self.shared.account_state.mark_order_status(
+                                    &order.client_order_id,
+                                    OrderStatus::NewOrderTimeout,
+                                );
+                                updates.push(Self::make_timeout_place(order, Some(local_oid)));
+                                warn!(
+                                    "[PolymarketTrade] ambiguous batch-update HTTP 2xx placement response index={} coid={} reason={} body={} → NewOrderTimeout",
+                                    i, order.client_order_id, reason, r,
+                                );
+                                continue;
+                            }
+                        };
+                        let success = parsed.success;
+                        let order_id = parsed.order_id;
+                        let status_str = parsed.status;
+                        let error_msg = parsed.error_msg;
                         if success && order_id.is_empty() {
                             self.shared.account_state.mark_order_status(
                                 &order.client_order_id,
@@ -5599,8 +5771,11 @@ impl ExchangeTrade for PolymarketTrade {
                         let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            effective_ack_status = self.shared.account_state.mark_order_status_effective(
+                            effective_ack_status = self.shared.mark_order_live(
                                 &order.client_order_id,
+                                &order.symbol,
+                                order.side,
+                                &self.instance_id,
                                 OrderStatus::Accepted,
                             );
                             if !Self::oid_eq(&order_id, local_oid) {
@@ -5622,7 +5797,7 @@ impl ExchangeTrade for PolymarketTrade {
                                 &order.client_order_id,
                                 OrderStatus::Rejected,
                             );
-                            let is_balance_err = SharedState::is_balance_error(error_msg);
+                            let is_balance_err = SharedState::is_balance_error(&error_msg);
                             if is_balance_err {
                                 // Balance rejects in batch_update_orders
                                 // are usually a cancel/submit race: the
@@ -5667,15 +5842,25 @@ impl ExchangeTrade for PolymarketTrade {
                         // moved past `order.price`). Same convention as
                         // `make_rejected`. For Accepted, the field stays
                         // 0.0 (no fill yet).
-                        let rejected_price = if !success { order.price.unwrap_or(0.0) } else { 0.0 };
-                        let err_field = if !success && !error_msg.is_empty() {
-                            Some(error_msg.to_string())
-                        } else { None };
                         let response_status = placement_response_status(
                             success,
-                            status_str,
+                            &status_str,
                             effective_ack_status,
                         );
+                        let response_price = if !success || response_status == OrderStatus::Accepted {
+                            order.price.unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        let err_field = if !success && !error_msg.is_empty() {
+                            Some(error_msg)
+                        } else { None };
+                        let effective_remaining = self
+                            .shared
+                            .account_state
+                            .order(&order.client_order_id)
+                            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
+                            .unwrap_or(order.quantity);
                         updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -5692,9 +5877,9 @@ impl ExchangeTrade for PolymarketTrade {
                             remaining_quantity: if response_status == OrderStatus::Filled {
                                 0.0
                             } else {
-                                order.quantity
+                                effective_remaining
                             },
-                            avg_fill_price: rejected_price,
+                            avg_fill_price: response_price,
                             timestamp_ns: now_ns(),
                             trade_id: None,
                             order_audit: None,
@@ -5852,6 +6037,42 @@ mod tests {
         assert_eq!(
             placement_response_status(true, "matched", Some(OrderStatus::PartiallyFilled)),
             OrderStatus::Filled,
+        );
+    }
+
+    #[test]
+    fn placement_response_requires_explicit_complete_decision_fields() {
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"success": "false", "errorMsg": "rejected"}),
+            serde_json::json!({"success": false}),
+            serde_json::json!({"success": true}),
+            serde_json::json!({"success": true, "orderID": 123}),
+        ] {
+            assert!(
+                parse_placement_response(&malformed).is_err(),
+                "malformed response accepted: {malformed}",
+            );
+        }
+        assert_eq!(
+            parse_placement_response(&serde_json::json!({
+                "success": false,
+                "errorMsg": "post-only order crosses book",
+            }))
+            .unwrap()
+            .success,
+            false,
+        );
+        assert_eq!(
+            parse_placement_response(&serde_json::json!({
+                "success": true,
+                "orderID": "0xabc",
+                "status": "live",
+            }))
+            .unwrap()
+            .order_id,
+            "0xabc",
         );
     }
 
@@ -6412,10 +6633,20 @@ mod tests {
             !transport.is_unknown_state(),
             "the shared cancel/GET classifier must retain its existing behavior"
         );
+        let invalid_response =
+            HttpErr::InvalidResponse("json parse: invalid response".to_string());
         assert!(
-            !HttpErr::Other("json parse: invalid response".to_string())
+            invalid_response.is_submit_unknown_state(),
+            "a malformed HTTP-success body cannot prove placement rejection"
+        );
+        assert!(
+            !invalid_response.is_unknown_state(),
+            "invalid response remains placement-specific so cancel/GET semantics are unchanged"
+        );
+        assert!(
+            !HttpErr::Other("local request construction failed".to_string())
                 .is_submit_unknown_state(),
-            "local/parse errors must not be swept into the transport fix"
+            "pre-dispatch local failures remain definitive"
         );
         assert!(
             !HttpErr::Status(400, "bad request".to_string())

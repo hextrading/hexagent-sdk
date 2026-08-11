@@ -505,7 +505,7 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         || (ownership.status == OrderStatus::Filled
             && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
         || (ownership.status == OrderStatus::Cancelled
-            && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
+            && status == OrderStatus::PartiallyFilled)
         || (ownership.status == OrderStatus::PartiallyFilled
             && status == OrderStatus::Accepted)
     {
@@ -530,6 +530,15 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
     match status {
         OrderStatus::Filled => shared.remove_order_as(&coid, status),
         OrderStatus::Cancelled => shared.remove_cancelled_order_with_match(&coid, size_matched),
+        OrderStatus::Accepted | OrderStatus::PartiallyFilled => {
+            shared.mark_order_live(
+                &coid,
+                &ownership.token_id,
+                ownership.side,
+                &ownership.instance_id,
+                status,
+            );
+        }
         _ => shared.account_state.mark_order_status(&coid, status),
     }
     Ok(vec![OrderUpdate {
@@ -2423,7 +2432,7 @@ mod tests {
     }
 
     #[test]
-    fn order_lifecycle_updates_are_owned_routed_and_release_on_cancel() {
+    fn order_lifecycle_updates_release_on_cancel_and_restore_on_late_placement() {
         let shared = owned_taker_shared(0.5);
         let placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -2439,6 +2448,18 @@ mod tests {
         assert_eq!(parse_user_event(&cancellation, &shared)[0].status, OrderStatus::Cancelled);
         assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
         assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+
+        let resurrection = serde_json::json!({
+            "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "0",
+        });
+        assert_eq!(
+            parse_user_event(&resurrection, &shared)[0].status,
+            OrderStatus::Accepted,
+        );
+        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
+        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
 
         let shared = owned_taker_shared(0.5);
         let mut update = serde_json::json!({
