@@ -3878,6 +3878,13 @@ fn mark_failed_trades_reconciled_by_snapshot(
 }
 
 fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &str) {
+    state.provisional_position_owners.retain(|token, owner| {
+        state
+            .instances
+            .get(owner)
+            .and_then(|instance| instance.positions.get(token))
+            .is_some_and(|quantity| *quantity > EPS)
+    });
     let virtual_cash: f64 = state.instances.values().map(|instance| instance.cash).sum();
     // MATCHED is the earliest reliable inventory edge for quoting, but the
     // Polygon wallet does not change until MINED/CONFIRMED. Exclude those
@@ -4152,7 +4159,6 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
 
     for (token, owner) in &state.provisional_position_owners {
         if token.trim().is_empty()
-            || !state.physical_positions.contains_key(token)
             || !state.instances.contains_key(owner)
             || state
                 .instances
@@ -6337,6 +6343,33 @@ mod tests {
         );
         let trade_error = validate_persisted_state("account", &state).unwrap_err();
         assert!(trade_error.contains("trade `trade` contains invalid"));
+    }
+
+    #[test]
+    fn provisional_owner_follows_virtual_inventory_across_physical_redemption() {
+        let mut state = SharedAccountState::default();
+        let mut instance = InstanceLedger::new(1.0);
+        instance.positions.insert("HISTORICAL-WIN".to_string(), 7.0);
+        state.instances.insert("maker".to_string(), instance);
+        state.provisional_position_owners.insert(
+            "HISTORICAL-WIN".to_string(),
+            "maker".to_string(),
+        );
+
+        // A wallet snapshot may no longer contain a redeemed historical token
+        // while its virtual owner remains necessary for attribution.
+        assert!(validate_persisted_state("account", &state).is_ok());
+
+        state
+            .instances
+            .get_mut("maker")
+            .unwrap()
+            .positions
+            .remove("HISTORICAL-WIN");
+        recompute_reconciliation(&mut state, "test provisional cleanup");
+        assert!(!state
+            .provisional_position_owners
+            .contains_key("HISTORICAL-WIN"));
     }
 
     #[test]
