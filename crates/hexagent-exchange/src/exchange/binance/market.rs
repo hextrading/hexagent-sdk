@@ -438,6 +438,7 @@ fn parse_trade_message(data: &serde_json::Value) -> Option<MarketEvent> {
     Some(MarketEvent::Trade(TradeTick {
         exchange: Exchange::Binance,
         symbol: symbol.to_uppercase(),
+        exchange_trade_id: None,
         price,
         quantity,
         side: if is_buyer_maker { Side::Sell } else { Side::Buy },
@@ -1301,6 +1302,7 @@ mod tests {
         let trade = MarketEvent::Trade(TradeTick {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
+            exchange_trade_id: None,
             price: 100.0, quantity: 1.0,
             side: Side::Buy,
             exchange_timestamp_ns: 0, local_timestamp_ns: 0,

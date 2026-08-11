@@ -653,6 +653,7 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                     MarketEvent::Trade(TradeTick {
                         exchange,
                         symbol: symbol.to_string(),
+                        exchange_trade_id: None,
                         price,
                         quantity,
                         side,

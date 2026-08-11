@@ -25,4 +25,4 @@ pub mod wallet;
 
 pub use market::{PolymarketMarket, PolymarketEvent, PolyMarketInfo};
 pub use trade::PolymarketTrade;
-pub use position::{fetch_positions, fetch_balance, fetch_balance_and_positions};
+pub use position::{fetch_positions, fetch_balance};

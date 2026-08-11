@@ -9,7 +9,7 @@ use crate::types::{Liquidity, OrderStatus, OrderUpdate, Side};
 /// A single position snapshot for a symbol. Produced on demand from the
 /// underlying trade ledger by `PositionManager::positions()` / `get()`,
 /// or from an external wallet query (live-mode API fetch).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     /// Net quantity: positive = long, negative = short.
     pub quantity: f64,
@@ -31,7 +31,7 @@ pub struct Position {
 /// - `Confirmed` and `Failed` are terminal — subsequent updates are ignored.
 /// - `Retrying` is not modeled here; callers should not call `upsert_trade`
 ///   with a retry status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TradeStatus {
     Matched,
     Mined,
@@ -106,7 +106,7 @@ impl UpsertResult {
 }
 
 /// A single fill in the PositionManager ledger.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
     pub trade_id: String,
     pub asset_id: String,
@@ -125,7 +125,7 @@ pub struct TradeRecord {
 /// trades so that `available_cash` / `available_inventory` can be derived
 /// entirely inside `PositionManager` without the caller having to plumb
 /// `locked_buy_cost` / `locked_sell_qty` from some other tracker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingOrder {
     pub client_order_id: String,
     pub symbol: String,
@@ -176,6 +176,18 @@ pub struct PositionManager {
     pending_orders: std::collections::BTreeMap<String, PendingOrder>,
     /// Monotonic counter used to synthesize `trade_id` when the caller
     /// didn't supply one (e.g. hexmarket fills without a per-fill id).
+    synthetic_counter: u64,
+    maker_volume: f64,
+    taker_volume: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PositionManagerSnapshot {
+    version: u32,
+    init_balance: f64,
+    init_positions: HashMap<String, f64>,
+    trades: std::collections::BTreeMap<String, TradeRecord>,
+    pending_orders: std::collections::BTreeMap<String, PendingOrder>,
     synthetic_counter: u64,
     maker_volume: f64,
     taker_volume: f64,
@@ -260,6 +272,69 @@ impl PositionManager {
             });
         }
         manager
+    }
+
+    /// Capture all late-fill-revisable state for durable settled-event FIFOs.
+    pub fn snapshot(&self) -> PositionManagerSnapshot {
+        PositionManagerSnapshot {
+            version: 1,
+            init_balance: self.init_balance,
+            init_positions: self.init_positions.clone(),
+            trades: self.trades.clone(),
+            pending_orders: self.pending_orders.clone(),
+            synthetic_counter: self.synthetic_counter,
+            maker_volume: self.maker_volume,
+            taker_volume: self.taker_volume,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: PositionManagerSnapshot) -> Result<Self, String> {
+        if snapshot.version != 1 {
+            return Err(format!("unsupported PositionManager snapshot version {}", snapshot.version));
+        }
+        if !snapshot.init_balance.is_finite()
+            || !snapshot.maker_volume.is_finite() || snapshot.maker_volume < 0.0
+            || !snapshot.taker_volume.is_finite() || snapshot.taker_volume < 0.0
+        {
+            return Err("snapshot contains invalid balance or volume".to_string());
+        }
+        for (symbol, quantity) in &snapshot.init_positions {
+            if symbol.trim().is_empty() || !quantity.is_finite() {
+                return Err("snapshot contains invalid initial position".to_string());
+            }
+        }
+        for (trade_id, trade) in &snapshot.trades {
+            if trade_id.trim().is_empty() || trade.trade_id != *trade_id
+                || trade.asset_id.trim().is_empty()
+                || !trade.size.is_finite() || trade.size <= 0.0
+                || !trade.price.is_finite() || trade.price <= 0.0 || trade.price > 1.0 + 1e-8
+                || !trade.usdc_fee.is_finite() || trade.usdc_fee < 0.0
+                || !trade.shares_fee.is_finite() || trade.shares_fee < 0.0
+            {
+                return Err(format!("snapshot contains invalid trade {trade_id}"));
+            }
+        }
+        for (client_order_id, pending) in &snapshot.pending_orders {
+            if pending.client_order_id != *client_order_id
+                || !valid_pending_order_fields(
+                    client_order_id, &pending.symbol, pending.price, pending.original_quantity,
+                )
+                || !pending.remaining_quantity.is_finite()
+                || pending.remaining_quantity < 0.0
+                || pending.remaining_quantity > pending.original_quantity + 1e-8
+            {
+                return Err(format!("snapshot contains invalid pending order {client_order_id}"));
+            }
+        }
+        Ok(Self {
+            init_balance: snapshot.init_balance,
+            init_positions: snapshot.init_positions,
+            trades: snapshot.trades,
+            pending_orders: snapshot.pending_orders,
+            synthetic_counter: snapshot.synthetic_counter,
+            maker_volume: snapshot.maker_volume,
+            taker_volume: snapshot.taker_volume,
+        })
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -800,6 +875,25 @@ mod tests {
             order_audit: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn position_manager_snapshot_round_trips_pending_and_trade_state() {
+        let mut initial = HashMap::new();
+        initial.insert("TOK".to_string(), 3.0);
+        let mut pm = PositionManager::with_initial_quantities(initial, 25.0);
+        pm.register_pending_order("pending", "TOK", Side::Sell, 0.6, 2.0);
+        pm.upsert_trade(
+            "trade", "TOK", Side::Buy, 1.0, 0.4,
+            TradeStatus::Matched, true, 0.0, 0.0, None,
+        );
+        let encoded = serde_json::to_vec(&pm.snapshot()).unwrap();
+        let snapshot: PositionManagerSnapshot = serde_json::from_slice(&encoded).unwrap();
+        let restored = PositionManager::from_snapshot(snapshot).unwrap();
+        assert_eq!(restored.pending_orders().len(), 1);
+        assert_eq!(restored.trades().len(), 1);
+        assert!((restored.balance() - pm.balance()).abs() < 1e-9);
+        assert!((restored.get("TOK").unwrap().quantity - pm.get("TOK").unwrap().quantity).abs() < 1e-9);
     }
 
     // Resurrection re-lock: a `Cancelled` releases the pending lock; a later

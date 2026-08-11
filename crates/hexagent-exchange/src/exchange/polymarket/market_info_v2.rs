@@ -388,14 +388,8 @@ fn parse_market_info_inner(json: &Value, expected_condition_id: Option<&str>) ->
         None => None,
     };
 
-    if !fee_exponent.is_finite() || fee_exponent <= 0.0 || fee_exponent > 10.0 {
-        return Err(anyhow!("fee exponent out of range: {}", fee_exponent));
-    }
-    if fee_rate.is_some_and(|rate| !rate.is_finite() || !(0.0..=1.0).contains(&rate)) {
-        return Err(anyhow!("fee rate out of range"));
-    }
-    if fee_rate_bps.is_some_and(|bps| bps > 10_000) {
-        return Err(anyhow!("fee rate bps out of range"));
+    if !fee_exponent.is_finite() {
+        return Err(anyhow!("fee exponent is not finite"));
     }
 
     if fee_rate.is_none() && fee_rate_bps.is_none() {
@@ -417,6 +411,9 @@ fn parse_market_info_inner(json: &Value, expected_condition_id: Option<&str>) ->
         (None, Some(bps))    => (bps as f64 / 10_000.0, bps),
         (None, None)         => (0.0, 0), // complete fee-free market schema
     };
+    crate::types::BinaryOption::validate_polymarket_fee_curve(
+        fee_rate_final, fee_exponent, fee_rate_bps_final,
+    ).map_err(|error| anyhow!(error))?;
 
     Ok(MarketInfoV2 {
         fee_rate: fee_rate_final,

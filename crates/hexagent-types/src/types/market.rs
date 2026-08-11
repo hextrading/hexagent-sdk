@@ -117,6 +117,11 @@ pub struct OrderBookSnapshot {
 pub struct TradeTick {
     pub exchange: Exchange,
     pub symbol: String,
+    /// Stable venue identity when the public feed supplies one. Consumers
+    /// must not synthesize identity from price/size/time because two real
+    /// executions can legitimately share those fields.
+    #[serde(default)]
+    pub exchange_trade_id: Option<String>,
     pub price: f64,
     pub quantity: f64,
     pub side: Side,

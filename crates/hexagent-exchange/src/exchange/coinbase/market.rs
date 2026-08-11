@@ -237,6 +237,7 @@ async fn coinbase_ws_task(
                                 let event = MarketEvent::Trade(TradeTick {
                                     exchange: Exchange::Coinbase,
                                     symbol: product_id.to_string(),
+                                    exchange_trade_id: None,
                                     price,
                                     quantity,
                                     side,

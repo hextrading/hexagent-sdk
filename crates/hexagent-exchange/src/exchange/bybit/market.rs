@@ -129,6 +129,7 @@ async fn bybit_ws_task(
                                     let event = MarketEvent::Trade(TradeTick {
                                         exchange: Exchange::Bybit,
                                         symbol: symbol.to_string(),
+                                        exchange_trade_id: None,
                                         price,
                                         quantity,
                                         side,

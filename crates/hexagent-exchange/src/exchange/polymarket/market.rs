@@ -1830,6 +1830,9 @@ struct TradeFields {
     side: String, // "BUY" | "SELL"
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
+    /// V2 market-channel execution identity.
+    #[serde(default, alias = "trade_id", alias = "tradeId", alias = "transactionHash")]
+    transaction_hash: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2095,9 +2098,13 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
         return None;
     }
+    let exchange_trade_id = t.transaction_hash
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     Some(MarketEvent::Trade(TradeTick {
         exchange: Exchange::Polymarket,
         symbol: t.asset_id,
+        exchange_trade_id,
         price,
         quantity,
         side,
@@ -2662,10 +2669,11 @@ mod pick_current_event_tests {
     #[test]
     fn public_trade_preserves_source_time_and_rejects_invalid_semantics() {
         let events = parse_clob_frame(
-            r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351"}"#,
+            r#"{"event_type":"last_trade_price","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","transaction_hash":"0xabc"}"#,
         );
         let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
         assert_eq!(trade.exchange_timestamp_ns, 1_757_908_892_351_000_000);
+        assert_eq!(trade.exchange_trade_id.as_deref(), Some("0xabc"));
 
         for invalid in [
             r#"{"event_type":"trade","asset_id":"up","price":"NaN","size":"2","side":"BUY","timestamp":"1757908892351"}"#,
@@ -2759,6 +2767,7 @@ mod pick_current_event_tests {
         let trade = MarketEvent::Trade(TradeTick {
             exchange: Exchange::Polymarket,
             symbol: "up".to_string(),
+            exchange_trade_id: None,
             price: 0.5,
             quantity: 1.0,
             side: Side::Buy,

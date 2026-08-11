@@ -168,6 +168,7 @@ async fn aster_ws_task(
                             let event = MarketEvent::Trade(TradeTick {
                                 exchange: Exchange::Aster,
                                 symbol,
+                                exchange_trade_id: None,
                                 price,
                                 quantity,
                                 side,

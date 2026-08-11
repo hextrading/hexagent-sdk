@@ -1064,8 +1064,8 @@ pub struct ExchangeConfig {
     /// "gnosis_safe" (poly_gnosis_safe), or "poly_1271" (deposit wallet).
     #[serde(default)]
     pub signature_type: String,
-    /// Polymarket CLOB protocol version: "v2" (default, 2026-04-28
-    /// cutover) or "v1" (legacy pre-cutover wire). v2 uses a new Exchange contract,
+    /// Polymarket CLOB protocol version. Only "v2" (the default) is accepted
+    /// after the 2026-04-28 production cutover. V2 uses a new Exchange contract,
     /// new EIP-712 domain version, drops `taker/expiration/nonce/feeRateBps`
     /// from the signed order, adds `timestamp/metadata/builder`, and
     /// removes `POLY_BUILDER_*` auth headers. See `signer_v2.rs`.

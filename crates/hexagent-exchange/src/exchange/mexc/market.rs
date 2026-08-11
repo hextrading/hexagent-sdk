@@ -148,6 +148,7 @@ async fn mexc_ws_task(
                                         let event = MarketEvent::Trade(TradeTick {
                                             exchange: Exchange::Mexc,
                                             symbol: symbol.clone(),
+                                            exchange_trade_id: None,
                                             price,
                                             quantity,
                                             side,

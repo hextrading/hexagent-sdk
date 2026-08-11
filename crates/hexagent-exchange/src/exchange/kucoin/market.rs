@@ -176,6 +176,7 @@ async fn kucoin_ws_task(
                                 let event = MarketEvent::Trade(TradeTick {
                                     exchange: Exchange::Kucoin,
                                     symbol: symbol.to_string(),
+                                    exchange_trade_id: None,
                                     price,
                                     quantity,
                                     side,

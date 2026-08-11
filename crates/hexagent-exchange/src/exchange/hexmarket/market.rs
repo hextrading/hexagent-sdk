@@ -275,6 +275,7 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
             vec![MarketEvent::Trade(TradeTick {
                 exchange: Exchange::Hexmarket,
                 symbol: asset_id.to_string(),
+                exchange_trade_id: None,
                 price,
                 quantity,
                 side: if side_str == "sell" { Side::Sell } else { Side::Buy },

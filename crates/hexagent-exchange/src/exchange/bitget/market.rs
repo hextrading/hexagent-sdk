@@ -133,6 +133,7 @@ async fn bitget_ws_task(
                                     let event = MarketEvent::Trade(TradeTick {
                                         exchange: Exchange::Bitget,
                                         symbol: inst_id.clone(),
+                                        exchange_trade_id: None,
                                         price,
                                         quantity,
                                         side,

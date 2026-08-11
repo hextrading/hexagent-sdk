@@ -257,6 +257,7 @@ mod tests {
         let trade = MarketEvent::Trade(TradeTick {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
+            exchange_trade_id: None,
             price: 100.0,
             quantity: f64::INFINITY,
             side: Side::Buy,
