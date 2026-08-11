@@ -129,6 +129,28 @@ fn parse_fetched_order(json: &serde_json::Value) -> Option<FetchedOrder> {
     })
 }
 
+/// Merge the exchange's cumulative match quantity with the durable local
+/// ledger. A reconnect audit is observational: an omitted, malformed, or
+/// smaller REST value must never erase fills already delivered by the private
+/// feed. The boolean reports whether the REST value itself was authoritative.
+fn effective_audited_match(
+    reported: Option<&str>,
+    order_quantity: f64,
+    locally_filled: f64,
+) -> (f64, bool) {
+    let tolerance = 1e-8_f64.max(order_quantity.abs() * 1e-8);
+    let reported = reported
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite()
+            && *value >= -tolerance
+            && *value <= order_quantity + tolerance);
+    let local = locally_filled.clamp(0.0, order_quantity.max(0.0));
+    match reported {
+        Some(value) => (value.clamp(0.0, order_quantity).max(local), true),
+        None => (local, false),
+    }
+}
+
 fn filled_trade_audit_complete(
     client_order_id: &str,
     audit: &AuthoritativeOrderAudit,
@@ -2616,18 +2638,28 @@ impl PolymarketTrade {
                     continue;
                 }
             };
+            let (effective_size_matched, has_valid_size_matched) = effective_audited_match(
+                fetched.audit.size_matched.as_deref(), ownership.quantity,
+                ownership.filled_quantity,
+            );
             let status_text = fetched.status.to_ascii_uppercase();
             let status = match status_text.as_str() {
                 "LIVE" => {
                     if !fetched.audit.associate_trades.is_empty() {
                         updates.extend(self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades));
                     }
-                    let matched = fetched.audit.size_matched.as_deref()
-                        .and_then(|value| value.parse::<f64>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.0);
-                    let live = if matched > 1e-9 { OrderStatus::PartiallyFilled }
-                        else { OrderStatus::Accepted };
-                    self.shared.account_state.mark_order_status(&coid, live);
+                    if !has_valid_size_matched {
+                        errors.push(format!(
+                            "live order coid={coid} omitted or has invalid size_matched; preserving local filled_quantity={}",
+                            ownership.filled_quantity,
+                        ));
+                    }
+                    let candidate = if effective_size_matched > 1e-9 {
+                        OrderStatus::PartiallyFilled
+                    } else { OrderStatus::Accepted };
+                    let live = self.shared.account_state
+                        .mark_order_status_effective(&coid, candidate)
+                        .unwrap_or(candidate);
                     live
                 }
                 "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => {
@@ -2670,10 +2702,6 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let size_matched = fetched.audit.size_matched.as_deref()
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .unwrap_or(ownership.filled_quantity);
             updates.push(OrderUpdate {
                 client_order_id: coid,
                 exchange: Exchange::Polymarket,
@@ -2683,7 +2711,7 @@ impl PolymarketTrade {
                 status,
                 liquidity: None,
                 filled_quantity: 0.0,
-                remaining_quantity: (ownership.quantity - size_matched).max(0.0),
+                remaining_quantity: (ownership.quantity - effective_size_matched).max(0.0),
                 avg_fill_price: ownership.price,
                 timestamp_ns: now_ns(),
                 trade_id: None,
@@ -5905,6 +5933,15 @@ mod tests {
         let fetched = parse_fetched_order(&json).expect("matched order");
         assert_eq!(fetched.audit.original_size.as_deref(), Some("20"));
         assert_eq!(fetched.audit.size_matched.as_deref(), Some("19.990489"));
+    }
+
+    #[test]
+    fn reconnect_audit_never_reduces_durable_matched_quantity() {
+        assert_eq!(effective_audited_match(Some("2"), 10.0, 4.0), (4.0, true));
+        assert_eq!(effective_audited_match(Some("6"), 10.0, 4.0), (6.0, true));
+        assert_eq!(effective_audited_match(None, 10.0, 4.0), (4.0, false));
+        assert_eq!(effective_audited_match(Some("NaN"), 10.0, 4.0), (4.0, false));
+        assert_eq!(effective_audited_match(Some("11"), 10.0, 4.0), (4.0, false));
     }
 
     #[test]

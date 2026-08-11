@@ -1898,7 +1898,7 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
     for f in frames {
         match f {
             ClobFrame::Tagged(TaggedMessage::Book(b)) => {
-                out.push(make_book_event(b, now));
+                if let Some(event) = make_book_event(b, now) { out.push(event); }
             }
             ClobFrame::Tagged(TaggedMessage::Trade(t))
             | ClobFrame::Tagged(TaggedMessage::LastTradePrice(t)) => {
@@ -1929,29 +1929,39 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
     out
 }
 
-fn make_book_event(b: BookFields, now: u64) -> MarketEvent {
-    let parse_side = |levels: Vec<BookLevel>| -> Vec<PriceLevel> {
+fn make_book_event(b: BookFields, now: u64) -> Option<MarketEvent> {
+    let parse_side = |levels: Vec<BookLevel>| -> Option<Vec<PriceLevel>> {
         levels.into_iter()
-            .filter_map(|l| {
+            .map(|l| {
                 let price: f64 = l.price.parse().ok()?;
                 let quantity: f64 = l.size.parse().ok()?;
+                if !price.is_finite() || !quantity.is_finite()
+                    || price <= 0.0 || price >= 1.0 || quantity <= 0.0
+                { return None; }
                 Some(PriceLevel { price, quantity })
             })
             .collect()
     };
+    let bids = parse_side(b.bids)?;
+    let asks = parse_side(b.asks)?;
+    let best_bid = bids.iter().map(|level| level.price).reduce(f64::max);
+    let best_ask = asks.iter().map(|level| level.price).reduce(f64::min);
+    if matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask) {
+        return None;
+    }
     let exchange_ts_ns = b.timestamp
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|ms| ms * 1_000_000)
+        .map(|ms| ms.saturating_mul(1_000_000))
         .unwrap_or(now);
-    MarketEvent::OrderBook(OrderBookSnapshot {
+    Some(MarketEvent::OrderBook(OrderBookSnapshot {
         exchange: Exchange::Polymarket,
         symbol: b.asset_id,
-        bids: parse_side(b.bids),
-        asks: parse_side(b.asks),
+        bids,
+        asks,
         exchange_timestamp_ns: exchange_ts_ns,
         local_timestamp_ns: now,
-    })
+    }))
 }
 
 fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64) -> u64 {
@@ -1980,8 +1990,9 @@ fn make_quote_event(
     let ask_price = best_ask?;
     if !bid_price.is_finite()
         || !ask_price.is_finite()
-        || !(0.0..=1.0).contains(&bid_price)
-        || !(0.0..=1.0).contains(&ask_price)
+        || bid_price <= 0.0 || bid_price >= 1.0
+        || ask_price <= 0.0 || ask_price >= 1.0
+        || bid_price >= ask_price
     {
         return None;
     }
@@ -2519,6 +2530,39 @@ mod pick_current_event_tests {
             }"#,
         );
         assert!(invalid_price.is_empty());
+
+        let crossed = parse_clob_frame(
+            r#"{
+                "event_type":"best_bid_ask",
+                "asset_id":"token",
+                "best_bid":"0.60",
+                "best_ask":"0.50",
+                "timestamp":"1757908892351"
+            }"#,
+        );
+        assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn invalid_polymarket_book_is_rejected_as_a_whole() {
+        let valid = parse_clob_frame(
+            r#"{
+                "event_type":"book",
+                "asset_id":"token",
+                "bids":[{"price":"0.48","size":"10"}],
+                "asks":[{"price":"0.52","size":"12"}],
+                "timestamp":"1757908892351"
+            }"#,
+        );
+        assert_eq!(valid.len(), 1);
+
+        for invalid in [
+            r#"{"event_type":"book","asset_id":"token","bids":[{"price":"0.48","size":"0"}],"asks":[{"price":"0.52","size":"12"}],"timestamp":"1757908892352"}"#,
+            r#"{"event_type":"book","asset_id":"token","bids":[{"price":"1","size":"10"}],"asks":[{"price":"0.52","size":"12"}],"timestamp":"1757908892352"}"#,
+            r#"{"event_type":"book","asset_id":"token","bids":[{"price":"0.60","size":"10"}],"asks":[{"price":"0.50","size":"12"}],"timestamp":"1757908892352"}"#,
+        ] {
+            assert!(parse_clob_frame(invalid).is_empty());
+        }
     }
 
     fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {

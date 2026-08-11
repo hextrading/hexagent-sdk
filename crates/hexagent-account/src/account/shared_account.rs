@@ -34,6 +34,9 @@ pub fn normalize_order_id(order_id: &str) -> String {
 pub struct InstanceAccountSnapshot {
     pub instance_id: String,
     pub weight: f64,
+    /// Monotonic generation of the virtual trade ledger represented by this
+    /// snapshot. Strategies use it to avoid double-applying late fills.
+    pub ledger_generation: u64,
     pub cash: f64,
     pub positions: HashMap<String, f64>,
     pub reserved_cash: f64,
@@ -166,6 +169,7 @@ pub struct RestoredTrade {
     pub virtual_fee_booked: bool,
     pub is_maker: bool,
     pub match_time_secs: u64,
+    pub ledger_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +273,9 @@ struct AppliedTrade {
     is_maker: Option<bool>,
     #[serde(default)]
     match_time_secs: u64,
+    /// Last virtual cash/position mutation caused by this trade.
+    #[serde(default)]
+    ledger_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +329,9 @@ struct SharedAccountState {
     orders: HashMap<String, OrderOwnership>,
     oid_to_coid: HashMap<String, String>,
     trades: HashMap<String, AppliedTrade>,
+    /// Advances only when the virtual trade/fee ledger changes.
+    #[serde(default)]
+    ledger_generation: u64,
     uncertain: bool,
     #[serde(default)]
     uncertain_reason: Option<String>,
@@ -1515,6 +1525,7 @@ impl SharedAccount {
             instances.push(InstanceAccountSnapshot {
                 instance_id: instance_id.clone(),
                 weight: instance.weight,
+                ledger_generation: state.ledger_generation,
                 cash: instance.cash,
                 positions: instance.positions.clone(),
                 reserved_cash: instance.reserved_cash,
@@ -1578,6 +1589,7 @@ impl SharedAccount {
         state.instances.get(instance_id).map(|instance| InstanceAccountSnapshot {
             instance_id: instance_id.to_string(),
             weight: instance.weight,
+            ledger_generation: state.ledger_generation,
             cash: instance.cash,
             positions: instance.positions.clone(),
             reserved_cash: instance.reserved_cash,
@@ -3043,24 +3055,14 @@ impl SharedAccount {
         }
         let mut order_fully_filled = false;
         if should_book {
-            let (cash_release, qty_release) = if let Some(order) = state.orders.get_mut(&resolved_coid) {
+            let (cash_delta, qty_delta, reservation_token) = if let Some(order) = state.orders.get_mut(&resolved_coid) {
                 let cancellation_audit_pending = order.status == OrderStatus::Cancelled;
-                let mut cash_release = if side == Side::Buy {
-                    (quantity * order.price).min(order.reserved_cash)
-                } else { 0.0 };
-                let mut qty_release = if side == Side::Sell {
-                    quantity.min(order.reserved_quantity)
-                } else { 0.0 };
-                order.reserved_cash -= cash_release;
-                order.reserved_quantity -= qty_release;
+                let old_cash = order.reserved_cash;
+                let old_qty = order.reserved_quantity;
                 order.filled_quantity = (order.filled_quantity + quantity).min(order.quantity);
                 let fill_target = order.terminal_matched_quantity
                     .unwrap_or(order.quantity).min(order.quantity);
                 if order.filled_quantity + EPS >= fill_target {
-                    cash_release += order.reserved_cash;
-                    qty_release += order.reserved_quantity;
-                    order.reserved_cash = 0.0;
-                    order.reserved_quantity = 0.0;
                     if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
                         order.status = OrderStatus::Filled;
                     }
@@ -3068,13 +3070,18 @@ impl SharedAccount {
                 } else if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
                     order.status = OrderStatus::PartiallyFilled;
                 }
-                (cash_release, qty_release)
-            } else { (0.0, 0.0) };
+                // Recompute from the effective remaining quantity after every
+                // fill so the pro-rata BUY fee buffer is released too.
+                let (desired_cash, desired_qty) = desired_order_reservation(order);
+                order.reserved_cash = desired_cash;
+                order.reserved_quantity = desired_qty;
+                (desired_cash - old_cash, desired_qty - old_qty, order.token_id.clone())
+            } else { (0.0, 0.0, token_id.to_string()) };
             if let Some(instance) = state.instances.get_mut(&instance_id) {
-                instance.reserved_cash = (instance.reserved_cash - cash_release).max(0.0);
-                if qty_release > 0.0 {
-                    let reserved = instance.reserved_positions.entry(token_id.into()).or_insert(0.0);
-                    *reserved = (*reserved - qty_release).max(0.0);
+                instance.reserved_cash = (instance.reserved_cash + cash_delta).max(0.0);
+                if qty_delta.abs() > EPS {
+                    let reserved = instance.reserved_positions.entry(reservation_token).or_insert(0.0);
+                    *reserved = (*reserved + qty_delta).max(0.0);
                 }
             }
         }
@@ -3170,6 +3177,8 @@ impl SharedAccount {
             match_time_secs: trade_context.map(|(_, ts)| ts).unwrap_or_else(|| {
                 existing.as_ref().map(|trade| trade.match_time_secs).unwrap_or(0)
             }),
+            ledger_generation: existing.as_ref()
+                .map(|trade| trade.ledger_generation).unwrap_or(0),
         });
         if let Some((is_maker, _)) = trade_context {
             let fee_status = if is_failed { OrderStatus::Failed }
@@ -3177,6 +3186,9 @@ impl SharedAccount {
             let _ = apply_configured_trade_fee_locked(
                 &mut state, trade_key, fee_status, is_maker,
             );
+        }
+        if should_book || should_reverse {
+            advance_trade_ledger_generation(&mut state, trade_key);
         }
         recompute_reconciliation(&mut state, "trade lifecycle transition");
         self.schedule_persist(&state);
@@ -3309,6 +3321,9 @@ impl SharedAccount {
             trade.physical_fee_booked = book_physical
                 || (existing.physical_fee_booked && !reverse_physical);
         }
+        if virtual_multiplier != 0.0 {
+            advance_trade_ledger_generation(&mut state, trade_key);
+        }
         state.fee_attribution_pending.remove(trade_key);
         recompute_reconciliation(&mut state, "trade fee lifecycle transition");
         self.schedule_persist(&state);
@@ -3348,6 +3363,7 @@ impl SharedAccount {
                 virtual_fee_booked: trade.virtual_fee_booked,
                 is_maker: trade.is_maker.unwrap_or(false),
                 match_time_secs: trade.match_time_secs,
+                ledger_generation: trade.ledger_generation,
             })
             .collect()
     }
@@ -3453,6 +3469,15 @@ fn wall_clock_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+fn advance_trade_ledger_generation(state: &mut SharedAccountState, trade_key: &str) -> u64 {
+    state.ledger_generation = state.ledger_generation.saturating_add(1).max(1);
+    let generation = state.ledger_generation;
+    if let Some(trade) = state.trades.get_mut(trade_key) {
+        trade.ledger_generation = generation;
+    }
+    generation
 }
 
 fn set_uncertain(state: &mut SharedAccountState, reason: String) {
@@ -3580,6 +3605,9 @@ fn apply_trade_fee_transition_locked(
             || (existing.virtual_fee_booked && !reverse_virtual);
         trade.physical_fee_booked = book_physical
             || (existing.physical_fee_booked && !reverse_physical);
+    }
+    if virtual_multiplier != 0.0 {
+        advance_trade_ledger_generation(state, trade_key);
     }
     state.fee_attribution_pending.remove(trade_key);
     recompute_reconciliation(state, "trade fee lifecycle transition");
@@ -4094,6 +4122,43 @@ mod tests {
         assert_eq!(audited.reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn partial_buy_fill_recomputes_principal_and_fee_reservation() {
+        let account = seeded_account();
+        let baseline_generation = account.instance_snapshot("a").unwrap().ledger_generation;
+        account.reserve_order(
+            "a", "a-fee-partial", "oid-fee-partial", "UP",
+            Side::Buy, 10.0, 0.5, 1_000,
+        ).unwrap();
+        assert!((account.instance_snapshot("a").unwrap().reserved_cash - 5.5).abs() < 1e-12);
+
+        account.apply_trade_transition(
+            "trade-fee-partial-1", "MATCHED", "a-fee-partial",
+            "oid-fee-partial", "UP", Side::Buy, 4.0, 0.5,
+        ).unwrap();
+        let partial = account.instance_snapshot("a").unwrap();
+        assert!((partial.reserved_cash - 3.3).abs() < 1e-12);
+        assert!(partial.ledger_generation > baseline_generation);
+        let restored_generation = account.restored_trades().into_iter()
+            .find(|trade| trade.ownership.trade_key == "trade-fee-partial-1")
+            .unwrap().ledger_generation;
+        assert_eq!(restored_generation, partial.ledger_generation);
+        assert!((account.order("a-fee-partial").unwrap().reserved_cash - 3.3).abs() < 1e-12);
+
+        account.apply_trade_transition(
+            "trade-fee-partial-1", "CONFIRMED", "a-fee-partial",
+            "oid-fee-partial", "UP", Side::Buy, 4.0, 0.5,
+        ).unwrap();
+        assert!((account.instance_snapshot("a").unwrap().reserved_cash - 3.3).abs() < 1e-12);
+
+        account.apply_trade_transition(
+            "trade-fee-partial-2", "MATCHED", "a-fee-partial",
+            "oid-fee-partial", "UP", Side::Buy, 6.0, 0.5,
+        ).unwrap();
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+        assert_eq!(account.order("a-fee-partial").unwrap().reserved_cash, 0.0);
     }
 
     #[test]
