@@ -1072,6 +1072,7 @@ mod tests {
             booked: true, usdc_fee: 0.0, shares_fee: 0.0,
             virtual_fee_booked: true, is_maker: true,
             match_time_secs: 1_700_000_000,
+            ledger_generation: 0,
         };
         let mut pm = PositionManager::with_positions_and_restored_trades(
             positions, 98.0, [restored],
