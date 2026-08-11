@@ -8,9 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use log::info;
 
-use crate::types::Side;
+use crate::types::{OrderUpdate, Side};
 use hexagent_account::account::shared_account::RestoredTrade;
 
 // ════════════════════════════════════════════════════════════════
@@ -40,6 +41,61 @@ pub struct UserFeedHealth {
     recovering: AtomicBool,
     inventory_uncertain: AtomicBool,
     gap_replay_degraded: AtomicBool,
+    recovery_delivery: Mutex<RecoveryDeliveryState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RecoveryUpdateKey {
+    instance_id: String,
+    client_order_id: String,
+    exchange_order_id: Option<String>,
+    trade_id: Option<String>,
+    symbol: String,
+    status: String,
+    filled_quantity_bits: u64,
+    remaining_quantity_bits: u64,
+}
+
+impl RecoveryUpdateKey {
+    fn new(instance_id: &str, update: &OrderUpdate) -> Self {
+        Self {
+            instance_id: instance_id.to_string(),
+            client_order_id: update.client_order_id.clone(),
+            exchange_order_id: update.exchange_order_id.clone(),
+            trade_id: update.trade_id.clone(),
+            symbol: update.symbol.clone(),
+            status: format!("{:?}", update.status),
+            filled_quantity_bits: update.filled_quantity.to_bits(),
+            remaining_quantity_bits: update.remaining_quantity.to_bits(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecoveryDeliveryState {
+    generation: u64,
+    enrolling: bool,
+    pending: HashMap<RecoveryUpdateKey, usize>,
+}
+
+/// Completion token held across one strategy `on_order_update` call. It only
+/// acknowledges on a normal return; a panicking worker leaves the recovery
+/// epoch pending and therefore keeps account quoting paused.
+#[derive(Debug)]
+pub struct RecoveryUpdateAck {
+    health: Arc<UserFeedHealth>,
+    instance_id: String,
+    update: OrderUpdate,
+}
+
+impl Drop for RecoveryUpdateAck {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = self
+                .health
+                .acknowledge_recovery_update(&self.instance_id, &self.update);
+        }
+    }
 }
 
 impl UserFeedHealth {
@@ -50,10 +106,11 @@ impl UserFeedHealth {
             recovering: AtomicBool::new(true),
             inventory_uncertain: AtomicBool::new(false),
             gap_replay_degraded: AtomicBool::new(false),
+            recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
         }
     }
-    pub fn is_recovering(&self) -> bool { self.recovering.load(Ordering::Relaxed) }
-    pub fn set_recovering(&self, v: bool) { self.recovering.store(v, Ordering::Relaxed); }
+    pub fn is_recovering(&self) -> bool { self.recovering.load(Ordering::Acquire) }
+    pub fn set_recovering(&self, v: bool) { self.recovering.store(v, Ordering::Release); }
     pub fn inventory_uncertain(&self) -> bool { self.inventory_uncertain.load(Ordering::Relaxed) }
     pub fn set_inventory_uncertain(&self, v: bool) { self.inventory_uncertain.store(v, Ordering::Relaxed); }
     pub fn gap_replay_degraded(&self) -> bool {
@@ -61,6 +118,105 @@ impl UserFeedHealth {
     }
     pub fn set_gap_replay_degraded(&self, v: bool) {
         self.gap_replay_degraded.store(v, Ordering::Relaxed);
+    }
+
+    /// Start one reconnect-delivery epoch. The user feed registers every
+    /// replay/open-order update before putting it on the engine channel; the
+    /// owning strategy acknowledges it only after `on_order_update` returns.
+    /// Quoting therefore cannot resume merely because recovery updates were
+    /// enqueued while their PositionManager is still stale.
+    pub fn begin_recovery_delivery(&self) -> u64 {
+        self.recovering.store(true, Ordering::Release);
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        delivery.generation = delivery.generation.wrapping_add(1).max(1);
+        delivery.enrolling = true;
+        delivery.pending.clear();
+        delivery.generation
+    }
+
+    pub fn register_recovery_update(
+        &self,
+        generation: u64,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> Result<(), String> {
+        if instance_id.trim().is_empty() {
+            return Err(format!(
+                "recovery update coid={} has no owning instance",
+                update.client_order_id,
+            ));
+        }
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        if delivery.generation != generation || !delivery.enrolling {
+            return Err(format!(
+                "recovery delivery generation {} is no longer accepting updates",
+                generation,
+            ));
+        }
+        *delivery
+            .pending
+            .entry(RecoveryUpdateKey::new(instance_id, update))
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    pub fn finish_recovery_delivery_enrollment(&self, generation: u64) -> bool {
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        if delivery.generation != generation {
+            return false;
+        }
+        delivery.enrolling = false;
+        true
+    }
+
+    /// Called by the owning strategy after it has fully processed an update.
+    /// Broadcast siblings cannot consume the acknowledgement because the
+    /// instance id is part of the key.
+    pub fn acknowledge_recovery_update(
+        &self,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> bool {
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        let key = RecoveryUpdateKey::new(instance_id, update);
+        let Some(count) = delivery.pending.get_mut(&key) else {
+            return false;
+        };
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            delivery.pending.remove(&key);
+        }
+        true
+    }
+
+    pub fn recovery_update_ack(
+        self: &Arc<Self>,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> Option<RecoveryUpdateAck> {
+        let delivery = self.recovery_delivery.lock().unwrap();
+        if delivery.pending.is_empty() {
+            return None;
+        }
+        let key = RecoveryUpdateKey::new(instance_id, update);
+        delivery.pending.contains_key(&key).then(|| RecoveryUpdateAck {
+            health: Arc::clone(self),
+            instance_id: instance_id.to_string(),
+            update: update.clone(),
+        })
+    }
+
+    /// Returns `None` if a newer reconnect superseded this generation;
+    /// otherwise `(enrollment_finished, pending_update_count)`.
+    pub fn recovery_delivery_progress(&self, generation: u64) -> Option<(bool, usize)> {
+        let delivery = self.recovery_delivery.lock().unwrap();
+        (delivery.generation == generation).then(|| {
+            (
+                !delivery.enrolling,
+                delivery.pending.values().copied().sum(),
+            )
+        })
     }
 }
 
@@ -296,6 +452,26 @@ impl LivePositionManager {
 #[cfg(test)]
 mod user_feed_health_tests {
     use super::UserFeedHealth;
+    use crate::types::{Exchange, OrderStatus, OrderUpdate, Side};
+
+    fn recovery_update(coid: &str) -> OrderUpdate {
+        OrderUpdate {
+            client_order_id: coid.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: "TOKEN".to_string(),
+            side: Side::Buy,
+            exchange_order_id: Some("0x1".to_string()),
+            status: OrderStatus::PartiallyFilled,
+            liquidity: None,
+            filled_quantity: 2.0,
+            remaining_quantity: 3.0,
+            avg_fill_price: 0.4,
+            timestamp_ns: 1,
+            trade_id: Some("trade-1".to_string()),
+            order_audit: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn starts_recovering_so_strategy_waits_for_first_replay() {
@@ -337,6 +513,38 @@ mod user_feed_health_tests {
         assert!(!h.inventory_uncertain());
         h.set_gap_replay_degraded(false);
         assert!(!h.gap_replay_degraded());
+    }
+
+    #[test]
+    fn recovery_delivery_waits_for_the_owning_worker() {
+        let h = std::sync::Arc::new(UserFeedHealth::new());
+        let generation = h.begin_recovery_delivery();
+        let update = recovery_update("btc01-1");
+        h.register_recovery_update(generation, "btc01", &update)
+            .unwrap();
+        assert!(h.finish_recovery_delivery_enrollment(generation));
+        assert_eq!(h.recovery_delivery_progress(generation), Some((true, 1)));
+
+        assert!(!h.acknowledge_recovery_update("btc02", &update));
+        assert_eq!(h.recovery_delivery_progress(generation), Some((true, 1)));
+        assert!(h.acknowledge_recovery_update("btc01", &update));
+        assert_eq!(h.recovery_delivery_progress(generation), Some((true, 0)));
+    }
+
+    #[test]
+    fn recovery_ack_guard_acknowledges_only_after_scope_exit() {
+        let h = std::sync::Arc::new(UserFeedHealth::new());
+        let generation = h.begin_recovery_delivery();
+        let update = recovery_update("btc01-2");
+        h.register_recovery_update(generation, "btc01", &update)
+            .unwrap();
+        assert!(h.finish_recovery_delivery_enrollment(generation));
+        {
+            let guard = h.recovery_update_ack("btc01", &update);
+            assert!(guard.is_some());
+            assert_eq!(h.recovery_delivery_progress(generation), Some((true, 1)));
+        }
+        assert_eq!(h.recovery_delivery_progress(generation), Some((true, 0)));
     }
 }
 

@@ -30,6 +30,7 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FUTURE_MATCH_TIME_SECS: u64 = 300;
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 
@@ -81,6 +82,59 @@ fn accept_reconnect_replay(
     _outcome: GapReplayOutcome,
 ) {
     health.set_recovering(false);
+}
+
+fn enqueue_recovery_update(
+    shared: &SharedState,
+    update_tx: &Sender<OrderUpdate>,
+    generation: u64,
+    update: OrderUpdate,
+) -> Result<()> {
+    let owner = shared
+        .account_state
+        .order_owner_by_coid(&update.client_order_id)
+        .ok_or_else(|| anyhow!(
+            "recovery update coid={} has no durable owner",
+            update.client_order_id,
+        ))?;
+    shared
+        .user_feed_health
+        .register_recovery_update(generation, &owner, &update)
+        .map_err(|error| anyhow!(error))?;
+    update_tx
+        .send(update)
+        .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
+}
+
+async fn wait_for_recovery_delivery(
+    shared: &SharedState,
+    generation: u64,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(anyhow!("shutdown while waiting for reconnect updates to drain"));
+        }
+        let Some((enrollment_finished, pending)) = shared
+            .user_feed_health
+            .recovery_delivery_progress(generation)
+        else {
+            return Err(anyhow!(
+                "reconnect delivery generation {generation} was superseded",
+            ));
+        };
+        if enrollment_finished && pending == 0 {
+            return Ok(());
+        }
+        if started.elapsed() >= RECOVERY_DELIVERY_TIMEOUT {
+            return Err(anyhow!(
+                "timed out after {}ms waiting for {pending} replay update(s) to be processed",
+                RECOVERY_DELIVERY_TIMEOUT.as_millis(),
+            ));
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
 }
 
 fn advance_gap_cursor(
@@ -986,9 +1040,17 @@ async fn replay_missed_trades(
     update_tx: &Sender<OrderUpdate>,
     checkpoint: &mut GapReplayCheckpoint,
     transport: &GapReplayTransport,
+    recovery_generation: Option<u64>,
 ) -> Result<GapReplayOutcome> {
     let pages_before_attempt = checkpoint.pages;
-    let result = replay_missed_trades_inner(shared, update_tx, checkpoint, transport).await;
+    let result = replay_missed_trades_inner(
+        shared,
+        update_tx,
+        checkpoint,
+        transport,
+        recovery_generation,
+    )
+    .await;
     shared.account_state.record_gap_replay_pages(
         checkpoint.pages.saturating_sub(pages_before_attempt),
     );
@@ -1000,6 +1062,7 @@ async fn replay_missed_trades_inner(
     update_tx: &Sender<OrderUpdate>,
     checkpoint: &mut GapReplayCheckpoint,
     transport: &GapReplayTransport,
+    recovery_generation: Option<u64>,
 ) -> Result<GapReplayOutcome> {
     // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
     // account, so we fetch ALL of the wallet's trades since `after` (no
@@ -1153,7 +1216,13 @@ async fn replay_missed_trades_inner(
             match parse_user_event_checked(&rec, shared) {
                 Ok(updates) => {
                     resolve_valid_private_event_anomaly(&rec, shared);
-                    for update in updates { let _ = update_tx.send(update); }
+                    for update in updates {
+                        if let Some(generation) = recovery_generation {
+                            enqueue_recovery_update(shared, update_tx, generation, update)?;
+                        } else if update_tx.send(update).is_err() {
+                            return Err(anyhow!("order update channel closed during periodic gap replay"));
+                        }
+                    }
                 }
                 Err(error) => {
                     flag_invalid_private_event(&rec, shared, &error);
@@ -1238,16 +1307,18 @@ async fn user_feed_loop(
     let mut recovery_checkpoint: Option<GapReplayCheckpoint> = None;
 
     // Periodic gap-replay task — independent of the WS read loop so its HTTP
-    // call never pauses WS reads, and it keeps recovering fills *across*
-    // reconnects (including while the main loop is reconnecting). Cadence and
+    // call never pauses WS reads. While reconnect recovery is active it yields
+    // to that recovery pass, so no untracked periodic update can race the
+    // worker-delivery barrier. Cadence and
     // rewind window are config-driven (`gap_replay.interval_ms` /
     // `periodic_rewind_ms`; defaults 2s / 10s — the rewind is a FLOOR,
     // the sweep also always reaches back to the last server-timestamped
     // trade seen, so longer WS gaps stay covered). The status dedup in
-    // upsert_trade / update_trade makes already-seen fills no-ops, so only
-    // genuinely-dropped ones reach the ledger. A rewind larger than the
-    // cadence means a fill is covered by ≥2 sweeps even with match_time
-    // second-quantization jitter.
+    // The durable ledger and update_trade both dedupe lifecycle transitions;
+    // unchanged durable replays skip persistence/fsync, while genuinely
+    // dropped transitions still reach the owning strategy. A rewind larger
+    // than the cadence means a fill is covered by ≥2 sweeps even with
+    // match_time second-quantization jitter.
     //
     // When the active event changes (new condition_id, incl. the first seed
     // after startup), the very next sweep does a one-shot now−300s DEEP
@@ -1275,6 +1346,9 @@ async fn user_feed_loop(
             loop {
                 sleep(interval).await;
                 if shutdown.load(Ordering::Relaxed) { break; }
+                if shared.user_feed_health.is_recovering() {
+                    continue;
+                }
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64).unwrap_or(0);
@@ -1303,7 +1377,14 @@ async fn user_feed_loop(
                     .get_or_insert_with(|| GapReplayCheckpoint::new(after));
                 let after = checkpoint.after_secs;
                 let replay_result =
-                    replay_missed_trades(&shared, &update_tx, checkpoint, &gap_transport).await;
+                    replay_missed_trades(
+                        &shared,
+                        &update_tx,
+                        checkpoint,
+                        &gap_transport,
+                        None,
+                    )
+                    .await;
                 match replay_result {
                     Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
                         if consecutive_failures > 0 {
@@ -1388,6 +1469,7 @@ async fn user_feed_loop(
         }
 
         info!("[PolyUserFeed] Connected and authenticated (async)");
+        let recovery_generation = shared.user_feed_health.begin_recovery_delivery();
 
         // Gap recovery on (re)connect — whole-wallet, rewind
         // `gap_replay.reconnect_rewind_ms` (default 5s, quantised up to whole
@@ -1407,6 +1489,7 @@ async fn user_feed_loop(
             &update_tx,
             checkpoint,
             &gap_transport,
+            Some(recovery_generation),
         )
         .await;
         match replay_result {
@@ -1448,11 +1531,59 @@ async fn user_feed_loop(
         }).await;
         match open_order_recovery {
             Ok(Ok(updates)) => {
+                let mut enqueue_error = None;
                 for update in updates {
-                    if update_tx.send(update).is_err() {
-                        warn!("[PolyUserFeed] order update channel closed during reconnect recovery");
-                        return;
+                    if let Err(error) = enqueue_recovery_update(
+                        &shared,
+                        &update_tx,
+                        recovery_generation,
+                        update,
+                    ) {
+                        enqueue_error = Some(error);
+                        break;
                     }
+                }
+                if let Some(error) = enqueue_error {
+                    shared.user_feed_health.set_recovering(true);
+                    let delay = backoff.next_delay();
+                    warn!(
+                        "[PolyUserFeed] reconnect update delivery failed: {}; keeping quoting paused and reconnecting in {:.1}s",
+                        error,
+                        delay.as_secs_f64(),
+                    );
+                    if !shutdown.load(Ordering::Relaxed) {
+                        sleep(delay).await;
+                    }
+                    continue;
+                }
+                if !shared
+                    .user_feed_health
+                    .finish_recovery_delivery_enrollment(recovery_generation)
+                {
+                    warn!(
+                        "[PolyUserFeed] reconnect delivery generation={} was superseded; keeping recovery asserted",
+                        recovery_generation,
+                    );
+                    continue;
+                }
+                if let Err(error) = wait_for_recovery_delivery(
+                    &shared,
+                    recovery_generation,
+                    &shutdown,
+                )
+                .await
+                {
+                    shared.user_feed_health.set_recovering(true);
+                    let delay = backoff.next_delay();
+                    warn!(
+                        "[PolyUserFeed] reconnect updates were not fully processed: {}; keeping quoting paused and reconnecting in {:.1}s",
+                        error,
+                        delay.as_secs_f64(),
+                    );
+                    if !shutdown.load(Ordering::Relaxed) {
+                        sleep(delay).await;
+                    }
+                    continue;
                 }
                 accept_reconnect_replay(
                     &shared.user_feed_health,

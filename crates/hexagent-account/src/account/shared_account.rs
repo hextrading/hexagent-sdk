@@ -2720,9 +2720,10 @@ impl SharedAccount {
         quantity: f64,
         price: f64,
     ) -> Option<TradeOwnership> {
+        let mut persistence_required = false;
         self.apply_trade_transition_inner(
             trade_key, status, client_order_id, order_id, token_id,
-            side, quantity, price, None,
+            side, quantity, price, None, &mut persistence_required,
         )
     }
 
@@ -2739,11 +2740,16 @@ impl SharedAccount {
         is_maker: bool,
         match_time_secs: u64,
     ) -> Option<TradeOwnership> {
+        let mut persistence_required = false;
         let applied = self.apply_trade_transition_inner(
             trade_key, status, client_order_id, order_id, token_id,
             side, quantity, price, Some((is_maker, match_time_secs)),
+            &mut persistence_required,
         );
-        if applied.is_some() && self.flush_persistence(Duration::from_secs(2)).is_err() {
+        if applied.is_some()
+            && persistence_required
+            && self.flush_persistence(Duration::from_secs(2)).is_err()
+        {
             self.mark_uncertain_with_reason(format!(
                 "trade `{trade_key}` atomic persistence failed"
             ));
@@ -2763,6 +2769,7 @@ impl SharedAccount {
         quantity: f64,
         price: f64,
         trade_context: Option<(bool, u64)>,
+        persistence_required: &mut bool,
     ) -> Option<TradeOwnership> {
         let mut normalized = status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase();
         if normalized == "MATCHED_NOT_BROADCASTED" { normalized = "MATCHED".to_string(); }
@@ -2893,20 +2900,42 @@ impl SharedAccount {
                 || applied.ownership.status == "CONFIRMED"
                 || lifecycle_rank <= prior_rank
             {
-                state.ownership_anomalies.remove(&anomaly_key);
-                recompute_reconciliation(&mut state, "corrected trade ownership replay");
+                let mut changed = state.ownership_anomalies.remove(&anomaly_key).is_some();
                 if let Some((is_maker, match_time_secs)) = trade_context {
+                    let role_changed = applied.is_maker != Some(is_maker);
+                    let match_time_changed = applied.match_time_secs < match_time_secs;
+                    let fee_pending = state.fee_attribution_pending.contains(trade_key);
                     if let Some(trade) = state.trades.get_mut(trade_key) {
-                        trade.match_time_secs = trade.match_time_secs.max(match_time_secs);
+                        if match_time_changed {
+                            trade.match_time_secs = match_time_secs;
+                        }
                     }
-                    let fee_status = if normalized == "FAILED" {
-                        OrderStatus::Failed
-                    } else { OrderStatus::PartiallyFilled };
-                    let _ = apply_configured_trade_fee_locked(
-                        &mut state, trade_key, fee_status, is_maker,
-                    );
+                    changed |= match_time_changed;
+                    if role_changed || fee_pending {
+                        let uncertainty_before = (
+                            state.uncertain,
+                            state.uncertain_reason.clone(),
+                            state.uncertain_since_ms,
+                        );
+                        let fee_status = if normalized == "FAILED" {
+                            OrderStatus::Failed
+                        } else { OrderStatus::PartiallyFilled };
+                        let fee_changed = apply_configured_trade_fee_locked(
+                            &mut state, trade_key, fee_status, is_maker,
+                        );
+                        let uncertainty_changed = uncertainty_before != (
+                            state.uncertain,
+                            state.uncertain_reason.clone(),
+                            state.uncertain_since_ms,
+                        );
+                        changed |= role_changed || fee_changed || uncertainty_changed;
+                    }
                 }
-                self.schedule_persist(&state);
+                if changed {
+                    recompute_reconciliation(&mut state, "corrected trade ownership replay");
+                    self.schedule_persist(&state);
+                    *persistence_required = true;
+                }
                 return Some(applied.ownership.clone());
             }
         }
@@ -2966,6 +2995,7 @@ impl SharedAccount {
                     );
                 }
                 self.schedule_persist(&state);
+                *persistence_required = true;
                 return Some(ownership);
             }
         }
@@ -3034,7 +3064,20 @@ impl SharedAccount {
             let reservation_delta = if let Some(order) = state.orders.get_mut(&resolved_coid) {
                 if should_reverse {
                     order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
+                    // An authoritative cancellation's size_matched includes this
+                    // trade while it is MATCHED. Once that trade reaches FAILED,
+                    // it is terminal and can never consume the cancelled parent
+                    // again, so remove it from the cancellation audit target.
+                    // Other, not-yet-delivered trade legs remain represented by
+                    // the residual target and therefore keep their reservation.
+                    if order.status == OrderStatus::Cancelled {
+                        if let Some(target) = order.terminal_matched_quantity.as_mut() {
+                            *target = (*target - quantity).max(order.filled_quantity);
+                        }
+                    }
                 }
+                let cancellation_audit_pending = order.status == OrderStatus::Cancelled
+                    && order.terminal_matched_quantity.is_none();
                 let off_book = order.status == OrderStatus::Rejected;
                 if should_reverse && !off_book && order.status != OrderStatus::Cancelled {
                     order.status = if order.filled_quantity > EPS {
@@ -3052,7 +3095,10 @@ impl SharedAccount {
                 let qty_delta = desired_qty - order.reserved_quantity;
                 order.reserved_cash = desired_cash;
                 order.reserved_quantity = desired_qty;
-                (cash_delta, qty_delta, order.token_id.clone(), order.status == OrderStatus::Cancelled)
+                let recovery_pending = cancellation_audit_pending
+                    || (order.status == OrderStatus::Cancelled
+                        && (desired_cash > EPS || desired_qty > EPS));
+                (cash_delta, qty_delta, order.token_id.clone(), recovery_pending)
             } else { (0.0, 0.0, token_id.to_string(), false) };
             if let Some(instance) = state.instances.get_mut(&instance_id) {
                 instance.reserved_cash = (instance.reserved_cash + reservation_delta.0).max(0.0);
@@ -3061,7 +3107,9 @@ impl SharedAccount {
                     *reserved = (*reserved + reservation_delta.1).max(0.0);
                 }
             }
-            if !reservation_delta.3 {
+            if reservation_delta.3 {
+                state.recovery_pending_orders.insert(resolved_coid.clone());
+            } else {
                 state.recovery_pending_orders.remove(&resolved_coid);
             }
         }
@@ -3111,6 +3159,7 @@ impl SharedAccount {
         }
         recompute_reconciliation(&mut state, "trade lifecycle transition");
         self.schedule_persist(&state);
+        *persistence_required = true;
         Some(ownership)
     }
 
@@ -4061,6 +4110,93 @@ mod tests {
         let after = account.monitoring_snapshot();
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
+    }
+
+    #[test]
+    fn failed_trade_on_authoritatively_cancelled_parent_releases_restored_reservation() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-cancel-fail", "oid-cancel-fail", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        assert!(account.mark_cancelled_pending_trade_audit("a-cancel-fail", 10.0));
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 1);
+
+        account
+            .apply_trade_transition(
+                "trade-cancel-fail",
+                "MATCHED",
+                "a-cancel-fail",
+                "oid-cancel-fail",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
+
+        account
+            .apply_trade_transition(
+                "trade-cancel-fail",
+                "FAILED",
+                "a-cancel-fail",
+                "oid-cancel-fail",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        let instance = account.instance_snapshot("a").unwrap();
+        assert_eq!(instance.reserved_cash, 0.0);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
+        assert!(!account.is_uncertain());
+        let order = account.order("a-cancel-fail").unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.terminal_matched_quantity, Some(0.0));
+    }
+
+    #[test]
+    fn failed_cancelled_trade_retains_only_other_unreplayed_trade_reservation() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-cancel-partial-fail", "oid-cancel-partial-fail", "UP", Side::Buy, 15.0, 0.5, 0)
+            .unwrap();
+        assert!(account.mark_cancelled_pending_trade_audit("a-cancel-partial-fail", 15.0));
+
+        account
+            .apply_trade_transition(
+                "trade-cancel-partial-fail",
+                "MATCHED",
+                "a-cancel-partial-fail",
+                "oid-cancel-partial-fail",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 2.5);
+
+        account
+            .apply_trade_transition(
+                "trade-cancel-partial-fail",
+                "FAILED",
+                "a-cancel-partial-fail",
+                "oid-cancel-partial-fail",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+            )
+            .unwrap();
+        let instance = account.instance_snapshot("a").unwrap();
+        assert_eq!(instance.reserved_cash, 2.5);
+        assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 1);
+        let order = account.order("a-cancel-partial-fail").unwrap();
+        assert_eq!(order.filled_quantity, 0.0);
+        assert_eq!(order.terminal_matched_quantity, Some(5.0));
     }
 
     #[test]
@@ -5261,6 +5397,61 @@ mod tests {
         ));
         assert!(!restored.is_uncertain());
         drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn duplicate_trade_context_replay_does_not_flush_unchanged_ledger() {
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-duplicate-trade-ledger-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("duplicate-trade", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.apply_physical_snapshot(100.0, HashMap::new());
+            account
+                .reserve_order(
+                    "a", "a-duplicate", "oid-duplicate", "UP", Side::Buy, 10.0, 0.5, 0,
+                )
+                .unwrap();
+            account
+                .apply_trade_transition_with_context(
+                    "trade-duplicate",
+                    "MATCHED",
+                    "a-duplicate",
+                    "oid-duplicate",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    false,
+                    123,
+                )
+                .unwrap();
+            let before = account.monitoring_snapshot();
+            account
+                .apply_trade_transition_with_context(
+                    "trade-duplicate",
+                    "MATCHED",
+                    "a-duplicate",
+                    "oid-duplicate",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    false,
+                    123,
+                )
+                .unwrap();
+            let after = account.monitoring_snapshot();
+            assert_eq!(after.persistence_flushes, before.persistence_flushes);
+            assert_eq!(after.persistence_writes, before.persistence_writes);
+        }
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let _ = std::fs::remove_file(&path);
