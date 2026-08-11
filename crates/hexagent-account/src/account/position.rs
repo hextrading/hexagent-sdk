@@ -696,6 +696,7 @@ impl PositionManager {
 
     pub fn maker_volume(&self) -> f64 { self.maker_volume }
     pub fn taker_volume(&self) -> f64 { self.taker_volume }
+    pub fn initial_balance(&self) -> f64 { self.init_balance }
     pub fn initial_quantity(&self, symbol: &str) -> f64 {
         self.init_positions.get(symbol).copied().unwrap_or(0.0)
     }
@@ -1054,6 +1055,7 @@ mod tests {
         let mut pm = PositionManager::with_positions_and_restored_trades(
             positions, 98.0, [restored],
         );
+        assert!((pm.initial_balance() - 100.0).abs() < 1e-12);
         assert!(pm.initial_quantity("TOKEN").abs() < 1e-12);
         assert!((pm.balance() - 98.0).abs() < 1e-12);
         assert!((pm.get_quantity("TOKEN") - 5.0).abs() < 1e-12);

@@ -4132,10 +4132,11 @@ impl Engine {
     }
 
     /// Route ONE market event to the subscribing instances' channels.
-    /// Known symbol → those instances; unknown → broadcast to all
-    /// (never drop — a strategy that receives a foreign event filters it
-    /// out internally, exactly as in the single-thread loop). Learns
-    /// Polymarket token_id → instance from `Instrument(BinaryOption)`.
+    /// Known symbol → those instances. Unknown stable spot symbols retain the
+    /// legacy broadcast fallback, but unknown dynamic Polymarket token ids are
+    /// dropped: broadcasting them contaminates per-instance PM activity and can
+    /// fill unrelated workers' bounded market queues. Learns Polymarket
+    /// token_id → instance from `Instrument(BinaryOption)`.
     fn route_market_event(
         event: Arc<MarketEvent>,
         sym_to_instances: &HashMap<String, Vec<usize>>,
@@ -4205,18 +4206,30 @@ impl Engine {
             | MarketEvent::Disconnected { .. }
             | MarketEvent::Instrument(_) => None,
             // Polymarket market data keyed by dynamic token_id.
-            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => token_to_instances
-                .get(&ob.symbol.to_ascii_lowercase())
-                .cloned(),
-            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => token_to_instances
-                .get(&t.symbol.to_ascii_lowercase())
-                .cloned(),
-            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => token_to_instances
-                .get(&q.symbol.to_ascii_lowercase())
-                .cloned(),
-            MarketEvent::TickSizeChange(tsc) => token_to_instances
-                .get(&tsc.symbol.to_ascii_lowercase())
-                .cloned(),
+            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => Some(
+                token_to_instances
+                    .get(&ob.symbol.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => Some(
+                token_to_instances
+                    .get(&t.symbol.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => Some(
+                token_to_instances
+                    .get(&q.symbol.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            MarketEvent::TickSizeChange(tsc) => Some(
+                token_to_instances
+                    .get(&tsc.symbol.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
             // Spot venues keyed by stable symbol.
             MarketEvent::OrderBook(ob) => sym_to_instances
                 .get(&ob.symbol.to_ascii_lowercase())
@@ -7858,6 +7871,41 @@ mod market_router_tests {
         })
     }
 
+    fn trade(exchange: Exchange, symbol: &str) -> MarketEvent {
+        MarketEvent::Trade(TradeTick {
+            exchange,
+            symbol: symbol.into(),
+            price: 0.5,
+            quantity: 1.0,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        })
+    }
+
+    fn quote(exchange: Exchange, symbol: &str) -> MarketEvent {
+        MarketEvent::Quote(QuoteTick {
+            exchange,
+            symbol: symbol.into(),
+            bid_price: 0.4,
+            bid_qty: 1.0,
+            ask_price: 0.6,
+            ask_qty: 1.0,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        })
+    }
+
+    fn tick_size(symbol: &str) -> MarketEvent {
+        MarketEvent::TickSizeChange(TickSizeChange {
+            exchange: Exchange::Polymarket,
+            symbol: symbol.into(),
+            old_tick_size: 0.01,
+            new_tick_size: 0.001,
+            local_timestamp_ns: 1,
+        })
+    }
+
     fn spot(symbol: &str) -> MarketEvent {
         MarketEvent::SpotPrice(SpotPrice {
             source: "chainlink".into(),
@@ -8034,7 +8082,43 @@ mod market_router_tests {
     }
 
     #[test]
-    fn lifecycle_and_unknown_symbols_broadcast() {
+    fn unknown_polymarket_market_data_is_never_broadcast() {
+        let sym = two_instance_map();
+        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
+        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
+        let txs = [tx0, tx1];
+
+        Engine::route_market_event(
+            Arc::new(ob(Exchange::Polymarket, "UNMAPPED-TOKEN")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        Engine::route_market_event(
+            Arc::new(trade(Exchange::Polymarket, "UNMAPPED-TOKEN")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        Engine::route_market_event(
+            Arc::new(quote(Exchange::Polymarket, "UNMAPPED-TOKEN")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        Engine::route_market_event(
+            Arc::new(tick_size("UNMAPPED-TOKEN")),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        assert_eq!(drain(&rx0), 0);
+        assert_eq!(drain(&rx1), 0);
+    }
+
+    #[test]
+    fn lifecycle_and_unknown_spot_symbols_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
         let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
