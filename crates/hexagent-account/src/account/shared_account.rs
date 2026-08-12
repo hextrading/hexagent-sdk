@@ -5,7 +5,7 @@
 //! wallet: physical funds/positions are the hard ceiling, while each
 //! instance's weighted virtual balance/inventory is its private ceiling.
 
-use hexagent_types::types::{OrderStatus, Side};
+use hexagent_types::types::{BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -268,6 +268,35 @@ struct InstanceLedger {
     market_scopes: HashSet<String>,
 }
 
+/// Immutable economic root captured immediately after the first authoritative
+/// wallet snapshot is allocated across the configured instances. Every later
+/// cash/position mutation must be reproducible from durable journal roots.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct EconomicBalance {
+    cash: f64,
+    positions: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct AccountEconomicState {
+    physical_cash: f64,
+    physical_positions: HashMap<String, f64>,
+    instances: BTreeMap<String, EconomicBalance>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct AccountSeedBaseline {
+    captured_at_ms: u64,
+    physical_cash: f64,
+    physical_positions: HashMap<String, f64>,
+    instances: BTreeMap<String, EconomicBalance>,
+    /// Version-1 ledgers predate immutable seed roots. Their first upgraded
+    /// load derives an equivalent synthetic root by reversing every durable
+    /// economic effect, then persists it exactly once.
+    #[serde(default)]
+    legacy_derived: bool,
+}
+
 impl InstanceLedger {
     fn new(weight: f64) -> Self {
         Self {
@@ -367,6 +396,14 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SharedAccountState {
     seeded: bool,
+    /// Immutable root for cold replay of every virtual and physical balance.
+    #[serde(default)]
+    seed_baseline: Option<AccountSeedBaseline>,
+    /// Terminal trade rows are pruned after the settled-event FIFO expires.
+    /// Fold their already-validated net effects here so history stays bounded
+    /// without making the immutable seed baseline mutable.
+    #[serde(default)]
+    compacted_economic_effects: AccountEconomicState,
     physical_cash: f64,
     physical_positions: HashMap<String, f64>,
     unallocated_cash: f64,
@@ -396,6 +433,8 @@ struct SharedAccountState {
     risk_blockers: BTreeMap<String, RiskBlocker>,
     #[serde(default)]
     external_adjustments: HashMap<String, ExternalAdjustment>,
+    #[serde(default)]
+    internal_adjustment_sequence: u64,
     #[serde(default)]
     gap_replay_last_pages: u64,
     #[serde(default)]
@@ -817,6 +856,14 @@ impl SharedAccount {
             let mut migrated = normalize_terminal_failed_state(&mut state);
             if migrated {
                 recompute_reconciliation(&mut state, "terminal FAILED ledger migration");
+            }
+            if state.seeded && state.seed_baseline.is_none() {
+                state.seed_baseline = Some(derive_legacy_seed_baseline(&state));
+                migrated = true;
+                log::warn!(
+                    "[shared_account] account={} upgraded legacy ledger with a synthetic immutable seed baseline",
+                    account_id,
+                );
             }
             // A persisted trade-persistence blocker proves that the snapshot
             // containing both the trade and the blocker reached disk. The new
@@ -1308,13 +1355,10 @@ impl SharedAccount {
     ) -> Result<(), ReservationError> {
         if token_ids.is_empty()
             || token_ids.iter().any(|token| token.is_empty())
-            || !rate.is_finite()
-            || rate < 0.0
-            || !exponent.is_finite()
-            || exponent < 0.0
+            || BinaryOption::validate_polymarket_fee_curve(rate, exponent, 0).is_err()
         {
             return Err(ReservationError::InvalidOrder(
-                "token fee config requires tokens and finite nonnegative rate/exponent".into(),
+                "token fee config requires tokens and a valid Polymarket v2 fee curve".into(),
             ));
         }
         let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
@@ -1453,6 +1497,7 @@ impl SharedAccount {
                 .map(|(token, qty)| (token.clone(), *qty))
                 .collect();
             redistribute_all(&mut state);
+            state.seed_baseline = Some(capture_seed_baseline(&state, false));
             self.schedule_persist(&state);
             return Ok(true);
         }
@@ -1540,19 +1585,36 @@ impl SharedAccount {
         }
 
         state.physical_cash += cash_delta;
+        let mut attributed = Vec::new();
         for (token, qty) in &removed {
             let physical = state.physical_positions.entry(token.clone()).or_insert(0.0);
             *physical = (*physical - *qty).max(0.0);
             let virtual_total: f64 = state.instances.values()
                 .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0)).sum();
             if virtual_total <= EPS { continue; }
-            for instance in state.instances.values_mut() {
+            for (instance_id, instance) in &mut state.instances {
                 let owned = instance.positions.get(token).copied().unwrap_or(0.0);
                 if owned <= EPS { continue; }
                 let burned = (owned * *qty / virtual_total).min(owned);
                 *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                instance.cash += cash_delta * burned / removed_total;
+                let instance_cash_delta = cash_delta * burned / removed_total;
+                instance.cash += instance_cash_delta;
+                attributed.push((
+                    instance_id.clone(),
+                    token.clone(),
+                    burned,
+                    instance_cash_delta,
+                ));
             }
+        }
+        for (instance_id, token, burned, instance_cash_delta) in attributed {
+            record_internal_external_adjustment(
+                &mut state,
+                "observed_platform_redeem",
+                &instance_id,
+                instance_cash_delta,
+                HashMap::from([(token, -burned)]),
+            );
         }
         recompute_reconciliation(&mut state, "platform automatic binary redeem");
         self.schedule_persist(&state);
@@ -2459,6 +2521,21 @@ impl SharedAccount {
             *instance.positions.entry(up_token.into()).or_insert(0.0) += *amount;
             *instance.positions.entry(down_token.into()).or_insert(0.0) += *amount;
         }
+        // This legacy direct API has no maintenance-operation row. Preserve
+        // the same immutable replay guarantee through an internal durable
+        // adjustment rather than leaving an unrooted balance mutation.
+        for (instance_id, amount) in allocations {
+            record_internal_external_adjustment(
+                &mut state,
+                "direct_split",
+                instance_id,
+                -*amount,
+                HashMap::from([
+                    (up_token.to_string(), *amount),
+                    (down_token.to_string(), *amount),
+                ]),
+            );
+        }
         recompute_reconciliation(&mut state, "confirmed split");
         self.schedule_persist(&state);
         Ok(())
@@ -2494,13 +2571,25 @@ impl SharedAccount {
             let payout = finite_nonnegative(*requested_payout)
                 * if *requested_qty > EPS { removed / *requested_qty } else { 0.0 };
             let ownership_scale = removed / virtual_total;
-            for instance in state.instances.values_mut() {
+            let mut attributed = Vec::new();
+            for (instance_id, instance) in &mut state.instances {
                 let owned = instance.positions.get(token).copied().unwrap_or(0.0);
                 if owned <= EPS { continue; }
                 let burned = (owned * ownership_scale).min(owned);
                 let share = burned / removed;
                 *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                instance.cash += payout * share;
+                let cash_delta = payout * share;
+                instance.cash += cash_delta;
+                attributed.push((instance_id.clone(), burned, cash_delta));
+            }
+            for (instance_id, burned, cash_delta) in attributed {
+                record_internal_external_adjustment(
+                    &mut state,
+                    "confirmed_redeem",
+                    &instance_id,
+                    cash_delta,
+                    HashMap::from([(token.clone(), -burned)]),
+                );
             }
             *state.physical_positions.entry(token.clone()).or_insert(0.0) -= removed;
             state.physical_cash += payout;
@@ -2620,6 +2709,18 @@ impl SharedAccount {
                 let reserved = instance.reserved_positions.entry(token.into()).or_insert(0.0);
                 *reserved = (*reserved - *amount).max(0.0);
             }
+        }
+        for (instance_id, amount) in allocations {
+            record_internal_external_adjustment(
+                &mut state,
+                "direct_merge",
+                instance_id,
+                *amount,
+                HashMap::from([
+                    (up_token.to_string(), -*amount),
+                    (down_token.to_string(), -*amount),
+                ]),
+            );
         }
         recompute_reconciliation(&mut state, "confirmed merge");
         self.schedule_persist(&state);
@@ -3511,6 +3612,17 @@ impl SharedAccount {
             self.schedule_persist(&state);
             return false;
         };
+        if existing.is_maker.is_some_and(|stored| stored != is_maker) {
+            set_uncertain(
+                &mut state,
+                format!(
+                    "trade role replay mismatch trade={trade_key} stored_maker={:?} replay_maker={is_maker}",
+                    existing.is_maker,
+                ),
+            );
+            self.schedule_persist(&state);
+            return false;
+        }
         if let Some(trade) = state.trades.get_mut(trade_key) {
             trade.is_maker = Some(is_maker);
         }
@@ -3661,7 +3773,7 @@ impl SharedAccount {
                 usdc_fee: if trade.virtual_fee_booked { trade.usdc_fee } else { 0.0 },
                 shares_fee: if trade.virtual_fee_booked { trade.shares_fee } else { 0.0 },
                 virtual_fee_booked: trade.virtual_fee_booked,
-                is_maker: trade.is_maker.unwrap_or(false),
+                is_maker: trade.is_maker.expect("persisted/runtime trade role must be resolved before restoration"),
                 match_time_secs: trade.match_time_secs,
                 ledger_generation: trade.ledger_generation,
             })
@@ -3723,7 +3835,13 @@ impl SharedAccount {
             .map(|(trade_key, _)| trade_key.clone())
             .collect();
         for trade_key in &stale_trades {
-            state.trades.remove(trade_key);
+            if let Some(trade) = state.trades.remove(trade_key) {
+                add_economic_state(
+                    &mut state.compacted_economic_effects,
+                    &trade_economic_effect(&trade),
+                    1.0,
+                );
+            }
             state.fee_attribution_pending.remove(trade_key);
         }
         let protected_fee_tokens: HashSet<String> = state
@@ -4243,6 +4361,247 @@ fn validate_named_values(
     Ok(())
 }
 
+fn add_position_delta(positions: &mut HashMap<String, f64>, token: &str, delta: f64) {
+    *positions.entry(token.to_string()).or_insert(0.0) += delta;
+}
+
+fn economic_instance_mut<'a>(
+    economics: &'a mut AccountEconomicState,
+    instance_id: &str,
+) -> &'a mut EconomicBalance {
+    economics
+        .instances
+        .entry(instance_id.to_string())
+        .or_default()
+}
+
+fn record_internal_external_adjustment(
+    state: &mut SharedAccountState,
+    label: &str,
+    instance_id: &str,
+    cash_delta: f64,
+    position_deltas: HashMap<String, f64>,
+) {
+    state.internal_adjustment_sequence =
+        state.internal_adjustment_sequence.saturating_add(1).max(1);
+    let operation_id = format!(
+        "internal:{label}:{}:{}",
+        state.internal_adjustment_sequence, instance_id,
+    );
+    state.external_adjustments.insert(
+        operation_id.clone(),
+        ExternalAdjustment {
+            operation_id,
+            instance_id: instance_id.to_string(),
+            cash_delta,
+            position_deltas,
+            recorded_at_ms: wall_clock_ms().max(1),
+        },
+    );
+}
+
+fn add_economic_state(target: &mut AccountEconomicState, delta: &AccountEconomicState, scale: f64) {
+    target.physical_cash += delta.physical_cash * scale;
+    for (token, quantity) in &delta.physical_positions {
+        add_position_delta(&mut target.physical_positions, token, quantity * scale);
+    }
+    for (instance_id, balance) in &delta.instances {
+        let target_instance = economic_instance_mut(target, instance_id);
+        target_instance.cash += balance.cash * scale;
+        for (token, quantity) in &balance.positions {
+            add_position_delta(&mut target_instance.positions, token, quantity * scale);
+        }
+    }
+}
+
+fn trade_economic_effect(trade: &AppliedTrade) -> AccountEconomicState {
+    let mut effect = AccountEconomicState::default();
+    if trade.failed {
+        return effect;
+    }
+    let ownership = &trade.ownership;
+    let sign = if ownership.side == Side::Buy {
+        1.0
+    } else {
+        -1.0
+    };
+    let cash_delta = -sign * ownership.quantity * ownership.price;
+    let position_delta = sign * ownership.quantity;
+    if trade.booked {
+        let instance = economic_instance_mut(&mut effect, &ownership.instance_id);
+        instance.cash += cash_delta;
+        add_position_delta(&mut instance.positions, &ownership.token_id, position_delta);
+    }
+    if trade.physical_booked {
+        effect.physical_cash += cash_delta;
+        add_position_delta(
+            &mut effect.physical_positions,
+            &ownership.token_id,
+            position_delta,
+        );
+    }
+    if trade.virtual_fee_booked {
+        let instance = economic_instance_mut(&mut effect, &ownership.instance_id);
+        instance.cash -= trade.usdc_fee;
+        add_position_delta(
+            &mut instance.positions,
+            &ownership.token_id,
+            -trade.shares_fee,
+        );
+    }
+    if trade.physical_fee_booked {
+        effect.physical_cash -= trade.usdc_fee;
+        add_position_delta(
+            &mut effect.physical_positions,
+            &ownership.token_id,
+            -trade.shares_fee,
+        );
+    }
+    effect
+}
+
+fn durable_root_economic_effects(state: &SharedAccountState) -> AccountEconomicState {
+    let mut effects = state.compacted_economic_effects.clone();
+    for trade in state.trades.values() {
+        add_economic_state(&mut effects, &trade_economic_effect(trade), 1.0);
+    }
+    for operation in state
+        .maintenance_ops
+        .values()
+        .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+    {
+        let total: f64 = operation.allocations.values().sum();
+        let direction = match operation.kind {
+            MaintenanceOperationKind::Split => -1.0,
+            MaintenanceOperationKind::Merge => 1.0,
+        };
+        effects.physical_cash += direction * total;
+        for token in [&operation.up_token_id, &operation.down_token_id] {
+            add_position_delta(&mut effects.physical_positions, token, -direction * total);
+        }
+        for (instance_id, amount) in &operation.allocations {
+            let instance = economic_instance_mut(&mut effects, instance_id);
+            instance.cash += direction * *amount;
+            for token in [&operation.up_token_id, &operation.down_token_id] {
+                add_position_delta(&mut instance.positions, token, -direction * *amount);
+            }
+        }
+    }
+    for adjustment in state.external_adjustments.values() {
+        effects.physical_cash += adjustment.cash_delta;
+        for (token, delta) in &adjustment.position_deltas {
+            add_position_delta(&mut effects.physical_positions, token, *delta);
+        }
+        let instance = economic_instance_mut(&mut effects, &adjustment.instance_id);
+        instance.cash += adjustment.cash_delta;
+        for (token, delta) in &adjustment.position_deltas {
+            add_position_delta(&mut instance.positions, token, *delta);
+        }
+    }
+    for migration in state.cash_allocation_migrations.values() {
+        let mut instance_ids: HashSet<String> = migration.cash_before.keys().cloned().collect();
+        instance_ids.extend(migration.cash_after.keys().cloned());
+        for instance_id in instance_ids {
+            let before = migration
+                .cash_before
+                .get(&instance_id)
+                .copied()
+                .unwrap_or(0.0);
+            let after = migration
+                .cash_after
+                .get(&instance_id)
+                .copied()
+                .unwrap_or(0.0);
+            economic_instance_mut(&mut effects, &instance_id).cash += after - before;
+        }
+    }
+    effects
+}
+
+fn current_account_economics(state: &SharedAccountState) -> AccountEconomicState {
+    AccountEconomicState {
+        physical_cash: state.physical_cash,
+        physical_positions: state.physical_positions.clone(),
+        instances: state
+            .instances
+            .iter()
+            .map(|(instance_id, instance)| {
+                (
+                    instance_id.clone(),
+                    EconomicBalance {
+                        cash: instance.cash,
+                        positions: instance.positions.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn capture_seed_baseline(state: &SharedAccountState, legacy_derived: bool) -> AccountSeedBaseline {
+    let current = current_account_economics(state);
+    AccountSeedBaseline {
+        captured_at_ms: wall_clock_ms().max(1),
+        physical_cash: current.physical_cash,
+        physical_positions: current.physical_positions,
+        instances: current.instances,
+        legacy_derived,
+    }
+}
+
+fn derive_legacy_seed_baseline(state: &SharedAccountState) -> AccountSeedBaseline {
+    let mut baseline_economics = current_account_economics(state);
+    let effects = durable_root_economic_effects(state);
+    add_economic_state(&mut baseline_economics, &effects, -1.0);
+    AccountSeedBaseline {
+        captured_at_ms: wall_clock_ms().max(1),
+        physical_cash: baseline_economics.physical_cash,
+        physical_positions: baseline_economics.physical_positions,
+        instances: baseline_economics.instances,
+        legacy_derived: true,
+    }
+}
+
+fn replay_account_economics(state: &SharedAccountState) -> Result<AccountEconomicState, String> {
+    let baseline = state
+        .seed_baseline
+        .as_ref()
+        .ok_or_else(|| "seeded account is missing immutable seed baseline".to_string())?;
+    let mut replayed = AccountEconomicState {
+        physical_cash: baseline.physical_cash,
+        physical_positions: baseline.physical_positions.clone(),
+        instances: baseline.instances.clone(),
+    };
+    add_economic_state(&mut replayed, &durable_root_economic_effects(state), 1.0);
+    Ok(replayed)
+}
+
+fn compare_economic_value(field: &str, stored: f64, replayed: f64) -> Result<(), String> {
+    if (stored - replayed).abs() > reconciliation_tolerance(stored, replayed) {
+        return Err(format!(
+            "{field}={stored} disagrees with immutable-baseline replay={replayed}",
+        ));
+    }
+    Ok(())
+}
+
+fn compare_economic_positions(
+    field: &str,
+    stored: &HashMap<String, f64>,
+    replayed: &HashMap<String, f64>,
+) -> Result<(), String> {
+    let mut tokens: HashSet<String> = stored.keys().cloned().collect();
+    tokens.extend(replayed.keys().cloned());
+    for token in tokens {
+        compare_economic_value(
+            &format!("{field}[{token}]"),
+            stored.get(&token).copied().unwrap_or(0.0),
+            replayed.get(&token).copied().unwrap_or(0.0),
+        )?;
+    }
+    Ok(())
+}
+
 /// A syntactically valid JSON ledger is not necessarily a valid account. This
 /// validator runs before the persistence worker starts so parseable corruption,
 /// incompatible old writers or hand-edited negative reservations fail closed.
@@ -4258,6 +4617,53 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
     }
     validate_named_values("physical_positions", &state.physical_positions, true)?;
     validate_named_values("unallocated_positions", &state.unallocated_positions, false)?;
+
+    if state.seeded {
+        let baseline = state
+            .seed_baseline
+            .as_ref()
+            .ok_or_else(|| "seeded account is missing immutable seed baseline".to_string())?;
+        if baseline.captured_at_ms == 0 || !baseline.physical_cash.is_finite() {
+            return Err("immutable seed baseline has invalid metadata/cash".to_string());
+        }
+        validate_named_values(
+            "immutable seed physical positions",
+            &baseline.physical_positions,
+            false,
+        )?;
+        for (instance_id, balance) in &baseline.instances {
+            if instance_id.trim().is_empty() || !balance.cash.is_finite() {
+                return Err(format!(
+                    "immutable seed baseline has invalid instance `{instance_id}`"
+                ));
+            }
+            validate_named_values(
+                &format!("immutable seed instance `{instance_id}` positions"),
+                &balance.positions,
+                false,
+            )?;
+        }
+    }
+    if !state.compacted_economic_effects.physical_cash.is_finite() {
+        return Err("compacted economic effects have invalid physical cash".to_string());
+    }
+    validate_named_values(
+        "compacted physical position effects",
+        &state.compacted_economic_effects.physical_positions,
+        false,
+    )?;
+    for (instance_id, balance) in &state.compacted_economic_effects.instances {
+        if instance_id.trim().is_empty() || !balance.cash.is_finite() {
+            return Err(format!(
+                "compacted economic effects have invalid instance `{instance_id}`"
+            ));
+        }
+        validate_named_values(
+            &format!("compacted instance `{instance_id}` position effects"),
+            &balance.positions,
+            false,
+        )?;
+    }
 
     for (instance_id, instance) in &state.instances {
         if instance_id.trim().is_empty()
@@ -4391,6 +4797,7 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
     }
 
     let mut max_trade_generation = 0_u64;
+    let mut expected_fee_pending = HashSet::new();
     for (trade_key, trade) in &state.trades {
         let ownership = &trade.ownership;
         max_trade_generation = max_trade_generation.max(trade.ledger_generation);
@@ -4434,6 +4841,76 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         {
             return Err(format!(
                 "trade `{trade_key}` contains invalid ownership/accounting fields"
+            ));
+        }
+        let Some(is_maker) = trade.is_maker else {
+            return Err(format!("trade `{trade_key}` has unknown maker/taker role"));
+        };
+        let fee_tolerance = reconciliation_tolerance(trade.usdc_fee, trade.shares_fee)
+            .max(ownership.quantity.abs().max(1.0) * 1e-8);
+        if is_maker {
+            if trade.usdc_fee.abs() > fee_tolerance || trade.shares_fee.abs() > fee_tolerance {
+                return Err(format!("maker trade `{trade_key}` contains non-zero fees"));
+            }
+            if !trade.failed && !trade.virtual_fee_booked {
+                return Err(format!(
+                    "maker trade `{trade_key}` is missing its explicit zero-fee booking"
+                ));
+            }
+        } else {
+            match ownership.side {
+                Side::Buy if trade.usdc_fee.abs() > fee_tolerance => {
+                    return Err(format!(
+                        "BUY taker trade `{trade_key}` stores fee in USDC instead of shares"
+                    ));
+                }
+                Side::Sell if trade.shares_fee.abs() > fee_tolerance => {
+                    return Err(format!(
+                        "SELL taker trade `{trade_key}` stores fee in shares instead of USDC"
+                    ));
+                }
+                _ => {}
+            }
+            if trade.virtual_fee_booked || trade.usdc_fee > EPS || trade.shares_fee > EPS {
+                let config = state
+                    .token_fee_configs
+                    .get(&ownership.token_id)
+                    .ok_or_else(|| {
+                        format!("attributed taker trade `{trade_key}` is missing token fee curve")
+                    })?;
+                BinaryOption::validate_polymarket_fee_curve(config.rate, config.exponent, 0)
+                    .map_err(|error| {
+                        format!("trade `{trade_key}` has invalid token fee curve: {error}")
+                    })?;
+                let notional = ownership.quantity
+                    * config.rate
+                    * (ownership.price * (1.0 - ownership.price)).powf(config.exponent);
+                let (expected_usdc, expected_shares) = match ownership.side {
+                    Side::Buy => (0.0, notional / ownership.price),
+                    Side::Sell => (notional, 0.0),
+                };
+                if (trade.usdc_fee - expected_usdc).abs()
+                    > reconciliation_tolerance(trade.usdc_fee, expected_usdc).max(fee_tolerance)
+                    || (trade.shares_fee - expected_shares).abs()
+                        > reconciliation_tolerance(trade.shares_fee, expected_shares)
+                            .max(fee_tolerance)
+                {
+                    return Err(format!(
+                        "taker trade `{trade_key}` fee disagrees with its durable curve"
+                    ));
+                }
+            }
+            if !trade.failed && !trade.virtual_fee_booked {
+                expected_fee_pending.insert(trade_key.clone());
+            }
+        }
+        if !trade.failed
+            && trade.physical_booked
+            && trade.virtual_fee_booked
+            && !trade.physical_fee_booked
+        {
+            return Err(format!(
+                "trade `{trade_key}` has virtual fee but missing physical fee booking"
             ));
         }
     }
@@ -4563,14 +5040,19 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         }
     }
 
-    for trade_key in &state.fee_attribution_pending {
-        if state.trades.get(trade_key).is_none_or(|trade| {
-            trade.failed || !trade.booked || trade.virtual_fee_booked
-        }) {
-            return Err(format!(
-                "fee-attribution pending set contains invalid trade `{trade_key}`"
-            ));
-        }
+    if state.fee_attribution_pending != expected_fee_pending {
+        let missing: Vec<_> = expected_fee_pending
+            .difference(&state.fee_attribution_pending)
+            .cloned()
+            .collect();
+        let extraneous: Vec<_> = state
+            .fee_attribution_pending
+            .difference(&expected_fee_pending)
+            .cloned()
+            .collect();
+        return Err(format!(
+            "fee-attribution pending relationship is not bidirectional: missing={missing:?} extraneous={extraneous:?}"
+        ));
     }
     for coid in &state.recovery_pending_orders {
         if !state.orders.contains_key(coid) {
@@ -4582,10 +5064,7 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
 
     for (token, config) in &state.token_fee_configs {
         if token.trim().is_empty()
-            || !config.rate.is_finite()
-            || config.rate < 0.0
-            || !config.exponent.is_finite()
-            || config.exponent < 0.0
+            || BinaryOption::validate_polymarket_fee_curve(config.rate, config.exponent, 0).is_err()
         {
             return Err(format!("invalid token fee config `{token}`"));
         }
@@ -4677,6 +5156,27 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         return Err("invalid unresolved trade match-time entry".to_string());
     }
 
+    if state.seeded {
+        let replayed = replay_account_economics(state)?;
+        let mut instance_ids: HashSet<String> = state.instances.keys().cloned().collect();
+        instance_ids.extend(replayed.instances.keys().cloned());
+        for instance_id in instance_ids {
+            let stored = state.instances.get(&instance_id);
+            let replayed_balance = replayed.instances.get(&instance_id);
+            let empty_positions = HashMap::new();
+            compare_economic_value(
+                &format!("instance `{instance_id}` cash"),
+                stored.map_or(0.0, |instance| instance.cash),
+                replayed_balance.map_or(0.0, |balance| balance.cash),
+            )?;
+            compare_economic_positions(
+                &format!("instance `{instance_id}` positions"),
+                stored.map_or(&empty_positions, |instance| &instance.positions),
+                replayed_balance.map_or(&empty_positions, |balance| &balance.positions),
+            )?;
+        }
+    }
+
     let mut recomputed = state.clone();
     recompute_reconciliation(&mut recomputed, "persisted ledger validation");
     if (recomputed.unallocated_cash - state.unallocated_cash).abs()
@@ -4754,12 +5254,24 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
             .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
             .sum();
         if virtual_total <= EPS { continue; }
-        for instance in state.instances.values_mut() {
+        let mut attributed = Vec::new();
+        for (instance_id, instance) in &mut state.instances {
             let owned = instance.positions.get(token).copied().unwrap_or(0.0);
             if owned <= EPS { continue; }
             let burned = (owned * *qty / virtual_total).min(owned);
             *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-            instance.cash += cash_to_credit * burned / removed_total;
+            let cash_delta = cash_to_credit * burned / removed_total;
+            instance.cash += cash_delta;
+            attributed.push((instance_id.clone(), burned, cash_delta));
+        }
+        for (instance_id, burned, cash_delta) in attributed {
+            record_internal_external_adjustment(
+                state,
+                "platform_redeem",
+                &instance_id,
+                cash_delta,
+                HashMap::from([(token.clone(), -burned)]),
+            );
         }
     }
     log::info!(
@@ -5011,10 +5523,12 @@ mod tests {
         ).unwrap();
         assert!((account.instance_snapshot("a").unwrap().reserved_cash - 5.5).abs() < 1e-12);
 
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade-fee-partial-1", "MATCHED", "a-fee-partial",
             "oid-fee-partial", "UP", Side::Buy, 4.0, 0.5,
-        ).unwrap();
+            true,
+            1,
+        );
         let partial = account.instance_snapshot("a").unwrap();
         assert!((partial.reserved_cash - 3.3).abs() < 1e-12);
         assert!(partial.ledger_generation > baseline_generation);
@@ -5024,16 +5538,20 @@ mod tests {
         assert_eq!(restored_generation, partial.ledger_generation);
         assert!((account.order("a-fee-partial").unwrap().reserved_cash - 3.3).abs() < 1e-12);
 
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade-fee-partial-1", "CONFIRMED", "a-fee-partial",
             "oid-fee-partial", "UP", Side::Buy, 4.0, 0.5,
-        ).unwrap();
+            true,
+            1,
+        );
         assert!((account.instance_snapshot("a").unwrap().reserved_cash - 3.3).abs() < 1e-12);
 
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade-fee-partial-2", "MATCHED", "a-fee-partial",
             "oid-fee-partial", "UP", Side::Buy, 6.0, 0.5,
-        ).unwrap();
+            true,
+            2,
+        );
         assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
         assert_eq!(account.order("a-fee-partial").unwrap().reserved_cash, 0.0);
     }
@@ -6728,7 +7246,7 @@ mod tests {
                 physical_booked: false,
                 usdc_fee: 0.0,
                 shares_fee: 0.0,
-                virtual_fee_booked: false,
+                virtual_fee_booked: true,
                 physical_fee_booked: false,
                 failed: false,
                 failure_reconciled: false,
@@ -6741,12 +7259,120 @@ mod tests {
 
         state.instances.get_mut("maker").unwrap().reserved_cash = 4.0;
         let aggregate_error = validate_persisted_state("account", &state).unwrap_err();
-        assert!(aggregate_error.contains("reserved_cash"), "{aggregate_error}");
+        assert!(
+            aggregate_error.contains("reserved_cash"),
+            "{aggregate_error}"
+        );
         state.instances.get_mut("maker").unwrap().reserved_cash = 4.5;
 
         state.orders.get_mut("maker-order").unwrap().filled_quantity = 0.5;
         let fill_error = validate_persisted_state("account", &state).unwrap_err();
         assert!(fill_error.contains("durable trades"), "{fill_error}");
+    }
+
+    #[test]
+    fn persisted_state_validator_replays_instance_economics_from_immutable_seed() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "replay-order",
+                "replay-oid",
+                "UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "replay-trade",
+                "CONFIRMED",
+                "replay-order",
+                "replay-oid",
+                "UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        assert_eq!(
+            account.prune_terminal_history(&HashSet::from(["UP".to_string()])),
+            (1, 1),
+        );
+
+        let mut state = account.state.lock().unwrap().clone();
+        assert!(validate_persisted_state("acct", &state).is_ok());
+
+        // Keep aggregate cash unchanged so the old reconciliation-only check
+        // cannot see the corruption. Immutable-root replay must reject the
+        // per-instance transfer that has no durable migration/adjustment row.
+        state.instances.get_mut("a").unwrap().cash += 1.0;
+        state.instances.get_mut("b").unwrap().cash -= 1.0;
+        let error = validate_persisted_state("acct", &state).unwrap_err();
+        assert!(error.contains("immutable-baseline replay"), "{error}");
+    }
+
+    #[test]
+    fn persisted_state_validator_requires_roles_fee_currency_and_pending_bijection() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "fee-order", "fee-oid", "UP", Side::Buy, 2.0, 0.5, 0)
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "fee-trade",
+                "MATCHED",
+                "fee-order",
+                "fee-oid",
+                "UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                false,
+                1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+
+        let state = account.state.lock().unwrap().clone();
+        assert!(state.fee_attribution_pending.contains("fee-trade"));
+        assert!(validate_persisted_state("acct", &state).is_ok());
+
+        let mut missing_pending = state.clone();
+        missing_pending.fee_attribution_pending.clear();
+        let pending_error = validate_persisted_state("acct", &missing_pending).unwrap_err();
+        assert!(
+            pending_error.contains("not bidirectional"),
+            "{pending_error}"
+        );
+
+        let mut unknown_role = state.clone();
+        unknown_role.trades.get_mut("fee-trade").unwrap().is_maker = None;
+        let role_error = validate_persisted_state("acct", &unknown_role).unwrap_err();
+        assert!(
+            role_error.contains("unknown maker/taker role"),
+            "{role_error}"
+        );
+
+        let mut wrong_currency = state;
+        wrong_currency.trades.get_mut("fee-trade").unwrap().usdc_fee = 0.1;
+        let currency_error = validate_persisted_state("acct", &wrong_currency).unwrap_err();
+        assert!(
+            currency_error.contains("instead of shares"),
+            "{currency_error}"
+        );
+
+        assert!(account
+            .register_token_fee_config(&["UP".to_string()], 1.01, 1.0)
+            .is_err());
+        assert!(account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 0.0)
+            .is_err());
     }
 
     #[test]
@@ -6778,6 +7404,87 @@ mod tests {
         assert!(!state
             .provisional_position_owners
             .contains_key("HISTORICAL-WIN"));
+    }
+
+    #[test]
+    fn persistent_restart_rejects_unjournaled_cross_instance_balance_transfer() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-economic-replay-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("economic-replay", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.register_instance("b", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let a = persisted["state"]["instances"]["a"]["cash"]
+            .as_f64()
+            .unwrap();
+        let b = persisted["state"]["instances"]["b"]["cash"]
+            .as_f64()
+            .unwrap();
+        persisted["state"]["instances"]["a"]["cash"] = serde_json::json!(a + 1.0);
+        persisted["state"]["instances"]["b"]["cash"] = serde_json::json!(b - 1.0);
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let error = match SharedAccount::new_persistent("economic-replay", &path) {
+            Ok(_) => panic!("unjournaled per-instance transfer must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("immutable-baseline replay"), "{error}");
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn legacy_seed_is_derived_once_and_persisted_as_immutable_baseline() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-legacy-seed-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("legacy-seed", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        persisted["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("seed_baseline");
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        {
+            let restored = SharedAccount::new_persistent("legacy-seed", &path).unwrap();
+            restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            upgraded["state"]["seed_baseline"]["legacy_derived"],
+            serde_json::json!(true),
+        );
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]
