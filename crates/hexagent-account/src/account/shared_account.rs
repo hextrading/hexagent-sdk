@@ -865,6 +865,25 @@ impl SharedAccount {
                     account_id,
                 );
             }
+            // Older SDK callers could book a trade before supplying its
+            // maker/taker role. Preserve the economic row, but make that
+            // intermediate state explicitly recoverable and risk-off instead
+            // of letting `restored_trades()` panic or rejecting the ledger on
+            // the next process start.
+            let unresolved_roles: Vec<String> = state
+                .trades
+                .iter()
+                .filter(|(_, trade)| trade.is_maker.is_none())
+                .map(|(trade_key, _)| trade_key.clone())
+                .collect();
+            let mut role_migrated = false;
+            for trade_key in unresolved_roles {
+                role_migrated |= state.fee_attribution_pending.insert(trade_key);
+            }
+            migrated |= role_migrated;
+            if role_migrated {
+                recompute_reconciliation(&mut state, "legacy trade-role attribution migration");
+            }
             // A persisted trade-persistence blocker proves that the snapshot
             // containing both the trade and the blocker reached disk. The new
             // process can therefore clear only this source-owned blocker; all
@@ -1363,11 +1382,86 @@ impl SharedAccount {
         }
         let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
         let mut state = self.state.lock().unwrap();
+        let next_config = TokenFeeConfig { rate, exponent };
+        let revised_tokens: HashSet<String> = token_ids
+            .iter()
+            .filter(|token| {
+                state.token_fee_configs.get(*token).is_some_and(|current| {
+                    !fee_configs_equal(current, &next_config)
+                })
+            })
+            .cloned()
+            .collect();
+
+        // A curve swap cannot be made atomic while any affected trade still
+        // lacks its role. Leave the old curve and account economics untouched;
+        // the role-pending blocker remains the owner of admission.
+        if let Some((trade_key, _)) = state.trades.iter().find(|(_, trade)| {
+            revised_tokens.contains(&trade.ownership.token_id) && trade.is_maker.is_none()
+        }) {
+            return Err(ReservationError::InvalidOrder(format!(
+                "cannot revise token fee curve while trade `{trade_key}` has unresolved maker/taker role"
+            )));
+        }
+
         for token in token_ids {
-            state.token_fee_configs.insert(
-                token.clone(),
-                TokenFeeConfig { rate, exponent },
+            state.token_fee_configs.insert(token.clone(), next_config.clone());
+        }
+
+        // Reprice every already-attributed execution before exposing the new
+        // curve. Pending rows remain zero/unbooked and are handled by the retry
+        // loop below. Both virtual and physical ledgers receive the exact fee
+        // delta, so the state is valid at every persistence boundary.
+        let attributed: Vec<(String, AppliedTrade)> = state
+            .trades
+            .iter()
+            .filter(|(_, trade)| revised_tokens.contains(&trade.ownership.token_id))
+            .filter(|(_, trade)| {
+                trade.virtual_fee_booked
+                    || trade.physical_fee_booked
+                    || trade.failed
+                    || trade.usdc_fee > EPS
+                    || trade.shares_fee > EPS
+            })
+            .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
+            .collect();
+        let mut generation_updates = Vec::new();
+        for (trade_key, previous) in attributed {
+            let is_maker = previous
+                .is_maker
+                .expect("fee-curve revision preflight rejected unresolved role");
+            let (next_usdc, next_shares) = configured_fee_amounts(
+                &previous.ownership,
+                is_maker,
+                (!is_maker).then_some(&next_config),
             );
+            let usdc_delta = previous.usdc_fee - next_usdc;
+            let shares_delta = previous.shares_fee - next_shares;
+            let changed = usdc_delta.abs() > EPS || shares_delta.abs() > EPS;
+            if previous.virtual_fee_booked && changed {
+                if let Some(instance) = state.instances.get_mut(&previous.ownership.instance_id) {
+                    instance.cash += usdc_delta;
+                    *instance
+                        .positions
+                        .entry(previous.ownership.token_id.clone())
+                        .or_insert(0.0) += shares_delta;
+                }
+                generation_updates.push(trade_key.clone());
+            }
+            if previous.physical_fee_booked && changed {
+                state.physical_cash += usdc_delta;
+                *state
+                    .physical_positions
+                    .entry(previous.ownership.token_id.clone())
+                    .or_insert(0.0) += shares_delta;
+            }
+            if let Some(trade) = state.trades.get_mut(&trade_key) {
+                trade.usdc_fee = next_usdc;
+                trade.shares_fee = next_shares;
+            }
+        }
+        for trade_key in generation_updates {
+            advance_trade_ledger_generation(&mut state, &trade_key);
         }
         let retry: Vec<(String, OrderStatus, bool)> = state
             .fee_attribution_pending
@@ -1385,6 +1479,7 @@ impl SharedAccount {
                 Some((trade_key.clone(), status, trade.is_maker?))
             })
             .collect();
+        recompute_reconciliation(&mut state, "token fee curve registration/revision");
         self.schedule_persist(&state);
         drop(state);
         for (trade_key, status, is_maker) in retry {
@@ -3581,6 +3676,17 @@ impl SharedAccount {
             ledger_generation: existing.as_ref()
                 .map(|trade| trade.ledger_generation).unwrap_or(0),
         });
+        if state
+            .trades
+            .get(trade_key)
+            .is_some_and(|trade| trade.is_maker.is_none())
+        {
+            // Legacy/two-phase callers are allowed to establish ownership
+            // before they know liquidity role, but that intermediate state is
+            // durable and admission-blocking until `apply_configured_trade_fee`
+            // supplies the role. It is never a healthy, restart-invalid row.
+            state.fee_attribution_pending.insert(trade_key.to_string());
+        }
         if let Some((is_maker, _)) = trade_context {
             let fee_status = if is_failed { OrderStatus::Failed }
                 else { OrderStatus::PartiallyFilled };
@@ -3681,6 +3787,37 @@ impl SharedAccount {
             self.schedule_persist(&state);
             return false;
         };
+        let Some(is_maker) = existing.is_maker else {
+            state.fee_attribution_pending.insert(trade_key.to_string());
+            recompute_reconciliation(&mut state, "trade role attribution pending");
+            self.schedule_persist(&state);
+            return false;
+        };
+        let config = (!is_maker)
+            .then(|| state.token_fee_configs.get(&existing.ownership.token_id))
+            .flatten();
+        if !is_maker && config.is_none() {
+            state.fee_attribution_pending.insert(trade_key.to_string());
+            recompute_reconciliation(&mut state, "missing token fee config");
+            self.schedule_persist(&state);
+            return false;
+        }
+        let (expected_usdc, expected_shares) =
+            configured_fee_amounts(&existing.ownership, is_maker, config);
+        if (usdc_fee - expected_usdc).abs()
+            > reconciliation_tolerance(usdc_fee, expected_usdc).max(EPS)
+            || (shares_fee - expected_shares).abs()
+                > reconciliation_tolerance(shares_fee, expected_shares).max(EPS)
+        {
+            set_uncertain(
+                &mut state,
+                format!(
+                    "trade fee disagrees with durable role/curve trade={trade_key} incoming=({usdc_fee:.8},{shares_fee:.8}) expected=({expected_usdc:.8},{expected_shares:.8})"
+                ),
+            );
+            self.schedule_persist(&state);
+            return false;
+        }
         let fee_changed = (existing.usdc_fee > EPS && (existing.usdc_fee - usdc_fee).abs() > EPS)
             || (existing.shares_fee > EPS && (existing.shares_fee - shares_fee).abs() > EPS);
         if fee_changed {
@@ -3767,16 +3904,16 @@ impl SharedAccount {
 
     pub fn restored_trades(&self) -> Vec<RestoredTrade> {
         self.state.lock().unwrap().trades.values()
-            .map(|trade| RestoredTrade {
+            .filter_map(|trade| Some(RestoredTrade {
                 ownership: trade.ownership.clone(),
                 booked: trade.booked,
                 usdc_fee: if trade.virtual_fee_booked { trade.usdc_fee } else { 0.0 },
                 shares_fee: if trade.virtual_fee_booked { trade.shares_fee } else { 0.0 },
                 virtual_fee_booked: trade.virtual_fee_booked,
-                is_maker: trade.is_maker.expect("persisted/runtime trade role must be resolved before restoration"),
+                is_maker: trade.is_maker?,
                 match_time_secs: trade.match_time_secs,
                 ledger_generation: trade.ledger_generation,
-            })
+            }))
             .collect()
     }
 
@@ -3930,6 +4067,39 @@ fn has_unsettled_maintenance_operation(state: &SharedAccountState) -> bool {
     })
 }
 
+fn fee_configs_equal(left: &TokenFeeConfig, right: &TokenFeeConfig) -> bool {
+    left.rate.to_bits() == right.rate.to_bits()
+        && left.exponent.to_bits() == right.exponent.to_bits()
+}
+
+fn configured_fee_amounts(
+    ownership: &TradeOwnership,
+    is_maker: bool,
+    config: Option<&TokenFeeConfig>,
+) -> (f64, f64) {
+    if is_maker {
+        return (0.0, 0.0);
+    }
+    let Some(config) = config else {
+        return (0.0, 0.0);
+    };
+    let price = ownership.price.clamp(0.0, 1.0);
+    let notional = ownership.quantity
+        * config.rate
+        * (price * (1.0 - price)).max(0.0).powf(config.exponent);
+    match ownership.side {
+        Side::Buy => (
+            0.0,
+            if ownership.price > EPS {
+                notional / ownership.price
+            } else {
+                0.0
+            },
+        ),
+        Side::Sell => (notional, 0.0),
+    }
+}
+
 fn apply_configured_trade_fee_locked(
     state: &mut SharedAccountState,
     trade_key: &str,
@@ -3956,18 +4126,8 @@ fn apply_configured_trade_fee_locked(
         recompute_reconciliation(state, "missing token fee config");
         return false;
     }
-    let notional = config.map_or(0.0, |config| {
-        let price = existing.ownership.price.clamp(0.0, 1.0);
-        existing.ownership.quantity * config.rate
-            * (price * (1.0 - price)).max(0.0).powf(config.exponent)
-    });
-    let (usdc_fee, shares_fee) = if is_maker {
-        (0.0, 0.0)
-    } else if existing.ownership.side == Side::Buy {
-        (0.0, if existing.ownership.price > EPS {
-            notional / existing.ownership.price
-        } else { 0.0 })
-    } else { (notional, 0.0) };
+    let (usdc_fee, shares_fee) =
+        configured_fee_amounts(&existing.ownership, is_maker, config.as_ref());
     apply_trade_fee_transition_locked(state, trade_key, status, usdc_fee, shares_fee)
 }
 
@@ -4844,7 +5004,18 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             ));
         }
         let Some(is_maker) = trade.is_maker else {
-            return Err(format!("trade `{trade_key}` has unknown maker/taker role"));
+            if !state.fee_attribution_pending.contains(trade_key)
+                || trade.virtual_fee_booked
+                || trade.physical_fee_booked
+                || trade.usdc_fee.abs() > EPS
+                || trade.shares_fee.abs() > EPS
+            {
+                return Err(format!(
+                    "trade `{trade_key}` has unknown maker/taker role without a clean pending-attribution state"
+                ));
+            }
+            expected_fee_pending.insert(trade_key.clone());
+            continue;
         };
         let fee_tolerance = reconciliation_tolerance(trade.usdc_fee, trade.shares_fee)
             .max(ownership.quantity.abs().max(1.0) * 1e-8);
@@ -5495,8 +5666,8 @@ mod tests {
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 1);
         assert!(account.is_uncertain());
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-fill",
                 "MATCHED",
                 "a-fill",
@@ -5505,8 +5676,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                true,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         let audited = account.instance_snapshot("a").unwrap();
         assert_eq!(audited.reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
@@ -5676,8 +5850,8 @@ mod tests {
         assert!(account.mark_cancelled_pending_trade_audit("a-cancel-fail", 10.0));
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 1);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-cancel-fail",
                 "MATCHED",
                 "a-cancel-fail",
@@ -5686,13 +5860,16 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                true,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-cancel-fail",
                 "FAILED",
                 "a-cancel-fail",
@@ -5701,8 +5878,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                true,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         let instance = account.instance_snapshot("a").unwrap();
         assert_eq!(instance.reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
@@ -5762,8 +5942,8 @@ mod tests {
             .unwrap();
         assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-failed",
                 "FAILED",
                 "a-failed",
@@ -5772,8 +5952,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                true,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
         assert_eq!(account.order("a-failed").unwrap().reserved_cash, 5.0);
         assert!(!account.is_uncertain());
@@ -5797,9 +5980,11 @@ mod tests {
     fn trade_is_owned_and_replay_is_idempotent() {
         let account = seeded_account();
         account.reserve_order("a", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
-        let first = account.apply_trade_transition(
+        let first = account.apply_trade_transition_with_context(
             "trade:oid-a", "MATCHED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
-        ).unwrap();
+            true, 0,
+        );
+        let first = first.ownership().unwrap();
         assert_eq!(first.instance_id, "a");
         let cash = account.instance_snapshot("a").unwrap().cash;
         let matched = account.monitoring_snapshot();
@@ -5813,16 +5998,18 @@ mod tests {
             "pending settlement is a known reconciliation delta"
         );
         assert!(matched.unallocated_cash.abs() < EPS);
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade:oid-a", "MINED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
+            true, 0,
         );
         assert_eq!(account.instance_snapshot("a").unwrap().cash, cash);
         let mined = account.monitoring_snapshot();
         assert_eq!(mined.physical_cash, 395.0);
         assert_eq!(mined.physical_positions["UP"], 50.0);
         assert!(!mined.uncertain);
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade:oid-a", "FAILED", "a-1", "oid-a", "UP", Side::Buy, 10.0, 0.5,
+            true, 0,
         );
         assert_eq!(account.instance_snapshot("a").unwrap().cash, 100.0);
         let failed = account.monitoring_snapshot();
@@ -5830,7 +6017,7 @@ mod tests {
         assert_eq!(failed.physical_positions["UP"], 40.0);
         assert!(!failed.uncertain, "FAILED is terminal and needs no wallet audit");
         assert!(!account.is_uncertain());
-        account.apply_trade_transition(
+        account.apply_trade_transition_with_context(
             "trade:oid-a",
             "MATCHED",
             "a-1",
@@ -5839,6 +6026,8 @@ mod tests {
             Side::Buy,
             10.0,
             0.5,
+            true,
+            0,
         );
         assert_eq!(
             account.instance_snapshot("a").unwrap().cash,
@@ -5984,7 +6173,7 @@ mod tests {
         assert!(account.monitoring_snapshot().uncertain_reason.is_some());
 
         assert!(account
-            .apply_trade_transition(
+            .apply_trade_transition_with_context(
                 "trade-sticky",
                 "MATCHED",
                 "a-sticky",
@@ -5993,7 +6182,10 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                true,
+                0,
             )
+            .ownership()
             .is_some());
         assert!(account.ownership_anomalies().is_empty());
         assert!(!account.is_uncertain());
@@ -6060,8 +6252,8 @@ mod tests {
         lifecycle
             .reserve_order("a", "a-life-econ", "oid-life-econ", "UP", Side::Buy, 10.0, 0.5, 0)
             .unwrap();
-        lifecycle
-            .apply_trade_transition(
+        assert!(lifecycle
+            .apply_trade_transition_with_context(
                 "life-econ",
                 "MATCHED",
                 "a-life-econ",
@@ -6070,8 +6262,11 @@ mod tests {
                 Side::Buy,
                 5.0,
                 0.49,
+                true,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert!(lifecycle
             .apply_trade_transition(
                 "life-econ",
@@ -6325,11 +6520,13 @@ mod tests {
         account
             .reserve_order("a", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5, 0)
             .unwrap();
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-buy", "MATCHED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+                true, 0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         account.state.lock().unwrap().startup_snapshot_applied_this_process = false;
 
         // This wallet view may already contain trade-buy, but a snapshot has no
@@ -6346,11 +6543,13 @@ mod tests {
         assert_eq!(account.monitoring_snapshot().physical_cash, 400.0);
         assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 40.0);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-buy", "CONFIRMED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+                true, 0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert_eq!(account.monitoring_snapshot().physical_cash, 395.0);
         assert_eq!(account.monitoring_snapshot().physical_positions["UP"], 50.0);
         assert!(account
@@ -6372,11 +6571,13 @@ mod tests {
         account
             .reserve_order("a", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5, 0)
             .unwrap();
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-buy", "MATCHED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+                false, 0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         account.release_order("a-buy", OrderStatus::Filled);
 
         assert_eq!(
@@ -6385,9 +6586,11 @@ mod tests {
         );
         assert_eq!(account.order_owner_by_oid("oid-buy").as_deref(), Some("a"));
         assert!(account
-            .apply_trade_transition(
+            .apply_trade_transition_with_context(
                 "trade-buy", "CONFIRMED", "a-buy", "oid-buy", "UP", Side::Buy, 10.0, 0.5,
+                false, 0,
             )
+            .ownership()
             .is_some());
 
         assert_eq!(
@@ -6401,10 +6604,13 @@ mod tests {
     fn taker_fee_follows_virtual_physical_and_failed_lifecycle() {
         let account = seeded_account();
         account
-            .reserve_order("a", "a-fee", "oid-fee", "UP", Side::Buy, 10.0, 0.5, 0)
+            .register_token_fee_config(&["UP".to_string()], 0.04, 1.0)
             .unwrap();
         account
-            .apply_trade_transition(
+            .reserve_order("a", "a-fee", "oid-fee", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-fee:oid-fee",
                 "MATCHED",
                 "a-fee",
@@ -6413,8 +6619,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                false,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert!(account.apply_trade_fee_transition(
             "trade-fee:oid-fee",
             OrderStatus::PartiallyFilled,
@@ -6427,8 +6636,8 @@ mod tests {
         assert!((physical_matched.physical_positions["UP"] - 40.0).abs() < EPS);
         assert!(!physical_matched.uncertain);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-fee:oid-fee",
                 "MINED",
                 "a-fee",
@@ -6437,8 +6646,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                false,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert!(account.apply_trade_fee_transition(
             "trade-fee:oid-fee",
             OrderStatus::PartiallyFilled,
@@ -6449,8 +6661,8 @@ mod tests {
         assert!((mined.physical_positions["UP"] - 49.8).abs() < EPS);
         assert!(!mined.uncertain);
 
-        account
-            .apply_trade_transition(
+        assert!(account
+            .apply_trade_transition_with_context(
                 "trade-fee:oid-fee",
                 "FAILED",
                 "a-fee",
@@ -6459,8 +6671,11 @@ mod tests {
                 Side::Buy,
                 10.0,
                 0.5,
+                false,
+                0,
             )
-            .unwrap();
+            .ownership()
+            .is_some());
         assert!(account.apply_trade_fee_transition(
             "trade-fee:oid-fee",
             OrderStatus::Failed,
@@ -6525,6 +6740,75 @@ mod tests {
             false,
         ));
         assert!((account.monitoring_snapshot().physical_positions["UP"] - 49.9).abs() < EPS);
+    }
+
+    #[test]
+    fn token_fee_curve_revision_reprices_attributed_virtual_and_physical_trade() {
+        let account = seeded_account();
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
+            .unwrap();
+        account
+            .reserve_order(
+                "a", "a-reprice", "oid-reprice", "UP", Side::Buy, 10.0, 0.5, 0,
+            )
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade-reprice", "CONFIRMED", "a-reprice", "oid-reprice", "UP",
+                Side::Buy, 10.0, 0.5, false, 1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        let before_generation = account.instance_snapshot("a").unwrap().ledger_generation;
+        assert!((account.instance_snapshot("a").unwrap().positions["UP"] - 19.9).abs() < EPS);
+        assert!((account.monitoring_snapshot().physical_positions["UP"] - 49.9).abs() < EPS);
+
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.04, 1.0)
+            .unwrap();
+
+        let instance = account.instance_snapshot("a").unwrap();
+        assert!((instance.positions["UP"] - 19.8).abs() < EPS);
+        assert!(instance.ledger_generation > before_generation);
+        assert!((account.monitoring_snapshot().physical_positions["UP"] - 49.8).abs() < EPS);
+        let restored = account
+            .restored_trades()
+            .into_iter()
+            .find(|trade| trade.ownership.trade_key == "trade-reprice")
+            .unwrap();
+        assert!((restored.shares_fee - 0.2).abs() < EPS);
+        assert!(restored.virtual_fee_booked);
+        assert!(!account.is_uncertain());
+        assert!(validate_persisted_state("acct", &account.state.lock().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn roleless_sdk_trade_is_durable_but_risk_off_until_attributed() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a", "a-role-pending", "oid-role-pending", "UP", Side::Buy, 2.0, 0.5, 0,
+            )
+            .unwrap();
+        assert!(account
+            .apply_trade_transition(
+                "trade-role-pending", "MATCHED", "a-role-pending", "oid-role-pending", "UP",
+                Side::Buy, 2.0, 0.5,
+            )
+            .is_some());
+        assert!(account.is_uncertain());
+        assert!(account.restored_trades().is_empty());
+        assert!(validate_persisted_state("acct", &account.state.lock().unwrap()).is_ok());
+
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
+            .unwrap();
+        assert!(account.apply_configured_trade_fee(
+            "trade-role-pending", OrderStatus::PartiallyFilled, false,
+        ));
+        assert!(!account.is_uncertain());
+        assert_eq!(account.restored_trades().len(), 1);
     }
 
     #[test]
@@ -7353,6 +7637,8 @@ mod tests {
 
         let mut unknown_role = state.clone();
         unknown_role.trades.get_mut("fee-trade").unwrap().is_maker = None;
+        assert!(validate_persisted_state("acct", &unknown_role).is_ok());
+        unknown_role.fee_attribution_pending.clear();
         let role_error = validate_persisted_state("acct", &unknown_role).unwrap_err();
         assert!(
             role_error.contains("unknown maker/taker role"),

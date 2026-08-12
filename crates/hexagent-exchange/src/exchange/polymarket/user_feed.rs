@@ -417,6 +417,72 @@ fn validate_quantity_price(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateTradeRole {
+    Maker,
+    Taker,
+}
+
+fn taker_order_id(data: &serde_json::Value) -> Option<&str> {
+    data.get("taker_order_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            data.get("order_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            data.get("orderID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn classify_private_trade_role(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> std::result::Result<PrivateTradeRole, String> {
+    let maker_orders = match data.get("maker_orders") {
+        None => None,
+        Some(serde_json::Value::Array(orders)) => Some(orders),
+        Some(_) => return Err("trade field `maker_orders` must be an array".to_string()),
+    };
+    if maker_orders.is_some_and(|orders| orders.iter().any(|order| !order.is_object())) {
+        return Err("trade field `maker_orders` contains a non-object leg".to_string());
+    }
+    let has_owned_maker_leg = maker_orders.is_some_and(|orders| {
+            orders.iter().any(|order| {
+                order
+                    .get("maker_address")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|address| {
+                        address.eq_ignore_ascii_case(&shared.order_maker_address)
+                    })
+            })
+        });
+    let taker_id = taker_order_id(data);
+    let has_owned_taker_order = taker_id.is_some_and(|order_id| {
+        shared.lookup_coid(order_id).is_some()
+            || shared.account_state.order_owner_by_oid(order_id).is_some()
+    });
+    match (has_owned_maker_leg, has_owned_taker_order) {
+        (true, false) => Ok(PrivateTradeRole::Maker),
+        (false, true) => Ok(PrivateTradeRole::Taker),
+        (true, true) => Err(
+            "trade payload is ambiguous: both maker leg and taker order belong to this account"
+                .to_string(),
+        ),
+        (false, false) => Err(format!(
+            "trade maker/taker role is unknown: no owned maker leg and taker order `{}` is not owned",
+            taker_id.unwrap_or("<missing>"),
+        )),
+    }
+}
+
 /// Validate every role-specific field before booking any maker leg, avoiding a
 /// partially-applied multi-leg trade when a later leg is malformed.
 fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<(), String> {
@@ -426,34 +492,68 @@ fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::
     if !matches!(status, "MATCHED" | "MATCHED_NOT_BROADCASTED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING") {
         return Err(format!("trade field `status` has unsupported value `{status}`"));
     }
-    strict_side(required_string(data, &["side"], "side")?, "side")?;
-    required_string(data, &["asset_id", "token_id"], "asset_id")?;
-    let quantity = strict_number(data.get("size").or_else(|| data.get("matched_amount")), "quantity")?;
-    let price = strict_number(data.get("price"), "price")?;
-    validate_quantity_price(quantity, price, "quantity", "price")?;
-
-    let maker_legs: Vec<&serde_json::Value> = data.get("maker_orders")
-        .and_then(serde_json::Value::as_array).into_iter().flatten()
-        .filter(|order| order.get("maker_address").and_then(serde_json::Value::as_str)
-            .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address)))
-        .collect();
-    if maker_legs.is_empty() {
-        required_string(data, &["taker_order_id", "order_id", "orderID"], "order_id")?;
-    } else {
-        for (index, order) in maker_legs.iter().enumerate() {
-            required_string(order, &["order_id"], &format!("maker_orders[{index}].order_id"))?;
-            required_string(order, &["asset_id"], &format!("maker_orders[{index}].asset_id"))?;
-            strict_side(
-                required_string(order, &["side"], &format!("maker_orders[{index}].side"))?,
-                &format!("maker_orders[{index}].side"),
+    match classify_private_trade_role(data, shared)? {
+        PrivateTradeRole::Taker => {
+            strict_side(required_string(data, &["side"], "side")?, "side")?;
+            required_string(data, &["asset_id", "token_id"], "asset_id")?;
+            let quantity = strict_number(
+                data.get("size").or_else(|| data.get("matched_amount")),
+                "quantity",
             )?;
-            let quantity = strict_number(order.get("matched_amount"), &format!("maker_orders[{index}].matched_amount"))?;
-            let price = strict_number(order.get("price"), &format!("maker_orders[{index}].price"))?;
-            validate_quantity_price(
-                quantity, price,
-                &format!("maker_orders[{index}].matched_amount"),
-                &format!("maker_orders[{index}].price"),
-            )?;
+            let price = strict_number(data.get("price"), "price")?;
+            validate_quantity_price(quantity, price, "quantity", "price")?;
+            taker_order_id(data)
+                .ok_or_else(|| "trade field `order_id` is missing or empty".to_string())?;
+        }
+        PrivateTradeRole::Maker => {
+            let maker_legs: Vec<&serde_json::Value> = data
+                .get("maker_orders")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|order| {
+                    order
+                        .get("maker_address")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|address| {
+                            address.eq_ignore_ascii_case(&shared.order_maker_address)
+                        })
+                })
+                .collect();
+            for (index, order) in maker_legs.iter().enumerate() {
+                required_string(
+                    order,
+                    &["order_id"],
+                    &format!("maker_orders[{index}].order_id"),
+                )?;
+                required_string(
+                    order,
+                    &["asset_id"],
+                    &format!("maker_orders[{index}].asset_id"),
+                )?;
+                strict_side(
+                    required_string(
+                        order,
+                        &["side"],
+                        &format!("maker_orders[{index}].side"),
+                    )?,
+                    &format!("maker_orders[{index}].side"),
+                )?;
+                let quantity = strict_number(
+                    order.get("matched_amount"),
+                    &format!("maker_orders[{index}].matched_amount"),
+                )?;
+                let price = strict_number(
+                    order.get("price"),
+                    &format!("maker_orders[{index}].price"),
+                )?;
+                validate_quantity_price(
+                    quantity,
+                    price,
+                    &format!("maker_orders[{index}].matched_amount"),
+                    &format!("maker_orders[{index}].price"),
+                )?;
+            }
         }
     }
     Ok(())
@@ -730,14 +830,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
     match event_type {
         "order" => Vec::new(),
         "trade" => {
-            let taker_order_id = data
-                .get("taker_order_id")
-                .and_then(|v| v.as_str())
-                .filter(|value| !value.is_empty())
-                .or_else(|| data.get("order_id").and_then(|v| v.as_str()))
-                .filter(|value| !value.is_empty())
-                .or_else(|| data.get("orderID").and_then(|v| v.as_str()))
-                .unwrap_or("");
+            let taker_order_id = taker_order_id(data).unwrap_or("");
             let asset_id = data.get("asset_id")
                 .or_else(|| data.get("token_id"))
                 .and_then(|v| v.as_str())
@@ -778,12 +871,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
             // wrong/empty for a maker fill, the old check routed it to the
             // taker branch and silently dropped it. Mirrors the reconciler
             // (fetch_server_trades) classification.
-            let is_maker = data.get("maker_orders")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().any(|mo| mo.get("maker_address")
-                    .and_then(|v| v.as_str())
-                    .map_or(false, |a| a.eq_ignore_ascii_case(&shared.order_maker_address))))
-                .unwrap_or(false);
+            let role = match classify_private_trade_role(data, shared) {
+                Ok(role) => role,
+                Err(_) => return Vec::new(),
+            };
             let status_raw = data.get("status").and_then(|v| v.as_str()).unwrap_or("MATCHED");
             let status_str = status_raw
                 .strip_prefix("TRADE_STATUS_")
@@ -845,7 +936,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
 
             let mut updates: Vec<OrderUpdate> = Vec::new();
 
-            if is_maker {
+            if role == PrivateTradeRole::Maker {
                 let funder = &shared.order_maker_address;
                 let Some(arr) = data.get("maker_orders").and_then(|v| v.as_array()) else {
                     return Vec::new();
@@ -2387,7 +2478,10 @@ mod tests {
     fn owned_taker_shared(limit_price: f64) -> Arc<SharedState> {
         let shared = test_shared();
         shared.account_state.register_instance("owner", 1.0);
-        shared.account_state.apply_physical_snapshot(100.0, HashMap::new());
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
         shared.account_state.register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0).unwrap();
         shared.account_state.reserve_order(
             "owner", "owner-1", "oid-1", "TOKEN", Side::Buy, 10.0, limit_price, 0,
@@ -2414,7 +2508,7 @@ mod tests {
 
     #[test]
     fn trade_identity_lifecycle_and_economics_are_all_strictly_required() {
-        let shared = test_shared();
+        let shared = owned_taker_shared(0.5);
         for field in ["id", "status", "side", "asset_id", "size", "price", "taker_order_id"] {
             let mut event = valid_taker_event();
             event.as_object_mut().unwrap().remove(field);
@@ -2442,7 +2536,68 @@ mod tests {
         assert!((updates[0].avg_fill_price - 1.000000005).abs() < 1e-12);
         let mut invalid = valid_taker_event();
         invalid["price"] = serde_json::json!("1.0001");
-        assert!(validate_trade_event(&invalid, &test_shared()).is_err());
+        assert!(validate_trade_event(&invalid, &owned_taker_shared(1.0)).is_err());
+    }
+
+    #[test]
+    fn private_trade_without_owned_maker_or_taker_evidence_is_rejected() {
+        let shared = test_shared();
+        let event = serde_json::json!({
+            "event_type": "trade",
+            "id": "unknown-role",
+            "status": "MATCHED",
+            "asset_id": "TOKEN",
+            "side": "BUY",
+            "size": "1",
+            "price": "0.5",
+            "taker_order_id": "somebody-elses-order",
+            "maker_orders": [],
+        });
+        let error = validate_trade_event(&event, &shared).unwrap_err();
+        assert!(error.contains("maker/taker role is unknown"), "{error}");
+        assert!(parse_user_event(&event, &shared).is_empty());
+        assert!(shared.account_state.is_uncertain());
+    }
+
+    #[test]
+    fn owned_maker_leg_does_not_require_untrusted_taker_economics() {
+        let shared = test_shared();
+        shared.account_state.register_instance("maker", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "maker",
+                "maker-coid",
+                "maker-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.4,
+                0,
+            )
+            .unwrap();
+        shared.register_order_id("maker-coid", "maker-oid", "TOKEN");
+        let event = serde_json::json!({
+            "event_type": "trade",
+            "id": "maker-without-taker-fields",
+            "status": "MATCHED",
+            "maker_orders": [{
+                "maker_address": shared.order_maker_address.clone(),
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "matched_amount": "2",
+                "price": "0.4",
+                "order_id": "maker-oid"
+            }]
+        });
+        assert!(validate_trade_event(&event, &shared).is_ok());
+        let updates = parse_user_event(&event, &shared);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].liquidity, Some(Liquidity::Maker));
     }
 
     #[test]
