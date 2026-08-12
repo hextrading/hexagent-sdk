@@ -1538,6 +1538,7 @@ fn expand_signal(sig: &Signal) -> (Vec<ReachAction>, bool) {
         // P1: orphan reconcile has no effect (no timeouts generated); Exit is a
         // no-op for the sim.
         Signal::ReconcilePolymarket { .. }
+        | Signal::RetainPolymarketEventAudit { .. }
         | Signal::RetirePolymarketEventAudit { .. }
         | Signal::BeginShutdown
         | Signal::Exit => (Vec::new(), false),

@@ -797,7 +797,15 @@ fn parse_user_event_checked(data: &serde_json::Value, shared: &SharedState) -> s
         "order" => parse_order_event(data, shared),
         "trade" => {
             validate_trade_event(data, shared)?;
-            Ok(parse_user_event_validated(data, shared))
+            let updates = parse_user_event_validated(data, shared);
+            let retired = shared.finalize_ready_settled_audit_retirements();
+            if retired > 0 {
+                info!(
+                    "[PolyUserFeed] retired {} terminal feed trade tombstone(s) after settled FIFO convergence",
+                    retired,
+                );
+            }
+            Ok(updates)
         }
         _ => Ok(Vec::new()),
     }
