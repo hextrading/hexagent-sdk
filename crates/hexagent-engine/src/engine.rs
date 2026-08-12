@@ -35,6 +35,94 @@ fn elapsed_ns(origin: &std::time::Instant) -> u64 {
     origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
+fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
+    if origin_ns == 0 {
+        return -1.0;
+    }
+    (stage_ns as i128 - origin_ns as i128) as f64 / 1_000_000.0
+}
+
+/// Attach the exact OrderBook event that caused `Strategy::on_quote` to run.
+/// The strategy only receives the local timestamp, so this engine boundary is
+/// the last place where both exchange and local clocks are still available.
+fn stamp_quote_trigger(
+    signals: &mut [Signal],
+    trigger: &OrderBookSnapshot,
+    log_lifecycle: bool,
+) {
+    let source = format!("orderbook:{}:{}", trigger.exchange, trigger.symbol);
+    let stage_ns = now_ns();
+    let stamp = |order: &mut OrderRequest| {
+        order.quote_trigger_exchange_timestamp_ns = trigger.exchange_timestamp_ns;
+        order.quote_trigger_local_timestamp_ns = trigger.local_timestamp_ns;
+        order.quote_trigger_source.clone_from(&source);
+        if log_lifecycle {
+            info!(
+                "[order_lifecycle] stage=quote_signal coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+                order.client_order_id,
+                order.instance_id,
+                order.quote_event_id,
+                order.symbol,
+                order.side,
+                order.quote_trigger_source,
+                order.quote_trigger_exchange_timestamp_ns,
+                order.quote_trigger_local_timestamp_ns,
+                order.timestamp_ns,
+                stage_ns,
+                lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
+                lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+                lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+            );
+        }
+    };
+    for signal in signals {
+        match signal {
+            Signal::NewOrder(order) => stamp(order),
+            Signal::BatchNewOrders { orders, .. }
+            | Signal::BatchUpdateOrders { place_orders: orders, .. }
+            | Signal::ReplaceOrder { place_orders: orders, .. } => {
+                for order in orders {
+                    stamp(order);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn log_executor_receive(signal: &Signal) {
+    let stage_ns = now_ns();
+    let log_order = |order: &OrderRequest| {
+        info!(
+            "[order_lifecycle] stage=executor_receive coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+            order.client_order_id,
+            order.instance_id,
+            order.quote_event_id,
+            order.symbol,
+            order.side,
+            order.quote_trigger_source,
+            order.quote_trigger_exchange_timestamp_ns,
+            order.quote_trigger_local_timestamp_ns,
+            order.timestamp_ns,
+            stage_ns,
+            lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
+            lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+            lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+        );
+    };
+    match signal {
+        Signal::NewOrder(order) => log_order(order),
+        Signal::BatchNewOrders { orders, .. }
+        | Signal::BatchUpdateOrders { place_orders: orders, .. }
+        | Signal::ReplaceOrder { place_orders: orders, .. } => {
+            for order in orders {
+                log_order(order);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn register_polymarket_wallet_identity(
     wallet_accounts: &mut HashMap<String, String>,
     account_id: &str,
@@ -2670,7 +2758,9 @@ impl Engine {
                             };
                             if fire {
                                 last_quote_ns[i] = ts;
-                                for sig in strategy.on_quote(ts) {
+                                let mut quote_signals = strategy.on_quote(ts);
+                                stamp_quote_trigger(&mut quote_signals, ob, false);
+                                for sig in quote_signals {
                                     sim.submit(&sig, strat_clock_ns);
                                 }
                             }
@@ -3884,7 +3974,8 @@ impl Engine {
                                                 };
                                                 if fire {
                                                     last_quote_ns[i] = ts;
-                                                    let ob_signals = strategy.on_quote(ts);
+                                                    let mut ob_signals = strategy.on_quote(ts);
+                                                    stamp_quote_trigger(&mut ob_signals, ob, true);
                                                     for sig in ob_signals {
                                                         if signal_tx.send(sig).is_err() { return; }
                                                     }
@@ -4656,7 +4747,9 @@ impl Engine {
                                 };
                                 if fire {
                                     last_quote_ns = ts;
-                                    for sig in strategy.on_quote(ts) {
+                                    let mut quote_signals = strategy.on_quote(ts);
+                                    stamp_quote_trigger(&mut quote_signals, ob, true);
+                                    for sig in quote_signals {
                                         if !emit(sig) { return; }
                                     }
                                 }
@@ -6893,6 +6986,7 @@ fn fire_or_execute(
     let is_stale =
         |ts: u64| ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms;
     let iid = extract_instance_id(&signal);
+    log_executor_receive(&signal);
 
     match signal {
         Signal::NewOrder(order)
@@ -8580,12 +8674,51 @@ mod market_router_tests {
             order_type: OrderType::Limit,
             price: Some(0.5),
             quantity: 10.0,
+            quote_trigger_exchange_timestamp_ns: 0,
+            quote_trigger_local_timestamp_ns: 1,
+            quote_event_id: "event".into(),
+            quote_trigger_source: "strategy_callback".into(),
             timestamp_ns: 1,
             instance_id: instance_id.into(),
             fee_rate_bps: 0,
             post_only: true,
             reduce_only: false,
             outcome_label: "Up".into(),
+        }
+    }
+
+    #[test]
+    fn quote_trigger_stamps_exact_orderbook_clock_on_every_place() {
+        let mut signals = vec![
+            Signal::NewOrder(order_req("single", "btc")),
+            Signal::BatchNewOrders {
+                exchange: Exchange::Polymarket,
+                market_id: "market".into(),
+                orders: vec![order_req("batch", "btc")],
+                instance_id: "btc".into(),
+            },
+        ];
+        let trigger = OrderBookSnapshot {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".into(),
+            bids: vec![PriceLevel { price: 100.0, quantity: 1.0 }],
+            asks: vec![PriceLevel { price: 101.0, quantity: 1.0 }],
+            exchange_timestamp_ns: 11,
+            local_timestamp_ns: 22,
+        };
+
+        stamp_quote_trigger(&mut signals, &trigger, false);
+
+        let orders: Vec<&OrderRequest> = signals.iter().flat_map(|signal| match signal {
+            Signal::NewOrder(order) => vec![order],
+            Signal::BatchNewOrders { orders, .. } => orders.iter().collect(),
+            _ => Vec::new(),
+        }).collect();
+        assert_eq!(orders.len(), 2);
+        for order in orders {
+            assert_eq!(order.quote_trigger_exchange_timestamp_ns, 11);
+            assert_eq!(order.quote_trigger_local_timestamp_ns, 22);
+            assert_eq!(order.quote_trigger_source, "orderbook:binance:BTCUSDT");
         }
     }
 

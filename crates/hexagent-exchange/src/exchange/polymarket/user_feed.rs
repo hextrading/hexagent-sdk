@@ -667,7 +667,7 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         }
         _ => shared.account_state.mark_order_status(&coid, status),
     }
-    Ok(vec![OrderUpdate {
+    let update = OrderUpdate {
         client_order_id: coid,
         exchange: Exchange::Polymarket,
         symbol: asset_id.to_string(),
@@ -683,7 +683,15 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         trade_id: None,
         order_audit: Some(order_audit),
         error: None,
-    }])
+    };
+    shared.log_order_lifecycle(
+        &update.client_order_id,
+        "private_order",
+        update.exchange_order_id.as_deref(),
+        Some(update.status),
+        None,
+    );
+    Ok(vec![update])
 }
 
 fn invalid_payload_key(data: &serde_json::Value) -> String {
@@ -1119,7 +1127,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         shared.finish_filled_order_if_audited(&coid);
                     }
 
-                    updates.push(OrderUpdate {
+                    let update = OrderUpdate {
                         client_order_id: coid,
                         exchange: Exchange::Polymarket,
                         symbol: mo_asset_id,
@@ -1134,7 +1142,15 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         trade_id: if leg_id.is_empty() { None } else { Some(leg_id) },
                         order_audit: None,
                         error: failure_reason.clone(),
-                    });
+                    };
+                    shared.log_order_lifecycle(
+                        &update.client_order_id,
+                        "private_trade",
+                        update.exchange_order_id.as_deref(),
+                        Some(update.status),
+                        update.trade_id.as_deref(),
+                    );
+                    updates.push(update);
                 }
             } else {
                 let matched_amount: f64 = parse_f(data.get("size").or_else(|| data.get("matched_amount")));
@@ -1201,7 +1217,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     shared.finish_filled_order_if_audited(&coid);
                 }
 
-                updates.push(OrderUpdate {
+                let update = OrderUpdate {
                     client_order_id: coid,
                     exchange: Exchange::Polymarket,
                     symbol: asset_id,
@@ -1220,7 +1236,15 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     trade_id: if trade_id.is_empty() { None } else { Some(trade_id.to_string()) },
                     order_audit: None,
                     error: failure_reason.clone(),
-                });
+                };
+                shared.log_order_lifecycle(
+                    &update.client_order_id,
+                    "private_trade",
+                    update.exchange_order_id.as_deref(),
+                    Some(update.status),
+                    update.trade_id.as_deref(),
+                );
+                updates.push(update);
             }
 
             if status == OrderStatus::Failed
