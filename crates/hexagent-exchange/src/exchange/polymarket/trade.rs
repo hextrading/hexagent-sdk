@@ -1713,6 +1713,10 @@ impl SharedState {
                 u8::from(active_count > 0), active_count, client_order_id,
             );
         }
+        // A zero-reference settled event may have been waiting solely for
+        // this order GET/audit edge. Re-check global retirement here as well
+        // as on private trades so an otherwise quiet market converges.
+        let _ = self.finalize_ready_settled_audit_retirements();
     }
 
     pub(crate) fn complete_filled_order_audit(&self, client_order_id: &str) {
