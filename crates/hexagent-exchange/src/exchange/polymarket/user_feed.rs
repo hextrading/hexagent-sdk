@@ -31,7 +31,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_FUTURE_MATCH_TIME_SECS: u64 = 300;
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +76,11 @@ impl GapReplayOutcome {
 /// never call this helper, so `recovering` stays asserted and quoting remains
 /// paused until the same recovery window has been fetched completely.
 ///
-fn accept_reconnect_replay(
-    health: &super::live_position::UserFeedHealth,
-    _outcome: GapReplayOutcome,
-) {
-    health.set_recovering(false);
+fn accept_reconnect_replay(shared: &SharedState, _outcome: GapReplayOutcome) {
+    shared.user_feed_health.set_recovering(false);
+    if !shared.account_state.is_uncertain() {
+        shared.user_feed_health.set_inventory_uncertain(false);
+    }
 }
 
 fn enqueue_recovery_update(
@@ -662,6 +661,9 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
                 &ownership.instance_id,
                 status,
             );
+            // A strict order lifecycle row is authoritative enough to clear
+            // the recovery gate installed for a malformed push.
+            shared.account_state.finish_order_recovery(&coid);
         }
         _ => shared.account_state.mark_order_status(&coid, status),
     }
@@ -732,15 +734,33 @@ fn receipt_time_secs() -> u64 {
         .map(|duration| duration.as_secs()).unwrap_or(1).max(1)
 }
 
-fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> u64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectiveMatchTime {
+    /// Upstream business timestamp retained in the durable trade audit.
+    business_secs: u64,
+    /// Conservative REST replay watermark. A future business timestamp must
+    /// never move the `after=` lower bound beyond receipt time.
+    replay_watermark_secs: u64,
+}
+
+fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMatchTime {
     let now = receipt_time_secs();
     let parsed = data.get("match_time").and_then(|value| {
         value.as_str().and_then(|text| text.parse::<u64>().ok()).or_else(|| value.as_u64())
-    }).filter(|value| *value > 0 && *value <= now.saturating_add(MAX_FUTURE_MATCH_TIME_SECS));
+    }).filter(|value| *value > 0);
     if parsed.is_none() {
         warn!("[PolyUserFeed] trade={} has missing/invalid match_time; pinning replay at receipt_time={}", trade_id, now);
+    } else if parsed.is_some_and(|value| value > now) {
+        warn!(
+            "[PolyUserFeed] trade={} has future business match_time={}; retaining audit timestamp but capping replay watermark at receipt_time={}",
+            trade_id, parsed.unwrap_or(now), now,
+        );
     }
-    parsed.unwrap_or(now)
+    let business_secs = parsed.unwrap_or(now);
+    EffectiveMatchTime {
+        business_secs,
+        replay_watermark_secs: business_secs.min(now),
+    }
 }
 
 fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, error: &str) {
@@ -749,9 +769,19 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
         .and_then(serde_json::Value::as_str).unwrap_or("");
     if event_type == "trade" {
         let replay_key = invalid_replay_anchor_key(data);
+        let match_time = effective_match_time(data, &key);
         shared.account_state.mark_unresolved_trade_match_time(
-            &replay_key, effective_match_time(data, &key),
+            &replay_key, match_time.replay_watermark_secs,
         );
+    } else if event_type == "order" {
+        if let Some(order_id) = data.get("order_id").or_else(|| data.get("orderID"))
+            .or_else(|| data.get("id")).and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|order_id| !order_id.is_empty())
+        {
+            if let Some(coid) = shared.lookup_coid(order_id) {
+                shared.account_state.begin_order_recovery(std::iter::once(coid.as_str()));
+            }
+        }
     }
     shared.account_state.mark_private_event_anomaly(
         &key, format!("invalid Polymarket private event `{key}`: {error}"),
@@ -770,6 +800,44 @@ fn parse_user_event_checked(data: &serde_json::Value, shared: &SharedState) -> s
             Ok(parse_user_event_validated(data, shared))
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+#[derive(Debug)]
+struct ParsedPrivateEvent {
+    updates: Vec<OrderUpdate>,
+    valid_business_event: bool,
+    invalid_business_event: bool,
+}
+
+fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) -> ParsedPrivateEvent {
+    let recognized = data.get("event_type").or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|event_type| matches!(event_type, "order" | "trade"));
+    if !recognized {
+        return ParsedPrivateEvent {
+            updates: Vec::new(),
+            valid_business_event: false,
+            invalid_business_event: false,
+        };
+    }
+    match parse_user_event_checked(data, shared) {
+        Ok(updates) => {
+            resolve_valid_private_event_anomaly(data, shared);
+            ParsedPrivateEvent {
+                updates,
+                valid_business_event: true,
+                invalid_business_event: false,
+            }
+        }
+        Err(error) => {
+            flag_invalid_private_event(data, shared, &error);
+            ParsedPrivateEvent {
+                updates: Vec::new(),
+                valid_business_event: false,
+                invalid_business_event: true,
+            }
+        }
     }
 }
 
@@ -801,16 +869,7 @@ fn resolve_valid_private_event_anomaly(data: &serde_json::Value, shared: &Shared
 /// A single "trade" push from a MAKER perspective may expand into multiple
 /// OrderUpdates (one per matching `maker_orders[]` entry owned by us).
 pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
-    match parse_user_event_checked(data, shared) {
-        Ok(updates) => {
-            resolve_valid_private_event_anomaly(data, shared);
-            updates
-        }
-        Err(error) => {
-            flag_invalid_private_event(data, shared, &error);
-            Vec::new()
-        }
-    }
+    parse_user_event_with_health(data, shared).updates
 }
 
 fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
@@ -907,7 +966,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 "MATCHED"
             } else { status_str };
 
-            let match_time_secs = effective_match_time(data, trade_id);
+            let match_time = effective_match_time(data, trade_id);
 
             let status = match status_str {
                 "MATCHED" | "MINED" => OrderStatus::PartiallyFilled,
@@ -1002,7 +1061,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         mo_size,
                         mo_price,
                         true,
-                        match_time_secs,
+                        match_time.business_secs,
                     );
                     let Some(ownership) = transition.ownership().cloned() else {
                         // Never broadcast an unowned private trade. The account
@@ -1011,7 +1070,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         // same-token strategy would book the fill N times.
                         shared
                             .account_state
-                            .mark_unresolved_trade_match_time(&leg_id, match_time_secs);
+                            .mark_unresolved_trade_match_time(&leg_id, match_time.replay_watermark_secs);
                         continue;
                     };
                     if transition.persistence_pending() {
@@ -1023,12 +1082,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     shared
                         .account_state
                         .resolve_unresolved_trade_match_time(&leg_id);
-                    if match_time_secs > 0 {
+                    if match_time.replay_watermark_secs > 0 {
                         shared
                             .live_position
                             .lock()
                             .unwrap()
-                            .touch_match_time(match_time_secs);
+                            .touch_match_time(match_time.replay_watermark_secs);
                     }
                     let coid = ownership.client_order_id;
                     // Only advance the feed-level dedupe after ownership was
@@ -1091,12 +1150,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     matched_amount,
                     price,
                     false,
-                    match_time_secs,
+                    match_time.business_secs,
                 );
                 let Some(ownership) = transition.ownership().cloned() else {
                     shared
                         .account_state
-                        .mark_unresolved_trade_match_time(trade_id, match_time_secs);
+                        .mark_unresolved_trade_match_time(trade_id, match_time.replay_watermark_secs);
                     return Vec::new();
                 };
                 if transition.persistence_pending() {
@@ -1108,12 +1167,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 shared
                     .account_state
                     .resolve_unresolved_trade_match_time(trade_id);
-                if match_time_secs > 0 {
+                if match_time.replay_watermark_secs > 0 {
                     shared
                         .live_position
                         .lock()
                         .unwrap()
-                        .touch_match_time(match_time_secs);
+                        .touch_match_time(match_time.replay_watermark_secs);
                 }
                 let coid = ownership.client_order_id;
                 let lifecycle_advanced = record_trade_transition(
@@ -1726,7 +1785,7 @@ async fn user_feed_loop(
                     continue;
                 }
                 accept_reconnect_replay(
-                    &shared.user_feed_health,
+                    &shared,
                     GapReplayOutcome::Complete { records: 0 },
                 );
                 backoff.reset();
@@ -1748,7 +1807,10 @@ async fn user_feed_loop(
         }
 
         let mut last_ping = Instant::now();
-        let mut last_data = Instant::now();
+        // Transport heartbeats prove only that the socket is alive. They must
+        // not masquerade as validated private order/trade traffic.
+        let mut last_transport = Instant::now();
+        let mut last_valid_business = Instant::now();
 
         // Event loop
         loop {
@@ -1774,80 +1836,115 @@ async fn user_feed_loop(
                 Ok(Some(Ok(msg))) => {
                     match msg {
                         Message::Text(text) => {
-                            last_data = Instant::now();
-                            if text == "PONG" || text.is_empty() { continue; }
+                            last_transport = Instant::now();
+                            shared.user_feed_health.record_transport_activity(now_ns());
+                            let body = text.trim();
+                            if body.eq_ignore_ascii_case("PONG") || body.is_empty() { continue; }
+                            if body.eq_ignore_ascii_case("PING") {
+                                let _ = sink.send(Message::Text("PONG".to_string())).await;
+                                continue;
+                            }
 
                             let t_parse = crate::latency::Instant::now();
                             // simd-json drop-in for SIMD parse speedup.
                             let mut buf = text.as_bytes().to_vec();
-                            if let Ok(data) = simd_json::serde::from_slice::<serde_json::Value>(&mut buf) {
-                                let events = if data.is_array() {
-                                    data.as_array().cloned().unwrap_or_default()
-                                } else {
-                                    vec![data]
-                                };
+                            let data = match simd_json::serde::from_slice::<serde_json::Value>(&mut buf) {
+                                Ok(data) => data,
+                                Err(error) => {
+                                    shared.user_feed_health.set_recovering(true);
+                                    shared.user_feed_health.set_inventory_uncertain(true);
+                                    let raw: String = text.chars().take(256).collect();
+                                    warn!(
+                                        "[PolyUserFeed] invalid private WS JSON after {:.3}s without a validated business event: {}; forcing reconnect; raw={}",
+                                        last_valid_business.elapsed().as_secs_f64(), error, raw,
+                                    );
+                                    break;
+                                }
+                            };
+                            let events = if data.is_array() {
+                                data.as_array().cloned().unwrap_or_default()
+                            } else {
+                                vec![data]
+                            };
+                            let mut frame_has_valid_business = false;
+                            let mut frame_has_invalid_business = false;
 
-                                for event in &events {
-                                    for update in parse_user_event(event, &shared) {
-                                        // RTT-probe traffic: the probe's synthetic
-                                        // resting orders have no coid mapping, so
-                                        // their placement / cancellation pushes
-                                        // would log as `<unmapped>` (an ops signal
-                                        // expected to stay at zero) and broadcast
-                                        // to every instance. Identify them by
-                                        // orderID and swallow: DEBUG only.
-                                        if update.client_order_id.is_empty() {
-                                            if let Some(oid) = update.exchange_order_id.as_deref() {
-                                                let is_probe = shared
-                                                    .probe_order_ids
-                                                    .lock()
-                                                    .unwrap_or_else(|p| p.into_inner())
-                                                    .iter()
-                                                    .any(|p| p == oid);
-                                                if is_probe {
-                                                    debug!(
-                                                        "[PolyUserFeed] probe order push muted: {} {:?} oid={}..",
-                                                        update.symbol, update.status,
-                                                        &oid[..oid.len().min(10)],
-                                                    );
-                                                    continue;
-                                                }
+                            for event in &events {
+                                let parsed = parse_user_event_with_health(event, &shared);
+                                frame_has_valid_business |= parsed.valid_business_event;
+                                frame_has_invalid_business |= parsed.invalid_business_event;
+                                for update in parsed.updates {
+                                    // RTT-probe traffic: the probe's synthetic
+                                    // resting orders have no coid mapping, so
+                                    // their placement / cancellation pushes
+                                    // would log as `<unmapped>` (an ops signal
+                                    // expected to stay at zero) and broadcast
+                                    // to every instance. Identify them by
+                                    // orderID and swallow: DEBUG only.
+                                    if update.client_order_id.is_empty() {
+                                        if let Some(oid) = update.exchange_order_id.as_deref() {
+                                            let is_probe = shared
+                                                .probe_order_ids
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner())
+                                                .iter()
+                                                .any(|p| p == oid);
+                                            if is_probe {
+                                                debug!(
+                                                    "[PolyUserFeed] probe order push muted: {} {:?} oid={}..",
+                                                    update.symbol, update.status,
+                                                    &oid[..oid.len().min(10)],
+                                                );
+                                                continue;
                                             }
-                                        }
-                                        let coid_str = if update.client_order_id.is_empty() {
-                                            match update.exchange_order_id.as_deref() {
-                                                Some(oid) if !oid.is_empty() => {
-                                                    let n = oid.len().min(10);
-                                                    format!("<unmapped:orderID={}..>", &oid[..n])
-                                                }
-                                                _ => "<unmapped>".to_string(),
-                                            }
-                                        } else {
-                                            update.client_order_id.clone()
-                                        };
-                                        info!(
-                                            "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
-                                            update.symbol, coid_str,
-                                            update.side, update.status,
-                                            update.filled_quantity, update.avg_fill_price,
-                                        );
-                                        if update_tx.send(update).is_err() {
-                                            return; // Channel closed
                                         }
                                     }
+                                    let coid_str = if update.client_order_id.is_empty() {
+                                        match update.exchange_order_id.as_deref() {
+                                            Some(oid) if !oid.is_empty() => {
+                                                let n = oid.len().min(10);
+                                                format!("<unmapped:orderID={}..>", &oid[..n])
+                                            }
+                                            _ => "<unmapped>".to_string(),
+                                        }
+                                    } else {
+                                        update.client_order_id.clone()
+                                    };
+                                    info!(
+                                        "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
+                                        update.symbol, coid_str,
+                                        update.side, update.status,
+                                        update.filled_quantity, update.avg_fill_price,
+                                    );
+                                    if update_tx.send(update).is_err() {
+                                        return; // Channel closed
+                                    }
                                 }
+                            }
+                            if frame_has_valid_business {
+                                last_valid_business = Instant::now();
+                                shared.user_feed_health.record_valid_business_event(now_ns());
                             }
                             // Full frame parse + dispatch latency: wall
                             // time from text arrival to last OrderUpdate
                             // forwarded to the engine.
                             crate::latency::record("polymarket.user.event_parse", t_parse);
+                            if frame_has_invalid_business {
+                                shared.user_feed_health.set_recovering(true);
+                                warn!(
+                                    "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit",
+                                );
+                                break;
+                            }
                         }
                         Message::Ping(payload) => {
-                            last_data = Instant::now();
+                            last_transport = Instant::now();
+                            shared.user_feed_health.record_transport_activity(now_ns());
                             let _ = sink.send(Message::Pong(payload)).await;
                         }
                         Message::Pong(_) => {
-                            last_data = Instant::now();
+                            last_transport = Instant::now();
+                            shared.user_feed_health.record_transport_activity(now_ns());
                         }
                         Message::Close(_) => {
                             warn!("[PolyUserFeed] Server closed connection");
@@ -1866,7 +1963,7 @@ async fn user_feed_loop(
                 }
                 Err(_) => {
                     // Timeout — no message in READ_TIMEOUT. Check staleness.
-                    if last_data.elapsed() > STALE_TIMEOUT {
+                    if last_transport.elapsed() > STALE_TIMEOUT {
                         warn!("[PolyUserFeed] No data for 30s, reconnecting");
                         break;
                     }
@@ -2424,25 +2521,25 @@ mod tests {
 
     #[test]
     fn reconnect_health_clears_only_after_a_successful_replay() {
-        let health = super::super::live_position::UserFeedHealth::new();
-        assert!(health.is_recovering());
+        let shared = test_shared();
+        assert!(shared.user_feed_health.is_recovering());
 
         // A failed REST result never reaches `accept_reconnect_replay`.
         let failed: Result<GapReplayOutcome> = Err(anyhow!("temporary REST failure"));
         if let Ok(outcome) = failed {
-            accept_reconnect_replay(&health, outcome);
+            accept_reconnect_replay(&shared, outcome);
         }
         assert!(
-            health.is_recovering(),
+            shared.user_feed_health.is_recovering(),
             "REST failure must keep quoting paused",
         );
 
         accept_reconnect_replay(
-            &health,
+            &shared,
             GapReplayOutcome::Complete { records: 3 },
         );
-        assert!(!health.is_recovering());
-        assert!(!health.inventory_uncertain());
+        assert!(!shared.user_feed_health.is_recovering());
+        assert!(!shared.user_feed_health.inventory_uncertain());
     }
 
     #[test]
@@ -2811,6 +2908,57 @@ mod tests {
         assert!(shared.account_state.is_uncertain());
         assert!(shared.account_state.earliest_unresolved_trade_match_time()
             .is_some_and(|anchor| anchor > 0));
+    }
+
+    #[test]
+    fn future_business_match_time_is_capped_for_replay_only() {
+        let receipt = receipt_time_secs();
+        let event = serde_json::json!({
+            "match_time": receipt.saturating_add(120),
+        });
+        let effective = effective_match_time(&event, "future-trade");
+        assert_eq!(effective.business_secs, receipt.saturating_add(120));
+        assert!(effective.replay_watermark_secs <= receipt_time_secs());
+        assert!(effective.replay_watermark_secs < effective.business_secs);
+    }
+
+    #[test]
+    fn unknown_private_event_cannot_clear_order_schema_anomaly() {
+        let shared = test_shared();
+        shared.account_state.mark_private_event_anomaly(
+            "order:oid-unknown", "test anomaly",
+        );
+        let ignored = serde_json::json!({
+            "event_type": "subscription_ack",
+            "id": "oid-unknown",
+        });
+        let parsed = parse_user_event_with_health(&ignored, &shared);
+        assert!(!parsed.valid_business_event);
+        assert!(!parsed.invalid_business_event);
+        assert!(shared.account_state.is_uncertain());
+        assert!(shared.account_state.ownership_anomalies()
+            .contains_key("private_event:order:oid-unknown"));
+    }
+
+    #[test]
+    fn corrected_order_schema_event_clears_anomaly_and_recovery_gate() {
+        let shared = owned_taker_shared(0.5);
+        let mut update = serde_json::json!({
+            "event_type": "order", "type": "UPDATE", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "4",
+        });
+        let rejected = parse_user_event_with_health(&update, &shared);
+        assert!(rejected.invalid_business_event);
+        assert!(shared.account_state.is_uncertain());
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+
+        update["associate_trades"] = serde_json::json!(["trade-partial"]);
+        let corrected = parse_user_event_with_health(&update, &shared);
+        assert!(corrected.valid_business_event);
+        assert_eq!(corrected.updates.len(), 1);
+        assert!(!shared.account_state.is_uncertain());
+        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
     }
 
     #[test]

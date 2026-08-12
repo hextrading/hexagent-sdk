@@ -1174,6 +1174,31 @@ fn is_valid_subscribed_book(event: &MarketEvent, tokens: &[String]) -> bool {
     }
 }
 
+fn is_valid_subscribed_clob_event(event: &MarketEvent, tokens: &[String]) -> bool {
+    let symbol = match event {
+        MarketEvent::OrderBook(book) => &book.symbol,
+        MarketEvent::Trade(trade) => &trade.symbol,
+        MarketEvent::Quote(quote) => &quote.symbol,
+        MarketEvent::TickSizeChange(change) => &change.symbol,
+        _ => return false,
+    };
+    tokens.iter().any(|token| token == symbol)
+}
+
+fn record_valid_clob_topic_frame(
+    health: &mut WsHealth,
+    events: &[MarketEvent],
+    tokens: &[String],
+    received_at: Instant,
+) -> bool {
+    let accepted = events.iter()
+        .any(|event| is_valid_subscribed_clob_event(event, tokens));
+    if accepted {
+        health.record_topic_frame(received_at);
+    }
+    accepted
+}
+
 fn has_complete_clob_subscription(tokens: &[String]) -> bool {
     // The subscription frame contains the full token set for every current
     // event. Sending that frame is atomic: there is no per-token ACK in the
@@ -1469,9 +1494,11 @@ async fn clob_ws_task(
                                 let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
                                 continue;
                             }
-                            health.record_topic_frame(received_at);
                             let t_parse = crate::latency::Instant::now();
                             let events = parse_clob_frame(&text);
+                            record_valid_clob_topic_frame(
+                                &mut health, &events, &tokens, received_at,
+                            );
                             let has_valid_book = events
                                 .iter()
                                 .any(|event| is_valid_subscribed_book(event, &tokens));
@@ -2851,6 +2878,25 @@ mod pick_current_event_tests {
             exchange_timestamp_ns: 1,
             local_timestamp_ns: 2,
         });
+        assert!(is_valid_subscribed_clob_event(&trade, &tokens));
+        let mut other_trade = trade.clone();
+        let MarketEvent::Trade(other) = &mut other_trade else { unreachable!() };
+        other.symbol = "other".to_string();
+        assert!(!is_valid_subscribed_clob_event(&other_trade, &tokens));
+        let connected_at = Instant::now();
+        let mut health = WsHealth::new(connected_at);
+        assert!(!record_valid_clob_topic_frame(
+            &mut health, &[], &tokens, connected_at,
+        ));
+        assert!(health.topic_is_stale(
+            connected_at + Duration::from_secs(2), Duration::from_secs(1),
+        ));
+        assert!(record_valid_clob_topic_frame(
+            &mut health, std::slice::from_ref(&trade), &tokens, connected_at,
+        ));
+        assert!(!health.topic_is_stale(
+            connected_at, Duration::from_secs(1),
+        ));
         assert!(!is_valid_subscribed_book(&trade, &tokens));
         assert!(!is_valid_subscribed_book(&book("up", vec![], vec![]), &tokens));
         assert!(!is_valid_subscribed_book(

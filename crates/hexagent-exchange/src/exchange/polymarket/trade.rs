@@ -2803,6 +2803,10 @@ impl PolymarketTrade {
                             "live order coid={coid} omitted or has invalid size_matched; preserving local filled_quantity={}",
                             ownership.filled_quantity,
                         ));
+                        // Do not manufacture a lifecycle update from an
+                        // incomplete LIVE response. The next strict GET pass
+                        // remains the convergence path for the schema anomaly.
+                        continue;
                     }
                     let candidate = if effective_size_matched > 1e-9 {
                         OrderStatus::PartiallyFilled
@@ -2859,12 +2863,18 @@ impl PolymarketTrade {
                     continue;
                 }
             };
+            if matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled) {
+                self.shared.account_state.finish_order_recovery(&coid);
+            }
+            self.shared.account_state.resolve_private_event_anomaly(
+                &format!("order:{}", normalize_order_id(&order_id)),
+            );
             updates.push(OrderUpdate {
                 client_order_id: coid,
                 exchange: Exchange::Polymarket,
                 symbol: tracked.symbol,
                 side: tracked.side,
-                exchange_order_id: Some(order_id),
+                exchange_order_id: Some(order_id.clone()),
                 status,
                 liquidity: None,
                 filled_quantity: 0.0,
