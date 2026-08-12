@@ -3078,6 +3078,10 @@ impl Engine {
                                     // order state to reconcile against — the sim
                                     // delivers deterministic results synchronously.
                                 }
+                                Ok(Signal::RetirePolymarketEventAudit { .. }) => {
+                                    // Paper execution has no durable exchange
+                                    // audit history to retire.
+                                }
                                 Ok(Signal::PolymarketCancelAllOrders { ref reason, ref market, .. }) => {
                                     if is_routine_expiry_cancel(reason, market.is_some()) {
                                         info!("[PaperExec] PolymarketCancelAllOrders: reason={}", reason);
@@ -4299,12 +4303,21 @@ impl Engine {
         worker_quarantined: &[Arc<AtomicBool>],
         instance_ids: &[String],
     ) {
-        let owner = coid_owner.lock().unwrap()
-            .get(&update.client_order_id).copied()
-            .or_else(|| owner_from_coid(&update.client_order_id, iid_to_idx));
-        let terminal = matches!(update.status, OrderStatus::Cancelled | OrderStatus::Rejected)
+        let is_market_cancel_finality = update.error.as_deref().is_some_and(|error| {
+            error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED)
+                || error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_PENDING)
+        });
+        let owner = if is_market_cancel_finality {
+            iid_to_idx.get(&update.client_order_id).copied()
+        } else {
+            coid_owner.lock().unwrap()
+                .get(&update.client_order_id).copied()
+                .or_else(|| owner_from_coid(&update.client_order_id, iid_to_idx))
+        };
+        let terminal = !is_market_cancel_finality
+            && (matches!(update.status, OrderStatus::Cancelled | OrderStatus::Rejected)
             || (matches!(update.status, OrderStatus::Filled | OrderStatus::Failed)
-                && update.trade_id.as_deref().is_none_or(str::is_empty));
+                && update.trade_id.as_deref().is_none_or(str::is_empty)));
         let terminal_coid = terminal.then(|| update.client_order_id.clone());
 
         match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
@@ -6601,6 +6614,7 @@ fn extract_instance_id(signal: &Signal) -> String {
         }
         Signal::ReconcilePolymarket { instance_id, .. } => instance_id.clone(),
         Signal::PolymarketCancelAllOrders { instance_id, .. } => instance_id.clone(),
+        Signal::RetirePolymarketEventAudit { instance_id, .. } => instance_id.clone(),
         _ => String::new(),
     }
 }
@@ -7382,7 +7396,40 @@ fn execute_fallback_signal(
                     } else {
                         warn!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
                     }
-                    route.cancel_market_orders(&cid, &asset_ids);
+                    let result = route.cancel_market_orders_until_final(&cid, &asset_ids);
+                    let mut updates = result.updates;
+                    let (status, error) = if result.confirmed {
+                        (
+                            OrderStatus::Cancelled,
+                            POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED.to_string(),
+                        )
+                    } else {
+                        (
+                            OrderStatus::CancelUncertain,
+                            format!(
+                                "{}: {}",
+                                POLYMARKET_MARKET_CANCEL_FINALITY_PENDING,
+                                result.detail,
+                            ),
+                        )
+                    };
+                    updates.push(OrderUpdate {
+                        client_order_id: instance_id.clone(),
+                        exchange: Exchange::Polymarket,
+                        symbol: cid,
+                        side: Side::Buy,
+                        exchange_order_id: None,
+                        status,
+                        liquidity: None,
+                        filled_quantity: 0.0,
+                        remaining_quantity: 0.0,
+                        avg_fill_price: 0.0,
+                        timestamp_ns: now_ns(),
+                        trade_id: None,
+                        order_audit: None,
+                        error: Some(error),
+                    });
+                    return updates;
                 }
                 None => {
                     if instance_id.is_empty() {
@@ -7396,6 +7443,12 @@ fn execute_fallback_signal(
                     }
                 }
             }
+            vec![]
+        }
+        Signal::RetirePolymarketEventAudit { asset_ids, .. } => {
+            executor
+                .poly_route_mut(&instance_id)
+                .retire_event_audit(&asset_ids);
             vec![]
         }
         _ => vec![],
