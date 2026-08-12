@@ -7,7 +7,7 @@
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use log::info;
 
@@ -41,6 +41,8 @@ pub struct UserFeedHealth {
     recovering: AtomicBool,
     inventory_uncertain: AtomicBool,
     gap_replay_degraded: AtomicBool,
+    last_transport_activity_ns: AtomicU64,
+    last_valid_business_event_ns: AtomicU64,
     recovery_delivery: Mutex<RecoveryDeliveryState>,
 }
 
@@ -106,6 +108,8 @@ impl UserFeedHealth {
             recovering: AtomicBool::new(true),
             inventory_uncertain: AtomicBool::new(false),
             gap_replay_degraded: AtomicBool::new(false),
+            last_transport_activity_ns: AtomicU64::new(0),
+            last_valid_business_event_ns: AtomicU64::new(0),
             recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
         }
     }
@@ -118,6 +122,18 @@ impl UserFeedHealth {
     }
     pub fn set_gap_replay_degraded(&self, v: bool) {
         self.gap_replay_degraded.store(v, Ordering::Relaxed);
+    }
+    pub fn record_transport_activity(&self, timestamp_ns: u64) {
+        self.last_transport_activity_ns.fetch_max(timestamp_ns, Ordering::Relaxed);
+    }
+    pub fn record_valid_business_event(&self, timestamp_ns: u64) {
+        self.last_valid_business_event_ns.fetch_max(timestamp_ns, Ordering::Relaxed);
+    }
+    pub fn activity_timestamps_ns(&self) -> (u64, u64) {
+        (
+            self.last_transport_activity_ns.load(Ordering::Relaxed),
+            self.last_valid_business_event_ns.load(Ordering::Relaxed),
+        )
     }
 
     /// Start one reconnect-delivery epoch. The user feed registers every
@@ -327,8 +343,14 @@ impl LivePositionManager {
 
     pub fn from_restored(rows: impl IntoIterator<Item = RestoredTrade>) -> Self {
         let mut manager = Self::new();
+        let receipt_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
         for row in rows {
-            manager.touch_match_time(row.match_time_secs);
+            // Keep the upstream timestamp in the durable row, but never
+            // restore a future REST replay lower bound after restart.
+            manager.touch_match_time(row.match_time_secs.min(receipt_secs));
             let Some(status) = TradeStatus::from_str(&row.ownership.status) else { continue; };
             manager.update_trade(
                 &row.ownership.trade_key,
@@ -348,7 +370,9 @@ impl LivePositionManager {
     /// lower bound on the REST `/trades` gap-fetch call.
     pub fn last_match_time_secs(&self) -> u64 { self.last_match_time_secs }
 
-    /// Bump the last-seen match_time if `ts > current`.
+    /// Bump the conservative REST replay watermark if `ts > current`.
+    /// Callers must pass receipt-capped time, never an unchecked upstream
+    /// business timestamp.
     pub fn touch_match_time(&mut self, ts_secs: u64) {
         if ts_secs > self.last_match_time_secs {
             self.last_match_time_secs = ts_secs;
@@ -481,6 +505,17 @@ mod user_feed_health_tests {
         assert!(h.is_recovering());
         assert!(!h.inventory_uncertain());
         assert!(!h.gap_replay_degraded());
+    }
+
+    #[test]
+    fn transport_and_business_health_clocks_are_independent() {
+        let h = UserFeedHealth::new();
+        h.record_transport_activity(10);
+        assert_eq!(h.activity_timestamps_ns(), (10, 0));
+        h.record_valid_business_event(8);
+        assert_eq!(h.activity_timestamps_ns(), (10, 8));
+        h.record_transport_activity(12);
+        assert_eq!(h.activity_timestamps_ns(), (12, 8));
     }
 
     #[test]
@@ -629,5 +664,36 @@ mod update_trade_dedup_tests {
         ));
         assert_eq!(m.prune_terminal_history(&HashSet::from(["TOK".into()])), 1);
         assert_eq!(m.trade_count(), 2);
+    }
+
+    #[test]
+    fn restored_future_business_time_cannot_restore_a_future_replay_watermark() {
+        let receipt_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let restored = RestoredTrade {
+            ownership: hexagent_account::account::shared_account::TradeOwnership {
+                account_id: "account".to_string(),
+                instance_id: "instance".to_string(),
+                trade_key: "future-trade".to_string(),
+                client_order_id: "coid".to_string(),
+                order_id: "order".to_string(),
+                token_id: "TOKEN".to_string(),
+                side: Side::Buy,
+                quantity: 1.0,
+                price: 0.5,
+                status: "MATCHED".to_string(),
+            },
+            booked: true,
+            usdc_fee: 0.0,
+            shares_fee: 0.0,
+            virtual_fee_booked: true,
+            is_maker: true,
+            match_time_secs: receipt_secs.saturating_add(3_600),
+            ledger_generation: 1,
+        };
+        let manager = LivePositionManager::from_restored([restored]);
+        assert!(manager.last_match_time_secs() <= receipt_secs);
     }
 }
