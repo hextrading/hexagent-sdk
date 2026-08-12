@@ -408,18 +408,68 @@ pub fn fetch_price_at_timestamp(
             .send()
             .await
             .map_err(|e| anyhow!("Chainlink REST error: {}", e))?;
+        let status = resp.status();
         let text = resp.text().await.map_err(|e| anyhow!("body: {}", e))?;
+        if !status.is_success() {
+            return Err(anyhow!("Chainlink REST HTTP {}", status.as_u16()));
+        }
         Ok::<String, anyhow::Error>(text)
     })?;
 
+    decode_rest_price_response(&body, feed_id)
+}
+
+/// Decode one REST response while proving it belongs to the requested stream.
+/// This prevents a proxy/cache/server mix-up from silently supplying a raw
+/// spot report when the caller requested a 30-second TWAP feed.
+fn decode_rest_price_response(body: &str, expected_feed_id: &str) -> Result<f64> {
     let body: serde_json::Value = serde_json::from_str(&body)?;
     let report = body.get("report")
         .ok_or_else(|| anyhow!("No 'report' in response"))?;
+    let returned_feed_id = report.get("feedID")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("No 'feedID' in report"))?;
+    if !returned_feed_id.eq_ignore_ascii_case(expected_feed_id) {
+        return Err(anyhow!(
+            "Chainlink REST feed mismatch: requested {}, returned {}",
+            expected_feed_id,
+            returned_feed_id,
+        ));
+    }
     let full_report = report.get("fullReport")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("No 'fullReport' in report"))?;
 
     ChainlinkStreamMarket::decode_benchmark_price(full_report)
+}
+
+#[cfg(test)]
+mod rest_response_tests {
+    use super::decode_rest_price_response;
+
+    #[test]
+    fn rejects_a_report_from_a_different_feed() {
+        let body = r#"{"report":{"feedID":"0xraw","fullReport":"0x00"}}"#;
+        let error = decode_rest_price_response(body, "0xtwap").unwrap_err().to_string();
+        assert!(error.contains("feed mismatch"), "error={error}");
+        assert!(error.contains("0xtwap"), "error={error}");
+        assert!(error.contains("0xraw"), "error={error}");
+    }
+
+    #[test]
+    fn feed_id_validation_is_case_insensitive() {
+        let body = r#"{"report":{"feedID":"0xABCD","fullReport":"0x00"}}"#;
+        let error = decode_rest_price_response(body, "0xabcd").unwrap_err().to_string();
+        assert!(!error.contains("feed mismatch"), "error={error}");
+        assert!(error.contains("Report too short"), "error={error}");
+    }
+
+    #[test]
+    fn rejects_a_report_without_feed_id() {
+        let body = r#"{"report":{"fullReport":"0x00"}}"#;
+        let error = decode_rest_price_response(body, "0xtwap").unwrap_err().to_string();
+        assert!(error.contains("No 'feedID'"), "error={error}");
+    }
 }
 
 fn read_uint256_as_usize(data: &[u8], offset: usize) -> usize {
