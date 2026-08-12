@@ -149,11 +149,21 @@ pub enum Signal {
         /// executor routes to the matching SharedState.
         instance_id: String,
     },
+    /// Register one strategy instance's settled-FIFO ownership of an event's
+    /// executor/account audit history. Registration is idempotent across
+    /// restart: the corresponding retire only removes this instance's
+    /// reference, and global cleanup waits for every sibling reference.
+    RetainPolymarketEventAudit {
+        condition_id: String,
+        asset_ids: Vec<String>,
+        instance_id: String,
+    },
     /// Retire executor/account audit history only after the strategy's
     /// settled-event FIFO has evicted the corresponding event. Expiry cancel
     /// must not perform this cleanup: late trade lifecycle revisions remain
     /// routable for the whole settled-ledger retention window.
     RetirePolymarketEventAudit {
+        condition_id: String,
         asset_ids: Vec<String>,
         instance_id: String,
     },

@@ -106,7 +106,7 @@ impl UpsertResult {
 }
 
 /// A single fill in the PositionManager ledger.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
     pub trade_id: String,
     pub asset_id: String,
@@ -125,7 +125,7 @@ pub struct TradeRecord {
 /// trades so that `available_cash` / `available_inventory` can be derived
 /// entirely inside `PositionManager` without the caller having to plumb
 /// `locked_buy_cost` / `locked_sell_qty` from some other tracker.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PendingOrder {
     pub client_order_id: String,
     pub symbol: String,
@@ -181,7 +181,7 @@ pub struct PositionManager {
     taker_volume: f64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PositionManagerSnapshot {
     version: u32,
     init_balance: f64,
@@ -367,6 +367,115 @@ impl PositionManager {
             maker_volume: snapshot.maker_volume,
             taker_volume: snapshot.taker_volume,
         })
+    }
+
+    /// Rebuild a retained event from its immutable PM seed and the shared
+    /// account's durable trade ledger. Unlike lifecycle `upsert_trade` on the
+    /// serialized PM, this deliberately discards the old derived trade rows,
+    /// volumes and fees so an authoritative fee-curve revision can replace a
+    /// terminal trade's economics after restart.
+    pub fn rebuild_from_snapshot_baseline(
+        snapshot: PositionManagerSnapshot,
+        rows: impl IntoIterator<Item = RestoredTrade>,
+    ) -> Result<Self, String> {
+        if snapshot.version != 1 || !snapshot.init_balance.is_finite() {
+            return Err("snapshot contains an invalid immutable baseline".to_string());
+        }
+        for (symbol, quantity) in &snapshot.init_positions {
+            if symbol.trim().is_empty() || !quantity.is_finite() {
+                return Err("snapshot contains an invalid immutable position".to_string());
+            }
+        }
+        for (client_order_id, pending) in &snapshot.pending_orders {
+            if pending.client_order_id != *client_order_id
+                || !valid_pending_order_fields(
+                    client_order_id,
+                    &pending.symbol,
+                    pending.price,
+                    pending.original_quantity,
+                )
+                || !pending.remaining_quantity.is_finite()
+                || pending.remaining_quantity < 0.0
+                || pending.remaining_quantity > pending.original_quantity + 1e-8
+            {
+                return Err(format!(
+                    "snapshot contains invalid pending order {client_order_id}",
+                ));
+            }
+        }
+
+        let mut manager = Self {
+            init_balance: snapshot.init_balance,
+            init_positions: snapshot.init_positions,
+            trades: std::collections::BTreeMap::new(),
+            pending_orders: snapshot.pending_orders,
+            synthetic_counter: snapshot.synthetic_counter,
+            maker_volume: 0.0,
+            taker_volume: 0.0,
+        };
+        let mut booked_by_order: HashMap<String, f64> = HashMap::new();
+        for row in rows {
+            let ownership = row.ownership;
+            let status = TradeStatus::from_polymarket_str(&ownership.status)
+                .ok_or_else(|| format!(
+                    "durable trade {} has invalid status {}",
+                    ownership.trade_key, ownership.status,
+                ))?;
+            if ownership.trade_key.trim().is_empty()
+                || ownership.client_order_id.trim().is_empty()
+                || ownership.token_id.trim().is_empty()
+                || !ownership.quantity.is_finite()
+                || ownership.quantity <= 0.0
+                || !ownership.price.is_finite()
+                || ownership.price <= 0.0
+                || ownership.price > 1.0 + 1e-8
+                || !row.usdc_fee.is_finite()
+                || row.usdc_fee < 0.0
+                || !row.shares_fee.is_finite()
+                || row.shares_fee < 0.0
+                || (!row.is_maker
+                    && status != TradeStatus::Failed
+                    && !row.virtual_fee_booked)
+                || (!row.booked && status != TradeStatus::Failed)
+            {
+                return Err(format!(
+                    "durable trade {} cannot rebuild settled PM",
+                    ownership.trade_key,
+                ));
+            }
+            let result = manager.upsert_trade(
+                &ownership.trade_key,
+                &ownership.token_id,
+                ownership.side,
+                ownership.quantity,
+                ownership.price,
+                status,
+                row.is_maker,
+                row.usdc_fee,
+                row.shares_fee,
+                None,
+            );
+            if !result.applied {
+                return Err(format!(
+                    "durable trade {} was not admitted during settled PM rebuild",
+                    ownership.trade_key,
+                ));
+            }
+            if row.booked && status != TradeStatus::Failed {
+                *booked_by_order
+                    .entry(ownership.client_order_id)
+                    .or_insert(0.0) += ownership.quantity;
+            }
+        }
+        for pending in manager.pending_orders.values_mut() {
+            let booked = booked_by_order
+                .get(&pending.client_order_id)
+                .copied()
+                .unwrap_or(0.0);
+            pending.remaining_quantity =
+                (pending.original_quantity - booked).clamp(0.0, pending.original_quantity);
+        }
+        Ok(manager)
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -932,6 +1041,59 @@ mod tests {
         assert_eq!(restored.trades().len(), 1);
         assert!((restored.balance() - pm.balance()).abs() < 1e-9);
         assert!((restored.get("TOK").unwrap().quantity - pm.get("TOK").unwrap().quantity).abs() < 1e-9);
+    }
+
+    #[test]
+    fn durable_rebuild_replaces_serialized_fee_economics_from_immutable_baseline() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 100.0);
+        pm.register_pending_order("order", "TOK", Side::Buy, 0.4, 5.0);
+        assert!(pm
+            .upsert_trade(
+                "trade",
+                "TOK",
+                Side::Buy,
+                2.0,
+                0.4,
+                TradeStatus::Confirmed,
+                false,
+                0.0,
+                0.01,
+                None,
+            )
+            .applied);
+
+        let rebuilt = PositionManager::rebuild_from_snapshot_baseline(
+            pm.snapshot(),
+            [RestoredTrade {
+                ownership: TradeOwnership {
+                    account_id: "acct".into(),
+                    instance_id: "instance".into(),
+                    trade_key: "trade".into(),
+                    client_order_id: "order".into(),
+                    order_id: "oid".into(),
+                    token_id: "TOK".into(),
+                    side: Side::Buy,
+                    quantity: 2.0,
+                    price: 0.4,
+                    status: "CONFIRMED".into(),
+                },
+                booked: true,
+                usdc_fee: 0.0,
+                shares_fee: 0.02,
+                virtual_fee_booked: true,
+                is_maker: false,
+                match_time_secs: 1,
+                ledger_generation: 2,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt.trades()["trade"].shares_fee, 0.02);
+        assert_eq!(rebuilt.trades()["trade"].usdc_fee, 0.0);
+        assert_eq!(rebuilt.pending_orders()["order"].remaining_quantity, 3.0);
+        assert!((rebuilt.balance() - 99.2).abs() < 1e-12);
+        assert!((rebuilt.get_quantity("TOK") - 1.98).abs() < 1e-12);
+        assert!((rebuilt.taker_volume() - 0.8).abs() < 1e-12);
     }
 
     #[test]

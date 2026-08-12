@@ -3078,7 +3078,8 @@ impl Engine {
                                     // order state to reconcile against — the sim
                                     // delivers deterministic results synchronously.
                                 }
-                                Ok(Signal::RetirePolymarketEventAudit { .. }) => {
+                                Ok(Signal::RetainPolymarketEventAudit { .. })
+                                | Ok(Signal::RetirePolymarketEventAudit { .. }) => {
                                     // Paper execution has no durable exchange
                                     // audit history to retire.
                                 }
@@ -6614,7 +6615,8 @@ fn extract_instance_id(signal: &Signal) -> String {
         }
         Signal::ReconcilePolymarket { instance_id, .. } => instance_id.clone(),
         Signal::PolymarketCancelAllOrders { instance_id, .. } => instance_id.clone(),
-        Signal::RetirePolymarketEventAudit { instance_id, .. } => instance_id.clone(),
+        Signal::RetainPolymarketEventAudit { instance_id, .. }
+        | Signal::RetirePolymarketEventAudit { instance_id, .. } => instance_id.clone(),
         _ => String::new(),
     }
 }
@@ -7445,10 +7447,30 @@ fn execute_fallback_signal(
             }
             vec![]
         }
-        Signal::RetirePolymarketEventAudit { asset_ids, .. } => {
+        Signal::RetainPolymarketEventAudit {
+            condition_id,
+            asset_ids,
+            ..
+        } => {
+            if let Err(error) = executor
+                .poly_route_mut(&instance_id)
+                .retain_event_audit(&condition_id, &asset_ids)
+            {
+                error!(
+                    "[Executor] failed to retain Polymarket event audit instance_id={} condition_id={}: {}",
+                    instance_id, condition_id, error,
+                );
+            }
+            vec![]
+        }
+        Signal::RetirePolymarketEventAudit {
+            condition_id,
+            asset_ids,
+            ..
+        } => {
             executor
                 .poly_route_mut(&instance_id)
-                .retire_event_audit(&asset_ids);
+                .retire_event_audit(&condition_id, &asset_ids);
             vec![]
         }
         _ => vec![],

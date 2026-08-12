@@ -1555,6 +1555,23 @@ impl SharedState {
             .cloned()
     }
 
+    /// Complete account-global settled-audit cleanup only after the durable
+    /// shared reference ledger proves every instance has evicted the event and
+    /// every associated order/trade is terminal.
+    pub(crate) fn finalize_ready_settled_audit_retirements(&self) -> usize {
+        let ready = self
+            .account_state
+            .finalize_ready_settled_audit_retirements();
+        if ready.is_empty() {
+            return 0;
+        }
+        let mut live = self.live_position.lock().unwrap();
+        ready
+            .iter()
+            .map(|tokens| live.prune_terminal_history(tokens))
+            .sum()
+    }
+
     /// Apply a live order status and restore every runtime structure that a
     /// preceding terminal update may have torn down. Polymarket lifecycle
     /// messages are not ordered, so Cancelled → Accepted is a valid
@@ -3211,9 +3228,24 @@ impl PolymarketTrade {
         }
     }
 
+    /// Register the strategy's durable settled-FIFO promise in the account-wide
+    /// reference ledger. Replays after restart are idempotent.
+    pub fn retain_event_audit(
+        &self,
+        condition_id: &str,
+        asset_ids: &[String],
+    ) -> Result<()> {
+        self.shared.account_state.retain_settled_event_audit(
+            &self.instance_id,
+            condition_id,
+            asset_ids,
+        )?;
+        Ok(())
+    }
+
     /// Destroy event-scoped mappings and durable audit rows only when the
     /// strategy confirms its settled-event FIFO has evicted that event.
-    pub fn retire_event_audit(&self, asset_ids: &[String]) {
+    pub fn retire_event_audit(&self, condition_id: &str, asset_ids: &[String]) {
         let retired_tokens: HashSet<String> = asset_ids
             .iter()
             .filter(|token| !token.is_empty())
@@ -3249,10 +3281,19 @@ impl PolymarketTrade {
             .shared
             .account_state
             .prune_terminal_history_for_instance(&self.instance_id, &retired_tokens);
-        // LivePositionManager has no instance ownership column. Retaining its
-        // terminal dedupe rows is safer than allowing one shared-wallet
-        // instance to erase a sibling's replay protection.
-        let live_trades = 0;
+        if let Err(error) = self.shared.account_state.release_settled_event_audit(
+            &self.instance_id,
+            condition_id,
+            asset_ids,
+        ) {
+            warn!(
+                "[PolymarketTrade] settled audit reference release failed instance={} condition={}: {}",
+                self.instance_id, condition_id, error,
+            );
+        }
+        let live_trades = self
+            .shared
+            .finalize_ready_settled_audit_retirements();
         info!(
             "[PolymarketTrade] settled FIFO eviction retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) for {} token(s)",
             reclaimed,

@@ -7,7 +7,7 @@
 
 use hexagent_types::types::{BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -383,6 +383,17 @@ struct TokenFeeConfig {
     exponent: f64,
 }
 
+/// Cross-instance ownership of the late-fill audit retained by each strategy's
+/// settled-event FIFO. An empty `instances` set means every strategy has
+/// evicted the event, but account cleanup is still waiting for a non-revisable
+/// order/trade terminal state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettledAuditReference {
+    condition_id: String,
+    asset_ids: BTreeSet<String>,
+    instances: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RiskBlocker {
     reason: String,
@@ -460,6 +471,9 @@ struct SharedAccountState {
     /// live strategy EventContext.
     #[serde(default)]
     token_fee_configs: HashMap<String, TokenFeeConfig>,
+    /// Durable shared reference count for strategy settled-event FIFOs.
+    #[serde(default)]
+    settled_audit_references: BTreeMap<String, SettledAuditReference>,
     /// Taker trades seen before their fee curve is available remain a sticky
     /// admission blocker rather than silently booking zero fee.
     #[serde(default)]
@@ -1316,6 +1330,98 @@ impl SharedAccount {
             }
         }
         self.schedule_persist(&state);
+    }
+
+    /// Idempotently retain one settled event's late-fill audit for an instance.
+    /// The reference is persisted in the shared account ledger so process
+    /// restart cannot let one instance clean history still promised by another.
+    pub fn retain_settled_event_audit(
+        &self,
+        instance_id: &str,
+        condition_id: &str,
+        asset_ids: &[String],
+    ) -> Result<(), ReservationError> {
+        let normalized = validate_settled_audit_identity(instance_id, condition_id, asset_ids)?;
+        let mut state = self.state.lock().unwrap();
+        if !state.instances.contains_key(instance_id) {
+            return Err(ReservationError::UnknownInstance(instance_id.to_string()));
+        }
+        match state.settled_audit_references.get_mut(condition_id) {
+            Some(reference) => {
+                if reference.asset_ids != normalized {
+                    return Err(ReservationError::InvalidOrder(format!(
+                        "settled audit token identity changed for condition `{condition_id}`",
+                    )));
+                }
+                reference.instances.insert(instance_id.to_string());
+            }
+            None => {
+                state.settled_audit_references.insert(
+                    condition_id.to_string(),
+                    SettledAuditReference {
+                        condition_id: condition_id.to_string(),
+                        asset_ids: normalized,
+                        instances: BTreeSet::from([instance_id.to_string()]),
+                    },
+                );
+            }
+        }
+        self.schedule_persist(&state);
+        Ok(())
+    }
+
+    /// Release one instance's FIFO reference. The empty reference remains as a
+    /// durable cleanup request while any order/trade can still be revised.
+    pub fn release_settled_event_audit(
+        &self,
+        instance_id: &str,
+        condition_id: &str,
+        asset_ids: &[String],
+    ) -> Result<(), ReservationError> {
+        let normalized = validate_settled_audit_identity(instance_id, condition_id, asset_ids)?;
+        let mut state = self.state.lock().unwrap();
+        let Some(reference) = state.settled_audit_references.get_mut(condition_id) else {
+            // A failed-event eviction never entered the settled FIFO. Keep this
+            // idempotent and conservative: instance-scoped rows are still pruned
+            // by the caller, but no account-global history is destroyed.
+            return Ok(());
+        };
+        if reference.asset_ids != normalized {
+            return Err(ReservationError::InvalidOrder(format!(
+                "settled audit retirement token mismatch for condition `{condition_id}`",
+            )));
+        }
+        reference.instances.remove(instance_id);
+        self.schedule_persist(&state);
+        Ok(())
+    }
+
+    /// Atomically claim every zero-reference event whose durable audit is fully
+    /// terminal, compact its account rows and fee curves, and return token sets
+    /// for the exchange feed's in-memory tombstone cleanup.
+    pub fn finalize_ready_settled_audit_retirements(&self) -> Vec<HashSet<String>> {
+        let mut state = self.state.lock().unwrap();
+        let ready: Vec<(String, HashSet<String>)> = state
+            .settled_audit_references
+            .iter()
+            .filter(|(_, reference)| reference.instances.is_empty())
+            .filter_map(|(condition_id, reference)| {
+                let tokens: HashSet<String> = reference.asset_ids.iter().cloned().collect();
+                (!settled_audit_has_revisable_rows(&state, &tokens))
+                    .then(|| (condition_id.clone(), tokens))
+            })
+            .collect();
+        if ready.is_empty() {
+            return Vec::new();
+        }
+        let mut retired = Vec::with_capacity(ready.len());
+        for (condition_id, tokens) in ready {
+            let _ = prune_terminal_history_locked(&mut state, None, &tokens);
+            state.settled_audit_references.remove(&condition_id);
+            retired.push(tokens);
+        }
+        self.schedule_persist(&state);
+        retired
     }
 
     /// Validate the final configured membership after every instance sharing
@@ -3984,94 +4090,149 @@ impl SharedAccount {
             return (0, 0);
         }
         let mut state = self.state.lock().unwrap();
-        // A terminal order is still the durable ownership root for every late
-        // MINED/CONFIRMED/FAILED edge. Retain it (and its oid mapping) until all
-        // trades that reference it are terminal and their fee attribution is
-        // complete.
-        let protected_coids: HashSet<String> = state
-            .trades
-            .iter()
-            .filter(|(trade_key, trade)| {
-                !trade.failed
-                    && (trade.ownership.status != "CONFIRMED"
-                        || state.fee_attribution_pending.contains(*trade_key))
-            })
-            .map(|(_, trade)| trade.ownership.client_order_id.clone())
-            .collect();
-        let stale_orders: Vec<(String, String)> = state
-            .orders
-            .iter()
-            .filter(|(coid, order)| {
-                tokens.contains(&order.token_id)
-                    && instance_id.is_none_or(|expected| order.instance_id == expected)
-                    && !protected_coids.contains(*coid)
-                    && !state.recovery_pending_orders.contains(*coid)
-                    && order.reserved_cash <= EPS
-                    && order.reserved_quantity <= EPS
-                    && matches!(
-                        order.status,
-                        OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
-                            | OrderStatus::Failed
-                    )
-            })
-            .map(|(coid, order)| (coid.clone(), order.order_id.clone()))
-            .collect();
-        for (coid, oid) in &stale_orders {
-            state.orders.remove(coid);
-            state.oid_to_coid.remove(&normalize_order_id(oid));
-        }
-        let stale_trades: Vec<String> = state
-            .trades
-            .iter()
-            .filter(|(trade_key, trade)| {
-                tokens.contains(&trade.ownership.token_id)
-                    && instance_id.is_none_or(|expected| {
-                        trade.ownership.instance_id == expected
-                    })
-                    && !state.fee_attribution_pending.contains(*trade_key)
-                    && (trade.failed || trade.ownership.status == "CONFIRMED")
-            })
-            .map(|(trade_key, _)| trade_key.clone())
-            .collect();
-        for trade_key in &stale_trades {
-            if let Some(trade) = state.trades.remove(trade_key) {
-                add_economic_state(
-                    &mut state.compacted_economic_effects,
-                    &trade_economic_effect(&trade),
-                    1.0,
-                );
-            }
-            state.fee_attribution_pending.remove(trade_key);
-        }
-        let protected_fee_tokens: HashSet<String> = state
-            .trades
-            .iter()
-            .filter(|(trade_key, trade)| {
-                !trade.failed
-                    && (trade.ownership.status != "CONFIRMED"
-                        || state.fee_attribution_pending.contains(*trade_key))
-            })
-            .map(|(_, trade)| trade.ownership.token_id.clone())
-            .collect();
-        // Fee curves are token-global within the shared wallet. An
-        // instance-scoped retirement cannot prove that no sibling retained
-        // event still needs the curve for a late revision, so only the legacy
-        // account-wide path may remove it.
-        let pruned_fee_configs = if instance_id.is_none() {
-            tokens
-                .iter()
-                .filter(|token| !protected_fee_tokens.contains(*token))
-                .filter(|token| state.token_fee_configs.remove(*token).is_some())
-                .count()
-        } else {
-            0
-        };
-        let pruned_trades = stale_trades.len();
-        if !stale_orders.is_empty() || pruned_trades > 0 || pruned_fee_configs > 0 {
+        let (pruned_orders, pruned_trades, pruned_fee_configs) =
+            prune_terminal_history_locked(&mut state, instance_id, tokens);
+        if pruned_orders > 0 || pruned_trades > 0 || pruned_fee_configs > 0 {
             self.schedule_persist(&state);
         }
-        (stale_orders.len(), pruned_trades)
+        (pruned_orders, pruned_trades)
     }
+}
+
+fn validate_settled_audit_identity(
+    instance_id: &str,
+    condition_id: &str,
+    asset_ids: &[String],
+) -> Result<BTreeSet<String>, ReservationError> {
+    let normalized: BTreeSet<String> = asset_ids
+        .iter()
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+    if instance_id.trim().is_empty()
+        || condition_id.trim().is_empty()
+        || normalized.len() != asset_ids.len()
+    {
+        return Err(ReservationError::InvalidOrder(
+            "settled audit reference requires instance/condition and distinct non-empty tokens"
+                .to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn settled_audit_has_revisable_rows(
+    state: &SharedAccountState,
+    tokens: &HashSet<String>,
+) -> bool {
+    state.orders.iter().any(|(coid, order)| {
+        tokens.contains(&order.token_id)
+            && (state.recovery_pending_orders.contains(coid)
+                || order.reserved_cash > EPS
+                || order.reserved_quantity > EPS
+                || !matches!(
+                    order.status,
+                    OrderStatus::Cancelled
+                        | OrderStatus::Rejected
+                        | OrderStatus::Filled
+                        | OrderStatus::Failed
+                ))
+    }) || state.trades.iter().any(|(trade_key, trade)| {
+        tokens.contains(&trade.ownership.token_id)
+            && !trade.failed
+            && (trade.ownership.status != "CONFIRMED"
+                || trade.is_maker.is_none()
+                || state.fee_attribution_pending.contains(trade_key))
+    })
+}
+
+fn prune_terminal_history_locked(
+    state: &mut SharedAccountState,
+    instance_id: Option<&str>,
+    tokens: &HashSet<String>,
+) -> (usize, usize, usize) {
+    // A terminal order is still the durable ownership root for every late
+    // MINED/CONFIRMED/FAILED edge. Retain it (and its oid mapping) until all
+    // trades that reference it are terminal and their fee attribution is
+    // complete.
+    let protected_coids: HashSet<String> = state
+        .trades
+        .iter()
+        .filter(|(trade_key, trade)| {
+            !trade.failed
+                && (trade.ownership.status != "CONFIRMED"
+                    || state.fee_attribution_pending.contains(*trade_key))
+        })
+        .map(|(_, trade)| trade.ownership.client_order_id.clone())
+        .collect();
+    let stale_orders: Vec<(String, String)> = state
+        .orders
+        .iter()
+        .filter(|(coid, order)| {
+            tokens.contains(&order.token_id)
+                && instance_id.is_none_or(|expected| order.instance_id == expected)
+                && !protected_coids.contains(*coid)
+                && !state.recovery_pending_orders.contains(*coid)
+                && order.reserved_cash <= EPS
+                && order.reserved_quantity <= EPS
+                && matches!(
+                    order.status,
+                    OrderStatus::Cancelled
+                        | OrderStatus::Rejected
+                        | OrderStatus::Filled
+                        | OrderStatus::Failed
+                )
+        })
+        .map(|(coid, order)| (coid.clone(), order.order_id.clone()))
+        .collect();
+    for (coid, oid) in &stale_orders {
+        state.orders.remove(coid);
+        state.oid_to_coid.remove(&normalize_order_id(oid));
+    }
+    let stale_trades: Vec<String> = state
+        .trades
+        .iter()
+        .filter(|(trade_key, trade)| {
+            tokens.contains(&trade.ownership.token_id)
+                && instance_id.is_none_or(|expected| trade.ownership.instance_id == expected)
+                && !state.fee_attribution_pending.contains(*trade_key)
+                && (trade.failed || trade.ownership.status == "CONFIRMED")
+        })
+        .map(|(trade_key, _)| trade_key.clone())
+        .collect();
+    for trade_key in &stale_trades {
+        if let Some(trade) = state.trades.remove(trade_key) {
+            add_economic_state(
+                &mut state.compacted_economic_effects,
+                &trade_economic_effect(&trade),
+                1.0,
+            );
+        }
+        state.fee_attribution_pending.remove(trade_key);
+    }
+    let protected_fee_tokens: HashSet<String> = state
+        .trades
+        .iter()
+        .filter(|(trade_key, trade)| {
+            !trade.failed
+                && (trade.ownership.status != "CONFIRMED"
+                    || state.fee_attribution_pending.contains(*trade_key))
+        })
+        .map(|(_, trade)| trade.ownership.token_id.clone())
+        .collect();
+    // Fee curves are token-global within the shared wallet. Instance-scoped
+    // retirement cannot prove that no sibling FIFO still references the token.
+    let pruned_fee_configs = if instance_id.is_none() {
+        tokens
+            .iter()
+            .filter(|token| !protected_fee_tokens.contains(*token))
+            .filter(|token| state.token_fee_configs.remove(*token).is_some())
+            .count()
+    } else {
+        0
+    };
+    (stale_orders.len(), stale_trades.len(), pruned_fee_configs)
 }
 
 impl Drop for SharedAccount {
@@ -4952,6 +5113,25 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             .any(|scope| scope.trim().is_empty())
         {
             return Err(format!("instance `{instance_id}` has an empty market scope"));
+        }
+    }
+
+    for (condition_id, reference) in &state.settled_audit_references {
+        if condition_id.trim().is_empty()
+            || reference.condition_id != *condition_id
+            || reference.asset_ids.is_empty()
+            || reference
+                .asset_ids
+                .iter()
+                .any(|token| token.trim().is_empty())
+            || reference
+                .instances
+                .iter()
+                .any(|instance_id| !state.instances.contains_key(instance_id))
+        {
+            return Err(format!(
+                "invalid settled audit reference for condition `{condition_id}`",
+            ));
         }
     }
 
@@ -6703,6 +6883,47 @@ mod tests {
             Some("b"),
         );
         assert!(account.trades().iter().any(|trade| trade.trade_key == "trade-b-same"));
+    }
+
+    #[test]
+    fn settled_audit_cleanup_waits_for_every_instance_reference() {
+        let account = seeded_account();
+        account
+            .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
+            .unwrap();
+        for instance in ["a", "b"] {
+            account
+                .retain_settled_event_audit(
+                    instance,
+                    "condition",
+                    &["UP".to_string()],
+                )
+                .unwrap();
+        }
+
+        account
+            .release_settled_event_audit("a", "condition", &["UP".to_string()])
+            .unwrap();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(account
+            .state
+            .lock()
+            .unwrap()
+            .token_fee_configs
+            .contains_key("UP"));
+
+        account
+            .release_settled_event_audit("b", "condition", &["UP".to_string()])
+            .unwrap();
+        assert_eq!(
+            account.finalize_ready_settled_audit_retirements(),
+            vec![HashSet::from(["UP".to_string()])],
+        );
+        let state = account.state.lock().unwrap();
+        assert!(!state.token_fee_configs.contains_key("UP"));
+        assert!(!state.settled_audit_references.contains_key("condition"));
     }
 
     #[test]
