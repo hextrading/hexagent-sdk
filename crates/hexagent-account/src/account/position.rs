@@ -303,6 +303,8 @@ impl PositionManager {
                 return Err("snapshot contains invalid initial position".to_string());
             }
         }
+        let mut expected_maker_volume = 0.0;
+        let mut expected_taker_volume = 0.0;
         for (trade_id, trade) in &snapshot.trades {
             if trade_id.trim().is_empty() || trade.trade_id != *trade_id
                 || trade.asset_id.trim().is_empty()
@@ -313,6 +315,36 @@ impl PositionManager {
             {
                 return Err(format!("snapshot contains invalid trade {trade_id}"));
             }
+            let fee_tolerance = 1e-10_f64.max(trade.size.abs() * 1e-8);
+            if (trade.is_maker
+                && (trade.usdc_fee.abs() > fee_tolerance || trade.shares_fee.abs() > fee_tolerance))
+                || (!trade.is_maker
+                    && match trade.side {
+                        Side::Buy => trade.usdc_fee.abs() > fee_tolerance,
+                        Side::Sell => trade.shares_fee.abs() > fee_tolerance,
+                    })
+            {
+                return Err(format!(
+                    "snapshot trade {trade_id} has fee in the wrong role/currency"
+                ));
+            }
+            if trade.status != TradeStatus::Failed {
+                let notional = trade.size * trade.price;
+                if trade.is_maker {
+                    expected_maker_volume += notional;
+                } else {
+                    expected_taker_volume += notional;
+                }
+            }
+        }
+        let volume_tolerance =
+            |stored: f64, expected: f64| 1e-8_f64.max(stored.abs().max(expected.abs()) * 1e-10);
+        if (snapshot.maker_volume - expected_maker_volume).abs()
+            > volume_tolerance(snapshot.maker_volume, expected_maker_volume)
+            || (snapshot.taker_volume - expected_taker_volume).abs()
+                > volume_tolerance(snapshot.taker_volume, expected_taker_volume)
+        {
+            return Err("snapshot maker/taker volume disagrees with durable trades".to_string());
         }
         for (client_order_id, pending) in &snapshot.pending_orders {
             if pending.client_order_id != *client_order_id
@@ -485,15 +517,21 @@ impl PositionManager {
     /// - PartiallyFilled → decrement the open order's remaining_quantity
     /// - Filled / Cancelled / Rejected → remove from pending_orders entirely
     pub fn on_order_update(&mut self, update: &OrderUpdate) {
-        self.sync_pending_from_update(update);
-
         let Some(status) = TradeStatus::from_order_status(update.status) else {
+            self.sync_pending_from_update(update);
             return;
         };
         if update.filled_quantity <= 0.0 {
+            self.sync_pending_from_update(update);
             return;
         }
-        let is_maker = matches!(update.liquidity, Some(Liquidity::Maker));
+        let Some(liquidity) = update.liquidity else {
+            // A fill without an authoritative role cannot be assigned a fee.
+            // Keep its reservation intact and wait for a corrected replay.
+            return;
+        };
+        let is_maker = liquidity == Liquidity::Maker;
+        self.sync_pending_from_update(update);
 
         // Prefer the authoritative trade_id; fall back to synthetic.
         let trade_id: String = match &update.trade_id {
@@ -894,6 +932,67 @@ mod tests {
         assert_eq!(restored.trades().len(), 1);
         assert!((restored.balance() - pm.balance()).abs() < 1e-9);
         assert!((restored.get("TOK").unwrap().quantity - pm.get("TOK").unwrap().quantity).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fill_without_liquidity_role_is_rejected_without_releasing_pending() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 10.0);
+        pm.register_pending_order("pending", "TOK", Side::Buy, 0.4, 5.0);
+        let mut update = ou("pending", Side::Buy, OrderStatus::PartiallyFilled, 0.4, 4.0);
+        update.filled_quantity = 1.0;
+        update.trade_id = Some("trade".to_string());
+
+        pm.on_order_update(&update);
+        assert!(pm.trades().is_empty());
+        assert_eq!(pm.pending_orders()["pending"].remaining_quantity, 5.0);
+
+        update.liquidity = Some(Liquidity::Maker);
+        pm.on_order_update(&update);
+        assert!(pm.trades().contains_key("trade"));
+        assert_eq!(pm.pending_orders()["pending"].remaining_quantity, 4.0);
+    }
+
+    #[test]
+    fn snapshot_rejects_missing_role_wrong_fee_currency_and_volume_drift() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 10.0);
+        assert!(
+            pm.upsert_trade(
+                "trade",
+                "TOK",
+                Side::Buy,
+                2.0,
+                0.4,
+                TradeStatus::Matched,
+                false,
+                0.0,
+                0.01,
+                None,
+            )
+            .applied
+        );
+        let snapshot = pm.snapshot();
+        assert!(PositionManager::from_snapshot(snapshot.clone()).is_ok());
+
+        let mut wrong_currency = snapshot.clone();
+        wrong_currency.trades.get_mut("trade").unwrap().usdc_fee = 0.1;
+        assert!(PositionManager::from_snapshot(wrong_currency)
+            .err()
+            .unwrap()
+            .contains("wrong role/currency"));
+
+        let mut wrong_volume = snapshot.clone();
+        wrong_volume.taker_volume += 1.0;
+        assert!(PositionManager::from_snapshot(wrong_volume)
+            .err()
+            .unwrap()
+            .contains("volume disagrees"));
+
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded["trades"]["trade"]
+            .as_object_mut()
+            .unwrap()
+            .remove("is_maker");
+        assert!(serde_json::from_value::<PositionManagerSnapshot>(encoded).is_err());
     }
 
     // Resurrection re-lock: a `Cancelled` releases the pending lock; a later

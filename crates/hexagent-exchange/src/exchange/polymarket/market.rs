@@ -2723,6 +2723,20 @@ mod pick_current_event_tests {
         let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
         assert_eq!(trade.exchange_trade_id.as_deref(), Some("execution:fill-7"));
 
+        let corrected = parse_clob_frame(
+            r#"{"event_type":"trade","asset_id":"up","price":"0.52","size":"2.5","side":"BUY","timestamp":"1757908892352","trade_id":"fill-7","transaction_hash":"0xabc"}"#,
+        );
+        let MarketEvent::Trade(corrected) = &corrected[0] else {
+            panic!("expected trade");
+        };
+        assert_eq!(
+            corrected.exchange_trade_id.as_deref(),
+            Some("execution:fill-7"),
+            "economic corrections must retain the execution identity",
+        );
+        assert_eq!(corrected.price, 0.52);
+        assert_eq!(corrected.quantity, 2.5);
+
         let events = parse_clob_frame(
             r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","transactionHash":"0xabc","logIndex":"0x2"}"#,
         );
