@@ -372,6 +372,35 @@ fn same_public_feed_connection(a: &ExchangeConfig, b: &ExchangeConfig) -> bool {
         && a.feed_ids == b.feed_ids
 }
 
+/// Treat `feed_ids` as the single Chainlink Data Streams configuration source
+/// in live-like modes. Backtests keep human-readable archive labels in
+/// `symbols`, and legacy stream configs without a feed map remain supported.
+fn normalize_chainlink_stream_subscriptions(mode: RunMode, exchanges: &mut [ExchangeConfig]) {
+    if mode == RunMode::Backtest {
+        return;
+    }
+
+    for exchange in exchanges {
+        if exchange.name != "chainlink"
+            || !exchange.source.eq_ignore_ascii_case("stream")
+            || exchange.feed_ids.is_empty()
+        {
+            continue;
+        }
+
+        let (subscriptions, invalid_labels) = exchange.chainlink_stream_subscriptions();
+        exchange.symbols = subscriptions;
+        if exchange.enabled {
+            for label in invalid_labels {
+                warn!(
+                    "[chainlink] invalid or missing feed_ids entry for {}; feed will not be subscribed",
+                    label,
+                );
+            }
+        }
+    }
+}
+
 /// Collapse duplicate public-feed config blocks onto one connection and one
 /// unique symbol set. Strategy routing remains one-to-many, so every sibling
 /// instance still receives the shared event without opening another socket.
@@ -432,6 +461,36 @@ mod public_subscription_coalesce_tests {
         coalesce_public_exchange_subscriptions(&mut exchanges);
         assert_eq!(exchanges.len(), 2);
     }
+
+    #[test]
+    fn chainlink_stream_uses_sorted_feed_map_subscriptions() {
+        let btc = format!("0x{:064x}", 1);
+        let twap = format!("0x{:064x}", 2);
+        let mut exchanges = vec![exchange(&format!(
+            "name = 'chainlink'\nsource = 'stream'\nsymbols = ['stale']\n\
+             feed_ids = {{ 'btc/usd/twap/30s' = '{twap}', 'btc/usd' = '{btc}', 'eth/usd' = '' }}"
+        ))];
+
+        normalize_chainlink_stream_subscriptions(RunMode::Live, &mut exchanges);
+
+        assert_eq!(
+            exchanges[0].symbols,
+            vec![format!("{btc}:btc/usd"), format!("{twap}:btc/usd/twap/30s")]
+        );
+    }
+
+    #[test]
+    fn chainlink_backtest_keeps_archive_labels() {
+        let btc = format!("0x{:064x}", 1);
+        let mut exchanges = vec![exchange(&format!(
+            "name = 'chainlink'\nsource = 'stream'\nsymbols = ['btc/usd/twap/30s']\n\
+             feed_ids = {{ 'btc/usd' = '{btc}' }}"
+        ))];
+
+        normalize_chainlink_stream_subscriptions(RunMode::Backtest, &mut exchanges);
+
+        assert_eq!(exchanges[0].symbols, vec!["btc/usd/twap/30s"]);
+    }
 }
 
 pub struct Engine {
@@ -448,6 +507,7 @@ impl Engine {
         // Each registered strategy injects its own required market-data symbols
         // (replaces the engine's old per-strategy-name inject_*_symbols).
         registry.inject_all_config(&mut config);
+        normalize_chainlink_stream_subscriptions(config.general.mode, &mut config.exchanges);
         coalesce_public_exchange_subscriptions(&mut config.exchanges);
         let feed_readiness = config
             .exchanges
@@ -8168,6 +8228,7 @@ mod market_router_tests {
         MarketEvent::Trade(TradeTick {
             exchange,
             symbol: symbol.into(),
+            exchange_trade_id: None,
             price: 0.5,
             quantity: 1.0,
             side: Side::Buy,

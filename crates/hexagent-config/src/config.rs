@@ -1054,10 +1054,13 @@ pub struct ExchangeConfig {
     /// Data source variant (e.g. chainlink: "rtds" or "stream"). Default: empty (auto).
     #[serde(default)]
     pub source: String,
-    /// Chainlink Data Streams feed IDs (hex) per spot symbol, for the REST
-    /// strike/close fetch. Keyed by the spot symbol label (e.g. "eth/usd").
-    /// The strategy looks up the slug-derived spot symbol here. TOML inline
-    /// table: `feed_ids = { "eth/usd" = "0x…", "btc/usd" = "0x…" }`.
+    /// Chainlink Data Streams feed IDs (hex) keyed by their event/archive
+    /// labels (for example `eth/usd` or `eth/usd/twap/30s`). For
+    /// `name = "chainlink", source = "stream"`, this is the canonical
+    /// subscription configuration; the engine projects valid entries to the
+    /// adapter's internal `feed_id:label` format. Strategies may also use the
+    /// same map for REST lookups. TOML inline table:
+    /// `feed_ids = { "eth/usd" = "0x…", "btc/usd" = "0x…" }`.
     #[serde(default)]
     pub feed_ids: HashMap<String, String>,
     /// Polymarket signature type: "eoa" (default fallback), "poly_proxy",
@@ -1190,6 +1193,33 @@ fn default_rate_limit() -> u32 {
 }
 fn default_account_allocation_weight() -> f64 {
     1.0
+}
+
+impl ExchangeConfig {
+    /// Build deterministic Chainlink Data Streams subscriptions from the
+    /// canonical `feed_ids` map. Invalid entries are returned separately so
+    /// callers can fail closed while reporting the affected labels.
+    pub fn chainlink_stream_subscriptions(&self) -> (Vec<String>, Vec<String>) {
+        let mut labels: Vec<&String> = self.feed_ids.keys().collect();
+        labels.sort_unstable_by(|left, right| {
+            left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+        });
+
+        let mut subscriptions = Vec::with_capacity(labels.len());
+        let mut invalid_labels = Vec::new();
+        for label in labels {
+            let feed_id = self.feed_ids[label].trim();
+            let valid = feed_id.len() == 66
+                && feed_id.starts_with("0x")
+                && feed_id[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+            if valid {
+                subscriptions.push(format!("{}:{}", feed_id, label));
+            } else {
+                invalid_labels.push(label.clone());
+            }
+        }
+        (subscriptions, invalid_labels)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
