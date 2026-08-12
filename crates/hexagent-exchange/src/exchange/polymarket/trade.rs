@@ -699,6 +699,16 @@ fn cancel_delete_response_outcome(
 }
 
 fn validated_cancel_all_counts(json: &serde_json::Value) -> Option<(usize, usize)> {
+    let object = json.as_object()?;
+    if object
+        .get("success")
+        .is_some_and(|value| value.as_bool() == Some(false))
+        || ["error", "errorMsg", "error_msg"]
+            .iter()
+            .any(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return None;
+    }
     let canceled_values = json.get("canceled")?.as_array()?;
     if canceled_values.iter().any(|value| {
         value.as_str().is_none_or(|order_id| order_id.trim().is_empty())
@@ -1482,19 +1492,23 @@ fn is_http_425_backoff_active(
     }
 }
 
-/// Remove every coid↔oid / coid↔token entry whose token is in `settling`,
-/// keeping all other events' entries. Returns the count reclaimed. Pure (maps
-/// passed in) so it's unit-testable without a live `SharedState`. Callers hold
-/// all three map locks for the duration.
+/// Remove every owned coid↔oid / coid↔token entry whose token is in
+/// `settling`, keeping sibling instances and all other events intact. Returns
+/// the count reclaimed. Pure (maps passed in) so it's unit-testable without a
+/// live `SharedState`. Callers hold all three map locks for the duration.
 fn reclaim_token_mappings(
     coid_to_oid: &mut HashMap<String, String>,
     oid_to_coid: &mut HashMap<String, String>,
     coid_to_token: &mut HashMap<String, String>,
     settling: &[String],
+    owned_coids: Option<&HashSet<String>>,
 ) -> usize {
     let settling: std::collections::HashSet<&str> = settling.iter().map(|s| s.as_str()).collect();
     let stale: Vec<String> = coid_to_token.iter()
-        .filter(|(_, tok)| settling.contains(tok.as_str()))
+        .filter(|(coid, tok)| {
+            settling.contains(tok.as_str())
+                && owned_coids.is_none_or(|owned| owned.contains(*coid))
+        })
         .map(|(coid, _)| coid.clone())
         .collect();
     for coid in &stale {
@@ -1508,10 +1522,9 @@ fn reclaim_token_mappings(
 
 impl SharedState {
     /// Register a bidirectional order ID mapping plus the order's outcome
-    /// token. The token lets `cancel_market_orders` purge this mapping at the
-    /// owning event's expiry sweep (the only place coid↔oid mappings are
-    /// reclaimed now that lifecycle rejects/cancels KEEP them — see
-    /// `coid_to_token` field doc).
+    /// token. The token lets settled-FIFO eviction retire the mapping after
+    /// the full late-revision window (the only place coid↔oid mappings are
+    /// reclaimed now that lifecycle rejects/cancels keep them).
     pub fn register_order_id(&self, client_order_id: &str, exchange_order_id: &str, token: &str) {
         // Make the durable ledger authoritative. If it detects an unknown
         // coid or an oid collision it enters risk-off; never install a runtime
@@ -3209,6 +3222,17 @@ impl PolymarketTrade {
         if retired_tokens.is_empty() {
             return;
         }
+        let owned_coids: HashSet<String> = self
+            .shared
+            .account_state
+            .orders()
+            .into_iter()
+            .filter(|order| {
+                order.instance_id == self.instance_id
+                    && retired_tokens.contains(&order.token_id)
+            })
+            .map(|order| order.client_order_id)
+            .collect();
         let reclaimed = {
             let mut coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
             let mut oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
@@ -3218,18 +3242,17 @@ impl PolymarketTrade {
                 &mut oid_to_coid,
                 &mut coid_to_token,
                 asset_ids,
+                Some(&owned_coids),
             )
         };
         let (ledger_orders, ledger_trades) = self
             .shared
             .account_state
-            .prune_terminal_history(&retired_tokens);
-        let live_trades = self
-            .shared
-            .live_position
-            .lock()
-            .unwrap()
-            .prune_terminal_history(&retired_tokens);
+            .prune_terminal_history_for_instance(&self.instance_id, &retired_tokens);
+        // LivePositionManager has no instance ownership column. Retaining its
+        // terminal dedupe rows is safer than allowing one shared-wallet
+        // instance to erase a sibling's replay protection.
+        let live_trades = 0;
         info!(
             "[PolymarketTrade] settled FIFO eviction retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) for {} token(s)",
             reclaimed,
@@ -6288,6 +6311,8 @@ mod tests {
             serde_json::json!({ "canceled": [null], "not_canceled": {} }),
             serde_json::json!({ "canceled": [""], "not_canceled": {} }),
             serde_json::json!({ "canceled": [], "not_canceled": { "oid": null } }),
+            serde_json::json!({ "success": false, "canceled": [], "not_canceled": {} }),
+            serde_json::json!({ "error": "unavailable", "canceled": [], "not_canceled": {} }),
         ] {
             assert_eq!(validated_cancel_all_counts(&json), None);
         }
@@ -6428,6 +6453,7 @@ mod tests {
         let n = reclaim_token_mappings(
             &mut coid_to_oid, &mut oid_to_coid, &mut coid_to_token,
             &["AUP".to_string(), "ADN".to_string()],
+            None,
         );
         assert_eq!(n, 2, "both event-A coids reclaimed");
         // Event A fully purged from all three maps.

@@ -3958,6 +3958,28 @@ impl SharedAccount {
     /// nonterminal trades are retained; only fully terminal rows for the
     /// retired token scope are removed.
     pub fn prune_terminal_history(&self, tokens: &HashSet<String>) -> (usize, usize) {
+        self.prune_terminal_history_scoped(None, tokens)
+    }
+
+    /// Instance-scoped settled-FIFO retirement. Multiple strategies may share
+    /// one physical wallet and even the same event tokens; one instance's FIFO
+    /// eviction must never erase a sibling's still-revisable ownership rows.
+    pub fn prune_terminal_history_for_instance(
+        &self,
+        instance_id: &str,
+        tokens: &HashSet<String>,
+    ) -> (usize, usize) {
+        if instance_id.is_empty() {
+            return (0, 0);
+        }
+        self.prune_terminal_history_scoped(Some(instance_id), tokens)
+    }
+
+    fn prune_terminal_history_scoped(
+        &self,
+        instance_id: Option<&str>,
+        tokens: &HashSet<String>,
+    ) -> (usize, usize) {
         if tokens.is_empty() {
             return (0, 0);
         }
@@ -3981,6 +4003,7 @@ impl SharedAccount {
             .iter()
             .filter(|(coid, order)| {
                 tokens.contains(&order.token_id)
+                    && instance_id.is_none_or(|expected| order.instance_id == expected)
                     && !protected_coids.contains(*coid)
                     && !state.recovery_pending_orders.contains(*coid)
                     && order.reserved_cash <= EPS
@@ -4002,6 +4025,9 @@ impl SharedAccount {
             .iter()
             .filter(|(trade_key, trade)| {
                 tokens.contains(&trade.ownership.token_id)
+                    && instance_id.is_none_or(|expected| {
+                        trade.ownership.instance_id == expected
+                    })
                     && !state.fee_attribution_pending.contains(*trade_key)
                     && (trade.failed || trade.ownership.status == "CONFIRMED")
             })
@@ -4027,11 +4053,19 @@ impl SharedAccount {
             })
             .map(|(_, trade)| trade.ownership.token_id.clone())
             .collect();
-        let pruned_fee_configs = tokens
-            .iter()
-            .filter(|token| !protected_fee_tokens.contains(*token))
-            .filter(|token| state.token_fee_configs.remove(*token).is_some())
-            .count();
+        // Fee curves are token-global within the shared wallet. An
+        // instance-scoped retirement cannot prove that no sibling retained
+        // event still needs the curve for a late revision, so only the legacy
+        // account-wide path may remove it.
+        let pruned_fee_configs = if instance_id.is_none() {
+            tokens
+                .iter()
+                .filter(|token| !protected_fee_tokens.contains(*token))
+                .filter(|token| state.token_fee_configs.remove(*token).is_some())
+                .count()
+        } else {
+            0
+        };
         let pruned_trades = stale_trades.len();
         if !stale_orders.is_empty() || pruned_trades > 0 || pruned_fee_configs > 0 {
             self.schedule_persist(&state);
@@ -6634,6 +6668,41 @@ mod tests {
             (1, 1),
         );
         assert!(account.order_owner_by_oid("oid-buy").is_none());
+    }
+
+    #[test]
+    fn instance_scoped_pruning_keeps_sibling_history_on_same_token() {
+        let account = seeded_account();
+        for (instance, coid, oid, trade_key) in [
+            ("a", "a-same", "oid-a-same", "trade-a-same"),
+            ("b", "b-same", "oid-b-same", "trade-b-same"),
+        ] {
+            account
+                .reserve_order(instance, coid, oid, "UP", Side::Buy, 2.0, 0.5, 0)
+                .unwrap();
+            assert!(account
+                .apply_trade_transition_with_context(
+                    trade_key, "CONFIRMED", coid, oid, "UP", Side::Buy, 2.0, 0.5,
+                    true, 0,
+                )
+                .ownership()
+                .is_some());
+            account.release_order(coid, OrderStatus::Filled);
+        }
+
+        assert_eq!(
+            account.prune_terminal_history_for_instance(
+                "a",
+                &HashSet::from(["UP".to_string()]),
+            ),
+            (1, 1),
+        );
+        assert!(account.order_owner_by_oid("oid-a-same").is_none());
+        assert_eq!(
+            account.order_owner_by_oid("oid-b-same").as_deref(),
+            Some("b"),
+        );
+        assert!(account.trades().iter().any(|trade| trade.trade_key == "trade-b-same"));
     }
 
     #[test]
