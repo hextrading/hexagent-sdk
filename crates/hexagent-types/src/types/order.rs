@@ -116,6 +116,24 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     pub price: Option<f64>,
     pub quantity: f64,
+    /// Exchange timestamp of the market-data event that triggered this quote.
+    /// Kept separate from `timestamp_ns`, which is the strategy's wall-clock
+    /// emission time and is used by executor staleness admission.
+    #[serde(default)]
+    pub quote_trigger_exchange_timestamp_ns: u64,
+    /// Local receive timestamp of the market-data event that triggered this
+    /// quote. This is the preferred origin for end-to-end latency because it
+    /// uses the same host clock as every downstream lifecycle stage.
+    #[serde(default)]
+    pub quote_trigger_local_timestamp_ns: u64,
+    /// Stable event/market identifier supplied by the strategy (for example a
+    /// Polymarket condition id). Logging-only; never used for order routing.
+    #[serde(default)]
+    pub quote_event_id: String,
+    /// Human-readable origin such as `orderbook:binance:BTCUSDT` or
+    /// `strategy_callback` for an immediate requote without a market event.
+    #[serde(default)]
+    pub quote_trigger_source: String,
     pub timestamp_ns: u64,
     /// Strategy instance ID for routing to the correct executor/wallet.
     #[serde(default)]
@@ -223,6 +241,10 @@ impl OrderRequest {
             order_type: OrderType::Limit,
             price: Some(price),
             quantity,
+            quote_trigger_exchange_timestamp_ns: 0,
+            quote_trigger_local_timestamp_ns: 0,
+            quote_event_id: String::new(),
+            quote_trigger_source: String::new(),
             timestamp_ns: crate::types::now_ns(),
             instance_id: String::new(),
             fee_rate_bps: 0,
@@ -246,6 +268,10 @@ impl OrderRequest {
             order_type: OrderType::Market,
             price: None,
             quantity,
+            quote_trigger_exchange_timestamp_ns: 0,
+            quote_trigger_local_timestamp_ns: 0,
+            quote_event_id: String::new(),
+            quote_trigger_source: String::new(),
             timestamp_ns: crate::types::now_ns(),
             instance_id: String::new(),
             fee_rate_bps: 0,
@@ -253,5 +279,33 @@ impl OrderRequest {
             reduce_only: false,
             outcome_label: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_origin_fields_are_backward_compatible() {
+        let request = OrderRequest::new_limit(
+            Exchange::Polymarket,
+            "token".to_string(),
+            Side::Buy,
+            0.5,
+            10.0,
+        );
+        let mut value = serde_json::to_value(request).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("quote_trigger_exchange_timestamp_ns");
+        object.remove("quote_trigger_local_timestamp_ns");
+        object.remove("quote_event_id");
+        object.remove("quote_trigger_source");
+
+        let restored: OrderRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.quote_trigger_exchange_timestamp_ns, 0);
+        assert_eq!(restored.quote_trigger_local_timestamp_ns, 0);
+        assert!(restored.quote_event_id.is_empty());
+        assert!(restored.quote_trigger_source.is_empty());
     }
 }

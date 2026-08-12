@@ -760,6 +760,27 @@ pub(crate) struct TrackedOrder {
     pub instance_id: String,
 }
 
+/// Logging-only correlation retained for the same lifetime as the settled
+/// event audit. Economic state remains authoritative in SharedAccount.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderLifecycleTrace {
+    pub instance_id: String,
+    pub event_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub trigger_source: String,
+    pub trigger_exchange_ns: u64,
+    pub trigger_local_ns: u64,
+    pub quote_emit_ns: u64,
+}
+
+fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
+    if origin_ns == 0 {
+        return -1.0;
+    }
+    (stage_ns as i128 - origin_ns as i128) as f64 / 1_000_000.0
+}
+
 fn instance_owned_open_coids(open: &HashMap<String, TrackedOrder>, instance_id: &str) -> Vec<String> {
     let mut coids: Vec<String> = open.iter()
         .filter(|(_, tracked)| tracked.instance_id == instance_id)
@@ -1244,6 +1265,10 @@ pub struct SharedState {
     /// only after the strategy's settled-event FIFO explicitly evicts the
     /// event, matching the full late-revision retention window.
     pub coid_to_token: Mutex<HashMap<String, String>>,
+    /// Quote-origin correlation used by parse-friendly lifecycle logs. Kept
+    /// beyond terminal order state so late private trades and settled-event
+    /// revisions still carry the original quote timestamps.
+    pub(crate) order_lifecycle_traces: Mutex<HashMap<String, OrderLifecycleTrace>>,
     /// Order IDs (== local EIP-712 order hashes) of the RTT probe's
     /// synthetic resting orders — ring of the most recent 64. The user
     /// feed consults this to identify probe placement / cancellation
@@ -1521,6 +1546,82 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    pub(crate) fn register_order_lifecycle(&self, order: &OrderRequest) {
+        self.order_lifecycle_traces.lock().unwrap().insert(
+            order.client_order_id.clone(),
+            OrderLifecycleTrace {
+                instance_id: order.instance_id.clone(),
+                event_id: order.quote_event_id.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side,
+                trigger_source: order.quote_trigger_source.clone(),
+                trigger_exchange_ns: order.quote_trigger_exchange_timestamp_ns,
+                trigger_local_ns: order.quote_trigger_local_timestamp_ns,
+                quote_emit_ns: order.timestamp_ns,
+            },
+        );
+    }
+
+    pub(crate) fn forget_order_lifecycle(&self, client_order_id: &str) {
+        self.order_lifecycle_traces.lock().unwrap().remove(client_order_id);
+    }
+
+    pub(crate) fn log_order_lifecycle(
+        &self,
+        client_order_id: &str,
+        stage: &str,
+        exchange_order_id: Option<&str>,
+        status: Option<OrderStatus>,
+        trade_id: Option<&str>,
+    ) {
+        let stage_ns = now_ns();
+        let trace = self.order_lifecycle_traces.lock().unwrap()
+            .get(client_order_id).cloned();
+        let (iid, event, symbol, side, source, trigger_exchange_ns, trigger_local_ns, quote_emit_ns) =
+            match trace {
+                Some(trace) => (
+                    trace.instance_id,
+                    trace.event_id,
+                    trace.symbol,
+                    trace.side.to_string(),
+                    trace.trigger_source,
+                    trace.trigger_exchange_ns,
+                    trace.trigger_local_ns,
+                    trace.quote_emit_ns,
+                ),
+                None => (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "recovered_or_untraced".to_string(),
+                    0,
+                    0,
+                    0,
+                ),
+            };
+        info!(
+            "[order_lifecycle] stage={} coid={} oid={} trade_id={} status={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+            stage,
+            client_order_id,
+            exchange_order_id.unwrap_or(""),
+            trade_id.unwrap_or(""),
+            status.map(|value| format!("{value:?}")).unwrap_or_default(),
+            iid,
+            event,
+            symbol,
+            side,
+            source,
+            trigger_exchange_ns,
+            trigger_local_ns,
+            quote_emit_ns,
+            stage_ns,
+            lifecycle_delta_ms(stage_ns, trigger_exchange_ns),
+            lifecycle_delta_ms(stage_ns, trigger_local_ns),
+            lifecycle_delta_ms(stage_ns, quote_emit_ns),
+        );
+    }
+
     /// Register a bidirectional order ID mapping plus the order's outcome
     /// token. The token lets settled-FIFO eviction retire the mapping after
     /// the full late-revision window (the only place coid↔oid mappings are
@@ -2398,6 +2499,7 @@ impl PolymarketTrade {
                 coid_to_oid: Mutex::new(recovered_coid_to_oid),
                 oid_to_coid: Mutex::new(recovered_oid_to_coid),
                 coid_to_token: Mutex::new(recovered_coid_to_token),
+                order_lifecycle_traces: Mutex::new(HashMap::new()),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
                 auth,
                 signer,
@@ -3281,6 +3383,12 @@ impl PolymarketTrade {
                 Some(&owned_coids),
             )
         };
+        {
+            let mut traces = self.shared.order_lifecycle_traces.lock().unwrap();
+            for coid in &owned_coids {
+                traces.remove(coid);
+            }
+        }
         let (ledger_orders, ledger_trades) = self
             .shared
             .account_state
@@ -4363,8 +4471,28 @@ impl PolymarketTrade {
         (String, crossbeam_channel::Receiver<HttpReply>),
         OrderUpdate,
     > {
-        let (local_oid, body_str) = self.submit_prep(order)?;
+        let (local_oid, body_str) = match self.submit_prep(order) {
+            Ok(prepared) => prepared,
+            Err(update) => {
+                self.shared.log_order_lifecycle(
+                    &order.client_order_id,
+                    "preflight_rejected",
+                    update.exchange_order_id.as_deref(),
+                    Some(update.status),
+                    None,
+                );
+                self.shared.forget_order_lifecycle(&order.client_order_id);
+                return Err(update);
+            }
+        };
         let rx = self.shared.http_call_async("POST", "/order", &body_str);
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "http_dispatched",
+            Some(&local_oid),
+            None,
+            None,
+        );
         Ok((local_oid, rx))
     }
 
@@ -4384,10 +4512,30 @@ impl PolymarketTrade {
         order: &OrderRequest,
         client: crate::http1_pool::PooledClient,
     ) -> std::result::Result<PendingSubmit, OrderUpdate> {
-        let (local_oid, body_str) = self.submit_prep(order)?;
+        let (local_oid, body_str) = match self.submit_prep(order) {
+            Ok(prepared) => prepared,
+            Err(update) => {
+                self.shared.log_order_lifecycle(
+                    &order.client_order_id,
+                    "preflight_rejected",
+                    update.exchange_order_id.as_deref(),
+                    Some(update.status),
+                    None,
+                );
+                self.shared.forget_order_lifecycle(&order.client_order_id);
+                return Err(update);
+            }
+        };
         let rx = self
             .shared
             .http_call_async_on(client, "POST", "/order", &body_str);
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "http_dispatched",
+            Some(&local_oid),
+            None,
+            None,
+        );
         Ok(PendingSubmit { local_oid, rx })
     }
 
@@ -4414,6 +4562,13 @@ impl PolymarketTrade {
             self.shared
                 .http_call_async_on(client, "DELETE", "/order", &body_str)
         });
+        self.shared.log_order_lifecycle(
+            client_order_id,
+            if rx.is_some() { "cancel_dispatched" } else { "cancel_not_dispatched" },
+            ctx.local_oid.as_deref(),
+            None,
+            None,
+        );
         PendingCancel { ctx, rx }
     }
 
@@ -4467,6 +4622,14 @@ impl PolymarketTrade {
         &mut self,
         order: &OrderRequest,
     ) -> std::result::Result<(String, String), OrderUpdate> {
+        self.shared.register_order_lifecycle(order);
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "submit_prep",
+            None,
+            Some(OrderStatus::Pending),
+            None,
+        );
         if !self.shared.check_rate_limit() {
             return Err(Self::make_rejected(order, "rate limited"));
         }
@@ -4481,11 +4644,25 @@ impl PolymarketTrade {
             Err(e) => return Err(Self::make_rejected(order, &e.to_string())),
         };
         let local_oid = order_hash;
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "signed",
+            Some(&local_oid),
+            None,
+            None,
+        );
         let body_json = match serde_json::to_string(&body) {
             Ok(body) => body,
             Err(e) => return Err(Self::make_rejected(order, &format!("body serialize: {}", e))),
         };
         self.reserve_account_order(order, &local_oid)?;
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "account_reserved",
+            Some(&local_oid),
+            Some(OrderStatus::Pending),
+            None,
+        );
         self.shared.register_order_id(&order.client_order_id, &local_oid, &order.symbol);
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
         // point on the order may already be live on the server (a
@@ -4529,6 +4706,7 @@ impl PolymarketTrade {
         local_oid: &str,
         reply: HttpReply,
     ) -> OrderUpdate {
+        let update = (|| {
         let resp = match reply {
             Ok(r) => r,
             Err(e) if e.is_submit_unknown_state() => {
@@ -4705,6 +4883,15 @@ impl PolymarketTrade {
             order_audit: None,
             error: None,
         }
+        })();
+        self.shared.log_order_lifecycle(
+            &order.client_order_id,
+            "http_response",
+            update.exchange_order_id.as_deref().or(Some(local_oid)),
+            Some(update.status),
+            None,
+        );
+        update
     }
 
     /// Look up local state for `coid`, dispatch a `DELETE /order` (or
@@ -4719,9 +4906,25 @@ impl PolymarketTrade {
         match body {
             Some(body_str) => {
                 let rx = self.shared.http_call_async("DELETE", "/order", &body_str);
+                self.shared.log_order_lifecycle(
+                    client_order_id,
+                    "cancel_dispatched",
+                    ctx.local_oid.as_deref(),
+                    None,
+                    None,
+                );
                 (ctx, Some(rx))
             }
-            None => (ctx, None),
+            None => {
+                self.shared.log_order_lifecycle(
+                    client_order_id,
+                    "cancel_not_dispatched",
+                    None,
+                    None,
+                    None,
+                );
+                (ctx, None)
+            }
         }
     }
 
@@ -4769,6 +4972,7 @@ impl PolymarketTrade {
         ctx: CancelCtx,
         reply: Option<HttpReply>,
     ) -> OrderUpdate {
+        let update = (|| {
         let CancelCtx { local_oid, symbol, side } = ctx;
         // Worst-case default: the order is still live. Only an explicit
         // terminal response below is allowed to remove tracking.
@@ -4894,6 +5098,15 @@ impl PolymarketTrade {
             order_audit: None,
             error: None,
         }
+        })();
+        self.shared.log_order_lifecycle(
+            client_order_id,
+            "cancel_response",
+            update.exchange_order_id.as_deref(),
+            Some(update.status),
+            None,
+        );
+        update
     }
 }
 
@@ -5076,13 +5289,43 @@ impl ExchangeTrade for PolymarketTrade {
             // this to `chunk[body_to_chunk[i]]`.
             let mut body_to_chunk: Vec<usize> = Vec::with_capacity(chunk.len());
             for (idx, o) in chunk.iter().enumerate() {
+                self.shared.register_order_lifecycle(o);
+                self.shared.log_order_lifecycle(
+                    &o.client_order_id,
+                    "submit_prep",
+                    None,
+                    Some(OrderStatus::Pending),
+                    None,
+                );
                 match self.sign_and_build_body(o) {
                     Ok((order_hash, b)) => {
+                        self.shared.log_order_lifecycle(
+                            &o.client_order_id,
+                            "signed",
+                            Some(&order_hash),
+                            None,
+                            None,
+                        );
                         let b = serde_json::to_value(&b).unwrap_or_default();
                         if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                            self.shared.log_order_lifecycle(
+                                &o.client_order_id,
+                                "preflight_rejected",
+                                Some(&order_hash),
+                                Some(rejected.status),
+                                None,
+                            );
+                            self.shared.forget_order_lifecycle(&o.client_order_id);
                             all_updates.push(rejected);
                             continue;
                         }
+                        self.shared.log_order_lifecycle(
+                            &o.client_order_id,
+                            "account_reserved",
+                            Some(&order_hash),
+                            Some(OrderStatus::Pending),
+                            None,
+                        );
                         // Pre-register BEFORE the HTTP call so the map
                         // survives a timeout / dropped ack. Same
                         // open_orders insert as `submit_kickoff` —
@@ -5106,7 +5349,16 @@ impl ExchangeTrade for PolymarketTrade {
                             "[PolymarketTrade] sign failed coid={}: {} — skipping",
                             o.client_order_id, e,
                         );
-                        all_updates.push(Self::make_rejected(o, &e.to_string()));
+                        let rejected = Self::make_rejected(o, &e.to_string());
+                        self.shared.log_order_lifecycle(
+                            &o.client_order_id,
+                            "preflight_rejected",
+                            None,
+                            Some(rejected.status),
+                            None,
+                        );
+                        self.shared.forget_order_lifecycle(&o.client_order_id);
+                        all_updates.push(rejected);
                     }
                 }
             }
@@ -5131,6 +5383,16 @@ impl ExchangeTrade for PolymarketTrade {
                 "[PolymarketTrade] Submit request: {} orders [{}]",
                 bodies.len(), details.join(", "),
             );
+            for (body_index, order_hash) in signed_hashes.iter().enumerate() {
+                let order = &chunk[body_to_chunk[body_index]];
+                self.shared.log_order_lifecycle(
+                    &order.client_order_id,
+                    "http_dispatched",
+                    Some(order_hash),
+                    None,
+                    None,
+                );
+            }
             match self.post_detailed(path, &body) {
                 Ok(resp) => {
                     let responses: Vec<serde_json::Value> = if resp.is_array() {
@@ -5339,6 +5601,15 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
             }
+        }
+        for update in all_updates.iter().filter(|update| update.exchange_order_id.is_some()) {
+            self.shared.log_order_lifecycle(
+                &update.client_order_id,
+                "http_response",
+                update.exchange_order_id.as_deref(),
+                Some(update.status),
+                None,
+            );
         }
         Ok(all_updates)
     }
@@ -5735,13 +6006,43 @@ impl ExchangeTrade for PolymarketTrade {
         // Track signing failures so we can emit Rejected for them below.
         let mut place_sign_failures: Vec<OrderUpdate> = Vec::new();
         for (idx, o) in place_chunk.iter().enumerate() {
+            self.shared.register_order_lifecycle(o);
+            self.shared.log_order_lifecycle(
+                &o.client_order_id,
+                "submit_prep",
+                None,
+                Some(OrderStatus::Pending),
+                None,
+            );
             match self.sign_and_build_body(o) {
                 Ok((order_hash, b)) => {
+                    self.shared.log_order_lifecycle(
+                        &o.client_order_id,
+                        "signed",
+                        Some(&order_hash),
+                        None,
+                        None,
+                    );
                     let b = serde_json::to_value(&b).unwrap_or_default();
                     if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                        self.shared.log_order_lifecycle(
+                            &o.client_order_id,
+                            "preflight_rejected",
+                            Some(&order_hash),
+                            Some(rejected.status),
+                            None,
+                        );
+                        self.shared.forget_order_lifecycle(&o.client_order_id);
                         place_sign_failures.push(rejected);
                         continue;
                     }
+                    self.shared.log_order_lifecycle(
+                        &o.client_order_id,
+                        "account_reserved",
+                        Some(&order_hash),
+                        Some(OrderStatus::Pending),
+                        None,
+                    );
                     self.shared.register_order_id(&o.client_order_id, &order_hash, &o.symbol);
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share
@@ -5763,7 +6064,16 @@ impl ExchangeTrade for PolymarketTrade {
                         "[PolymarketTrade] sign failed coid={}: {} — skipping",
                         o.client_order_id, e,
                     );
-                    place_sign_failures.push(Self::make_rejected(o, &e.to_string()));
+                    let rejected = Self::make_rejected(o, &e.to_string());
+                    self.shared.log_order_lifecycle(
+                        &o.client_order_id,
+                        "preflight_rejected",
+                        None,
+                        Some(rejected.status),
+                        None,
+                    );
+                    self.shared.forget_order_lifecycle(&o.client_order_id);
+                    place_sign_failures.push(rejected);
                 }
             }
         }
@@ -5807,6 +6117,16 @@ impl ExchangeTrade for PolymarketTrade {
                 "[PolymarketTrade] Submit request: {} orders [{}]",
                 place_chunk.len(), details.join(", "),
             );
+            for (body_index, order_hash) in place_signed.iter().enumerate() {
+                let order = &place_chunk[place_body_to_chunk[body_index]];
+                self.shared.log_order_lifecycle(
+                    &order.client_order_id,
+                    "http_dispatched",
+                    Some(order_hash),
+                    None,
+                    None,
+                );
+            }
             self.shared.http_call_async("POST", path, body)
         });
 
@@ -6219,6 +6539,19 @@ impl ExchangeTrade for PolymarketTrade {
             updates.extend(self.batch_submit_orders(_market_id, place_orders)?);
         }
 
+        for update in &updates {
+            if update.exchange_order_id.is_some()
+                && place_orders.iter().any(|order| order.client_order_id == update.client_order_id)
+            {
+                self.shared.log_order_lifecycle(
+                    &update.client_order_id,
+                    "http_response",
+                    update.exchange_order_id.as_deref(),
+                    Some(update.status),
+                    None,
+                );
+            }
+        }
         Ok(updates)
     }
 
