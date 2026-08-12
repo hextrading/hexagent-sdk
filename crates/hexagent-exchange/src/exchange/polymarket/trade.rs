@@ -67,6 +67,15 @@ struct RuntimeOrderAuditPass {
     errors: Vec<String>,
 }
 
+/// One bounded market-expiry cancel attempt. `confirmed` is true only after
+/// every DELETE response has the authoritative schema and the token-scoped
+/// order/trade audit has no remaining live or recovery-pending rows.
+pub struct MarketCancelFinality {
+    pub confirmed: bool,
+    pub updates: Vec<OrderUpdate>,
+    pub detail: String,
+}
+
 /// Result of an orphan order lookup. Keep an explicit server not-found result
 /// separate from transport/service/parse failures: only the former is
 /// authoritative enough to advance the universal four-result placement
@@ -690,8 +699,21 @@ fn cancel_delete_response_outcome(
 }
 
 fn validated_cancel_all_counts(json: &serde_json::Value) -> Option<(usize, usize)> {
-    let canceled = json.get("canceled")?.as_array()?.len();
-    let not_canceled = json.get("not_canceled")?.as_object()?.len();
+    let canceled_values = json.get("canceled")?.as_array()?;
+    if canceled_values.iter().any(|value| {
+        value.as_str().is_none_or(|order_id| order_id.trim().is_empty())
+    }) {
+        return None;
+    }
+    let not_canceled_values = json.get("not_canceled")?.as_object()?;
+    if not_canceled_values.iter().any(|(order_id, reason)| {
+        order_id.trim().is_empty()
+            || reason.as_str().is_none_or(|reason| reason.trim().is_empty())
+    }) {
+        return None;
+    }
+    let canceled = canceled_values.len();
+    let not_canceled = not_canceled_values.len();
     Some((canceled, not_canceled))
 }
 
@@ -1208,8 +1230,9 @@ pub struct SharedState {
     /// rejects/cancels (a "post-only crosses book" 400 or a cancel can still
     /// be followed by a real fill — the racy reject/cancel-then-fill case)
     /// so a late fill push still resolves its coid instead of arriving
-    /// `<unmapped>` and broadcasting to every instance. This map lets us
-    /// reclaim that memory per-event at settlement rather than never.
+    /// `<unmapped>` and broadcasting to every instance. This map is reclaimed
+    /// only after the strategy's settled-event FIFO explicitly evicts the
+    /// event, matching the full late-revision retention window.
     pub coid_to_token: Mutex<HashMap<String, String>>,
     /// Order IDs (== local EIP-712 order hashes) of the RTT probe's
     /// synthetic resting orders — ring of the most recent 64. The user
@@ -1219,15 +1242,6 @@ pub struct SharedState {
     /// at zero) and broadcast to every instance. Identified probe
     /// events are logged at DEBUG and NOT forwarded.
     pub probe_order_ids: Mutex<std::collections::VecDeque<String>>,
-    /// Deferred map-reclaim queue: `(sweep_ns, tokens)` batches recorded at
-    /// each event-expiry sweep. The settling event's FINAL matching fills land
-    /// ~1-2 s AFTER the sweep cancel (observed: sweep 20:05:00.127, settlement
-    /// fills 20:05:01.5), so reclaiming a token's coid↔oid mapping right at the
-    /// sweep loses those fills to `<unmapped>`. Instead each batch waits out
-    /// `RECLAIM_GRACE_NS` before its mappings are dropped (drained on a later
-    /// sweep). Timestamped per-batch so concurrent / back-to-back sweeps of
-    /// different markets never reclaim each other's just-settled tokens early.
-    pub pending_reclaim: Mutex<Vec<(u64, Vec<String>)>>,
     /// Authentication for REST requests
     pub auth: PolyAuth,
     /// EIP-712 order signer (v1 — pre-2026-04-28-cutover).
@@ -1468,35 +1482,6 @@ fn is_http_425_backoff_active(
     }
 }
 
-/// Grace period a settling event's coid↔oid mappings are kept AFTER its
-/// expiry sweep before being reclaimed. The event's final matching fills land
-/// ~1-2 s after the sweep cancel; 60 s is a generous margin while still
-/// reclaiming within the same event cadence (next same-market sweep is minutes
-/// away). See `pending_reclaim` field doc.
-pub(crate) const RECLAIM_GRACE_NS: u64 = 60_000_000_000;
-
-/// Record this sweep's `tokens` (stamped `now_ns`) and return the token sets of
-/// all batches that have aged past `RECLAIM_GRACE_NS` (removed from `queue`).
-/// Pure so it's unit-testable. The returned batches' mappings are then dropped
-/// via `reclaim_token_mappings`.
-fn drain_matured_reclaims(
-    queue: &mut Vec<(u64, Vec<String>)>,
-    tokens: &[String],
-    now_ns: u64,
-) -> Vec<Vec<String>> {
-    queue.push((now_ns, tokens.to_vec()));
-    let mut due = Vec::new();
-    queue.retain(|(ts, toks)| {
-        if now_ns.saturating_sub(*ts) >= RECLAIM_GRACE_NS {
-            due.push(toks.clone());
-            false
-        } else {
-            true
-        }
-    });
-    due
-}
-
 /// Remove every coid↔oid / coid↔token entry whose token is in `settling`,
 /// keeping all other events' entries. Returns the count reclaimed. Pure (maps
 /// passed in) so it's unit-testable without a live `SharedState`. Callers hold
@@ -1607,7 +1592,7 @@ impl SharedState {
     /// can still resolve its coid via `oid_to_coid`, so the fill is attributed
     /// to the placing instance instead of arriving `<unmapped>` (empty coid)
     /// and broadcasting to every instance's PositionManager. The maps are
-    /// reclaimed per-event by `cancel_market_orders` at the event-expiry sweep
+    /// reclaimed per-event by `retire_event_audit` after settled-FIFO eviction
     /// (keyed by `coid_to_token`), and fully wiped by `cancel_all_orders` at
     /// shutdown / account-wide cancel.
     ///
@@ -2380,7 +2365,6 @@ impl PolymarketTrade {
                 oid_to_coid: Mutex::new(recovered_oid_to_coid),
                 coid_to_token: Mutex::new(recovered_coid_to_token),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
-                pending_reclaim: Mutex::new(Vec::new()),
                 auth,
                 signer,
                 signer_v2,
@@ -2744,16 +2728,39 @@ impl PolymarketTrade {
     /// when one sibling order is temporarily unavailable. Shutdown uses the
     /// partial updates to converge accounting on every retry.
     fn reconcile_runtime_open_orders_pass(&self) -> RuntimeOrderAuditPass {
+        self.reconcile_runtime_orders_pass(None)
+    }
+
+    /// Event-expiry counterpart of the account-wide audit. Only orders whose
+    /// durable token belongs to `tokens` participate, so a next event trading
+    /// concurrently on the same wallet cannot keep the previous event's
+    /// settlement barrier open.
+    fn reconcile_runtime_orders_for_tokens_pass(
+        &self,
+        tokens: &HashSet<String>,
+    ) -> RuntimeOrderAuditPass {
+        self.reconcile_runtime_orders_pass(Some(tokens))
+    }
+
+    fn reconcile_runtime_orders_pass(
+        &self,
+        token_filter: Option<&HashSet<String>>,
+    ) -> RuntimeOrderAuditPass {
         let tracked: Vec<(String, TrackedOrder, String)> = {
             let open = self.shared.open_orders.lock().unwrap();
             let ids = self.shared.coid_to_oid.lock().unwrap();
             let mut rows: HashMap<String, (TrackedOrder, String)> = open.iter()
+                .filter(|(_, tracked)| token_filter
+                    .is_none_or(|tokens| tokens.contains(&tracked.symbol)))
                 .filter_map(|(coid, tracked)| ids.get(coid)
                     .map(|oid| (coid.clone(), (tracked.clone(), oid.clone()))))
                 .collect();
             for coid in self.shared.account_state.recovery_pending_order_ids() {
                 if rows.contains_key(&coid) { continue; }
                 let Some(order) = self.shared.account_state.order(&coid) else { continue; };
+                if token_filter.is_some_and(|tokens| !tokens.contains(&order.token_id)) {
+                    continue;
+                }
                 let Some(order_id) = ids.get(&coid) else { continue; };
                 rows.insert(coid, (TrackedOrder {
                     symbol: order.token_id,
@@ -3055,80 +3062,182 @@ impl PolymarketTrade {
     /// would otherwise rest unmanaged to settlement. Scoped to a single
     /// `condition_id` so an account trading several markets concurrently
     /// keeps the others' orders intact — used as the event-expiry backstop.
-    pub fn cancel_market_orders(&self, market_condition_id: &str, asset_ids: &[String]) {
-        for asset_id in asset_ids {
-            if asset_id.is_empty() { continue; }
-            let body = serde_json::json!({
-                "market": market_condition_id,
-                "asset_id": asset_id,
-            }).to_string();
-            match self.shared.http_call_sync("DELETE", "/cancel-market-orders", &body) {
-                Ok(json) => {
-                    let canceled = json.get("canceled").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                    let not_canceled = json.get("not_canceled").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
-                    info!("[PolymarketTrade] Cancel-market market={} asset={}: {} canceled, {} failed",
-                        market_condition_id, asset_id, canceled.len(), not_canceled);
-                    // Drop local tracking for any canceled order we still
-                    // tracked (forgotten orders have no local entry → no-op).
-                    if !canceled.is_empty() {
-                        let coids: Vec<String> = {
-                            let oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
-                            canceled.iter()
-                                .filter_map(|v| v.as_str())
-                                .filter_map(|oid| {
-                                    oid_to_coid.get(&normalize_order_id(oid)).cloned()
-                                })
-                                .collect()
-                        };
-                        for coid in coids {
-                            self.shared.remove_order(&coid);
-                        }
-                    }
-                }
-                Err(e) => warn!("[PolymarketTrade] Cancel-market market={} asset={} failed: {}",
-                    market_condition_id, asset_id, e),
-            }
+    pub fn cancel_market_orders_until_final(
+        &self,
+        market_condition_id: &str,
+        asset_ids: &[String],
+    ) -> MarketCancelFinality {
+        let tokens: HashSet<String> = asset_ids
+            .iter()
+            .map(|token| token.trim())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect();
+        if market_condition_id.trim().is_empty() || tokens.len() != asset_ids.len() {
+            return MarketCancelFinality {
+                confirmed: false,
+                updates: Vec::new(),
+                detail: "market cancel requires a non-empty condition id and distinct non-empty tokens"
+                    .to_string(),
+            };
         }
 
-        // Event-expiry reclaim, DEFERRED: enqueue this sweep's settling tokens
-        // and reclaim only batches that have aged past `RECLAIM_GRACE_NS`. The
-        // settling event's final matching fills land ~1-2 s after this sweep
-        // cancel — reclaiming its coid↔oid mappings now would lose them to
-        // `<unmapped>`. We KEEP mappings across rejects/cancels (racy
-        // crosses-book-reject / cancel-then-fill — see `coid_to_token` field
-        // doc); the grace window is the safe point to free the per-event memory.
-        let due = {
-            let mut q = self.shared.pending_reclaim.lock().unwrap();
-            drain_matured_reclaims(&mut q, asset_ids, crate::types::now_ns())
-        };
-        if !due.is_empty() {
-            let retired_tokens: HashSet<String> = due.iter()
-                .flat_map(|tokens| tokens.iter().cloned())
-                .collect();
-            // Holding all three map locks at once is deadlock-free: no other
-            // path in this module ever holds more than one simultaneously.
-            let reclaimed = {
-                let mut coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
-                let mut oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
-                let mut coid_to_token = self.shared.coid_to_token.lock().unwrap();
-                due.iter()
-                    .map(|toks| reclaim_token_mappings(
-                        &mut coid_to_oid,
-                        &mut oid_to_coid,
-                        &mut coid_to_token,
-                        toks,
-                    ))
-                    .sum::<usize>()
-            };
-            let (ledger_orders, ledger_trades) = self.shared.account_state
-                .prune_terminal_history(&retired_tokens);
-            let live_trades = self.shared.live_position.lock().unwrap()
-                .prune_terminal_history(&retired_tokens);
-            if reclaimed > 0 || ledger_orders > 0 || ledger_trades > 0 || live_trades > 0 {
-                info!("[PolymarketTrade] Cancel-market market={}: reclaimed {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) from {} matured batch(es)",
-                    market_condition_id, reclaimed, ledger_orders, ledger_trades, live_trades, due.len());
+        // Keep one executor dispatch bounded; the strategy remains unsettled
+        // and re-emits after a pending acknowledgement. This avoids monopolising
+        // the shared execution worker during a venue outage while still making
+        // settlement strictly dependent on an authoritative success.
+        let retry_delays_ms = [0_u64, 100, 250];
+        let mut all_updates = Vec::new();
+        let mut last_detail = String::new();
+        for (attempt_idx, delay_ms) in retry_delays_ms.into_iter().enumerate() {
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
             }
+            let mut remote_clean = true;
+            let mut remote_details = Vec::new();
+            for asset_id in &tokens {
+                let body = serde_json::json!({
+                    "market": market_condition_id,
+                    "asset_id": asset_id,
+                })
+                .to_string();
+                match self
+                    .shared
+                    .http_call_sync("DELETE", "/cancel-market-orders", &body)
+                {
+                    Ok(json) => match validated_cancel_all_counts(&json) {
+                        Some((canceled, not_canceled)) => {
+                            remote_clean &= not_canceled == 0;
+                            remote_details.push(format!(
+                                "asset={asset_id} canceled={canceled} not_canceled={not_canceled}"
+                            ));
+                            if let Some(canceled_ids) = json.get("canceled").and_then(|v| v.as_array()) {
+                                let coids: Vec<String> = {
+                                    let oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
+                                    canceled_ids
+                                        .iter()
+                                        .filter_map(|value| value.as_str())
+                                        .filter_map(|oid| {
+                                            oid_to_coid.get(&normalize_order_id(oid)).cloned()
+                                        })
+                                        .collect()
+                                };
+                                for coid in coids {
+                                    self.shared.remove_order(&coid);
+                                }
+                            }
+                        }
+                        None => {
+                            remote_clean = false;
+                            remote_details.push(format!(
+                                "asset={asset_id} invalid response schema"
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        remote_clean = false;
+                        remote_details.push(format!("asset={asset_id} request failed: {error}"));
+                    }
+                }
+            }
+
+            let audit = self.reconcile_runtime_orders_for_tokens_pass(&tokens);
+            all_updates.extend(audit.updates);
+            let open_orders = self
+                .shared
+                .open_orders
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|tracked| tokens.contains(&tracked.symbol))
+                .count();
+            let recovery_pending = self
+                .shared
+                .account_state
+                .recovery_pending_order_ids()
+                .into_iter()
+                .filter(|coid| {
+                    self.shared
+                        .account_state
+                        .order(coid)
+                        .is_some_and(|order| tokens.contains(&order.token_id))
+                })
+                .count();
+            let local_clean = audit.errors.is_empty()
+                && open_orders == 0
+                && recovery_pending == 0;
+            last_detail = format!(
+                "attempt={} remote=[{}] open_orders={} recovery_pending={} audit_errors={:?}",
+                attempt_idx + 1,
+                remote_details.join(", "),
+                open_orders,
+                recovery_pending,
+                audit.errors,
+            );
+            if remote_clean && local_clean {
+                info!(
+                    "[PolymarketTrade] market cancel finality confirmed market={}: {}",
+                    market_condition_id, last_detail,
+                );
+                return MarketCancelFinality {
+                    confirmed: true,
+                    updates: all_updates,
+                    detail: last_detail,
+                };
+            }
+            warn!(
+                "[PolymarketTrade] market cancel finality pending market={}: {}",
+                market_condition_id, last_detail,
+            );
         }
+
+        MarketCancelFinality {
+            confirmed: false,
+            updates: all_updates,
+            detail: last_detail,
+        }
+    }
+
+    /// Destroy event-scoped mappings and durable audit rows only when the
+    /// strategy confirms its settled-event FIFO has evicted that event.
+    pub fn retire_event_audit(&self, asset_ids: &[String]) {
+        let retired_tokens: HashSet<String> = asset_ids
+            .iter()
+            .filter(|token| !token.is_empty())
+            .cloned()
+            .collect();
+        if retired_tokens.is_empty() {
+            return;
+        }
+        let reclaimed = {
+            let mut coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
+            let mut oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
+            let mut coid_to_token = self.shared.coid_to_token.lock().unwrap();
+            reclaim_token_mappings(
+                &mut coid_to_oid,
+                &mut oid_to_coid,
+                &mut coid_to_token,
+                asset_ids,
+            )
+        };
+        let (ledger_orders, ledger_trades) = self
+            .shared
+            .account_state
+            .prune_terminal_history(&retired_tokens);
+        let live_trades = self
+            .shared
+            .live_position
+            .lock()
+            .unwrap()
+            .prune_terminal_history(&retired_tokens);
+        info!(
+            "[PolymarketTrade] settled FIFO eviction retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) for {} token(s)",
+            reclaimed,
+            ledger_orders,
+            ledger_trades,
+            live_trades,
+            retired_tokens.len(),
+        );
     }
 
     /// React to a `not enough balance / allowance` rejection.
@@ -6176,6 +6285,9 @@ mod tests {
             serde_json::json!({ "canceled": [] }),
             serde_json::json!({ "canceled": null, "not_canceled": {} }),
             serde_json::json!({ "canceled": [], "not_canceled": [] }),
+            serde_json::json!({ "canceled": [null], "not_canceled": {} }),
+            serde_json::json!({ "canceled": [""], "not_canceled": {} }),
+            serde_json::json!({ "canceled": [], "not_canceled": { "oid": null } }),
         ] {
             assert_eq!(validated_cancel_all_counts(&json), None);
         }
@@ -6326,31 +6438,6 @@ mod tests {
         assert_eq!(coid_to_oid.get("c3").map(String::as_str), Some("0xb1"));
         assert_eq!(oid_to_coid.get("b1").map(String::as_str), Some("c3"));
         assert_eq!(coid_to_token.get("c3").map(String::as_str), Some("BUP"));
-    }
-
-    // Deferral: a token swept now is NOT reclaimed immediately (its settlement
-    // fills are still in flight); it matures only after RECLAIM_GRACE_NS. A
-    // back-to-back sweep of a different market must not reclaim the first
-    // market's just-settled tokens early.
-    #[test]
-    fn drain_matured_reclaims_defers_until_grace() {
-        let mut q: Vec<(u64, Vec<String>)> = Vec::new();
-        let t0 = 1_000_000_000_000u64;
-
-        // Sweep A at t0 → nothing matured yet (A's fills still landing).
-        let due = drain_matured_reclaims(&mut q, &["AUP".into(), "ADN".into()], t0);
-        assert!(due.is_empty(), "A not reclaimed at its own sweep");
-
-        // Sweep B 1s later (concurrent market) → still nothing matured;
-        // A must NOT be reclaimed this soon.
-        let due = drain_matured_reclaims(&mut q, &["BUP".into()], t0 + 1_000_000_000);
-        assert!(due.is_empty(), "A not reclaimed 1s later");
-        assert_eq!(q.len(), 2);
-
-        // Sweep C past A's grace → A matures and drains; B/C still held.
-        let due = drain_matured_reclaims(&mut q, &["CUP".into()], t0 + RECLAIM_GRACE_NS + 1);
-        assert_eq!(due, vec![vec!["AUP".to_string(), "ADN".to_string()]]);
-        assert_eq!(q.len(), 2, "B and C remain pending");
     }
 
     /// Locks the 3-way reason → outcome mapping against the live-observed

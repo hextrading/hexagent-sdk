@@ -15,6 +15,20 @@ pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str =
 /// lifecycle as if a placement or cancel signal had been rejected.
 pub const ORPHAN_RECONCILE_DEFERRED: &str = "orphan_reconcile_deferred";
 
+/// Prefix attached to the synthetic executor update that proves a
+/// market-scoped Polymarket expiry cancel reached order/trade finality.
+/// `client_order_id` carries the owning strategy instance and `symbol` carries
+/// the condition id; this update is control-plane feedback, not an order
+/// lifecycle transition.
+pub const POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED: &str =
+    "polymarket_market_cancel_finality_confirmed";
+
+/// Prefix attached when the market-scoped expiry cancel or its follow-up
+/// order/trade audit is still unavailable. The strategy must remain
+/// unsettled and retry; details may follow this prefix after `: `.
+pub const POLYMARKET_MARKET_CANCEL_FINALITY_PENDING: &str =
+    "polymarket_market_cancel_finality_pending";
+
 fn default_true_fn() -> bool { true }
 
 /// Order type
