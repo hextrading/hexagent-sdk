@@ -8,9 +8,15 @@ use crate::types::{Exchange, OrderBookSnapshot, QuoteTick};
 const MAX_EXCHANGE_FUTURE_SKEW_NS: u64 = 2_000_000_000;
 
 fn timestamp_too_far_in_future(exchange_timestamp_ns: u64, local_timestamp_ns: u64) -> bool {
-    local_timestamp_ns > 0
-        && exchange_timestamp_ns
-            > local_timestamp_ns.saturating_add(MAX_EXCHANGE_FUTURE_SKEW_NS)
+    // A non-zero exchange timestamp without its receive-time anchor cannot be
+    // checked for future skew.  Treat that shape as untrusted instead of
+    // letting SDK/replay callers disable the guard with `local_timestamp_ns=0`.
+    // Keep the all-zero pair for timeless simulation fixtures; it cannot pin a
+    // monotonic cache or clear a timestamp-anchored nudge.
+    (exchange_timestamp_ns > 0 && local_timestamp_ns == 0)
+        || (local_timestamp_ns > 0
+            && exchange_timestamp_ns
+                > local_timestamp_ns.saturating_add(MAX_EXCHANGE_FUTURE_SKEW_NS))
 }
 
 fn valid_price(exchange: Exchange, price: f64) -> bool {
@@ -387,7 +393,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             exchange_timestamp_ns: 0,
-            local_timestamp_ns: 0,
+            local_timestamp_ns: crate::types::now_ns(),
         }
     }
 
@@ -403,7 +409,7 @@ mod tests {
             ask_price: ask,
             ask_qty: 0.0,
             exchange_timestamp_ns: ts_ns,
-            local_timestamp_ns: ts_ns + 1,
+            local_timestamp_ns: ts_ns.saturating_add(1),
         }
     }
 
@@ -736,6 +742,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_local_timestamp_cannot_bypass_orderbook_future_guard() {
+        let mut om = OrderbookManager::new();
+        let mut invalid = empty_book("tok");
+        invalid.bids = vec![PriceLevel { price: 0.40, quantity: 10.0 }];
+        invalid.asks = vec![PriceLevel { price: 0.60, quantity: 10.0 }];
+        invalid.exchange_timestamp_ns = u64::MAX;
+        invalid.local_timestamp_ns = 0;
+        assert!(!om.update(&invalid));
+        assert!(om.get("tok").is_none());
+
+        let mut timeless = empty_book("sim");
+        timeless.local_timestamp_ns = 0;
+        assert!(om.update(&timeless));
+    }
+
+    #[test]
     fn non_finite_orderbook_and_quote_are_rejected_without_mutating_cache() {
         let mut om = OrderbookManager::new();
         let mut initial = empty_book("tok");
@@ -809,5 +831,15 @@ mod tests {
         om.update_quote(&quote("tok", 0.45, 0.55, 300));
         assert_eq!(om.best_bid_price("tok"), Some(0.45));
         assert_eq!(om.l1_timestamp_ns("tok"), Some(300));
+    }
+
+    #[test]
+    fn missing_local_timestamp_cannot_bypass_quote_future_guard() {
+        let mut om = OrderbookManager::new();
+        let mut invalid = quote("tok", 0.40, 0.60, u64::MAX);
+        invalid.local_timestamp_ns = 0;
+        assert!(!om.update_quote(&invalid));
+        assert_eq!(om.best_bid_price("tok"), None);
+        assert_eq!(om.best_ask_price("tok"), None);
     }
 }

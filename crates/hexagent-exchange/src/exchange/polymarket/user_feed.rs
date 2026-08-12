@@ -615,13 +615,37 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
         );
         return Ok(Vec::new());
     }
-    let associate_trades = data.get("associate_trades")
-        .and_then(serde_json::Value::as_array)
-        .map(|values| values.iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim).filter(|value| !value.is_empty())
-            .map(str::to_string).collect())
-        .unwrap_or_default();
+    let associate_trades = match data.get("associate_trades") {
+        None => Vec::new(),
+        Some(value) => {
+            let values = value.as_array().ok_or_else(|| {
+                format!("order lifecycle associate_trades is not an array order_id={order_id}")
+            })?;
+            let mut seen = std::collections::HashSet::with_capacity(values.len());
+            let mut trades = Vec::with_capacity(values.len());
+            for value in values {
+                let trade_id = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| format!(
+                        "order lifecycle associate_trades contains a non-string/empty id order_id={order_id}"
+                    ))?;
+                if !seen.insert(trade_id.to_string()) {
+                    return Err(format!(
+                        "order lifecycle associate_trades contains duplicate id `{trade_id}` order_id={order_id}"
+                    ));
+                }
+                trades.push(trade_id.to_string());
+            }
+            trades
+        }
+    };
+    if size_matched > tolerance && associate_trades.is_empty() {
+        return Err(format!(
+            "matched order lifecycle is missing associate_trades order_id={order_id} size_matched={size_matched}"
+        ));
+    }
     let order_audit = AuthoritativeOrderAudit {
         original_size: Some(original_size.to_string()),
         size_matched: Some(size_matched.to_string()),
@@ -2635,6 +2659,7 @@ mod tests {
             "event_type": "order", "type": "UPDATE", "id": "oid-1",
             "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
             "original_size": "10", "size_matched": "4",
+            "associate_trades": ["trade-partial"],
         });
         assert_eq!(parse_user_event(&update, &shared)[0].status, OrderStatus::PartiallyFilled);
         assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
@@ -2653,6 +2678,7 @@ mod tests {
             "event_type": "order", "type": "UPDATE", "id": "oid-1",
             "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
             "original_size": "10", "size_matched": "4",
+            "associate_trades": ["trade-partial"],
         });
         assert_eq!(parse_user_event(&partial, &shared)[0].status, OrderStatus::PartiallyFilled);
 
@@ -2687,6 +2713,38 @@ mod tests {
         assert_eq!(parse_user_event(&trade, &shared).len(), 1);
         assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+    }
+
+    #[test]
+    fn matched_order_lifecycle_requires_strict_associate_trade_ids() {
+        for associate_trades in [
+            serde_json::json!(null),
+            serde_json::json!("trade-1"),
+            serde_json::json!([]),
+            serde_json::json!(["trade-1", 2]),
+            serde_json::json!(["trade-1", "trade-1"]),
+        ] {
+            let shared = owned_taker_shared(0.5);
+            let mut update = serde_json::json!({
+                "event_type": "order", "type": "UPDATE", "id": "oid-1",
+                "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+                "original_size": "10", "size_matched": "4",
+            });
+            update["associate_trades"] = associate_trades;
+            assert!(parse_user_event(&update, &shared).is_empty());
+            assert_eq!(shared.account_state.order("owner-1").unwrap().filled_quantity, 0.0);
+            assert!(shared.account_state.is_uncertain());
+        }
+
+        let shared = owned_taker_shared(0.5);
+        let unmatched = serde_json::json!({
+            "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
+            "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
+            "original_size": "10", "size_matched": "0",
+            "associate_trades": [],
+        });
+        assert_eq!(parse_user_event(&unmatched, &shared).len(), 1);
+        assert!(!shared.account_state.is_uncertain());
     }
 
     #[test]

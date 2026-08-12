@@ -1028,6 +1028,42 @@ impl SharedAccount {
         Ok(true)
     }
 
+    /// Replace a checkpoint whose opaque payload the owning subsystem has
+    /// independently proved invalid.  This compare-and-swap escape hatch is
+    /// deliberately separate from the monotonic fast path above: a corrupt
+    /// marker may advertise `u64::MAX`, so generation ordering alone can never
+    /// repair it with a valid lower-generation recovery payload.
+    pub fn repair_sidecar_checkpoint(
+        &self,
+        sidecar_id: &str,
+        invalid_generation: u64,
+        replacement: DurableSidecarCheckpoint,
+    ) -> Result<bool, String> {
+        if sidecar_id.trim().is_empty()
+            || invalid_generation == 0
+            || replacement.generation == 0
+            || replacement.expected_entries == 0
+            || replacement.recovery_payload.trim().is_empty()
+        {
+            return Err(
+                "sidecar checkpoint repair requires id, observed generation, entries and recovery payload"
+                    .to_string(),
+            );
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.sidecar_checkpoints.get(sidecar_id) else {
+            return Ok(false);
+        };
+        if existing.generation != invalid_generation {
+            return Ok(false);
+        }
+        state
+            .sidecar_checkpoints
+            .insert(sidecar_id.to_string(), replacement);
+        self.schedule_persist(&state);
+        Ok(true)
+    }
+
     /// Register an instance before the first physical snapshot. Non-positive
     /// and non-finite weights are normalized to the default equal weight 1.0.
     /// Once an account has been seeded, a new member or changed weight never
@@ -7380,6 +7416,46 @@ mod tests {
         lock_path.push(".lock");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn invalid_max_generation_sidecar_checkpoint_can_be_repaired() {
+        let account = SharedAccount::new("sidecar-repair");
+        account
+            .record_sidecar_checkpoint(
+                "maker-a",
+                DurableSidecarCheckpoint {
+                    generation: u64::MAX,
+                    expected_entries: 9,
+                    recovery_payload: "{\"invalid\":true}".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(account
+            .repair_sidecar_checkpoint(
+                "maker-a",
+                u64::MAX,
+                DurableSidecarCheckpoint {
+                    generation: 7,
+                    expected_entries: 2,
+                    recovery_payload: "{\"generation\":7}".to_string(),
+                },
+            )
+            .unwrap());
+        let repaired = account.sidecar_checkpoint("maker-a").unwrap();
+        assert_eq!(repaired.generation, 7);
+        assert_eq!(repaired.expected_entries, 2);
+        assert!(!account
+            .repair_sidecar_checkpoint(
+                "maker-a",
+                u64::MAX,
+                DurableSidecarCheckpoint {
+                    generation: 8,
+                    expected_entries: 2,
+                    recovery_payload: "{\"generation\":8}".to_string(),
+                },
+            )
+            .unwrap());
     }
 
     #[test]
