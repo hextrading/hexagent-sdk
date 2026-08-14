@@ -4870,7 +4870,9 @@ impl Engine {
             Signals::new(&[SIGINT, SIGTERM]).expect("Failed to register signal handlers");
         info!("Press Ctrl-C to stop...");
 
-        // Block until a signal arrives
+        // The first signal starts the coordinated shutdown. Keep the same
+        // signal iterator alive afterwards so a second operator request can
+        // escape any blocked network/join path immediately.
         if let Some(sig) = signals.forever().next() {
             let sig_name = match sig {
                 SIGINT => "SIGINT (Ctrl-C)",
@@ -4898,6 +4900,25 @@ impl Engine {
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = shutdown_tx.send(MarketEvent::Exit);
+
+        if let Err(error) = thread::Builder::new()
+            .name("forced-shutdown-signal".to_string())
+            .spawn(move || {
+                if let Some(sig) = signals.forever().next() {
+                    let exit_code = 128_i32.saturating_add(sig);
+                    error!(
+                        "Shutdown: second termination signal={} received; forcing process exit code={}",
+                        sig, exit_code,
+                    );
+                    eprintln!(
+                        "Shutdown: second termination signal received; forcing exit ({exit_code})"
+                    );
+                    std::process::exit(exit_code);
+                }
+            })
+        {
+            warn!("Shutdown: failed to arm second-signal forced exit: {error}");
+        }
     }
 
     /// Get current process RSS in MB.

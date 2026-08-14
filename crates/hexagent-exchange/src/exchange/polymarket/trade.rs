@@ -65,6 +65,15 @@ struct FetchedOrder {
 struct RuntimeOrderAuditPass {
     updates: Vec<OrderUpdate>,
     errors: Vec<String>,
+    not_found: Vec<RuntimeMissingOrder>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeMissingOrder {
+    client_order_id: String,
+    tracked: TrackedOrder,
+    order_id: String,
+    evidence: String,
 }
 
 /// Normalize the terminal trade endpoint while preserving the distinction
@@ -98,31 +107,69 @@ pub struct MarketCancelFinality {
 /// separate from transport/service/parse failures: only the former is
 /// authoritative enough to advance the universal four-result placement
 /// terminalization rule.
+#[derive(Debug)]
 enum FetchOrderResult {
     Found(FetchedOrder),
-    NotFound,
+    NotFound(String),
     Unavailable(FetchUnavailable),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FetchUnavailable {
     Timeout,
     Transport,
     Http(u16),
-    InvalidResponse,
+    InvalidResponse(String),
 }
 
 impl FetchOrderResult {
     fn order(&self) -> Option<&FetchedOrder> {
         match self {
             Self::Found(order) => Some(order),
-            Self::NotFound | Self::Unavailable(_) => None,
+            Self::NotFound(_) | Self::Unavailable(_) => None,
         }
     }
 
     fn is_explicit_not_found(&self) -> bool {
-        matches!(self, Self::NotFound)
+        matches!(self, Self::NotFound(_))
     }
+}
+
+const ORDER_LOOKUP_EVIDENCE_MAX_CHARS: usize = 512;
+
+fn compact_order_lookup_evidence_text(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let compact: String = chars.by_ref().take(ORDER_LOOKUP_EVIDENCE_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
+    }
+}
+
+fn compact_order_lookup_evidence(json: &serde_json::Value) -> String {
+    let raw = serde_json::to_string(json).unwrap_or_else(|_| "<unserializable>".to_string());
+    compact_order_lookup_evidence_text(&raw)
+}
+
+/// Polymarket may answer a singular `/data/order/{id}` lookup with HTTP 2xx
+/// plus an error envelope instead of HTTP 404. Only recognized, order-specific
+/// absence messages are authoritative; arbitrary error envelopes remain
+/// unavailable evidence.
+fn successful_lookup_not_found_evidence(json: &serde_json::Value) -> Option<String> {
+    let object = json.as_object()?;
+    let message = ["error", "errorMsg", "error_msg", "detail"]
+        .iter()
+        .find_map(|field| object.get(*field).and_then(serde_json::Value::as_str))?
+        .trim()
+        .to_ascii_lowercase();
+    let authoritative = message == "order not found"
+        || message.starts_with("order not found:")
+        || message.starts_with("could not find order")
+        || message.starts_with("no order found")
+        || message.starts_with("order does not exist")
+        || message.starts_with("order doesn't exist");
+    authoritative.then(|| format!("http_2xx_error_envelope={}", compact_order_lookup_evidence(json)))
 }
 
 fn parse_fetched_order(
@@ -350,9 +397,7 @@ fn placement_response_status(
     effective_account_status: Option<OrderStatus>,
 ) -> OrderStatus {
     if !success {
-        // The signed hash reached the exchange and can still receive a late
-        // match; retain it as a placement orphan until audit proves terminal.
-        return OrderStatus::NewOrderTimeout;
+        return OrderStatus::Rejected;
     }
     if let Some(status @ (OrderStatus::Filled | OrderStatus::Failed)) = effective_account_status {
         return status;
@@ -378,9 +423,14 @@ fn classify_successful_order_lookup(
     json: &serde_json::Value,
     expected_order_id: &str,
 ) -> FetchOrderResult {
+    if let Some(evidence) = successful_lookup_not_found_evidence(json) {
+        return FetchOrderResult::NotFound(evidence);
+    }
     match parse_fetched_order(json, expected_order_id) {
         Ok(order) => FetchOrderResult::Found(order),
-        Err(()) => FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse),
+        Err(()) => FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(
+            compact_order_lookup_evidence(json),
+        )),
     }
 }
 
@@ -437,9 +487,8 @@ impl HttpErr {
             HttpErr::Timeout => FetchUnavailable::Timeout,
             HttpErr::Transport(_) => FetchUnavailable::Transport,
             HttpErr::Status(code, _) => FetchUnavailable::Http(*code),
-            HttpErr::InvalidResponse(_) | HttpErr::Other(_) => {
-                FetchUnavailable::InvalidResponse
-            }
+            HttpErr::InvalidResponse(message) | HttpErr::Other(message) =>
+                FetchUnavailable::InvalidResponse(compact_order_lookup_evidence_text(message)),
         }
     }
 
@@ -483,10 +532,11 @@ impl HttpErr {
             || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
     }
 
-    /// A signed request received an HTTP response. Even a 4xx response cannot
-    /// prove that no late exchange-side match exists for its deterministic hash.
-    fn reached_server(&self) -> bool {
-        matches!(self, HttpErr::Status(_, _))
+    /// A completed 4xx placement response is authoritative rejection evidence.
+    /// 425 remains unknown-state because Polymarket uses it for transient
+    /// service backpressure and may have accepted the signed request.
+    fn is_definitive_submit_rejection(&self) -> bool {
+        matches!(self, HttpErr::Status(code, _) if (400..500).contains(code) && *code != 425)
     }
 }
 
@@ -1181,8 +1231,12 @@ async fn execute_http_on(
             return Err(map_reqwest_err(error));
         }
     };
-    serde_json::from_slice(&bytes)
-        .map_err(|e| HttpErr::InvalidResponse(format!("json parse: {}", e)))
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let raw_body = String::from_utf8_lossy(&bytes);
+        HttpErr::InvalidResponse(compact_order_lookup_evidence_text(&format!(
+            "json_parse_error={error} raw_body={raw_body}"
+        )))
+    })
 }
 
 
@@ -1473,6 +1527,10 @@ impl ReconcileAttemptCounters {
 /// policy. Any unavailable, found, or otherwise non-not-found lookup resets
 /// the run.
 pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 4;
+
+fn shutdown_absent_placement_phantom_is_terminal(status: OrderStatus, streak: u32) -> bool {
+    status == OrderStatus::NewOrderTimeout && streak >= RECONCILE_NOT_FOUND_RETRY_LIMIT
+}
 
 /// Base interval for the placement not-found retry backoff. The gap before
 /// the Nth GET doubles: 0.5s, 1s, 2s across attempts 2..4, so four
@@ -2828,10 +2886,10 @@ impl PolymarketTrade {
                             ),
                         }
                     }
-                    FetchOrderResult::NotFound => {
+                    FetchOrderResult::NotFound(evidence) => {
                         warn!(
-                            "[PolymarketTrade] startup recovery coid={} orderID={} not found attempt={} — retaining reservation",
-                            coid, order_id, attempt + 1,
+                            "[PolymarketTrade] startup recovery coid={} orderID={} not found attempt={} evidence={} — retaining reservation",
+                            coid, order_id, attempt + 1, evidence,
                         );
                     }
                     FetchOrderResult::Unavailable(kind) => warn!(
@@ -2926,13 +2984,20 @@ impl PolymarketTrade {
         };
         let mut updates = Vec::new();
         let mut errors = Vec::new();
+        let mut not_found = Vec::new();
         for (coid, tracked, order_id) in tracked {
             let fetched = match self.fetch_order_by_id(&coid, &order_id, None) {
                 FetchOrderResult::Found(order) => order,
-                FetchOrderResult::NotFound => {
+                FetchOrderResult::NotFound(evidence) => {
                     errors.push(format!(
-                        "open order coid={coid} orderID={order_id} was not found"
+                        "open order coid={coid} orderID={order_id} was not found: {evidence}"
                     ));
+                    not_found.push(RuntimeMissingOrder {
+                        client_order_id: coid,
+                        tracked,
+                        order_id,
+                        evidence,
+                    });
                     continue;
                 }
                 FetchOrderResult::Unavailable(kind) => {
@@ -3047,7 +3112,11 @@ impl PolymarketTrade {
                 error: None,
             });
         }
-        RuntimeOrderAuditPass { updates, errors }
+        RuntimeOrderAuditPass {
+            updates,
+            errors,
+            not_found,
+        }
     }
 
     /// POST variant that distinguishes timeout / status / other errors so
@@ -3132,6 +3201,7 @@ impl PolymarketTrade {
     ) -> usize {
         let retry_delays_ms = [0_u64, 100, 250, 500, 1_000, 2_000, 5_000];
         let mut attempt = 0usize;
+        let mut remote_clean_not_found_streaks: HashMap<String, u32> = HashMap::new();
         loop {
             let delay_ms = retry_delays_ms[attempt.min(retry_delays_ms.len() - 1)];
             if delay_ms > 0 {
@@ -3158,6 +3228,82 @@ impl PolymarketTrade {
             let audit = self.reconcile_runtime_open_orders_pass();
             for update in audit.updates {
                 emit_update(update);
+            }
+
+            // Historical deterministic rejects may have been persisted as
+            // placement orphans by older binaries. During shutdown, a clean
+            // account-wide cancel plus four consecutive authoritative GET
+            // absences is sufficient to release only those phantom rows.
+            // Unavailable/malformed lookups never enter this list and reset
+            // the run, so a service outage cannot manufacture a rejection.
+            let absent_coids: HashSet<&str> = audit
+                .not_found
+                .iter()
+                .map(|missing| missing.client_order_id.as_str())
+                .collect();
+            if remote_clean {
+                remote_clean_not_found_streaks
+                    .retain(|coid, _| absent_coids.contains(coid.as_str()));
+            } else {
+                remote_clean_not_found_streaks.clear();
+            }
+            if remote_clean {
+                for missing in &audit.not_found {
+                    let streak = remote_clean_not_found_streaks
+                        .entry(missing.client_order_id.clone())
+                        .or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    let Some(ownership) = self
+                        .shared
+                        .account_state
+                        .order(&missing.client_order_id)
+                    else {
+                        warn!(
+                            "[PolymarketTrade] shutdown phantom coid={} orderID={} has no durable ownership row; retaining for diagnosis",
+                            missing.client_order_id, missing.order_id,
+                        );
+                        continue;
+                    };
+                    if !shutdown_absent_placement_phantom_is_terminal(ownership.status, *streak) {
+                        if *streak == RECONCILE_NOT_FOUND_RETRY_LIMIT {
+                            warn!(
+                                "[PolymarketTrade] shutdown absent order is not a placement phantom: coid={} orderID={} status={:?}; retaining for trade/cancel audit",
+                                missing.client_order_id, missing.order_id, ownership.status,
+                            );
+                        }
+                        continue;
+                    }
+                    self.shared.remove_order_as(
+                        &missing.client_order_id,
+                        OrderStatus::Rejected,
+                    );
+                    warn!(
+                        "[PolymarketTrade] shutdown resolved absent placement phantom as Rejected: coid={} orderID={} consecutive_remote_clean_not_found={} evidence={}",
+                        missing.client_order_id,
+                        missing.order_id,
+                        streak,
+                        missing.evidence,
+                    );
+                    emit_update(OrderUpdate {
+                        client_order_id: missing.client_order_id.clone(),
+                        exchange: Exchange::Polymarket,
+                        symbol: missing.tracked.symbol.clone(),
+                        side: missing.tracked.side,
+                        exchange_order_id: Some(missing.order_id.clone()),
+                        status: OrderStatus::Rejected,
+                        liquidity: None,
+                        filled_quantity: 0.0,
+                        remaining_quantity: ownership.quantity,
+                        avg_fill_price: ownership.price,
+                        timestamp_ns: now_ns(),
+                        trade_id: None,
+                        order_audit: None,
+                        error: Some(format!(
+                            "shutdown authoritative absence after {} clean cancel passes: {}",
+                            streak, missing.evidence
+                        )),
+                    });
+                }
             }
             let open_orders = self.shared.open_orders.lock().unwrap().len();
             let monitoring = self.shared.account_state.monitoring_snapshot();
@@ -3730,16 +3876,6 @@ impl PolymarketTrade {
         }
     }
 
-    fn make_exchange_rejection_pending(
-        order: &OrderRequest,
-        order_hash: Option<&str>,
-        msg: &str,
-    ) -> OrderUpdate {
-        let mut update = Self::make_timeout_place(order, order_hash);
-        update.error = (!msg.is_empty()).then(|| msg.to_string());
-        update
-    }
-
     /// Make a timeout OrderUpdate for a cancel whose HTTP call timed out.
     fn make_timeout_cancel(coid: &str, symbol: &str, side: Side, order_id: Option<String>) -> OrderUpdate {
         Self::make_orphan_cancel(coid, symbol, side, order_id, OrderStatus::CancelOrderTimeout)
@@ -4261,7 +4397,9 @@ impl PolymarketTrade {
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
                     let evidence = match &fetch_result {
-                        FetchOrderResult::NotFound => "explicit_not_found".to_string(),
+                        FetchOrderResult::NotFound(evidence) => {
+                            format!("explicit_not_found:{evidence}")
+                        }
                         FetchOrderResult::Unavailable(kind) => {
                             format!("unavailable:{kind:?}")
                         }
@@ -4275,10 +4413,10 @@ impl PolymarketTrade {
                         attempts,
                     ));
                     match &fetch_result {
-                        FetchOrderResult::NotFound => {
+                        FetchOrderResult::NotFound(evidence) => {
                             warn!(
-                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=explicit_not_found attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
-                                coid, order_id, attempts, pending_delayed, backoff_ms,
+                                "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence={} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
+                                coid, order_id, evidence, attempts, pending_delayed, backoff_ms,
                             );
                             // Replica answered (not-found): transport healthy,
                             // state ambiguous.
@@ -4506,7 +4644,10 @@ impl PolymarketTrade {
                 // consecutive-not-found terminalization rule.
                 if e.is_explicit_not_found() {
                     warn!("[PolymarketTrade] Reconcile /data/order/{}: {}", order_id, e);
-                    return FetchOrderResult::NotFound;
+                    return FetchOrderResult::NotFound(format!(
+                        "http_status=404 response={}",
+                        e
+                    ));
                 }
                 if e.is_http_425() {
                     self.shared.note_http_425_backoff(coid);
@@ -4804,23 +4945,19 @@ impl PolymarketTrade {
                 return Self::make_timeout_place(order, Some(local_oid));
             }
             Err(e) => {
-                let reached_server = e.reached_server();
                 let err_s = e.to_string();
                 if SharedState::is_balance_error(&err_s) {
                     self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
                 } else if SharedState::is_invalid_token_error(&err_s) {
                     self.handle_invalid_token(&order.symbol);
                 }
-                if reached_server {
-                    self.shared.account_state.mark_order_status(
-                        &order.client_order_id, OrderStatus::NewOrderTimeout,
-                    );
-                    warn!("[PolymarketTrade] Order server-rejected: {} coid={} → pending audit",
-                        e, order.client_order_id);
-                    return Self::make_exchange_rejection_pending(order, Some(local_oid), &err_s);
-                }
                 self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-                warn!("[PolymarketTrade] Local order failure: {} coid={}", e, order.client_order_id);
+                if e.is_definitive_submit_rejection() {
+                    warn!("[PolymarketTrade] Order server-rejected: {} coid={} → Rejected",
+                        e, order.client_order_id);
+                } else {
+                    warn!("[PolymarketTrade] Local order failure: {} coid={}", e, order.client_order_id);
+                }
                 return Self::make_rejected(order, &err_s);
             }
         };
@@ -4848,17 +4985,15 @@ impl PolymarketTrade {
         let error_msg = parsed.error_msg;
 
         if !success {
-            self.shared.account_state.mark_order_status(
-                &order.client_order_id, OrderStatus::NewOrderTimeout,
-            );
+            self.shared.remove_order_as(&order.client_order_id, OrderStatus::Rejected);
             if SharedState::is_balance_error(&error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
             } else if SharedState::is_invalid_token_error(&error_msg) {
                 self.handle_invalid_token(&order.symbol);
             }
-            warn!("[PolymarketTrade] Order rejected by server: {} coid={} → pending audit",
+            warn!("[PolymarketTrade] Order rejected by server: {} coid={} → Rejected",
                 error_msg, order.client_order_id);
-            return Self::make_exchange_rejection_pending(order, Some(local_oid), &error_msg);
+            return Self::make_rejected(order, &error_msg);
         }
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
@@ -5557,11 +5692,9 @@ impl ExchangeTrade for PolymarketTrade {
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            // Keep reservation and order-id routing until the
-                            // placement orphan receives terminal audit proof.
-                            self.shared.account_state.mark_order_status(
+                            self.shared.remove_order_as(
                                 &order.client_order_id,
-                                OrderStatus::NewOrderTimeout,
+                                OrderStatus::Rejected,
                             );
                             if SharedState::is_balance_error(&error_msg) {
                                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
@@ -5645,7 +5778,6 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    let reached_server = e.reached_server();
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Use the first chunk order's side+symbol as the
@@ -5664,21 +5796,12 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, chunk_coids);
-                    for (i, order_hash) in signed_hashes.iter().enumerate() {
+                    for (i, _) in signed_hashes.iter().enumerate() {
                         let order = &chunk[body_to_chunk[i]];
-                        if reached_server {
-                            self.shared.account_state.mark_order_status(
-                                &order.client_order_id, OrderStatus::NewOrderTimeout,
-                            );
-                            all_updates.push(Self::make_exchange_rejection_pending(
-                                order, Some(order_hash), &err_s,
-                            ));
-                        } else {
-                            self.shared.remove_order_as(
-                                &order.client_order_id, OrderStatus::Rejected,
-                            );
-                            all_updates.push(Self::make_rejected(order, &err_s));
-                        }
+                        self.shared.remove_order_as(
+                            &order.client_order_id, OrderStatus::Rejected,
+                        );
+                        all_updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
             }
@@ -6450,9 +6573,9 @@ impl ExchangeTrade for PolymarketTrade {
                             // open_orders already populated at sign time.
                         } else {
                             rejected_coids.push(order.client_order_id.clone());
-                            self.shared.account_state.mark_order_status(
+                            self.shared.remove_order_as(
                                 &order.client_order_id,
-                                OrderStatus::NewOrderTimeout,
+                                OrderStatus::Rejected,
                             );
                             let is_balance_err = SharedState::is_balance_error(&error_msg);
                             if is_balance_err {
@@ -6574,7 +6697,6 @@ impl ExchangeTrade for PolymarketTrade {
                     }
                 }
                 Err(e) => {
-                    let reached_server = e.reached_server();
                     let err_s = e.to_string();
                     if SharedState::is_balance_error(&err_s) {
                         // Pick the first place_chunk order (mapped via
@@ -6591,21 +6713,12 @@ impl ExchangeTrade for PolymarketTrade {
                         }
                     }
                     warn!("[PolymarketTrade] Submit failed: {} coids={:?}", e, place_coids);
-                    for (i, order_hash) in place_signed.iter().enumerate() {
+                    for (i, _) in place_signed.iter().enumerate() {
                         let order = &place_chunk[place_body_to_chunk[i]];
-                        if reached_server {
-                            self.shared.account_state.mark_order_status(
-                                &order.client_order_id, OrderStatus::NewOrderTimeout,
-                            );
-                            updates.push(Self::make_exchange_rejection_pending(
-                                order, Some(order_hash), &err_s,
-                            ));
-                        } else {
-                            self.shared.remove_order_as(
-                                &order.client_order_id, OrderStatus::Rejected,
-                            );
-                            updates.push(Self::make_rejected(order, &err_s));
-                        }
+                        self.shared.remove_order_as(
+                            &order.client_order_id, OrderStatus::Rejected,
+                        );
+                        updates.push(Self::make_rejected(order, &err_s));
                     }
                 }
             }
@@ -6732,8 +6845,8 @@ mod tests {
         );
         assert_eq!(
             placement_response_status(false, "", None),
-            OrderStatus::NewOrderTimeout,
-            "exchange-side rejection must retain reservation pending audit",
+            OrderStatus::Rejected,
+            "a complete exchange-side rejection must release active reservation",
         );
     }
 
@@ -7260,16 +7373,31 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!({}),
             serde_json::json!([]),
-            serde_json::json!({"error": "Order not found"}),
             serde_json::json!({"unexpected": "non-empty malformed response"}),
+            serde_json::json!({"error": "upstream unavailable"}),
+            serde_json::json!({"error": "market not found"}),
         ] {
             assert!(
                 matches!(
                     classify_successful_order_lookup(&json, "0xabc"),
-                    FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+                    FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(_))
                 ),
                 "json={json}",
             );
+        }
+
+        for json in [
+            serde_json::json!({"error": "Order not found"}),
+            serde_json::json!({"errorMsg": "Order not found: 0xabc"}),
+            serde_json::json!({"detail": "Could not find order"}),
+        ] {
+            match classify_successful_order_lookup(&json, "0xabc") {
+                FetchOrderResult::NotFound(evidence) => {
+                    assert!(evidence.starts_with("http_2xx_error_envelope="));
+                    assert!(evidence.contains("not found") || evidence.contains("find order"));
+                }
+                other => panic!("expected authoritative not-found for {json}, got {other:?}"),
+            }
         }
 
         assert!(matches!(
@@ -7283,12 +7411,12 @@ mod tests {
                 }),
                 "0xabc",
             ),
-            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(_))
         ));
 
         assert!(matches!(
             classify_successful_order_lookup(&serde_json::json!({"status": "LIVE"}), "0xabc"),
-            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(_))
         ));
         assert!(matches!(
             classify_successful_order_lookup(
@@ -7349,7 +7477,7 @@ mod tests {
         ] {
             assert!(matches!(
                 classify_successful_order_lookup(&json, "0xabc"),
-                FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse)
+                FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(_))
             ));
         }
     }
@@ -7370,6 +7498,29 @@ mod tests {
             assert_eq!(attempts.next_placement(coid), 2);
             assert_eq!(attempts.next_placement(coid), 3);
             assert_eq!(attempts.next_placement(coid), 4);
+        }
+    }
+
+    #[test]
+    fn shutdown_absence_only_terminalizes_placement_phantoms() {
+        assert!(!shutdown_absent_placement_phantom_is_terminal(
+            OrderStatus::NewOrderTimeout,
+            RECONCILE_NOT_FOUND_RETRY_LIMIT - 1,
+        ));
+        assert!(shutdown_absent_placement_phantom_is_terminal(
+            OrderStatus::NewOrderTimeout,
+            RECONCILE_NOT_FOUND_RETRY_LIMIT,
+        ));
+        for status in [
+            OrderStatus::Accepted,
+            OrderStatus::PartiallyFilled,
+            OrderStatus::CancelOrderTimeout,
+            OrderStatus::CancelUncertain,
+        ] {
+            assert!(!shutdown_absent_placement_phantom_is_terminal(
+                status,
+                RECONCILE_NOT_FOUND_RETRY_LIMIT,
+            ));
         }
     }
 
@@ -7408,10 +7559,12 @@ mod tests {
         assert!(
             !HttpErr::Status(400, "bad request".to_string())
                 .is_submit_unknown_state(),
-            "HTTP 400 has a known response, even though its order hash still requires audit"
+            "HTTP 400 has a definitive response"
         );
-        assert!(HttpErr::Status(400, "bad request".to_string()).reached_server());
-        assert!(!HttpErr::Other("local validation".to_string()).reached_server());
+        assert!(HttpErr::Status(400, "bad request".to_string()).is_definitive_submit_rejection());
+        assert!(!HttpErr::Status(425, "too early".to_string()).is_definitive_submit_rejection());
+        assert!(!HttpErr::Status(503, "unavailable".to_string()).is_definitive_submit_rejection());
+        assert!(!HttpErr::Other("local validation".to_string()).is_definitive_submit_rejection());
     }
 
     /// Four not-found observations use 0.5/1/2 second gaps and reach the
@@ -7459,7 +7612,7 @@ mod tests {
         );
         assert_eq!(
             HttpErr::Other("json parse".to_string()).fetch_unavailable(),
-            FetchUnavailable::InvalidResponse,
+            FetchUnavailable::InvalidResponse("json parse".to_string()),
         );
     }
 
