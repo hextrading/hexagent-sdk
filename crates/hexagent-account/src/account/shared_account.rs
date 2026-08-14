@@ -951,6 +951,30 @@ impl SharedAccount {
                     "durable trade-persistence blocker recovery",
                 );
             }
+            // Rebuild startup recovery admission before validating resource
+            // availability. An order can legitimately outlive the event's
+            // wallet position while its crash-durable reservation is still
+            // present. Rejecting that temporary deficit here makes the
+            // order-specific recovery path unreachable. The derived-order
+            // checks below still prove that every accepted reservation comes
+            // from a durable order root.
+            let startup_deficit_orders: Vec<String> = state
+                .orders
+                .iter()
+                .filter(|(_, order)| order_has_startup_reservation_deficit(&state, order))
+                .map(|(coid, _)| coid.clone())
+                .collect();
+            let recovered_before = state.recovery_pending_orders.len();
+            state.recovery_pending_orders.extend(startup_deficit_orders);
+            if state.recovery_pending_orders.len() != recovered_before {
+                migrated = true;
+                recompute_reconciliation(&mut state, "startup order recovery rebuild");
+                log::warn!(
+                    "[shared_account] account={} restored {} potentially-live order(s) into risk-off startup recovery before ledger validation",
+                    account_id,
+                    state.recovery_pending_orders.len(),
+                );
+            }
             validate_persisted_state(&account_id, &state)
                 .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
             (state, migrated)
@@ -4521,6 +4545,72 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
     }
 }
 
+fn order_has_startup_reservation_deficit(
+    state: &SharedAccountState,
+    order: &OrderOwnership,
+) -> bool {
+    let Some(instance) = state.instances.get(&order.instance_id) else {
+        return false;
+    };
+    let reserved_position = instance
+        .reserved_positions
+        .get(&order.token_id)
+        .copied()
+        .unwrap_or(0.0);
+    let owned_position = instance
+        .positions
+        .get(&order.token_id)
+        .copied()
+        .unwrap_or(0.0);
+    (order.reserved_cash > EPS
+        && instance.reserved_cash
+            > instance.cash + reconciliation_tolerance(instance.cash, instance.reserved_cash))
+        || (order.reserved_quantity > EPS
+            && reserved_position
+                > owned_position + reconciliation_tolerance(owned_position, reserved_position))
+}
+
+/// A reservation may temporarily exceed the last persisted wallet view only
+/// when a matching durable recovery root owns that exact resource. Aggregate
+/// reservation equality is validated later from the same roots, so this does
+/// not permit arbitrary hand-edited availability or cross-instance borrowing.
+fn reservation_deficit_has_recovery_root(
+    state: &SharedAccountState,
+    instance_id: &str,
+    token_id: Option<&str>,
+) -> bool {
+    let order_root = state.recovery_pending_orders.iter().any(|coid| {
+        state.orders.get(coid).is_some_and(|order| {
+            order.instance_id == instance_id
+                && match token_id {
+                    Some(token) => order.token_id == token && order.reserved_quantity > EPS,
+                    None => order.reserved_cash > EPS,
+                }
+        })
+    });
+    if order_root {
+        return true;
+    }
+    state.maintenance_ops.values().any(|operation| {
+        matches!(
+            operation.status,
+            MaintenanceOperationStatus::Reserved
+                | MaintenanceOperationStatus::Submitted
+                | MaintenanceOperationStatus::Uncertain
+        ) && operation
+            .allocations
+            .get(instance_id)
+            .is_some_and(|amount| *amount > EPS)
+            && match (operation.kind, token_id) {
+                (MaintenanceOperationKind::Split, None) => true,
+                (MaintenanceOperationKind::Merge, Some(token)) => {
+                    token == operation.up_token_id || token == operation.down_token_id
+                }
+                _ => false,
+            }
+    })
+}
+
 fn normalize_terminal_failed_state(state: &mut SharedAccountState) -> bool {
     let mut changed = false;
     let failed_coids: Vec<String> = state.orders.iter()
@@ -5167,6 +5257,7 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         )?;
         if instance.reserved_cash
             > instance.cash + reconciliation_tolerance(instance.cash, instance.reserved_cash)
+            && !reservation_deficit_has_recovery_root(state, instance_id, None)
         {
             return Err(format!(
                 "instance `{instance_id}` reserves more cash than it owns"
@@ -5174,7 +5265,13 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         }
         for (token, reserved) in &instance.reserved_positions {
             let owned = instance.positions.get(token).copied().unwrap_or(0.0);
-            if *reserved > owned + reconciliation_tolerance(owned, *reserved) {
+            if *reserved > owned + reconciliation_tolerance(owned, *reserved)
+                && !reservation_deficit_has_recovery_root(
+                    state,
+                    instance_id,
+                    Some(token.as_str()),
+                )
+            {
                 return Err(format!(
                     "instance `{instance_id}` reserves more `{token}` than it owns"
                 ));
@@ -8061,6 +8158,67 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let error = SharedAccount::new_persistent("invalid", &path).unwrap_err();
         assert!(error.contains("invalid account ledger"), "{error}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistent_ledger_admits_order_owned_position_deficit_for_startup_recovery() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-recoverable-reservation-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let mut state = SharedAccountState::default();
+        let mut instance = InstanceLedger::new(1.0);
+        instance
+            .reserved_positions
+            .insert("ENDED-UP".to_string(), 10.0);
+        state.instances.insert("maker".to_string(), instance);
+        state.orders.insert(
+            "maker-1".to_string(),
+            OrderOwnership {
+                account_id: "recoverable".to_string(),
+                instance_id: "maker".to_string(),
+                client_order_id: "maker-1".to_string(),
+                order_id: "0xABC".to_string(),
+                token_id: "ENDED-UP".to_string(),
+                side: Side::Sell,
+                quantity: 10.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 10.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: "recoverable".to_string(),
+                state,
+            },
+        )
+        .unwrap();
+
+        let restored = SharedAccount::new_persistent("recoverable", &path).unwrap();
+        let snapshot = restored.monitoring_snapshot();
+        assert_eq!(snapshot.recovery_pending_orders, 1);
+        assert!(snapshot.uncertain);
+        assert_eq!(
+            restored
+                .instance_snapshot("maker")
+                .unwrap()
+                .reserved_positions["ENDED-UP"],
+            10.0,
+        );
+        drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]

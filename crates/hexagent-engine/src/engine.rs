@@ -31,6 +31,20 @@ use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 const CHANNEL_CAPACITY: usize = 10_000;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownTrigger {
+    Signal(i32),
+    CriticalThread(&'static str),
+}
+
+fn first_finished_critical_thread(
+    critical_threads: &[(&'static str, &thread::JoinHandle<()>)],
+) -> Option<&'static str> {
+    critical_threads
+        .iter()
+        .find_map(|(name, handle)| handle.is_finished().then_some(*name))
+}
+
 fn account_ledger_display_path(path: &std::path::Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -1001,14 +1015,44 @@ impl Engine {
             None
         };
 
-        // Persist every subscribed live market-data source through one
-        // recorder before strategy fan-out.
-        let (recorder_tx, recorder_handle) = self.spawn_recorder_thread()?;
-
         // Build the per-instance Polymarket SharedState map. The
         // underlying h2 pool is shared across instances; auth, signer,
         // and order-id registry are per-instance (Phase 2a).
         let poly_states = self.build_poly_shared_states_map();
+        let mut required_poly_instances = Vec::new();
+        for strategy in self.config.strategies.iter().filter(|strategy| {
+            strategy.enabled
+                && self
+                    .registry
+                    .capabilities(&strategy.name)
+                    .needs_poly_user_feed
+        }) {
+            if strategy.instance_id.trim().is_empty() {
+                anyhow::bail!(
+                    "live Polymarket strategy `{}` requires a non-empty instance_id",
+                    strategy.name,
+                );
+            }
+            required_poly_instances.push(strategy.instance_id.clone());
+        }
+        required_poly_instances.sort();
+        required_poly_instances.dedup();
+        let missing_poly_instances: Vec<String> = required_poly_instances
+            .iter()
+            .filter(|instance_id| !poly_states.contains_key(*instance_id))
+            .cloned()
+            .collect();
+        if !missing_poly_instances.is_empty() {
+            anyhow::bail!(
+                "refusing LIVE startup: Polymarket execution routes missing for enabled instance(s) [{}]; no feeds or strategies were started",
+                missing_poly_instances.join(","),
+            );
+        }
+
+        // Persist every subscribed live market-data source through one
+        // recorder before strategy fan-out. Route admission above must pass
+        // first so a zero-executor process cannot look healthy and run feeds.
+        let (recorder_tx, recorder_handle) = self.spawn_recorder_thread()?;
 
         // Stale-signal threshold handle — shared `Arc<AtomicU64>` between
         // the executor (reads on every signal arrival) and the strategy
@@ -1161,10 +1205,17 @@ impl Engine {
         // socket consumption, and leave the first tradable book stale.
         let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
 
-        Self::wait_for_shutdown(&shutdown, &shutdown_tx);
+        let shutdown_trigger = Self::wait_for_shutdown_or_critical(
+            &shutdown,
+            &shutdown_tx,
+            &[
+                ("strategy", &strategy_handle),
+                ("execution", &exec_handle),
+            ],
+        );
 
-        let _ = strategy_handle.join();
-        let _ = exec_handle.join();
+        let strategy_join = strategy_handle.join();
+        let exec_join = exec_handle.join();
         if let Some(h) = user_feed_handle {
             let _ = h.join();
         }
@@ -1190,6 +1241,22 @@ impl Engine {
         crate::latency_record::flush();
 
         info!("  All threads stopped, exiting");
+        let mut critical_failures = Vec::new();
+        if let ShutdownTrigger::CriticalThread(name) = shutdown_trigger {
+            critical_failures.push(format!("critical thread `{name}` exited before shutdown"));
+        }
+        if strategy_join.is_err() {
+            critical_failures.push("strategy thread panicked".to_string());
+        }
+        if exec_join.is_err() {
+            critical_failures.push("execution thread panicked".to_string());
+        }
+        if !critical_failures.is_empty() {
+            anyhow::bail!(
+                "live runtime stopped after critical-thread failure: {}",
+                critical_failures.join("; "),
+            );
+        }
         Ok(())
     }
 
@@ -4862,6 +4929,14 @@ impl Engine {
     }
 
     fn wait_for_shutdown(shutdown: &Arc<AtomicBool>, shutdown_tx: &Sender<MarketEvent>) {
+        let _ = Self::wait_for_shutdown_or_critical(shutdown, shutdown_tx, &[]);
+    }
+
+    fn wait_for_shutdown_or_critical(
+        shutdown: &Arc<AtomicBool>,
+        shutdown_tx: &Sender<MarketEvent>,
+        critical_threads: &[(&'static str, &thread::JoinHandle<()>)],
+    ) -> ShutdownTrigger {
         use signal_hook::consts::{SIGINT, SIGTERM};
         use signal_hook::iterator::Signals;
 
@@ -4870,36 +4945,60 @@ impl Engine {
             Signals::new(&[SIGINT, SIGTERM]).expect("Failed to register signal handlers");
         info!("Press Ctrl-C to stop...");
 
-        // The first signal starts the coordinated shutdown. Keep the same
-        // signal iterator alive afterwards so a second operator request can
-        // escape any blocked network/join path immediately.
-        if let Some(sig) = signals.forever().next() {
-            let sig_name = match sig {
-                SIGINT => "SIGINT (Ctrl-C)",
-                SIGTERM => "SIGTERM",
-                _ => "unknown",
-            };
-            let uptime = start_time.elapsed();
-            let hours = uptime.as_secs() / 3600;
-            let mins = (uptime.as_secs() % 3600) / 60;
-            let secs = uptime.as_secs() % 60;
+        // Poll both OS signals and root worker liveness. Blocking forever in
+        // `signals.forever()` left a process alive after its execution thread
+        // panicked; `JoinHandle::is_finished` makes either root lane an
+        // explicit shutdown source.
+        let trigger = loop {
+            if let Some(sig) = signals.pending().next() {
+                break ShutdownTrigger::Signal(sig);
+            }
+            if let Some(name) = first_finished_critical_thread(critical_threads) {
+                break ShutdownTrigger::CriticalThread(name);
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        };
 
-            // Read RSS from /proc/self/status (Linux) or use sysctl (macOS)
-            let rss_mb = Self::get_rss_mb().unwrap_or(0.0);
-
-            info!(
-                "Shutdown: signal={}, uptime={}h{}m{}s, rss={:.1}MB, pid={}",
-                sig_name,
+        let uptime = start_time.elapsed();
+        let hours = uptime.as_secs() / 3600;
+        let mins = (uptime.as_secs() % 3600) / 60;
+        let secs = uptime.as_secs() % 60;
+        let rss_mb = Self::get_rss_mb().unwrap_or(0.0);
+        match trigger {
+            ShutdownTrigger::Signal(sig) => {
+                let sig_name = match sig {
+                    SIGINT => "SIGINT (Ctrl-C)",
+                    SIGTERM => "SIGTERM",
+                    _ => "unknown",
+                };
+                info!(
+                    "Shutdown: signal={}, uptime={}h{}m{}s, rss={:.1}MB, pid={}",
+                    sig_name,
+                    hours,
+                    mins,
+                    secs,
+                    rss_mb,
+                    std::process::id()
+                );
+            }
+            ShutdownTrigger::CriticalThread(name) => error!(
+                "Shutdown: critical_thread={} exited unexpectedly, uptime={}h{}m{}s, rss={:.1}MB, pid={}; starting coordinated shutdown",
+                name,
                 hours,
                 mins,
                 secs,
                 rss_mb,
-                std::process::id()
-            );
+                std::process::id(),
+            ),
         }
 
         shutdown.store(true, Ordering::Relaxed);
-        let _ = shutdown_tx.send(MarketEvent::Exit);
+        if let Err(error) = shutdown_tx.send_timeout(
+            MarketEvent::Exit,
+            std::time::Duration::from_secs(1),
+        ) {
+            warn!("Shutdown: could not enqueue strategy Exit event: {error}");
+        }
 
         if let Err(error) = thread::Builder::new()
             .name("forced-shutdown-signal".to_string())
@@ -4919,6 +5018,7 @@ impl Engine {
         {
             warn!("Shutdown: failed to arm second-signal forced exit: {error}");
         }
+        trigger
     }
 
     /// Get current process RSS in MB.
@@ -5629,6 +5729,11 @@ impl Engine {
                 return out;
             }
         };
+        // Engine callers may construct `Config` directly instead of going
+        // through `Config::load`. Load the shared builder/Polygon secrets here
+        // as part of the same live preflight that resolves account wallets, so
+        // maintenance never depends on an earlier CLI-only side effect.
+        secrets.apply_shared_to_env();
 
         // Build one SharedState per unique `account_id` (= one
         // Polymarket wallet / signer / user-feed / nonce stream).
@@ -5807,6 +5912,39 @@ impl Engine {
                         &creds.signature_type,
                         &creds.funder,
                     );
+                    let maintenance_enabled = !self.config.general.all_probe
+                        && self.config.strategies.iter().any(|strategy| {
+                            strategy.enabled
+                                && strategy.account_id() == account_id
+                                && self
+                                    .registry
+                                    .capabilities(&strategy.name)
+                                    .needs_poly_user_feed
+                                && strategy
+                                    .params
+                                    .get("redeem_split_enabled")
+                                    .and_then(|value| value.as_bool())
+                                    .unwrap_or(false)
+                        });
+                    if maintenance_enabled {
+                        if let Err(error) =
+                            crate::exchange::polymarket::wallet::validate_registered_account_wallet(
+                                &account_id,
+                                trade.order_maker_address(),
+                            )
+                        {
+                            error!(
+                                "[Engine] account={} maintenance wallet preflight failed: {}; refusing Polymarket startup",
+                                account_id, error,
+                            );
+                            return HashMap::new();
+                        }
+                        info!(
+                            "[Engine] account={} maintenance wallet preflight OK maker/funder={}",
+                            account_id,
+                            trade.order_maker_address(),
+                        );
+                    }
                     trade.prewarm_connections();
                     let shared = trade.shared_state();
                     shared.account_state.register_instance(
@@ -7118,11 +7256,28 @@ fn fire_or_execute(
                 }
                 Some(permit) => {
                     let client = permit.pooled_client();
-                    match worker.poly_route_mut(&iid).submit_fire(&order, client) {
+                    let route = match worker.poly_route_mut(&iid) {
+                        Ok(route) => route,
+                        Err(error) => {
+                            error!("[Executor] Polymarket place route error: {}", error);
+                            drop(permit);
+                            let _ = utx.send(exec_rejected_place(&order));
+                            return;
+                        }
+                    };
+                    match route.submit_fire(&order, client) {
                         Ok(pending) => {
                             let iid2 = iid;
                             let f: PolyCompletionFn = Box::new(move |r| {
-                                let u = r.poly_route_mut(&iid2).complete_submit(&order, pending);
+                                let route = match r.poly_route_mut(&iid2) {
+                                    Ok(route) => route,
+                                    Err(error) => {
+                                        error!("[Executor] Polymarket completion route error: {}", error);
+                                        drop(permit);
+                                        return vec![exec_rejected_place(&order)];
+                                    }
+                                };
+                                let u = route.complete_submit(&order, pending);
                                 drop(permit); // release the reserved connection
                                 vec![u]
                             });
@@ -7164,12 +7319,28 @@ fn fire_or_execute(
                         );
                     }
                     let client = permit.pooled_client();
-                    let route = worker.poly_route_mut(&iid);
+                    let route = match worker.poly_route_mut(&iid) {
+                        Ok(route) => route,
+                        Err(error) => {
+                            error!("[Executor] Polymarket cancel route error: {}", error);
+                            drop(permit);
+                            let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
+                            return;
+                        }
+                    };
                     route.set_gen_ns_hint(timestamp_ns);
                     let pending = route.cancel_fire(&client_order_id, client);
                     let iid2 = iid;
                     let f: PolyCompletionFn = Box::new(move |r| {
-                        let u = r.poly_route_mut(&iid2).complete_cancel(
+                        let route = match r.poly_route_mut(&iid2) {
+                            Ok(route) => route,
+                            Err(error) => {
+                                error!("[Executor] Polymarket cancel completion route error: {}", error);
+                                drop(permit);
+                                return vec![exec_rejected_cancel(client_order_id, exchange)];
+                            }
+                        };
+                        let u = route.complete_cancel(
                             exchange,
                             &client_order_id,
                             pending,
@@ -7209,12 +7380,29 @@ fn fire_or_execute(
                     }
                     Some(ppermit) => {
                         let pclient = ppermit.pooled_client();
-                        match worker.poly_route_mut(&iid).submit_fire(&place, pclient) {
+                        let route = match worker.poly_route_mut(&iid) {
+                            Ok(route) => route,
+                            Err(error) => {
+                                error!("[Executor] Polymarket replace-place route error: {}", error);
+                                drop(ppermit);
+                                let _ = utx.send(exec_rejected_place(&place));
+                                let _ = utx.send(exec_rejected_cancel(coid, exchange));
+                                return;
+                            }
+                        };
+                        match route.submit_fire(&place, pclient) {
                             Ok(pending) => {
                                 let iid_p = iid.clone();
                                 let pf: PolyCompletionFn = Box::new(move |r| {
-                                    let u =
-                                        r.poly_route_mut(&iid_p).complete_submit(&place, pending);
+                                    let route = match r.poly_route_mut(&iid_p) {
+                                        Ok(route) => route,
+                                        Err(error) => {
+                                            error!("[Executor] Polymarket replace-place completion route error: {}", error);
+                                            drop(ppermit);
+                                            return vec![exec_rejected_place(&place)];
+                                        }
+                                    };
+                                    let u = route.complete_submit(&place, pending);
                                     drop(ppermit);
                                     vec![u]
                                 });
@@ -7249,14 +7437,28 @@ fn fire_or_execute(
                 );
             }
             let cclient = cancel_permit.pooled_client();
-            let route = worker.poly_route_mut(&iid);
+            let route = match worker.poly_route_mut(&iid) {
+                Ok(route) => route,
+                Err(error) => {
+                    error!("[Executor] Polymarket replace-cancel route error: {}", error);
+                    drop(cancel_permit);
+                    let _ = utx.send(exec_rejected_cancel(coid, exchange));
+                    return;
+                }
+            };
             route.set_gen_ns_hint(timestamp_ns);
             let cpending = route.cancel_fire(&coid, cclient);
             let iid_c = iid.clone();
             let cf: PolyCompletionFn = Box::new(move |r| {
-                let u = r
-                    .poly_route_mut(&iid_c)
-                    .complete_cancel(exchange, &coid, cpending);
+                let route = match r.poly_route_mut(&iid_c) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        error!("[Executor] Polymarket replace-cancel completion route error: {}", error);
+                        drop(cancel_permit);
+                        return vec![exec_rejected_cancel(coid, exchange)];
+                    }
+                };
+                let u = route.complete_cancel(exchange, &coid, cpending);
                 drop(cancel_permit);
                 vec![u]
             });
@@ -7284,12 +7486,23 @@ fn fire_or_execute(
                     }
                 }
                 Some(permit) => {
-                    let updates = worker.poly_route_mut(&iid).reconcile_orphans_on(
-                        &permit,
-                        &pending_places,
-                        &pending_cancels,
-                        &pending_trade_ids,
-                    );
+                    let updates = match worker.poly_route_mut(&iid) {
+                        Ok(route) => route.reconcile_orphans_on(
+                            &permit,
+                            &pending_places,
+                            &pending_cancels,
+                            &pending_trade_ids,
+                        ),
+                        Err(error) => {
+                            error!("[Executor] Polymarket reconcile route error: {}", error);
+                            reconcile_deferred_updates(
+                                &iid,
+                                &pending_places,
+                                &pending_cancels,
+                                &pending_trade_ids,
+                            )
+                        }
+                    };
                     for update in updates {
                         if utx.send(update).is_err() {
                             break;
@@ -7376,7 +7589,9 @@ fn execute_fallback_signal(
                 return vec![build_exec_rejected_place(&order)];
             }
             let result = if order.exchange == Exchange::Polymarket {
-                executor.poly_route_mut(&instance_id).submit_order(&order)
+                executor
+                    .poly_route_mut(&instance_id)
+                    .and_then(|route| route.submit_order(&order))
             } else {
                 executor.submit_order(&order)
             };
@@ -7412,9 +7627,10 @@ fn execute_fallback_signal(
             // Cancellation is monotonic: age can make a replacement quote
             // stale, but never makes pulling the old order unsafe.
             let result = if exchange == Exchange::Polymarket {
-                let route = executor.poly_route_mut(&instance_id);
-                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log line
-                route.cancel_order(exchange, &client_order_id)
+                executor.poly_route_mut(&instance_id).and_then(|route| {
+                    route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log line
+                    route.cancel_order(exchange, &client_order_id)
+                })
             } else {
                 executor.cancel_order(exchange, &client_order_id)
             };
@@ -7432,7 +7648,7 @@ fn execute_fallback_signal(
             let result = if exchange == Exchange::Polymarket {
                 executor
                     .poly_route_mut(&instance_id)
-                    .cancel_all(exchange, &symbol)
+                    .and_then(|route| route.cancel_all(exchange, &symbol))
             } else {
                 executor.cancel_all(exchange, &symbol)
             };
@@ -7458,7 +7674,7 @@ fn execute_fallback_signal(
             let result = if exchange == Exchange::Polymarket {
                 executor
                     .poly_route_mut(&instance_id)
-                    .batch_submit_orders(&market_id, &orders)
+                    .and_then(|route| route.batch_submit_orders(&market_id, &orders))
             } else {
                 executor.batch_submit_orders(&market_id, &orders)
             };
@@ -7475,9 +7691,10 @@ fn execute_fallback_signal(
             ..
         } => {
             let result = if exchange == Exchange::Polymarket {
-                let route = executor.poly_route_mut(&instance_id);
-                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
-                route.batch_cancel_orders(exchange, &market_id, &client_order_ids)
+                executor.poly_route_mut(&instance_id).and_then(|route| {
+                    route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                    route.batch_cancel_orders(exchange, &market_id, &client_order_ids)
+                })
             } else {
                 executor.batch_cancel_orders(exchange, &market_id, &client_order_ids)
             };
@@ -7500,9 +7717,14 @@ fn execute_fallback_signal(
                     cancel_client_order_ids.len(), place_orders.len(),
                 );
                 let mut out = if exchange == Exchange::Polymarket {
-                    let route = executor.poly_route_mut(&instance_id);
-                    route.set_gen_ns_hint(timestamp_ns);
-                    route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                    executor.poly_route_mut(&instance_id).and_then(|route| {
+                        route.set_gen_ns_hint(timestamp_ns);
+                        route.batch_cancel_orders(
+                            exchange,
+                            &market_id,
+                            &cancel_client_order_ids,
+                        )
+                    })
                 } else {
                     executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
                 }
@@ -7514,14 +7736,15 @@ fn execute_fallback_signal(
                 return out;
             }
             let result = if exchange == Exchange::Polymarket {
-                let route = executor.poly_route_mut(&instance_id);
-                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
-                route.batch_update_orders(
-                    exchange,
-                    &market_id,
-                    &cancel_client_order_ids,
-                    &place_orders,
-                )
+                executor.poly_route_mut(&instance_id).and_then(|route| {
+                    route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                    route.batch_update_orders(
+                        exchange,
+                        &market_id,
+                        &cancel_client_order_ids,
+                        &place_orders,
+                    )
+                })
             } else {
                 executor.batch_update_orders(
                     exchange,
@@ -7549,9 +7772,14 @@ fn execute_fallback_signal(
                     cancel_client_order_ids.len(), place_orders.len(),
                 );
                 let mut out = if exchange == Exchange::Polymarket {
-                    let route = executor.poly_route_mut(&instance_id);
-                    route.set_gen_ns_hint(timestamp_ns);
-                    route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
+                    executor.poly_route_mut(&instance_id).and_then(|route| {
+                        route.set_gen_ns_hint(timestamp_ns);
+                        route.batch_cancel_orders(
+                            exchange,
+                            &market_id,
+                            &cancel_client_order_ids,
+                        )
+                    })
                 } else {
                     executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
                 }
@@ -7563,14 +7791,15 @@ fn execute_fallback_signal(
                 return out;
             }
             let result = if exchange == Exchange::Polymarket {
-                let route = executor.poly_route_mut(&instance_id);
-                route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
-                route.replace_order(
-                    exchange,
-                    &market_id,
-                    &cancel_client_order_ids,
-                    &place_orders,
-                )
+                executor.poly_route_mut(&instance_id).and_then(|route| {
+                    route.set_gen_ns_hint(timestamp_ns); // `gen_ns=` on the cancel log lines
+                    route.replace_order(
+                        exchange,
+                        &market_id,
+                        &cancel_client_order_ids,
+                        &place_orders,
+                    )
+                })
             } else {
                 executor.replace_order(
                     exchange,
@@ -7589,18 +7818,53 @@ fn execute_fallback_signal(
             pending_cancels,
             pending_trade_ids,
             ..
-        } => executor.poly_route_mut(&instance_id).reconcile_orphans(
-            &pending_places,
-            &pending_cancels,
-            &pending_trade_ids,
-        ),
+        } => match executor.poly_route_mut(&instance_id) {
+            Ok(route) => route.reconcile_orphans(
+                &pending_places,
+                &pending_cancels,
+                &pending_trade_ids,
+            ),
+            Err(error) => {
+                error!("[Executor] Polymarket reconcile route error: {}", error);
+                reconcile_deferred_updates(
+                    &instance_id,
+                    &pending_places,
+                    &pending_cancels,
+                    &pending_trade_ids,
+                )
+            }
+        },
         Signal::PolymarketCancelAllOrders {
             reason,
             market,
             asset_ids,
             ..
         } => {
-            let route = executor.poly_route_mut(&instance_id);
+            let route = match executor.poly_route_mut(&instance_id) {
+                Ok(route) => route,
+                Err(error) => {
+                    error!(
+                        "[Executor] Polymarket cancel-all route error instance_id={}: {}",
+                        instance_id, error,
+                    );
+                    return vec![OrderUpdate {
+                        client_order_id: instance_id,
+                        exchange: Exchange::Polymarket,
+                        symbol: market.unwrap_or_default(),
+                        side: Side::Buy,
+                        exchange_order_id: None,
+                        status: OrderStatus::ExecutorRejected,
+                        liquidity: None,
+                        filled_quantity: 0.0,
+                        remaining_quantity: 0.0,
+                        avg_fill_price: 0.0,
+                        timestamp_ns: now_ns(),
+                        trade_id: None,
+                        order_audit: None,
+                        error: Some(error.to_string()),
+                    }];
+                }
+            };
             match market {
                 Some(cid) => {
                     if is_routine_expiry_cancel(&reason, true) {
@@ -7662,10 +7926,10 @@ fn execute_fallback_signal(
             asset_ids,
             ..
         } => {
-            if let Err(error) = executor
-                .poly_route_mut(&instance_id)
-                .retain_event_audit(&condition_id, &asset_ids)
-            {
+            let retained = executor.poly_route_mut(&instance_id).and_then(|route| {
+                route.retain_event_audit(&condition_id, &asset_ids)
+            });
+            if let Err(error) = retained {
                 error!(
                     "[Executor] failed to retain Polymarket event audit instance_id={} condition_id={}: {}",
                     instance_id, condition_id, error,
@@ -7678,9 +7942,13 @@ fn execute_fallback_signal(
             asset_ids,
             ..
         } => {
-            executor
-                .poly_route_mut(&instance_id)
-                .retire_event_audit(&condition_id, &asset_ids);
+            match executor.poly_route_mut(&instance_id) {
+                Ok(route) => route.retire_event_audit(&condition_id, &asset_ids),
+                Err(error) => error!(
+                    "[Executor] failed to retire Polymarket event audit instance_id={} condition_id={}: {}",
+                    instance_id, condition_id, error,
+                ),
+            }
             vec![]
         }
         _ => vec![],
@@ -7700,11 +7968,6 @@ struct LiveRouter {
     /// signal has no instance_id or references an unknown one
     /// (with a WARN at that call site).
     poly_routes: HashMap<String, PolymarketTrade>,
-    /// Lex-first instance_id from `poly_routes` — cached so the
-    /// default route lookup is O(1) on the hot path. Empty iff
-    /// `poly_routes` is empty (only valid for paper / BT paths that
-    /// never touch poly).
-    poly_default_id: String,
     /// Live-mutable back-compat view: returns the default instance's
     /// `PolymarketTrade` for callers that haven't yet been migrated
     /// to per-instance routing. Kept as a separate clone so methods
@@ -8012,7 +8275,6 @@ impl LiveRouter {
         Self {
             binance: BinanceTrade::new(),
             poly_routes,
-            poly_default_id,
             polymarket,
             hexmarket: HexmarketTrade::new(
                 hex_private_key,
@@ -8026,34 +8288,36 @@ impl LiveRouter {
         }
     }
 
-    /// Look up the `PolymarketTrade` for a given `instance_id`. Falls
-    /// back to the default (lex-first) when the id is empty or
-    /// unknown, with a one-line WARN so the operator notices a
-    /// signal-routing miss.
+    /// Look up the `PolymarketTrade` for a given `instance_id`. Legacy signals
+    /// with an empty id may use the default route, but an explicit unknown id
+    /// is never sent through a sibling wallet. Missing routes are ordinary
+    /// executor errors rather than process panics.
     #[allow(dead_code)]
-    fn poly_route_mut(&mut self, instance_id: &str) -> &mut PolymarketTrade {
-        if !instance_id.is_empty() && self.poly_routes.contains_key(instance_id) {
-            return self
-                .poly_routes
-                .get_mut(instance_id)
-                .expect("contains_key checked");
-        }
+    fn poly_route_mut(&mut self, instance_id: &str) -> Result<&mut PolymarketTrade> {
         if !instance_id.is_empty() {
-            warn!(
-                "[LiveRouter] Unknown polymarket instance_id `{}`; routing to default `{}`",
-                instance_id, self.poly_default_id,
-            );
+            if !self.poly_routes.contains_key(instance_id) {
+                let mut routes: Vec<&str> =
+                    self.poly_routes.keys().map(String::as_str).collect();
+                routes.sort_unstable();
+                return Err(anyhow::anyhow!(
+                    "unknown Polymarket instance_id `{}` (available routes: [{}])",
+                    instance_id,
+                    routes.join(","),
+                ));
+            }
+            return match self.poly_routes.get_mut(instance_id) {
+                Some(route) => Ok(route),
+                None => Err(anyhow::anyhow!(
+                    "Polymarket route `{}` disappeared during executor lookup",
+                    instance_id,
+                )),
+            };
         }
-        // Fall back to the default in-place clone. This keeps the
-        // hot path simple at the cost of one extra PolymarketTrade
-        // allocation at construction; legacy callsites that never
-        // populated an instance_id behave exactly as before.
-        //
-        // Only reached for `Exchange::Polymarket` signals, which imply at
-        // least one polymaker instance → `polymarket` is `Some`.
         self.polymarket
             .as_mut()
-            .expect("poly_route_mut called with no PolymarketTrade configured")
+            .ok_or_else(|| anyhow::anyhow!(
+                "Polymarket route requested with no PolymarketTrade configured"
+            ))
     }
 
     /// The default `PolymarketTrade`, or a clear error if no polymaker
@@ -8994,6 +9258,32 @@ mod market_router_tests {
         let error = register_polymarket_wallet_identity(&mut wallets, "zhu02", "0xABC")
             .unwrap_err();
         assert!(error.contains("both account_id `hex001` and `zhu02`"));
+    }
+
+    #[test]
+    fn empty_polymarket_route_returns_error_without_panicking() {
+        let config: Config = toml::from_str("[general]\nmode = 'live'").unwrap();
+        let mut router = LiveRouter::new_with_poly_map(&config, &HashMap::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            router.poly_route_mut("btc03").map(|_| ())
+        }));
+        assert!(result.is_ok(), "route lookup must never panic");
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(error.contains("unknown Polymarket instance_id `btc03`"));
+    }
+
+    #[test]
+    fn critical_thread_completion_is_detected_without_joining() {
+        let finished = thread::spawn(|| {});
+        while !finished.is_finished() {
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            first_finished_critical_thread(&[("execution", &finished)]),
+            Some("execution"),
+        );
+        finished.join().unwrap();
     }
 
     #[test]
