@@ -966,8 +966,6 @@ impl Engine {
         // and order-id registry are per-instance (Phase 2a).
         let poly_states = self.build_poly_shared_states_map();
 
-        let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
-
         // Stale-signal threshold handle — shared `Arc<AtomicU64>` between
         // the executor (reads on every signal arrival) and the strategy
         // (writes on each event boundary as part of the per-event RTT-N
@@ -1112,6 +1110,12 @@ impl Engine {
             &poly_states,
             Some(shutdown_done_rx),
         );
+
+        // Strategy construction performs prediction/APV2 warm-up
+        // synchronously. Subscribe only after it returns: otherwise the
+        // bounded market queue can fill while no consumer exists, block CLOB
+        // socket consumption, and leave the first tradable book stale.
+        let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
 
@@ -5773,8 +5777,21 @@ impl Engine {
                         && out.contains_key(&strategy.instance_id)
                 })
                 .collect();
-            let configured_instances: HashSet<String> = configured_strategies
+            // `enabled=false` stops new workers/orders; it does not erase the
+            // instance's historical ownership. Keep disabled configured
+            // instances in the registry so offline auto-redeem can credit
+            // their persisted positions instead of treating them as orphaned.
+            let configured_instances: HashSet<String> = self
+                .config
+                .strategies
                 .iter()
+                .filter(|strategy| {
+                    self.registry
+                        .capabilities(&strategy.name)
+                        .needs_poly_user_feed
+                        && strategy.account_id() == account_id
+                        && !strategy.instance_id.is_empty()
+                })
                 .map(|strategy| strategy.instance_id.clone())
                 .collect();
             let target_weights: std::collections::BTreeMap<String, f64> = configured_strategies
@@ -5971,10 +5988,10 @@ impl Engine {
                 .spawn(move || {
                     crate::os_tune::pin_background("poly-order-recovery");
                     while !recovery_shutdown.load(Ordering::Relaxed) {
-                        let pending = recovery_shared
-                            .account_state
-                            .monitoring_snapshot()
-                            .recovery_pending_orders;
+                        let before = recovery_shared.account_state.monitoring_snapshot();
+                        let pending = before
+                            .recovery_pending_orders
+                            .saturating_add(before.routine_cancel_audits);
                         if pending > 0 {
                             let recovery = PolymarketTrade::from_shared(
                                 recovery_shared.clone(),
@@ -5988,24 +6005,38 @@ impl Engine {
                                     return;
                                 }
                             }
+                            let after = recovery_shared.account_state.monitoring_snapshot();
                             if unresolved > 0 {
                                 warn!(
                                     "[Engine] Polymarket account={} background recovery still pending: {} order(s)",
                                     recovery_account_id,
                                     unresolved,
                                 );
-                            } else {
+                            } else if after.routine_cancel_audits > 0 {
+                                log::debug!(
+                                    "[Engine] Polymarket account={} routine cancel audits still pending: {} order(s)",
+                                    recovery_account_id,
+                                    after.routine_cancel_audits,
+                                );
+                            } else if before.recovery_pending_orders > 0 {
                                 info!(
                                     "[Engine] Polymarket account={} background order recovery complete",
                                     recovery_account_id,
                                 );
                             }
                         }
-                        for _ in 0..5 {
+                        let poll_slices = if before.recovery_pending_orders == 0
+                            && before.routine_cancel_audits > 0
+                        {
+                            1
+                        } else {
+                            10
+                        };
+                        for _ in 0..poll_slices {
                             if recovery_shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
-                            thread::sleep(std::time::Duration::from_secs(1));
+                            thread::sleep(std::time::Duration::from_millis(500));
                         }
                     }
                 })
@@ -6389,7 +6420,7 @@ impl Engine {
                                         let snapshot = account.monitoring_snapshot();
                                         let log_account = || {
                                             format!(
-                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
+                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
                                                 snapshot.physical_cash,
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
@@ -6402,6 +6433,7 @@ impl Engine {
                                                 snapshot.uncertain_since_ms,
                                                 snapshot.uncertain_reason,
                                                 snapshot.recovery_pending_orders,
+                                                snapshot.routine_cancel_audits,
                                                 snapshot.gap_replay_last_pages,
                                                 snapshot.gap_replay_max_pages,
                                                 snapshot.gap_replay_total_pages,

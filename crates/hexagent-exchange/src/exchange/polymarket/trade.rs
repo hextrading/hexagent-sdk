@@ -67,6 +67,24 @@ struct RuntimeOrderAuditPass {
     errors: Vec<String>,
 }
 
+/// Normalize the terminal trade endpoint while preserving the distinction
+/// between an absent record and a record rejected later by parsing/invariants.
+fn terminal_trade_records(json: serde_json::Value, trade_id: &str) -> Vec<serde_json::Value> {
+    let records = if let Some(records) = json.as_array() {
+        records.clone()
+    } else if let Some(records) = json.get("data").and_then(|value| value.as_array()) {
+        records.clone()
+    } else if json.get("id").and_then(|value| value.as_str()).is_some() {
+        vec![json]
+    } else {
+        Vec::new()
+    };
+    records
+        .into_iter()
+        .filter(|record| record.get("id").and_then(|value| value.as_str()) == Some(trade_id))
+        .collect()
+}
+
 /// One bounded market-expiry cancel attempt. `confirmed` is true only after
 /// every DELETE response has the authoritative schema and the token-scoped
 /// order/trade audit has no remaining live or recovery-pending rows.
@@ -1758,8 +1776,8 @@ impl SharedState {
         if status == OrderStatus::Cancelled {
             self.open_orders.lock().unwrap().remove(client_order_id);
             if self.account_state.mark_cancelled_pending_audit(client_order_id) {
-                warn!(
-                    "[PolymarketTrade] Cancelled coid={} awaits authoritative size_matched audit; preserving reservation",
+                info!(
+                    "[PolymarketTrade] Cancelled coid={} queued routine size_matched audit; preserving reservation without blocking account",
                     client_order_id,
                 );
             }
@@ -2711,7 +2729,7 @@ impl PolymarketTrade {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
             let pending: Vec<(String, String, OrderStatus)> = {
-                let coids = self.shared.account_state.recovery_pending_order_ids();
+                let coids = self.shared.account_state.pending_order_audit_ids();
                 let ids = self.shared.coid_to_oid.lock().unwrap();
                 coids
                     .into_iter()
@@ -2891,7 +2909,7 @@ impl PolymarketTrade {
                 .filter_map(|(coid, tracked)| ids.get(coid)
                     .map(|oid| (coid.clone(), (tracked.clone(), oid.clone()))))
                 .collect();
-            for coid in self.shared.account_state.recovery_pending_order_ids() {
+            for coid in self.shared.account_state.pending_order_audit_ids() {
                 if rows.contains_key(&coid) { continue; }
                 let Some(order) = self.shared.account_state.order(&coid) else { continue; };
                 if token_filter.is_some_and(|tokens| !tokens.contains(&order.token_id)) {
@@ -3142,14 +3160,13 @@ impl PolymarketTrade {
                 emit_update(update);
             }
             let open_orders = self.shared.open_orders.lock().unwrap().len();
-            let recovery_pending = self
-                .shared
-                .account_state
-                .monitoring_snapshot()
-                .recovery_pending_orders;
+            let monitoring = self.shared.account_state.monitoring_snapshot();
+            let recovery_pending = monitoring.recovery_pending_orders;
+            let routine_cancel_audits = monitoring.routine_cancel_audits;
             let local_clean = audit.errors.is_empty()
                 && open_orders == 0
-                && recovery_pending == 0;
+                && recovery_pending == 0
+                && routine_cancel_audits == 0;
 
             if remote_clean && local_clean {
                 info!(
@@ -3161,12 +3178,13 @@ impl PolymarketTrade {
             }
 
             warn!(
-                "[PolymarketTrade] shutdown cancel barrier retry attempt={} remote_clean={} remote={} open_orders={} recovery_pending={} audit_errors={:?}",
+                "[PolymarketTrade] shutdown cancel barrier retry attempt={} remote_clean={} remote={} open_orders={} recovery_pending={} routine_cancel_audits={} audit_errors={:?}",
                 attempt,
                 remote_clean,
                 remote_detail,
                 open_orders,
                 recovery_pending,
+                routine_cancel_audits,
                 audit.errors,
             );
         }
@@ -3290,7 +3308,7 @@ impl PolymarketTrade {
             let recovery_pending = self
                 .shared
                 .account_state
-                .recovery_pending_order_ids()
+                .pending_order_audit_ids()
                 .into_iter()
                 .filter(|coid| {
                     self.shared
@@ -4337,20 +4355,17 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let records = if let Some(records) = json.as_array() {
-                records.clone()
-            } else if let Some(records) = json.get("data").and_then(|value| value.as_array()) {
-                records.clone()
-            } else if json.get("id").and_then(|value| value.as_str()).is_some() {
-                vec![json]
-            } else {
-                Vec::new()
-            };
+            let records = terminal_trade_records(json, &trade_id);
+            if records.is_empty() {
+                warn!(
+                    "[orphan_metric] terminal_trade_backfill_missing=1 trade_id={} lock_release=forbidden",
+                    trade_id,
+                );
+                continue;
+            }
+            let record_count = records.len();
             let mut matched = 0usize;
             for mut record in records {
-                if record.get("id").and_then(|value| value.as_str()) != Some(trade_id.as_str()) {
-                    continue;
-                }
                 if let Some(object) = record.as_object_mut() {
                     object.entry("event_type".to_string())
                         .or_insert(serde_json::Value::String("trade".to_string()));
@@ -4361,8 +4376,8 @@ impl PolymarketTrade {
             }
             if matched == 0 {
                 warn!(
-                    "[orphan_metric] terminal_trade_backfill_missing=1 trade_id={} lock_release=forbidden",
-                    trade_id,
+                    "[orphan_metric] terminal_trade_backfill_parser_rejected=1 trade_id={} records={} ownership_anomalies={} lock_release=forbidden",
+                    trade_id, record_count, self.shared.account_state.ownership_anomalies().len(),
                 );
             } else {
                 info!(
@@ -6572,6 +6587,26 @@ mod tests {
             0.5,
             1.0,
         )
+    }
+
+    #[test]
+    fn terminal_trade_lookup_distinguishes_absent_from_present_record() {
+        let trade_id = "43535f84-454f-4302-b4cd-23b4510d9723";
+        assert!(terminal_trade_records(serde_json::json!([]), trade_id).is_empty());
+        assert!(terminal_trade_records(
+            serde_json::json!({"data": [{"id": "different"}]}),
+            trade_id,
+        )
+        .is_empty());
+
+        let present = terminal_trade_records(
+            serde_json::json!({
+                "data": [{"id": trade_id, "status": "MATCHED", "malformed": true}]
+            }),
+            trade_id,
+        );
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0]["id"], trade_id);
     }
 
     #[test]
