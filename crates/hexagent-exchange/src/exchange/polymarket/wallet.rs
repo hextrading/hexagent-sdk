@@ -477,6 +477,34 @@ pub(crate) fn load_wallet_for_account(account_id: &str) -> Result<WalletInfo> {
     load_wallet()
 }
 
+/// Startup preflight for live split/redeem. This deliberately resolves the
+/// same per-account registry path used by the maintenance worker and proves it
+/// names the same funds wallet as the account's trading route. It catches a
+/// missing registration, builder credentials, or account/instance mismatch
+/// before strategies and market feeds start.
+pub fn validate_registered_account_wallet(
+    account_id: &str,
+    expected_primary_address: &str,
+) -> Result<()> {
+    if account_id.trim().is_empty() {
+        return Err(anyhow!("maintenance wallet preflight requires account_id"));
+    }
+    let wallet = load_wallet_for_account(account_id)?;
+    if expected_primary_address.trim().is_empty()
+        || !wallet
+            .primary_address()
+            .eq_ignore_ascii_case(expected_primary_address.trim())
+    {
+        return Err(anyhow!(
+            "maintenance wallet mismatch for account `{}`: registered primary={} trading maker/funder={}",
+            account_id,
+            wallet.primary_address(),
+            expected_primary_address,
+        ));
+    }
+    Ok(())
+}
+
 // balanceOf(address) selector
 const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 
