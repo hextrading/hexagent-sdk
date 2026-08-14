@@ -213,6 +213,7 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             gap_replay_reconnect_rewind_ms: 5000,
             executor_workers: 8,
             account_ledger_dir: String::new(),
+            account_ledger_require_existing: false,
             account_address: String::new(),
             network: String::new(),
         });

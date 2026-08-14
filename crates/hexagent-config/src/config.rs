@@ -1055,7 +1055,7 @@ pub struct ExchangeConfig {
     #[serde(default)]
     pub source: String,
     /// Chainlink Data Streams feed IDs (hex) keyed by their event/archive
-    /// labels (for example `eth/usd` or `eth/usd/twap/30s`). For
+    /// labels (for example `eth/usd` or `eth/usd/twap/60s`). For
     /// `name = "chainlink", source = "stream"`, this is the canonical
     /// subscription configuration; the engine projects valid entries to the
     /// adapter's internal `feed_id:label` format. Strategies may also use the
@@ -1142,6 +1142,12 @@ pub struct ExchangeConfig {
     /// `./data/state/polymarket-ledgers`; explicitly empty disables persistence.
     #[serde(default = "default_account_ledger_dir")]
     pub account_ledger_dir: String,
+    /// Polymarket-only — refuse to create a fresh account ledger when the
+    /// expected per-account file is absent. Production shared wallets should
+    /// enable this so a wrong cwd/unmounted state volume cannot silently erase
+    /// disabled-instance ownership or offline auto-redeem history.
+    #[serde(default)]
+    pub account_ledger_require_existing: bool,
     /// Hyperliquid-only — the master/owner account address (0x-hex, 20 bytes)
     /// whose positions and fills are queried and traded. When signing with an
     /// approved **API agent wallet**, `private_key` is the agent key while

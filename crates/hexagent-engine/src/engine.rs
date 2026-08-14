@@ -31,6 +31,37 @@ use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 const CHANNEL_CAPACITY: usize = 10_000;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
 
+fn account_ledger_display_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn validate_required_account_ledger(
+    path: Option<&std::path::Path>,
+    require_existing: bool,
+) -> std::result::Result<(), String> {
+    if !require_existing {
+        return Ok(());
+    }
+    let Some(path) = path else {
+        return Err(
+            "account_ledger_require_existing=true but account_ledger_dir is empty".to_string(),
+        );
+    };
+    if !path.is_file() {
+        return Err(format!(
+            "required durable account ledger is missing or not a file: {}",
+            account_ledger_display_path(path).display(),
+        ));
+    }
+    Ok(())
+}
+
 fn elapsed_ns(origin: &std::time::Instant) -> u64 {
     origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
@@ -530,6 +561,19 @@ mod public_subscription_coalesce_tests {
     }
 
     #[test]
+    fn required_account_ledger_fails_closed_when_history_is_absent() {
+        let missing = std::env::temp_dir().join(format!(
+            "hexagent-required-ledger-missing-{}-{}.json",
+            std::process::id(),
+            crate::types::now_ns(),
+        ));
+        assert!(validate_required_account_ledger(Some(&missing), false).is_ok());
+        let error = validate_required_account_ledger(Some(&missing), true).unwrap_err();
+        assert!(error.contains("required durable account ledger is missing"));
+        assert!(validate_required_account_ledger(None, true).is_err());
+    }
+
+    #[test]
     fn identical_public_blocks_share_one_case_insensitive_symbol_set() {
         let mut exchanges = vec![
             exchange("name = 'binance'\nsymbols = ['BTCUSDT', 'ETHUSDT']"),
@@ -556,14 +600,14 @@ mod public_subscription_coalesce_tests {
         let twap = format!("0x{:064x}", 2);
         let mut exchanges = vec![exchange(&format!(
             "name = 'chainlink'\nsource = 'stream'\nsymbols = ['stale']\n\
-             feed_ids = {{ 'btc/usd/twap/30s' = '{twap}', 'btc/usd' = '{btc}', 'eth/usd' = '' }}"
+             feed_ids = {{ 'btc/usd/twap/60s' = '{twap}', 'btc/usd' = '{btc}', 'eth/usd' = '' }}"
         ))];
 
         normalize_chainlink_stream_subscriptions(RunMode::Live, &mut exchanges);
 
         assert_eq!(
             exchanges[0].symbols,
-            vec![format!("{btc}:btc/usd"), format!("{twap}:btc/usd/twap/30s")]
+            vec![format!("{btc}:btc/usd"), format!("{twap}:btc/usd/twap/60s")]
         );
     }
 
@@ -571,13 +615,13 @@ mod public_subscription_coalesce_tests {
     fn chainlink_backtest_keeps_archive_labels() {
         let btc = format!("0x{:064x}", 1);
         let mut exchanges = vec![exchange(&format!(
-            "name = 'chainlink'\nsource = 'stream'\nsymbols = ['btc/usd/twap/30s']\n\
+            "name = 'chainlink'\nsource = 'stream'\nsymbols = ['btc/usd/twap/60s']\n\
              feed_ids = {{ 'btc/usd' = '{btc}' }}"
         ))];
 
         normalize_chainlink_stream_subscriptions(RunMode::Backtest, &mut exchanges);
 
-        assert_eq!(exchanges[0].symbols, vec!["btc/usd/twap/30s"]);
+        assert_eq!(exchanges[0].symbols, vec!["btc/usd/twap/60s"]);
     }
 }
 
@@ -5681,6 +5725,25 @@ impl Engine {
                 Some(PathBuf::from(&poly_cfg.account_ledger_dir)
                     .join(format!("{}.json", safe_account)))
             };
+            if let Err(error) = validate_required_account_ledger(
+                ledger_path.as_deref(),
+                poly_cfg.account_ledger_require_existing,
+            ) {
+                error!(
+                    "[Engine] refusing every Polymarket strategy: account={} {}; a fresh ledger would lose historical/disabled-instance ownership and offline auto-redeem attribution",
+                    account_id, error,
+                );
+                return HashMap::new();
+            }
+            if let Some(path) = ledger_path.as_deref() {
+                info!(
+                    "[Engine] account={} durable ledger path={} require_existing={} bytes={}",
+                    account_id,
+                    account_ledger_display_path(path).display(),
+                    poly_cfg.account_ledger_require_existing,
+                    std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+                );
+            }
             match PolymarketTrade::new_with_pool(
                 &creds.api_key,
                 &creds.api_secret,
