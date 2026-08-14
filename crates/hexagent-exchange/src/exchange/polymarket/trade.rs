@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use hexagent_account::account::shared_account::normalize_order_id;
+use hexagent_account::account::shared_account::{OrderOwnership, normalize_order_id};
 use log::{info, warn};
 
 use crate::async_rt;
@@ -120,6 +120,46 @@ enum FetchUnavailable {
     Transport,
     Http(u16),
     InvalidResponse(String),
+}
+
+impl FetchUnavailable {
+    /// Polymarket returns a literal JSON `null` for some orders after their
+    /// event has closed. The general lookup path deliberately keeps that
+    /// response unavailable; only durable-order recovery may terminalize it.
+    fn is_json_null(&self) -> bool {
+        matches!(self, Self::InvalidResponse(body) if body.trim() == "null")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveredOrderCloseReason {
+    EventEnded,
+    JsonNull,
+}
+
+impl RecoveredOrderCloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EventEnded => "event_end_recorded",
+            Self::JsonNull => "single_order_lookup_json_null",
+        }
+    }
+}
+
+/// The exception is deliberately recovery-scoped. A literal null remains an
+/// unavailable response for ordinary live/orphan lookups.
+fn recovered_order_close_reason(
+    is_recovered: bool,
+    event_has_ended: bool,
+    unavailable: Option<&FetchUnavailable>,
+) -> Option<RecoveredOrderCloseReason> {
+    is_recovered.then_some(())?;
+    if event_has_ended {
+        return Some(RecoveredOrderCloseReason::EventEnded);
+    }
+    unavailable
+        .is_some_and(FetchUnavailable::is_json_null)
+        .then_some(RecoveredOrderCloseReason::JsonNull)
 }
 
 impl FetchOrderResult {
@@ -2764,8 +2804,10 @@ impl PolymarketTrade {
     /// Resolve potentially-live orders restored from the durable account
     /// ledger before strategy workers are allowed to quote. A recovered order
     /// remains a sticky account-level risk-off condition until an order-
-    /// specific lookup proves it cancelled/rejected, or every trade named by
-    /// a MATCHED/FILLED audit has been replayed into the shared ledger.
+    /// specific lookup proves it cancelled/rejected, its event is durably
+    /// known to have ended, its recovery-only lookup returns literal JSON
+    /// `null`, or every trade named by a MATCHED/FILLED audit has been replayed
+    /// into the shared ledger.
     ///
     /// The bounded retry window covers the common pending/delayed write-index
     /// race without turning startup into an unbounded wait. Anything still
@@ -2786,14 +2828,22 @@ impl PolymarketTrade {
             if delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
-            let pending: Vec<(String, String, OrderStatus)> = {
+            let pending: Vec<(String, String, OrderOwnership, bool)> = {
                 let coids = self.shared.account_state.pending_order_audit_ids();
+                let recovered: HashSet<String> = self
+                    .shared
+                    .account_state
+                    .recovery_pending_order_ids()
+                    .into_iter()
+                    .collect();
                 let ids = self.shared.coid_to_oid.lock().unwrap();
                 coids
                     .into_iter()
                     .filter_map(|coid| {
-                        let status = self.shared.account_state.order(&coid)?.status;
-                        ids.get(&coid).map(|oid| (coid, oid.clone(), status))
+                        let ownership = self.shared.account_state.order(&coid)?;
+                        let is_recovered = recovered.contains(&coid);
+                        ids.get(&coid)
+                            .map(|oid| (coid, oid.clone(), ownership, is_recovered))
                     })
                     .collect()
             };
@@ -2806,7 +2856,21 @@ impl PolymarketTrade {
                 return (unresolved, replayed_updates);
             }
 
-            for (coid, order_id, durable_status) in pending {
+            for (coid, order_id, ownership, is_recovered) in pending {
+                if let Some(reason) = recovered_order_close_reason(
+                    is_recovered,
+                    self.shared
+                        .account_state
+                        .token_event_has_ended(&ownership.token_id),
+                    None,
+                ) {
+                    replayed_updates.push(self.close_recovered_order(
+                        &ownership,
+                        &order_id,
+                        reason.as_str(),
+                    ));
+                    continue;
+                }
                 match self.fetch_order_by_id(&coid, &order_id, None) {
                     FetchOrderResult::Found(order) => {
                         match order.status.as_str() {
@@ -2816,7 +2880,7 @@ impl PolymarketTrade {
                                 // Filled, never regress it to LIVE or release
                                 // its reservation through a later cancel ACK;
                                 // wait for the associated trade audit instead.
-                                if durable_status == OrderStatus::Filled {
+                                if ownership.status == OrderStatus::Filled {
                                     warn!(
                                         "[PolymarketTrade] trade-audit coid={} orderID={} returned stale LIVE; retaining Filled reservation",
                                         coid, order_id,
@@ -2892,6 +2956,15 @@ impl PolymarketTrade {
                             coid, order_id, attempt + 1, evidence,
                         );
                     }
+                    FetchOrderResult::Unavailable(kind)
+                        if recovered_order_close_reason(is_recovered, false, Some(&kind))
+                            == Some(RecoveredOrderCloseReason::JsonNull) => {
+                        replayed_updates.push(self.close_recovered_order(
+                            &ownership,
+                            &order_id,
+                            RecoveredOrderCloseReason::JsonNull.as_str(),
+                        ));
+                    }
                     FetchOrderResult::Unavailable(kind) => warn!(
                         "[PolymarketTrade] startup recovery coid={} orderID={} unavailable={:?} attempt={} — retaining reservation",
                         coid, order_id, kind, attempt + 1,
@@ -2921,6 +2994,52 @@ impl PolymarketTrade {
             );
         }
         (unresolved, replayed_updates)
+    }
+
+    /// Close only an order that is already in durable recovery. Event-end and
+    /// literal-null evidence prove that it is no longer open, but do not
+    /// rewrite already-observed fills or invent a terminal match quantity.
+    fn close_recovered_order(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+        reason: &str,
+    ) -> OrderUpdate {
+        let terminal_status = match ownership.status {
+            OrderStatus::Filled => OrderStatus::Filled,
+            OrderStatus::Rejected => OrderStatus::Rejected,
+            _ => OrderStatus::Cancelled,
+        };
+        self.shared
+            .remove_order_resolved_as(&ownership.client_order_id, terminal_status);
+        info!(
+            "[PolymarketTrade] recovered order closed coid={} orderID={} token={} status={:?} reason={} — released residual reservation",
+            ownership.client_order_id,
+            order_id,
+            ownership.token_id,
+            terminal_status,
+            reason,
+        );
+        OrderUpdate {
+            client_order_id: ownership.client_order_id.clone(),
+            exchange: Exchange::Polymarket,
+            symbol: ownership.token_id.clone(),
+            side: ownership.side,
+            exchange_order_id: Some(order_id.to_string()),
+            status: terminal_status,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: if terminal_status == OrderStatus::Filled {
+                0.0
+            } else {
+                (ownership.quantity - ownership.filled_quantity).max(0.0)
+            },
+            avg_fill_price: ownership.price,
+            timestamp_ns: now_ns(),
+            trade_id: None,
+            order_audit: None,
+            error: None,
+        }
     }
 
     /// Audit every locally live or cancellation-pending order after a user
@@ -2985,7 +3104,35 @@ impl PolymarketTrade {
         let mut updates = Vec::new();
         let mut errors = Vec::new();
         let mut not_found = Vec::new();
+        let recovered: HashSet<String> = self
+            .shared
+            .account_state
+            .recovery_pending_order_ids()
+            .into_iter()
+            .collect();
         for (coid, tracked, order_id) in tracked {
+            let ownership = match self.shared.account_state.order(&coid) {
+                Some(ownership) => ownership,
+                None => {
+                    errors.push(format!("open order coid={coid} has no durable ownership row"));
+                    continue;
+                }
+            };
+            let is_recovered = recovered.contains(&coid);
+            if let Some(reason) = recovered_order_close_reason(
+                is_recovered,
+                self.shared
+                    .account_state
+                    .token_event_has_ended(&ownership.token_id),
+                None,
+            ) {
+                updates.push(self.close_recovered_order(
+                    &ownership,
+                    &order_id,
+                    reason.as_str(),
+                ));
+                continue;
+            }
             let fetched = match self.fetch_order_by_id(&coid, &order_id, None) {
                 FetchOrderResult::Found(order) => order,
                 FetchOrderResult::NotFound(evidence) => {
@@ -3000,17 +3147,20 @@ impl PolymarketTrade {
                     });
                     continue;
                 }
+                FetchOrderResult::Unavailable(kind)
+                    if recovered_order_close_reason(is_recovered, false, Some(&kind))
+                        == Some(RecoveredOrderCloseReason::JsonNull) => {
+                    updates.push(self.close_recovered_order(
+                        &ownership,
+                        &order_id,
+                        RecoveredOrderCloseReason::JsonNull.as_str(),
+                    ));
+                    continue;
+                }
                 FetchOrderResult::Unavailable(kind) => {
                     errors.push(format!(
                         "open order coid={coid} orderID={order_id} audit unavailable: {kind:?}"
                     ));
-                    continue;
-                }
-            };
-            let ownership = match self.shared.account_state.order(&coid) {
-                Some(ownership) => ownership,
-                None => {
-                    errors.push(format!("open order coid={coid} has no durable ownership row"));
                     continue;
                 }
             };
@@ -3193,8 +3343,9 @@ impl PolymarketTrade {
     ///
     /// A pass is final only when `/cancel-all` has the complete expected
     /// schema with no failures, all locally known orders were audited (with
-    /// associated trades replayed), and both runtime and durable pending-order
-    /// registries are empty.
+    /// associated trades replayed, except the recovery-only ended-event/null
+    /// closure rule), and both runtime and durable pending-order registries are
+    /// empty.
     pub fn cancel_all_orders_until_final(
         &self,
         mut emit_update: impl FnMut(OrderUpdate),
@@ -7413,6 +7564,34 @@ mod tests {
             ),
             FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(_))
         ));
+
+        let null = classify_successful_order_lookup(&serde_json::Value::Null, "0xabc");
+        assert!(matches!(
+            null,
+            FetchOrderResult::Unavailable(ref kind) if kind.is_json_null()
+        ));
+        assert!(matches!(
+            classify_successful_order_lookup(&serde_json::json!({}), "0xabc"),
+            FetchOrderResult::Unavailable(ref kind) if !kind.is_json_null()
+        ));
+        let null = FetchUnavailable::InvalidResponse("null".to_string());
+        assert_eq!(
+            recovered_order_close_reason(true, false, Some(&null)),
+            Some(RecoveredOrderCloseReason::JsonNull),
+        );
+        assert_eq!(
+            recovered_order_close_reason(true, true, None),
+            Some(RecoveredOrderCloseReason::EventEnded),
+        );
+        assert_eq!(recovered_order_close_reason(false, true, Some(&null)), None);
+        assert_eq!(
+            recovered_order_close_reason(
+                true,
+                false,
+                Some(&FetchUnavailable::InvalidResponse("{}".to_string())),
+            ),
+            None,
+        );
 
         assert!(matches!(
             classify_successful_order_lookup(&serde_json::json!({"status": "LIVE"}), "0xabc"),
