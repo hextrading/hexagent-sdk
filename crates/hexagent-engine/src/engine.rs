@@ -6678,24 +6678,18 @@ impl Engine {
                                                 snapshot.account_id,
                                                 log_account(),
                                             );
-                                        } else {
-                                            info!(
-                                                "[account_metric] account={} {}",
-                                                snapshot.account_id,
-                                                log_account(),
-                                            );
-                                        }
-                                        for instance in snapshot.instances {
-                                            info!(
-                                                "[account_metric] account={} instance={} weight={:.4} virtual_cash={:.6} reserved_cash={:.6} virtual_pos={:?} reserved_pos={:?}",
-                                                snapshot.account_id,
-                                                instance.instance_id,
-                                                instance.weight,
-                                                instance.cash,
-                                                instance.reserved_cash,
-                                                instance.positions,
-                                                instance.reserved_positions,
-                                            );
+                                            for instance in snapshot.instances {
+                                                warn!(
+                                                    "[account_metric] account={} instance={} weight={:.4} virtual_cash={:.6} reserved_cash={:.6} virtual_pos={:?} reserved_pos={:?}",
+                                                    snapshot.account_id,
+                                                    instance.instance_id,
+                                                    instance.weight,
+                                                    instance.cash,
+                                                    instance.reserved_cash,
+                                                    instance.positions,
+                                                    instance.reserved_positions,
+                                                );
+                                            }
                                         }
                                     }
                                 }

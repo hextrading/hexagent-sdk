@@ -5,8 +5,8 @@
 //! but under the hood the WS read loop runs as a tokio task on the shared
 //! async runtime.
 
-use std::error::Error as _;
 use std::collections::HashSet;
+use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,10 +20,10 @@ use log::{debug, info, warn};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::async_rt;
-use crate::types::*;
 use super::live_position::{LivePositionManager, TradeStatus};
 use super::trade::{PolymarketTrade, SharedState};
+use crate::async_rt;
+use crate::types::*;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
@@ -92,10 +92,12 @@ fn enqueue_recovery_update(
     let owner = shared
         .account_state
         .order_owner_by_coid(&update.client_order_id)
-        .ok_or_else(|| anyhow!(
-            "recovery update coid={} has no durable owner",
-            update.client_order_id,
-        ))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "recovery update coid={} has no durable owner",
+                update.client_order_id,
+            )
+        })?;
     shared
         .user_feed_health
         .register_recovery_update(generation, &owner, &update)
@@ -113,7 +115,9 @@ async fn wait_for_recovery_delivery(
     let started = Instant::now();
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            return Err(anyhow!("shutdown while waiting for reconnect updates to drain"));
+            return Err(anyhow!(
+                "shutdown while waiting for reconnect updates to drain"
+            ));
         }
         let Some((enrollment_finished, pending)) = shared
             .user_feed_health
@@ -145,7 +149,9 @@ fn advance_gap_cursor(
         return Ok(false);
     }
     if !seen.insert(next.clone()) {
-        return Err(anyhow!("Gap-fetch /trades returned repeated cursor `{next}`"));
+        return Err(anyhow!(
+            "Gap-fetch /trades returned repeated cursor `{next}`"
+        ));
     }
     *cursor = next;
     Ok(true)
@@ -169,7 +175,12 @@ struct GapSendFailure {
 
 impl GapSendFailure {
     fn new(slot: usize, generation: u64, kind: &'static str, detail: String) -> Self {
-        Self { slot, generation, kind, detail }
+        Self {
+            slot,
+            generation,
+            kind,
+            detail,
+        }
     }
 
     fn from_reqwest(slot: usize, generation: u64, error: &reqwest::Error) -> Self {
@@ -214,10 +225,7 @@ impl fmt::Display for GapSendFailure {
         write!(
             f,
             "slot={} generation={} kind={}: {}",
-            self.slot,
-            self.generation,
-            self.kind,
-            self.detail,
+            self.slot, self.generation, self.kind, self.detail,
         )
     }
 }
@@ -262,19 +270,26 @@ impl GapReplayTransport {
             crate::http1_pool::Role::GapReplay,
         ) {
             Some(permit) => permit,
-            None => return Err(GapAttemptFailure {
-                failure: GapSendFailure::new(
-                    usize::MAX, 0, "pool_busy",
-                    "no GapReplay warm slot available".to_string(),
-                ),
-                _permit: None,
-            }),
+            None => {
+                return Err(GapAttemptFailure {
+                    failure: GapSendFailure::new(
+                        usize::MAX,
+                        0,
+                        "pool_busy",
+                        "no GapReplay warm slot available".to_string(),
+                    ),
+                    _permit: None,
+                })
+            }
         };
         let slot = permit.slot();
         let generation = permit.generation();
         let client = permit.pooled_client();
         let headers = shared.auth.sign_request("GET", "/trades", "");
-        let mut request = client.client().get(url).header("User-Agent", GAP_USER_AGENT);
+        let mut request = client
+            .client()
+            .get(url)
+            .header("User-Agent", GAP_USER_AGENT);
         for (key, value) in headers.as_pairs() {
             request = request.header(key, value);
         }
@@ -314,13 +329,10 @@ impl GapReplayTransport {
                         );
                         Ok(result)
                     }
-                    Err(second) => {
-                        Err(format!(
-                            "primary [{}]; fallback [{}]",
-                            first.failure,
-                            second.failure,
-                        ))
-                    }
+                    Err(second) => Err(format!(
+                        "primary [{}]; fallback [{}]",
+                        first.failure, second.failure,
+                    )),
                 }
             }
         }
@@ -376,21 +388,33 @@ fn required_string<'a>(
     keys: &[&str],
     field: &str,
 ) -> std::result::Result<&'a str, String> {
-    keys.iter().find_map(|key| {
-        data.get(*key).and_then(serde_json::Value::as_str)
-            .map(str::trim).filter(|value| !value.is_empty())
-    }).ok_or_else(|| format!("trade field `{field}` is missing or empty"))
+    keys.iter()
+        .find_map(|key| {
+            data.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| format!("trade field `{field}` is missing or empty"))
 }
 
-fn strict_number(value: Option<&serde_json::Value>, field: &str) -> std::result::Result<f64, String> {
+fn strict_number(
+    value: Option<&serde_json::Value>,
+    field: &str,
+) -> std::result::Result<f64, String> {
     let parsed = match value {
-        Some(serde_json::Value::String(value)) => value.trim().parse::<f64>()
+        Some(serde_json::Value::String(value)) => value
+            .trim()
+            .parse::<f64>()
             .map_err(|_| format!("trade field `{field}` is not a finite number"))?,
-        Some(serde_json::Value::Number(value)) => value.as_f64()
+        Some(serde_json::Value::Number(value)) => value
+            .as_f64()
             .ok_or_else(|| format!("trade field `{field}` is not representable as f64"))?,
         _ => return Err(format!("trade field `{field}` is missing or not numeric")),
     };
-    if !parsed.is_finite() { return Err(format!("trade field `{field}` is not finite")); }
+    if !parsed.is_finite() {
+        return Err(format!("trade field `{field}` is not finite"));
+    }
     Ok(parsed)
 }
 
@@ -408,7 +432,9 @@ fn validate_quantity_price(
     quantity_field: &str,
     price_field: &str,
 ) -> std::result::Result<(), String> {
-    if quantity <= 0.0 { return Err(format!("trade field `{quantity_field}` must be positive")); }
+    if quantity <= 0.0 {
+        return Err(format!("trade field `{quantity_field}` must be positive"));
+    }
     let tolerance = 1e-10_f64.max(price.abs() * 1e-8);
     if price <= 0.0 || price > 1.0 + tolerance {
         return Err(format!("trade field `{price_field}` is outside (0, 1]"));
@@ -454,15 +480,13 @@ fn classify_private_trade_role(
         return Err("trade field `maker_orders` contains a non-object leg".to_string());
     }
     let has_owned_maker_leg = maker_orders.is_some_and(|orders| {
-            orders.iter().any(|order| {
-                order
-                    .get("maker_address")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|address| {
-                        address.eq_ignore_ascii_case(&shared.order_maker_address)
-                    })
-            })
-        });
+        orders.iter().any(|order| {
+            order
+                .get("maker_address")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address))
+        })
+    });
     let taker_id = taker_order_id(data);
     let has_owned_taker_order = taker_id.is_some_and(|order_id| {
         shared.lookup_coid(order_id).is_some()
@@ -484,12 +508,20 @@ fn classify_private_trade_role(
 
 /// Validate every role-specific field before booking any maker leg, avoiding a
 /// partially-applied multi-leg trade when a later leg is malformed.
-fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<(), String> {
+fn validate_trade_event(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> std::result::Result<(), String> {
     required_string(data, &["id", "trade_id"], "id")?;
     let status = required_string(data, &["status"], "status")?;
     let status = status.strip_prefix("TRADE_STATUS_").unwrap_or(status);
-    if !matches!(status, "MATCHED" | "MATCHED_NOT_BROADCASTED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING") {
-        return Err(format!("trade field `status` has unsupported value `{status}`"));
+    if !matches!(
+        status,
+        "MATCHED" | "MATCHED_NOT_BROADCASTED" | "MINED" | "CONFIRMED" | "FAILED" | "RETRYING"
+    ) {
+        return Err(format!(
+            "trade field `status` has unsupported value `{status}`"
+        ));
     }
     match classify_private_trade_role(data, shared)? {
         PrivateTradeRole::Taker => {
@@ -531,21 +563,15 @@ fn validate_trade_event(data: &serde_json::Value, shared: &SharedState) -> std::
                     &format!("maker_orders[{index}].asset_id"),
                 )?;
                 strict_side(
-                    required_string(
-                        order,
-                        &["side"],
-                        &format!("maker_orders[{index}].side"),
-                    )?,
+                    required_string(order, &["side"], &format!("maker_orders[{index}].side"))?,
                     &format!("maker_orders[{index}].side"),
                 )?;
                 let quantity = strict_number(
                     order.get("matched_amount"),
                     &format!("maker_orders[{index}].matched_amount"),
                 )?;
-                let price = strict_number(
-                    order.get("price"),
-                    &format!("maker_orders[{index}].price"),
-                )?;
+                let price =
+                    strict_number(order.get("price"), &format!("maker_orders[{index}].price"))?;
                 validate_quantity_price(
                     quantity,
                     price,
@@ -562,34 +588,55 @@ fn close_enough(left: f64, right: f64) -> bool {
     (left - right).abs() <= 1e-9_f64.max(left.abs().max(right.abs()) * 1e-8)
 }
 
-fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<Vec<OrderUpdate>, String> {
+fn parse_order_event(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> std::result::Result<Vec<OrderUpdate>, String> {
     let order_id = required_string(data, &["order_id", "orderID", "id"], "order_id")?;
-    if shared.probe_order_ids.lock().unwrap_or_else(|p| p.into_inner()).iter()
+    if shared
+        .probe_order_ids
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
         .any(|id| normalize_order_id(id) == normalize_order_id(order_id))
     {
         debug!("[PolyUserFeed] probe order lifecycle push muted: oid={order_id}");
         return Ok(Vec::new());
     }
-    let coid = shared.lookup_coid(order_id)
-        .ok_or_else(|| format!("unowned private order lifecycle event for order_id `{order_id}`"))?;
-    let ownership = shared.account_state.order(&coid)
-        .ok_or_else(|| format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`"))?;
+    let coid = shared.lookup_coid(order_id).ok_or_else(|| {
+        format!("unowned private order lifecycle event for order_id `{order_id}`")
+    })?;
+    let ownership = shared.account_state.order(&coid).ok_or_else(|| {
+        format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
+    })?;
     let asset_id = required_string(data, &["asset_id", "token_id"], "asset_id")?;
     let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
     let price = strict_number(data.get("price"), "price")?;
-    let original_size = strict_number(data.get("original_size").or_else(|| data.get("size")), "original_size")?;
+    let original_size = strict_number(
+        data.get("original_size").or_else(|| data.get("size")),
+        "original_size",
+    )?;
     let size_matched = strict_number(data.get("size_matched"), "size_matched")?;
     let tolerance = 1e-9_f64.max(original_size.abs() * 1e-8);
-    if original_size <= 0.0 || size_matched < 0.0 || size_matched > original_size + tolerance
-        || price <= 0.0 || price > 1.0 + 1e-8
+    if original_size <= 0.0
+        || size_matched < 0.0
+        || size_matched > original_size + tolerance
+        || price <= 0.0
+        || price > 1.0 + 1e-8
     {
-        return Err(format!("invalid order lifecycle economics order_id={order_id}"));
+        return Err(format!(
+            "invalid order lifecycle economics order_id={order_id}"
+        ));
     }
     if normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
-        || ownership.token_id != asset_id || ownership.side != side
-        || !close_enough(ownership.quantity, original_size) || !close_enough(ownership.price, price)
+        || ownership.token_id != asset_id
+        || ownership.side != side
+        || !close_enough(ownership.quantity, original_size)
+        || !close_enough(ownership.price, price)
     {
-        return Err(format!("order lifecycle invariant mismatch coid={coid} order_id={order_id}"));
+        return Err(format!(
+            "order lifecycle invariant mismatch coid={coid} order_id={order_id}"
+        ));
     }
     let lifecycle = required_string(data, &["type"], "type")?.to_ascii_uppercase();
     let status = match lifecycle.as_str() {
@@ -603,10 +650,8 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
     if ownership.status == OrderStatus::Failed
         || (ownership.status == OrderStatus::Filled
             && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
-        || (ownership.status == OrderStatus::Cancelled
-            && status == OrderStatus::PartiallyFilled)
-        || (ownership.status == OrderStatus::PartiallyFilled
-            && status == OrderStatus::Accepted)
+        || (ownership.status == OrderStatus::Cancelled && status == OrderStatus::PartiallyFilled)
+        || (ownership.status == OrderStatus::PartiallyFilled && status == OrderStatus::Accepted)
     {
         debug!(
             "[PolyUserFeed] stale order lifecycle regression ignored: coid={} current={:?} incoming={:?}",
@@ -695,17 +740,29 @@ fn parse_order_event(data: &serde_json::Value, shared: &SharedState) -> std::res
 }
 
 fn invalid_payload_key(data: &serde_json::Value) -> String {
-    let is_trade = data.get("event_type").or_else(|| data.get("type"))
-        .and_then(serde_json::Value::as_str).is_some_and(|kind| kind == "trade");
+    let is_trade = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "trade");
     if is_trade {
-        if let Some(id) = data.get("trade_id").or_else(|| data.get("id"))
-            .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+        if let Some(id) = data
+            .get("trade_id")
+            .or_else(|| data.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
         {
             return format!("trade:{id}");
         }
     }
-    if let Some(id) = data.get("order_id").or_else(|| data.get("orderID")).or_else(|| data.get("id"))
-        .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+    if let Some(id) = data
+        .get("order_id")
+        .or_else(|| data.get("orderID"))
+        .or_else(|| data.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
     {
         return format!("order:{}", normalize_order_id(id));
     }
@@ -718,19 +775,31 @@ fn invalid_payload_key(data: &serde_json::Value) -> String {
 }
 
 fn invalid_replay_anchor_key(data: &serde_json::Value) -> String {
-    let is_trade = data.get("event_type").or_else(|| data.get("type"))
-        .and_then(serde_json::Value::as_str).is_some_and(|kind| kind == "trade");
+    let is_trade = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "trade");
     if is_trade {
-        if let Some(id) = data.get("trade_id").or_else(|| data.get("id"))
-            .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+        if let Some(id) = data
+            .get("trade_id")
+            .or_else(|| data.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
         {
             // Successful taker attribution clears the raw trade id, and maker
             // attribution creates more-specific `{trade_id}:{order_id}` keys.
             return id.to_string();
         }
     }
-    if let Some(id) = data.get("order_id").or_else(|| data.get("orderID")).or_else(|| data.get("id"))
-        .and_then(serde_json::Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+    if let Some(id) = data
+        .get("order_id")
+        .or_else(|| data.get("orderID"))
+        .or_else(|| data.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
     {
         return format!("private-order:{}", normalize_order_id(id));
     }
@@ -738,8 +807,11 @@ fn invalid_replay_anchor_key(data: &serde_json::Value) -> String {
 }
 
 fn receipt_time_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs()).unwrap_or(1).max(1)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,9 +825,15 @@ struct EffectiveMatchTime {
 
 fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMatchTime {
     let now = receipt_time_secs();
-    let parsed = data.get("match_time").and_then(|value| {
-        value.as_str().and_then(|text| text.parse::<u64>().ok()).or_else(|| value.as_u64())
-    }).filter(|value| *value > 0);
+    let parsed = data
+        .get("match_time")
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(|text| text.parse::<u64>().ok())
+                .or_else(|| value.as_u64())
+        })
+        .filter(|value| *value > 0);
     if parsed.is_none() {
         warn!("[PolyUserFeed] trade={} has missing/invalid match_time; pinning replay at receipt_time={}", trade_id, now);
     } else if parsed.is_some_and(|value| value > now) {
@@ -773,34 +851,50 @@ fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMa
 
 fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, error: &str) {
     let key = invalid_payload_key(data);
-    let event_type = data.get("event_type").or_else(|| data.get("type"))
-        .and_then(serde_json::Value::as_str).unwrap_or("");
+    let event_type = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     if event_type == "trade" {
         let replay_key = invalid_replay_anchor_key(data);
         let match_time = effective_match_time(data, &key);
-        shared.account_state.mark_unresolved_trade_match_time(
-            &replay_key, match_time.replay_watermark_secs,
-        );
+        shared
+            .account_state
+            .mark_unresolved_trade_match_time(&replay_key, match_time.replay_watermark_secs);
     } else if event_type == "order" {
-        if let Some(order_id) = data.get("order_id").or_else(|| data.get("orderID"))
-            .or_else(|| data.get("id")).and_then(serde_json::Value::as_str)
-            .map(str::trim).filter(|order_id| !order_id.is_empty())
+        if let Some(order_id) = data
+            .get("order_id")
+            .or_else(|| data.get("orderID"))
+            .or_else(|| data.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|order_id| !order_id.is_empty())
         {
             if let Some(coid) = shared.lookup_coid(order_id) {
-                shared.account_state.begin_order_recovery(std::iter::once(coid.as_str()));
+                shared
+                    .account_state
+                    .begin_order_recovery(std::iter::once(coid.as_str()));
             }
         }
     }
     shared.account_state.mark_private_event_anomaly(
-        &key, format!("invalid Polymarket private event `{key}`: {error}"),
+        &key,
+        format!("invalid Polymarket private event `{key}`: {error}"),
     );
     shared.user_feed_health.set_inventory_uncertain(true);
     warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
 }
 
-fn parse_user_event_checked(data: &serde_json::Value, shared: &SharedState) -> std::result::Result<Vec<OrderUpdate>, String> {
-    let event_type = data.get("event_type").or_else(|| data.get("type"))
-        .and_then(serde_json::Value::as_str).unwrap_or("");
+fn parse_user_event_checked(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> std::result::Result<Vec<OrderUpdate>, String> {
+    let event_type = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     match event_type {
         "order" => parse_order_event(data, shared),
         "trade" => {
@@ -830,8 +924,13 @@ pub(crate) struct ParsedPrivateEvent {
     pub(crate) rejection_reason: Option<String>,
 }
 
-fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) -> ParsedPrivateEvent {
-    let recognized = data.get("event_type").or_else(|| data.get("type"))
+fn parse_user_event_with_health(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> ParsedPrivateEvent {
+    let recognized = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
         .and_then(serde_json::Value::as_str)
         .is_some_and(|event_type| matches!(event_type, "order" | "trade"));
     if !recognized {
@@ -867,20 +966,34 @@ fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) 
 fn resolve_valid_private_event_anomaly(data: &serde_json::Value, shared: &SharedState) {
     let key = invalid_payload_key(data);
     let replay_key = invalid_replay_anchor_key(data);
-    let event_type = data.get("event_type").or_else(|| data.get("type"))
-        .and_then(serde_json::Value::as_str).unwrap_or("");
+    let event_type = data
+        .get("event_type")
+        .or_else(|| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     // Successful trade attribution already clears its exact replay anchor in
     // `parse_user_event_validated`. Do not clear it generically here: for a
     // valid but still-unowned taker trade the exact key is also `trade:{id}`.
     // Maker failures use per-leg anchors (`trade:{id}:{maker_order_id}`), so
     // the payload-level syntax anchor can safely be cleared after validation.
-    if event_type == "trade" && data.get("maker_orders")
-        .and_then(serde_json::Value::as_array).is_some_and(|orders| orders.iter().any(|order| {
-            order.get("maker_address").and_then(serde_json::Value::as_str)
-                .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address))
-        }))
+    if event_type == "trade"
+        && data
+            .get("maker_orders")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|orders| {
+                orders.iter().any(|order| {
+                    order
+                        .get("maker_address")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|address| {
+                            address.eq_ignore_ascii_case(&shared.order_maker_address)
+                        })
+                })
+            })
     {
-        shared.account_state.resolve_unresolved_trade_match_time(&replay_key);
+        shared
+            .account_state
+            .resolve_unresolved_trade_match_time(&replay_key);
     }
     shared.account_state.resolve_private_event_anomaly(&key);
     if !shared.account_state.is_uncertain() {
@@ -908,9 +1021,11 @@ pub(crate) fn parse_user_event_diagnosed(
 
 fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
-    let event_type = match data.get("event_type")
+    let event_type = match data
+        .get("event_type")
         .or_else(|| data.get("type"))
-        .and_then(|v| v.as_str()) {
+        .and_then(|v| v.as_str())
+    {
         Some(s) => s,
         None => return Vec::new(),
     };
@@ -948,10 +1063,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
         "order" => Vec::new(),
         "trade" => {
             let taker_order_id = taker_order_id(data).unwrap_or("");
-            let asset_id = data.get("asset_id")
+            let asset_id = data
+                .get("asset_id")
                 .or_else(|| data.get("token_id"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("").to_string();
+                .unwrap_or("")
+                .to_string();
 
             // The authenticated maker address determines whether we use
             // top-level fields (TAKER) or walk `maker_orders[]` (MAKER).
@@ -970,13 +1087,18 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
             // (the server may not populate these consistently).
 
             let side = data.get("side").and_then(|v| v.as_str()).unwrap_or("BUY");
-            let side = if side.eq_ignore_ascii_case("SELL") { Side::Sell } else { Side::Buy };
+            let side = if side.eq_ignore_ascii_case("SELL") {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
 
             // trade id (from top-level `id` / `trade_id`) + maker_order_id
             // (from `maker_orders[]`) form the ledger key. For TAKER we
             // use trade_id alone; for MAKER we build `{trade_id}:{maker_order_id}`
             // so each of our maker legs on this trade gets a distinct ledger row.
-            let trade_id = data.get("id")
+            let trade_id = data
+                .get("id")
                 .or_else(|| data.get("trade_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -992,13 +1114,18 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 Ok(role) => role,
                 Err(_) => return Vec::new(),
             };
-            let status_raw = data.get("status").and_then(|v| v.as_str()).unwrap_or("MATCHED");
+            let status_raw = data
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("MATCHED");
             let status_str = status_raw
                 .strip_prefix("TRADE_STATUS_")
                 .unwrap_or(status_raw);
             let status_str = if status_str == "MATCHED_NOT_BROADCASTED" {
                 "MATCHED"
-            } else { status_str };
+            } else {
+                status_str
+            };
 
             let match_time = effective_match_time(data, trade_id);
 
@@ -1043,7 +1170,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     "errorMsg",
                 ] {
                     if let Some(s) = d.get(*k).and_then(|v| v.as_str()) {
-                        if !s.is_empty() { return Some(s.to_string()); }
+                        if !s.is_empty() {
+                            return Some(s.to_string());
+                        }
                     }
                 }
                 None
@@ -1060,12 +1189,25 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 };
 
                 for mo in arr {
-                    let mo_addr = mo.get("maker_address").and_then(|v| v.as_str()).unwrap_or("");
-                    if !mo_addr.eq_ignore_ascii_case(funder) { continue; }
+                    let mo_addr = mo
+                        .get("maker_address")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !mo_addr.eq_ignore_ascii_case(funder) {
+                        continue;
+                    }
 
-                    let mo_asset_id = mo.get("asset_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let mo_asset_id = mo
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let mo_side_str = mo.get("side").and_then(|v| v.as_str()).unwrap_or("BUY");
-                    let mo_side = if mo_side_str.eq_ignore_ascii_case("SELL") { Side::Sell } else { Side::Buy };
+                    let mo_side = if mo_side_str.eq_ignore_ascii_case("SELL") {
+                        Side::Sell
+                    } else {
+                        Side::Buy
+                    };
                     let mo_size: f64 = parse_f(mo.get("matched_amount"));
                     let mo_price: f64 = parse_f(mo.get("price"));
                     let mo_order_id = mo.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1102,9 +1244,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         // ledger has already entered uncertain with the exact
                         // oid/trade reason; fanning an empty coid to every
                         // same-token strategy would book the fill N times.
-                        shared
-                            .account_state
-                            .mark_unresolved_trade_match_time(&leg_id, match_time.replay_watermark_secs);
+                        shared.account_state.mark_unresolved_trade_match_time(
+                            &leg_id,
+                            match_time.replay_watermark_secs,
+                        );
                         continue;
                     };
                     if transition.persistence_pending() {
@@ -1150,14 +1293,22 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         exchange: Exchange::Polymarket,
                         symbol: mo_asset_id,
                         side: mo_side,
-                        exchange_order_id: if mo_order_id.is_empty() { None } else { Some(mo_order_id.to_string()) },
+                        exchange_order_id: if mo_order_id.is_empty() {
+                            None
+                        } else {
+                            Some(mo_order_id.to_string())
+                        },
                         status,
                         liquidity: Some(Liquidity::Maker),
                         filled_quantity: mo_size,
                         remaining_quantity: 0.0,
                         avg_fill_price: mo_price,
                         timestamp_ns: now_ns(),
-                        trade_id: if leg_id.is_empty() { None } else { Some(leg_id) },
+                        trade_id: if leg_id.is_empty() {
+                            None
+                        } else {
+                            Some(leg_id)
+                        },
                         order_audit: None,
                         error: failure_reason.clone(),
                     };
@@ -1171,7 +1322,8 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     updates.push(update);
                 }
             } else {
-                let matched_amount: f64 = parse_f(data.get("size").or_else(|| data.get("matched_amount")));
+                let matched_amount: f64 =
+                    parse_f(data.get("size").or_else(|| data.get("matched_amount")));
                 let price: f64 = parse_f(data.get("price"));
 
                 if TradeStatus::from_str(status_str).is_none()
@@ -1195,9 +1347,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     match_time.business_secs,
                 );
                 let Some(ownership) = transition.ownership().cloned() else {
-                    shared
-                        .account_state
-                        .mark_unresolved_trade_match_time(trade_id, match_time.replay_watermark_secs);
+                    shared.account_state.mark_unresolved_trade_match_time(
+                        trade_id,
+                        match_time.replay_watermark_secs,
+                    );
                     return Vec::new();
                 };
                 if transition.persistence_pending() {
@@ -1251,7 +1404,11 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     remaining_quantity: 0.0,
                     avg_fill_price: price,
                     timestamp_ns: now_ns(),
-                    trade_id: if trade_id.is_empty() { None } else { Some(trade_id.to_string()) },
+                    trade_id: if trade_id.is_empty() {
+                        None
+                    } else {
+                        Some(trade_id.to_string())
+                    },
                     order_audit: None,
                     error: failure_reason.clone(),
                 };
@@ -1265,15 +1422,14 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 updates.push(update);
             }
 
-            if status == OrderStatus::Failed
-                && failure_reason.is_none()
-                && !updates.is_empty()
-            {
+            if status == OrderStatus::Failed && failure_reason.is_none() && !updates.is_empty() {
                 // Warn only for the accepted terminal edge. Periodic REST
                 // replay can return the same FAILED trade indefinitely.
-                warn!("[PolyUserFeed] FAILED trade {} carries no known \
+                warn!(
+                    "[PolyUserFeed] FAILED trade {} carries no known \
                       reason field; raw payload: {}",
-                      trade_id, data);
+                    trade_id, data
+                );
             }
 
             updates
@@ -1300,9 +1456,9 @@ async fn replay_missed_trades(
         recovery_generation,
     )
     .await;
-    shared.account_state.record_gap_replay_pages(
-        checkpoint.pages.saturating_sub(pages_before_attempt),
-    );
+    shared
+        .account_state
+        .record_gap_replay_pages(checkpoint.pages.saturating_sub(pages_before_attempt));
     result
 }
 
@@ -1331,14 +1487,21 @@ async fn replay_missed_trades_inner(
     // was reached. Long disconnects are replayed to completion through the
     // same account-level connection slot. Yield periodically so the runtime
     // can service the live user feed and other accounts between batches.
-    const PAGES_PER_YIELD: usize = 50;
+    // One page can contain enough JSON/account work to monopolise the
+    // current-thread general runtime. Yield after every page so the private
+    // user socket and other control-plane tasks remain responsive. The public
+    // CLOB reader is additionally isolated on its own runtime.
+    const PAGES_PER_YIELD: usize = 1;
     let mut attempt_pages = 0usize;
     loop {
+        let page_stage = crate::latency::TimedStage::new("polymarket.gap_replay.page_total");
         let url = if checkpoint.cursor.is_empty() {
             format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
-            format!("{}/trades?after={}&next_cursor={}",
-                CLOB_BASE_URL, after_param, checkpoint.cursor)
+            format!(
+                "{}/trades?after={}&next_cursor={}",
+                CLOB_BASE_URL, after_param, checkpoint.cursor
+            )
         };
         let gap_response = match transport.get(shared, &url).await {
             Ok(response) => response,
@@ -1364,11 +1527,8 @@ async fn replay_missed_trades_inner(
                     body
                 }
                 Err(error) => {
-                    let failure = GapSendFailure::from_reqwest(
-                        response_slot,
-                        response_generation,
-                        &error,
-                    );
+                    let failure =
+                        GapSendFailure::from_reqwest(response_slot, response_generation, &error);
                     let detail = format!("<response body read failed: {}>", failure);
                     transport.report_body_failure(permit, failure).await;
                     return Err(anyhow!(
@@ -1401,17 +1561,17 @@ async fn replay_missed_trades_inner(
                 body,
             ));
         }
-        let json: serde_json::Value = match resp.json().await {
-            Ok(j) => {
+        let body_started = crate::latency::Instant::now();
+        let body = match resp.bytes().await {
+            Ok(body) => {
+                crate::latency::record("polymarket.gap_replay.http_body", body_started);
                 permit.pooled_client().note_transport_success();
-                j
+                body
             }
             Err(error) => {
-                let failure = GapSendFailure::from_reqwest(
-                    response_slot,
-                    response_generation,
-                    &error,
-                );
+                crate::latency::record("polymarket.gap_replay.http_body", body_started);
+                let failure =
+                    GapSendFailure::from_reqwest(response_slot, response_generation, &error);
                 if failure.is_transport() {
                     let detail = failure.to_string();
                     transport.report_body_failure(permit, failure).await;
@@ -1429,9 +1589,21 @@ async fn replay_missed_trades_inner(
                 ));
             }
         };
+        let json_started = crate::latency::Instant::now();
+        let json_result = serde_json::from_slice::<serde_json::Value>(&body);
+        crate::latency::record("polymarket.gap_replay.json_decode", json_started);
+        let json = json_result.map_err(|error| {
+            anyhow!(
+                "Gap-fetch /trades JSON decode failed after {} records: {}",
+                checkpoint.records,
+                error,
+            )
+        })?;
         // The response body is fully consumed; release the exclusive global
         // slot before routing/deduplicating records.
         drop(permit);
+
+        let apply_stage = crate::latency::TimedStage::new("polymarket.gap_replay.apply_page");
 
         let (records, next) = if let Some(arr) = json.as_array() {
             (arr.clone(), String::new())
@@ -1444,10 +1616,12 @@ async fn replay_missed_trades_inner(
             let next = match object.get("next_cursor") {
                 None | Some(serde_json::Value::Null) => String::new(),
                 Some(serde_json::Value::String(next)) => next.clone(),
-                Some(_) => return Err(anyhow!(
-                    "Gap-fetch /trades returned non-string `next_cursor` after {} records",
-                    checkpoint.records,
-                )),
+                Some(_) => {
+                    return Err(anyhow!(
+                        "Gap-fetch /trades returned non-string `next_cursor` after {} records",
+                        checkpoint.records,
+                    ))
+                }
             };
             (data, next)
         } else {
@@ -1469,7 +1643,9 @@ async fn replay_missed_trades_inner(
                         if let Some(generation) = recovery_generation {
                             enqueue_recovery_update(shared, update_tx, generation, update)?;
                         } else if update_tx.send(update).is_err() {
-                            return Err(anyhow!("order update channel closed during periodic gap replay"));
+                            return Err(anyhow!(
+                                "order update channel closed during periodic gap replay"
+                            ));
                         }
                     }
                 }
@@ -1477,7 +1653,8 @@ async fn replay_missed_trades_inner(
                     flag_invalid_private_event(&rec, shared, &error);
                     return Err(anyhow!(
                         "Gap-fetch /trades rejected invalid record after {} records: {}",
-                        checkpoint.records, error,
+                        checkpoint.records,
+                        error,
                     ));
                 }
             }
@@ -1486,19 +1663,21 @@ async fn replay_missed_trades_inner(
 
         checkpoint.pages += 1;
         attempt_pages += 1;
-        if !advance_gap_cursor(
-            &mut checkpoint.cursor,
-            &mut checkpoint.seen_cursors,
-            next,
-        )? {
+        if !advance_gap_cursor(&mut checkpoint.cursor, &mut checkpoint.seen_cursors, next)? {
+            drop(apply_stage);
+            drop(page_stage);
             break;
         }
+        drop(apply_stage);
+        drop(page_stage);
         if attempt_pages % PAGES_PER_YIELD == 0 {
             tokio::task::yield_now().await;
         }
     }
 
-    Ok(GapReplayOutcome::Complete { records: checkpoint.records })
+    Ok(GapReplayOutcome::Complete {
+        records: checkpoint.records,
+    })
 }
 
 /// Async WebSocket loop. Spawned as a tokio task on the shared runtime.
@@ -1519,7 +1698,8 @@ async fn user_feed_loop(
         if lp.last_match_time_secs() == 0 {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0);
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             lp.touch_match_time(now_secs);
         }
     }
@@ -1542,8 +1722,7 @@ async fn user_feed_loop(
     } else {
         info!(
             "[PolyUserFeed] account={} GapReplay prewarmed all {} slots",
-            account_id,
-            prewarm.total,
+            account_id, prewarm.total,
         );
     }
     // The transport is stateless; the account pool itself owns its two slot
@@ -1581,86 +1760,82 @@ async fn user_feed_loop(
         // New task → won't inherit the loop's span; re-attach the same
         // per-account span so gap-recovery logs are tagged too.
         let gap_span = tracing::info_span!("user_feed", acct = %account_id);
-        tokio::spawn(tracing::Instrument::instrument(async move {
-            let interval = Duration::from_millis(shared.gap_replay.interval_ms.max(1));
-            let rewind_ms = shared.gap_replay.periodic_rewind_ms;
-            // One-shot deep (now−300s) catch-up on the first sweep so a
-            // mid-event (re)start recovers all in-flight fills across EVERY
-            // active market on this wallet at once; subsequent sweeps use the
-            // small rewind. (Was keyed on per-event `CurrentMarket` change,
-            // which a sibling instance sharing the wallet could clobber.)
-            let mut did_startup_deep = false;
-            let mut periodic_checkpoint: Option<GapReplayCheckpoint> = None;
-            let mut consecutive_failures = 0u32;
-            loop {
-                sleep(interval).await;
-                if shutdown.load(Ordering::Relaxed) { break; }
-                if shared.user_feed_health.is_recovering() {
-                    continue;
-                }
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64).unwrap_or(0);
-                let floor_after = if !did_startup_deep {
-                    did_startup_deep = true;
-                    (now_ms / 1000).saturating_sub(300) // startup → deep catch-up
-                } else {
-                    // Dynamic rewind: max(configured floor, now − last trade
-                    // the feed actually delivered, on the SERVER match_time
-                    // axis) — i.e. `after = min(now − floor, last_trade − 1)`.
-                    // A WS drop longer than the floor is then still covered:
-                    // the window always reaches back to the last fill we have
-                    // seen. −1 s guards Polymarket's strict-`>` semantics on
-                    // `?after=T`; the overlap is deduped by trade_id.
-                    now_ms.saturating_sub(rewind_ms) / 1000 // rewind (ms) → floor to sec
-                };
-                let committed_secs =
-                    shared.live_position.lock().unwrap().last_match_time_secs();
-                let replay_anchor = replay_match_time_anchor(&shared, committed_secs);
-                let after = if replay_anchor > 0 {
-                    floor_after.min(replay_anchor.saturating_sub(1))
-                } else {
-                    floor_after
-                };
-                let checkpoint = periodic_checkpoint
-                    .get_or_insert_with(|| GapReplayCheckpoint::new(after));
-                let after = checkpoint.after_secs;
-                let replay_result =
-                    replay_missed_trades(
-                        &shared,
-                        &update_tx,
-                        checkpoint,
-                        &gap_transport,
-                        None,
-                    )
-                    .await;
-                match replay_result {
-                    Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
-                        if consecutive_failures > 0 {
-                            info!(
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let interval = Duration::from_millis(shared.gap_replay.interval_ms.max(1));
+                let rewind_ms = shared.gap_replay.periodic_rewind_ms;
+                // One-shot deep (now−300s) catch-up on the first sweep so a
+                // mid-event (re)start recovers all in-flight fills across EVERY
+                // active market on this wallet at once; subsequent sweeps use the
+                // small rewind. (Was keyed on per-event `CurrentMarket` change,
+                // which a sibling instance sharing the wallet could clobber.)
+                let mut did_startup_deep = false;
+                let mut periodic_checkpoint: Option<GapReplayCheckpoint> = None;
+                let mut consecutive_failures = 0u32;
+                loop {
+                    sleep(interval).await;
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if shared.user_feed_health.is_recovering() {
+                        continue;
+                    }
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let floor_after = if !did_startup_deep {
+                        did_startup_deep = true;
+                        (now_ms / 1000).saturating_sub(300) // startup → deep catch-up
+                    } else {
+                        // Dynamic rewind: max(configured floor, now − last trade
+                        // the feed actually delivered, on the SERVER match_time
+                        // axis) — i.e. `after = min(now − floor, last_trade − 1)`.
+                        // A WS drop longer than the floor is then still covered:
+                        // the window always reaches back to the last fill we have
+                        // seen. −1 s guards Polymarket's strict-`>` semantics on
+                        // `?after=T`; the overlap is deduped by trade_id.
+                        now_ms.saturating_sub(rewind_ms) / 1000 // rewind (ms) → floor to sec
+                    };
+                    let committed_secs =
+                        shared.live_position.lock().unwrap().last_match_time_secs();
+                    let replay_anchor = replay_match_time_anchor(&shared, committed_secs);
+                    let after = if replay_anchor > 0 {
+                        floor_after.min(replay_anchor.saturating_sub(1))
+                    } else {
+                        floor_after
+                    };
+                    let checkpoint =
+                        periodic_checkpoint.get_or_insert_with(|| GapReplayCheckpoint::new(after));
+                    let after = checkpoint.after_secs;
+                    let replay_result =
+                        replay_missed_trades(&shared, &update_tx, checkpoint, &gap_transport, None)
+                            .await;
+                    match replay_result {
+                        Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
+                            if consecutive_failures > 0 {
+                                info!(
                                 "[PolyUserFeed] Periodic gap replay recovered: after={} attempts={} \
                                  records={}",
                                 after,
                                 consecutive_failures.saturating_add(1),
                                 outcome.records(),
                             );
+                            }
+                            consecutive_failures = 0;
+                            periodic_checkpoint = None;
+                            shared.user_feed_health.set_gap_replay_degraded(false);
                         }
-                        consecutive_failures = 0;
-                        periodic_checkpoint = None;
-                        shared.user_feed_health.set_gap_replay_degraded(false);
-                    }
-                    Err(e) => {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        {
-                            let newly_degraded = !shared
-                                .user_feed_health
-                                .gap_replay_degraded();
-                            shared.user_feed_health.set_gap_replay_degraded(true);
-                            if newly_degraded {
-                                let (acquires, skips, busy, slots) =
-                                    crate::http1_pool::gap_replay_stats(&account_id)
-                                        .unwrap_or((0, 0, 0, Vec::new()));
-                                warn!(
+                        Err(e) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            {
+                                let newly_degraded = !shared.user_feed_health.gap_replay_degraded();
+                                shared.user_feed_health.set_gap_replay_degraded(true);
+                                if newly_degraded {
+                                    let (acquires, skips, busy, slots) =
+                                        crate::http1_pool::gap_replay_stats(&account_id)
+                                            .unwrap_or((0, 0, 0, Vec::new()));
+                                    warn!(
                                     "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
                                      consecutive failures; after={} remains pinned and quoting \
                                      will pause until catch-up succeeds; \
@@ -1673,29 +1848,37 @@ async fn user_feed_loop(
                                     skips,
                                     busy,
                                 );
+                                }
                             }
-                        }
-                        warn!(
+                            warn!(
                             "[PolyUserFeed] Periodic gap replay failed: {} (attempt={} pinned_after={})",
                             e,
                             consecutive_failures,
                             after,
                         );
+                        }
                     }
                 }
-            }
-        }, gap_span));
+            },
+            gap_span,
+        ));
     }
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Connect
         let ws_stream = match tokio_tungstenite::connect_async(WS_URL).await {
             Ok((ws, _)) => ws,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[PolyUserFeed] Connect failed: {}, retrying in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[PolyUserFeed] Connect failed: {}, retrying in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 sleep(delay).await;
                 continue;
             }
@@ -1726,8 +1909,7 @@ async fn user_feed_loop(
         // around the disconnect edge isn't skipped by an exact `after=`
         // boundary. Idempotent via the upsert_trade / update_trade status
         // dedup. Covers ALL active markets on this wallet at once.
-        let last_match_time_secs =
-            shared.live_position.lock().unwrap().last_match_time_secs();
+        let last_match_time_secs = shared.live_position.lock().unwrap().last_match_time_secs();
         let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         let checkpoint = recovery_checkpoint.get_or_insert_with(|| {
             GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
@@ -1747,8 +1929,7 @@ async fn user_feed_loop(
                     GapReplayOutcome::Complete { records } => {
                         info!(
                             "[PolyUserFeed] Gap recovery after={} replayed={} trades (complete)",
-                            after_secs,
-                            records,
+                            after_secs, records,
                         );
                     }
                 }
@@ -1777,17 +1958,15 @@ async fn user_feed_loop(
         let recovery_executor = PolymarketTrade::from_shared(shared.clone(), "", "");
         let open_order_recovery = tokio::task::spawn_blocking(move || {
             recovery_executor.reconcile_runtime_open_orders_with_updates()
-        }).await;
+        })
+        .await;
         match open_order_recovery {
             Ok(Ok(updates)) => {
                 let mut enqueue_error = None;
                 for update in updates {
-                    if let Err(error) = enqueue_recovery_update(
-                        &shared,
-                        &update_tx,
-                        recovery_generation,
-                        update,
-                    ) {
+                    if let Err(error) =
+                        enqueue_recovery_update(&shared, &update_tx, recovery_generation, update)
+                    {
                         enqueue_error = Some(error);
                         break;
                     }
@@ -1815,12 +1994,8 @@ async fn user_feed_loop(
                     );
                     continue;
                 }
-                if let Err(error) = wait_for_recovery_delivery(
-                    &shared,
-                    recovery_generation,
-                    &shutdown,
-                )
-                .await
+                if let Err(error) =
+                    wait_for_recovery_delivery(&shared, recovery_generation, &shutdown).await
                 {
                     shared.user_feed_health.set_recovering(true);
                     let delay = backoff.next_delay();
@@ -1834,24 +2009,25 @@ async fn user_feed_loop(
                     }
                     continue;
                 }
-                accept_reconnect_replay(
-                    &shared,
-                    GapReplayOutcome::Complete { records: 0 },
-                );
+                accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 0 });
                 backoff.reset();
             }
             Ok(Err(error)) => {
                 shared.user_feed_health.set_recovering(true);
                 let delay = backoff.next_delay();
                 warn!("[PolyUserFeed] Open-order recovery failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
-                if !shutdown.load(Ordering::Relaxed) { sleep(delay).await; }
+                if !shutdown.load(Ordering::Relaxed) {
+                    sleep(delay).await;
+                }
                 continue;
             }
             Err(error) => {
                 shared.user_feed_health.set_recovering(true);
                 let delay = backoff.next_delay();
                 warn!("[PolyUserFeed] Open-order recovery task failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
-                if !shutdown.load(Ordering::Relaxed) { sleep(delay).await; }
+                if !shutdown.load(Ordering::Relaxed) {
+                    sleep(delay).await;
+                }
                 continue;
             }
         }
@@ -1864,7 +2040,9 @@ async fn user_feed_loop(
 
         // Event loop
         loop {
-            if shutdown.load(Ordering::Relaxed) { break; }
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
 
             // Periodic PING (application-level — CLOB uses plaintext "PING"/"PONG"
             // strings). Also send a WebSocket protocol Ping frame.
@@ -1889,7 +2067,9 @@ async fn user_feed_loop(
                             last_transport = Instant::now();
                             shared.user_feed_health.record_transport_activity(now_ns());
                             let body = text.trim();
-                            if body.eq_ignore_ascii_case("PONG") || body.is_empty() { continue; }
+                            if body.eq_ignore_ascii_case("PONG") || body.is_empty() {
+                                continue;
+                            }
                             if body.eq_ignore_ascii_case("PING") {
                                 let _ = sink.send(Message::Text("PONG".to_string())).await;
                                 continue;
@@ -1898,7 +2078,9 @@ async fn user_feed_loop(
                             let t_parse = crate::latency::Instant::now();
                             // simd-json drop-in for SIMD parse speedup.
                             let mut buf = text.as_bytes().to_vec();
-                            let data = match simd_json::serde::from_slice::<serde_json::Value>(&mut buf) {
+                            let data = match simd_json::serde::from_slice::<serde_json::Value>(
+                                &mut buf,
+                            ) {
                                 Ok(data) => data,
                                 Err(error) => {
                                     shared.user_feed_health.set_recovering(true);
@@ -1962,9 +2144,12 @@ async fn user_feed_loop(
                                     };
                                     info!(
                                         "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
-                                        update.symbol, coid_str,
-                                        update.side, update.status,
-                                        update.filled_quantity, update.avg_fill_price,
+                                        update.symbol,
+                                        coid_str,
+                                        update.side,
+                                        update.status,
+                                        update.filled_quantity,
+                                        update.avg_fill_price,
                                     );
                                     if update_tx.send(update).is_err() {
                                         return; // Channel closed
@@ -1973,7 +2158,9 @@ async fn user_feed_loop(
                             }
                             if frame_has_valid_business {
                                 last_valid_business = Instant::now();
-                                shared.user_feed_health.record_valid_business_event(now_ns());
+                                shared
+                                    .user_feed_health
+                                    .record_valid_business_event(now_ns());
                             }
                             // Full frame parse + dispatch latency: wall
                             // time from text arrival to last OrderUpdate
@@ -2024,8 +2211,7 @@ async fn user_feed_loop(
         // Disconnected
         info!("[PolyUserFeed] Disconnected, will reconcile on reconnect");
         shared.user_feed_health.set_recovering(true);
-        let last_match_time_secs =
-            shared.live_position.lock().unwrap().last_match_time_secs();
+        let last_match_time_secs = shared.live_position.lock().unwrap().last_match_time_secs();
         let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         recovery_checkpoint.get_or_insert_with(|| {
             GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
@@ -2072,7 +2258,9 @@ pub fn spawn_user_feed(
         .name("poly-user-feed-join".into())
         .spawn(move || {
             crate::os_tune::pin_background("poly-user-feed-join");
-            async_rt::block_on_runtime(async move { let _ = task_handle.await; });
+            async_rt::block_on_runtime(async move {
+                let _ = task_handle.await;
+            });
         })?;
 
     Ok(handle)
@@ -2125,7 +2313,10 @@ mod tests {
         }
         assert!(!record(&manager, "MATCHED"), "FAILED is terminal");
         assert!(!record(&manager, "MINED"), "FAILED cannot regress");
-        assert!(!record(&manager, "CONFIRMED"), "FAILED cannot flip terminal");
+        assert!(
+            !record(&manager, "CONFIRMED"),
+            "FAILED cannot flip terminal"
+        );
     }
 
     #[test]
@@ -2189,7 +2380,10 @@ mod tests {
             shared.account_state.earliest_unresolved_trade_match_time(),
             Some(123),
         );
-        assert_eq!(shared.live_position.lock().unwrap().last_match_time_secs(), 0);
+        assert_eq!(
+            shared.live_position.lock().unwrap().last_match_time_secs(),
+            0
+        );
 
         shared.account_state.rebind_order_id("owner-1", "oid-final");
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
@@ -2197,8 +2391,14 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].client_order_id, "owner-1");
         assert!(!shared.account_state.is_uncertain());
-        assert_eq!(shared.account_state.earliest_unresolved_trade_match_time(), None);
-        assert_eq!(shared.live_position.lock().unwrap().last_match_time_secs(), 123);
+        assert_eq!(
+            shared.account_state.earliest_unresolved_trade_match_time(),
+            None
+        );
+        assert_eq!(
+            shared.live_position.lock().unwrap().last_match_time_secs(),
+            123
+        );
     }
 
     #[test]
@@ -2409,12 +2609,20 @@ mod tests {
         );
         assert_eq!(replay_updates.len(), 2);
         assert_eq!(
-            shared.account_state.instance_snapshot("maker-a").unwrap().cash,
+            shared
+                .account_state
+                .instance_snapshot("maker-a")
+                .unwrap()
+                .cash,
             before_a.cash,
             "a casing/prefix-only lifecycle replay must not book twice",
         );
         assert_eq!(
-            shared.account_state.instance_snapshot("maker-b").unwrap().cash,
+            shared
+                .account_state
+                .instance_snapshot("maker-b")
+                .unwrap()
+                .cash,
             before_b.cash,
             "a casing/prefix-only lifecycle replay must not book twice",
         );
@@ -2541,10 +2749,20 @@ mod tests {
         shared.remove_order_as("owner-1", OrderStatus::Filled);
         assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
         assert_eq!(
-            shared.account_state.instance_snapshot("owner").unwrap().reserved_cash,
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
             5.0,
         );
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            1
+        );
 
         let updates = parse_user_event(
             &serde_json::json!({
@@ -2563,10 +2781,20 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
         assert_eq!(
-            shared.account_state.instance_snapshot("owner").unwrap().reserved_cash,
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
             0.0,
         );
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            0
+        );
     }
 
     #[test]
@@ -2584,10 +2812,7 @@ mod tests {
             "REST failure must keep quoting paused",
         );
 
-        accept_reconnect_replay(
-            &shared,
-            GapReplayOutcome::Complete { records: 3 },
-        );
+        accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 3 });
         assert!(!shared.user_feed_health.is_recovering());
         assert!(!shared.user_feed_health.inventory_uncertain());
     }
@@ -2598,26 +2823,11 @@ mod tests {
         let mut seen = HashSet::new();
 
         for page in 1..=75 {
-            assert!(advance_gap_cursor(
-                &mut cursor,
-                &mut seen,
-                format!("cursor-{page}"),
-            )
-            .unwrap());
+            assert!(advance_gap_cursor(&mut cursor, &mut seen, format!("cursor-{page}"),).unwrap());
         }
         assert_eq!(cursor, "cursor-75");
-        assert!(advance_gap_cursor(
-            &mut cursor,
-            &mut seen,
-            "cursor-75".to_string(),
-        )
-        .is_err());
-        assert!(!advance_gap_cursor(
-            &mut cursor,
-            &mut seen,
-            "LTE=".to_string(),
-        )
-        .unwrap());
+        assert!(advance_gap_cursor(&mut cursor, &mut seen, "cursor-75".to_string(),).is_err());
+        assert!(!advance_gap_cursor(&mut cursor, &mut seen, "LTE=".to_string(),).unwrap());
     }
 
     #[test]
@@ -2627,7 +2837,8 @@ mod tests {
             &mut checkpoint.cursor,
             &mut checkpoint.seen_cursors,
             "page-2".to_string(),
-        ).unwrap());
+        )
+        .unwrap());
         checkpoint.records = 100;
         checkpoint.pages = 1;
 
@@ -2642,7 +2853,8 @@ mod tests {
             &mut checkpoint.cursor,
             &mut checkpoint.seen_cursors,
             "page-3".to_string(),
-        ).unwrap());
+        )
+        .unwrap());
         assert_eq!(checkpoint.cursor, "page-3");
     }
 
@@ -2653,10 +2865,23 @@ mod tests {
             .account_state
             .apply_physical_snapshot(100.0, HashMap::new())
             .unwrap();
-        shared.account_state.register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0).unwrap();
-        shared.account_state.reserve_order(
-            "owner", "owner-1", "oid-1", "TOKEN", Side::Buy, 10.0, limit_price, 0,
-        ).unwrap();
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-1",
+                "oid-1",
+                "TOKEN",
+                Side::Buy,
+                10.0,
+                limit_price,
+                0,
+            )
+            .unwrap();
         shared.register_order_id("owner-1", "oid-1", "TOKEN");
         shared.open_orders.lock().unwrap().insert(
             "owner-1".to_string(),
@@ -2680,10 +2905,21 @@ mod tests {
     #[test]
     fn trade_identity_lifecycle_and_economics_are_all_strictly_required() {
         let shared = owned_taker_shared(0.5);
-        for field in ["id", "status", "side", "asset_id", "size", "price", "taker_order_id"] {
+        for field in [
+            "id",
+            "status",
+            "side",
+            "asset_id",
+            "size",
+            "price",
+            "taker_order_id",
+        ] {
             let mut event = valid_taker_event();
             event.as_object_mut().unwrap().remove(field);
-            assert!(validate_trade_event(&event, &shared).is_err(), "missing `{field}`");
+            assert!(
+                validate_trade_event(&event, &shared).is_err(),
+                "missing `{field}`"
+            );
         }
         for (field, invalid) in [
             ("status", serde_json::json!("UNKNOWN")),
@@ -2693,7 +2929,10 @@ mod tests {
         ] {
             let mut event = valid_taker_event();
             event[field] = invalid;
-            assert!(validate_trade_event(&event, &shared).is_err(), "invalid `{field}`");
+            assert!(
+                validate_trade_event(&event, &shared).is_err(),
+                "invalid `{field}`"
+            );
         }
     }
 
@@ -2785,8 +3024,18 @@ mod tests {
         assert_eq!(updates[0].filled_quantity, 0.0);
         let mut cancellation = placement;
         cancellation["type"] = serde_json::json!("CANCELLATION");
-        assert_eq!(parse_user_event(&cancellation, &shared)[0].status, OrderStatus::Cancelled);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
+        assert_eq!(
+            parse_user_event(&cancellation, &shared)[0].status,
+            OrderStatus::Cancelled
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            0.0
+        );
         assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
 
         let resurrection = serde_json::json!({
@@ -2798,7 +3047,14 @@ mod tests {
             parse_user_event(&resurrection, &shared)[0].status,
             OrderStatus::Accepted,
         );
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0
+        );
         assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
 
         let shared = owned_taker_shared(0.5);
@@ -2808,14 +3064,40 @@ mod tests {
             "original_size": "10", "size_matched": "4",
             "associate_trades": ["trade-partial"],
         });
-        assert_eq!(parse_user_event(&update, &shared)[0].status, OrderStatus::PartiallyFilled);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
-            "order lifecycle must not book or release trade-driven inventory");
+        assert_eq!(
+            parse_user_event(&update, &shared)[0].status,
+            OrderStatus::PartiallyFilled
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0,
+            "order lifecycle must not book or release trade-driven inventory"
+        );
         update["size_matched"] = serde_json::json!("10");
-        assert_eq!(parse_user_event(&update, &shared)[0].status, OrderStatus::Filled);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0,
-            "whole-order Filled holds the lock until trade rows arrive");
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+        assert_eq!(
+            parse_user_event(&update, &shared)[0].status,
+            OrderStatus::Filled
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0,
+            "whole-order Filled holds the lock until trade rows arrive"
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            1
+        );
     }
 
     #[test]
@@ -2827,7 +3109,10 @@ mod tests {
             "original_size": "10", "size_matched": "4",
             "associate_trades": ["trade-partial"],
         });
-        assert_eq!(parse_user_event(&partial, &shared)[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(
+            parse_user_event(&partial, &shared)[0].status,
+            OrderStatus::PartiallyFilled
+        );
 
         let placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -2852,14 +3137,40 @@ mod tests {
         });
         let updates = parse_user_event(&cancellation, &shared);
         assert_eq!(updates[0].status, OrderStatus::Cancelled);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 2.0);
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            2.0
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            1
+        );
 
         let mut trade = valid_taker_event();
         trade["size"] = serde_json::json!("4");
         assert_eq!(parse_user_event(&trade, &shared).len(), 1);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 0.0);
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            0.0
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            0
+        );
     }
 
     #[test]
@@ -2879,7 +3190,14 @@ mod tests {
             });
             update["associate_trades"] = associate_trades;
             assert!(parse_user_event(&update, &shared).is_empty());
-            assert_eq!(shared.account_state.order("owner-1").unwrap().filled_quantity, 0.0);
+            assert_eq!(
+                shared
+                    .account_state
+                    .order("owner-1")
+                    .unwrap()
+                    .filled_quantity,
+                0.0
+            );
             assert!(shared.account_state.is_uncertain());
         }
 
@@ -2899,14 +3217,17 @@ mod tests {
         let shared = test_shared();
         shared.account_state.register_instance("maker-a", 1.0);
         shared.account_state.register_instance("maker-b", 1.0);
-        shared.account_state.apply_physical_snapshot(200.0, HashMap::new());
+        shared
+            .account_state
+            .apply_physical_snapshot(200.0, HashMap::new());
         for (instance, coid, oid) in [
             ("maker-a", "maker-a-1", "oid-a"),
             ("maker-b", "maker-b-1", "oid-b"),
         ] {
-            shared.account_state.reserve_order(
-                instance, coid, oid, "TOKEN", Side::Buy, 5.0, 0.5, 0,
-            ).unwrap();
+            shared
+                .account_state
+                .reserve_order(instance, coid, oid, "TOKEN", Side::Buy, 5.0, 0.5, 0)
+                .unwrap();
             shared.register_order_id(coid, oid, "TOKEN");
         }
         let event = serde_json::json!({
@@ -2920,8 +3241,22 @@ mod tests {
             ]
         });
         assert!(parse_user_event(&event, &shared).is_empty());
-        assert_eq!(shared.account_state.order("maker-a-1").unwrap().filled_quantity, 0.0);
-        assert_eq!(shared.account_state.order("maker-b-1").unwrap().filled_quantity, 0.0);
+        assert_eq!(
+            shared
+                .account_state
+                .order("maker-a-1")
+                .unwrap()
+                .filled_quantity,
+            0.0
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .order("maker-b-1")
+                .unwrap()
+                .filled_quantity,
+            0.0
+        );
         assert!(shared.account_state.is_uncertain());
     }
 
@@ -2933,8 +3268,21 @@ mod tests {
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, OrderStatus::Failed);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            0
+        );
         assert!(!shared.account_state.is_uncertain());
         assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
 
@@ -2944,8 +3292,18 @@ mod tests {
             "original_size": "10", "size_matched": "0",
         });
         assert_eq!(parse_user_event(&stale_placement, &shared).len(), 1);
-        assert_eq!(shared.account_state.order("owner-1").unwrap().status, OrderStatus::Accepted);
-        assert_eq!(shared.account_state.instance_snapshot("owner").unwrap().reserved_cash, 5.0);
+        assert_eq!(
+            shared.account_state.order("owner-1").unwrap().status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0
+        );
     }
 
     #[test]
@@ -2956,7 +3314,9 @@ mod tests {
         event["match_time"] = serde_json::json!("not-a-time");
         assert!(parse_user_event(&event, &shared).is_empty());
         assert!(shared.account_state.is_uncertain());
-        assert!(shared.account_state.earliest_unresolved_trade_match_time()
+        assert!(shared
+            .account_state
+            .earliest_unresolved_trade_match_time()
             .is_some_and(|anchor| anchor > 0));
     }
 
@@ -2975,9 +3335,9 @@ mod tests {
     #[test]
     fn unknown_private_event_cannot_clear_order_schema_anomaly() {
         let shared = test_shared();
-        shared.account_state.mark_private_event_anomaly(
-            "order:oid-unknown", "test anomaly",
-        );
+        shared
+            .account_state
+            .mark_private_event_anomaly("order:oid-unknown", "test anomaly");
         let ignored = serde_json::json!({
             "event_type": "subscription_ack",
             "id": "oid-unknown",
@@ -2986,7 +3346,9 @@ mod tests {
         assert!(!parsed.valid_business_event);
         assert!(!parsed.invalid_business_event);
         assert!(shared.account_state.is_uncertain());
-        assert!(shared.account_state.ownership_anomalies()
+        assert!(shared
+            .account_state
+            .ownership_anomalies()
             .contains_key("private_event:order:oid-unknown"));
     }
 
@@ -3000,11 +3362,18 @@ mod tests {
         });
         let rejected = parse_user_event_with_health(&update, &shared);
         assert!(rejected.invalid_business_event);
-        assert!(rejected.rejection_reason.as_deref().is_some_and(|reason| {
-            reason.contains("missing associate_trades")
-        }));
+        assert!(rejected
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("missing associate_trades") }));
         assert!(shared.account_state.is_uncertain());
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            1
+        );
 
         update["associate_trades"] = serde_json::json!(["trade-partial"]);
         let corrected = parse_user_event_with_health(&update, &shared);
@@ -3012,7 +3381,13 @@ mod tests {
         assert_eq!(corrected.updates.len(), 1);
         assert!(corrected.rejection_reason.is_none());
         assert!(!shared.account_state.is_uncertain());
-        assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+        assert_eq!(
+            shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders,
+            0
+        );
     }
 
     #[test]
@@ -3040,7 +3415,9 @@ mod tests {
         assert!(parse_user_event(&event, &shared).is_empty());
         assert!(shared.account_state.is_uncertain());
         assert!(shared.user_feed_health.inventory_uncertain());
-        assert!(shared.account_state.earliest_unresolved_trade_match_time()
+        assert!(shared
+            .account_state
+            .earliest_unresolved_trade_match_time()
             .is_some_and(|anchor| anchor > 0));
 
         event["side"] = serde_json::json!("BUY");
@@ -3048,7 +3425,9 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert!(!shared.account_state.is_uncertain());
         assert!(!shared.user_feed_health.inventory_uncertain());
-        assert_eq!(shared.account_state.earliest_unresolved_trade_match_time(), None);
+        assert_eq!(
+            shared.account_state.earliest_unresolved_trade_match_time(),
+            None
+        );
     }
-
 }
