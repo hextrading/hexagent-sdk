@@ -1063,6 +1063,12 @@ pub struct ExchangeConfig {
     /// `feed_ids = { "eth/usd" = "0x…", "btc/usd" = "0x…" }`.
     #[serde(default)]
     pub feed_ids: HashMap<String, String>,
+    /// Canonical settlement averaging window for Chainlink-backed binary
+    /// markets. Feed labels, strike/close lookup, the conditional TWAP mean,
+    /// and Asian residual variance must all derive from this one value.
+    /// Defaults to the market-declared 60-second window.
+    #[serde(default = "default_settlement_twap_secs")]
+    pub settlement_twap_secs: u64,
     /// Polymarket signature type: "eoa" (default fallback), "poly_proxy",
     /// "gnosis_safe" (poly_gnosis_safe), or "poly_1271" (deposit wallet).
     #[serde(default)]
@@ -1166,6 +1172,10 @@ pub struct ExchangeConfig {
 fn default_hl_network() -> String {
     "testnet".to_string()
 }
+pub const DEFAULT_SETTLEMENT_TWAP_SECS: u64 = 60;
+fn default_settlement_twap_secs() -> u64 {
+    DEFAULT_SETTLEMENT_TWAP_SECS
+}
 fn default_http_timeout_ms() -> u64 {
     1000
 }
@@ -1202,6 +1212,12 @@ fn default_account_allocation_weight() -> f64 {
 }
 
 impl ExchangeConfig {
+    /// Derive the settlement feed/archive label from the canonical window.
+    /// `None` is fail-closed for an empty spot symbol or a zero-second window.
+    pub fn settlement_twap_label(&self, spot_symbol: &str) -> Option<String> {
+        settlement_twap_label(spot_symbol, self.settlement_twap_secs)
+    }
+
     /// Build deterministic Chainlink Data Streams subscriptions from the
     /// canonical `feed_ids` map. Invalid entries are returned separately so
     /// callers can fail closed while reporting the affected labels.
@@ -1226,6 +1242,17 @@ impl ExchangeConfig {
         }
         (subscriptions, invalid_labels)
     }
+}
+
+pub fn settlement_twap_label(
+    spot_symbol: &str,
+    settlement_twap_secs: u64,
+) -> Option<String> {
+    let spot_symbol = spot_symbol.trim().trim_end_matches('/');
+    if spot_symbol.is_empty() || settlement_twap_secs == 0 {
+        return None;
+    }
+    Some(format!("{spot_symbol}/twap/{settlement_twap_secs}s"))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1930,6 +1957,34 @@ fn resolve_env_vars(input: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod settlement_twap_config_tests {
+    use super::*;
+
+    #[test]
+    fn settlement_window_defaults_to_sixty_seconds_and_drives_the_label() {
+        let exchange: ExchangeConfig = toml::from_str("name = 'chainlink'").unwrap();
+        assert_eq!(exchange.settlement_twap_secs, DEFAULT_SETTLEMENT_TWAP_SECS);
+        assert_eq!(
+            exchange.settlement_twap_label("btc/usd"),
+            Some("btc/usd/twap/60s".to_string()),
+        );
+    }
+
+    #[test]
+    fn settlement_label_uses_the_configured_window_and_rejects_zero() {
+        let exchange: ExchangeConfig = toml::from_str(
+            "name = 'chainlink'\nsettlement_twap_secs = 90",
+        ).unwrap();
+        assert_eq!(
+            exchange.settlement_twap_label("eth/usd/"),
+            Some("eth/usd/twap/90s".to_string()),
+        );
+        assert_eq!(settlement_twap_label("eth/usd", 0), None);
+        assert_eq!(settlement_twap_label("", 60), None);
+    }
 }
 
 #[cfg(test)]
