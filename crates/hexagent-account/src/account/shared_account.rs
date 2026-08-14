@@ -1357,6 +1357,30 @@ impl SharedAccount {
         interests
     }
 
+    /// Whether the durable account ledger proves that the event owning this
+    /// token has already ended. Any one of these monotonic markers is enough:
+    /// the event entered the settled audit FIFO, its token interest was
+    /// retired by the strategy, or an authoritative 0/1 outcome was recorded.
+    /// This is intentionally narrower than merely having historical inventory.
+    pub fn token_event_has_ended(&self, token_id: &str) -> bool {
+        if token_id.trim().is_empty() {
+            return false;
+        }
+        let state = self.state.lock().unwrap();
+        state.settled_token_values.contains_key(token_id)
+            || state
+                .settled_audit_references
+                .values()
+                .any(|reference| reference.asset_ids.iter().any(|token| token == token_id))
+            || state.instances.values().any(|instance| {
+                instance.token_interests.values().any(|interest| {
+                    interest.retire_after_ms.is_some()
+                        && (interest.up_token_id == token_id
+                            || interest.down_token_id == token_id)
+                })
+            })
+    }
+
     /// Retire a finished/abandoned event after a ten-minute reconciliation
     /// grace. Existing virtual positions retain their direct instance ownership;
     /// their on-chain/settlement query scope expires only after inventory is
@@ -5905,6 +5929,36 @@ mod tests {
         let (revised_generation, revised) = account.settled_token_values_snapshot();
         assert_eq!(revised_generation, generation + 1);
         assert_eq!(revised.get("UP"), Some(&0.0));
+    }
+
+    #[test]
+    fn token_event_end_is_detected_from_each_durable_terminal_marker() {
+        let retired = SharedAccount::new("retired-event-marker");
+        retired.register_instance("maker", 1.0);
+        retired
+            .register_token_interest("maker", "retired", "RET-UP", "RET-DOWN")
+            .unwrap();
+        assert!(!retired.token_event_has_ended("RET-UP"));
+        retired.retire_token_interest("maker", "retired");
+        assert!(retired.token_event_has_ended("RET-UP"));
+        assert!(retired.token_event_has_ended("RET-DOWN"));
+
+        let audited = SharedAccount::new("settled-audit-marker");
+        audited.register_instance("maker", 1.0);
+        audited
+            .retain_settled_event_audit(
+                "maker",
+                "settled",
+                &["AUDIT-UP".to_string(), "AUDIT-DOWN".to_string()],
+            )
+            .unwrap();
+        assert!(audited.token_event_has_ended("AUDIT-UP"));
+
+        let outcome = SharedAccount::new("settled-outcome-marker");
+        outcome.record_settled_token_values(&HashMap::from([("WIN".to_string(), 1.0)]));
+        assert!(outcome.token_event_has_ended("WIN"));
+        assert!(!outcome.token_event_has_ended("UNKNOWN"));
+        assert!(!outcome.token_event_has_ended(""));
     }
 
     #[test]
