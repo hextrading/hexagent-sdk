@@ -14,6 +14,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EPS: f64 = 1e-9;
+/// Polymarket settles quote notional in six-decimal USDC units. The CLOB can
+/// therefore report an average fill price a fraction beyond the submitted
+/// limit when the integer quote amount is divided back by the matched shares.
+/// Compare order limits in quote-notional space and permit at most one atomic
+/// quote unit.
+const QUOTE_CURRENCY_ATOMIC_UNIT: f64 = 1e-6;
 const RECONCILIATION_UNIT: f64 = 1e-6;
 const INITIAL_TOKEN_BARRIER_TIMEOUT_MS: u64 = 10_000;
 const MANUAL_RISK_BLOCKER: &str = "manual";
@@ -30,6 +36,29 @@ pub fn normalize_order_id(order_id: &str) -> String {
         .or_else(|| order_id.trim().strip_prefix("0X"))
         .unwrap_or(order_id.trim())
         .to_ascii_lowercase()
+}
+
+fn fill_violates_limit(side: Side, limit_price: f64, fill_price: f64, fill_quantity: f64) -> bool {
+    let adverse_price = match side {
+        Side::Buy => fill_price - limit_price,
+        Side::Sell => limit_price - fill_price,
+    };
+    if adverse_price <= 0.0 {
+        return false;
+    }
+    let adverse_notional = adverse_price * fill_quantity;
+    let arithmetic_slack =
+        (fill_price.abs().max(limit_price.abs()) * fill_quantity).max(1.0) * f64::EPSILON * 8.0;
+    adverse_notional > QUOTE_CURRENCY_ATOMIC_UNIT + arithmetic_slack
+}
+
+fn fixed_point_trade_price_tolerance(reference_price: f64, quantity: f64) -> f64 {
+    let arithmetic_slack = reference_price.abs().max(1.0) * f64::EPSILON * 8.0;
+    if quantity.is_finite() && quantity > 0.0 {
+        (QUOTE_CURRENCY_ATOMIC_UNIT / quantity).max(arithmetic_slack)
+    } else {
+        arithmetic_slack
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -118,6 +147,10 @@ pub struct AccountMonitoringSnapshot {
     pub maintenance_queue_jobs: u64,
     pub pending_maintenance_operations: usize,
     pub recovery_pending_orders: usize,
+    /// Ordinary terminal cancels retaining their full reservation until an
+    /// order-specific size-matched audit completes. They do not globally block
+    /// unrelated instances sharing the account.
+    pub routine_cancel_audits: usize,
     pub persistence_path: Option<PathBuf>,
     pub persistence_error: Option<String>,
     pub persistence_writes: u64,
@@ -484,6 +517,11 @@ struct SharedAccountState {
     /// wallet snapshot must not clear them.
     #[serde(default)]
     recovery_pending_orders: HashSet<String>,
+    /// Successful ordinary cancels awaiting an authoritative cumulative
+    /// `size_matched` read. Kept separate from true trade recovery so normal
+    /// cancellation does not pause the shared account.
+    #[serde(default)]
+    routine_cancel_audits: HashSet<String>,
     /// Persisted ownership for an instance no longer present in config cannot
     /// be silently reassigned without moving that instance's PnL/inventory.
     #[serde(default)]
@@ -1180,6 +1218,7 @@ impl SharedAccount {
         if has_reservations
             || has_live_orders
             || !state.recovery_pending_orders.is_empty()
+            || !state.routine_cancel_audits.is_empty()
             || has_unsettled_trade_lifecycle(&state)
             || has_unsettled_maintenance_operation(&state)
         {
@@ -1284,31 +1323,30 @@ impl SharedAccount {
     pub fn token_interests(&self) -> Vec<TokenInterest> {
         let mut state = self.state.lock().unwrap();
         let now_ms = wall_clock_ms();
-        // Keep a settled winner in the explicit ERC-1155 query scope until
-        // both physical and virtual quantities have been observed at zero.
-        // Otherwise a platform redemption landing after the normal event grace
-        // can be missed because the Data API omits zero-balance rows.
-        let settled_winners_requiring_zero: HashSet<String> = state
-            .settled_token_values
+        // Keep every owned historical token in the explicit ERC-1155 and
+        // settlement-query scope until physical and virtual quantities both
+        // reach zero. Settlement can happen while the process is stopped, so
+        // winner proof may not exist in the ledger yet and Data API may omit
+        // the already-auto-redeemed rows entirely.
+        let mut owned_tokens_requiring_zero: HashSet<String> = state
+            .physical_positions
             .iter()
-            .filter(|(_, value)| **value == 1.0)
-            .filter_map(|(token, _)| {
-                let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
-                let virtual_qty: f64 = state
-                    .instances
-                    .values()
-                    .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-                    .sum();
-                (physical > EPS || virtual_qty > EPS).then(|| token.clone())
-            })
+            .filter(|(_, qty)| **qty > EPS)
+            .map(|(token, _)| token.clone())
             .collect();
+        owned_tokens_requiring_zero.extend(
+            state.instances.values()
+                .flat_map(|instance| instance.positions.iter())
+                .filter(|(_, qty)| **qty > EPS)
+                .map(|(token, _)| token.clone()),
+        );
         let mut pruned = false;
         for instance in state.instances.values_mut() {
             let before = instance.token_interests.len();
             instance.token_interests.retain(|_, interest| {
                 interest.retire_after_ms.is_none_or(|deadline| deadline > now_ms)
-                    || settled_winners_requiring_zero.contains(&interest.up_token_id)
-                    || settled_winners_requiring_zero.contains(&interest.down_token_id)
+                    || owned_tokens_requiring_zero.contains(&interest.up_token_id)
+                    || owned_tokens_requiring_zero.contains(&interest.down_token_id)
             });
             pruned |= instance.token_interests.len() != before;
         }
@@ -1321,7 +1359,8 @@ impl SharedAccount {
 
     /// Retire a finished/abandoned event after a ten-minute reconciliation
     /// grace. Existing virtual positions retain their direct instance ownership;
-    /// only the active on-chain fetch scope eventually expires.
+    /// their on-chain/settlement query scope expires only after inventory is
+    /// authoritatively observed at zero.
     pub fn retire_token_interest(&self, instance_id: &str, condition_id: &str) {
         let mut state = self.state.lock().unwrap();
         if let Some(instance) = state.instances.get_mut(instance_id) {
@@ -1803,19 +1842,23 @@ impl SharedAccount {
             let observed = observed_positions.get(token).copied().unwrap_or(0.0);
             let delta = observed - prior;
             if delta.abs() <= reconciliation_tolerance(prior, observed) { continue; }
-            if delta < 0.0 && state.settled_token_values.get(token)
-                .is_some_and(|value| (*value - 1.0).abs() <= EPS)
-            {
-                removed.push((token.clone(), -delta));
+            let Some(value) = state.settled_token_values.get(token).copied() else {
+                return false;
+            };
+            if delta < 0.0 && (value == 0.0 || value == 1.0) {
+                removed.push((token.clone(), -delta, value));
             } else {
                 return false;
             }
         }
         if removed.is_empty() { return false; }
-        let removed_total: f64 = removed.iter().map(|(_, qty)| qty).sum();
+        let removed_total: f64 = removed.iter().map(|(_, qty, _)| qty).sum();
+        let expected_payout: f64 = removed.iter().map(|(_, qty, value)| qty * value).sum();
         let tolerance = 0.02_f64.max(removed_total.abs().max(cash_delta.abs()) * 0.001);
-        if (removed_total - cash_delta).abs() > tolerance { return false; }
-        for (token, qty) in &removed {
+        if expected_payout <= EPS || (expected_payout - cash_delta).abs() > tolerance {
+            return false;
+        }
+        for (token, qty, _) in &removed {
             let virtual_total: f64 = state.instances.values()
                 .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0)).sum();
             if virtual_total + tolerance < *qty { return false; }
@@ -1823,7 +1866,7 @@ impl SharedAccount {
 
         state.physical_cash += cash_delta;
         let mut attributed = Vec::new();
-        for (token, qty) in &removed {
+        for (token, qty, value) in &removed {
             let physical = state.physical_positions.entry(token.clone()).or_insert(0.0);
             *physical = (*physical - *qty).max(0.0);
             let virtual_total: f64 = state.instances.values()
@@ -1834,7 +1877,7 @@ impl SharedAccount {
                 if owned <= EPS { continue; }
                 let burned = (owned * *qty / virtual_total).min(owned);
                 *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                let instance_cash_delta = cash_delta * burned / removed_total;
+                let instance_cash_delta = cash_delta * burned * *value / expected_payout;
                 instance.cash += instance_cash_delta;
                 attributed.push((
                     instance_id.clone(),
@@ -1942,6 +1985,18 @@ impl SharedAccount {
     pub fn recovery_pending_order_ids(&self) -> Vec<String> {
         let state = self.state.lock().unwrap();
         let mut pending: Vec<String> = state.recovery_pending_orders.iter().cloned().collect();
+        pending.sort();
+        pending
+    }
+
+    /// All orders needing an authoritative order-specific audit. Startup or
+    /// trade recovery remains a global blocker; routine cancel audits merely
+    /// retain the affected order's reservation.
+    pub fn pending_order_audit_ids(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut pending: HashSet<String> = state.recovery_pending_orders.clone();
+        pending.extend(state.routine_cancel_audits.iter().cloned());
+        let mut pending: Vec<String> = pending.into_iter().collect();
         pending.sort();
         pending
     }
@@ -2105,6 +2160,7 @@ impl SharedAccount {
                 })
                 .count(),
             recovery_pending_orders: state.recovery_pending_orders.len(),
+            routine_cancel_audits: state.routine_cancel_audits.len(),
             persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
             persistence_error,
             persistence_writes: persistence_metrics.0,
@@ -2544,6 +2600,7 @@ impl SharedAccount {
                     }
                 }
                 state.recovery_pending_orders.remove(client_order_id);
+                state.routine_cancel_audits.remove(client_order_id);
                 state
                     .ownership_anomalies
                     .remove(&format!("order_cancel_audit:{client_order_id}"));
@@ -2572,6 +2629,7 @@ impl SharedAccount {
         };
         order.status = OrderStatus::Filled;
         let pending = order.reserved_cash > EPS || order.reserved_quantity > EPS;
+        state.routine_cancel_audits.remove(client_order_id);
         if pending {
             state
                 .recovery_pending_orders
@@ -2588,6 +2646,7 @@ impl SharedAccount {
         size_matched: f64,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
+        state.routine_cancel_audits.remove(client_order_id);
         let Some(existing) = state.orders.get(client_order_id) else { return false; };
         let quantity = existing.quantity;
         let filled = existing.filled_quantity;
@@ -2630,14 +2689,16 @@ impl SharedAccount {
     }
 
     /// DELETE acknowledgements have no matched quantity; preserve the full
-    /// residual lock until an order-specific audit arrives.
+    /// residual lock until an order-specific audit arrives, without globally
+    /// pausing unrelated instances on the same account.
     pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(order) = state.orders.get_mut(client_order_id) else { return false; };
         order.status = OrderStatus::Cancelled;
         order.terminal_matched_quantity = None;
-        state.recovery_pending_orders.insert(client_order_id.to_string());
-        recompute_reconciliation(&mut state, "cancellation awaits order audit");
+        state.recovery_pending_orders.remove(client_order_id);
+        state.routine_cancel_audits.insert(client_order_id.to_string());
+        recompute_reconciliation(&mut state, "routine cancellation audit queued");
         self.schedule_persist(&state);
         true
     }
@@ -2658,6 +2719,9 @@ impl SharedAccount {
         order.reserved_quantity = 0.0;
         order.status = status;
         state.orders.insert(client_order_id.into(), order);
+        if state.routine_cancel_audits.remove(client_order_id) {
+            recompute_reconciliation(&mut state, "routine cancellation audit released");
+        }
         self.schedule_persist(&state);
     }
 
@@ -3543,7 +3607,7 @@ impl SharedAccount {
                 return None;
             }
             let quantity_tolerance = 1e-8_f64.max(prior.quantity.abs() * 1e-8);
-            let price_tolerance = 1e-10_f64.max(prior.price.abs() * 1e-8);
+            let price_tolerance = fixed_point_trade_price_tolerance(prior.price, prior.quantity);
             if (prior.quantity - quantity).abs() > quantity_tolerance
                 || (prior.price - price).abs() > price_tolerance
             {
@@ -3610,11 +3674,7 @@ impl SharedAccount {
                 return Some(applied.ownership.clone());
             }
         }
-        let price_tolerance = 1e-10_f64.max(order.price.abs() * 1e-8);
-        let violates_limit = match side {
-            Side::Buy => price > order.price + price_tolerance,
-            Side::Sell => price + price_tolerance < order.price,
-        };
+        let violates_limit = fill_violates_limit(side, order.price, price, quantity);
         let quantity_tolerance = 1e-8_f64.max(order.quantity.abs() * 1e-8);
         let exceeds_order_quantity = existing.is_none()
             && order.filled_quantity + quantity > order.quantity + quantity_tolerance;
@@ -4129,6 +4189,7 @@ fn settled_audit_has_revisable_rows(
     state.orders.iter().any(|(coid, order)| {
         tokens.contains(&order.token_id)
             && (state.recovery_pending_orders.contains(coid)
+                || state.routine_cancel_audits.contains(coid)
                 || order.reserved_cash > EPS
                 || order.reserved_quantity > EPS
                 || !matches!(
@@ -4174,6 +4235,7 @@ fn prune_terminal_history_locked(
                 && instance_id.is_none_or(|expected| order.instance_id == expected)
                 && !protected_coids.contains(*coid)
                 && !state.recovery_pending_orders.contains(*coid)
+                && !state.routine_cancel_audits.contains(*coid)
                 && order.reserved_cash <= EPS
                 && order.reserved_quantity <= EPS
                 && matches!(
@@ -5369,7 +5431,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         let terminal_and_released = matches!(
             order.status,
             OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
-        ) && !state.recovery_pending_orders.contains(coid);
+        ) && !state.recovery_pending_orders.contains(coid)
+            && !state.routine_cancel_audits.contains(coid);
         let (expected_cash, expected_quantity) = if terminal_and_released {
             (0.0, 0.0)
         } else {
@@ -5479,6 +5542,19 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         if !state.orders.contains_key(coid) {
             return Err(format!(
                 "recovery pending set contains missing order `{coid}`"
+            ));
+        }
+    }
+    for coid in &state.routine_cancel_audits {
+        let Some(order) = state.orders.get(coid) else {
+            return Err(format!("routine cancel audit set contains missing order `{coid}`"));
+        };
+        if order.status != OrderStatus::Cancelled
+            || order.terminal_matched_quantity.is_some()
+            || state.recovery_pending_orders.contains(coid)
+        {
+            return Err(format!(
+                "routine cancel audit `{coid}` must be a distinct cancelled order without terminal matched quantity"
             ));
         }
     }
@@ -5648,21 +5724,26 @@ fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: St
 /// unallocated/uncertain until explicitly attributed by operation_id.
 fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
     if state.unallocated_cash <= EPS { return; }
-    let removed: Vec<(String, f64)> = state.unallocated_positions.iter()
+    let removed: Vec<(String, f64, f64)> = state.unallocated_positions.iter()
         .filter(|(token, delta)| {
             **delta < -EPS
                 && state
                     .settled_token_values
                     .get(*token)
-                    .is_some_and(|value| *value == 1.0)
+                    .is_some_and(|value| *value == 0.0 || *value == 1.0)
         })
-        .map(|(token, delta)| (token.clone(), -*delta))
+        .map(|(token, delta)| {
+            (token.clone(), -*delta, state.settled_token_values[token])
+        })
         .collect();
     if removed.is_empty() { return; }
-    let removed_total: f64 = removed.iter().map(|(_, qty)| *qty).sum();
+    let removed_total: f64 = removed.iter().map(|(_, qty, _)| *qty).sum();
+    let expected_payout: f64 = removed.iter().map(|(_, qty, value)| qty * value).sum();
     let tolerance = 0.02_f64.max(removed_total * 0.001);
-    if (removed_total - state.unallocated_cash).abs() > tolerance { return; }
-    for (token, qty) in &removed {
+    if expected_payout <= EPS || (expected_payout - state.unallocated_cash).abs() > tolerance {
+        return;
+    }
+    for (token, qty, _) in &removed {
         let virtual_total: f64 = state.instances.values()
             .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
             .sum();
@@ -5670,7 +5751,7 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
     }
 
     let cash_to_credit = state.unallocated_cash;
-    for (token, qty) in &removed {
+    for (token, qty, value) in &removed {
         let virtual_total: f64 = state.instances.values()
             .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
             .sum();
@@ -5681,7 +5762,7 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
             if owned <= EPS { continue; }
             let burned = (owned * *qty / virtual_total).min(owned);
             *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-            let cash_delta = cash_to_credit * burned / removed_total;
+            let cash_delta = cash_to_credit * burned * *value / expected_payout;
             instance.cash += cash_delta;
             attributed.push((instance_id.clone(), burned, cash_delta));
         }
@@ -6089,6 +6170,35 @@ mod tests {
         let after = account.monitoring_snapshot();
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
+    }
+
+    #[test]
+    fn routine_cancel_audit_keeps_reservation_without_blocking_shared_account() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a", "a-routine-cancel", "oid-routine-cancel", "UP",
+                Side::Buy, 10.0, 0.5, 0,
+            )
+            .unwrap();
+
+        assert!(account.mark_cancelled_pending_audit("a-routine-cancel"));
+        let pending = account.monitoring_snapshot();
+        assert!(!pending.uncertain);
+        assert_eq!(pending.recovery_pending_orders, 0);
+        assert_eq!(pending.routine_cancel_audits, 1);
+        assert_eq!(pending.reserved_cash, 5.0);
+        assert_eq!(
+            account.pending_order_audit_ids(),
+            vec!["a-routine-cancel".to_string()],
+        );
+
+        assert!(!account.mark_cancelled_pending_trade_audit("a-routine-cancel", 0.0));
+        let audited = account.monitoring_snapshot();
+        assert!(!audited.uncertain);
+        assert_eq!(audited.recovery_pending_orders, 0);
+        assert_eq!(audited.routine_cancel_audits, 0);
+        assert_eq!(audited.reserved_cash, 0.0);
     }
 
     #[test]
@@ -6543,6 +6653,55 @@ mod tests {
             )
             .unwrap();
         assert!(!lifecycle.is_uncertain());
+    }
+
+    #[test]
+    fn quantized_live_fill_within_one_usdc_atomic_unit_respects_buy_limit() {
+        let account = seeded_account();
+        let client_order_id = "btc03-1786695330861";
+        let order_id = "0xf865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
+        let token_id =
+            "4198435257457475353965016703411921574448583789337517048843814114807930128350";
+        let trade_key = "43535f84-454f-4302-b4cd-23b4510d9723:\
+f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
+        account
+            .reserve_order(
+                "a", client_order_id, order_id, token_id, Side::Buy, 10.0, 0.77, 0,
+            )
+            .unwrap();
+
+        let transition = account.apply_trade_transition_with_context(
+            trade_key,
+            "MATCHED",
+            client_order_id,
+            order_id,
+            token_id,
+            Side::Buy,
+            4.347825,
+            0.770000172500043,
+            true,
+            1_786_695_717,
+        );
+
+        assert!(transition.ownership().is_some());
+        assert!(account.ownership_anomalies().is_empty());
+        assert!(!account.is_uncertain());
+        assert!((account.order(client_order_id).unwrap().filled_quantity - 4.347825).abs() < 1e-12);
+
+        let rejected = seeded_account();
+        rejected
+            .reserve_order(
+                "a", "too-adverse", "oid-too-adverse", "UP",
+                Side::Buy, 10.0, 0.77, 0,
+            )
+            .unwrap();
+        assert!(rejected
+            .apply_trade_transition(
+                "too-adverse-trade", "MATCHED", "too-adverse", "oid-too-adverse",
+                "UP", Side::Buy, 4.347825, 0.770001,
+            )
+            .is_none());
+        assert!(rejected.is_uncertain());
     }
 
     #[test]
@@ -7475,6 +7634,53 @@ mod tests {
     }
 
     #[test]
+    fn persistent_restart_attributes_offline_auto_redeem_including_losing_leg() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-offline-auto-redeem-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("offline-redeem", &path).unwrap();
+            account.register_instance("btc03", 1.0);
+            account.register_instance("eth03", 1.0);
+            account
+                .register_token_interest(
+                    "eth03", "eth-settled", "ETH-WIN", "ETH-LOSE",
+                )
+                .unwrap();
+            account.apply_physical_snapshot(
+                100.0,
+                HashMap::from([("ETH-WIN".into(), 80.0), ("ETH-LOSE".into(), 80.0)]),
+            );
+            account.record_settled_token_values(&HashMap::from([
+                ("ETH-WIN".into(), 1.0),
+                ("ETH-LOSE".into(), 0.0),
+            ]));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("offline-redeem", &path).unwrap();
+        // eth03 may be disabled for new trading, but it remains configured so
+        // its historical cash and token ownership must survive reconciliation.
+        restored.reconcile_configured_instances(&HashSet::from([
+            "btc03".to_string(),
+            "eth03".to_string(),
+        ]));
+        restored.apply_physical_snapshot(180.0, HashMap::new());
+
+        let eth = restored.instance_snapshot("eth03").unwrap();
+        assert_eq!(eth.cash, 130.0);
+        assert!(eth.positions.get("ETH-WIN").copied().unwrap_or(0.0).abs() <= EPS);
+        assert!(eth.positions.get("ETH-LOSE").copied().unwrap_or(0.0).abs() <= EPS);
+        assert_eq!(restored.instance_snapshot("btc03").unwrap().cash, 50.0);
+        assert_eq!(restored.monitoring_snapshot().unallocated_cash, 0.0);
+        assert!(restored.monitoring_snapshot().unallocated_positions.is_empty());
+        assert!(!restored.is_uncertain());
+    }
+
+    #[test]
     fn runtime_platform_redeem_is_attributed_without_applying_a_snapshot() {
         let account = SharedAccount::new("runtime-platform-redeem");
         account.register_instance("btc", 1.0);
@@ -7498,6 +7704,32 @@ mod tests {
         assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
         assert_eq!(account.instance_snapshot("eth").unwrap().positions["ETH-UP"], 20.0);
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn expired_interest_with_persisted_inventory_waits_for_offline_settlement_proof() {
+        let account = SharedAccount::new("offline-settlement-proof");
+        account.register_instance("eth03", 1.0);
+        account
+            .register_token_interest("eth03", "eth-event", "ETH-WIN", "ETH-LOSE")
+            .unwrap();
+        account.apply_physical_snapshot(
+            100.0,
+            HashMap::from([("ETH-WIN".into(), 80.0), ("ETH-LOSE".into(), 80.0)]),
+        );
+        {
+            let mut state = account.state.lock().unwrap();
+            state.instances
+                .get_mut("eth03")
+                .unwrap()
+                .token_interests
+                .get_mut("eth-event")
+                .unwrap()
+                .retire_after_ms = Some(0);
+        }
+
+        assert_eq!(account.token_interests().len(), 1);
+        assert!(account.settled_token_values_snapshot().1.is_empty());
     }
 
     #[test]

@@ -215,7 +215,10 @@ async fn fetch_authoritative_resolutions(
 /// separate entries — we do NOT collapse by conditionId.
 ///
 /// API: `GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0`
-pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot> {
+fn fetch_position_snapshot_with_conditions(
+    wallet_address: &str,
+    mut settlement_conditions: HashSet<String>,
+) -> Result<PositionSnapshot> {
     info!("[Polymarket] Fetching positions for {}", wallet_address);
 
     // Route through the shared async runtime + HTTP/2 client.
@@ -261,14 +264,15 @@ pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot>
     // starts, Data API metadata can be incomplete or rounded, while the CLOB
     // market endpoint still carries the final winner flags. Failed/active
     // lookups remain provisional and are retried on the next account refresh.
-    let conditions: HashSet<String> = resp.iter()
-        .filter(|position| position.size.is_finite() && position.size > 0.0)
-        .map(|position| position.condition_id.trim())
-        .filter(|condition_id| !condition_id.is_empty())
-        .map(str::to_string)
-        .collect();
+    settlement_conditions.extend(
+        resp.iter()
+            .filter(|position| position.size.is_finite() && position.size > 0.0)
+            .map(|position| position.condition_id.trim())
+            .filter(|condition_id| !condition_id.is_empty())
+            .map(str::to_string),
+    );
     let authoritative = crate::async_rt::block_on_runtime(
-        fetch_authoritative_resolutions(conditions),
+        fetch_authoritative_resolutions(settlement_conditions),
     );
     let mut snapshot = position_snapshot_from_rows(&resp)?;
     snapshot.settled_token_values.extend(authoritative);
@@ -287,6 +291,10 @@ pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot>
     }
 
     Ok(snapshot)
+}
+
+pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot> {
+    fetch_position_snapshot_with_conditions(wallet_address, HashSet::new())
 }
 
 pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>> {
@@ -347,6 +355,34 @@ pub fn try_fetch_balance_positions_and_settlements_versioned(
     let t_pos = std::thread::Builder::new()
         .name("poly-fetch-positions".into())
         .spawn(move || fetch_position_snapshot(&wp))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
+
+    let balance = t_bal.join()
+        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
+    let snapshot = t_pos.join()
+        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    Ok((balance, snapshot.positions, snapshot.settled_token_values))
+}
+
+/// Strict cold-start snapshot that also resolves conditions remembered only
+/// by the persistent account ledger. Auto-redeem may remove every corresponding
+/// Data API position row while the bot is stopped.
+pub fn try_fetch_balance_positions_and_settlements_for_conditions_versioned(
+    wallet_address: &str,
+    is_v2: bool,
+    settlement_conditions: HashSet<String>,
+) -> Result<(f64, HashMap<String, Position>, HashMap<String, f64>)> {
+    let token = active_collateral_token(is_v2);
+    let wb = wallet_address.to_string();
+    let tok = token.to_string();
+    let t_bal = std::thread::Builder::new()
+        .name("poly-fetch-balance".into())
+        .spawn(move || fetch_balance_for_token(&wb, &tok))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
+    let wp = wallet_address.to_string();
+    let t_pos = std::thread::Builder::new()
+        .name("poly-fetch-positions".into())
+        .spawn(move || fetch_position_snapshot_with_conditions(&wp, settlement_conditions))
         .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
 
     let balance = t_bal.join()
