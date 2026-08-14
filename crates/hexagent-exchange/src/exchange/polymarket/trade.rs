@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use hexagent_account::account::shared_account::{OrderOwnership, normalize_order_id};
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::async_rt;
 use crate::exchange::ExchangeTrade;
@@ -160,6 +160,20 @@ fn recovered_order_close_reason(
     unavailable
         .is_some_and(FetchUnavailable::is_json_null)
         .then_some(RecoveredOrderCloseReason::JsonNull)
+}
+
+/// The same bounded retry pass owns both crash-recovered orders and routine
+/// post-cancel size-matched audits.  Returning when only the first counter is
+/// zero restarts the outer background loop and resets every log to attempt=1.
+fn startup_recovery_audits_complete(
+    recovery_pending_orders: usize,
+    routine_cancel_audits: usize,
+) -> bool {
+    recovery_pending_orders == 0 && routine_cancel_audits == 0
+}
+
+fn startup_recovery_warn_attempt(attempt: usize, attempts: usize) -> bool {
+    attempt == 0 || attempt.saturating_add(1) == attempts
 }
 
 impl FetchOrderResult {
@@ -2828,6 +2842,8 @@ impl PolymarketTrade {
             if delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
+            let mut unavailable_count = 0usize;
+            let mut unavailable_samples = Vec::new();
             let pending: Vec<(String, String, OrderOwnership, bool)> = {
                 let coids = self.shared.account_state.pending_order_audit_ids();
                 let recovered: HashSet<String> = self
@@ -2965,20 +2981,43 @@ impl PolymarketTrade {
                             RecoveredOrderCloseReason::JsonNull.as_str(),
                         ));
                     }
-                    FetchOrderResult::Unavailable(kind) => warn!(
-                        "[PolymarketTrade] startup recovery coid={} orderID={} unavailable={:?} attempt={} — retaining reservation",
-                        coid, order_id, kind, attempt + 1,
-                    ),
+                    FetchOrderResult::Unavailable(kind) => {
+                        unavailable_count = unavailable_count.saturating_add(1);
+                        if unavailable_samples.len() < 3 {
+                            unavailable_samples.push(format!("{}:{:?}", coid, kind));
+                        }
+                        debug!(
+                            "[PolymarketTrade] startup recovery coid={} orderID={} unavailable={:?} attempt={}/{} — retaining reservation",
+                            coid, order_id, kind, attempt + 1, RETRY_DELAYS_MS.len(),
+                        );
+                    }
                 }
             }
-            if self
-                .shared
-                .account_state
-                .monitoring_snapshot()
-                .recovery_pending_orders
-                == 0
-            {
-                return (0, replayed_updates);
+            if unavailable_count > 0 {
+                if startup_recovery_warn_attempt(attempt, RETRY_DELAYS_MS.len()) {
+                    warn!(
+                        "[PolymarketTrade] startup recovery lookup unavailable attempt={}/{} orders={} samples={:?} — retaining reservations",
+                        attempt + 1,
+                        RETRY_DELAYS_MS.len(),
+                        unavailable_count,
+                        unavailable_samples,
+                    );
+                } else {
+                    debug!(
+                        "[PolymarketTrade] startup recovery lookup unavailable attempt={}/{} orders={} samples={:?}",
+                        attempt + 1,
+                        RETRY_DELAYS_MS.len(),
+                        unavailable_count,
+                        unavailable_samples,
+                    );
+                }
+            }
+            let after = self.shared.account_state.monitoring_snapshot();
+            if startup_recovery_audits_complete(
+                after.recovery_pending_orders,
+                after.routine_cancel_audits,
+            ) {
+                return (after.recovery_pending_orders, replayed_updates);
             }
         }
 
@@ -6908,6 +6947,24 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routine_cancel_audits_keep_the_bounded_recovery_pass_running() {
+        assert!(startup_recovery_audits_complete(0, 0));
+        assert!(!startup_recovery_audits_complete(1, 0));
+        assert!(!startup_recovery_audits_complete(0, 1));
+        assert!(!startup_recovery_audits_complete(1, 1));
+    }
+
+    #[test]
+    fn startup_recovery_warns_only_at_retry_boundaries() {
+        let attempts = 6;
+        assert!(startup_recovery_warn_attempt(0, attempts));
+        for attempt in 1..attempts - 1 {
+            assert!(!startup_recovery_warn_attempt(attempt, attempts));
+        }
+        assert!(startup_recovery_warn_attempt(attempts - 1, attempts));
+    }
 
     fn valid_signing_order() -> OrderRequest {
         OrderRequest::new_limit(

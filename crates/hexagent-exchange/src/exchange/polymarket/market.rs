@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
-    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL,
-    POLYMARKET_WS_HEARTBEAT_INTERVAL, WS_CONNECT_TIMEOUT,
+    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL, POLYMARKET_RTDS_PING_PAYLOAD,
+    POLYMARKET_WS_HEALTH_LOG_INTERVAL, POLYMARKET_WS_HEARTBEAT_INTERVAL, WS_CONNECT_TIMEOUT,
 };
 use crate::types::*;
 
@@ -68,8 +67,8 @@ pub(crate) fn gamma_get_text_retry(
                             }
                         }
                     } else {
-                        let retriable = matches!(status.as_u16(), 408 | 425 | 429)
-                            || status.is_server_error();
+                        let retriable =
+                            matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error();
                         if !retriable || i + 1 == attempts {
                             return Err(anyhow!("GET {} returned {}", url, status));
                         }
@@ -83,14 +82,11 @@ pub(crate) fn gamma_get_text_retry(
 
             if i + 1 < attempts {
                 let exp = i.min(7);
-                let delay_ms = base_backoff_ms
-                    .saturating_mul(1u64 << exp)
-                    .min(30_000);
+                let delay_ms = base_backoff_ms.saturating_mul(1u64 << exp).min(30_000);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| anyhow!("GET {} failed after {} attempts", url, attempts)))
+        Err(last_err.unwrap_or_else(|| anyhow!("GET {} failed after {} attempts", url, attempts)))
     })
 }
 
@@ -116,6 +112,10 @@ pub(crate) fn gamma_get_text_retry(
 /// own 45 s Polymarket data-timeout, so the engine remains the first
 /// responder and this is the backstop it was always documented to be.
 const CLOB_STALE_THRESHOLD: Duration = Duration::from_secs(90);
+/// Cooperative-scheduler probe for the dedicated CLOB runtime.  Any long
+/// synchronous task accidentally moved onto that runtime appears as timer
+/// drift in `polymarket.ws.clob_scheduler_lag`.
+const CLOB_SCHEDULER_PROBE_INTERVAL: Duration = Duration::from_millis(10);
 const CLOB_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
@@ -124,16 +124,16 @@ const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Deserialize a field that is either a JSON array or a stringified JSON array.
 /// Handles: `["a","b"]`, `"[\"a\",\"b\"]"`, and `null` / missing.
-fn deserialize_json_string_array<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+fn deserialize_json_string_array<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de;
     let value = serde_json::Value::deserialize(deserializer)?;
     match value {
-        serde_json::Value::String(s) => {
-            serde_json::from_str(&s).map_err(de::Error::custom)
-        }
+        serde_json::Value::String(s) => serde_json::from_str(&s).map_err(de::Error::custom),
         serde_json::Value::Array(arr) => arr
             .into_iter()
             .map(|v| match v {
@@ -173,13 +173,21 @@ pub struct PolyMarketInfo {
     #[serde(default)]
     pub slug: String,
     /// CLOB token IDs for each outcome (e.g. [YES_TOKEN_ID, NO_TOKEN_ID])
-    #[serde(default, deserialize_with = "deserialize_json_string_array", rename = "clobTokenIds")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_json_string_array",
+        rename = "clobTokenIds"
+    )]
     pub clob_token_ids: Vec<String>,
     /// Outcome labels — stringified JSON array in the API: `"[\"Yes\",\"No\"]"`
     #[serde(default, deserialize_with = "deserialize_json_string_array")]
     pub outcomes: Vec<String>,
     /// Outcome prices — stringified JSON array in the API: `"[\"0.65\",\"0.35\"]"`
-    #[serde(default, deserialize_with = "deserialize_json_string_array", rename = "outcomePrices")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_json_string_array",
+        rename = "outcomePrices"
+    )]
     pub outcome_prices: Vec<String>,
     #[serde(default)]
     pub active: bool,
@@ -231,14 +239,18 @@ impl PolyMarketInfo {
         }
         let first_outcome = self.outcomes[0].trim().to_ascii_lowercase();
         let second_outcome = self.outcomes[1].trim().to_ascii_lowercase();
-        if first_outcome.is_empty() || second_outcome.is_empty() || first_outcome == second_outcome {
+        if first_outcome.is_empty() || second_outcome.is_empty() || first_outcome == second_outcome
+        {
             return Err(anyhow!("outcome labels must be non-empty and distinct"));
         }
         if !self.tick_size.is_finite() || self.tick_size <= 0.0 || self.tick_size >= 1.0 {
             return Err(anyhow!("invalid tick size {}", self.tick_size));
         }
         if !self.order_min_size.is_finite() || self.order_min_size <= 0.0 {
-            return Err(anyhow!("invalid minimum order size {}", self.order_min_size));
+            return Err(anyhow!(
+                "invalid minimum order size {}",
+                self.order_min_size
+            ));
         }
         Ok(())
     }
@@ -248,16 +260,15 @@ fn accepted_binary_markets<'a>(
     markets: &'a [PolyMarketInfo],
     active_only: bool,
 ) -> Vec<&'a PolyMarketInfo> {
-    markets.iter()
+    markets
+        .iter()
         .filter(|market| !active_only || (market.active && !market.closed))
         .filter(|market| match market.validate_binary_structure() {
             Ok(()) => true,
             Err(error) => {
                 warn!(
                     "[Polymarket] Rejecting malformed binary market id={} condition={}: {}",
-                    market.id,
-                    market.condition_id,
-                    error,
+                    market.id, market.condition_id, error,
                 );
                 false
             }
@@ -374,7 +385,9 @@ fn cache_gamma_events_at(
     events: &[PolymarketEvent],
     now: Instant,
 ) {
-    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
     for event in events {
         if event.id.is_empty() {
@@ -402,7 +415,9 @@ fn cached_gamma_event_after_at(
     now: Instant,
 ) -> Option<PolymarketEvent> {
     let min_end_ns = end_date_min_secs.saturating_mul(1_000_000_000);
-    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
     cache
         .values()
@@ -415,10 +430,7 @@ fn cached_gamma_event_after_at(
         .map(|(_, event)| event)
 }
 
-fn cached_gamma_event_after(
-    series_id: &str,
-    end_date_min_secs: u64,
-) -> Option<PolymarketEvent> {
+fn cached_gamma_event_after(series_id: &str, end_date_min_secs: u64) -> Option<PolymarketEvent> {
     cached_gamma_event_after_at(
         gamma_event_cache(),
         series_id,
@@ -448,27 +460,35 @@ pub fn fetch_event_by_slug(slug: &str) -> Result<PolymarketEvent> {
 /// don't want noisy URL/response dumps can pass `log=false`.
 pub fn fetch_event_by_slug_with_log(slug: &str, log: bool) -> Result<PolymarketEvent> {
     let url = format!("{}/events?slug={}", GAMMA_API_BASE, slug);
-    if log { info!("[Polymarket] Fetching event by slug: {}", url); }
+    if log {
+        info!("[Polymarket] Fetching event by slug: {}", url);
+    }
 
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
     // permanently stalling the subscribe / maintenance path.
     let resp_text = gamma_get_text_retry(&url, 5, 200)?;
     if log {
-        info!("[Polymarket] Gamma API response (first 500 chars): {}", &resp_text[..resp_text.len().min(500)]);
+        info!(
+            "[Polymarket] Gamma API response (first 500 chars): {}",
+            &resp_text[..resp_text.len().min(500)]
+        );
     }
 
     let events: Vec<PolymarketEvent> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse Gamma API response: {}", e))?;
 
-    let event = events.into_iter()
+    let event = events
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("No Polymarket event found for slug: {}", slug))?;
 
     if log {
         info!(
             "[Polymarket] Found event: '{}' (id={}, {} markets)",
-            event.title, event.id, event.markets.len()
+            event.title,
+            event.id,
+            event.markets.len()
         );
     }
     Ok(event)
@@ -511,7 +531,8 @@ fn fetch_series_id(series_slug: &str) -> Result<String> {
     let series_list: Vec<PolymarketSeries> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse series response: {}", e))?;
 
-    let series = series_list.into_iter()
+    let series = series_list
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("No series found for slug: {}", series_slug))?;
 
@@ -550,7 +571,10 @@ fn fetch_active_events_by_series_id(
         "{}/events?series_id={}&end_date_min={}&ascending=true&limit=1",
         GAMMA_API_BASE, series_id, end_min_iso,
     );
-    info!("[Polymarket] Fetching active events for series_id={}: {}", series_id, url);
+    info!(
+        "[Polymarket] Fetching active events for series_id={}: {}",
+        series_id, url
+    );
 
     // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
     // covers brief gamma-api 5xx blips during event rotation without
@@ -560,7 +584,10 @@ fn fetch_active_events_by_series_id(
         .map_err(|e| anyhow!("Failed to parse events response: {}", e))?;
 
     cache_gamma_events(series_id, &events);
-    info!("[Polymarket] Found {} active events in series", events.len());
+    info!(
+        "[Polymarket] Found {} active events in series",
+        events.len()
+    );
     Ok(events)
 }
 
@@ -574,7 +601,9 @@ fn event_open_ns(event: &PolymarketEvent) -> Option<u64> {
     if let Some(m) = event.markets.first() {
         if !m.event_start_time.is_empty() {
             if let Ok(ns) = parse_date_ns(&m.event_start_time) {
-                if ns > 0 { return Some(ns); }
+                if ns > 0 {
+                    return Some(ns);
+                }
             }
         }
     }
@@ -640,9 +669,15 @@ fn pick_current_event(events: Vec<PolymarketEvent>, series_slug: &str) -> Result
     let mut upcoming_start_ns = u64::MAX;
 
     for event in events {
-        if event.end_date.is_empty() { continue; }
-        let Some(end_dt) = parse_end(&event.end_date) else { continue };
-        if end_dt <= min_end { continue; } // expired or too close to expiry
+        if event.end_date.is_empty() {
+            continue;
+        }
+        let Some(end_dt) = parse_end(&event.end_date) else {
+            continue;
+        };
+        if end_dt <= min_end {
+            continue;
+        } // expired or too close to expiry
 
         let start_ns = event_open_ns(&event).unwrap_or(0);
         let is_open = start_ns == 0 || start_ns <= now_ns;
@@ -658,7 +693,10 @@ fn pick_current_event(events: Vec<PolymarketEvent>, series_slug: &str) -> Result
     }
 
     if let Some(event) = open {
-        info!("[Polymarket] Current event: '{}' (ends {})", event.title, event.end_date);
+        info!(
+            "[Polymarket] Current event: '{}' (ends {})",
+            event.title, event.end_date
+        );
         return Ok(event);
     }
     if let Some(event) = upcoming {
@@ -772,13 +810,20 @@ pub fn fetch_next_event(
 
     cache_gamma_events(series_id, &events);
     let Some(event) = events.into_iter().next() else {
-        info!("[Polymarket] Next event: <none> (no event with end_date ≥ {})", end_min_iso);
+        info!(
+            "[Polymarket] Next event: <none> (no event with end_date ≥ {})",
+            end_min_iso
+        );
         return Ok(None);
     };
-    let start_time = event.markets.first()
+    let start_time = event
+        .markets
+        .first()
         .map(|m| m.event_start_time.as_str())
         .unwrap_or("?");
-    let cid = event.markets.first()
+    let cid = event
+        .markets
+        .first()
         .map(|m| m.condition_id.as_str())
         .unwrap_or("?");
     info!(
@@ -936,7 +981,11 @@ impl PolymarketMarket {
     }
 
     /// Set the engine's market_tx and shutdown flag so RTDS task can send events directly.
-    pub fn set_market_tx(&mut self, tx: crossbeam_channel::Sender<MarketEvent>, shutdown: Arc<AtomicBool>) {
+    pub fn set_market_tx(
+        &mut self,
+        tx: crossbeam_channel::Sender<MarketEvent>,
+        shutdown: Arc<AtomicBool>,
+    ) {
         self.rtds_tx = Some(tx);
         self.rtds_shutdown = shutdown;
     }
@@ -949,7 +998,10 @@ impl PolymarketMarket {
 
     /// Collect all currently-subscribed CLOB token ids across every series.
     fn current_tokens(&self) -> Vec<String> {
-        self.series.iter().flat_map(|s| s.market.token_ids()).collect()
+        self.series
+            .iter()
+            .flat_map(|s| s.market.token_ids())
+            .collect()
     }
 
     /// Send a Resubscribe message to the async WS task. No-op if the task
@@ -981,19 +1033,20 @@ impl PolymarketMarket {
                 let cached_id = self.series[i].series_id.clone();
                 let result = match &cached_id {
                     Some(id) => fetch_active_event_by_series_id(id, &series_slug),
-                    None => {
-                        match fetch_active_event_with_series_id(&series_slug) {
-                            Ok((id, ev)) => {
-                                self.series[i].series_id = Some(id);
-                                Ok(ev)
-                            }
-                            Err(e) => Err(e),
+                    None => match fetch_active_event_with_series_id(&series_slug) {
+                        Ok((id, ev)) => {
+                            self.series[i].series_id = Some(id);
+                            Ok(ev)
                         }
-                    }
+                        Err(e) => Err(e),
+                    },
                 };
                 match result {
                     Ok(event) => {
-                        info!("[Polymarket] Event series '{}' refresh: '{}'", series_slug, event.title);
+                        info!(
+                            "[Polymarket] Event series '{}' refresh: '{}'",
+                            series_slug, event.title
+                        );
 
                         // Remove old token mappings
                         for sym in &self.series[i].market.symbols {
@@ -1008,7 +1061,8 @@ impl PolymarketMarket {
                         for condition in &active_markets {
                             for (j, token_id) in condition.clob_token_ids.iter().enumerate() {
                                 self.token_to_series.insert(token_id.clone(), i);
-                                let outcome = condition.outcomes.get(j).cloned().unwrap_or_default();
+                                let outcome =
+                                    condition.outcomes.get(j).cloned().unwrap_or_default();
                                 symbols_state.push(SymbolState {
                                     token_id: token_id.clone(),
                                     _outcome: outcome,
@@ -1038,8 +1092,8 @@ impl PolymarketMarket {
                             ));
                         }
 
-                        let end_ns = parse_date_ns(&event.end_date)
-                            .unwrap_or(now + 300_000_000_000);
+                        let end_ns =
+                            parse_date_ns(&event.end_date).unwrap_or(now + 300_000_000_000);
 
                         self.series[i].market = MarketState {
                             event_id: event.id,
@@ -1050,7 +1104,9 @@ impl PolymarketMarket {
                         self.series[i].next_retry_ns = 0;
                         // Reset failure-streak counters on success.
                         if self.series[i].refresh_idling_logged {
-                            let dur_s = (now.saturating_sub(self.series[i].refresh_fail_first_ns)) as f64 / 1e9;
+                            let dur_s = (now.saturating_sub(self.series[i].refresh_fail_first_ns))
+                                as f64
+                                / 1e9;
                             info!(
                                 "[Polymarket] Event series '{}' recovered after {:.0}s of idling",
                                 series_slug, dur_s,
@@ -1084,7 +1140,8 @@ impl PolymarketMarket {
                             s.next_retry_ns = now + 5_000_000_000; // retry in 5s
                         } else {
                             if !s.refresh_idling_logged {
-                                let dur_s = (now.saturating_sub(s.refresh_fail_first_ns)) as f64 / 1e9;
+                                let dur_s =
+                                    (now.saturating_sub(s.refresh_fail_first_ns)) as f64 / 1e9;
                                 warn!(
                                     "[Polymarket] Series '{}' has no live event for {:.0}s, idling (last error: {})",
                                     series_slug, dur_s, e,
@@ -1116,7 +1173,7 @@ impl PolymarketMarket {
 // Async WS tasks
 // ────────────────────────────────────────────────────────────────
 
-/// Main CLOB orderbook WS task. Runs on the shared tokio runtime.
+/// Main CLOB orderbook WS task. Runs on the dedicated CLOB tokio runtime.
 ///
 /// Protocol:
 ///   - On start (and on each Resubscribe): (re)connect, send full
@@ -1128,34 +1185,122 @@ impl PolymarketMarket {
 #[derive(Debug, Default)]
 struct ClobLifecycle {
     subscribed_once: bool,
+    ready: bool,
     not_ready_announced: bool,
 }
 
-impl ClobLifecycle {
-    /// The first successful subscription is ready immediately. A
-    /// re-subscription after a transport failure stays NOT_READY until a
-    /// non-empty book for one of the subscribed tokens arrives.
-    fn subscribed(&mut self) -> bool {
-        if !self.subscribed_once {
-            self.subscribed_once = true;
-            self.not_ready_announced = false;
-            true
-        } else {
-            false
+struct ClobWindowMetrics {
+    window_started_at: Instant,
+    last_data_frame_at: Option<Instant>,
+    data_frames: u64,
+    frame_bytes: u64,
+    events: u64,
+    books: u64,
+    quotes: u64,
+    trades: u64,
+    tick_size_changes: u64,
+    other_events: u64,
+    max_frame_bytes: usize,
+    max_events_per_frame: usize,
+    max_event_queue_depth: usize,
+}
+
+impl ClobWindowMetrics {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            last_data_frame_at: None,
+            data_frames: 0,
+            frame_bytes: 0,
+            events: 0,
+            books: 0,
+            quotes: 0,
+            trades: 0,
+            tick_size_changes: 0,
+            other_events: 0,
+            max_frame_bytes: 0,
+            max_events_per_frame: 0,
+            max_event_queue_depth: 0,
         }
+    }
+
+    fn record_frame(&mut self, now: Instant, frame_bytes: usize, events: &[MarketEvent]) {
+        if let Some(previous) = self.last_data_frame_at {
+            crate::latency::record_ns(
+                "polymarket.ws.clob_data_frame_gap",
+                now.saturating_duration_since(previous).as_nanos() as u64,
+            );
+        }
+        self.last_data_frame_at = Some(now);
+        self.data_frames = self.data_frames.saturating_add(1);
+        self.frame_bytes = self.frame_bytes.saturating_add(frame_bytes as u64);
+        self.events = self.events.saturating_add(events.len() as u64);
+        self.max_frame_bytes = self.max_frame_bytes.max(frame_bytes);
+        self.max_events_per_frame = self.max_events_per_frame.max(events.len());
+        for event in events {
+            match event {
+                MarketEvent::OrderBook(_) => self.books += 1,
+                MarketEvent::Quote(_) => self.quotes += 1,
+                MarketEvent::Trade(_) => self.trades += 1,
+                MarketEvent::TickSizeChange(_) => self.tick_size_changes += 1,
+                _ => self.other_events += 1,
+            }
+        }
+    }
+
+    fn record_queue_depth(&mut self, depth: usize) {
+        self.max_event_queue_depth = self.max_event_queue_depth.max(depth);
+    }
+
+    fn log_and_reset(&mut self, now: Instant, queue_depth_now: usize) {
+        let window_secs = now
+            .saturating_duration_since(self.window_started_at)
+            .as_secs_f64();
+        info!(
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={}",
+            window_secs,
+            self.data_frames,
+            self.frame_bytes,
+            self.events,
+            self.books,
+            self.quotes,
+            self.trades,
+            self.tick_size_changes,
+            self.other_events,
+            self.max_frame_bytes,
+            self.max_events_per_frame,
+            queue_depth_now,
+            self.max_event_queue_depth,
+        );
+        let last_data_frame_at = self.last_data_frame_at;
+        *self = Self::new(now);
+        self.last_data_frame_at = last_data_frame_at;
+    }
+}
+
+impl ClobLifecycle {
+    /// A successful subscription proves only transport setup, not usable
+    /// market state.  Initial startup and every reconnect remain NOT_READY
+    /// until a subscribed token produces a valid full book snapshot or a
+    /// valid two-sided L1 best-bid/ask update.
+    fn subscribed(&mut self) {
+        self.subscribed_once = true;
+        self.ready = false;
     }
 
     fn disconnected(&mut self) -> bool {
         if self.not_ready_announced {
             false
         } else {
+            self.ready = false;
             self.not_ready_announced = true;
             true
         }
     }
 
-    fn valid_book(&mut self) -> bool {
-        if self.subscribed_once && self.not_ready_announced {
+    fn valid_market_data(&mut self) -> bool {
+        if self.subscribed_once && !self.ready {
+            self.ready = true;
             self.not_ready_announced = false;
             true
         } else {
@@ -1164,13 +1309,18 @@ impl ClobLifecycle {
     }
 }
 
-fn is_valid_subscribed_book(event: &MarketEvent, tokens: &[String]) -> bool {
+fn clob_readiness_source(event: &MarketEvent, tokens: &[String]) -> Option<&'static str> {
     match event {
-        MarketEvent::OrderBook(book) => {
-            tokens.iter().any(|token| token == &book.symbol)
-                && (book.best_bid().is_some() || book.best_ask().is_some())
-        }
-        _ => false,
+        MarketEvent::OrderBook(book) => (tokens.iter().any(|token| token == &book.symbol)
+            && (book.best_bid().is_some() || book.best_ask().is_some()))
+        .then_some("order_book"),
+        // `make_quote_event` has already rejected missing, non-finite,
+        // out-of-range, crossed, or one-sided best_bid_ask messages.
+        MarketEvent::Quote(quote) => tokens
+            .iter()
+            .any(|token| token == &quote.symbol)
+            .then_some("best_bid_ask"),
+        _ => None,
     }
 }
 
@@ -1191,7 +1341,8 @@ fn record_valid_clob_topic_frame(
     tokens: &[String],
     received_at: Instant,
 ) -> bool {
-    let accepted = events.iter()
+    let accepted = events
+        .iter()
         .any(|event| is_valid_subscribed_clob_event(event, tokens));
     if accepted {
         health.record_topic_frame(received_at);
@@ -1205,6 +1356,16 @@ fn has_complete_clob_subscription(tokens: &[String]) -> bool {
     // CLOB protocol. A non-empty set therefore means every token selected for
     // the current event(s) was included, regardless of market cardinality.
     !tokens.is_empty()
+}
+
+fn clob_subscription_message(tokens: &[String]) -> serde_json::Value {
+    // Keep custom L1 best-bid/ask updates permanently enabled. They are both
+    // useful quote inputs and an allowed readiness source after reconnect.
+    serde_json::json!({
+        "type": "market",
+        "assets_ids": tokens,
+        "custom_feature_enabled": true,
+    })
 }
 
 fn announce_clob_not_ready(
@@ -1233,6 +1394,7 @@ async fn clob_ws_task(
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
         subscribed_once: was_previously_subscribed,
+        ready: false,
         // Engine-level reconnects create a fresh task after already placing
         // the feed in NOT_READY. Preserve that recovery state so this task
         // still waits for a valid book.
@@ -1246,23 +1408,33 @@ async fn clob_ws_task(
     }
 
     'outer: loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Drain any buffered ctrl messages — take the latest Resubscribe so
         // we don't churn through stale token lists if rotations piled up.
         loop {
             match ctrl_rx.try_recv() {
-                Ok(WsCtrl::Resubscribe(new_tokens)) => { tokens = new_tokens; }
+                Ok(WsCtrl::Resubscribe(new_tokens)) => {
+                    tokens = new_tokens;
+                }
                 Ok(WsCtrl::Shutdown) => break 'outer,
                 Err(_) => break,
             }
         }
 
-        info!("[Polymarket] Connecting to {} ({} tokens)", POLYMARKET_WS_URL, tokens.len());
+        info!(
+            "[Polymarket] Connecting to {} ({} tokens)",
+            POLYMARKET_WS_URL,
+            tokens.len()
+        );
         let stream = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(POLYMARKET_WS_URL),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok((s, _))) => s,
             Ok(Err(e)) => {
                 announce_clob_not_ready(
@@ -1271,7 +1443,11 @@ async fn clob_ws_task(
                     format!("WS connect failed: {}", e),
                 );
                 let delay = backoff.next_delay();
-                warn!("[Polymarket] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Polymarket] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -1297,17 +1473,15 @@ async fn clob_ws_task(
         };
         backoff.reset();
         let (mut write, mut read) = stream.split();
-        let mut health = WsHealth::new(Instant::now());
+        let connected_at = Instant::now();
+        let mut health = WsHealth::new(connected_at);
+        let mut diagnostics = ClobWindowMetrics::new(connected_at);
 
         // Align with the official CLOB SDK: lowercase channel `"market"`
         // (the user channel already uses lowercase `"user"`; the server is
         // case-tolerant) plus `custom_feature_enabled`. Our frame parser
         // drops unknown messages/fields silently, so this can only add data.
-        let sub_msg = serde_json::json!({
-            "type": "market",
-            "assets_ids": tokens,
-            "custom_feature_enabled": true,
-        });
+        let sub_msg = clob_subscription_message(&tokens);
         if let Err(e) = ws_send(&mut write, Message::Text(sub_msg.to_string())).await {
             announce_clob_not_ready(
                 &event_tx,
@@ -1327,18 +1501,18 @@ async fn clob_ws_task(
             warn!(
                 "[Polymarket] CLOB subscription has no event tokens; readiness remains NOT_READY",
             );
-        } else if lifecycle.subscribed() {
+        } else {
+            lifecycle.subscribed();
             subscribed_once.store(true, Ordering::Relaxed);
-            let _ = event_tx.send(MarketEvent::Connected {
-                exchange: Exchange::Polymarket,
-            });
         }
 
         let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
         ping_interval.tick().await; // consume immediate tick
-        let mut health_interval =
-            tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+        let mut health_interval = tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
         health_interval.tick().await;
+        let mut scheduler_probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
+        scheduler_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        scheduler_probe.tick().await;
 
         loop {
             tokio::select! {
@@ -1359,6 +1533,13 @@ async fn clob_ws_task(
                         }
                         Some(WsCtrl::Shutdown) | None => break 'outer,
                     }
+                }
+
+                scheduled_at = scheduler_probe.tick() => {
+                    crate::latency::record_ns(
+                        "polymarket.ws.clob_scheduler_lag",
+                        scheduled_at.elapsed().as_nanos() as u64,
+                    );
                 }
 
                 _ = ping_interval.tick() => {
@@ -1395,6 +1576,7 @@ async fn clob_ws_task(
 
                 _ = health_interval.tick() => {
                     let now = Instant::now();
+                    diagnostics.log_and_reset(now, event_tx.len());
                     if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
                         warn!(
                             "[Polymarket] CLOB topic silent; {}",
@@ -1478,9 +1660,14 @@ async fn clob_ws_task(
                         }
                     };
                     let received_at = Instant::now();
-                    health.record_raw_frame(received_at);
                     match msg {
                         Message::Text(text) => {
+                            // Record only non-Close transport traffic here.
+                            // Previously the unconditional call above the
+                            // match made every close diagnostic report
+                            // `last_raw_frame=0.0s_ago`, hiding the actual
+                            // pre-close receive gap.
+                            health.record_raw_frame(received_at);
                             // Server answers our text "PING" heartbeat with
                             // "PONG" (and may echo "PING"). These aren't JSON
                             // frames — skip them so parse_clob_frame doesn't
@@ -1496,28 +1683,34 @@ async fn clob_ws_task(
                             }
                             let t_parse = crate::latency::Instant::now();
                             let events = parse_clob_frame(&text);
+                            diagnostics.record_frame(received_at, text.len(), &events);
                             record_valid_clob_topic_frame(
                                 &mut health, &events, &tokens, received_at,
                             );
-                            let has_valid_book = events
+                            let readiness_source = events
                                 .iter()
-                                .any(|event| is_valid_subscribed_book(event, &tokens));
+                                .find_map(|event| clob_readiness_source(event, &tokens));
                             for event in events {
                                 if event_tx.send(event).is_err() {
                                     break 'outer; // engine gone
                                 }
                             }
-                            // Queue READY after the qualifying book event, so
-                            // observers cannot see a recovered stream before
-                            // the first valid post-reconnect book was received.
-                            if has_valid_book && lifecycle.valid_book() {
-                                info!(
-                                    "[Polymarket] CLOB recovered after valid order book"
-                                );
-                                if event_tx.send(MarketEvent::Connected {
-                                    exchange: Exchange::Polymarket,
-                                }).is_err() {
-                                    break 'outer;
+                            diagnostics.record_queue_depth(event_tx.len());
+                            // Queue READY after the qualifying market-data
+                            // event, so observers cannot see a recovered stream
+                            // before a usable full book or two-sided L1 was
+                            // delivered to the engine queue.
+                            if let Some(source) = readiness_source {
+                                if lifecycle.valid_market_data() {
+                                    info!(
+                                        "[Polymarket] CLOB READY after valid {}",
+                                        source,
+                                    );
+                                    if event_tx.send(MarketEvent::Connected {
+                                        exchange: Exchange::Polymarket,
+                                    }).is_err() {
+                                        break 'outer;
+                                    }
                                 }
                             }
                             // Parse + dispatch latency for the whole
@@ -1551,7 +1744,9 @@ async fn clob_ws_task(
         }
 
         // Inner loop broke → reconnect after backoff.
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -1580,10 +1775,18 @@ async fn rtds_task(
                 return;
             }
             Err(e) => {
-                if shutdown.load(Ordering::Relaxed) { return; }
-                if start.elapsed().as_secs() > 30 { backoff.reset(); }
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                if start.elapsed().as_secs() > 30 {
+                    backoff.reset();
+                }
                 let delay = backoff.next_delay();
-                warn!("[RTDS] Error: {}, reconnecting in {:.1}s...", e, delay.as_secs_f64());
+                warn!(
+                    "[RTDS] Error: {}, reconnecting in {:.1}s...",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
             }
         }
@@ -1601,14 +1804,18 @@ async fn rtds_connect_and_run(
         tokio_tungstenite::connect_async(POLYMARKET_RTDS_URL),
     )
     .await
-    .map_err(|_| anyhow!("RTDS connect stalled >{:.0}s", WS_CONNECT_TIMEOUT.as_secs_f64()))??;
+    .map_err(|_| {
+        anyhow!(
+            "RTDS connect stalled >{:.0}s",
+            WS_CONNECT_TIMEOUT.as_secs_f64()
+        )
+    })??;
     let (mut write, mut read) = stream.split();
     let mut health = WsHealth::new(Instant::now());
     let monitors_btc = subscriptions.iter().any(|rtds| {
         let (topic, _) = rtds.topic_and_type();
         matches!(topic, "crypto_prices" | "crypto_prices_chainlink")
-            && (rtds.filters.is_empty()
-                || rtds.filters.iter().any(|symbol| is_btc_symbol(symbol)))
+            && (rtds.filters.is_empty() || rtds.filters.iter().any(|symbol| is_btc_symbol(symbol)))
     });
 
     // Build and send subscriptions — ALWAYS one unfiltered subscription
@@ -1643,12 +1850,13 @@ async fn rtds_connect_and_run(
 
     let mut ping_interval = tokio::time::interval(POLYMARKET_RTDS_PING_INTERVAL);
     ping_interval.tick().await;
-    let mut health_interval =
-        tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+    let mut health_interval = tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
     health_interval.tick().await;
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { return Ok(()); }
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
         tokio::select! {
             biased;
@@ -1859,12 +2067,7 @@ struct TradeFields {
     timestamp: Option<serde_json::Value>,
     /// Venue execution identity. A transaction can contain multiple fills, so
     /// its hash alone is deliberately not accepted as a trade id.
-    #[serde(
-        default,
-        alias = "trade_id",
-        alias = "tradeId",
-        alias = "executionId"
-    )]
+    #[serde(default, alias = "trade_id", alias = "tradeId", alias = "executionId")]
     execution_id: Option<String>,
     #[serde(default, alias = "transactionHash")]
     transaction_hash: Option<String>,
@@ -1952,7 +2155,8 @@ enum ClobFrame {
 /// Deserialize a field that may arrive as a number or a string-encoded
 /// number. Defaults to 0.0 on any other shape.
 fn de_str_or_num_f64<'de, D>(d: D) -> Result<f64, D::Error>
-where D: serde::Deserializer<'de>
+where
+    D: serde::Deserializer<'de>,
 {
     let v = serde_json::Value::deserialize(d)?;
     Ok(match v {
@@ -1963,7 +2167,8 @@ where D: serde::Deserializer<'de>
 }
 
 fn de_opt_str_or_num_f64<'de, D>(d: D) -> Result<Option<f64>, D::Error>
-where D: serde::Deserializer<'de>
+where
+    D: serde::Deserializer<'de>,
 {
     let v = Option::<serde_json::Value>::deserialize(d)?;
     Ok(match v {
@@ -1976,7 +2181,9 @@ where D: serde::Deserializer<'de>
 /// Parse a whole CLOB WS text frame (single object OR array of objects)
 /// using simd-json. Returns an owned Vec of MarketEvents to emit.
 fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
-    if text.is_empty() { return Vec::new(); }
+    if text.is_empty() {
+        return Vec::new();
+    }
     // simd-json mutates the input buffer in place, so we need an owned
     // Vec<u8>. This is one allocation per frame — cheaper than the
     // multiple HashMap allocations serde_json::Value does internally.
@@ -1989,8 +2196,11 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
         match simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut buf) {
             Ok(v) => v,
             Err(e) => {
-                warn!("[Polymarket] simd-json parse (array) failed: {} (raw: {})",
-                    e, &text[..text.len().min(200)]);
+                warn!(
+                    "[Polymarket] simd-json parse (array) failed: {} (raw: {})",
+                    e,
+                    &text[..text.len().min(200)]
+                );
                 return Vec::new();
             }
         }
@@ -1998,8 +2208,11 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
         match simd_json::serde::from_slice::<ClobFrame>(&mut buf) {
             Ok(v) => vec![v],
             Err(e) => {
-                warn!("[Polymarket] simd-json parse (single) failed: {} (raw: {})",
-                    e, &text[..text.len().min(200)]);
+                warn!(
+                    "[Polymarket] simd-json parse (single) failed: {} (raw: {})",
+                    e,
+                    &text[..text.len().min(200)]
+                );
                 return Vec::new();
             }
         }
@@ -2010,30 +2223,34 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
     for f in frames {
         match f {
             ClobFrame::Tagged(TaggedMessage::Book(b)) => {
-                if let Some(event) = make_book_event(b, now) { out.push(event); }
+                if let Some(event) = make_book_event(b, now) {
+                    out.push(event);
+                }
             }
             ClobFrame::Tagged(TaggedMessage::Trade(t))
             | ClobFrame::Tagged(TaggedMessage::LastTradePrice(t)) => {
-                if let Some(e) = make_trade_event(t, now) { out.push(e); }
+                if let Some(e) = make_trade_event(t, now) {
+                    out.push(e);
+                }
             }
             ClobFrame::Tagged(TaggedMessage::TickSizeChange(t)) => {
-                if let Some(event) = make_tick_size_event(t, now) { out.push(event); }
+                if let Some(event) = make_tick_size_event(t, now) {
+                    out.push(event);
+                }
             }
             ClobFrame::Tagged(TaggedMessage::PriceChange {}) => { /* ignored */ }
             ClobFrame::Tagged(TaggedMessage::BestBidAsk(q)) => {
                 let exchange_ts_ns = timestamp_value_to_ns(q.timestamp.as_ref(), now);
-                if let Some(event) = make_quote_event(
-                    q.asset_id,
-                    q.best_bid,
-                    q.best_ask,
-                    exchange_ts_ns,
-                    now,
-                ) {
+                if let Some(event) =
+                    make_quote_event(q.asset_id, q.best_bid, q.best_ask, exchange_ts_ns, now)
+                {
                     out.push(event);
                 }
             }
             ClobFrame::Rtds(r) => {
-                if let Some(e) = make_inline_rtds_event(r, now) { out.push(e); }
+                if let Some(e) = make_inline_rtds_event(r, now) {
+                    out.push(e);
+                }
             }
             ClobFrame::Unknown(_) => { /* ignored */ }
         }
@@ -2043,13 +2260,19 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
 
 fn make_book_event(b: BookFields, now: u64) -> Option<MarketEvent> {
     let parse_side = |levels: Vec<BookLevel>| -> Option<Vec<PriceLevel>> {
-        levels.into_iter()
+        levels
+            .into_iter()
             .map(|l| {
                 let price: f64 = l.price.parse().ok()?;
                 let quantity: f64 = l.size.parse().ok()?;
-                if !price.is_finite() || !quantity.is_finite()
-                    || price <= 0.0 || price >= 1.0 || quantity <= 0.0
-                { return None; }
+                if !price.is_finite()
+                    || !quantity.is_finite()
+                    || price <= 0.0
+                    || price >= 1.0
+                    || quantity <= 0.0
+                {
+                    return None;
+                }
                 Some(PriceLevel { price, quantity })
             })
             .collect()
@@ -2061,7 +2284,8 @@ fn make_book_event(b: BookFields, now: u64) -> Option<MarketEvent> {
     if matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask) {
         return None;
     }
-    let exchange_ts_ns = b.timestamp
+    let exchange_ts_ns = b
+        .timestamp
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|ms| ms.saturating_mul(1_000_000))
@@ -2106,8 +2330,10 @@ fn make_quote_event(
     let ask_price = best_ask?;
     if !bid_price.is_finite()
         || !ask_price.is_finite()
-        || bid_price <= 0.0 || bid_price >= 1.0
-        || ask_price <= 0.0 || ask_price >= 1.0
+        || bid_price <= 0.0
+        || bid_price >= 1.0
+        || ask_price <= 0.0
+        || ask_price >= 1.0
         || bid_price >= ask_price
     {
         return None;
@@ -2130,8 +2356,11 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     let price: f64 = t.price.parse().ok()?;
     let quantity: f64 = t.size.parse().ok()?;
     if t.asset_id.trim().is_empty()
-        || !price.is_finite() || price <= 0.0 || price >= 1.0
-        || !quantity.is_finite() || quantity <= 0.0
+        || !price.is_finite()
+        || price <= 0.0
+        || price >= 1.0
+        || !quantity.is_finite()
+        || quantity <= 0.0
     {
         return None;
     }
@@ -2153,8 +2382,13 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
         serde_json::Value::Number(value) => value.as_u64().map(|value| value.to_string()),
         serde_json::Value::String(value) => {
             let value = value.trim();
-            if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
-                u64::from_str_radix(hex, 16).ok().map(|value| value.to_string())
+            if let Some(hex) = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16)
+                    .ok()
+                    .map(|value| value.to_string())
             } else {
                 value.parse::<u64>().ok().map(|value| value.to_string())
             }
@@ -2184,8 +2418,12 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
 
 fn make_tick_size_event(t: TickSizeFields, now: u64) -> Option<MarketEvent> {
     if t.asset_id.trim().is_empty()
-        || !t.old_tick_size.is_finite() || t.old_tick_size <= 0.0 || t.old_tick_size >= 1.0
-        || !t.new_tick_size.is_finite() || t.new_tick_size <= 0.0 || t.new_tick_size >= 1.0
+        || !t.old_tick_size.is_finite()
+        || t.old_tick_size <= 0.0
+        || t.old_tick_size >= 1.0
+        || !t.new_tick_size.is_finite()
+        || t.new_tick_size <= 0.0
+        || t.new_tick_size >= 1.0
         || t.new_tick_size > t.old_tick_size
     {
         return None;
@@ -2211,7 +2449,8 @@ fn make_inline_rtds_event(r: InlineRtdsFields, local_now: u64) -> Option<MarketE
     let price = r.value.or(r.price)?;
     // Normalize timestamp (sec / ms / ns) to ns.
     let ts_raw = r.server_timestamp.or(r.timestamp).and_then(|v| {
-        v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     });
     let ts_ns = match ts_raw {
         Some(ts) if ts < 1_000_000_000_000 => ts * 1_000_000_000,
@@ -2245,7 +2484,7 @@ impl ExchangeMarket for PolymarketMarket {
         let shutdown = Arc::new(AtomicBool::new(false));
         self.ws_shutdown = shutdown.clone();
 
-        // Spawn the main CLOB async task on the shared runtime. Bridge into
+        // Spawn the main CLOB async task on its dedicated runtime. Bridge into
         // the sync engine via a crossbeam event channel; take control input
         // (resubscribe / shutdown) via a tokio mpsc.
         let all_tokens = self.current_tokens();
@@ -2254,7 +2493,7 @@ impl ExchangeMarket for PolymarketMarket {
         self.event_rx = Some(event_rx);
         self.ws_ctrl_tx = Some(ctrl_tx);
 
-        crate::async_rt::handle().spawn(clob_ws_task(
+        crate::async_rt::clob_handle().spawn(clob_ws_task(
             all_tokens.clone(),
             event_tx,
             ctrl_rx,
@@ -2273,7 +2512,8 @@ impl ExchangeMarket for PolymarketMarket {
 
         info!(
             "[Polymarket] WS tasks launched — {} CLOB tokens, {} rtds sources",
-            all_tokens.len(), self.rtds_subscriptions.len(),
+            all_tokens.len(),
+            self.rtds_subscriptions.len(),
         );
         Ok(())
     }
@@ -2285,7 +2525,8 @@ impl ExchangeMarket for PolymarketMarket {
                 let parts: Vec<&str> = rtds_rest.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     let source = parts[0].to_string();
-                    let filters: Vec<String> = parts[1].split(',')
+                    let filters: Vec<String> = parts[1]
+                        .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
@@ -2293,7 +2534,8 @@ impl ExchangeMarket for PolymarketMarket {
                         "[Polymarket] RTDS subscription: source={}, filters={:?}",
                         source, filters,
                     );
-                    self.rtds_subscriptions.push(RtdsSubscription { source, filters });
+                    self.rtds_subscriptions
+                        .push(RtdsSubscription { source, filters });
                 } else {
                     warn!("[Polymarket] Invalid rtds format: {}", symbol_str);
                 }
@@ -2307,7 +2549,10 @@ impl ExchangeMarket for PolymarketMarket {
                 let (series_id, event) = fetch_active_event_with_series_id(series_slug)?;
                 info!(
                     "[Polymarket] Event series '{}': found '{}' (id={}, {} markets)",
-                    series_slug, event.title, event.id, event.markets.len()
+                    series_slug,
+                    event.title,
+                    event.id,
+                    event.markets.len()
                 );
 
                 let series_idx = self.series.len();
@@ -2351,8 +2596,7 @@ impl ExchangeMarket for PolymarketMarket {
 
                 // Parse end_date for rotation check — use event level end_date,
                 // or if not available, set to check every 5 minutes
-                let end_ns = parse_date_ns(&event.end_date)
-                    .unwrap_or(now_ns() + 300_000_000_000); // 5 min default
+                let end_ns = parse_date_ns(&event.end_date).unwrap_or(now_ns() + 300_000_000_000); // 5 min default
 
                 let market = MarketState {
                     event_id: event.id.clone(),
@@ -2364,7 +2608,10 @@ impl ExchangeMarket for PolymarketMarket {
                 let active_count = active_markets.len();
                 info!(
                     "[Polymarket] Event series '{}': subscribed to {}/{} active markets, {} tokens",
-                    series_slug, active_count, event.markets.len(), market.symbols.len()
+                    series_slug,
+                    active_count,
+                    event.markets.len(),
+                    market.symbols.len()
                 );
 
                 self.series.push(SeriesState {
@@ -2382,7 +2629,9 @@ impl ExchangeMarket for PolymarketMarket {
                 let event = fetch_event_by_slug(symbol_str)?;
                 info!(
                     "[Polymarket] Found event by slug '{}': {} ({} markets)",
-                    symbol_str, event.title, event.markets.len()
+                    symbol_str,
+                    event.title,
+                    event.markets.len()
                 );
 
                 let series_idx = self.series.len();
@@ -2436,9 +2685,7 @@ impl ExchangeMarket for PolymarketMarket {
             }
         }
 
-        let total_markets: usize = self.series.iter()
-            .map(|s| s.market.symbols.len())
-            .sum();
+        let total_markets: usize = self.series.iter().map(|s| s.market.symbols.len()).sum();
         info!(
             "[Polymarket] {} events, {} markets, {} pending instrument events",
             self.series.len(),
@@ -2524,15 +2771,20 @@ mod pick_current_event_tests {
         }
     }
 
-    fn now() -> u64 { chrono::Utc::now().timestamp() as u64 }
+    fn now() -> u64 {
+        chrono::Utc::now().timestamp() as u64
+    }
 
     #[test]
     fn picks_open_event_not_future_one() {
         let n = now();
-        let open = mk_event(n - 60, n + 240);        // started 60s ago, ends in 4m
-        let upcoming = mk_event(n + 1200, n + 1500);  // opens in 20m (the live.log case)
+        let open = mk_event(n - 60, n + 240); // started 60s ago, ends in 4m
+        let upcoming = mk_event(n + 1200, n + 1500); // opens in 20m (the live.log case)
         let picked = pick_current_event(vec![upcoming, open.clone()], "btc-updown-5m").unwrap();
-        assert_eq!(picked.slug, open.slug, "must pick the already-open event over a future one");
+        assert_eq!(
+            picked.slug, open.slug,
+            "must pick the already-open event over a future one"
+        );
     }
 
     #[test]
@@ -2542,7 +2794,10 @@ mod pick_current_event_tests {
         let n = now();
         let upcoming = mk_event(n + 1186, n + 1186 + 300);
         let picked = pick_current_event(vec![upcoming.clone()], "btc-updown-5m").unwrap();
-        assert_eq!(picked.slug, upcoming.slug, "series gap -> return upcoming event as pending");
+        assert_eq!(
+            picked.slug, upcoming.slug,
+            "series gap -> return upcoming event as pending"
+        );
     }
 
     #[test]
@@ -2559,9 +2814,11 @@ mod pick_current_event_tests {
         let n = now();
         let near_end = mk_event(n - 270, n + 30);
         let next = mk_event(n + 30, n + 330);
-        let picked =
-            pick_current_event(vec![near_end, next.clone()], "btc-updown-5m").unwrap();
-        assert_eq!(picked.slug, next.slug, "5m series requires 60s useful lifetime");
+        let picked = pick_current_event(vec![near_end, next.clone()], "btc-updown-5m").unwrap();
+        assert_eq!(
+            picked.slug, next.slug,
+            "5m series requires 60s useful lifetime"
+        );
     }
 
     #[test]
@@ -2592,22 +2849,12 @@ mod pick_current_event_tests {
             2,
             "duplicate event ids must replace rather than grow the cache",
         );
-        let cached = cached_gamma_event_after_at(
-            &cache,
-            "series-1",
-            base + 299,
-            inserted_at,
-        )
-        .expect("first event should satisfy the strict end-date threshold");
+        let cached = cached_gamma_event_after_at(&cache, "series-1", base + 299, inserted_at)
+            .expect("first event should satisfy the strict end-date threshold");
         assert_eq!(cached.id, first.id);
 
-        let cached = cached_gamma_event_after_at(
-            &cache,
-            "series-1",
-            base + 300,
-            inserted_at,
-        )
-        .expect("second event should be selected once the first no longer qualifies");
+        let cached = cached_gamma_event_after_at(&cache, "series-1", base + 300, inserted_at)
+            .expect("second event should be selected once the first no longer qualifies");
         assert_eq!(cached.id, second.id);
         assert!(
             cached_gamma_event_after_at(&cache, "other-series", base, inserted_at).is_none(),
@@ -2648,7 +2895,10 @@ mod pick_current_event_tests {
         let mut e = mk_event(n + 1200, n + 1500); // end in the future
         e.slug = "categorical-market-no-timestamp".into();
         let picked = pick_current_event(vec![e.clone()], "s").unwrap();
-        assert_eq!(picked.slug, e.slug, "unknown start -> open (legacy end-only)");
+        assert_eq!(
+            picked.slug, e.slug,
+            "unknown start -> open (legacy end-only)"
+        );
     }
 
     #[test]
@@ -2740,14 +2990,21 @@ mod pick_current_event_tests {
         let events = parse_clob_frame(
             r#"{"event_type":"last_trade_price","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","transaction_hash":"0xabc"}"#,
         );
-        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        let MarketEvent::Trade(trade) = &events[0] else {
+            panic!("expected trade");
+        };
         assert_eq!(trade.exchange_timestamp_ns, 1_757_908_892_351_000_000);
-        assert_eq!(trade.exchange_trade_id, None, "a transaction hash is not a fill id");
+        assert_eq!(
+            trade.exchange_trade_id, None,
+            "a transaction hash is not a fill id"
+        );
 
         let events = parse_clob_frame(
             r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","trade_id":"fill-7","transaction_hash":"0xabc"}"#,
         );
-        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        let MarketEvent::Trade(trade) = &events[0] else {
+            panic!("expected trade");
+        };
         assert_eq!(trade.exchange_trade_id.as_deref(), Some("execution:fill-7"));
 
         let corrected = parse_clob_frame(
@@ -2767,7 +3024,9 @@ mod pick_current_event_tests {
         let events = parse_clob_frame(
             r#"{"event_type":"trade","asset_id":"up","price":"0.51","size":"2","side":"BUY","timestamp":"1757908892351","transactionHash":"0xabc","logIndex":"0x2"}"#,
         );
-        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        let MarketEvent::Trade(trade) = &events[0] else {
+            panic!("expected trade");
+        };
         assert_eq!(
             trade.exchange_trade_id.as_deref(),
             Some("execution:0xabc:log:2"),
@@ -2776,7 +3035,9 @@ mod pick_current_event_tests {
         let events = parse_clob_frame(
             r#"{"event_type":"trade","asset_id":"down","price":"0.49","size":"2","side":"SELL","timestamp":"1757908892351","trade_id":"down-fill","mirrorTradeId":"pair-9"}"#,
         );
-        let MarketEvent::Trade(trade) = &events[0] else { panic!("expected trade"); };
+        let MarketEvent::Trade(trade) = &events[0] else {
+            panic!("expected trade");
+        };
         assert_eq!(trade.exchange_trade_id.as_deref(), Some("mirror:pair-9"));
 
         for invalid in [
@@ -2828,13 +3089,17 @@ mod pick_current_event_tests {
             fee_schedule: FeeSchedule::default(),
         };
         assert!(market(vec!["up", "down"], vec!["Up", "Down"])
-            .validate_binary_structure().is_ok());
+            .validate_binary_structure()
+            .is_ok());
         assert!(market(vec!["up", "up"], vec!["Up", "Down"])
-            .validate_binary_structure().is_err());
+            .validate_binary_structure()
+            .is_err());
         assert!(market(vec!["up", "down"], vec!["Up", " up "])
-            .validate_binary_structure().is_err());
+            .validate_binary_structure()
+            .is_err());
         assert!(market(vec!["up"], vec!["Up"])
-            .validate_binary_structure().is_err());
+            .validate_binary_structure()
+            .is_err());
     }
 
     fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {
@@ -2849,22 +3114,29 @@ mod pick_current_event_tests {
     }
 
     #[test]
-    fn initial_subscription_is_ready_but_reconnect_waits_for_valid_book() {
+    fn startup_and_reconnect_wait_for_valid_book_or_l1() {
         assert!(!has_complete_clob_subscription(&[]));
-        assert!(has_complete_clob_subscription(&["only-outcome".to_string()]));
+        assert!(has_complete_clob_subscription(
+            &["only-outcome".to_string()]
+        ));
         assert!(has_complete_clob_subscription(&[
             "up".to_string(),
             "down".to_string(),
             "third-outcome".to_string(),
         ]));
         let mut lifecycle = ClobLifecycle::default();
-        assert!(lifecycle.subscribed(), "first successful subscribe is READY");
+        lifecycle.subscribed();
+        assert!(!lifecycle.ready, "subscription alone must remain NOT_READY");
 
         assert!(lifecycle.disconnected(), "read error emits NOT_READY once");
-        assert!(!lifecycle.disconnected(), "retry failures do not flap NOT_READY");
         assert!(
-            !lifecycle.subscribed(),
-            "successful re-subscribe alone must not restore READY",
+            !lifecycle.disconnected(),
+            "retry failures do not flap NOT_READY"
+        );
+        lifecycle.subscribed();
+        assert!(
+            !lifecycle.ready,
+            "re-subscribe alone must not restore READY"
         );
 
         let tokens = vec!["up".to_string(), "down".to_string()];
@@ -2880,55 +3152,107 @@ mod pick_current_event_tests {
         });
         assert!(is_valid_subscribed_clob_event(&trade, &tokens));
         let mut other_trade = trade.clone();
-        let MarketEvent::Trade(other) = &mut other_trade else { unreachable!() };
+        let MarketEvent::Trade(other) = &mut other_trade else {
+            unreachable!()
+        };
         other.symbol = "other".to_string();
         assert!(!is_valid_subscribed_clob_event(&other_trade, &tokens));
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
         assert!(!record_valid_clob_topic_frame(
-            &mut health, &[], &tokens, connected_at,
+            &mut health,
+            &[],
+            &tokens,
+            connected_at,
         ));
         assert!(health.topic_is_stale(
-            connected_at + Duration::from_secs(2), Duration::from_secs(1),
+            connected_at + Duration::from_secs(2),
+            Duration::from_secs(1),
         ));
         assert!(record_valid_clob_topic_frame(
-            &mut health, std::slice::from_ref(&trade), &tokens, connected_at,
-        ));
-        assert!(!health.topic_is_stale(
-            connected_at, Duration::from_secs(1),
-        ));
-        assert!(!is_valid_subscribed_book(&trade, &tokens));
-        assert!(!is_valid_subscribed_book(&book("up", vec![], vec![]), &tokens));
-        assert!(!is_valid_subscribed_book(
-            &book(
-                "other",
-                vec![PriceLevel { price: 0.49, quantity: 1.0 }],
-                vec![],
-            ),
+            &mut health,
+            std::slice::from_ref(&trade),
             &tokens,
+            connected_at,
         ));
-        assert!(is_valid_subscribed_book(
-            &book(
-                "up",
-                vec![PriceLevel { price: 0.49, quantity: 1.0 }],
-                vec![],
+        assert!(!health.topic_is_stale(connected_at, Duration::from_secs(1),));
+        assert_eq!(clob_readiness_source(&trade, &tokens), None);
+        assert_eq!(
+            clob_readiness_source(&book("up", vec![], vec![]), &tokens),
+            None
+        );
+        assert_eq!(
+            clob_readiness_source(
+                &book(
+                    "other",
+                    vec![PriceLevel {
+                        price: 0.49,
+                        quantity: 1.0
+                    }],
+                    vec![],
+                ),
+                &tokens,
             ),
-            &tokens,
-        ));
-        assert!(lifecycle.valid_book(), "first valid subscribed book restores READY");
-        assert!(!lifecycle.valid_book(), "subsequent books do not duplicate READY");
+            None
+        );
+        assert_eq!(
+            clob_readiness_source(
+                &book(
+                    "up",
+                    vec![PriceLevel {
+                        price: 0.49,
+                        quantity: 1.0
+                    }],
+                    vec![],
+                ),
+                &tokens,
+            ),
+            Some("order_book")
+        );
+        assert!(
+            lifecycle.valid_market_data(),
+            "first valid subscribed book restores READY"
+        );
+        assert!(
+            !lifecycle.valid_market_data(),
+            "subsequent books do not duplicate READY"
+        );
+
+        assert!(lifecycle.disconnected());
+        lifecycle.subscribed();
+        let quote = MarketEvent::Quote(QuoteTick {
+            exchange: Exchange::Polymarket,
+            symbol: "down".to_string(),
+            bid_price: 0.48,
+            bid_qty: 0.0,
+            ask_price: 0.52,
+            ask_qty: 0.0,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 2,
+        });
+        assert_eq!(clob_readiness_source(&quote, &tokens), Some("best_bid_ask"));
+        assert!(
+            lifecycle.valid_market_data(),
+            "valid subscribed L1 restores READY"
+        );
+    }
+
+    #[test]
+    fn clob_subscription_always_enables_custom_l1_updates() {
+        let message = clob_subscription_message(&["up".to_string(), "down".to_string()]);
+        assert_eq!(message["type"], "market");
+        assert_eq!(message["custom_feature_enabled"], true);
     }
 
     #[test]
     fn engine_level_reconnect_also_waits_for_valid_book() {
         let mut lifecycle = ClobLifecycle {
             subscribed_once: true,
+            ready: false,
             not_ready_announced: true,
         };
-        assert!(
-            !lifecycle.subscribed(),
-            "a new task must remember that this is not the initial subscription",
-        );
-        assert!(lifecycle.valid_book());
+        lifecycle.subscribed();
+        assert!(!lifecycle.ready);
+        assert!(lifecycle.valid_market_data());
     }
 }

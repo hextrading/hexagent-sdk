@@ -60,8 +60,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 #[allow(unused_imports)]
 use log::{error, info, warn};
@@ -70,12 +70,12 @@ use crate::config::OsTuneConfig;
 
 // ── Legacy 4-core defaults (used when no [os_tune] block is present) ──
 const DEFAULT_BACKGROUND_CORE: usize = 0;
-const DEFAULT_ASYNC_RT_CORE:   usize = 1;
-const DEFAULT_STRATEGY_CORE:   usize = 2;
-const DEFAULT_EXECUTION_CORE:  usize = 3;
+const DEFAULT_ASYNC_RT_CORE: usize = 1;
+const DEFAULT_STRATEGY_CORE: usize = 2;
+const DEFAULT_EXECUTION_CORE: usize = 3;
 
-const DEFAULT_PRIO_ASYNC_RT:  u8 = 70;
-const DEFAULT_PRIO_STRATEGY:  u8 = 60;
+const DEFAULT_PRIO_ASYNC_RT: u8 = 70;
+const DEFAULT_PRIO_STRATEGY: u8 = 60;
 const DEFAULT_PRIO_EXECUTION: u8 = 50;
 
 /// Resolved at startup from `OsTuneConfig`. All fields are concrete
@@ -231,14 +231,21 @@ impl CorePlan {
         let mut seen_ids = HashSet::new();
         for instance_id in instance_ids {
             if !seen_ids.insert(instance_id) {
-                return Err(format!("duplicate enabled strategy instance_id `{}`", instance_id));
-            }
-            let core = self.strategy_cores.get(instance_id).copied().ok_or_else(|| {
-                format!(
-                    "enabled strategy `{}` has no strategy_cores entry",
+                return Err(format!(
+                    "duplicate enabled strategy instance_id `{}`",
                     instance_id
-                )
-            })?;
+                ));
+            }
+            let core = self
+                .strategy_cores
+                .get(instance_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "enabled strategy `{}` has no strategy_cores entry",
+                        instance_id
+                    )
+                })?;
             claim(core, format!("strategy:{instance_id}"), &mut exclusive)?;
         }
 
@@ -273,7 +280,10 @@ impl CorePlan {
                 return Err(format!("hex-worker core {} overlaps {}", core, role));
             }
             if feed_cores.contains(&core) || poly_cores.contains(&core) {
-                return Err(format!("hex-worker core {} overlaps another worker pool", core));
+                return Err(format!(
+                    "hex-worker core {} overlaps another worker pool",
+                    core
+                ));
             }
         }
 
@@ -298,7 +308,10 @@ impl CorePlan {
     fn route_background(&self) -> usize {
         let n = self.background_cores.len().max(1);
         let i = BACKGROUND_RR.fetch_add(1, Ordering::Relaxed) % n;
-        *self.background_cores.get(i).unwrap_or(&DEFAULT_BACKGROUND_CORE)
+        *self
+            .background_cores
+            .get(i)
+            .unwrap_or(&DEFAULT_BACKGROUND_CORE)
     }
 }
 
@@ -418,7 +431,10 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
         ""
     };
     if !skip.is_empty() && std::env::var(skip).ok().as_deref() == Some("1") {
-        info!("[os_tune] Pin '{}' → core {} SKIPPED ({}=1)", thread_name, core_id, skip);
+        info!(
+            "[os_tune] Pin '{}' → core {} SKIPPED ({}=1)",
+            thread_name, core_id, skip
+        );
         return;
     }
     #[cfg(target_os = "linux")]
@@ -428,7 +444,10 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
         // `ps -eLo pid,tid,comm,psr,cls,state | grep hexbot`.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         if core_affinity::set_for_current(target) {
-            info!("[os_tune] Pinned '{}' (tid={}) → core {}", thread_name, tid, core_id);
+            info!(
+                "[os_tune] Pinned '{}' (tid={}) → core {}",
+                thread_name, tid, core_id
+            );
         } else {
             warn!(
                 "[os_tune] Pin '{}' (tid={}) → core {} FAILED (core out of range or affinity mask restricted)",
@@ -466,14 +485,11 @@ pub fn set_fifo(priority: u8, thread_name: &str) {
     }
     #[cfg(target_os = "linux")]
     {
-        let param = libc::sched_param { sched_priority: priority as i32 };
-        let rc = unsafe {
-            libc::pthread_setschedparam(
-                libc::pthread_self(),
-                libc::SCHED_FIFO,
-                &param,
-            )
+        let param = libc::sched_param {
+            sched_priority: priority as i32,
         };
+        let rc =
+            unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
         if rc == 0 {
             info!("[os_tune] SCHED_FIFO prio={} → '{}'", priority, thread_name);
         } else {
@@ -517,6 +533,21 @@ pub fn pin_async_ord(thread_name: &str) {
     }
 }
 
+/// Pin the dedicated public-CLOB reader beside the synchronous Polymarket
+/// feed-drain thread when that feed core is configured.  The reader runs at
+/// async-runtime FIFO priority while the drain thread runs at execution
+/// priority, so socket polling preempts downstream decoding/drain work and
+/// immediately yields again after bridging events.  With no explicit
+/// Polymarket feed core, leave the reader unpinned at normal priority rather
+/// than silently colliding with another FIFO role.
+pub fn pin_async_clob(thread_name: &str) {
+    let p = plan();
+    if let Some(&core) = p.feed_cores.get("polymarket") {
+        pin_current(core, thread_name);
+        set_fifo(p.fifo_async_rt, thread_name);
+    }
+}
+
 /// Pin the strategy decision thread to its dedicated core with
 /// `PRIO_STRATEGY`.
 pub fn pin_strategy(thread_name: &str) {
@@ -531,7 +562,11 @@ pub fn pin_strategy(thread_name: &str) {
 /// Same `PRIO_STRATEGY` FIFO priority as the single-thread path.
 pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
     let p = plan();
-    let core = p.strategy_cores.get(instance_id).copied().unwrap_or(p.strategy);
+    let core = p
+        .strategy_cores
+        .get(instance_id)
+        .copied()
+        .unwrap_or(p.strategy);
     pin_current(core, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
 }
@@ -701,7 +736,11 @@ mod tests {
     #[test]
     fn completion_threads_use_polymarket_worker_pool() {
         let plan = CorePlan::from_config(&five_instance_config());
-        assert!(plan.poly_exec_cores.contains(&plan.route_execution("poly-exec-0")));
-        assert!(plan.poly_exec_cores.contains(&plan.route_execution("poly-done-0")));
+        assert!(plan
+            .poly_exec_cores
+            .contains(&plan.route_execution("poly-exec-0")));
+        assert!(plan
+            .poly_exec_cores
+            .contains(&plan.route_execution("poly-done-0")));
     }
 }

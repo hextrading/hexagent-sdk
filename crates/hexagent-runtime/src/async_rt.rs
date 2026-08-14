@@ -1,10 +1,13 @@
 //! Async runtime infrastructure for latency-sensitive I/O paths.
 //!
 //! Architecture:
-//!   - TWO `tokio::runtime::Runtime`s, each `current_thread` on its own
+//!   - THREE `tokio::runtime::Runtime`s, each `current_thread` on its own
 //!     dedicated OS thread:
 //!       * `hexbot-async-rt`  — general runtime: WS feeds, gap replay,
 //!         heartbeats, queries. Pinned + FIFO via `os_tune::pin_async_rt`.
+//!       * `hexbot-async-clob` — Polymarket public CLOB reader only.  It is
+//!         isolated from gap-replay JSON/account work so the socket is polled
+//!         even when the general runtime has a long cooperative task.
 //!       * `hexbot-async-ord` — order-I/O runtime: CLOB place/cancel HTTP
 //!         futures, plus everything that ESTABLISHES pool connections
 //!         (prewarm, keep-warm, slot repair). Split out 2026-07-31: on the
@@ -16,7 +19,8 @@
 //!         readiness events still route through the busy feed reactor.
 //!         Optional pinning via `[os_tune] async_ord_core` (default:
 //!         unpinned, normal priority).
-//!   - Latency-critical order I/O is spawned via `order_handle` /
+//!   - The public CLOB reader is spawned via `clob_handle`; latency-critical
+//!     order I/O is spawned via `order_handle` /
 //!     `block_on_order_runtime`; feeds and misc I/O via `handle` /
 //!     `block_on_runtime`
 //!   - Sync callers bridge via the `block_on_*` helpers (a
@@ -58,6 +62,7 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 
 static RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
+static CLOB_RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 static ORDER_RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 
 /// Number of HTTP/2 clients per role. Each client owns its own connection
@@ -132,7 +137,11 @@ static HTTP_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 fn load_timeout_or(fallback_ms: u64) -> u64 {
     use std::sync::atomic::Ordering;
     let v = HTTP_TIMEOUT_MS.load(Ordering::Relaxed);
-    if v == 0 { fallback_ms } else { v }
+    if v == 0 {
+        fallback_ms
+    } else {
+        v
+    }
 }
 
 /// Initialise the flat per-request timeout (in ms) for the FAST +
@@ -153,7 +162,8 @@ pub fn init_http_timeout(ms: u64) {
     } else if ms > ceiling {
         log::warn!(
             "[async_rt] http_timeout = {} ms exceeds client ceiling {} ms — clamped",
-            ms, ceiling,
+            ms,
+            ceiling,
         );
         ceiling
     } else {
@@ -162,7 +172,8 @@ pub fn init_http_timeout(ms: u64) {
     HTTP_TIMEOUT_MS.store(clamped, Ordering::Relaxed);
     log::info!(
         "[async_rt] http_timeout: {} ms (ceiling={}ms, default fallback=500ms)",
-        ms, ceiling,
+        ms,
+        ceiling,
     );
 }
 
@@ -179,7 +190,6 @@ pub fn current_fast_timeout() -> Duration {
 pub fn current_cancel_timeout() -> Duration {
     Duration::from_millis(load_timeout_or(CANCEL_DEFAULT_TIMEOUT_MS))
 }
-
 
 /// Spawn the async runtime on a dedicated OS thread. Idempotent — safe to
 /// call multiple times; only the first call has effect. Must be invoked
@@ -249,6 +259,35 @@ pub fn init() -> Result<()> {
 
     let ord_handle = ord_rx.recv().context("receive order runtime handle")?;
 
+    // Third runtime, dedicated to the public Polymarket CLOB socket.  Keep it
+    // separate from the general runtime because gap-replay response decoding
+    // and account application are synchronous work inside async tasks: on a
+    // current-thread scheduler they can otherwise delay socket polling long
+    // enough for the venue's per-client send buffer to fill.
+    let (clob_tx, clob_rx) = std::sync::mpsc::sync_channel::<Handle>(1);
+    std::thread::Builder::new()
+        .name("hexbot-async-clob".into())
+        .spawn(move || {
+            crate::os_tune::pin_async_clob("hexbot-async-clob");
+            let rt = match Builder::new_current_thread()
+                .enable_all()
+                .thread_name("hexbot-async-clob")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("Failed to build CLOB tokio runtime: {}", e);
+                    return;
+                }
+            };
+            let handle = rt.handle().clone();
+            let _ = clob_tx.send(handle);
+            rt.block_on(futures_util::future::pending::<()>());
+        })
+        .context("spawn CLOB runtime thread")?;
+
+    let clob_handle = clob_rx.recv().context("receive CLOB runtime handle")?;
+
     // Role-separated HTTP/1.1 client pools — fixed global fallback/query
     // construction plus account-scaled admission pools, round-robin and
     // keep-warm all live in `crate::http1_pool`; the getters below delegate.
@@ -257,9 +296,14 @@ pub fn init() -> Result<()> {
     // can override DOWN to the configured value.
     crate::http1_pool::init_pools()?;
 
-    RUNTIME_HANDLE.set(handle)
+    RUNTIME_HANDLE
+        .set(handle)
         .map_err(|_| anyhow!("runtime handle already initialised"))?;
-    ORDER_RUNTIME_HANDLE.set(ord_handle)
+    CLOB_RUNTIME_HANDLE
+        .set(clob_handle)
+        .map_err(|_| anyhow!("CLOB runtime handle already initialised"))?;
+    ORDER_RUNTIME_HANDLE
+        .set(ord_handle)
         .map_err(|_| anyhow!("order runtime handle already initialised"))?;
     Ok(())
 }
@@ -267,6 +311,12 @@ pub fn init() -> Result<()> {
 /// Get the runtime handle. Panics if `init()` hasn't been called.
 pub fn handle() -> &'static Handle {
     RUNTIME_HANDLE.get().expect("async_rt::init() not called")
+}
+
+/// Get the dedicated public Polymarket CLOB reader runtime.  It contains no
+/// REST queries, gap replay, private-feed account processing, or order I/O.
+pub fn clob_handle() -> &'static Handle {
+    CLOB_RUNTIME_HANDLE.get().unwrap_or_else(handle)
 }
 
 /// Get the order-I/O runtime handle (`hexbot-async-ord`). All CLOB
@@ -380,18 +430,13 @@ pub fn blocking_get_text(url: &str) -> Result<String> {
 /// base_backoff_ms=200` total wait before giving up is roughly
 /// 200 + 400 + 800 + 1600 + 3200 ≈ 6.2 s — long enough to ride out
 /// brief upstream 500s without permanently stalling the caller.
-pub fn blocking_get_text_retry(
-    url: &str,
-    attempts: u32,
-    base_backoff_ms: u64,
-) -> Result<String> {
+pub fn blocking_get_text_retry(url: &str, attempts: u32, base_backoff_ms: u64) -> Result<String> {
     let url = url.to_string();
     let attempts = attempts.max(1);
     block_on_runtime(async move {
         let mut last_err: Option<anyhow::Error> = None;
         for i in 0..attempts {
-            let client =
-                crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
+            let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
             match client.client().get(&url).send().await {
                 Ok(resp) => {
                     let status = resp.status();
@@ -464,7 +509,8 @@ where
     });
     // Block on the oneshot. If the runtime is down (shutdown), rx errors
     // and we panic — callers catch or propagate.
-    rx.blocking_recv().expect("async task dropped before sending")
+    rx.blocking_recv()
+        .expect("async task dropped before sending")
 }
 
 /// `block_on_runtime` against the order-I/O runtime. Use for sync paths
@@ -481,27 +527,44 @@ where
         let val = fut.await;
         let _ = tx.send(val);
     });
-    rx.blocking_recv().expect("async task dropped before sending")
+    rx.blocking_recv()
+        .expect("async task dropped before sending")
 }
 
+/// `block_on_runtime` against the dedicated public CLOB runtime.  Primarily
+/// intended for isolation tests; production code normally calls
+/// `clob_handle().spawn(...)` and keeps the reader long-lived.
+pub fn block_on_clob_runtime<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel::<T>();
+    clob_handle().spawn(async move {
+        let val = fut.await;
+        let _ = tx.send(val);
+    });
+    rx.blocking_recv()
+        .expect("CLOB async task dropped before sending")
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Both runtimes come up from one `init()` and futures land on the
-    /// right dedicated thread — the order-I/O split depends on this
-    /// (order futures must never share the feed runtime's event loop).
+    /// All runtimes come up from one `init()` and futures land on the right
+    /// dedicated thread.  Neither public CLOB reads nor order futures may
+    /// share the general feed/gap-replay event loop.
     #[test]
-    fn init_spawns_general_and_order_runtimes() {
+    fn init_spawns_general_clob_and_order_runtimes() {
         init().expect("async_rt::init");
-        let general = block_on_runtime(async {
-            std::thread::current().name().map(str::to_string)
-        });
-        let order = block_on_order_runtime(async {
-            std::thread::current().name().map(str::to_string)
-        });
+        let general = block_on_runtime(async { std::thread::current().name().map(str::to_string) });
+        let order =
+            block_on_order_runtime(async { std::thread::current().name().map(str::to_string) });
+        let clob =
+            block_on_clob_runtime(async { std::thread::current().name().map(str::to_string) });
         assert_eq!(general.as_deref(), Some("hexbot-async-rt"));
+        assert_eq!(clob.as_deref(), Some("hexbot-async-clob"));
         assert_eq!(order.as_deref(), Some("hexbot-async-ord"));
     }
 
@@ -519,7 +582,8 @@ mod tests {
         assert_eq!(
             HTTP_TIMEOUT_MS.load(Ordering::Relaxed),
             ceiling,
-            "999_999 must be clamped to FAST_CLIENT_TIMEOUT_CEILING={}", ceiling,
+            "999_999 must be clamped to FAST_CLIENT_TIMEOUT_CEILING={}",
+            ceiling,
         );
 
         // Normal values pass through.
@@ -546,6 +610,10 @@ mod tests {
         HTTP_TIMEOUT_MS.store(750, Ordering::Relaxed);
         assert_eq!(load_timeout_or(500), 750, "non-zero must pass through");
         HTTP_TIMEOUT_MS.store(2000, Ordering::Relaxed);
-        assert_eq!(load_timeout_or(500), 2000, "non-zero (at ceiling) must pass through");
+        assert_eq!(
+            load_timeout_or(500),
+            2000,
+            "non-zero (at ceiling) must pass through"
+        );
     }
 }
