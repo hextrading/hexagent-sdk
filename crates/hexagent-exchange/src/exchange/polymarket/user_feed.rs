@@ -820,10 +820,14 @@ fn parse_user_event_checked(data: &serde_json::Value, shared: &SharedState) -> s
 }
 
 #[derive(Debug)]
-struct ParsedPrivateEvent {
-    updates: Vec<OrderUpdate>,
-    valid_business_event: bool,
-    invalid_business_event: bool,
+pub(crate) struct ParsedPrivateEvent {
+    pub(crate) updates: Vec<OrderUpdate>,
+    pub(crate) valid_business_event: bool,
+    pub(crate) invalid_business_event: bool,
+    /// Exact schema/ownership/invariant failure returned by the checked
+    /// parser. `None` with a valid event and zero updates is an idempotent or
+    /// non-advancing replay, not a parser rejection.
+    pub(crate) rejection_reason: Option<String>,
 }
 
 fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) -> ParsedPrivateEvent {
@@ -835,6 +839,7 @@ fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) 
             updates: Vec::new(),
             valid_business_event: false,
             invalid_business_event: false,
+            rejection_reason: None,
         };
     }
     match parse_user_event_checked(data, shared) {
@@ -844,6 +849,7 @@ fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) 
                 updates,
                 valid_business_event: true,
                 invalid_business_event: false,
+                rejection_reason: None,
             }
         }
         Err(error) => {
@@ -852,6 +858,7 @@ fn parse_user_event_with_health(data: &serde_json::Value, shared: &SharedState) 
                 updates: Vec::new(),
                 valid_business_event: false,
                 invalid_business_event: true,
+                rejection_reason: Some(error),
             }
         }
     }
@@ -884,8 +891,19 @@ fn resolve_valid_private_event_anomaly(data: &serde_json::Value, shared: &Shared
 /// Parse a Polymarket user WebSocket event into zero-or-more OrderUpdates.
 /// A single "trade" push from a MAKER perspective may expand into multiple
 /// OrderUpdates (one per matching `maker_orders[]` entry owned by us).
+#[cfg(test)]
 pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
     parse_user_event_with_health(data, shared).updates
+}
+
+/// Checked parser outcome for terminal order-audit backfill. Callers must not
+/// infer "parser rejected" from an empty update vector: valid lifecycle
+/// duplicates and already-applied records intentionally produce no update.
+pub(crate) fn parse_user_event_diagnosed(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> ParsedPrivateEvent {
+    parse_user_event_with_health(data, shared)
 }
 
 fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
@@ -2982,6 +3000,9 @@ mod tests {
         });
         let rejected = parse_user_event_with_health(&update, &shared);
         assert!(rejected.invalid_business_event);
+        assert!(rejected.rejection_reason.as_deref().is_some_and(|reason| {
+            reason.contains("missing associate_trades")
+        }));
         assert!(shared.account_state.is_uncertain());
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 1);
 
@@ -2989,8 +3010,25 @@ mod tests {
         let corrected = parse_user_event_with_health(&update, &shared);
         assert!(corrected.valid_business_event);
         assert_eq!(corrected.updates.len(), 1);
+        assert!(corrected.rejection_reason.is_none());
         assert!(!shared.account_state.is_uncertain());
         assert_eq!(shared.account_state.monitoring_snapshot().recovery_pending_orders, 0);
+    }
+
+    #[test]
+    fn valid_duplicate_trade_is_a_noop_not_a_parser_rejection() {
+        let shared = owned_taker_shared(0.5);
+        let event = valid_taker_event();
+        let first = parse_user_event_diagnosed(&event, &shared);
+        assert!(first.valid_business_event);
+        assert_eq!(first.updates.len(), 1);
+        assert!(first.rejection_reason.is_none());
+
+        let duplicate = parse_user_event_diagnosed(&event, &shared);
+        assert!(duplicate.valid_business_event);
+        assert!(!duplicate.invalid_business_event);
+        assert!(duplicate.updates.is_empty());
+        assert!(duplicate.rejection_reason.is_none());
     }
 
     #[test]

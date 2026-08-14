@@ -15,6 +15,22 @@ pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str =
 /// lifecycle as if a placement or cancel signal had been rejected.
 pub const ORPHAN_RECONCILE_DEFERRED: &str = "orphan_reconcile_deferred";
 
+/// Prefix on an ambiguous cancel-reconcile update whose next authoritative
+/// GET has an executor-owned backoff. The strategy mirrors this deadline so
+/// it does not mark the coid in-flight and then wait its unrelated 4.5-second
+/// lost-callback TTL. Optional diagnostic fields follow after `;`.
+pub const ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX: &str =
+    "orphan_reconcile_retry_after_ms=";
+
+pub fn orphan_reconcile_retry_after_ms(error: Option<&str>) -> Option<u64> {
+    error?
+        .strip_prefix(ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX)?
+        .split(';')
+        .next()?
+        .parse::<u64>()
+        .ok()
+}
+
 /// Prefix attached to the synthetic executor update that proves a
 /// market-scoped Polymarket expiry cancel reached order/trade finality.
 /// `client_order_id` carries the owning strategy instance and `symbol` carries
@@ -30,6 +46,23 @@ pub const POLYMARKET_MARKET_CANCEL_FINALITY_PENDING: &str =
     "polymarket_market_cancel_finality_pending";
 
 fn default_true_fn() -> bool { true }
+
+#[cfg(test)]
+mod orphan_reconcile_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn parses_retry_delay_without_consuming_diagnostic_suffix() {
+        assert_eq!(
+            orphan_reconcile_retry_after_ms(Some(
+                "orphan_reconcile_retry_after_ms=582;evidence=unavailable;attempt=1",
+            )),
+            Some(582),
+        );
+        assert_eq!(orphan_reconcile_retry_after_ms(Some("other")), None);
+        assert_eq!(orphan_reconcile_retry_after_ms(None), None);
+    }
+}
 
 /// Order type
 #[derive(

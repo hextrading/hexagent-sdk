@@ -17,7 +17,7 @@ use crate::types::*;
 use super::auth::PolyAuth;
 use super::live_position::LivePositionManager;
 use super::signer::{OrderSigner, SignatureType, validate_signing_inputs};
-use super::user_feed::parse_user_event;
+use super::user_feed::parse_user_event_diagnosed;
 
 /// CLOB protocol version selector. Threaded through `SharedState` so
 /// every signing / POST / auth path can dispatch at runtime.
@@ -4157,20 +4157,22 @@ impl PolymarketTrade {
             let fetch_result = self.fetch_order_by_id(coid, order_id, permit);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
-            if matches!(&fetch_result, FetchOrderResult::Unavailable(_))
-                && self.shared.in_http_425_backoff(coid)
-            {
+            let http_425_backoff_active = matches!(
+                &fetch_result,
+                FetchOrderResult::Unavailable(_),
+            ) && self.shared.in_http_425_backoff(coid);
+            if http_425_backoff_active {
                 log::debug!(
                     "[PolymarketTrade] Reconcile cancel coid={} orderID={}: fetch deferred (HTTP 425 backoff); keeping orphan",
                     coid, order_id,
                 );
-                continue;
             }
             let fetched_order = fetch_result.order();
             let status_str = fetched_order
                 .map(|order| order.status.clone())
                 .unwrap_or_default();
             let order_audit = fetched_order.map(|order| order.audit.clone());
+            let mut retry_diagnostic: Option<String> = None;
             let status = match status_str.as_str() {
                 "LIVE" => {
                     // The order is still active on the server — our
@@ -4248,11 +4250,30 @@ impl PolymarketTrade {
                     let attempts = self.shared.reconcile_attempts.next_cancel(coid);
                     let pending_delayed = self.shared.pending_delayed_orphans
                         .lock().unwrap().contains(coid);
-                    let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts);
+                    let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts)
+                        .max(if http_425_backoff_active {
+                            HTTP_425_BACKOFF_NS / 1_000_000
+                        } else {
+                            0
+                        });
                     self.shared.cancel_reconcile_next_retry_ns.lock().unwrap().insert(
                         coid.clone(),
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
+                    let evidence = match &fetch_result {
+                        FetchOrderResult::NotFound => "explicit_not_found".to_string(),
+                        FetchOrderResult::Unavailable(kind) => {
+                            format!("unavailable:{kind:?}")
+                        }
+                        FetchOrderResult::Found(_) => "status_missing".to_string(),
+                    };
+                    retry_diagnostic = Some(format!(
+                        "{}{};evidence={};attempt={}",
+                        ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX,
+                        backoff_ms,
+                        evidence,
+                        attempts,
+                    ));
                     match &fetch_result {
                         FetchOrderResult::NotFound => {
                             warn!(
@@ -4286,6 +4307,13 @@ impl PolymarketTrade {
                         coid.clone(),
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
+                    retry_diagnostic = Some(format!(
+                        "{}{};evidence=unknown_status:{};attempt={}",
+                        ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX,
+                        backoff_ms,
+                        other,
+                        attempts,
+                    ));
                     warn!(
                         "[PolymarketTrade] Reconcile cancel coid={} orderID={} unknown server status '{}' (attempt={}, retry_ms={}) — keeping orphan and worst-case reservation",
                         coid, order_id, other, attempts, backoff_ms,
@@ -4293,6 +4321,27 @@ impl PolymarketTrade {
                     OrderStatus::CancelUncertain
                 }
             };
+            if matches!(status, OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain)
+                && retry_diagnostic.is_none()
+            {
+                let attempts = self.shared.reconcile_attempts.next_cancel(coid);
+                let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts)
+                    .max(if self.shared.in_http_425_backoff(coid) {
+                        HTTP_425_BACKOFF_NS / 1_000_000
+                    } else {
+                        0
+                    });
+                self.shared.cancel_reconcile_next_retry_ns.lock().unwrap().insert(
+                    coid.clone(),
+                    now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
+                );
+                retry_diagnostic = Some(format!(
+                    "{}{};evidence=live_delete_ambiguous;attempt={}",
+                    ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX,
+                    backoff_ms,
+                    attempts,
+                ));
+            }
             if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
                 self.shared.remove_order_as(coid, status);
                 // Clear the defensive-retry counter on conclusive resolution
@@ -4328,8 +4377,11 @@ impl PolymarketTrade {
                 )
                     .then(|| order_audit.clone())
                     .flatten(),
-                error: matches!(status, OrderStatus::Cancelled | OrderStatus::Filled)
-                    .then(|| ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
+                error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
+                    Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
+                } else {
+                    retry_diagnostic
+                },
             });
         }
 
@@ -4365,24 +4417,38 @@ impl PolymarketTrade {
             }
             let record_count = records.len();
             let mut matched = 0usize;
+            let mut validated_no_update = 0usize;
+            let mut rejection_reasons = Vec::new();
             for mut record in records {
                 if let Some(object) = record.as_object_mut() {
                     object.entry("event_type".to_string())
                         .or_insert(serde_json::Value::String("trade".to_string()));
                 }
-                let parsed = parse_user_event(&record, &self.shared);
-                matched += parsed.len();
-                updates.extend(parsed);
+                let parsed = parse_user_event_diagnosed(&record, &self.shared);
+                if let Some(reason) = parsed.rejection_reason {
+                    rejection_reasons.push(reason);
+                } else if parsed.valid_business_event && parsed.updates.is_empty() {
+                    validated_no_update += 1;
+                }
+                matched += parsed.updates.len();
+                updates.extend(parsed.updates);
             }
-            if matched == 0 {
+            if !rejection_reasons.is_empty() {
                 warn!(
-                    "[orphan_metric] terminal_trade_backfill_parser_rejected=1 trade_id={} records={} ownership_anomalies={} lock_release=forbidden",
-                    trade_id, record_count, self.shared.account_state.ownership_anomalies().len(),
+                    "[orphan_metric] terminal_trade_backfill_parser_rejected={} trade_id={} records={} validated_no_update={} reasons={:?} ownership_anomalies={} lock_release=forbidden",
+                    rejection_reasons.len(), trade_id, record_count, validated_no_update,
+                    rejection_reasons, self.shared.account_state.ownership_anomalies().len(),
                 );
-            } else {
+            }
+            if matched > 0 {
                 info!(
                     "[orphan_metric] terminal_trade_backfill_updates={} trade_id={}",
                     matched, trade_id,
+                );
+            } else if rejection_reasons.is_empty() {
+                info!(
+                    "[orphan_metric] terminal_trade_backfill_validated_noop=1 trade_id={} records={} validated_no_update={} reason=already_applied_or_nonadvancing lock_release=forbidden",
+                    trade_id, record_count, validated_no_update,
                 );
             }
         }
