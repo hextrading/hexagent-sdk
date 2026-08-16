@@ -1025,6 +1025,12 @@ impl SharedAccount {
                 ));
             }
             let mut state = persisted.state;
+            let persisted_uncertainty = state.uncertain.then(|| {
+                (
+                    state.uncertain_reason.clone(),
+                    state.uncertain_since_ms,
+                )
+            });
             // `oid_to_coid` used to preserve the API's exact casing/prefix.
             // Rebuild it from durable orders so old ledgers are migrated to
             // canonical keys and cannot lose attribution after restart.
@@ -1139,6 +1145,25 @@ impl SharedAccount {
                     account_id,
                     state.recovery_pending_orders.len(),
                 );
+            }
+            // `uncertain` used to be persisted for an ordinary negative
+            // wallet-vs-virtual residual. Wallet differences are accounting
+            // observations, not structural admission blockers: keep their
+            // exact signed values in `unallocated_*`, but re-evaluate old
+            // scalar uncertainty under the current blocker-only policy.
+            if let Some((previous_reason, previous_since_ms)) = persisted_uncertainty {
+                recompute_reconciliation(&mut state, "persisted uncertainty migration");
+                if !state.uncertain {
+                    migrated = true;
+                    log::warn!(
+                        "[shared_account] account={} reset legacy persisted uncertainty reason={:?} since_ms={:?}; preserving wallet residual unallocated_cash={:+.6} unallocated_positions={:?}",
+                        account_id,
+                        previous_reason,
+                        previous_since_ms,
+                        state.unallocated_cash,
+                        state.unallocated_positions,
+                    );
+                }
             }
             validate_persisted_state(&account_id, &state)
                 .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
@@ -6176,7 +6201,7 @@ fn fee_degradation_is_only_uncertainty(state: &SharedAccountState) -> bool {
     !without_fees.uncertain
 }
 
-fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &str) {
+fn recompute_reconciliation(state: &mut SharedAccountState, _deficit_context: &str) {
     state.provisional_position_owners.retain(|token, owner| {
         state
             .instances
@@ -6235,7 +6260,6 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
             .values()
             .flat_map(|instance| instance.positions.keys().cloned()),
     );
-    let mut negative_tokens = Vec::new();
     for token in all_tokens {
         let physical = state.physical_positions.get(&token).copied().unwrap_or(0.0);
         let virtual_qty: f64 = state
@@ -6248,13 +6272,9 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
         let delta = physical - expected_virtual;
         let tolerance = reconciliation_tolerance(physical, expected_virtual);
         if delta.abs() > tolerance {
-            if delta < -tolerance {
-                negative_tokens.push(format!("{token}:{delta:.6}"));
-            }
             state.unallocated_positions.insert(token, delta);
         }
     }
-    negative_tokens.sort();
     if let Some((source, blocker)) = state.risk_blockers.iter().next() {
         state.uncertain = true;
         state.uncertain_reason = Some(format!("{source}: {}", blocker.reason));
@@ -6315,19 +6335,11 @@ fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &st
             state,
             format!("failed trade `{trade_key}` awaits startup account baseline"),
         );
-    } else if state.unallocated_cash
-        < -reconciliation_tolerance(state.physical_cash, virtual_cash - pending_cash_delta)
-        || !negative_tokens.is_empty()
-    {
-        set_uncertain(
-            state,
-            format!(
-                "{deficit_context}: cash_delta={:.6} negative_tokens=[{}]",
-                state.unallocated_cash,
-                negative_tokens.join(","),
-            ),
-        );
     } else {
+        // Wallet-vs-virtual differences remain visible as exact signed
+        // `unallocated_*` residuals. They do not, by themselves, make order
+        // ownership or operation finality uncertain and therefore must not
+        // close account admission.
         clear_uncertain(state);
     }
 }
@@ -9990,7 +10002,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
-    fn reconciliation_uses_wallet_unit_tolerance_but_keeps_exact_metrics() {
+    fn reconciliation_keeps_exact_wallet_residuals_without_uncertainty() {
         let account = SharedAccount::new("rounding-tolerance");
         account.register_instance("a", 1.0);
         account.apply_physical_snapshot(100.0, HashMap::new());
@@ -10007,7 +10019,83 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             state.instances.get_mut("a").unwrap().cash += 2.0e-6;
             recompute_reconciliation(&mut state, "rounding test");
         }
-        assert!(account.is_uncertain());
+        assert!(!account.is_uncertain());
+        assert!((account.monitoring_snapshot().unallocated_cash + 2.5e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn persistent_restart_resets_legacy_wallet_residual_uncertainty() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-legacy-wallet-residual-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("legacy-wallet-residual", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            {
+                let mut state = account.state.lock().unwrap();
+                state.physical_cash = 99.894124;
+                recompute_reconciliation(&mut state, "legacy wallet residual fixture");
+                state.uncertain = true;
+                state.uncertain_reason = Some(
+                    "token fee curve registration/revision: cash_delta=-0.105876 negative_tokens=[]"
+                        .to_string(),
+                );
+                state.uncertain_since_ms = Some(wall_clock_ms().max(1));
+                account.schedule_persist(&state);
+            }
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("legacy-wallet-residual", &path).unwrap();
+        let snapshot = restored.monitoring_snapshot();
+        assert!(!snapshot.uncertain);
+        assert!(snapshot.uncertain_reason.is_none());
+        assert!(snapshot.uncertain_since_ms.is_none());
+        assert!((snapshot.unallocated_cash + 0.105876).abs() <= EPS);
+        restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(restored);
+
+        let reloaded = SharedAccount::new_persistent("legacy-wallet-residual", &path).unwrap();
+        assert!(!reloaded.is_uncertain());
+        assert!((reloaded.monitoring_snapshot().unallocated_cash + 0.105876).abs() <= EPS);
+        drop(reloaded);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn negative_wallet_position_residual_does_not_set_uncertain() {
+        let account = SharedAccount::new("position-residual");
+        account.register_instance("a", 1.0);
+        account
+            .register_token_interest("a", "event", "UP", "DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("UP".to_string(), 10.0), ("DOWN".to_string(), 10.0)]),
+            )
+            .unwrap();
+
+        {
+            let mut state = account.state.lock().unwrap();
+            state.physical_positions.insert("UP".to_string(), 9.5);
+            recompute_reconciliation(&mut state, "wallet position residual fixture");
+        }
+
+        assert!(!account.is_uncertain());
+        assert_eq!(
+            account.monitoring_snapshot().unallocated_positions.get("UP"),
+            Some(&-0.5),
+        );
     }
 
     #[test]
@@ -10049,10 +10137,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             account.instance_snapshot("eth").unwrap().positions["ETH-UP"],
             20.0
         );
-        assert!(
-            account.is_uncertain(),
-            "BTC's unexplained removal must fail closed"
-        );
+        assert!(!account.is_uncertain());
+        assert_eq!(metric.unallocated_positions.get("BTC-UP"), Some(&-10.0));
     }
 
     #[test]
@@ -10240,7 +10326,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .startup_snapshot_applied_this_process = false;
 
         account.apply_physical_snapshot(189.0, HashMap::new()).unwrap();
-        assert!(account.is_uncertain());
+        assert!(!account.is_uncertain());
+        assert!((account.monitoring_snapshot().unallocated_cash - 89.0).abs() <= EPS);
         account.record_settled_token_values(&HashMap::from([
             ("ETH-WIN".into(), 1.0),
             ("ETH-LOSE".into(), 0.0),
@@ -10274,7 +10361,10 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
 
         assert_eq!(account.instance_snapshot("eth03").unwrap().cash, 100.0);
         assert_eq!(account.instance_snapshot("eth03").unwrap().positions["ETH-WIN"], 80.0);
-        assert!(account.is_uncertain());
+        let metric = account.monitoring_snapshot();
+        assert!(!metric.uncertain);
+        assert!((metric.unallocated_cash - 89.0).abs() <= EPS);
+        assert_eq!(metric.unallocated_positions.get("ETH-WIN"), Some(&-80.0));
     }
 
     #[test]
@@ -10468,12 +10558,15 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .unwrap()
             .startup_snapshot_applied_this_process = false;
         account.apply_physical_snapshot(130.0, HashMap::new());
-        assert!(account.is_uncertain());
+        assert!(!account.is_uncertain());
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 100.0);
         assert_eq!(
             account.instance_snapshot("btc").unwrap().positions["LIVE-UP"],
             30.0
         );
+        let metric = account.monitoring_snapshot();
+        assert!((metric.unallocated_cash - 30.0).abs() <= EPS);
+        assert_eq!(metric.unallocated_positions.get("LIVE-UP"), Some(&-30.0));
     }
 
     #[test]
