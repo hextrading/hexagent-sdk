@@ -6642,7 +6642,7 @@ impl Engine {
                                         let snapshot = account.monitoring_snapshot();
                                         let log_account = || {
                                             format!(
-                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
+                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
                                                 snapshot.physical_cash,
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
@@ -6656,6 +6656,8 @@ impl Engine {
                                                 snapshot.uncertain_reason,
                                                 snapshot.recovery_pending_orders,
                                                 snapshot.routine_cancel_audits,
+                                                snapshot.retired_trade_ownership_tombstones,
+                                                snapshot.verified_trade_replay_recoveries,
                                                 snapshot.gap_replay_last_pages,
                                                 snapshot.gap_replay_max_pages,
                                                 snapshot.gap_replay_total_pages,

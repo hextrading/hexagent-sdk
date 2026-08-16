@@ -24,6 +24,12 @@ const RECONCILIATION_UNIT: f64 = 1e-6;
 const INITIAL_TOKEN_BARRIER_TIMEOUT_MS: u64 = 10_000;
 const MANUAL_RISK_BLOCKER: &str = "manual";
 const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
+/// Settled-event FIFO eviction may race a pinned gap replay by many hours.
+/// Keep a lightweight, durable ownership proof long after the full order and
+/// trade rows have been compacted so an already-applied fill remains an
+/// attributable no-op instead of becoming an `unowned trade`.
+const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
 /// the same hash with mixed hex casing and, on some paths, without the `0x`
@@ -151,6 +157,12 @@ pub struct AccountMonitoringSnapshot {
     /// order-specific size-matched audit completes. They do not globally block
     /// unrelated instances sharing the account.
     pub routine_cancel_audits: usize,
+    /// Lightweight durable ownership proofs retained after settled history is
+    /// economically compacted.
+    pub retired_trade_ownership_tombstones: usize,
+    /// Exact retired-trade replays that removed their matching ownership
+    /// anomaly and caused the account invariants to be recomputed.
+    pub verified_trade_replay_recoveries: u64,
     pub persistence_path: Option<PathBuf>,
     pub persistence_error: Option<String>,
     pub persistence_writes: u64,
@@ -207,6 +219,40 @@ pub struct TradeOwnership {
     pub status: String,
 }
 
+fn validate_owned_trade_replay(
+    prior: &TradeOwnership,
+    client_order_id: &str,
+    order_id: &str,
+    token_id: &str,
+    side: Side,
+    quantity: f64,
+    price: f64,
+) -> Result<(), String> {
+    let normalized_order_id = normalize_order_id(order_id);
+    if (!client_order_id.is_empty() && prior.client_order_id != client_order_id)
+        || normalized_order_id.is_empty()
+        || normalize_order_id(&prior.order_id) != normalized_order_id
+        || prior.token_id != token_id
+        || prior.side != side
+    {
+        return Err(format!(
+            "trade `{}` lifecycle ownership changed incoming=(coid=`{client_order_id}`,oid=`{order_id}`,token=`{token_id}`,side={side:?}) stored=(coid=`{}`,oid=`{}`,token=`{}`,side={:?})",
+            prior.trade_key, prior.client_order_id, prior.order_id, prior.token_id, prior.side,
+        ));
+    }
+    let quantity_tolerance = 1e-8_f64.max(prior.quantity.abs() * 1e-8);
+    let price_tolerance = fixed_point_trade_price_tolerance(prior.price, prior.quantity);
+    if (prior.quantity - quantity).abs() > quantity_tolerance
+        || (prior.price - price).abs() > price_tolerance
+    {
+        return Err(format!(
+            "trade `{}` lifecycle economics changed incoming=(quantity={quantity},price={price}) stored=(quantity={},price={})",
+            prior.trade_key, prior.quantity, prior.price,
+        ));
+    }
+    Ok(())
+}
+
 /// Result of applying one private-trade lifecycle edge to the durable account.
 /// Ownership/accounting validation is deliberately separate from persistence
 /// confirmation: a slow fsync must not make callers suppress an already-owned
@@ -215,13 +261,21 @@ pub struct TradeOwnership {
 pub enum TradeTransitionResult {
     Applied(TradeOwnership),
     AppliedButPersistencePending(TradeOwnership),
+    /// The trade is durably owned and its economic/lifecycle edge was already
+    /// applied. Callers must treat this as a valid business event without
+    /// broadcasting another fill downstream.
+    OwnedNoop(TradeOwnership),
+    OwnedNoopButPersistencePending(TradeOwnership),
     Rejected,
 }
 
 impl TradeTransitionResult {
     pub fn ownership(&self) -> Option<&TradeOwnership> {
         match self {
-            Self::Applied(ownership) | Self::AppliedButPersistencePending(ownership) => {
+            Self::Applied(ownership)
+            | Self::AppliedButPersistencePending(ownership)
+            | Self::OwnedNoop(ownership)
+            | Self::OwnedNoopButPersistencePending(ownership) => {
                 Some(ownership)
             }
             Self::Rejected => None,
@@ -229,7 +283,17 @@ impl TradeTransitionResult {
     }
 
     pub fn persistence_pending(&self) -> bool {
-        matches!(self, Self::AppliedButPersistencePending(_))
+        matches!(
+            self,
+            Self::AppliedButPersistencePending(_) | Self::OwnedNoopButPersistencePending(_)
+        )
+    }
+
+    pub fn owned_noop(&self) -> bool {
+        matches!(
+            self,
+            Self::OwnedNoop(_) | Self::OwnedNoopButPersistencePending(_)
+        )
     }
 }
 
@@ -433,6 +497,18 @@ struct RiskBlocker {
     since_ms: u64,
 }
 
+/// Identity retained after a terminal trade's economics have been folded into
+/// `compacted_economic_effects`. It deliberately contains no bookable state:
+/// a matching replay can only prove ownership and no-op; a mismatch remains a
+/// sticky ownership anomaly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetiredTradeOwnershipTombstone {
+    ownership: TradeOwnership,
+    #[serde(default)]
+    is_maker: Option<bool>,
+    retired_at_ms: u64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -462,6 +538,10 @@ struct SharedAccountState {
     orders: HashMap<String, OrderOwnership>,
     oid_to_coid: HashMap<String, String>,
     trades: HashMap<String, AppliedTrade>,
+    #[serde(default)]
+    retired_trade_ownership_tombstones: HashMap<String, RetiredTradeOwnershipTombstone>,
+    #[serde(default)]
+    verified_trade_replay_recoveries: u64,
     /// Advances only when the virtual trade/fee ledger changes.
     #[serde(default)]
     ledger_generation: u64,
@@ -2209,6 +2289,12 @@ impl SharedAccount {
                 .count(),
             recovery_pending_orders: state.recovery_pending_orders.len(),
             routine_cancel_audits: state.routine_cancel_audits.len(),
+            retired_trade_ownership_tombstones: state
+                .retired_trade_ownership_tombstones
+                .values()
+                .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
+                .count(),
+            verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
             persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
             persistence_error,
             persistence_writes: persistence_metrics.0,
@@ -3492,9 +3578,11 @@ impl SharedAccount {
         price: f64,
     ) -> Option<TradeOwnership> {
         let mut persistence_required = false;
+        let mut owned_noop = false;
         self.apply_trade_transition_inner(
             trade_key, status, client_order_id, order_id, token_id,
             side, quantity, price, None, &mut persistence_required,
+            &mut owned_noop,
         )
     }
 
@@ -3512,10 +3600,11 @@ impl SharedAccount {
         match_time_secs: u64,
     ) -> TradeTransitionResult {
         let mut persistence_required = false;
+        let mut owned_noop = false;
         let applied = self.apply_trade_transition_inner(
             trade_key, status, client_order_id, order_id, token_id,
             side, quantity, price, Some((is_maker, match_time_secs)),
-            &mut persistence_required,
+            &mut persistence_required, &mut owned_noop,
         );
         let Some(ownership) = applied else {
             return TradeTransitionResult::Rejected;
@@ -3534,11 +3623,19 @@ impl SharedAccount {
                         "trade `{trade_key}` applied but generation {generation} is not durable: {error}"
                     ),
                 );
-                return TradeTransitionResult::AppliedButPersistencePending(ownership);
+                return if owned_noop {
+                    TradeTransitionResult::OwnedNoopButPersistencePending(ownership)
+                } else {
+                    TradeTransitionResult::AppliedButPersistencePending(ownership)
+                };
             }
             self.refresh_trade_persistence_blocker();
         }
-        TradeTransitionResult::Applied(ownership)
+        if owned_noop {
+            TradeTransitionResult::OwnedNoop(ownership)
+        } else {
+            TradeTransitionResult::Applied(ownership)
+        }
     }
 
     fn apply_trade_transition_inner(
@@ -3553,6 +3650,7 @@ impl SharedAccount {
         price: f64,
         trade_context: Option<(bool, u64)>,
         persistence_required: &mut bool,
+        owned_noop: &mut bool,
     ) -> Option<TradeOwnership> {
         let mut normalized = status.trim_start_matches("TRADE_STATUS_").to_ascii_uppercase();
         if normalized == "MATCHED_NOT_BROADCASTED" { normalized = "MATCHED".to_string(); }
@@ -3587,6 +3685,129 @@ impl SharedAccount {
             return None;
         }
         let normalized_order_id = normalize_order_id(order_id);
+        let existing = state.trades.get(trade_key).cloned();
+
+        // Resolve already-applied durable rows before consulting order maps.
+        // Settled cleanup may retire oid/coid roots independently; replay
+        // idempotence must therefore be rooted in the trade id itself.
+        if let Some(applied) = existing.as_ref() {
+            let prior_rank = match applied.ownership.status.as_str() {
+                "MATCHED" => 1,
+                "MINED" => 2,
+                "CONFIRMED" | "FAILED" => 3,
+                _ => 0,
+            };
+            if applied.failed || applied.ownership.status == "CONFIRMED"
+                || lifecycle_rank <= prior_rank
+            {
+                if let Err(reason) = validate_owned_trade_replay(
+                    &applied.ownership, client_order_id, order_id, token_id,
+                    side, quantity, price,
+                ) {
+                    set_ownership_anomaly(&mut state, anomaly_key.clone(), reason);
+                    self.schedule_persist(&state);
+                    return None;
+                }
+                let was_uncertain = state.uncertain;
+                let recovered = state.ownership_anomalies.remove(&anomaly_key).is_some();
+                let mut changed = recovered;
+                if let Some((is_maker, match_time_secs)) = trade_context {
+                    let role_changed = applied.is_maker != Some(is_maker);
+                    let match_time_changed = applied.match_time_secs < match_time_secs;
+                    let fee_pending = state.fee_attribution_pending.contains(trade_key);
+                    if let Some(trade) = state.trades.get_mut(trade_key) {
+                        if match_time_changed { trade.match_time_secs = match_time_secs; }
+                    }
+                    changed |= match_time_changed;
+                    if role_changed || fee_pending {
+                        let uncertainty_before = (
+                            state.uncertain,
+                            state.uncertain_reason.clone(),
+                            state.uncertain_since_ms,
+                        );
+                        let fee_status = if normalized == "FAILED" {
+                            OrderStatus::Failed
+                        } else { OrderStatus::PartiallyFilled };
+                        let fee_changed = apply_configured_trade_fee_locked(
+                            &mut state, trade_key, fee_status, is_maker,
+                        );
+                        let uncertainty_changed = uncertainty_before != (
+                            state.uncertain,
+                            state.uncertain_reason.clone(),
+                            state.uncertain_since_ms,
+                        );
+                        changed |= role_changed || fee_changed || uncertainty_changed;
+                    }
+                }
+                if changed {
+                    recompute_reconciliation(&mut state, "corrected trade ownership replay");
+                    if recovered {
+                        state.verified_trade_replay_recoveries = state
+                            .verified_trade_replay_recoveries.saturating_add(1);
+                        log::info!(
+                            "[shared_account] verified durable trade replay account={} trade={} coid={} source=active reopened_admission={}",
+                            self.account_id, trade_key,
+                            applied.ownership.client_order_id,
+                            was_uncertain && !state.uncertain,
+                        );
+                    }
+                    self.schedule_persist(&state);
+                    *persistence_required = true;
+                }
+                *owned_noop = true;
+                return Some(applied.ownership.clone());
+            }
+        }
+
+        // Full terminal rows are economically compacted, but their seven-day
+        // ownership tombstones survive. Exact identity/economic agreement is
+        // sufficient proof that this replay is already applied.
+        if existing.is_none() {
+            let retired = state.retired_trade_ownership_tombstones.get(trade_key)
+                .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
+                .cloned();
+            if let Some(tombstone) = retired {
+                let validation = validate_owned_trade_replay(
+                    &tombstone.ownership, client_order_id, order_id, token_id,
+                    side, quantity, price,
+                ).and_then(|()| {
+                    if trade_context.is_some_and(|(is_maker, _)| {
+                        tombstone.is_maker.is_some_and(|stored| stored != is_maker)
+                    }) {
+                        Err(format!(
+                            "trade `{trade_key}` retired ownership role changed incoming_maker={} stored_maker={}",
+                            trade_context.map(|(is_maker, _)| is_maker).unwrap_or(false),
+                            tombstone.is_maker.unwrap_or(false),
+                        ))
+                    } else { Ok(()) }
+                });
+                if let Err(reason) = validation {
+                    set_ownership_anomaly(&mut state, anomaly_key.clone(), reason);
+                    self.schedule_persist(&state);
+                    return None;
+                }
+                let was_uncertain = state.uncertain;
+                let recovered = state.ownership_anomalies.remove(&anomaly_key).is_some();
+                if recovered {
+                    recompute_reconciliation(
+                        &mut state, "verified retired trade ownership replay",
+                    );
+                    state.verified_trade_replay_recoveries = state
+                        .verified_trade_replay_recoveries.saturating_add(1);
+                    let reopened = was_uncertain && !state.uncertain;
+                    log::info!(
+                        "[shared_account] verified retired trade replay account={} trade={} coid={} reopened_admission={}",
+                        self.account_id, trade_key,
+                        tombstone.ownership.client_order_id, reopened,
+                    );
+                    self.schedule_persist(&state);
+                    *persistence_required = true;
+                }
+                *owned_noop = true;
+                return Some(tombstone.ownership);
+            }
+        }
+
         let durable_coid = state.oid_to_coid.get(&normalized_order_id).cloned();
         if !client_order_id.is_empty()
             && durable_coid.as_deref().is_some_and(|coid| coid != client_order_id)
@@ -3635,7 +3856,6 @@ impl SharedAccount {
         }
         let instance_id = order.instance_id;
 
-        let existing = state.trades.get(trade_key).cloned();
         if let Some(applied) = existing.as_ref() {
             let prior = &applied.ownership;
             if prior.client_order_id != resolved_coid
@@ -3669,57 +3889,6 @@ impl SharedAccount {
                 );
                 self.schedule_persist(&state);
                 return None;
-            }
-            let prior_rank = match applied.ownership.status.as_str() {
-                "MATCHED" => 1,
-                "MINED" => 2,
-                "CONFIRMED" | "FAILED" => 3,
-                _ => 0,
-            };
-            // Mirror the user-feed lifecycle gate inside the durable ledger:
-            // terminal states are immutable and replayed same/earlier stages
-            // cannot regress a CONFIRMED row or re-book inventory.
-            if applied.failed
-                || applied.ownership.status == "CONFIRMED"
-                || lifecycle_rank <= prior_rank
-            {
-                let mut changed = state.ownership_anomalies.remove(&anomaly_key).is_some();
-                if let Some((is_maker, match_time_secs)) = trade_context {
-                    let role_changed = applied.is_maker != Some(is_maker);
-                    let match_time_changed = applied.match_time_secs < match_time_secs;
-                    let fee_pending = state.fee_attribution_pending.contains(trade_key);
-                    if let Some(trade) = state.trades.get_mut(trade_key) {
-                        if match_time_changed {
-                            trade.match_time_secs = match_time_secs;
-                        }
-                    }
-                    changed |= match_time_changed;
-                    if role_changed || fee_pending {
-                        let uncertainty_before = (
-                            state.uncertain,
-                            state.uncertain_reason.clone(),
-                            state.uncertain_since_ms,
-                        );
-                        let fee_status = if normalized == "FAILED" {
-                            OrderStatus::Failed
-                        } else { OrderStatus::PartiallyFilled };
-                        let fee_changed = apply_configured_trade_fee_locked(
-                            &mut state, trade_key, fee_status, is_maker,
-                        );
-                        let uncertainty_changed = uncertainty_before != (
-                            state.uncertain,
-                            state.uncertain_reason.clone(),
-                            state.uncertain_since_ms,
-                        );
-                        changed |= role_changed || fee_changed || uncertainty_changed;
-                    }
-                }
-                if changed {
-                    recompute_reconciliation(&mut state, "corrected trade ownership replay");
-                    self.schedule_persist(&state);
-                    *persistence_required = true;
-                }
-                return Some(applied.ownership.clone());
             }
         }
         let violates_limit = fill_violates_limit(side, order.price, price, quantity);
@@ -4152,6 +4321,21 @@ impl SharedAccount {
             .map(|trade| trade.ownership.clone()).collect()
     }
 
+    /// Resolve either a live durable trade row or a still-live compacted
+    /// ownership tombstone. This is used before role classification so a
+    /// delayed taker replay remains attributable after oid mappings retire.
+    pub fn trade_ownership(&self, trade_key: &str) -> Option<TradeOwnership> {
+        if trade_key.is_empty() { return None; }
+        let state = self.state.lock().unwrap();
+        state.trades.get(trade_key)
+            .map(|trade| trade.ownership.clone())
+            .or_else(|| {
+                let tombstone = state.retired_trade_ownership_tombstones.get(trade_key)?;
+                retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                    .then(|| tombstone.ownership.clone())
+            })
+    }
+
     pub fn restored_trades(&self) -> Vec<RestoredTrade> {
         self.state.lock().unwrap().trades.values()
             .filter_map(|trade| Some(RestoredTrade {
@@ -4311,8 +4495,17 @@ fn prune_terminal_history_locked(
         })
         .map(|(trade_key, _)| trade_key.clone())
         .collect();
+    let retired_at_ms = wall_clock_ms();
     for trade_key in &stale_trades {
         if let Some(trade) = state.trades.remove(trade_key) {
+            state.retired_trade_ownership_tombstones.insert(
+                trade_key.clone(),
+                RetiredTradeOwnershipTombstone {
+                    ownership: trade.ownership.clone(),
+                    is_maker: trade.is_maker,
+                    retired_at_ms,
+                },
+            );
             add_economic_state(
                 &mut state.compacted_economic_effects,
                 &trade_economic_effect(&trade),
@@ -4321,6 +4514,7 @@ fn prune_terminal_history_locked(
         }
         state.fee_attribution_pending.remove(trade_key);
     }
+    prune_retired_trade_ownership_tombstones(state, retired_at_ms);
     let protected_fee_tokens: HashSet<String> = state
         .trades
         .iter()
@@ -4365,6 +4559,28 @@ fn wall_clock_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+fn retired_trade_tombstone_is_live(
+    tombstone: &RetiredTradeOwnershipTombstone,
+    now_ms: u64,
+) -> bool {
+    now_ms.saturating_sub(tombstone.retired_at_ms) <= RETIRED_TRADE_TOMBSTONE_TTL_MS
+}
+
+fn prune_retired_trade_ownership_tombstones(state: &mut SharedAccountState, now_ms: u64) {
+    state.retired_trade_ownership_tombstones
+        .retain(|_, tombstone| retired_trade_tombstone_is_live(tombstone, now_ms));
+    let excess = state.retired_trade_ownership_tombstones.len()
+        .saturating_sub(MAX_RETIRED_TRADE_TOMBSTONES);
+    if excess == 0 { return; }
+    let mut oldest: Vec<(u64, String)> = state.retired_trade_ownership_tombstones.iter()
+        .map(|(trade_key, tombstone)| (tombstone.retired_at_ms, trade_key.clone()))
+        .collect();
+    oldest.sort_unstable();
+    for (_, trade_key) in oldest.into_iter().take(excess) {
+        state.retired_trade_ownership_tombstones.remove(&trade_key);
+    }
 }
 
 fn advance_trade_ledger_generation(state: &mut SharedAccountState, trade_key: &str) -> u64 {
@@ -5515,6 +5731,35 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         {
             return Err(format!(
                 "trade `{trade_key}` has virtual fee but missing physical fee booking"
+            ));
+        }
+    }
+    if state.retired_trade_ownership_tombstones.len() > MAX_RETIRED_TRADE_TOMBSTONES {
+        return Err(format!(
+            "retired trade ownership tombstones exceed bound: {} > {}",
+            state.retired_trade_ownership_tombstones.len(), MAX_RETIRED_TRADE_TOMBSTONES,
+        ));
+    }
+    for (trade_key, tombstone) in &state.retired_trade_ownership_tombstones {
+        let ownership = &tombstone.ownership;
+        if trade_key.trim().is_empty()
+            || ownership.trade_key != *trade_key
+            || ownership.account_id != account_id
+            || !state.instances.contains_key(&ownership.instance_id)
+            || ownership.client_order_id.trim().is_empty()
+            || ownership.order_id.trim().is_empty()
+            || ownership.token_id.trim().is_empty()
+            || !ownership.quantity.is_finite()
+            || ownership.quantity <= 0.0
+            || !ownership.price.is_finite()
+            || ownership.price <= 0.0
+            || ownership.price >= 1.0
+            || !matches!(ownership.status.as_str(), "CONFIRMED" | "FAILED")
+            || tombstone.retired_at_ms == 0
+            || state.trades.contains_key(trade_key)
+        {
+            return Err(format!(
+                "retired trade tombstone `{trade_key}` contains invalid ownership fields"
             ));
         }
     }
@@ -7161,6 +7406,96 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn retired_trade_replay_is_owned_noop_and_auto_recovers_matching_anomaly() {
+        let account = seeded_account();
+        account.reserve_order(
+            "a", "a-retired", "oid-retired", "UP", Side::Buy, 10.0, 0.5, 0,
+        ).unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade-retired", "CONFIRMED", "a-retired", "oid-retired", "UP",
+                Side::Buy, 10.0, 0.5, true, 1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        account.release_order("a-retired", OrderStatus::Filled);
+        let instance_before = account.instance_snapshot("a").unwrap();
+        let physical_before = account.monitoring_snapshot();
+
+        assert_eq!(
+            account.prune_terminal_history(&HashSet::from(["UP".to_string()])),
+            (1, 1),
+        );
+        assert!(account.order_owner_by_oid("oid-retired").is_none());
+        assert_eq!(
+            account.trade_ownership("trade-retired").unwrap().client_order_id,
+            "a-retired",
+        );
+        assert_eq!(
+            account.monitoring_snapshot().retired_trade_ownership_tombstones,
+            1,
+        );
+
+        // A mismatching replay remains fail-closed. Only an exact replay of
+        // the same durable trade proof may clear its ownership anomaly.
+        let rejected = account.apply_trade_transition_with_context(
+            "trade-retired", "CONFIRMED", "", "oid-retired", "UP",
+            Side::Buy, 10.0, 0.4, true, 1,
+        );
+        assert!(matches!(rejected, TradeTransitionResult::Rejected));
+        assert!(account.is_uncertain());
+        assert_eq!(account.monitoring_snapshot().verified_trade_replay_recoveries, 0);
+
+        let replay = account.apply_trade_transition_with_context(
+            "trade-retired", "CONFIRMED", "", "oid-retired", "UP",
+            Side::Buy, 10.0, 0.5, true, 1,
+        );
+        assert!(matches!(replay, TradeTransitionResult::OwnedNoop(_)));
+        assert!(!account.is_uncertain());
+        assert!(account.ownership_anomalies().is_empty());
+        assert_eq!(account.monitoring_snapshot().verified_trade_replay_recoveries, 1);
+        assert_eq!(account.instance_snapshot("a").unwrap(), instance_before);
+        let physical_after = account.monitoring_snapshot();
+        assert_eq!(physical_after.physical_cash, physical_before.physical_cash);
+        assert_eq!(physical_after.physical_positions, physical_before.physical_positions);
+    }
+
+    #[test]
+    fn active_durable_trade_exact_replay_auto_recovers_without_rebooking() {
+        let account = seeded_account();
+        account.reserve_order(
+            "a", "a-active", "oid-active", "UP", Side::Buy, 10.0, 0.5, 0,
+        ).unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade-active", "MATCHED", "a-active", "oid-active", "UP",
+                Side::Buy, 10.0, 0.5, true, 1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        let before = account.instance_snapshot("a").unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade-active", "MATCHED", "", "oid-active", "UP",
+                Side::Buy, 10.0, 0.4, true, 1,
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        assert!(account.is_uncertain());
+
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade-active", "MATCHED", "", "oid-active", "UP",
+                Side::Buy, 10.0, 0.5, true, 1,
+            ),
+            TradeTransitionResult::OwnedNoop(_)
+        ));
+        assert!(!account.is_uncertain());
+        assert_eq!(account.instance_snapshot("a").unwrap(), before);
+        assert_eq!(account.monitoring_snapshot().verified_trade_replay_recoveries, 1);
+    }
+
+    #[test]
     fn instance_scoped_pruning_keeps_sibling_history_on_same_token() {
         let account = seeded_account();
         for (instance, coid, oid, trade_key) in [
@@ -8500,6 +8835,62 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!(!state
             .provisional_position_owners
             .contains_key("HISTORICAL-WIN"));
+    }
+
+    #[test]
+    fn retired_trade_ownership_tombstone_survives_persistent_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-retired-trade-{}-{}.json",
+            std::process::id(), wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("retired-replay", &path).unwrap();
+            account.register_instance("owner", 1.0);
+            account.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+            account.reserve_order(
+                "owner", "retired-order", "retired-oid", "TOKEN",
+                Side::Buy, 2.0, 0.5, 0,
+            ).unwrap();
+            assert!(matches!(
+                account.apply_trade_transition_with_context(
+                    "retired-trade", "CONFIRMED", "retired-order", "retired-oid",
+                    "TOKEN", Side::Buy, 2.0, 0.5, true, 1,
+                ),
+                TradeTransitionResult::Applied(_)
+            ));
+            account.release_order("retired-order", OrderStatus::Filled);
+            assert_eq!(
+                account.prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
+                (1, 1),
+            );
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        {
+            let restored = SharedAccount::new_persistent("retired-replay", &path).unwrap();
+            assert_eq!(
+                restored.trade_ownership("retired-trade").unwrap().client_order_id,
+                "retired-order",
+            );
+            let before = restored.monitoring_snapshot();
+            assert!(matches!(
+                restored.apply_trade_transition_with_context(
+                    "retired-trade", "CONFIRMED", "", "retired-oid", "TOKEN",
+                    Side::Buy, 2.0, 0.5, true, 1,
+                ),
+                TradeTransitionResult::OwnedNoop(_)
+            ));
+            let after = restored.monitoring_snapshot();
+            assert_eq!(after.physical_cash, before.physical_cash);
+            assert_eq!(after.physical_positions, before.physical_positions);
+            assert!(!after.uncertain);
+        }
+
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]

@@ -488,9 +488,20 @@ fn classify_private_trade_role(
         })
     });
     let taker_id = taker_order_id(data);
+    let trade_id = data
+        .get("id")
+        .or_else(|| data.get("trade_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let has_owned_taker_order = taker_id.is_some_and(|order_id| {
         shared.lookup_coid(order_id).is_some()
             || shared.account_state.order_owner_by_oid(order_id).is_some()
+            || trade_id
+                .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
+                .is_some_and(|ownership| {
+                    normalize_order_id(&ownership.order_id) == normalize_order_id(order_id)
+                })
     });
     match (has_owned_maker_leg, has_owned_taker_order) {
         (true, false) => Ok(PrivateTradeRole::Maker),
@@ -1266,6 +1277,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                             .unwrap()
                             .touch_match_time(match_time.replay_watermark_secs);
                     }
+                    if transition.owned_noop() {
+                        continue;
+                    }
                     let coid = ownership.client_order_id;
                     // Only advance the feed-level dedupe after ownership was
                     // successfully resolved. An unowned event must remain
@@ -1368,6 +1382,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         .lock()
                         .unwrap()
                         .touch_match_time(match_time.replay_watermark_secs);
+                }
+                if transition.owned_noop() {
+                    return Vec::new();
                 }
                 let coid = ownership.client_order_id;
                 let lifecycle_advanced = record_trade_transition(
@@ -3404,6 +3421,42 @@ mod tests {
         assert!(!duplicate.invalid_business_event);
         assert!(duplicate.updates.is_empty());
         assert!(duplicate.rejection_reason.is_none());
+    }
+
+    #[test]
+    fn retired_taker_trade_replay_uses_durable_ownership_and_emits_no_fill() {
+        let shared = owned_taker_shared(0.5);
+        let mut event = valid_taker_event();
+        event["status"] = serde_json::json!("CONFIRMED");
+        let first = parse_user_event_diagnosed(&event, &shared);
+        assert!(first.valid_business_event);
+        assert_eq!(first.updates.len(), 1);
+
+        let before = shared.account_state.monitoring_snapshot();
+        assert_eq!(
+            shared
+                .account_state
+                .prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
+            (1, 1),
+        );
+        shared.coid_to_oid.lock().unwrap().clear();
+        shared.oid_to_coid.lock().unwrap().clear();
+        shared.coid_to_token.lock().unwrap().clear();
+        assert!(shared.lookup_coid("oid-1").is_none());
+        assert!(shared.account_state.order_owner_by_oid("oid-1").is_none());
+
+        shared.user_feed_health.set_inventory_uncertain(true);
+        let replay = parse_user_event_diagnosed(&event, &shared);
+        assert!(replay.valid_business_event);
+        assert!(!replay.invalid_business_event);
+        assert!(replay.updates.is_empty());
+        assert!(replay.rejection_reason.is_none());
+        assert!(!shared.account_state.is_uncertain());
+        assert!(!shared.user_feed_health.inventory_uncertain());
+        let after = shared.account_state.monitoring_snapshot();
+        assert_eq!(after.physical_cash, before.physical_cash);
+        assert_eq!(after.physical_positions, before.physical_positions);
+        assert_eq!(after.retired_trade_ownership_tombstones, 1);
     }
 
     #[test]
