@@ -28,7 +28,7 @@ const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
 /// Keep a lightweight, durable ownership proof long after the full order and
 /// trade rows have been compacted so an already-applied fill remains an
 /// attributable no-op instead of becoming an `unowned trade`.
-const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
@@ -506,6 +506,12 @@ struct RetiredTradeOwnershipTombstone {
     ownership: TradeOwnership,
     #[serde(default)]
     is_maker: Option<bool>,
+    /// A terminal private-feed row whose account address, settled token and
+    /// unique historical instance owner were proved after its original order
+    /// and trade rows had already aged out. It is intentionally economic-free:
+    /// the authoritative wallet snapshot already contains the old trade.
+    #[serde(default)]
+    authenticated_terminal_noop: bool,
     retired_at_ms: u64,
 }
 
@@ -3638,6 +3644,181 @@ impl SharedAccount {
         }
     }
 
+    /// Recover a terminal historical private trade after both its order row
+    /// and original trade tombstone are absent. The caller must have proved
+    /// that the authenticated account address owns this exact maker/taker leg.
+    /// We additionally require a known settlement value and one unique
+    /// historical instance owner for the token. No economics are applied: a
+    /// startup wallet snapshot already includes this aged trade and settlement.
+    pub fn record_authenticated_terminal_trade_noop(
+        &self,
+        trade_key: &str,
+        status: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        is_maker: bool,
+    ) -> TradeTransitionResult {
+        let normalized = status
+            .trim_start_matches("TRADE_STATUS_")
+            .to_ascii_uppercase();
+        let anomaly_key = if trade_key.is_empty() {
+            format!("trade:<missing>:{order_id}")
+        } else {
+            format!("trade:{trade_key}")
+        };
+        let mut state = self.state.lock().unwrap();
+        let reject = |state: &mut SharedAccountState, reason: String| {
+            set_ownership_anomaly(state, anomaly_key.clone(), reason);
+        };
+        if !matches!(normalized.as_str(), "CONFIRMED" | "FAILED")
+            || trade_key.trim().is_empty()
+            || order_id.trim().is_empty()
+            || token_id.trim().is_empty()
+            || !quantity.is_finite()
+            || quantity <= 0.0
+            || !price.is_finite()
+            || price <= 0.0
+            || price > 1.0 + 1e-8
+        {
+            reject(
+                &mut state,
+                format!(
+                    "authenticated historical trade `{trade_key}` is not a valid terminal edge"
+                ),
+            );
+            self.schedule_persist(&state);
+            return TradeTransitionResult::Rejected;
+        }
+        if state.trades.contains_key(trade_key)
+            || state
+                .retired_trade_ownership_tombstones
+                .contains_key(trade_key)
+        {
+            reject(
+                &mut state,
+                format!(
+                    "authenticated historical trade `{trade_key}` conflicts with an existing durable trade proof"
+                ),
+            );
+            self.schedule_persist(&state);
+            return TradeTransitionResult::Rejected;
+        }
+        if !state.settled_token_values.contains_key(token_id) {
+            reject(
+                &mut state,
+                format!(
+                    "authenticated historical trade `{trade_key}` token `{token_id}` has no durable settlement proof"
+                ),
+            );
+            self.schedule_persist(&state);
+            return TradeTransitionResult::Rejected;
+        }
+
+        // A zero position key survives settlement and is stronger ownership
+        // evidence than a temporarily shared interest registration. Fall back
+        // to interests only when no instance ledger retains the token key.
+        let position_owners: Vec<String> = state
+            .instances
+            .iter()
+            .filter(|(_, instance)| instance.positions.contains_key(token_id))
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect();
+        let candidate_owners = if position_owners.is_empty() {
+            state
+                .instances
+                .iter()
+                .filter(|(_, instance)| {
+                    instance.token_interests.values().any(|interest| {
+                        interest.up_token_id == token_id
+                            || interest.down_token_id == token_id
+                    })
+                })
+                .map(|(instance_id, _)| instance_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            position_owners
+        };
+        if candidate_owners.len() != 1 {
+            reject(
+                &mut state,
+                format!(
+                    "authenticated historical trade `{trade_key}` token `{token_id}` has {} candidate instance owners",
+                    candidate_owners.len(),
+                ),
+            );
+            self.schedule_persist(&state);
+            return TradeTransitionResult::Rejected;
+        }
+
+        let ownership = TradeOwnership {
+            account_id: self.account_id.clone(),
+            instance_id: candidate_owners[0].clone(),
+            trade_key: trade_key.to_string(),
+            client_order_id: String::new(),
+            order_id: order_id.to_string(),
+            token_id: token_id.to_string(),
+            side,
+            quantity,
+            price,
+            status: normalized,
+        };
+        let retired_at_ms = wall_clock_ms();
+        state.retired_trade_ownership_tombstones.insert(
+            trade_key.to_string(),
+            RetiredTradeOwnershipTombstone {
+                ownership: ownership.clone(),
+                is_maker: Some(is_maker),
+                authenticated_terminal_noop: true,
+                retired_at_ms,
+            },
+        );
+        prune_retired_trade_ownership_tombstones(&mut state, retired_at_ms);
+        let was_uncertain = state.uncertain;
+        state.ownership_anomalies.remove(&anomaly_key);
+        state.unresolved_trade_match_times.remove(trade_key);
+        state.verified_trade_replay_recoveries = state
+            .verified_trade_replay_recoveries
+            .saturating_add(1);
+        recompute_reconciliation(
+            &mut state,
+            "authenticated terminal historical trade no-op",
+        );
+        let reopened = was_uncertain && !state.uncertain;
+        log::info!(
+            "[shared_account] authenticated terminal trade recovered as durable no-op account={} trade={} oid={} token={} instance={} maker={} reopened_admission={}",
+            self.account_id,
+            trade_key,
+            order_id,
+            token_id,
+            ownership.instance_id,
+            is_maker,
+            reopened,
+        );
+        self.schedule_persist(&state);
+        drop(state);
+
+        if let Err(error) = self.flush_persistence(Duration::from_secs(2)) {
+            let generation = self
+                .persistence
+                .as_ref()
+                .map_or(0, AccountPersistence::scheduled_generation);
+            self.trade_persistence_pending_generation
+                .fetch_max(generation, Ordering::AcqRel);
+            self.set_risk_blocker(
+                TRADE_PERSISTENCE_RISK_BLOCKER,
+                format!(
+                    "authenticated historical trade `{trade_key}` no-op generation {generation} is not durable: {error}"
+                ),
+            );
+            return TradeTransitionResult::OwnedNoopButPersistencePending(ownership);
+        }
+        self.refresh_trade_persistence_blocker();
+        TradeTransitionResult::OwnedNoop(ownership)
+    }
+
     fn apply_trade_transition_inner(
         &self,
         trade_key: &str,
@@ -4503,6 +4684,7 @@ fn prune_terminal_history_locked(
                 RetiredTradeOwnershipTombstone {
                     ownership: trade.ownership.clone(),
                     is_maker: trade.is_maker,
+                    authenticated_terminal_noop: false,
                     retired_at_ms,
                 },
             );
@@ -5746,7 +5928,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || ownership.trade_key != *trade_key
             || ownership.account_id != account_id
             || !state.instances.contains_key(&ownership.instance_id)
-            || ownership.client_order_id.trim().is_empty()
+            || (!tombstone.authenticated_terminal_noop
+                && ownership.client_order_id.trim().is_empty())
             || ownership.order_id.trim().is_empty()
             || ownership.token_id.trim().is_empty()
             || !ownership.quantity.is_finite()
@@ -5757,6 +5940,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || !matches!(ownership.status.as_str(), "CONFIRMED" | "FAILED")
             || tombstone.retired_at_ms == 0
             || state.trades.contains_key(trade_key)
+            || (tombstone.authenticated_terminal_noop
+                && !state.settled_token_values.contains_key(&ownership.token_id))
         {
             return Err(format!(
                 "retired trade tombstone `{trade_key}` contains invalid ownership fields"
@@ -7443,6 +7628,14 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             Side::Buy, 10.0, 0.4, true, 1,
         );
         assert!(matches!(rejected, TradeTransitionResult::Rejected));
+        assert!(matches!(
+            account.record_authenticated_terminal_trade_noop(
+                "trade-retired", "CONFIRMED", "oid-retired", "UP",
+                Side::Buy, 10.0, 0.4, true,
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        assert_eq!(account.trade_ownership("trade-retired").unwrap().price, 0.5);
         assert!(account.is_uncertain());
         assert_eq!(account.monitoring_snapshot().verified_trade_replay_recoveries, 0);
 
@@ -7458,6 +7651,76 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let physical_after = account.monitoring_snapshot();
         assert_eq!(physical_after.physical_cash, physical_before.physical_cash);
         assert_eq!(physical_after.physical_positions, physical_before.physical_positions);
+    }
+
+    #[test]
+    fn authenticated_settled_terminal_trade_creates_economic_free_durable_noop() {
+        let account = SharedAccount::new("authenticated-history");
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("TOKEN".to_string(), 1.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([(
+            "TOKEN".to_string(),
+            1.0,
+        )]));
+        let before = account.monitoring_snapshot();
+
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "historical-trade",
+                "CONFIRMED",
+                "",
+                "historical-oid",
+                "TOKEN",
+                Side::Buy,
+                6.24,
+                0.42,
+                false,
+                1,
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        assert!(account.is_uncertain());
+
+        let recovered = account.record_authenticated_terminal_trade_noop(
+            "historical-trade",
+            "CONFIRMED",
+            "historical-oid",
+            "TOKEN",
+            Side::Buy,
+            6.24,
+            0.42,
+            false,
+        );
+        assert!(matches!(recovered, TradeTransitionResult::OwnedNoop(_)));
+        assert!(!account.is_uncertain());
+        assert!(account.ownership_anomalies().is_empty());
+        let ownership = account.trade_ownership("historical-trade").unwrap();
+        assert_eq!(ownership.instance_id, "owner");
+        assert!(ownership.client_order_id.is_empty());
+
+        let replay = account.apply_trade_transition_with_context(
+            "historical-trade",
+            "CONFIRMED",
+            "",
+            "historical-oid",
+            "TOKEN",
+            Side::Buy,
+            6.24,
+            0.42,
+            false,
+            1,
+        );
+        assert!(matches!(replay, TradeTransitionResult::OwnedNoop(_)));
+        let after = account.monitoring_snapshot();
+        assert_eq!(after.physical_cash, before.physical_cash);
+        assert_eq!(after.physical_positions, before.physical_positions);
+        assert_eq!(account.instance_snapshot("owner").unwrap().cash, 100.0);
+        assert_eq!(after.retired_trade_ownership_tombstones, 1);
     }
 
     #[test]
@@ -8878,6 +9141,73 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 restored.apply_trade_transition_with_context(
                     "retired-trade", "CONFIRMED", "", "retired-oid", "TOKEN",
                     Side::Buy, 2.0, 0.5, true, 1,
+                ),
+                TradeTransitionResult::OwnedNoop(_)
+            ));
+            let after = restored.monitoring_snapshot();
+            assert_eq!(after.physical_cash, before.physical_cash);
+            assert_eq!(after.physical_positions, before.physical_positions);
+            assert!(!after.uncertain);
+        }
+
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn authenticated_terminal_noop_tombstone_survives_persistent_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-authenticated-noop-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("authenticated-noop", &path).unwrap();
+            account.register_instance("owner", 1.0);
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([("TOKEN".to_string(), 1.0)]),
+                )
+                .unwrap();
+            account.record_settled_token_values(&HashMap::from([(
+                "TOKEN".to_string(),
+                1.0,
+            )]));
+            assert!(matches!(
+                account.record_authenticated_terminal_trade_noop(
+                    "historical-trade",
+                    "CONFIRMED",
+                    "historical-oid",
+                    "TOKEN",
+                    Side::Buy,
+                    6.24,
+                    0.42,
+                    false,
+                ),
+                TradeTransitionResult::OwnedNoop(_)
+            ));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        {
+            let restored = SharedAccount::new_persistent("authenticated-noop", &path).unwrap();
+            let before = restored.monitoring_snapshot();
+            assert!(matches!(
+                restored.apply_trade_transition_with_context(
+                    "historical-trade",
+                    "CONFIRMED",
+                    "",
+                    "historical-oid",
+                    "TOKEN",
+                    Side::Buy,
+                    6.24,
+                    0.42,
+                    false,
+                    1,
                 ),
                 TradeTransitionResult::OwnedNoop(_)
             ));
