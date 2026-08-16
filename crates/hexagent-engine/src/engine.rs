@@ -94,25 +94,115 @@ fn account_ledger_display_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredAccountLedgerStatus {
+    NotRequired,
+    Existing,
+    BootstrapMissing,
+}
+
 fn validate_required_account_ledger(
     path: Option<&std::path::Path>,
     require_existing: bool,
-) -> std::result::Result<(), String> {
+    bootstrap_allowed: bool,
+) -> std::result::Result<RequiredAccountLedgerStatus, String> {
     if !require_existing {
-        return Ok(());
+        return Ok(RequiredAccountLedgerStatus::NotRequired);
     }
     let Some(path) = path else {
         return Err(
             "account_ledger_require_existing=true but account_ledger_dir is empty".to_string(),
         );
     };
-    if !path.is_file() {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "required durable account ledger exists but is not a file: {}",
+            account_ledger_display_path(path).display(),
+        )),
+        Ok(_) if bootstrap_allowed => Err(format!(
+            "durable account ledger already exists but the account remains in the one-time account_ledger_bootstrap_accounts allowlist: {}; remove the stale bootstrap entry",
+            account_ledger_display_path(path).display(),
+        )),
+        Ok(_) => Ok(RequiredAccountLedgerStatus::Existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && bootstrap_allowed => {
+            Ok(RequiredAccountLedgerStatus::BootstrapMissing)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "required durable account ledger is missing: {}",
+            account_ledger_display_path(path).display(),
+        )),
+        Err(error) => Err(format!(
+            "failed to inspect required durable account ledger {}: {error}",
+            account_ledger_display_path(path).display(),
+        )),
+    }
+}
+
+fn verify_bootstrapped_account_ledger(
+    path: &std::path::Path,
+    account_id: &str,
+) -> std::result::Result<u64, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "read bootstrapped account ledger {}: {error}",
+            account_ledger_display_path(path).display(),
+        )
+    })?;
+    let persisted: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "parse bootstrapped account ledger {}: {error}",
+            account_ledger_display_path(path).display(),
+        )
+    })?;
+    if persisted.get("account_id").and_then(|value| value.as_str()) != Some(account_id) {
         return Err(format!(
-            "required durable account ledger is missing or not a file: {}",
+            "bootstrapped account ledger {} does not belong to `{account_id}`",
             account_ledger_display_path(path).display(),
         ));
     }
-    Ok(())
+    if persisted.get("version").and_then(|value| value.as_u64()).is_none()
+        || !persisted.get("state").is_some_and(|value| value.is_object())
+    {
+        return Err(format!(
+            "bootstrapped account ledger {} is missing its durable version/state envelope",
+            account_ledger_display_path(path).display(),
+        ));
+    }
+    Ok(bytes.len() as u64)
+}
+
+fn validate_account_ledger_bootstrap_accounts(
+    configured_accounts: &[String],
+    require_existing: bool,
+    enabled_accounts: &HashSet<String>,
+) -> std::result::Result<HashSet<String>, String> {
+    let mut validated = HashSet::new();
+    for configured in configured_accounts {
+        let account_id = configured.trim();
+        if !require_existing {
+            return Err(
+                "account_ledger_bootstrap_accounts requires account_ledger_require_existing=true"
+                    .to_string(),
+            );
+        }
+        if account_id.is_empty() || account_id != configured {
+            return Err(
+                "account_ledger_bootstrap_accounts contains an empty or whitespace-padded account id"
+                    .to_string(),
+            );
+        }
+        if !validated.insert(account_id.to_string()) {
+            return Err(format!(
+                "duplicate one-time ledger bootstrap account `{account_id}`",
+            ));
+        }
+        if !enabled_accounts.contains(account_id) {
+            return Err(format!(
+                "one-time ledger bootstrap account `{account_id}` has no enabled Polymarket strategy",
+            ));
+        }
+    }
+    Ok(validated)
 }
 
 fn elapsed_ns(origin: &std::time::Instant) -> u64 {
@@ -620,10 +710,107 @@ mod public_subscription_coalesce_tests {
             std::process::id(),
             crate::types::now_ns(),
         ));
-        assert!(validate_required_account_ledger(Some(&missing), false).is_ok());
-        let error = validate_required_account_ledger(Some(&missing), true).unwrap_err();
+        assert_eq!(
+            validate_required_account_ledger(Some(&missing), false, false).unwrap(),
+            RequiredAccountLedgerStatus::NotRequired,
+        );
+        let error =
+            validate_required_account_ledger(Some(&missing), true, false).unwrap_err();
         assert!(error.contains("required durable account ledger is missing"));
-        assert!(validate_required_account_ledger(None, true).is_err());
+        assert!(validate_required_account_ledger(None, true, false).is_err());
+    }
+
+    #[test]
+    fn required_account_ledger_bootstrap_is_missing_only_and_one_time() {
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-required-ledger-bootstrap-{}-{}.json",
+            std::process::id(),
+            crate::types::now_ns(),
+        ));
+        assert_eq!(
+            validate_required_account_ledger(Some(&path), true, true).unwrap(),
+            RequiredAccountLedgerStatus::BootstrapMissing,
+        );
+
+        std::fs::write(&path, b"durable-ledger-placeholder").unwrap();
+        assert_eq!(
+            validate_required_account_ledger(Some(&path), true, false).unwrap(),
+            RequiredAccountLedgerStatus::Existing,
+        );
+        let stale = validate_required_account_ledger(Some(&path), true, true).unwrap_err();
+        assert!(stale.contains("remove the stale bootstrap entry"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bootstrapped_account_ledger_is_fsynced_and_identity_verified() {
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-bootstrap-ledger-fsync-{}-{}.json",
+            std::process::id(),
+            crate::types::now_ns(),
+        ));
+        {
+            let account = crate::account::shared_account::SharedAccount::new_persistent(
+                "new001",
+                &path,
+            )
+            .unwrap();
+            account.register_instance("btc-new", 1.0);
+            account.register_instance("eth-new", 1.0);
+            account.register_market_scope("btc-new", "btc-up-or-down-5m");
+            account
+                .flush_persistence(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(verify_bootstrapped_account_ledger(&path, "new001").unwrap() > 0);
+        }
+
+        let stale = validate_required_account_ledger(Some(&path), true, true).unwrap_err();
+        assert!(stale.contains("remove the stale bootstrap entry"));
+        std::fs::remove_file(&path).unwrap();
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        std::fs::remove_file(PathBuf::from(lock_path)).unwrap();
+    }
+
+    #[test]
+    fn account_ledger_bootstrap_allowlist_rejects_unsafe_configuration() {
+        let enabled = HashSet::from(["new001".to_string()]);
+        assert!(validate_account_ledger_bootstrap_accounts(&[], true, &enabled)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            validate_account_ledger_bootstrap_accounts(
+                &["new001".to_string()],
+                true,
+                &enabled,
+            )
+            .unwrap(),
+            enabled.clone(),
+        );
+        assert!(validate_account_ledger_bootstrap_accounts(
+            &["new001".to_string()],
+            false,
+            &enabled,
+        )
+        .is_err());
+        assert!(validate_account_ledger_bootstrap_accounts(
+            &["new001".to_string(), "new001".to_string()],
+            true,
+            &enabled,
+        )
+        .is_err());
+        assert!(validate_account_ledger_bootstrap_accounts(
+            &["unknown".to_string()],
+            true,
+            &enabled,
+        )
+        .is_err());
+        assert!(validate_account_ledger_bootstrap_accounts(
+            &[" new001".to_string()],
+            true,
+            &enabled,
+        )
+        .is_err());
     }
 
     #[test]
@@ -5709,6 +5896,34 @@ impl Engine {
             }
         };
 
+        let enabled_polymarket_accounts: HashSet<String> = self
+            .config
+            .strategies
+            .iter()
+            .filter(|strategy| {
+                strategy.enabled
+                    && self
+                        .registry
+                        .capabilities(&strategy.name)
+                        .needs_poly_user_feed
+            })
+            .map(|strategy| strategy.account_id().to_string())
+            .collect();
+        let bootstrap_accounts = match validate_account_ledger_bootstrap_accounts(
+            &poly_cfg.account_ledger_bootstrap_accounts,
+            poly_cfg.account_ledger_require_existing,
+            &enabled_polymarket_accounts,
+        ) {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                error!(
+                    "[Engine] refusing every Polymarket strategy: {}",
+                    error,
+                );
+                return out;
+            }
+        };
+
         // Build the complete account→instances routing table before the first
         // SharedState prewarms transport. Every shared wallet receives one
         // physical pool group sized from N: order=4N, reconcile=2N,
@@ -5789,6 +6004,7 @@ impl Engine {
         let mut by_account: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> =
             HashMap::new();
         let mut wallet_accounts: HashMap<String, String> = HashMap::new();
+        let mut bootstrapped_ledgers: HashMap<String, PathBuf> = HashMap::new();
         for sc in &self.config.strategies {
             if !sc.enabled || !self.registry.capabilities(&sc.name).needs_poly_user_feed {
                 continue;
@@ -5890,22 +6106,42 @@ impl Engine {
                 Some(PathBuf::from(&poly_cfg.account_ledger_dir)
                     .join(format!("{}.json", safe_account)))
             };
-            if let Err(error) = validate_required_account_ledger(
+            let ledger_status = match validate_required_account_ledger(
                 ledger_path.as_deref(),
                 poly_cfg.account_ledger_require_existing,
+                bootstrap_accounts.contains(&account_id),
             ) {
-                error!(
-                    "[Engine] refusing every Polymarket strategy: account={} {}; a fresh ledger would lose historical/disabled-instance ownership and offline auto-redeem attribution",
-                    account_id, error,
+                Ok(status) => status,
+                Err(error) => {
+                    error!(
+                        "[Engine] refusing every Polymarket strategy: account={} {}; a fresh ledger would lose historical/disabled-instance ownership and offline auto-redeem attribution",
+                        account_id, error,
+                    );
+                    return HashMap::new();
+                }
+            };
+            if ledger_status == RequiredAccountLedgerStatus::BootstrapMissing {
+                let Some(path) = ledger_path.as_ref() else {
+                    error!(
+                        "[Engine] refusing every Polymarket strategy: account={} bootstrap admitted without a durable ledger path",
+                        account_id,
+                    );
+                    return HashMap::new();
+                };
+                warn!(
+                    "[Engine] ONE-TIME ACCOUNT LEDGER BOOTSTRAP account={} path={}; only a genuinely new wallet with no historical bot activity may use this path",
+                    account_id,
+                    account_ledger_display_path(path).display(),
                 );
-                return HashMap::new();
+                bootstrapped_ledgers.insert(account_id.clone(), path.clone());
             }
             if let Some(path) = ledger_path.as_deref() {
                 info!(
-                    "[Engine] account={} durable ledger path={} require_existing={} bytes={}",
+                    "[Engine] account={} durable ledger path={} require_existing={} bootstrap={} bytes={}",
                     account_id,
                     account_ledger_display_path(path).display(),
                     poly_cfg.account_ledger_require_existing,
+                    ledger_status == RequiredAccountLedgerStatus::BootstrapMissing,
                     std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
                 );
             }
@@ -6016,6 +6252,47 @@ impl Engine {
                     );
                 }
             }
+        }
+
+        // A bootstrap exception is safe only after every enabled sibling and
+        // market scope has been written to the new ledger and fsynced. Keep
+        // strategy workers stopped until the on-disk JSON envelope and account
+        // identity are independently verified.
+        for (account_id, path) in &bootstrapped_ledgers {
+            let Some(shared) = by_account.get(account_id) else {
+                error!(
+                    "[Engine] refusing every Polymarket strategy: bootstrapped account={} did not build a SharedState",
+                    account_id,
+                );
+                return HashMap::new();
+            };
+            if let Err(error) = shared
+                .account_state
+                .flush_persistence(std::time::Duration::from_secs(5))
+            {
+                error!(
+                    "[Engine] refusing every Polymarket strategy: account={} bootstrap ledger fsync failed: {}",
+                    account_id, error,
+                );
+                return HashMap::new();
+            }
+            let bytes = match verify_bootstrapped_account_ledger(path, account_id) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    error!(
+                        "[Engine] refusing every Polymarket strategy: account={} bootstrap verification failed: {}",
+                        account_id, error,
+                    );
+                    return HashMap::new();
+                }
+            };
+            warn!(
+                "[Engine] ONE-TIME ACCOUNT LEDGER BOOTSTRAP COMPLETE account={} path={} bytes={}; remove `{}` from account_ledger_bootstrap_accounts before the next restart",
+                account_id,
+                account_ledger_display_path(path).display(),
+                bytes,
+                account_id,
+            );
         }
 
         // The persisted account ledger may contain orders that were live when
