@@ -1154,6 +1154,15 @@ pub struct ExchangeConfig {
     /// disabled-instance ownership or offline auto-redeem history.
     #[serde(default)]
     pub account_ledger_require_existing: bool,
+    /// Polymarket-only — one-time exceptions to
+    /// `account_ledger_require_existing` for genuinely new accounts. A listed
+    /// account may create its missing durable ledger exactly once. Startup
+    /// fails if the ledger already exists while the account remains listed,
+    /// forcing operators to remove the exception after the bootstrap run.
+    /// Existing non-file, unreadable, corrupt, or account-mismatched paths are
+    /// never accepted through this allowlist.
+    #[serde(default)]
+    pub account_ledger_bootstrap_accounts: Vec<String>,
     /// Hyperliquid-only — the master/owner account address (0x-hex, 20 bytes)
     /// whose positions and fills are queried and traded. When signing with an
     /// approved **API agent wallet**, `private_key` is the agent key while

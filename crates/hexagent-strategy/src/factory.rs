@@ -215,6 +215,7 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             executor_workers: 8,
             account_ledger_dir: String::new(),
             account_ledger_require_existing: false,
+            account_ledger_bootstrap_accounts: Vec::new(),
             account_address: String::new(),
             network: String::new(),
         });
