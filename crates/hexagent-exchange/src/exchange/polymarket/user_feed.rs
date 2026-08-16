@@ -467,6 +467,12 @@ fn taker_order_id(data: &serde_json::Value) -> Option<&str> {
         })
 }
 
+fn top_level_maker_matches_account(data: &serde_json::Value, shared: &SharedState) -> bool {
+    data.get("maker_address")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address))
+}
+
 fn classify_private_trade_role(
     data: &serde_json::Value,
     shared: &SharedState,
@@ -494,15 +500,16 @@ fn classify_private_trade_role(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let has_owned_taker_order = taker_id.is_some_and(|order_id| {
-        shared.lookup_coid(order_id).is_some()
-            || shared.account_state.order_owner_by_oid(order_id).is_some()
-            || trade_id
-                .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
-                .is_some_and(|ownership| {
-                    normalize_order_id(&ownership.order_id) == normalize_order_id(order_id)
-                })
-    });
+    let has_owned_taker_order = top_level_maker_matches_account(data, shared)
+        || taker_id.is_some_and(|order_id| {
+            shared.lookup_coid(order_id).is_some()
+                || shared.account_state.order_owner_by_oid(order_id).is_some()
+                || trade_id
+                    .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
+                    .is_some_and(|ownership| {
+                        normalize_order_id(&ownership.order_id) == normalize_order_id(order_id)
+                    })
+        });
     match (has_owned_maker_leg, has_owned_taker_order) {
         (true, false) => Ok(PrivateTradeRole::Maker),
         (false, true) => Ok(PrivateTradeRole::Taker),
@@ -1250,6 +1257,22 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         true,
                         match_time.business_secs,
                     );
+                    let transition = if transition.ownership().is_none()
+                        && matches!(status_str, "CONFIRMED" | "FAILED")
+                    {
+                        shared.account_state.record_authenticated_terminal_trade_noop(
+                            &leg_id,
+                            status_str,
+                            mo_order_id,
+                            &mo_asset_id,
+                            mo_side,
+                            mo_size,
+                            mo_price,
+                            true,
+                        )
+                    } else {
+                        transition
+                    };
                     let Some(ownership) = transition.ownership().cloned() else {
                         // Never broadcast an unowned private trade. The account
                         // ledger has already entered uncertain with the exact
@@ -1360,6 +1383,23 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     false,
                     match_time.business_secs,
                 );
+                let transition = if transition.ownership().is_none()
+                    && matches!(status_str, "CONFIRMED" | "FAILED")
+                    && top_level_maker_matches_account(data, shared)
+                {
+                    shared.account_state.record_authenticated_terminal_trade_noop(
+                        trade_id,
+                        status_str,
+                        taker_order_id,
+                        &asset_id,
+                        side,
+                        matched_amount,
+                        price,
+                        false,
+                    )
+                } else {
+                    transition
+                };
                 let Some(ownership) = transition.ownership().cloned() else {
                     shared.account_state.mark_unresolved_trade_match_time(
                         trade_id,
@@ -3453,6 +3493,62 @@ mod tests {
         assert!(replay.rejection_reason.is_none());
         assert!(!shared.account_state.is_uncertain());
         assert!(!shared.user_feed_health.inventory_uncertain());
+        let after = shared.account_state.monitoring_snapshot();
+        assert_eq!(after.physical_cash, before.physical_cash);
+        assert_eq!(after.physical_positions, before.physical_positions);
+        assert_eq!(after.retired_trade_ownership_tombstones, 1);
+    }
+
+    #[test]
+    fn authenticated_settled_historical_taker_recovers_as_noop_without_order_row() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("TOKEN".to_string(), 1.0)]),
+            )
+            .unwrap();
+        shared
+            .account_state
+            .record_settled_token_values(&HashMap::from([(
+                "TOKEN".to_string(),
+                1.0,
+            )]));
+        let event = serde_json::json!({
+            "event_type": "trade",
+            "id": "historical-trade",
+            "status": "CONFIRMED",
+            "asset_id": "TOKEN",
+            "side": "BUY",
+            "size": "6.24",
+            "price": "0.42",
+            "match_time": "123",
+            "taker_order_id": "historical-oid",
+            "maker_address": shared.order_maker_address.clone(),
+            "maker_orders": [{
+                "maker_address": "0x0000000000000000000000000000000000000002",
+                "asset_id": "TOKEN",
+                "side": "SELL",
+                "matched_amount": "6.24",
+                "price": "0.42",
+                "order_id": "counterparty-oid"
+            }],
+        });
+
+        let before = shared.account_state.monitoring_snapshot();
+        let recovered = parse_user_event_diagnosed(&event, &shared);
+        assert!(recovered.valid_business_event);
+        assert!(!recovered.invalid_business_event);
+        assert!(recovered.updates.is_empty());
+        assert!(recovered.rejection_reason.is_none());
+        assert!(!shared.account_state.is_uncertain());
+        assert!(shared.account_state.ownership_anomalies().is_empty());
+
+        let replay = parse_user_event_diagnosed(&event, &shared);
+        assert!(replay.valid_business_event);
+        assert!(replay.updates.is_empty());
         let after = shared.account_state.monitoring_snapshot();
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
