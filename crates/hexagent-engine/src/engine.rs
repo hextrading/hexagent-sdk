@@ -30,6 +30,45 @@ use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
+const ACCOUNT_METRIC_POSITION_EPS: f64 = 1e-9;
+
+fn nonzero_account_metric_positions(
+    positions: &HashMap<String, f64>,
+) -> std::collections::BTreeMap<&str, f64> {
+    positions
+        .iter()
+        .filter(|(_, quantity)| {
+            !quantity.is_finite() || quantity.abs() > ACCOUNT_METRIC_POSITION_EPS
+        })
+        .map(|(asset, quantity)| (asset.as_str(), *quantity))
+        .collect()
+}
+
+#[cfg(test)]
+mod account_metric_tests {
+    use super::*;
+
+    #[test]
+    fn position_logging_hides_zero_and_float_dust_but_keeps_material_values() {
+        let positions = HashMap::from([
+            ("zero".to_string(), 0.0),
+            ("negative_zero".to_string(), -0.0),
+            ("dust".to_string(), 2.84e-14),
+            ("negative_dust".to_string(), -1e-12),
+            ("epsilon".to_string(), ACCOUNT_METRIC_POSITION_EPS),
+            ("long".to_string(), 1e-6),
+            ("short".to_string(), -0.25),
+            ("invalid".to_string(), f64::NAN),
+        ]);
+
+        let logged = nonzero_account_metric_positions(&positions);
+
+        assert_eq!(logged.len(), 3);
+        assert_eq!(logged.get("long"), Some(&1e-6));
+        assert_eq!(logged.get("short"), Some(&-0.25));
+        assert!(logged.get("invalid").is_some_and(|value| value.is_nan()));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownTrigger {
@@ -6647,10 +6686,10 @@ impl Engine {
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
                                                 snapshot.reserved_cash,
-                                                snapshot.physical_positions,
-                                                snapshot.virtual_positions,
-                                                snapshot.unallocated_positions,
-                                                snapshot.reserved_positions,
+                                                nonzero_account_metric_positions(&snapshot.physical_positions),
+                                                nonzero_account_metric_positions(&snapshot.virtual_positions),
+                                                nonzero_account_metric_positions(&snapshot.unallocated_positions),
+                                                nonzero_account_metric_positions(&snapshot.reserved_positions),
                                                 snapshot.uncertain,
                                                 snapshot.uncertain_since_ms,
                                                 snapshot.uncertain_reason,
@@ -6688,8 +6727,8 @@ impl Engine {
                                                     instance.weight,
                                                     instance.cash,
                                                     instance.reserved_cash,
-                                                    instance.positions,
-                                                    instance.reserved_positions,
+                                                    nonzero_account_metric_positions(&instance.positions),
+                                                    nonzero_account_metric_positions(&instance.reserved_positions),
                                                 );
                                             }
                                         }
