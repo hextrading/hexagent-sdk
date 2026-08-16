@@ -1804,6 +1804,11 @@ impl SharedAccount {
         }
         if changed {
             state.settled_token_values_generation = effective_generation.saturating_add(1).max(1);
+            // A restart snapshot can arrive before the market outcome lookup.
+            // Retry the same conservative inference while holding the account
+            // lock so the outcome and any resulting virtual redemption are
+            // persisted as one state transition.
+            try_attribute_binary_redeem(&mut state);
             self.schedule_persist(&state);
         }
     }
@@ -2140,6 +2145,7 @@ impl SharedAccount {
         }
 
         let mut removed = Vec::new();
+        let mut conditions = BTreeSet::new();
         for token in authoritative_tokens {
             let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
             let observed = observed_positions.get(token).copied().unwrap_or(0.0);
@@ -2147,11 +2153,12 @@ impl SharedAccount {
             if delta.abs() <= reconciliation_tolerance(prior, observed) {
                 continue;
             }
-            let Some(value) = state.settled_token_values.get(token).copied() else {
+            let Some((condition_id, value)) = proven_binary_token_value(&state, token) else {
                 return false;
             };
-            if delta < 0.0 && (value == 0.0 || value == 1.0) {
+            if delta < 0.0 {
                 removed.push((token.clone(), -delta, value));
+                conditions.insert(condition_id);
             } else {
                 return false;
             }
@@ -2162,7 +2169,7 @@ impl SharedAccount {
         let removed_total: f64 = removed.iter().map(|(_, qty, _)| qty).sum();
         let expected_payout: f64 = removed.iter().map(|(_, qty, value)| qty * value).sum();
         let tolerance = 0.02_f64.max(removed_total.abs().max(cash_delta.abs()) * 0.001);
-        if expected_payout <= EPS || (expected_payout - cash_delta).abs() > tolerance {
+        if expected_payout <= EPS || cash_delta + tolerance < expected_payout {
             return false;
         }
         for (token, qty, _) in &removed {
@@ -2196,7 +2203,7 @@ impl SharedAccount {
                 }
                 let burned = (owned * *qty / virtual_total).min(owned);
                 *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                let instance_cash_delta = cash_delta * burned * *value / expected_payout;
+                let instance_cash_delta = burned * *value;
                 instance.cash += instance_cash_delta;
                 attributed.push((
                     instance_id.clone(),
@@ -2218,8 +2225,13 @@ impl SharedAccount {
         recompute_reconciliation(&mut state, "platform automatic binary redeem");
         self.schedule_persist(&state);
         log::info!(
-            "[shared_account] attributed platform automatic redeem account={} cash={:.6} removed={:?}",
-            self.account_id, cash_delta, removed,
+            "[shared_account] attributed platform automatic redeem account={} payout={:.6} observed_cash_delta={:.6} residual_cash={:.6} conditions={:?} removed={:?}",
+            self.account_id,
+            expected_payout,
+            cash_delta,
+            (cash_delta - expected_payout).max(0.0),
+            conditions,
+            removed,
         );
         true
     }
@@ -7323,49 +7335,97 @@ fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: St
     set_uncertain(state, reason);
 }
 
-/// Polymarket may redeem a winning binary token outside the bot process. The
-/// authoritative wallet delta is unambiguous only when removed token quantity
-/// and added pUSD match 1:1. In that narrow case, burn virtual inventory and
-/// credit cash to the token's existing owners. Other external operations stay
-/// unallocated/uncertain until explicitly attributed by operation_id.
-fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
-    if state.unallocated_cash <= EPS {
-        return;
+/// Return a token's authoritative binary outcome only when its registered
+/// event has complementary 1/0 outcomes. A token-level settlement value alone
+/// is insufficient proof because unrelated wallet changes can overlap a
+/// restart snapshot.
+fn proven_binary_token_value(
+    state: &SharedAccountState,
+    token_id: &str,
+) -> Option<(String, f64)> {
+    let mut proof = None;
+    for interest in state
+        .instances
+        .values()
+        .flat_map(|instance| instance.token_interests.values())
+        .filter(|interest| {
+            interest.up_token_id == token_id || interest.down_token_id == token_id
+        })
+    {
+        let up = state
+            .settled_token_values
+            .get(&interest.up_token_id)
+            .copied()?;
+        let down = state
+            .settled_token_values
+            .get(&interest.down_token_id)
+            .copied()?;
+        if !((up == 1.0 && down == 0.0) || (up == 0.0 && down == 1.0)) {
+            continue;
+        }
+        let value = if interest.up_token_id == token_id {
+            up
+        } else {
+            down
+        };
+        let candidate = (interest.condition_id.clone(), value);
+        if proof.as_ref().is_some_and(|existing| existing != &candidate) {
+            return None;
+        }
+        proof = Some(candidate);
     }
-    let removed: Vec<(String, f64, f64)> = state
+    proof
+}
+
+/// Polymarket may redeem settled binary inventory outside the bot process.
+/// Burn only tokens backed by a complete registered 1/0 outcome pair and
+/// credit exactly their proven payout. Any additional positive cash remains
+/// unallocated instead of being assigned to strategy inventory.
+fn try_attribute_binary_redeem(state: &mut SharedAccountState) -> bool {
+    if state.unallocated_cash <= EPS {
+        return false;
+    }
+    let removed: Vec<(String, String, f64, f64)> = state
         .unallocated_positions
         .iter()
-        .filter(|(token, delta)| {
-            **delta < -EPS
-                && state
-                    .settled_token_values
-                    .get(*token)
-                    .is_some_and(|value| *value == 0.0 || *value == 1.0)
+        .filter_map(|(token, delta)| {
+            if *delta >= -EPS {
+                return None;
+            }
+            proven_binary_token_value(state, token).map(|(condition_id, value)| {
+                (condition_id, token.clone(), -*delta, value)
+            })
         })
-        .map(|(token, delta)| (token.clone(), -*delta, state.settled_token_values[token]))
         .collect();
     if removed.is_empty() {
-        return;
+        return false;
     }
-    let removed_total: f64 = removed.iter().map(|(_, qty, _)| *qty).sum();
-    let expected_payout: f64 = removed.iter().map(|(_, qty, value)| qty * value).sum();
+    let removed_total: f64 = removed.iter().map(|(_, _, qty, _)| *qty).sum();
+    let expected_payout: f64 = removed
+        .iter()
+        .map(|(_, _, qty, value)| qty * value)
+        .sum();
     let tolerance = 0.02_f64.max(removed_total * 0.001);
-    if expected_payout <= EPS || (expected_payout - state.unallocated_cash).abs() > tolerance {
-        return;
+    if expected_payout <= EPS || state.unallocated_cash + tolerance < expected_payout {
+        return false;
     }
-    for (token, qty, _) in &removed {
+    for (_, token, qty, _) in &removed {
         let virtual_total: f64 = state
             .instances
             .values()
             .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
             .sum();
         if virtual_total + EPS < *qty {
-            return;
+            return false;
         }
     }
 
-    let cash_to_credit = state.unallocated_cash;
-    for (token, qty, value) in &removed {
+    let observed_cash_delta = state.unallocated_cash;
+    let conditions: BTreeSet<String> = removed
+        .iter()
+        .map(|(condition_id, _, _, _)| condition_id.clone())
+        .collect();
+    for (_, token, qty, value) in &removed {
         let virtual_total: f64 = state
             .instances
             .values()
@@ -7382,7 +7442,7 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
             }
             let burned = (owned * *qty / virtual_total).min(owned);
             *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-            let cash_delta = cash_to_credit * burned * *value / expected_payout;
+            let cash_delta = burned * *value;
             instance.cash += cash_delta;
             attributed.push((instance_id.clone(), burned, cash_delta));
         }
@@ -7397,11 +7457,15 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) {
         }
     }
     log::info!(
-        "[shared_account] inferred platform binary redeem: cash={:.6} removed={:?}",
-        cash_to_credit,
+        "[shared_account] inferred platform binary redeem: payout={:.6} observed_cash_delta={:.6} residual_cash={:.6} conditions={:?} removed={:?}",
+        expected_payout,
+        observed_cash_delta,
+        (observed_cash_delta - expected_payout).max(0.0),
+        conditions,
         removed,
     );
     recompute_reconciliation(state, "inferred platform binary redeem");
+    true
 }
 
 fn total_weight(instances: &BTreeMap<String, InstanceLedger>) -> f64 {
@@ -10072,6 +10136,127 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn persistent_restart_attributes_multiple_redeems_and_leaves_extra_cash_unallocated() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-offline-multiple-auto-redeem-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("offline-multiple-redeem", &path).unwrap();
+            account.register_instance("btc03", 1.0);
+            account.register_instance("eth03", 1.0);
+            account
+                .register_token_interest("btc03", "btc-settled", "BTC-WIN", "BTC-LOSE")
+                .unwrap();
+            account
+                .register_token_interest("eth03", "eth-settled", "ETH-WIN", "ETH-LOSE")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([
+                        ("BTC-WIN".into(), 80.0),
+                        ("BTC-LOSE".into(), 80.0),
+                        ("ETH-WIN".into(), 80.0),
+                        ("ETH-LOSE".into(), 80.0),
+                    ]),
+                )
+                .unwrap();
+            account.record_settled_token_values(&HashMap::from([
+                ("BTC-WIN".into(), 1.0),
+                ("BTC-LOSE".into(), 0.0),
+                ("ETH-WIN".into(), 1.0),
+                ("ETH-LOSE".into(), 0.0),
+            ]));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("offline-multiple-redeem", &path).unwrap();
+        restored.reconcile_configured_instances(&HashSet::from([
+            "btc03".to_string(),
+            "eth03".to_string(),
+        ]));
+        restored
+            .apply_physical_snapshot(269.3462, HashMap::new())
+            .unwrap();
+
+        assert!((restored.instance_snapshot("btc03").unwrap().cash - 130.0).abs() <= EPS);
+        assert!((restored.instance_snapshot("eth03").unwrap().cash - 130.0).abs() <= EPS);
+        assert!((restored.monitoring_snapshot().unallocated_cash - 9.3462).abs() <= EPS);
+        assert!(restored
+            .monitoring_snapshot()
+            .unallocated_positions
+            .is_empty());
+        assert!(!restored.is_uncertain());
+        restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(restored);
+
+        let reloaded = SharedAccount::new_persistent("offline-multiple-redeem", &path).unwrap();
+        assert!((reloaded.instance_snapshot("btc03").unwrap().cash - 130.0).abs() <= EPS);
+        assert!((reloaded.monitoring_snapshot().unallocated_cash - 9.3462).abs() <= EPS);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn settled_outcomes_retry_a_restart_snapshot_that_arrived_first() {
+        let account = SharedAccount::new("outcome-after-snapshot");
+        account.register_instance("eth03", 1.0);
+        account
+            .register_token_interest("eth03", "eth-settled", "ETH-WIN", "ETH-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("ETH-WIN".into(), 80.0), ("ETH-LOSE".into(), 80.0)]),
+            )
+            .unwrap();
+        account
+            .state
+            .lock()
+            .unwrap()
+            .startup_snapshot_applied_this_process = false;
+
+        account.apply_physical_snapshot(189.0, HashMap::new()).unwrap();
+        assert!(account.is_uncertain());
+        account.record_settled_token_values(&HashMap::from([
+            ("ETH-WIN".into(), 1.0),
+            ("ETH-LOSE".into(), 0.0),
+        ]));
+
+        let instance = account.instance_snapshot("eth03").unwrap();
+        assert!((instance.cash - 180.0).abs() <= EPS);
+        assert!(instance.positions.values().all(|quantity| quantity.abs() <= EPS));
+        assert!((account.monitoring_snapshot().unallocated_cash - 9.0).abs() <= EPS);
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn incomplete_binary_outcome_does_not_attribute_restart_redeem() {
+        let account = SharedAccount::new("incomplete-outcome");
+        account.register_instance("eth03", 1.0);
+        account
+            .register_token_interest("eth03", "eth-settled", "ETH-WIN", "ETH-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([("ETH-WIN".into(), 80.0)]))
+            .unwrap();
+        account
+            .state
+            .lock()
+            .unwrap()
+            .startup_snapshot_applied_this_process = false;
+        account.apply_physical_snapshot(189.0, HashMap::new()).unwrap();
+
+        account.record_settled_token_values(&HashMap::from([("ETH-WIN".into(), 1.0)]));
+
+        assert_eq!(account.instance_snapshot("eth03").unwrap().cash, 100.0);
+        assert_eq!(account.instance_snapshot("eth03").unwrap().positions["ETH-WIN"], 80.0);
+        assert!(account.is_uncertain());
+    }
+
+    #[test]
     fn runtime_platform_redeem_is_attributed_without_applying_a_snapshot() {
         let account = SharedAccount::new("runtime-platform-redeem");
         account.register_instance("btc", 1.0);
@@ -10091,17 +10276,23 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             ("BTC-LOSE".into(), 0.0),
         ]));
         assert!(account.observe_platform_binary_redeem(
-            130.0,
+            140.0,
             &HashMap::from([("ETH-UP".into(), 20.0)]),
             &HashSet::from(["BTC-WIN".into(), "ETH-UP".into()]),
         ));
-        assert_eq!(account.monitoring_snapshot().physical_cash, 130.0);
+        assert_eq!(account.monitoring_snapshot().physical_cash, 140.0);
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 80.0);
         assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
+        assert_eq!(account.monitoring_snapshot().unallocated_cash, 10.0);
         assert_eq!(
             account.instance_snapshot("eth").unwrap().positions["ETH-UP"],
             20.0
         );
+        assert!(!account.observe_platform_binary_redeem(
+            140.0,
+            &HashMap::from([("ETH-UP".into(), 20.0)]),
+            &HashSet::from(["BTC-WIN".into(), "ETH-UP".into()]),
+        ));
         assert!(!account.is_uncertain());
     }
 
