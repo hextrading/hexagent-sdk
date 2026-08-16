@@ -2970,23 +2970,23 @@ fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<
     let funder = to_checksum_address(&derive_safe_address(&signer));
 
     // Paginate through the authenticated user's trades on the given market.
-    // Endpoint: GET https://clob.polymarket.com/trades
+    // Endpoint: GET https://clob.polymarket.com/data/trades
     // Signing matches py-clob-client: path without query string, empty body.
     // Scope by `market` only (no `maker_address`): L2 auth already restricts
-    // /trades to this account, so dropping the maker filter returns BOTH our
-    // maker and taker legs (the maker-only filter silently hid taker fills).
+    // /data/trades to this account, so dropping the maker filter returns BOTH
+    // our maker and taker legs (the maker-only filter silently hid taker fills).
     // `funder` is still used below to classify each row as maker vs taker.
     let mut all_trades: Vec<serde_json::Value> = Vec::new();
     let mut cursor = String::new();
 
     loop {
-        let headers = auth.sign_request("GET", "/trades", "");
+        let headers = auth.sign_request("GET", "/data/trades", "");
         let query = if cursor.is_empty() {
             format!("?market={}", bo.condition_id)
         } else {
             format!("?market={}&next_cursor={}", bo.condition_id, cursor)
         };
-        let url = format!("{}/trades{}", CLOB_URL, query);
+        let url = format!("{}/data/trades{}", CLOB_URL, query);
         let json = user_clob_get(url, headers)?;
 
         // Response may be a bare array or { data: [...], next_cursor }.

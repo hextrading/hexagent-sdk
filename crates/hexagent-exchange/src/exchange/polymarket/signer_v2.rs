@@ -200,7 +200,7 @@ impl OrderSignerV2 {
     /// EOA-derived address. Downstream fill ingestion keys off
     /// `signer.maker_address`:
     ///   * WS live maker-leg match (`user_feed.rs`: `maker_orders[].maker_address`)
-    ///   * REST gap recovery (`/trades?maker_address=…`)
+    ///   * REST gap recovery (`/data/trades?maker_address=…`)
     /// Leaving `maker_address` as the EOA silently dropped EVERY maker fill
     /// (the EOA owns no orders) — the ledger never decremented, so the
     /// strategy over-quoted SELL against phantom inventory and the CLOB
