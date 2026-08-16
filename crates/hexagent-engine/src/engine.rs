@@ -160,8 +160,13 @@ fn verify_bootstrapped_account_ledger(
             account_ledger_display_path(path).display(),
         ));
     }
-    if persisted.get("version").and_then(|value| value.as_u64()).is_none()
-        || !persisted.get("state").is_some_and(|value| value.is_object())
+    if persisted
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .is_none()
+        || !persisted
+            .get("state")
+            .is_some_and(|value| value.is_object())
     {
         return Err(format!(
             "bootstrapped account ledger {} is missing its durable version/state envelope",
@@ -219,11 +224,7 @@ fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
 /// Attach the exact OrderBook event that caused `Strategy::on_quote` to run.
 /// The strategy only receives the local timestamp, so this engine boundary is
 /// the last place where both exchange and local clocks are still available.
-fn stamp_quote_trigger(
-    signals: &mut [Signal],
-    trigger: &OrderBookSnapshot,
-    log_lifecycle: bool,
-) {
+fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_lifecycle: bool) {
     let source = format!("orderbook:{}:{}", trigger.exchange, trigger.symbol);
     let stage_ns = now_ns();
     let stamp = |order: &mut OrderRequest| {
@@ -253,8 +254,14 @@ fn stamp_quote_trigger(
         match signal {
             Signal::NewOrder(order) => stamp(order),
             Signal::BatchNewOrders { orders, .. }
-            | Signal::BatchUpdateOrders { place_orders: orders, .. }
-            | Signal::ReplaceOrder { place_orders: orders, .. } => {
+            | Signal::BatchUpdateOrders {
+                place_orders: orders,
+                ..
+            }
+            | Signal::ReplaceOrder {
+                place_orders: orders,
+                ..
+            } => {
                 for order in orders {
                     stamp(order);
                 }
@@ -287,8 +294,14 @@ fn log_executor_receive(signal: &Signal) {
     match signal {
         Signal::NewOrder(order) => log_order(order),
         Signal::BatchNewOrders { orders, .. }
-        | Signal::BatchUpdateOrders { place_orders: orders, .. }
-        | Signal::ReplaceOrder { place_orders: orders, .. } => {
+        | Signal::BatchUpdateOrders {
+            place_orders: orders,
+            ..
+        }
+        | Signal::ReplaceOrder {
+            place_orders: orders,
+            ..
+        } => {
             for order in orders {
                 log_order(order);
             }
@@ -339,7 +352,9 @@ fn send_private_update_lossless(
     quarantined: &AtomicBool,
 ) -> bool {
     loop {
-        if quarantined.load(Ordering::Acquire) { return false; }
+        if quarantined.load(Ordering::Acquire) {
+            return false;
+        }
         match tx.send_timeout(queued, std::time::Duration::from_secs(1)) {
             Ok(()) => return true,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
@@ -363,10 +378,17 @@ fn quarantine_strategy_worker(
     quarantined: &[Arc<AtomicBool>],
     signal_tx: &Sender<Signal>,
 ) -> bool {
-    let Some(flag) = quarantined.get(idx) else { return false; };
-    if flag.swap(true, Ordering::AcqRel) { return false; }
+    let Some(flag) = quarantined.get(idx) else {
+        return false;
+    };
+    if flag.swap(true, Ordering::AcqRel) {
+        return false;
+    }
     let instance_id = instance_ids.get(idx).cloned().unwrap_or_default();
-    error!("[strategy_supervisor] instance={} quarantined=1 reason={}", instance_id, reason);
+    error!(
+        "[strategy_supervisor] instance={} quarantined=1 reason={}",
+        instance_id, reason
+    );
     enqueue_emergency_instance_cancel(idx, &instance_id, reason, signal_tx);
     true
 }
@@ -616,8 +638,18 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, delay: std::time::Duration) -> boo
 fn is_public_subscription_exchange(name: &str) -> bool {
     matches!(
         name,
-        "binance" | "binance_futures" | "coinbase" | "chainlink" | "bybit"
-            | "kraken" | "okx" | "gate" | "bitget" | "kucoin" | "mexc" | "pyth"
+        "binance"
+            | "binance_futures"
+            | "coinbase"
+            | "chainlink"
+            | "bybit"
+            | "kraken"
+            | "okx"
+            | "gate"
+            | "bitget"
+            | "kucoin"
+            | "mexc"
+            | "pyth"
     )
 }
 
@@ -670,12 +702,17 @@ fn coalesce_public_exchange_subscriptions(exchanges: &mut Vec<ExchangeConfig>) {
     let mut merged: Vec<ExchangeConfig> = Vec::with_capacity(exchanges.len());
     for mut candidate in exchanges.drain(..) {
         if is_public_subscription_exchange(&candidate.name) {
-            if let Some(existing) = merged.iter_mut()
+            if let Some(existing) = merged
+                .iter_mut()
                 .find(|existing| same_public_feed_connection(existing, &candidate))
             {
                 let before = existing.symbols.len();
                 for symbol in candidate.symbols.drain(..) {
-                    if !existing.symbols.iter().any(|current| current.eq_ignore_ascii_case(&symbol)) {
+                    if !existing
+                        .symbols
+                        .iter()
+                        .any(|current| current.eq_ignore_ascii_case(&symbol))
+                    {
                         existing.symbols.push(symbol);
                     }
                 }
@@ -689,7 +726,9 @@ fn coalesce_public_exchange_subscriptions(exchanges: &mut Vec<ExchangeConfig>) {
             }
         }
         let mut seen = std::collections::HashSet::new();
-        candidate.symbols.retain(|symbol| seen.insert(symbol.to_ascii_lowercase()));
+        candidate
+            .symbols
+            .retain(|symbol| seen.insert(symbol.to_ascii_lowercase()));
         merged.push(candidate);
     }
     *exchanges = merged;
@@ -714,8 +753,7 @@ mod public_subscription_coalesce_tests {
             validate_required_account_ledger(Some(&missing), false, false).unwrap(),
             RequiredAccountLedgerStatus::NotRequired,
         );
-        let error =
-            validate_required_account_ledger(Some(&missing), true, false).unwrap_err();
+        let error = validate_required_account_ledger(Some(&missing), true, false).unwrap_err();
         assert!(error.contains("required durable account ledger is missing"));
         assert!(validate_required_account_ledger(None, true, false).is_err());
     }
@@ -750,10 +788,8 @@ mod public_subscription_coalesce_tests {
             crate::types::now_ns(),
         ));
         {
-            let account = crate::account::shared_account::SharedAccount::new_persistent(
-                "new001",
-                &path,
-            )
+            let account =
+                crate::account::shared_account::SharedAccount::new_persistent("new001", &path)
             .unwrap();
             account.register_instance("btc-new", 1.0);
             account.register_instance("eth-new", 1.0);
@@ -775,15 +811,13 @@ mod public_subscription_coalesce_tests {
     #[test]
     fn account_ledger_bootstrap_allowlist_rejects_unsafe_configuration() {
         let enabled = HashSet::from(["new001".to_string()]);
-        assert!(validate_account_ledger_bootstrap_accounts(&[], true, &enabled)
+        assert!(
+            validate_account_ledger_bootstrap_accounts(&[], true, &enabled)
             .unwrap()
-            .is_empty());
+                .is_empty()
+        );
         assert_eq!(
-            validate_account_ledger_bootstrap_accounts(
-                &["new001".to_string()],
-                true,
-                &enabled,
-            )
+            validate_account_ledger_bootstrap_accounts(&["new001".to_string()], true, &enabled,)
             .unwrap(),
             enabled.clone(),
         );
@@ -1434,10 +1468,7 @@ impl Engine {
         let shutdown_trigger = Self::wait_for_shutdown_or_critical(
             &shutdown,
             &shutdown_tx,
-            &[
-                ("strategy", &strategy_handle),
-                ("execution", &exec_handle),
-            ],
+            &[("strategy", &strategy_handle), ("execution", &exec_handle)],
         );
 
         let strategy_join = strategy_handle.join();
@@ -3214,8 +3245,10 @@ impl Engine {
             info!("  Sim v2:   adverse-sel tilt advanced queue on {} resyncs (cancel-attribution ahead_frac→1 on adverse mid moves)", adv_adv);
         }
         if let Some((n, mean, min, max)) = sim.dynamic_ahead_frac_stats() {
-            info!("  Sim v2:   dynamic ahead_frac cancel-resyncs={} mean={:.3} range=[{:.3},{:.3}]",
-                n, mean, min, max);
+            info!(
+                "  Sim v2:   dynamic ahead_frac cancel-resyncs={} mean={:.3} range=[{:.3},{:.3}]",
+                n, mean, min, max
+            );
         }
         let bt_fills = sim.book_through_fills();
         if bt_fills > 0 {
@@ -4413,10 +4446,8 @@ impl Engine {
         // Market events are immutable after parsing. Fan out one allocation
         // through Arc instead of deep-cloning order-book vectors and Strings
         // once per subscribing strategy instance.
-        let mut market_txs: Vec<Sender<QueuedMarketEvent>> =
-            Vec::with_capacity(strategies.len());
-        let mut update_txs: Vec<Sender<QueuedOrderUpdate>> =
-            Vec::with_capacity(strategies.len());
+        let mut market_txs: Vec<Sender<QueuedMarketEvent>> = Vec::with_capacity(strategies.len());
+        let mut update_txs: Vec<Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
         let mut update_dispatch_specs: Vec<(
             Receiver<QueuedOrderUpdate>,
             Sender<QueuedOrderUpdate>,
@@ -4743,13 +4774,18 @@ impl Engine {
         let owner = if is_market_cancel_finality {
             iid_to_idx.get(&update.client_order_id).copied()
         } else {
-            coid_owner.lock().unwrap()
-                .get(&update.client_order_id).copied()
+            coid_owner
+                .lock()
+                .unwrap()
+                .get(&update.client_order_id)
+                .copied()
                 .or_else(|| owner_from_coid(&update.client_order_id, iid_to_idx))
         };
         let terminal = !is_market_cancel_finality
-            && (matches!(update.status, OrderStatus::Cancelled | OrderStatus::Rejected)
-            || (matches!(update.status, OrderStatus::Filled | OrderStatus::Failed)
+            && (matches!(
+                update.status,
+                OrderStatus::Cancelled | OrderStatus::Rejected
+            ) || (matches!(update.status, OrderStatus::Filled | OrderStatus::Failed)
                 && update.trade_id.as_deref().is_none_or(str::is_empty)));
         let terminal_coid = terminal.then(|| update.client_order_id.clone());
 
@@ -4765,12 +4801,17 @@ impl Engine {
                     instance_ids.get(i).map(String::as_str).unwrap_or(""), update.client_order_id);
             }
             PrivateUpdateRoute::DropInvalid(i) => {
-                error!("[strategy_router] invalid owner index={} coid={}", i, update.client_order_id);
+                error!(
+                    "[strategy_router] invalid owner index={} coid={}",
+                    i, update.client_order_id
+                );
             }
             PrivateUpdateRoute::Broadcast => {
                 let enqueued_at = std::time::Instant::now();
                 for (idx, tx) in update_txs.iter().enumerate() {
-                    if worker_quarantined[idx].load(Ordering::Acquire) { continue; }
+                    if worker_quarantined[idx].load(Ordering::Acquire) {
+                        continue;
+                    }
                     let _ = tx.send(QueuedOrderUpdate {
                         update: update.clone(),
                         enqueued_at,
@@ -4964,7 +5005,9 @@ impl Engine {
         // Emit a signal: register its placed coids to this instance, then
         // forward. Returns false if the executor channel is gone.
         let emit = |sig: Signal| -> bool {
-            if quarantined.load(Ordering::Acquire) { return false; }
+            if quarantined.load(Ordering::Acquire) {
+                return false;
+            }
             Self::register_place_coids(&sig, idx, &coid_owner);
             signal_tx.send(sig).is_ok()
         };
@@ -5219,10 +5262,9 @@ impl Engine {
         }
 
         shutdown.store(true, Ordering::Relaxed);
-        if let Err(error) = shutdown_tx.send_timeout(
-            MarketEvent::Exit,
-            std::time::Duration::from_secs(1),
-        ) {
+        if let Err(error) =
+            shutdown_tx.send_timeout(MarketEvent::Exit, std::time::Duration::from_secs(1))
+        {
             warn!("Shutdown: could not enqueue strategy Exit event: {error}");
         }
 
@@ -5916,10 +5958,7 @@ impl Engine {
         ) {
             Ok(accounts) => accounts,
             Err(error) => {
-                error!(
-                    "[Engine] refusing every Polymarket strategy: {}",
-                    error,
-                );
+                error!("[Engine] refusing every Polymarket strategy: {}", error,);
                 return out;
             }
         };
@@ -5942,9 +5981,7 @@ impl Engine {
                     .push(sc.instance_id.clone());
             }
             if !accounts.is_empty() {
-                if let Err(error) =
-                    hexagent_runtime::http1_pool::init_account_pools(&accounts)
-                {
+                if let Err(error) = hexagent_runtime::http1_pool::init_account_pools(&accounts) {
                     warn!(
                         "[Engine] account admission pools not initialised before prewarm: {}",
                         error,
@@ -6032,12 +6069,13 @@ impl Engine {
             // Another instance already built this account's SharedState
             // → share it (one wallet, one user-feed, one nonce stream).
             if let Some(shared) = by_account.get(&account_id) {
-                shared.account_state.register_instance(
-                    &instance_id,
-                    sc.account_allocation_weight,
-                );
+                shared
+                    .account_state
+                    .register_instance(&instance_id, sc.account_allocation_weight);
                 if let Some(scope) = sc.params.get("event_series_slug").and_then(|v| v.as_str()) {
-                    shared.account_state.register_market_scope(&instance_id, scope);
+                    shared
+                        .account_state
+                        .register_market_scope(&instance_id, scope);
                 }
                 info!(
                     "[Engine] instance_id={} shares Polymarket account `{}` \
@@ -6082,9 +6120,9 @@ impl Engine {
             let neg_risk = false;
             let sig_type =
                 crate::exchange::polymarket::signer::parse_signature_type(&creds.signature_type);
-            let clob_version = match
-                crate::exchange::polymarket::trade::ClobVersion::parse(&poly_cfg.clob_version)
-            {
+            let clob_version = match crate::exchange::polymarket::trade::ClobVersion::parse(
+                &poly_cfg.clob_version,
+            ) {
                 Ok(version) => version,
                 Err(error) => {
                     log::error!(
@@ -6098,13 +6136,20 @@ impl Engine {
             let ledger_path = if poly_cfg.account_ledger_dir.trim().is_empty() {
                 None
             } else {
-                let safe_account: String = account_id.chars()
+                let safe_account: String = account_id
+                    .chars()
                     .map(|ch| {
-                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' }
+                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                            ch
+                        } else {
+                            '_'
+                        }
                     })
                     .collect();
-                Some(PathBuf::from(&poly_cfg.account_ledger_dir)
-                    .join(format!("{}.json", safe_account)))
+                Some(
+                    PathBuf::from(&poly_cfg.account_ledger_dir)
+                        .join(format!("{}.json", safe_account)),
+                )
             };
             let ledger_status = match validate_required_account_ledger(
                 ledger_path.as_deref(),
@@ -6172,9 +6217,7 @@ impl Engine {
                         &account_id,
                         trade.order_maker_address(),
                     ) {
-                        error!(
-                            "[Engine] {error}; refusing to start any Polymarket strategy"
-                        );
+                        error!("[Engine] {error}; refusing to start any Polymarket strategy");
                         return HashMap::new();
                     }
                     // Publish credentials only after physical-wallet identity
@@ -6222,12 +6265,14 @@ impl Engine {
                     }
                     trade.prewarm_connections();
                     let shared = trade.shared_state();
-                    shared.account_state.register_instance(
-                        &instance_id,
-                        sc.account_allocation_weight,
-                    );
-                    if let Some(scope) = sc.params.get("event_series_slug").and_then(|v| v.as_str()) {
-                        shared.account_state.register_market_scope(&instance_id, scope);
+                    shared
+                        .account_state
+                        .register_instance(&instance_id, sc.account_allocation_weight);
+                    if let Some(scope) = sc.params.get("event_series_slug").and_then(|v| v.as_str())
+                    {
+                        shared
+                            .account_state
+                            .register_market_scope(&instance_id, scope);
                     }
                     info!(
                         "[Engine] Built Polymarket SharedState for account_id={} \
@@ -6350,9 +6395,9 @@ impl Engine {
                 .map(|strategy| strategy.account_allocation_migration_id.trim())
                 .filter(|migration_id| !migration_id.is_empty())
                 .collect();
-            let every_member_acknowledged = configured_strategies.iter().all(|strategy| {
-                !strategy.account_allocation_migration_id.trim().is_empty()
-            });
+            let every_member_acknowledged = configured_strategies
+                .iter()
+                .all(|strategy| !strategy.account_allocation_migration_id.trim().is_empty());
             if shared.account_state.is_seeded() && !migration_ids.is_empty() {
                 if migration_ids.len() != 1 || !every_member_acknowledged {
                     error!(
@@ -6382,7 +6427,7 @@ impl Engine {
             let unresolved = recovery.reconcile_recovered_orders();
             if unresolved > 0 {
                 warn!(
-                    "[Engine] Polymarket account={} remains risk-off: {} recovered order(s) unresolved",
+                    "[Engine] Polymarket account={} startup recovery pending for {} order(s); quoting continues under retained reservations while owner maintenance waits for authoritative metadata",
                     account_id, unresolved,
                 );
             }
@@ -6516,7 +6561,10 @@ impl Engine {
             // Startup's bounded reconciliation is intentionally short so boot
             // cannot hang. Continue retrying unresolved durable orders on an
             // account-scoped background thread until their complete terminal
-            // trade audit is observed or shutdown begins.
+            // trade audit is observed or shutdown begins. Quote admission
+            // continues throughout under durable reservations; only
+            // balance-changing owner maintenance waits for pre-audit metadata.
+            // Exact trade replay proceeds concurrently after bridge handoff.
             let recovery_shared = shared.clone();
             let recovery_shutdown = shutdown.clone();
             let recovery_account_id = account_id.clone();
@@ -6525,6 +6573,10 @@ impl Engine {
                 .name(format!("poly-order-recovery-{account_id}"))
                 .spawn(move || {
                     crate::os_tune::pin_background("poly-order-recovery");
+                    let mut audit_generation =
+                        recovery_shared.account_state.order_audit_generation();
+                    let mut warned_pending_ids = Vec::<String>::new();
+                    let mut delivered_audit_fingerprints = HashMap::<String, String>::new();
                     while !recovery_shutdown.load(Ordering::Relaxed) {
                         let before = recovery_shared.account_state.monitoring_snapshot();
                         let pending = before
@@ -6539,18 +6591,52 @@ impl Engine {
                             let (unresolved, updates) =
                                 recovery.reconcile_recovered_orders_with_updates();
                             for update in updates {
+                                if let Some(audit) = update.order_audit.as_ref() {
+                                    let fingerprint = format!(
+                                        "{:?}|{:?}|{:?}|{:?}",
+                                        update.status,
+                                        audit.original_size,
+                                        audit.size_matched,
+                                        audit.associate_trades,
+                                    );
+                                    if delivered_audit_fingerprints
+                                        .get(&update.client_order_id)
+                                        == Some(&fingerprint)
+                                    {
+                                        continue;
+                                    }
+                                    delivered_audit_fingerprints.insert(
+                                        update.client_order_id.clone(),
+                                        fingerprint,
+                                    );
+                                }
                                 if recovery_update_tx.send(update).is_err() {
                                     return;
                                 }
                             }
                             let after = recovery_shared.account_state.monitoring_snapshot();
                             if unresolved > 0 {
+                                let pending_ids = recovery_shared
+                                    .account_state
+                                    .recovery_pending_order_ids();
+                                if pending_ids != warned_pending_ids {
                                 warn!(
-                                    "[Engine] Polymarket account={} background recovery still pending: {} order(s)",
+                                        "[Engine] Polymarket account={} background recovery still pending: {} order(s) coids={:?}",
                                     recovery_account_id,
                                     unresolved,
+                                        pending_ids,
                                 );
-                            } else if after.routine_cancel_audits > 0 {
+                                    warned_pending_ids = pending_ids;
+                                } else {
+                                    log::debug!(
+                                        "[Engine] Polymarket account={} background recovery unchanged: {} order(s)",
+                                        recovery_account_id,
+                                        unresolved,
+                                    );
+                                }
+                            } else {
+                                warned_pending_ids.clear();
+                                if after.routine_cancel_audits > 0 {
                                 log::debug!(
                                     "[Engine] Polymarket account={} routine cancel audits still pending: {} order(s)",
                                     recovery_account_id,
@@ -6563,19 +6649,22 @@ impl Engine {
                                 );
                             }
                         }
-                        let poll_slices = if before.recovery_pending_orders == 0
-                            && before.routine_cancel_audits > 0
-                        {
-                            1
                         } else {
-                            10
-                        };
-                        for _ in 0..poll_slices {
-                            if recovery_shutdown.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            thread::sleep(std::time::Duration::from_millis(500));
+                            // A later audit for the same coid is a fresh edge
+                            // and should receive one new WARN.
+                            warned_pending_ids.clear();
                         }
+                        // New terminal audits wake this account worker on the
+                        // insertion edge. The bounded 500 ms timeout is only
+                        // for shutdown responsiveness and retrying unresolved
+                        // HTTP/trade rows; there is no longer a 5 s idle poll
+                        // that can delay a newly-created safety blocker.
+                        audit_generation = recovery_shared
+                            .account_state
+                            .wait_for_order_audit_work(
+                                audit_generation,
+                                std::time::Duration::from_millis(500),
+                            );
                     }
                 })
             {
@@ -7197,13 +7286,22 @@ fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<us
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrivateUpdateRoute { Owner(usize), Broadcast, DropQuarantined(usize), DropInvalid(usize) }
+enum PrivateUpdateRoute {
+    Owner(usize),
+    Broadcast,
+    DropQuarantined(usize),
+    DropInvalid(usize),
+}
 
 fn classify_private_update_route(
-    owner: Option<usize>, worker_count: usize, quarantined: &[Arc<AtomicBool>],
+    owner: Option<usize>,
+    worker_count: usize,
+    quarantined: &[Arc<AtomicBool>],
 ) -> PrivateUpdateRoute {
     match owner {
-        Some(i) if i >= worker_count || i >= quarantined.len() => PrivateUpdateRoute::DropInvalid(i),
+        Some(i) if i >= worker_count || i >= quarantined.len() => {
+            PrivateUpdateRoute::DropInvalid(i)
+        }
         Some(i) if quarantined[i].load(Ordering::Acquire) => PrivateUpdateRoute::DropQuarantined(i),
         Some(i) => PrivateUpdateRoute::Owner(i),
         None => PrivateUpdateRoute::Broadcast,
@@ -7466,7 +7564,9 @@ fn reconcile_deferred_updates(
     let mut updates = Vec::new();
     let mut coids = HashSet::new();
     for (coid, symbol, side, price, _) in pending_places {
-        if !coids.insert(coid.clone()) { continue; }
+        if !coids.insert(coid.clone()) {
+            continue;
+        }
         updates.push(OrderUpdate {
             client_order_id: coid.clone(),
             exchange: Exchange::Polymarket,
@@ -7485,7 +7585,9 @@ fn reconcile_deferred_updates(
         });
     }
     for (coid, order_id) in pending_cancels {
-        if !coids.insert(coid.clone()) { continue; }
+        if !coids.insert(coid.clone()) {
+            continue;
+        }
         updates.push(OrderUpdate {
             client_order_id: coid.clone(),
             exchange: Exchange::Polymarket,
@@ -7512,7 +7614,9 @@ fn reconcile_deferred_updates(
     };
     let mut trade_ids = HashSet::new();
     for trade_id in pending_trade_ids {
-        if !trade_ids.insert(trade_id.clone()) { continue; }
+        if !trade_ids.insert(trade_id.clone()) {
+            continue;
+        }
         updates.push(OrderUpdate {
             client_order_id: synthetic_coid.clone(),
             exchange: Exchange::Polymarket,
@@ -7584,7 +7688,10 @@ fn fire_or_execute(
                                 let route = match r.poly_route_mut(&iid2) {
                                     Ok(route) => route,
                                     Err(error) => {
-                                        error!("[Executor] Polymarket completion route error: {}", error);
+                                        error!(
+                                            "[Executor] Polymarket completion route error: {}",
+                                            error
+                                        );
                                         drop(permit);
                                         return vec![exec_rejected_place(&order)];
                                     }
@@ -7647,16 +7754,15 @@ fn fire_or_execute(
                         let route = match r.poly_route_mut(&iid2) {
                             Ok(route) => route,
                             Err(error) => {
-                                error!("[Executor] Polymarket cancel completion route error: {}", error);
+                                error!(
+                                    "[Executor] Polymarket cancel completion route error: {}",
+                                    error
+                                );
                                 drop(permit);
                                 return vec![exec_rejected_cancel(client_order_id, exchange)];
                             }
                         };
-                        let u = route.complete_cancel(
-                            exchange,
-                            &client_order_id,
-                            pending,
-                        );
+                        let u = route.complete_cancel(exchange, &client_order_id, pending);
                         drop(permit);
                         vec![u]
                     });
@@ -7695,7 +7801,10 @@ fn fire_or_execute(
                         let route = match worker.poly_route_mut(&iid) {
                             Ok(route) => route,
                             Err(error) => {
-                                error!("[Executor] Polymarket replace-place route error: {}", error);
+                                error!(
+                                    "[Executor] Polymarket replace-place route error: {}",
+                                    error
+                                );
                                 drop(ppermit);
                                 let _ = utx.send(exec_rejected_place(&place));
                                 let _ = utx.send(exec_rejected_cancel(coid, exchange));
@@ -7752,7 +7861,10 @@ fn fire_or_execute(
             let route = match worker.poly_route_mut(&iid) {
                 Ok(route) => route,
                 Err(error) => {
-                    error!("[Executor] Polymarket replace-cancel route error: {}", error);
+                    error!(
+                        "[Executor] Polymarket replace-cancel route error: {}",
+                        error
+                    );
                     drop(cancel_permit);
                     let _ = utx.send(exec_rejected_cancel(coid, exchange));
                     return;
@@ -7765,7 +7877,10 @@ fn fire_or_execute(
                 let route = match r.poly_route_mut(&iid_c) {
                     Ok(route) => route,
                     Err(error) => {
-                        error!("[Executor] Polymarket replace-cancel completion route error: {}", error);
+                        error!(
+                            "[Executor] Polymarket replace-cancel completion route error: {}",
+                            error
+                        );
                         drop(cancel_permit);
                         return vec![exec_rejected_cancel(coid, exchange)];
                     }
@@ -7788,13 +7903,17 @@ fn fire_or_execute(
             pending_cancels,
             pending_trade_ids,
             ..
-        } if !iid.is_empty() => {
-            match try_acquire(&iid, Role::Reconcile) {
+        } if !iid.is_empty() => match try_acquire(&iid, Role::Reconcile) {
                 None => {
                     for update in reconcile_deferred_updates(
-                        &iid, &pending_places, &pending_cancels, &pending_trade_ids,
+                    &iid,
+                    &pending_places,
+                    &pending_cancels,
+                    &pending_trade_ids,
                     ) {
-                        if utx.send(update).is_err() { break; }
+                    if utx.send(update).is_err() {
+                        break;
+                    }
                     }
                 }
                 Some(permit) => {
@@ -7821,8 +7940,7 @@ fn fire_or_execute(
                         }
                     }
                 }
-            }
-        }
+        },
         // Batch / cancel-all / non-poly / empty-iid → synchronous fallback.
         // polymaker's only batch signals are BatchCancelOrders (a leg pulling
         // >1 accumulated/orphan order with no replace — the `live_count >= 2`
@@ -8031,11 +8149,7 @@ fn execute_fallback_signal(
                 let mut out = if exchange == Exchange::Polymarket {
                     executor.poly_route_mut(&instance_id).and_then(|route| {
                         route.set_gen_ns_hint(timestamp_ns);
-                        route.batch_cancel_orders(
-                            exchange,
-                            &market_id,
-                            &cancel_client_order_ids,
-                        )
+                        route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
                     })
                 } else {
                     executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
@@ -8086,11 +8200,7 @@ fn execute_fallback_signal(
                 let mut out = if exchange == Exchange::Polymarket {
                     executor.poly_route_mut(&instance_id).and_then(|route| {
                         route.set_gen_ns_hint(timestamp_ns);
-                        route.batch_cancel_orders(
-                            exchange,
-                            &market_id,
-                            &cancel_client_order_ids,
-                        )
+                        route.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
                     })
                 } else {
                     executor.batch_cancel_orders(exchange, &market_id, &cancel_client_order_ids)
@@ -8131,11 +8241,9 @@ fn execute_fallback_signal(
             pending_trade_ids,
             ..
         } => match executor.poly_route_mut(&instance_id) {
-            Ok(route) => route.reconcile_orphans(
-                &pending_places,
-                &pending_cancels,
-                &pending_trade_ids,
-            ),
+            Ok(route) => {
+                route.reconcile_orphans(&pending_places, &pending_cancels, &pending_trade_ids)
+            }
             Err(error) => {
                 error!("[Executor] Polymarket reconcile route error: {}", error);
                 reconcile_deferred_updates(
@@ -8196,8 +8304,7 @@ fn execute_fallback_signal(
                             OrderStatus::CancelUncertain,
                             format!(
                                 "{}: {}",
-                                POLYMARKET_MARKET_CANCEL_FINALITY_PENDING,
-                                result.detail,
+                                POLYMARKET_MARKET_CANCEL_FINALITY_PENDING, result.detail,
                             ),
                         )
                     };
@@ -8221,7 +8328,10 @@ fn execute_fallback_signal(
                 }
                 None => {
                     if instance_id.is_empty() {
-                        warn!("[Executor] PolymarketCancelAllOrders account-wide: reason={}", reason);
+                        warn!(
+                            "[Executor] PolymarketCancelAllOrders account-wide: reason={}",
+                            reason
+                        );
                         route.cancel_all_orders();
                     } else {
                         return route.cancel_instance_orders().unwrap_or_else(|error| {
@@ -8238,9 +8348,9 @@ fn execute_fallback_signal(
             asset_ids,
             ..
         } => {
-            let retained = executor.poly_route_mut(&instance_id).and_then(|route| {
-                route.retain_event_audit(&condition_id, &asset_ids)
-            });
+            let retained = executor
+                .poly_route_mut(&instance_id)
+                .and_then(|route| route.retain_event_audit(&condition_id, &asset_ids));
             if let Err(error) = retained {
                 error!(
                     "[Executor] failed to retain Polymarket event audit instance_id={} condition_id={}: {}",
@@ -8608,8 +8718,7 @@ impl LiveRouter {
     fn poly_route_mut(&mut self, instance_id: &str) -> Result<&mut PolymarketTrade> {
         if !instance_id.is_empty() {
             if !self.poly_routes.contains_key(instance_id) {
-                let mut routes: Vec<&str> =
-                    self.poly_routes.keys().map(String::as_str).collect();
+                let mut routes: Vec<&str> = self.poly_routes.keys().map(String::as_str).collect();
                 routes.sort_unstable();
                 return Err(anyhow::anyhow!(
                     "unknown Polymarket instance_id `{}` (available routes: [{}])",
@@ -8625,11 +8734,9 @@ impl LiveRouter {
                 )),
             };
         }
-        self.polymarket
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!(
-                "Polymarket route requested with no PolymarketTrade configured"
-            ))
+        self.polymarket.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Polymarket route requested with no PolymarketTrade configured")
+        })
     }
 
     /// The default `PolymarketTrade`, or a clear error if no polymaker
@@ -9257,7 +9364,9 @@ mod market_router_tests {
         // Instrument for BTC series carrying token "TOKxyz" → instance 0,
         // and the router learns TOKxyz → [0].
         let mut rotating = binary_option("btc-up-or-down-5m", &["TOKxyz"]);
-        let Instrument::BinaryOption(ref mut option) = rotating else { unreachable!() };
+        let Instrument::BinaryOption(ref mut option) = rotating else {
+            unreachable!()
+        };
         option.slug = "btc-updown-5m-1782840600".into();
         Engine::route_market_event(
             Arc::new(MarketEvent::Instrument(rotating)),
@@ -9288,9 +9397,12 @@ mod market_router_tests {
         let txs = [tx0, tx1];
         Engine::route_market_event(
             Arc::new(MarketEvent::Instrument(binary_option(
-                "sol-up-or-down-5m", &["SOL-TOKEN"],
+                "sol-up-or-down-5m",
+                &["SOL-TOKEN"],
             ))),
-            &sym, &mut tok, &txs,
+            &sym,
+            &mut tok,
+            &txs,
         );
         assert_eq!(drain(&rx0), 0);
         assert_eq!(drain(&rx1), 0);
@@ -9323,12 +9435,7 @@ mod market_router_tests {
             &mut tok,
             &txs,
         );
-        Engine::route_market_event(
-            Arc::new(tick_size("UNMAPPED-TOKEN")),
-            &sym,
-            &mut tok,
-            &txs,
-        );
+        Engine::route_market_event(Arc::new(tick_size("UNMAPPED-TOKEN")), &sym, &mut tok, &txs);
         assert_eq!(drain(&rx0), 0);
         assert_eq!(drain(&rx1), 0);
     }
@@ -9393,19 +9500,28 @@ mod market_router_tests {
         let trigger = OrderBookSnapshot {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),
-            bids: vec![PriceLevel { price: 100.0, quantity: 1.0 }],
-            asks: vec![PriceLevel { price: 101.0, quantity: 1.0 }],
+            bids: vec![PriceLevel {
+                price: 100.0,
+                quantity: 1.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 101.0,
+                quantity: 1.0,
+            }],
             exchange_timestamp_ns: 11,
             local_timestamp_ns: 22,
         };
 
         stamp_quote_trigger(&mut signals, &trigger, false);
 
-        let orders: Vec<&OrderRequest> = signals.iter().flat_map(|signal| match signal {
+        let orders: Vec<&OrderRequest> = signals
+            .iter()
+            .flat_map(|signal| match signal {
             Signal::NewOrder(order) => vec![order],
             Signal::BatchNewOrders { orders, .. } => orders.iter().collect(),
             _ => Vec::new(),
-        }).collect();
+            })
+            .collect();
         assert_eq!(orders.len(), 2);
         for order in orders {
             assert_eq!(order.quote_trigger_exchange_timestamp_ns, 11);
@@ -9471,8 +9587,20 @@ mod market_router_tests {
     #[test]
     fn reconcile_pool_saturation_returns_routeable_deduplicated_feedback() {
         let places = vec![
-            ("zhu-03-place".to_string(), "UP".to_string(), Side::Buy, 0.41, None),
-            ("zhu-03-place".to_string(), "UP".to_string(), Side::Buy, 0.41, None),
+            (
+                "zhu-03-place".to_string(),
+                "UP".to_string(),
+                Side::Buy,
+                0.41,
+                None,
+            ),
+            (
+                "zhu-03-place".to_string(),
+                "UP".to_string(),
+                Side::Buy,
+                0.41,
+                None,
+            ),
         ];
         let cancels = vec![
             ("zhu-03-cancel".to_string(), "oid-1".to_string()),
@@ -9489,11 +9617,14 @@ mod market_router_tests {
 
         let mut owners = HashMap::new();
         owners.insert("zhu-03".to_string(), 7usize);
-        assert!(updates.iter().all(|update| {
-            owner_from_coid(&update.client_order_id, &owners) == Some(7)
-        }));
+        assert!(updates
+            .iter()
+            .all(|update| { owner_from_coid(&update.client_order_id, &owners) == Some(7) }));
         assert_eq!(
-            updates.iter().filter_map(|update| update.trade_id.as_deref()).collect::<Vec<_>>(),
+            updates
+                .iter()
+                .filter_map(|update| update.trade_id.as_deref())
+                .collect::<Vec<_>>(),
             vec!["trade-1"]
         );
     }
@@ -9504,11 +9635,20 @@ mod market_router_tests {
         let flags = vec![Arc::new(AtomicBool::new(false))];
         let instances = vec!["btc01".to_string()];
         assert!(quarantine_strategy_worker(
-            0, "market queue overflow (event loss)", &instances, &flags, &signal_tx,
+            0,
+            "market queue overflow (event loss)",
+            &instances,
+            &flags,
+            &signal_tx,
         ));
         assert!(flags[0].load(Ordering::Acquire));
         match signal_rx.try_recv().unwrap() {
-            Signal::PolymarketCancelAllOrders { instance_id, market, reason, .. } => {
+            Signal::PolymarketCancelAllOrders {
+                instance_id,
+                market,
+                reason,
+                ..
+            } => {
                 assert_eq!(instance_id, "btc01");
                 assert!(market.is_none());
                 assert!(reason.contains("market queue overflow"));
@@ -9516,7 +9656,11 @@ mod market_router_tests {
             other => panic!("unexpected supervisor signal: {other:?}"),
         }
         assert!(!quarantine_strategy_worker(
-            0, "duplicate", &instances, &flags, &signal_tx,
+            0,
+            "duplicate",
+            &instances,
+            &flags,
+            &signal_tx,
         ));
         assert!(signal_rx.try_recv().is_err());
     }
@@ -9526,11 +9670,17 @@ mod market_router_tests {
         let (signal_tx, signal_rx) = bounded::<Signal>(1);
         signal_tx.send(Signal::Exit).unwrap();
         assert!(!enqueue_emergency_instance_cancel(
-            0, "btc01", "first attempt", &signal_tx,
+            0,
+            "btc01",
+            "first attempt",
+            &signal_tx,
         ));
         assert!(matches!(signal_rx.recv().unwrap(), Signal::Exit));
         assert!(enqueue_emergency_instance_cancel(
-            0, "btc01", "periodic retry", &signal_tx,
+            0,
+            "btc01",
+            "periodic retry",
+            &signal_tx,
         ));
         assert!(matches!(
             signal_rx.recv().unwrap(),
@@ -9567,8 +9717,8 @@ mod market_router_tests {
         let mut wallets = HashMap::new();
         register_polymarket_wallet_identity(&mut wallets, "hex001", "0xAbC").unwrap();
         register_polymarket_wallet_identity(&mut wallets, "hex001", "0xabc").unwrap();
-        let error = register_polymarket_wallet_identity(&mut wallets, "zhu02", "0xABC")
-            .unwrap_err();
+        let error =
+            register_polymarket_wallet_identity(&mut wallets, "zhu02", "0xABC").unwrap_err();
         assert!(error.contains("both account_id `hex001` and `zhu02`"));
     }
 
@@ -9646,9 +9796,7 @@ mod market_router_tests {
         let mut sym: HashMap<String, Vec<usize>> = HashMap::new();
         sym.insert("btcusdt".into(), vec![0, 1, 2, 3, 4]);
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (txs, rxs): (Vec<_>, Vec<_>) = (0..5)
-            .map(|_| bounded::<QueuedMarketEvent>(64))
-            .unzip();
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..5).map(|_| bounded::<QueuedMarketEvent>(64)).unzip();
 
         Engine::route_market_event(
             Arc::new(ob(Exchange::Binance, "BTCUSDT")),
@@ -9658,7 +9806,9 @@ mod market_router_tests {
         );
         let first = rxs[0].try_recv().expect("instance 0 event");
         for (idx, rx) in rxs.iter().enumerate().skip(1) {
-            let event = rx.try_recv().unwrap_or_else(|_| panic!("instance {idx} event"));
+            let event = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("instance {idx} event"));
             assert!(
                 Arc::ptr_eq(&first.event, &event.event),
                 "all five subscribers must share one MarketEvent allocation"

@@ -6,12 +6,12 @@
 //! - `confirmed_position()`: only CONFIRMED trades (for sell inventory checks)
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
+use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use log::info;
 
-use crate::types::{OrderUpdate, Side};
+use crate::types::{now_ns, OrderUpdate, Side};
 use hexagent_account::account::shared_account::RestoredTrade;
 
 // ════════════════════════════════════════════════════════════════
@@ -24,7 +24,7 @@ use hexagent_account::account::shared_account::RestoredTrade;
 /// This is a *narrow* handle on purpose: the strategy must NOT read the full
 /// `LivePositionManager` (its position/balance source of truth is its own
 /// internal ledger), but it DOES need to know when the fill feed is
-/// untrustworthy so it can pause quoting. Two independent conditions:
+/// untrustworthy so it can pause quoting. Three independent conditions:
 ///
 /// - `recovering`: the user WS is disconnected / reconnecting / replaying the
 ///   post-reconnect REST gap-fetch. The local ledger may be missing in-flight
@@ -35,10 +35,16 @@ use hexagent_account::account::shared_account::RestoredTrade;
 ///   it ride to settlement. Cleared on the next event settlement.
 /// - `gap_replay_degraded`: the periodic REST safety net has failed repeatedly.
 ///   The WebSocket may still be connected, but until the pinned replay window
-///   catches up we cannot prove that its local ledger is complete.
+///   catches up we cannot prove that the REST safety net is current. This is
+///   diagnostic/degraded state only while the private WS remains connected;
+///   it does not by itself make inventory unknown or require quote pauses.
 #[derive(Debug)]
 pub struct UserFeedHealth {
     recovering: AtomicBool,
+    /// Wall-clock edge timestamp for the current recovery interval. Strategies
+    /// use it to pause new orders immediately while retaining resting maker
+    /// orders across short reconnects.
+    recovering_since_ns: AtomicU64,
     inventory_uncertain: AtomicBool,
     gap_replay_degraded: AtomicBool,
     last_transport_activity_ns: AtomicU64,
@@ -106,6 +112,7 @@ impl UserFeedHealth {
     pub fn new() -> Self {
         Self {
             recovering: AtomicBool::new(true),
+            recovering_since_ns: AtomicU64::new(now_ns()),
             inventory_uncertain: AtomicBool::new(false),
             gap_replay_degraded: AtomicBool::new(false),
             last_transport_activity_ns: AtomicU64::new(0),
@@ -113,10 +120,36 @@ impl UserFeedHealth {
             recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
         }
     }
-    pub fn is_recovering(&self) -> bool { self.recovering.load(Ordering::Acquire) }
-    pub fn set_recovering(&self, v: bool) { self.recovering.store(v, Ordering::Release); }
-    pub fn inventory_uncertain(&self) -> bool { self.inventory_uncertain.load(Ordering::Relaxed) }
-    pub fn set_inventory_uncertain(&self, v: bool) { self.inventory_uncertain.store(v, Ordering::Relaxed); }
+    pub fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::Acquire)
+    }
+    pub fn set_recovering(&self, v: bool) {
+        if v {
+            if !self.recovering.swap(true, Ordering::AcqRel) {
+                self.recovering_since_ns.store(now_ns(), Ordering::Release);
+            } else if self.recovering_since_ns.load(Ordering::Acquire) == 0 {
+                self.recovering_since_ns.store(now_ns(), Ordering::Release);
+            }
+        } else {
+            self.recovering.store(false, Ordering::Release);
+            self.recovering_since_ns.store(0, Ordering::Release);
+        }
+    }
+    /// Elapsed wall-clock recovery time. Returns zero while healthy and also
+    /// for the tiny publication race at the beginning of a recovery edge.
+    pub fn recovering_for_ns(&self, current_ns: u64) -> u64 {
+        if !self.is_recovering() {
+            return 0;
+        }
+        let since = self.recovering_since_ns.load(Ordering::Acquire);
+        current_ns.saturating_sub(since)
+    }
+    pub fn inventory_uncertain(&self) -> bool {
+        self.inventory_uncertain.load(Ordering::Relaxed)
+    }
+    pub fn set_inventory_uncertain(&self, v: bool) {
+        self.inventory_uncertain.store(v, Ordering::Relaxed);
+    }
     pub fn gap_replay_degraded(&self) -> bool {
         self.gap_replay_degraded.load(Ordering::Relaxed)
     }
@@ -124,10 +157,12 @@ impl UserFeedHealth {
         self.gap_replay_degraded.store(v, Ordering::Relaxed);
     }
     pub fn record_transport_activity(&self, timestamp_ns: u64) {
-        self.last_transport_activity_ns.fetch_max(timestamp_ns, Ordering::Relaxed);
+        self.last_transport_activity_ns
+            .fetch_max(timestamp_ns, Ordering::Relaxed);
     }
     pub fn record_valid_business_event(&self, timestamp_ns: u64) {
-        self.last_valid_business_event_ns.fetch_max(timestamp_ns, Ordering::Relaxed);
+        self.last_valid_business_event_ns
+            .fetch_max(timestamp_ns, Ordering::Relaxed);
     }
     pub fn activity_timestamps_ns(&self) -> (u64, u64) {
         (
@@ -142,7 +177,7 @@ impl UserFeedHealth {
     /// Quoting therefore cannot resume merely because recovery updates were
     /// enqueued while their PositionManager is still stale.
     pub fn begin_recovery_delivery(&self) -> u64 {
-        self.recovering.store(true, Ordering::Release);
+        self.set_recovering(true);
         let mut delivery = self.recovery_delivery.lock().unwrap();
         delivery.generation = delivery.generation.wrapping_add(1).max(1);
         delivery.enrolling = true;
@@ -188,11 +223,7 @@ impl UserFeedHealth {
     /// Called by the owning strategy after it has fully processed an update.
     /// Broadcast siblings cannot consume the acknowledgement because the
     /// instance id is part of the key.
-    pub fn acknowledge_recovery_update(
-        &self,
-        instance_id: &str,
-        update: &OrderUpdate,
-    ) -> bool {
+    pub fn acknowledge_recovery_update(&self, instance_id: &str, update: &OrderUpdate) -> bool {
         let mut delivery = self.recovery_delivery.lock().unwrap();
         let key = RecoveryUpdateKey::new(instance_id, update);
         let Some(count) = delivery.pending.get_mut(&key) else {
@@ -216,7 +247,10 @@ impl UserFeedHealth {
             return None;
         }
         let key = RecoveryUpdateKey::new(instance_id, update);
-        delivery.pending.contains_key(&key).then(|| RecoveryUpdateAck {
+        delivery
+            .pending
+            .contains_key(&key)
+            .then(|| RecoveryUpdateAck {
             health: Arc::clone(self),
             instance_id: instance_id.to_string(),
             update: update.clone(),
@@ -237,7 +271,9 @@ impl UserFeedHealth {
 }
 
 impl Default for UserFeedHealth {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -351,7 +387,9 @@ impl LivePositionManager {
             // Keep the upstream timestamp in the durable row, but never
             // restore a future REST replay lower bound after restart.
             manager.touch_match_time(row.match_time_secs.min(receipt_secs));
-            let Some(status) = TradeStatus::from_str(&row.ownership.status) else { continue; };
+            let Some(status) = TradeStatus::from_str(&row.ownership.status) else {
+                continue;
+            };
             manager.update_trade(
                 &row.ownership.trade_key,
                 status,
@@ -368,7 +406,9 @@ impl LivePositionManager {
 
     /// Largest `match_time` (unix seconds) seen so far. Used as the `after=`
     /// lower bound on the REST `/trades` gap-fetch call.
-    pub fn last_match_time_secs(&self) -> u64 { self.last_match_time_secs }
+    pub fn last_match_time_secs(&self) -> u64 {
+        self.last_match_time_secs
+    }
 
     /// Bump the conservative REST replay watermark if `ts > current`.
     /// Callers must pass receipt-capped time, never an unchecked upstream
@@ -408,16 +448,21 @@ impl LivePositionManager {
         if status == TradeStatus::Retrying {
             return false;
         }
-        if trade_id.trim().is_empty() || asset_id.trim().is_empty()
-            || !size.is_finite() || size <= 0.0
-            || !price.is_finite() || price <= 0.0 || price > 1.0 + 1e-8
+        if trade_id.trim().is_empty()
+            || asset_id.trim().is_empty()
+            || !size.is_finite()
+            || size <= 0.0
+            || !price.is_finite()
+            || price <= 0.0
+            || price > 1.0 + 1e-8
         {
             return false;
         }
         if let Some(existing) = self.trades.get(trade_id) {
             let size_tolerance = 1e-8_f64.max(existing.size.abs() * 1e-8);
             let price_tolerance = 1e-10_f64.max(existing.price.abs() * 1e-8);
-            if existing.asset_id != asset_id || existing.side != side
+            if existing.asset_id != asset_id
+                || existing.side != side
                 || existing.is_maker != is_maker
                 || (existing.size - size).abs() > size_tolerance
                 || (existing.price - price).abs() > price_tolerance
@@ -436,7 +481,9 @@ impl LivePositionManager {
         }
 
         let is_new = !self.trades.contains_key(trade_id);
-        self.trades.insert(trade_id.to_string(), LiveTrade {
+        self.trades.insert(
+            trade_id.to_string(),
+            LiveTrade {
             trade_id: trade_id.to_string(),
             asset_id: asset_id.to_string(),
             side,
@@ -444,17 +491,23 @@ impl LivePositionManager {
             price,
             status,
             is_maker,
-        });
+            },
+        );
 
         let reason_part = match reason {
             Some(s) if !s.is_empty() => format!(" reason=\"{}\"", s),
             _ => String::new(),
         };
         if is_new {
-            info!("[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
-                trade_id, side, asset_id, size, price, status, is_maker, reason_part);
+            info!(
+                "[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
+                trade_id, side, asset_id, size, price, status, is_maker, reason_part
+            );
         } else {
-            info!("[LivePosition] Trade {} status → {:?}{}", trade_id, status, reason_part);
+            info!(
+                "[LivePosition] Trade {} status → {:?}{}",
+                trade_id, status, reason_part
+            );
         }
 
         true
@@ -462,21 +515,21 @@ impl LivePositionManager {
 
     pub fn prune_terminal_history(&mut self, tokens: &HashSet<String>) -> usize {
         let before = self.trades.len();
-        self.trades.retain(|_, trade| {
-            !tokens.contains(&trade.asset_id) || !trade.status.is_terminal()
-        });
+        self.trades
+            .retain(|_, trade| !tokens.contains(&trade.asset_id) || !trade.status.is_terminal());
         before.saturating_sub(self.trades.len())
     }
 
     #[cfg(test)]
-    fn trade_count(&self) -> usize { self.trades.len() }
-
+    fn trade_count(&self) -> usize {
+        self.trades.len()
+    }
 }
 
 #[cfg(test)]
 mod user_feed_health_tests {
     use super::UserFeedHealth;
-    use crate::types::{Exchange, OrderStatus, OrderUpdate, Side};
+    use crate::types::{now_ns, Exchange, OrderStatus, OrderUpdate, Side};
 
     fn recovery_update(coid: &str) -> OrderUpdate {
         OrderUpdate {
@@ -525,6 +578,9 @@ mod user_feed_health_tests {
         assert!(!h.is_recovering());
         h.set_recovering(true); // disconnect
         assert!(h.is_recovering());
+        assert!(h.recovering_for_ns(now_ns().saturating_add(1)) > 0);
+        h.set_recovering(false);
+        assert_eq!(h.recovering_for_ns(now_ns()), 0);
     }
 
     #[test]
@@ -614,36 +670,84 @@ mod update_trade_dedup_tests {
     fn rejects_invalid_values_and_trade_identity_mutation() {
         let mut m = LivePositionManager::new();
         assert!(!m.update_trade(
-            "bad", TradeStatus::Matched, "TOK", Side::Buy,
-            f64::NAN, 0.4, true, None,
+            "bad",
+            TradeStatus::Matched,
+            "TOK",
+            Side::Buy,
+            f64::NAN,
+            0.4,
+            true,
+            None,
         ));
         assert!(m.update_trade(
-            "strict", TradeStatus::Matched, "TOK", Side::Buy,
-            5.0, 0.4, true, None,
+            "strict",
+            TradeStatus::Matched,
+            "TOK",
+            Side::Buy,
+            5.0,
+            0.4,
+            true,
+            None,
         ));
         assert!(!m.update_trade(
-            "strict", TradeStatus::Mined, "OTHER", Side::Buy,
-            5.0, 0.4, true, None,
+            "strict",
+            TradeStatus::Mined,
+            "OTHER",
+            Side::Buy,
+            5.0,
+            0.4,
+            true,
+            None,
         ));
         assert!(!m.update_trade(
-            "strict", TradeStatus::Mined, "TOK", Side::Sell,
-            5.0, 0.4, true, None,
+            "strict",
+            TradeStatus::Mined,
+            "TOK",
+            Side::Sell,
+            5.0,
+            0.4,
+            true,
+            None,
         ));
         assert!(!m.update_trade(
-            "strict", TradeStatus::Mined, "TOK", Side::Buy,
-            5.1, 0.4, true, None,
+            "strict",
+            TradeStatus::Mined,
+            "TOK",
+            Side::Buy,
+            5.1,
+            0.4,
+            true,
+            None,
         ));
         assert!(!m.update_trade(
-            "strict", TradeStatus::Mined, "TOK", Side::Buy,
-            5.0, 0.41, true, None,
+            "strict",
+            TradeStatus::Mined,
+            "TOK",
+            Side::Buy,
+            5.0,
+            0.41,
+            true,
+            None,
         ));
         assert!(!m.update_trade(
-            "strict", TradeStatus::Mined, "TOK", Side::Buy,
-            5.0, 0.4, false, None,
+            "strict",
+            TradeStatus::Mined,
+            "TOK",
+            Side::Buy,
+            5.0,
+            0.4,
+            false,
+            None,
         ));
         assert!(m.update_trade(
-            "strict", TradeStatus::Mined, "TOK", Side::Buy,
-            5.0 + 1e-9, 0.4 + 1e-10, true, None,
+            "strict",
+            TradeStatus::Mined,
+            "TOK",
+            Side::Buy,
+            5.0 + 1e-9,
+            0.4 + 1e-10,
+            true,
+            None,
         ));
     }
 
@@ -651,16 +755,34 @@ mod update_trade_dedup_tests {
     fn prune_removes_only_terminal_rows_in_retired_token_scope() {
         let mut m = LivePositionManager::new();
         assert!(m.update_trade(
-            "terminal", TradeStatus::Confirmed, "TOK", Side::Buy,
-            1.0, 0.4, true, None,
+            "terminal",
+            TradeStatus::Confirmed,
+            "TOK",
+            Side::Buy,
+            1.0,
+            0.4,
+            true,
+            None,
         ));
         assert!(m.update_trade(
-            "pending", TradeStatus::Matched, "TOK", Side::Buy,
-            1.0, 0.4, true, None,
+            "pending",
+            TradeStatus::Matched,
+            "TOK",
+            Side::Buy,
+            1.0,
+            0.4,
+            true,
+            None,
         ));
         assert!(m.update_trade(
-            "other", TradeStatus::Failed, "OTHER", Side::Buy,
-            1.0, 0.4, true, None,
+            "other",
+            TradeStatus::Failed,
+            "OTHER",
+            Side::Buy,
+            1.0,
+            0.4,
+            true,
+            None,
         ));
         assert_eq!(m.prune_terminal_history(&HashSet::from(["TOK".into()])), 1);
         assert_eq!(m.trade_count(), 2);

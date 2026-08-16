@@ -47,7 +47,8 @@ pub struct PredictionsStatus {
     /// Number of components named `Predictions` or grouped under it.
     pub matched_components: usize,
     /// `name=status` entries for every matching component that is not
-    /// `OPERATIONAL` (including a missing status).
+    /// `OPERATIONAL`. Missing/malformed status data is returned as an error so
+    /// callers can distinguish an unavailable status page from a venue outage.
     pub non_operational: Vec<String>,
 }
 
@@ -62,8 +63,8 @@ impl PredictionsStatus {
 ///
 /// Blocking; uses the shared query HTTP client with one quick retry. An empty
 /// URL falls back to [`DEFAULT_STATUS_URL`]. A response without any matching
-/// Predictions component is an error so callers remain fail-closed if the
-/// upstream schema changes.
+/// Predictions component is an error. Callers should treat fetch/schema errors
+/// as status-page unavailability, not as proof that trading is unavailable.
 pub fn fetch_predictions_status(url: &str) -> Result<PredictionsStatus> {
     let url = if url.is_empty() {
         DEFAULT_STATUS_URL
@@ -116,7 +117,16 @@ fn parse_predictions_status(body: &str) -> Result<PredictionsStatus> {
         }
 
         matched_components += 1;
-        let status = component.status.as_deref().unwrap_or("<missing>");
+        let Some(status) = component.status.as_deref() else {
+            let name = if component.name.is_empty() {
+                "<unnamed>"
+            } else {
+                component.name.as_str()
+            };
+            return Err(anyhow!(
+                "Polymarket Predictions component `{name}` has no status"
+            ));
+        };
         if status != STATUS_OPERATIONAL {
             let name = if component.name.is_empty() {
                 "<unnamed>"
@@ -188,16 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_matching_status_blocks_trading() {
+    fn missing_matching_status_is_unknown_not_an_outage() {
         let body = r#"{
             "components": [
                 {"name":"Predictions","group":null}
             ]
         }"#;
 
-        let status = parse_predictions_status(body).unwrap();
-        assert!(!status.is_operational());
-        assert_eq!(status.non_operational, vec!["Predictions=<missing>"]);
+        assert!(parse_predictions_status(body).is_err());
     }
 
     #[test]

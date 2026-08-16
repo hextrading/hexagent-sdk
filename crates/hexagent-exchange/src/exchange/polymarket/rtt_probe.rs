@@ -118,10 +118,8 @@ const FULL_PROBE_SIZE: f64 = 100.0;
 /// would WARN 43k×/day, as the 2026-07 poly_1271 signing regression
 /// did at INFO-invisible level).
 const REJECT_WARN_EVERY_SECS: u64 = 60;
-static LAST_REJECT_WARN_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static REJECTS_SINCE_WARN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_REJECT_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECTS_SINCE_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// WARN (rate-limited) that a probe place was rejected, with the HTTP
 /// status and (truncated) response body so the reject *reason* lands in
@@ -177,9 +175,27 @@ pub fn pick_probe_side<'a>(
     down_ask: Option<f64>,
 ) -> &'a str {
     match (up_ask, down_ask) {
-        (Some(u), Some(d)) => if d > u { down_token } else { up_token },
-        (Some(u), None) => if u < 0.5 { down_token } else { up_token },
-        (None, Some(d)) => if d < 0.5 { up_token } else { down_token },
+        (Some(u), Some(d)) => {
+            if d > u {
+                down_token
+            } else {
+                up_token
+            }
+        }
+        (Some(u), None) => {
+            if u < 0.5 {
+                down_token
+            } else {
+                up_token
+            }
+        }
+        (None, Some(d)) => {
+            if d < 0.5 {
+                up_token
+            } else {
+                down_token
+            }
+        }
         (None, None) => up_token,
     }
 }
@@ -224,16 +240,25 @@ pub fn spawn_rtt_probe(
                 "[RttProbe] Started (instance_id={}) — interval={:.1}s, real resting \
                  place + cancel (postOnly BUY high-side @{} size={}, never fills); \
                  all_probe={} ({}).",
-                instance_id, interval.as_secs_f64(), FULL_PROBE_PRICE, FULL_PROBE_SIZE,
+                instance_id,
+                interval.as_secs_f64(),
+                FULL_PROBE_PRICE,
+                FULL_PROBE_SIZE,
                 all_probe,
-                if all_probe { "fires continuously" } else { "fires only in gate PROBE mode" },
+                if all_probe {
+                    "fires continuously"
+                } else {
+                    "fires only in gate PROBE mode"
+                },
             );
 
             let poll_resolution = Duration::from_millis(100);
             let mut last_fire = Instant::now() - interval;
 
             loop {
-                if shutdown.load(Ordering::Relaxed) { break; }
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 // Normal (gate-driven) mode fires only while the gate is
                 // in PROBE. All-probe mode ignores the flag — the whole
@@ -289,7 +314,9 @@ fn fire_full_probe(
     instance_id: &str,
 ) -> Option<f64> {
     let token = active_token.lock().ok()?.clone()?;
-    if token.is_empty() { return None; }
+    if token.is_empty() {
+        return None;
+    }
     let signer = shared.signer_v2.as_ref()?;
 
     // `_dispatch`, NOT the plain `build_signed_order`: poly_1271
@@ -311,12 +338,16 @@ fn fire_full_probe(
             return None;
         }
     };
-    let salt_u64: u64 = signed.order.salt.parse::<u128>()
-        .map(|v| v as u64).unwrap_or(0);
+    let salt_u64: u64 = signed
+        .order
+        .salt
+        .parse::<u128>()
+        .map(|v| v as u64)
+        .unwrap_or(0);
     let probe_coid = format!("probe:{}:{}", instance_id, signed.order_hash);
     let account_reserved = shared.account_state.is_seeded();
     if account_reserved {
-        if let Err(error) = shared.account_state.reserve_order(
+        if let Err(error) = shared.account_state.reserve_passive_order(
             instance_id,
             &probe_coid,
             &signed.order_hash,
@@ -326,7 +357,10 @@ fn fire_full_probe(
             FULL_PROBE_PRICE,
             0,
         ) {
-            warn!("[RttProbe] shared-account admission rejected (skip): {}", error);
+            warn!(
+                "[RttProbe] shared-account admission rejected (skip): {}",
+                error
+            );
             return None;
         }
     }
@@ -354,7 +388,8 @@ fn fire_full_probe(
             "builder": signed.order.builder,
             "signature": signed.signature,
         }
-    }).to_string();
+    })
+    .to_string();
 
     // Register the probe's orderID (== local order hash) BEFORE sending
     // so the user feed can identify the resting order's placement /
@@ -384,16 +419,15 @@ fn fire_full_probe(
     // the locally-computed EIP-712 `order_hash`, which we fall back to.
     let (order_id, place_round_trip): (Option<String>, bool) = match &res {
         Ok(json) => {
-            let oid = json.get("orderID")
+            let oid = json
+                .get("orderID")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| signed.order_hash.clone());
             (Some(oid), true)
         }
-        Err(HttpErr::Timeout)
-        | Err(HttpErr::Transport(_))
-        | Err(HttpErr::InvalidResponse(_)) => {
+        Err(HttpErr::Timeout) | Err(HttpErr::Transport(_)) | Err(HttpErr::InvalidResponse(_)) => {
             // The order's fate is unknown: the request may have rested
             // server-side and only the response was lost. Best-effort
             // cancel via the locally-computed order_hash (== Polymarket
@@ -409,7 +443,9 @@ fn fire_full_probe(
             // (rate-limited) with the reason.
             warn_probe_place_rejected(*code, body);
             if account_reserved {
-                shared.account_state.release_order(&probe_coid, crate::types::OrderStatus::Rejected);
+                shared
+                    .account_state
+                    .release_order(&probe_coid, crate::types::OrderStatus::Rejected);
             }
             (None, true)
         }
@@ -430,14 +466,14 @@ fn fire_full_probe(
         let cbody = serde_json::json!({ "orderID": oid }).to_string();
         let cres = shared.http_call_sync_rec("DELETE", "/order", &cbody, Some("probe_cancel"));
         if cres.is_ok() && account_reserved {
-            shared.account_state.release_order(
-                &probe_coid,
-                crate::types::OrderStatus::Cancelled,
-            );
+            shared
+                .account_state
+                .release_order(&probe_coid, crate::types::OrderStatus::Cancelled);
         }
         debug!(
             "[RttProbe] probe place={:.1}ms cancel_ok={}",
-            place_rtt, cres.is_ok(),
+            place_rtt,
+            cres.is_ok(),
         );
     }
 
