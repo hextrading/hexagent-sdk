@@ -714,8 +714,9 @@ fn parse_order_event(
         associate_trades,
     };
     match status {
-        OrderStatus::Filled => shared.remove_order_as(&coid, status),
-        OrderStatus::Cancelled => shared.remove_cancelled_order_with_match(&coid, size_matched),
+        OrderStatus::Filled | OrderStatus::Cancelled => {
+            shared.commit_authoritative_terminal_audit(&coid, status, &order_audit);
+        }
         OrderStatus::Accepted | OrderStatus::PartiallyFilled => {
             shared.mark_order_live(
                 &coid,
@@ -1260,7 +1261,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     let transition = if transition.ownership().is_none()
                         && matches!(status_str, "CONFIRMED" | "FAILED")
                     {
-                        shared.account_state.record_authenticated_terminal_trade_noop(
+                        shared
+                            .account_state
+                            .record_authenticated_terminal_trade_noop(
                             &leg_id,
                             status_str,
                             mo_order_id,
@@ -1387,7 +1390,9 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     && matches!(status_str, "CONFIRMED" | "FAILED")
                     && top_level_maker_matches_account(data, shared)
                 {
-                    shared.account_state.record_authenticated_terminal_trade_noop(
+                    shared
+                        .account_state
+                        .record_authenticated_terminal_trade_noop(
                         trade_id,
                         status_str,
                         taker_order_id,
@@ -1894,8 +1899,9 @@ async fn user_feed_loop(
                                             .unwrap_or((0, 0, 0, Vec::new()));
                                     warn!(
                                     "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
-                                     consecutive failures; after={} remains pinned and quoting \
-                                     will pause until catch-up succeeds; \
+                                     consecutive failures; after={} remains pinned; live WS \
+                                     inventory stays authoritative and quoting continues while \
+                                     background catch-up retries; \
                                      account={} GapReplay pool slots={:?} acquires={} skips={} busy={}",
                                     consecutive_failures,
                                     after,
@@ -3505,17 +3511,11 @@ mod tests {
         shared.account_state.register_instance("owner", 1.0);
         shared
             .account_state
-            .apply_physical_snapshot(
-                100.0,
-                HashMap::from([("TOKEN".to_string(), 1.0)]),
-            )
+            .apply_physical_snapshot(100.0, HashMap::from([("TOKEN".to_string(), 1.0)]))
             .unwrap();
         shared
             .account_state
-            .record_settled_token_values(&HashMap::from([(
-                "TOKEN".to_string(),
-                1.0,
-            )]));
+            .record_settled_token_values(&HashMap::from([("TOKEN".to_string(), 1.0)]));
         let event = serde_json::json!({
             "event_type": "trade",
             "id": "historical-trade",
