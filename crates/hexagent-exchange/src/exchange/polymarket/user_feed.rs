@@ -38,7 +38,7 @@ enum GapReplayOutcome {
     Complete { records: usize },
 }
 
-/// In-memory progress for one authenticated `/trades` pagination sweep.
+/// In-memory progress for one authenticated `/data/trades` pagination sweep.
 /// Retaining this value across a transient failure makes the retry request the
 /// exact failed page instead of starting again at the original `after`.
 #[derive(Debug, Clone)]
@@ -150,7 +150,7 @@ fn advance_gap_cursor(
     }
     if !seen.insert(next.clone()) {
         return Err(anyhow!(
-            "Gap-fetch /trades returned repeated cursor `{next}`"
+            "Gap-fetch /data/trades returned repeated cursor `{next}`"
         ));
     }
     *cursor = next;
@@ -285,7 +285,7 @@ impl GapReplayTransport {
         let slot = permit.slot();
         let generation = permit.generation();
         let client = permit.pooled_client();
-        let headers = shared.auth.sign_request("GET", "/trades", "");
+        let headers = shared.auth.sign_request("GET", "/data/trades", "");
         let mut request = client
             .client()
             .get(url)
@@ -1072,7 +1072,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
     //           which declares `taker_order_id: str` as required and
     //           returns `[self.taker_order_id]` from
     //           `get_filled_user_order_ids()` when trader_side==TAKER
-    //         * py-clob-client / wallet.rs's REST `/trades` parser
+    //         * py-clob-client / wallet.rs's REST `/data/trades` parser
     //           (shared schema between the WS and REST endpoints)
     //       The top-level `order_id` / `orderID` keys exist on some
     //       legacy/order-lifecycle payloads. They are handled separately so
@@ -1500,7 +1500,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
     }
 }
 
-/// Fetch trades newer than `after_secs` from the authenticated CLOB `/trades`
+/// Fetch trades newer than `after_secs` from the authenticated CLOB `/data/trades`
 /// endpoint and replay them through the update channel.
 async fn replay_missed_trades(
     shared: &SharedState,
@@ -1531,7 +1531,7 @@ async fn replay_missed_trades_inner(
     transport: &GapReplayTransport,
     recovery_generation: Option<u64>,
 ) -> Result<GapReplayOutcome> {
-    // Whole-wallet catch-up: L2 auth already restricts `/trades` to this
+    // Whole-wallet catch-up: L2 auth already restricts `/data/trades` to this
     // account, so we fetch ALL of the wallet's trades since `after` (no
     // `?market=` narrowing). This is multi-market correct — two instances
     // sharing one wallet both recover via the same sweep — and `upsert_trade`
@@ -1558,10 +1558,10 @@ async fn replay_missed_trades_inner(
     loop {
         let page_stage = crate::latency::TimedStage::new("polymarket.gap_replay.page_total");
         let url = if checkpoint.cursor.is_empty() {
-            format!("{}/trades?after={}", CLOB_BASE_URL, after_param)
+            format!("{}/data/trades?after={}", CLOB_BASE_URL, after_param)
         } else {
             format!(
-                "{}/trades?after={}&next_cursor={}",
+                "{}/data/trades?after={}&next_cursor={}",
                 CLOB_BASE_URL, after_param, checkpoint.cursor
             )
         };
@@ -1569,7 +1569,7 @@ async fn replay_missed_trades_inner(
             Ok(response) => response,
             Err(error) => {
                 return Err(anyhow!(
-                    "Gap-fetch /trades request failed after {} records: {}",
+                    "Gap-fetch /data/trades request failed after {} records: {}",
                     checkpoint.records,
                     error,
                 ));
@@ -1594,7 +1594,7 @@ async fn replay_missed_trades_inner(
                     let detail = format!("<response body read failed: {}>", failure);
                     transport.report_body_failure(permit, failure).await;
                     return Err(anyhow!(
-                        "Gap-fetch /trades HTTP {} after {} records: {}",
+                        "Gap-fetch /data/trades HTTP {} after {} records: {}",
                         code,
                         checkpoint.records,
                         detail,
@@ -1617,7 +1617,7 @@ async fn replay_missed_trades_inner(
                 continue;
             }
             return Err(anyhow!(
-                "Gap-fetch /trades HTTP {} after {} records: {}",
+                "Gap-fetch /data/trades HTTP {} after {} records: {}",
                 code,
                 checkpoint.records,
                 body,
@@ -1638,14 +1638,14 @@ async fn replay_missed_trades_inner(
                     let detail = failure.to_string();
                     transport.report_body_failure(permit, failure).await;
                     return Err(anyhow!(
-                        "Gap-fetch /trades parse failed after {} records: {}",
+                        "Gap-fetch /data/trades parse failed after {} records: {}",
                         checkpoint.records,
                         detail,
                     ));
                 }
                 permit.pooled_client().note_transport_success();
                 return Err(anyhow!(
-                    "Gap-fetch /trades parse failed after {} records: {}",
+                    "Gap-fetch /data/trades parse failed after {} records: {}",
                     checkpoint.records,
                     failure,
                 ));
@@ -1656,7 +1656,7 @@ async fn replay_missed_trades_inner(
         crate::latency::record("polymarket.gap_replay.json_decode", json_started);
         let json = json_result.map_err(|error| {
             anyhow!(
-                "Gap-fetch /trades JSON decode failed after {} records: {}",
+                "Gap-fetch /data/trades JSON decode failed after {} records: {}",
                 checkpoint.records,
                 error,
             )
@@ -1672,7 +1672,7 @@ async fn replay_missed_trades_inner(
         } else if let Some(object) = json.as_object() {
             let data = object.get("data").and_then(serde_json::Value::as_array).cloned()
                 .ok_or_else(|| anyhow!(
-                    "Gap-fetch /trades returned object without an array `data` field after {} records",
+                    "Gap-fetch /data/trades returned object without an array `data` field after {} records",
                     checkpoint.records,
                 ))?;
             let next = match object.get("next_cursor") {
@@ -1680,7 +1680,7 @@ async fn replay_missed_trades_inner(
                 Some(serde_json::Value::String(next)) => next.clone(),
                 Some(_) => {
                     return Err(anyhow!(
-                        "Gap-fetch /trades returned non-string `next_cursor` after {} records",
+                        "Gap-fetch /data/trades returned non-string `next_cursor` after {} records",
                         checkpoint.records,
                     ))
                 }
@@ -1688,7 +1688,7 @@ async fn replay_missed_trades_inner(
             (data, next)
         } else {
             return Err(anyhow!(
-                "Gap-fetch /trades returned neither an array nor a paginated object after {} records",
+                "Gap-fetch /data/trades returned neither an array nor a paginated object after {} records",
                 checkpoint.records,
             ));
         };
@@ -1714,7 +1714,7 @@ async fn replay_missed_trades_inner(
                 Err(error) => {
                     flag_invalid_private_event(&rec, shared, &error);
                     return Err(anyhow!(
-                        "Gap-fetch /trades rejected invalid record after {} records: {}",
+                        "Gap-fetch /data/trades rejected invalid record after {} records: {}",
                         checkpoint.records,
                         error,
                     ));

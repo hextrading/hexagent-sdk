@@ -55,6 +55,7 @@ impl ClobVersion {
 /// you need to point at a non-prod environment.
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
 
 #[derive(Debug, Clone)]
 struct FetchedOrder {
@@ -74,6 +75,17 @@ struct RuntimeMissingOrder {
     tracked: TrackedOrder,
     order_id: String,
     evidence: String,
+}
+
+/// Polymarket L2 HMAC signs the endpoint path only. Query parameters are sent
+/// on the wire but deliberately excluded from the signing payload, matching
+/// the official clients.
+fn canonical_l2_auth_path(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(endpoint, _)| endpoint)
+}
+
+fn terminal_trade_lookup_path(trade_id: &str) -> String {
+    format!("{}?id={}", AUTHENTICATED_TRADES_PATH, trade_id)
 }
 
 /// Normalize the terminal trade endpoint while preserving the distinction
@@ -1358,7 +1370,7 @@ pub(crate) struct WireOrderV2 {
 
 /// User-feed gap-replay tuning (sourced from `exchanges[polymarket]`). All
 /// values in milliseconds; the rewinds are quantised to whole seconds for the
-/// second-granular `/trades?after=` API. `Default` matches the historical
+/// second-granular `/data/trades?after=` API. `Default` matches the historical
 /// hard-coded behaviour (2s cadence, 5s rewinds).
 #[derive(Clone, Copy, Debug)]
 pub struct GapReplayConfig {
@@ -1426,7 +1438,7 @@ pub struct SharedState {
     pub signer_v2: Option<super::signer_v2::OrderSignerV2>,
     /// The address that actually owns the orders we place on-book — used
     /// to match incoming fills (WS maker-leg match + REST
-    /// `/trades?maker_address=` gap recovery). For POLY_1271 (v2 deposit
+    /// `/data/trades?maker_address=` gap recovery). For POLY_1271 (v2 deposit
     /// wallet) this is the funder/DW, which `with_funder` wrote into
     /// `signer_v2.maker_address`. `signer.maker_address` is the EOA
     /// (`derive_addresses` fixes POLY_1271 to the EOA), so matching fills
@@ -2367,8 +2379,8 @@ impl SharedState {
         let t_start = crate::latency::Instant::now();
         let url = format!("{}{}", self.clob_base_url, path);
         // L2 HMAC covers the endpoint path, not the query string. This also
-        // matches the existing `/trades?after=...` gap-replay request.
-        let auth_path = path.split('?').next().unwrap_or(path);
+        // matches the existing `/data/trades?after=...` gap-replay request.
+        let auth_path = canonical_l2_auth_path(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
         // Every authenticated account-owned order/reconcile request uses that
@@ -2457,11 +2469,12 @@ impl SharedState {
         let rec_kind = latency_record_kind(method.as_str(), path);
         let t_start = crate::latency::Instant::now();
         let url = format!("{}{}", self.clob_base_url, path);
+        let auth_path = canonical_l2_auth_path(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
         // Single request on the reserved connection.
         {
-            let headers = self.auth.sign_request(method.as_str(), path, body);
+            let headers = self.auth.sign_request(method.as_str(), auth_path, body);
             let method_a = method.clone();
             let path_a = path.to_string();
             let body_a = body.to_string();
@@ -5180,7 +5193,7 @@ impl PolymarketTrade {
         // Replay missing IDs through the same parser used by WS/gap recovery,
         // leaving PositionManager as the sole dedup/accounting authority.
         for trade_id in pending_trade_ids {
-            let path = format!("/trades?id={}", trade_id);
+            let path = terminal_trade_lookup_path(&trade_id);
             let reply = permit.map_or_else(
                 || self.shared.http_call_sync("GET", &path, ""),
                 |permit| {
@@ -7759,6 +7772,17 @@ mod tests {
         );
         assert_eq!(present.len(), 1);
         assert_eq!(present[0]["id"], trade_id);
+    }
+
+    #[test]
+    fn terminal_trade_lookup_uses_official_path_and_canonical_hmac_endpoint() {
+        let path = terminal_trade_lookup_path("trade-123");
+        assert_eq!(path, "/data/trades?id=trade-123");
+        assert_eq!(canonical_l2_auth_path(&path), "/data/trades");
+        assert_eq!(
+            canonical_l2_auth_path("/data/order/oid-123"),
+            "/data/order/oid-123"
+        );
     }
 
     #[test]

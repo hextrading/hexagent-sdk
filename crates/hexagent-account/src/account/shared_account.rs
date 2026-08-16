@@ -2172,6 +2172,16 @@ impl SharedAccount {
         if expected_payout <= EPS || cash_delta + tolerance < expected_payout {
             return false;
         }
+        // Polymarket can settle a redeem a few cents below its proven binary
+        // payout (for example, because the platform deducted a redeem fee).
+        // The physical side already contains the authoritative wallet delta,
+        // so cap virtual attribution at that amount and spread the shortfall
+        // pro rata across every winning token/owner. Positive excess cash is
+        // intentionally left unallocated, preserving the existing deposit
+        // safety boundary.
+        let attributed_payout = cash_delta.min(expected_payout);
+        let payout_scale = attributed_payout / expected_payout;
+        let residual_cash = cash_delta - expected_payout;
         for (token, qty, _) in &removed {
             let virtual_total: f64 = state
                 .instances
@@ -2203,7 +2213,7 @@ impl SharedAccount {
                 }
                 let burned = (owned * *qty / virtual_total).min(owned);
                 *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                let instance_cash_delta = burned * *value;
+                let instance_cash_delta = burned * *value * payout_scale;
                 instance.cash += instance_cash_delta;
                 attributed.push((
                     instance_id.clone(),
@@ -2225,11 +2235,13 @@ impl SharedAccount {
         recompute_reconciliation(&mut state, "platform automatic binary redeem");
         self.schedule_persist(&state);
         log::info!(
-            "[shared_account] attributed platform automatic redeem account={} payout={:.6} observed_cash_delta={:.6} residual_cash={:.6} conditions={:?} removed={:?}",
+            "[shared_account] attributed platform automatic redeem account={} payout={:.6} attributed_payout={:.6} payout_scale={:.9} observed_cash_delta={:.6} residual_cash={:+.6} conditions={:?} removed={:?}",
             self.account_id,
             expected_payout,
+            attributed_payout,
+            payout_scale,
             cash_delta,
-            (cash_delta - expected_payout).max(0.0),
+            residual_cash,
             conditions,
             removed,
         );
@@ -7409,6 +7421,13 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) -> bool {
     if expected_payout <= EPS || state.unallocated_cash + tolerance < expected_payout {
         return false;
     }
+    // Attribute no more than the observed wallet cash. A tolerated
+    // underpayment is spread over the proven winning payout instead of
+    // crediting the theoretical $1/token and immediately creating a negative
+    // reconciliation residual. Any overpayment remains unallocated.
+    let attributed_payout = state.unallocated_cash.min(expected_payout);
+    let payout_scale = attributed_payout / expected_payout;
+    let residual_cash = state.unallocated_cash - expected_payout;
     for (_, token, qty, _) in &removed {
         let virtual_total: f64 = state
             .instances
@@ -7442,7 +7461,7 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) -> bool {
             }
             let burned = (owned * *qty / virtual_total).min(owned);
             *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-            let cash_delta = burned * *value;
+            let cash_delta = burned * *value * payout_scale;
             instance.cash += cash_delta;
             attributed.push((instance_id.clone(), burned, cash_delta));
         }
@@ -7457,10 +7476,12 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState) -> bool {
         }
     }
     log::info!(
-        "[shared_account] inferred platform binary redeem: payout={:.6} observed_cash_delta={:.6} residual_cash={:.6} conditions={:?} removed={:?}",
+        "[shared_account] inferred platform binary redeem: payout={:.6} attributed_payout={:.6} payout_scale={:.9} observed_cash_delta={:.6} residual_cash={:+.6} conditions={:?} removed={:?}",
         expected_payout,
+        attributed_payout,
+        payout_scale,
         observed_cash_delta,
-        (observed_cash_delta - expected_payout).max(0.0),
+        residual_cash,
         conditions,
         removed,
     );
@@ -10293,6 +10314,77 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &HashMap::from([("ETH-UP".into(), 20.0)]),
             &HashSet::from(["BTC-WIN".into(), "ETH-UP".into()]),
         ));
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn runtime_platform_redeem_prorates_a_tolerated_underpayment() {
+        let account = SharedAccount::new("runtime-platform-redeem-underpayment");
+        account.register_instance("a", 1.0);
+        account.register_instance("b", 1.0);
+        account
+            .register_token_interest("a", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account
+            .register_token_interest("b", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("BTC-WIN".into(), 80.0), ("BTC-LOSE".into(), 80.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0),
+            ("BTC-LOSE".into(), 0.0),
+        ]));
+
+        assert!(account.observe_platform_binary_redeem(
+            179.95,
+            &HashMap::new(),
+            &HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+        ));
+
+        let metric = account.monitoring_snapshot();
+        assert!((metric.physical_cash - 179.95).abs() <= EPS);
+        assert!(metric.unallocated_cash.abs() <= EPS);
+        assert!(metric.physical_positions.values().all(|qty| qty.abs() <= EPS));
+        assert!((account.instance_snapshot("a").unwrap().cash - 89.975).abs() <= EPS);
+        assert!((account.instance_snapshot("b").unwrap().cash - 89.975).abs() <= EPS);
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn restart_platform_redeem_prorates_a_tolerated_underpayment() {
+        let account = SharedAccount::new("restart-platform-redeem-underpayment");
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("BTC-WIN".into(), 80.0), ("BTC-LOSE".into(), 80.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0),
+            ("BTC-LOSE".into(), 0.0),
+        ]));
+        account
+            .state
+            .lock()
+            .unwrap()
+            .startup_snapshot_applied_this_process = false;
+
+        account
+            .apply_physical_snapshot(179.95, HashMap::new())
+            .unwrap();
+
+        let metric = account.monitoring_snapshot();
+        assert!((metric.physical_cash - 179.95).abs() <= EPS);
+        assert!(metric.unallocated_cash.abs() <= EPS);
+        assert!((account.instance_snapshot("btc").unwrap().cash - 179.95).abs() <= EPS);
         assert!(!account.is_uncertain());
     }
 
