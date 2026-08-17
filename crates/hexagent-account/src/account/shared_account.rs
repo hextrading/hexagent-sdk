@@ -793,6 +793,7 @@ impl AccountPersistence {
                     .unwrap_or("writer")
             ))
             .spawn(move || {
+                hexagent_runtime::os_tune::pin_background("account-ledger-writer");
                 while rx.recv().is_ok() {
                     loop {
                         let Some(job) = thread_pending.lock().unwrap().take() else {

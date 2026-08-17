@@ -107,12 +107,17 @@ where
 /// Keeping these clocks separate lets an incident log distinguish:
 /// - no PONG: heartbeat response absent (diagnostic only);
 /// - PONG and raw frames, but no topic frame: subscription silence;
-/// - topic frames, but no BTC price: a single-symbol data gap.
+/// - topic frames, but no usable book: decode/state-application lag;
+/// - topic frames, but no BTC price: a single-symbol RTDS data gap.
 pub(crate) struct WsHealth {
     connected_at: Instant,
     last_pong: Option<Instant>,
     last_raw_frame: Option<Instant>,
     last_topic_frame: Option<Instant>,
+    /// Last order-book snapshot or two-sided L1 that downstream strategy
+    /// code could actually consume. This remains separate from the topic
+    /// clock because an unseeded delta still proves the subscription is live.
+    last_usable_book: Option<Instant>,
     last_btc_price: Option<Instant>,
 }
 
@@ -123,6 +128,7 @@ impl WsHealth {
             last_pong: None,
             last_raw_frame: None,
             last_topic_frame: None,
+            last_usable_book: None,
             last_btc_price: None,
         }
     }
@@ -139,12 +145,20 @@ impl WsHealth {
         self.last_topic_frame = Some(now);
     }
 
+    pub(crate) fn record_usable_book(&mut self, now: Instant) {
+        self.last_usable_book = Some(now);
+    }
+
     pub(crate) fn record_btc_price(&mut self, now: Instant) {
         self.last_btc_price = Some(now);
     }
 
     pub(crate) fn topic_is_stale(&self, now: Instant, threshold: Duration) -> bool {
         self.age(self.last_topic_frame, now) >= threshold
+    }
+
+    pub(crate) fn usable_book_is_stale(&self, now: Instant, threshold: Duration) -> bool {
+        self.age(self.last_usable_book, now) >= threshold
     }
 
     pub(crate) fn btc_price_is_stale(&self, now: Instant, threshold: Duration) -> bool {
@@ -157,6 +171,14 @@ impl WsHealth {
             self.age_label(self.last_pong, now),
             self.age_label(self.last_raw_frame, now),
             self.age_label(self.last_topic_frame, now),
+        )
+    }
+
+    pub(crate) fn clob_summary(&self, now: Instant) -> String {
+        format!(
+            "{} last_usable_book={}",
+            self.transport_summary(now),
+            self.age_label(self.last_usable_book, now),
         )
     }
 
@@ -368,6 +390,25 @@ mod tests {
         assert!(summary.contains("last_raw_frame=9.0s_ago"));
         assert!(summary.contains("last_topic_frame=7.0s_ago"));
         assert!(summary.contains("last_btc_price=6.0s_ago"));
+    }
+
+    #[test]
+    fn clob_health_keeps_raw_topic_and_usable_book_clocks_separate() {
+        let start = Instant::now();
+        let mut health = WsHealth::new(start);
+        health.record_raw_frame(start + Duration::from_secs(8));
+        health.record_topic_frame(start + Duration::from_secs(9));
+
+        let now = start + Duration::from_secs(10);
+        assert!(!health.topic_is_stale(now, Duration::from_secs(2)));
+        assert!(health.usable_book_is_stale(now, Duration::from_secs(2)));
+        assert!(health
+            .clob_summary(now)
+            .contains("last_usable_book=never(10.0s_since_connect)"));
+
+        health.record_usable_book(now);
+        assert!(!health.usable_book_is_stale(now, Duration::from_secs(2)));
+        assert!(health.clob_summary(now).contains("last_usable_book=0.0s_ago"));
     }
 
     /// A sink whose flush never completes must not be able to hold the task

@@ -185,7 +185,40 @@ fn startup_recovery_audits_complete(
 }
 
 fn startup_recovery_warn_attempt(attempt: usize, attempts: usize) -> bool {
-    attempt == 0 || attempt.saturating_add(1) == attempts
+    attempt.saturating_add(1) == attempts
+}
+
+const EXPECTED_ORPHAN_WARN_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// Claim one operator-visible warning slot for a repetitive, fail-closed
+/// orphan condition. The underlying retry/lock behavior is unchanged; only
+/// duplicate WARN emission is suppressed until the next interval.
+fn claim_rate_limited_warning(silent_until_ns: &std::sync::atomic::AtomicU64, now_ns: u64) -> bool {
+    loop {
+        let current = silent_until_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if now_ns < current {
+            return false;
+        }
+        let next = now_ns.saturating_add(EXPECTED_ORPHAN_WARN_INTERVAL_NS);
+        match silent_until_ns.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) if now_ns < observed => return false,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// A literal JSON null is Polymarket's eventual-consistency response for an
+/// order that is not visible on the queried replica. It remains unavailable
+/// evidence (and therefore keeps every lock/reservation), but is not itself an
+/// operator-actionable parse failure.
+fn fetch_unavailable_should_warn(kind: &FetchUnavailable) -> bool {
+    !kind.is_json_null()
 }
 
 impl FetchOrderResult {
@@ -1525,7 +1558,11 @@ pub struct SharedState {
     /// (account/instance route) and are emitted with every transition so the
     /// live log can be aggregated without a separate metrics dependency.
     pub(crate) http_425_circuit_entries_total: std::sync::atomic::AtomicU64,
+    pub(crate) startup_recovery_lookup_warn_silent_until_ns: std::sync::atomic::AtomicU64,
     pub(crate) get_live_delete_uncertain_total: std::sync::atomic::AtomicU64,
+    pub(crate) get_live_delete_uncertain_warn_silent_until_ns: std::sync::atomic::AtomicU64,
+    pub(crate) terminal_trade_backfill_missing_total: std::sync::atomic::AtomicU64,
+    pub(crate) terminal_trade_backfill_missing_warn_silent_until_ns: std::sync::atomic::AtomicU64,
     /// Per-coid cumulative count of the exact ambiguous DELETE response
     /// "order can't be found - already canceled or matched" returned by
     /// DELETEs issued from the cancel-orphan reconciler. The initial cancel
@@ -2285,10 +2322,18 @@ impl SharedState {
             .get_live_delete_uncertain_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1);
+        let now = crate::types::now_ns();
+        if claim_rate_limited_warning(&self.get_live_delete_uncertain_warn_silent_until_ns, now) {
         warn!(
-            "[orphan_metric] GET_LIVE_DELETE_UNCERTAIN=1 GET_LIVE_DELETE_UNCERTAIN_total={} coid={} orderID={} lock_release=forbidden",
+                "[orphan_metric] GET_LIVE_DELETE_UNCERTAIN=1 GET_LIVE_DELETE_UNCERTAIN_total={} coid={} orderID={} lock_release=forbidden warn_interval_s={}",
+                total, coid, order_id, EXPECTED_ORPHAN_WARN_INTERVAL_NS / 1_000_000_000,
+            );
+        } else {
+            debug!(
+                "[orphan_metric] GET_LIVE_DELETE_UNCERTAIN=1 GET_LIVE_DELETE_UNCERTAIN_total={} coid={} orderID={} lock_release=forbidden warning_suppressed=1",
             total, coid, order_id,
         );
+    }
     }
 
     /// Apply the bounded terminal policy for Polymarket's exact ambiguous
@@ -2809,7 +2854,14 @@ impl PolymarketTrade {
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
+                startup_recovery_lookup_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
+                get_live_delete_uncertain_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(
+                    0,
+                ),
+                terminal_trade_backfill_missing_total: std::sync::atomic::AtomicU64::new(0),
+                terminal_trade_backfill_missing_warn_silent_until_ns:
+                    std::sync::atomic::AtomicU64::new(0),
                 reconcile_cancel_not_found_counts: Mutex::new(HashMap::new()),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
@@ -3015,6 +3067,7 @@ impl PolymarketTrade {
             }
             let mut unavailable_count = 0usize;
             let mut unavailable_samples = Vec::new();
+            let mut json_null_count = 0usize;
             let pending: Vec<(String, String, OrderOwnership, bool)> = {
                 let coids = self.shared.account_state.pending_order_audit_ids();
                 let recovered: HashSet<String> = self
@@ -3211,9 +3264,13 @@ impl PolymarketTrade {
                         ));
                     }
                     FetchOrderResult::Unavailable(kind) => {
+                        if fetch_unavailable_should_warn(&kind) {
                         unavailable_count = unavailable_count.saturating_add(1);
                         if unavailable_samples.len() < 3 {
                             unavailable_samples.push(format!("{}:{:?}", coid, kind));
+                        }
+                        } else {
+                            json_null_count = json_null_count.saturating_add(1);
                         }
                         debug!(
                             "[PolymarketTrade] startup recovery coid={} orderID={} unavailable={:?} attempt={}/{} — retaining reservation",
@@ -3222,14 +3279,28 @@ impl PolymarketTrade {
                     }
                 }
             }
+            if json_null_count > 0 {
+                debug!(
+                    "[PolymarketTrade] startup recovery order lookup returned JSON null attempt={}/{} orders={} — eventual consistency; retaining reservations",
+                    attempt + 1,
+                    RETRY_DELAYS_MS.len(),
+                    json_null_count,
+                );
+            }
             if unavailable_count > 0 {
-                if startup_recovery_warn_attempt(attempt, RETRY_DELAYS_MS.len()) {
+                let should_warn = startup_recovery_warn_attempt(attempt, RETRY_DELAYS_MS.len())
+                    && claim_rate_limited_warning(
+                        &self.shared.startup_recovery_lookup_warn_silent_until_ns,
+                        crate::types::now_ns(),
+                    );
+                if should_warn {
                     warn!(
-                        "[PolymarketTrade] startup recovery lookup unavailable attempt={}/{} orders={} samples={:?} — retaining reservations",
+                        "[PolymarketTrade] startup recovery lookup unavailable attempt={}/{} orders={} samples={:?} — retaining reservations warn_interval_s={}",
                         attempt + 1,
                         RETRY_DELAYS_MS.len(),
                         unavailable_count,
                         unavailable_samples,
+                        EXPECTED_ORPHAN_WARN_INTERVAL_NS / 1_000_000_000,
                     );
                 } else {
                     debug!(
@@ -5059,10 +5130,17 @@ impl PolymarketTrade {
                             OrderStatus::CancelUncertain
                         }
                         FetchOrderResult::Unavailable(kind) => {
+                            if fetch_unavailable_should_warn(kind) {
                             warn!(
                                 "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=unavailable kind={:?} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
                                 coid, order_id, kind, attempts, pending_delayed, backoff_ms,
                             );
+                            } else {
+                                debug!(
+                                    "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=json_null attempt={} pending_delayed={} retry_ms={} — eventual consistency; keeping orphan and worst-case reservation",
+                                    coid, order_id, attempts, pending_delayed, backoff_ms,
+                                );
+                            }
                             OrderStatus::CancelOrderTimeout
                         }
                         FetchOrderResult::Found(_) => unreachable!(
@@ -5213,10 +5291,29 @@ impl PolymarketTrade {
             };
             let records = terminal_trade_records(json, &trade_id);
             if records.is_empty() {
+                let total = self
+                    .shared
+                    .terminal_trade_backfill_missing_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1);
+                if claim_rate_limited_warning(
+                    &self
+                        .shared
+                        .terminal_trade_backfill_missing_warn_silent_until_ns,
+                    crate::types::now_ns(),
+                ) {
                 warn!(
-                    "[orphan_metric] terminal_trade_backfill_missing=1 trade_id={} lock_release=forbidden",
+                        "[orphan_metric] terminal_trade_backfill_missing=1 terminal_trade_backfill_missing_total={} trade_id={} lock_release=forbidden warn_interval_s={}",
+                        total,
                     trade_id,
+                        EXPECTED_ORPHAN_WARN_INTERVAL_NS / 1_000_000_000,
+                    );
+                } else {
+                    debug!(
+                        "[orphan_metric] terminal_trade_backfill_missing=1 terminal_trade_backfill_missing_total={} trade_id={} lock_release=forbidden warning_suppressed=1",
+                        total, trade_id,
                 );
+                }
                 continue;
             }
             let record_count = records.len();
@@ -7696,13 +7793,32 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_warns_only_at_retry_boundaries() {
+    fn startup_recovery_warns_only_after_the_final_retry() {
         let attempts = 6;
-        assert!(startup_recovery_warn_attempt(0, attempts));
-        for attempt in 1..attempts - 1 {
+        for attempt in 0..attempts - 1 {
             assert!(!startup_recovery_warn_attempt(attempt, attempts));
         }
         assert!(startup_recovery_warn_attempt(attempts - 1, attempts));
+    }
+
+    #[test]
+    fn expected_json_null_remains_fail_closed_without_operator_warning() {
+        let json_null = FetchUnavailable::InvalidResponse("null".to_string());
+        let malformed = FetchUnavailable::InvalidResponse("{}".to_string());
+        assert!(!fetch_unavailable_should_warn(&json_null));
+        assert!(fetch_unavailable_should_warn(&malformed));
+        assert!(fetch_unavailable_should_warn(&FetchUnavailable::Timeout));
+    }
+
+    #[test]
+    fn repetitive_orphan_warning_window_is_atomic_and_reopens() {
+        let silent_until = std::sync::atomic::AtomicU64::new(0);
+        assert!(claim_rate_limited_warning(&silent_until, 100));
+        assert!(!claim_rate_limited_warning(&silent_until, 101));
+        assert!(claim_rate_limited_warning(
+            &silent_until,
+            100 + EXPECTED_ORPHAN_WARN_INTERVAL_NS,
+        ));
     }
 
     #[test]
