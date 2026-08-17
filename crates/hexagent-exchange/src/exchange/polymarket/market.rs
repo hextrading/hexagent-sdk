@@ -1482,6 +1482,33 @@ struct TcpSocketMetrics {
     so_rcvbuf: Option<i32>,
 }
 
+// Linux keeps `struct tcp_info` ABI-compatible by appending fields, but the
+// Rust `libc::tcp_info` definition can lag behind the running kernel. In
+// particular, libc 0.2.186's glibc definition ends at `tcpi_total_retrans`,
+// while newer kernels append `tcpi_rcv_wnd` at byte 232. Request the stable
+// UAPI prefix as bytes so compiling this crate does not depend on which fields
+// the consumer's Cargo.lock happens to expose.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_PREFIX_LEN: usize = 236;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_RCV_WSCALE_OFFSET: usize = 6;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET: usize = 64;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_RCV_SPACE_OFFSET: usize = 96;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_RCV_WND_OFFSET: usize = 232;
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_tcp_info_u32(info: &[u8], returned_len: usize, offset: usize) -> Option<u32> {
+    let end = offset.checked_add(std::mem::size_of::<u32>())?;
+    if end > returned_len {
+        return None;
+    }
+    let bytes: [u8; 4] = info.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(bytes))
+}
+
 #[cfg(unix)]
 fn clob_socket_fd(
     stream: &tokio_tungstenite::WebSocketStream<
@@ -1526,29 +1553,27 @@ fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
     }
     #[cfg(target_os = "linux")]
     unsafe {
-        let mut info: libc::tcp_info = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let mut info = [0_u8; LINUX_TCP_INFO_PREFIX_LEN];
+        let mut len = info.len() as libc::socklen_t;
         if libc::getsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_INFO,
-            (&mut info as *mut libc::tcp_info).cast(),
+            info.as_mut_ptr().cast(),
             &mut len,
         ) == 0
         {
-            metrics.rcv_space = Some(info.tcpi_rcv_space);
-            // libc exposes the recent tcpi_rcv_wnd extension on glibc;
-            // musl's portable tcp_info currently stops at tcpi_snd_wnd.
-            #[cfg(target_env = "gnu")]
-            {
-                let rcv_wnd_end = std::mem::offset_of!(libc::tcp_info, tcpi_rcv_wnd)
-                    + std::mem::size_of::<u32>();
-                if (len as usize) >= rcv_wnd_end {
-                    metrics.rcv_wnd = Some(info.tcpi_rcv_wnd);
-                }
-            }
-            metrics.rcv_ssthresh = Some(info.tcpi_rcv_ssthresh);
-            metrics.rcv_wscale = Some((info.tcpi_snd_rcv_wscale >> 4) & 0x0f);
+            let returned_len = len as usize;
+            metrics.rcv_space =
+                linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_RCV_SPACE_OFFSET);
+            metrics.rcv_wnd =
+                linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_RCV_WND_OFFSET);
+            metrics.rcv_ssthresh =
+                linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET);
+            metrics.rcv_wscale = info
+                .get(LINUX_TCP_INFO_RCV_WSCALE_OFFSET)
+                .filter(|_| returned_len > LINUX_TCP_INFO_RCV_WSCALE_OFFSET)
+                .map(|scales| (scales >> 4) & 0x0f);
         }
     }
     metrics
@@ -3741,6 +3766,57 @@ impl ExchangeMarket for PolymarketMarket {
 #[cfg(test)]
 mod pick_current_event_tests {
     use super::*;
+
+    #[test]
+    fn linux_tcp_info_tail_is_parsed_without_libc_field_support() {
+        let mut info = [0_u8; LINUX_TCP_INFO_PREFIX_LEN];
+        let rcv_space = 256_000_u32;
+        let rcv_wnd = 128_000_u32;
+        let rcv_ssthresh = 512_000_u32;
+        info[LINUX_TCP_INFO_RCV_WSCALE_OFFSET] = 7 << 4;
+        info[LINUX_TCP_INFO_RCV_SPACE_OFFSET..LINUX_TCP_INFO_RCV_SPACE_OFFSET + 4]
+            .copy_from_slice(&rcv_space.to_ne_bytes());
+        info[LINUX_TCP_INFO_RCV_WND_OFFSET..LINUX_TCP_INFO_RCV_WND_OFFSET + 4]
+            .copy_from_slice(&rcv_wnd.to_ne_bytes());
+        info[LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET..LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET + 4]
+            .copy_from_slice(&rcv_ssthresh.to_ne_bytes());
+
+        assert_eq!((info[LINUX_TCP_INFO_RCV_WSCALE_OFFSET] >> 4) & 0x0f, 7);
+        assert_eq!(
+            linux_tcp_info_u32(
+                &info,
+                LINUX_TCP_INFO_PREFIX_LEN,
+                LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET,
+            ),
+            Some(rcv_ssthresh)
+        );
+
+        assert_eq!(
+            linux_tcp_info_u32(
+                &info,
+                LINUX_TCP_INFO_PREFIX_LEN,
+                LINUX_TCP_INFO_RCV_SPACE_OFFSET,
+            ),
+            Some(rcv_space)
+        );
+        assert_eq!(
+            linux_tcp_info_u32(
+                &info,
+                LINUX_TCP_INFO_PREFIX_LEN,
+                LINUX_TCP_INFO_RCV_WND_OFFSET,
+            ),
+            Some(rcv_wnd)
+        );
+        assert_eq!(
+            linux_tcp_info_u32(
+                &info,
+                LINUX_TCP_INFO_RCV_WND_OFFSET,
+                LINUX_TCP_INFO_RCV_WND_OFFSET,
+            ),
+            None,
+            "an older kernel's shorter TCP_INFO must leave rcv_wnd unavailable"
+        );
+    }
 
     /// Build a minimal event whose open time comes from the slug's trailing
     /// timestamp (`btc-updown-5m-<start_secs>`) and whose `end_date` is the
