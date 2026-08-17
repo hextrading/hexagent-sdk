@@ -4,7 +4,7 @@ use log::{info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::str::FromStr;
@@ -127,6 +127,10 @@ const CLOB_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 /// Dirty non-BBO L2 changes are collapsed into at most four full snapshots
 /// per second per token. BBO changes still publish immediately.
 const CLOB_BOOK_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
+/// Polymarket may split one logical price update across several WebSocket
+/// frames carrying the same exchange timestamp.  Give those sibling frames a
+/// small quiet window before declaring their advertised BBO irreconcilable.
+const CLOB_BBO_SETTLE_INTERVAL: Duration = Duration::from_millis(3);
 const CLOB_BURST_METRIC_INTERVAL: Duration = Duration::from_secs(1);
 const CLOB_DIAGNOSTIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
@@ -905,6 +909,7 @@ struct CanonicalEventSpec {
     condition_id: String,
     up_token: String,
     down_token: String,
+    tick_size: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -920,6 +925,9 @@ struct SymbolState {
     _outcome: String,
     // Which condition (market) within the event this token belongs to
     _condition_id: String,
+    // Current tick learned from Gamma. Mid-event narrowing is applied from
+    // the public tick_size_change stream inside ClobLocalBooks.
+    _tick_size: f64,
 }
 
 /// A single event (market) within a series — rotates every interval.
@@ -1037,6 +1045,11 @@ pub struct PolymarketMarket {
     rtds_tx: Option<crossbeam_channel::Sender<MarketEvent>>,
     /// Shared shutdown flag for RTDS task.
     rtds_shutdown: Arc<AtomicBool>,
+    /// A rotation wave may complete one series a few milliseconds before its
+    /// siblings. Keep the subscription refresh pending until every currently
+    /// expired series has finished its in-flight lookup, then send one exact
+    /// full-state subscription instead of reconnecting once per series.
+    clob_resubscribe_pending: bool,
 }
 
 impl PolymarketMarket {
@@ -1052,6 +1065,7 @@ impl PolymarketMarket {
             rtds_subscriptions: Vec::new(),
             rtds_tx: None,
             rtds_shutdown: Arc::new(AtomicBool::new(false)),
+            clob_resubscribe_pending: false,
         }
     }
 
@@ -1081,11 +1095,14 @@ impl PolymarketMarket {
 
     fn current_clob_subscription(&self) -> ClobSubscription {
         let tokens = self.current_tokens();
-        let mut by_condition: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        let mut by_condition: HashMap<String, (Option<String>, Option<String>, f64)> =
+            HashMap::new();
         for symbol in self.series.iter().flat_map(|series| &series.market.symbols) {
-            let entry = by_condition
-                .entry(symbol._condition_id.clone())
-                .or_insert((None, None));
+            let entry = by_condition.entry(symbol._condition_id.clone()).or_insert((
+                None,
+                None,
+                symbol._tick_size,
+            ));
             match symbol._outcome.trim().to_ascii_lowercase().as_str() {
                 "up" | "yes" => entry.0 = Some(symbol.token_id.clone()),
                 "down" | "no" => entry.1 = Some(symbol.token_id.clone()),
@@ -1094,11 +1111,12 @@ impl PolymarketMarket {
         }
         let mut canonical_events: Vec<_> = by_condition
             .into_iter()
-            .filter_map(|(condition_id, (up_token, down_token))| {
+            .filter_map(|(condition_id, (up_token, down_token, tick_size))| {
                 Some(CanonicalEventSpec {
                     condition_id,
                     up_token: up_token?,
                     down_token: down_token?,
+                    tick_size,
                 })
             })
             .collect();
@@ -1206,6 +1224,7 @@ impl PolymarketMarket {
                                     token_id: token_id.clone(),
                                     _outcome: outcome,
                                     _condition_id: condition.condition_id.clone(),
+                                    _tick_size: condition.tick_size,
                                 });
                             }
                         }
@@ -1300,8 +1319,15 @@ impl PolymarketMarket {
         // Resubscribe the async WS task with the updated token list if any
         // series rotated. The task will close + reconnect so the server's
         // subscription reflects the new set.
-        if rotated {
+        self.clob_resubscribe_pending |= rotated;
+        let rotation_wave_in_flight = self.series.iter().any(|series| {
+            series.interval_minutes == -1
+                && now >= series.market.end_ns
+                && series.rotation_refresh.is_some()
+        });
+        if self.clob_resubscribe_pending && !rotation_wave_in_flight {
             self.resubscribe_ws();
+            self.clob_resubscribe_pending = false;
         }
 
         Ok(())
@@ -1348,7 +1374,9 @@ struct ClobWireCounters {
     price_change_entries: u64,
     level_upserts: u64,
     level_deletes: u64,
+    bbo_transient_recoveries: u64,
     bbo_mismatches: u64,
+    bbo_repair_requests: u64,
     unseeded_deltas: u64,
     ignored: u64,
     unknown: u64,
@@ -1369,7 +1397,13 @@ impl ClobWireCounters {
             .saturating_add(rhs.price_change_entries);
         self.level_upserts = self.level_upserts.saturating_add(rhs.level_upserts);
         self.level_deletes = self.level_deletes.saturating_add(rhs.level_deletes);
+        self.bbo_transient_recoveries = self
+            .bbo_transient_recoveries
+            .saturating_add(rhs.bbo_transient_recoveries);
         self.bbo_mismatches = self.bbo_mismatches.saturating_add(rhs.bbo_mismatches);
+        self.bbo_repair_requests = self
+            .bbo_repair_requests
+            .saturating_add(rhs.bbo_repair_requests);
         self.unseeded_deltas = self.unseeded_deltas.saturating_add(rhs.unseeded_deltas);
         self.ignored = self.ignored.saturating_add(rhs.ignored);
         self.unknown = self.unknown.saturating_add(rhs.unknown);
@@ -1461,6 +1495,18 @@ impl ClobWindowMetrics {
         self.record_events(events);
     }
 
+    fn record_deferred(&mut self, batch: &ClobDeferredBatch) {
+        self.wire.add(batch.wire);
+        self.bbo_change_snapshots = self.bbo_change_snapshots.saturating_add(
+            batch
+                .events
+                .iter()
+                .filter(|event| matches!(event, MarketEvent::OrderBook(_)))
+                .count() as u64,
+        );
+        self.record_events(&batch.events);
+    }
+
     fn record_ws_send(&mut self, elapsed: Duration, failed: bool) {
         self.ws_sends = self.ws_sends.saturating_add(1);
         self.ws_send_errors = self.ws_send_errors.saturating_add(u64::from(failed));
@@ -1478,7 +1524,7 @@ impl ClobWindowMetrics {
             .saturating_duration_since(self.window_started_at)
             .as_secs_f64();
         info!(
-            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_mismatches={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
             window_secs,
             self.data_frames,
             self.frame_bytes,
@@ -1504,7 +1550,9 @@ impl ClobWindowMetrics {
             self.wire.price_change_entries,
             self.wire.level_upserts,
             self.wire.level_deletes,
+            self.wire.bbo_transient_recoveries,
             self.wire.bbo_mismatches,
+            self.wire.bbo_repair_requests,
             self.wire.unseeded_deltas,
             self.wire.ignored,
             self.wire.unknown,
@@ -1854,6 +1902,61 @@ fn forward_clob_events(
     true
 }
 
+struct ClobBookRepairResult {
+    token: String,
+    result: std::result::Result<BookFields, String>,
+}
+
+async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookFields, String> {
+    let base = std::env::var("POLYMARKET_V2_API_URL")
+        .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+    let url = format!("{}/book", base.trim_end_matches('/'));
+    let response = gamma_http_client()
+        .get(url)
+        .query(&[("token_id", token)])
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("read response failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} body={}",
+            status,
+            text.chars().take(300).collect::<String>(),
+        ));
+    }
+    let book: BookFields =
+        serde_json::from_str(&text).map_err(|error| format!("invalid book response: {error}"))?;
+    if book.asset_id != token {
+        return Err(format!(
+            "token mismatch requested={} returned={}",
+            token, book.asset_id,
+        ));
+    }
+    Ok(book)
+}
+
+fn request_clob_book_repairs(
+    tokens: Vec<String>,
+    in_flight: &mut HashSet<String>,
+    tx: &tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
+) {
+    for token in tokens {
+        if !in_flight.insert(token.clone()) {
+            continue;
+        }
+        let tx = tx.clone();
+        crate::async_rt::clob_handle().spawn(async move {
+            let result = fetch_authoritative_clob_book(&token).await;
+            let _ = tx.send(ClobBookRepairResult { token, result });
+        });
+    }
+}
+
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
     event_tx: crossbeam_channel::Sender<MarketEvent>,
@@ -1954,6 +2057,9 @@ async fn clob_ws_task(
         let mut diagnostics = ClobWindowMetrics::new(connected_at);
         let mut burst_metrics = ClobBurstMetrics::new(connected_at);
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
+        let (repair_tx, mut repair_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
+        let mut repairs_in_flight = HashSet::new();
 
         // Align with the official CLOB SDK: lowercase channel `"market"`
         // (the user channel already uses lowercase `"user"`; the server is
@@ -2010,6 +2116,12 @@ async fn clob_ws_task(
         scheduler_probe.tick().await;
 
         loop {
+            let deferred_deadline = books
+                .next_deferred_deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            let deferred_sleep =
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deferred_deadline));
+            tokio::pin!(deferred_sleep);
             tokio::select! {
                 biased;
 
@@ -2032,6 +2144,99 @@ async fn clob_ws_task(
                             continue 'outer;
                         }
                         Some(WsCtrl::Shutdown) | None => break 'outer,
+                    }
+                }
+
+                _ = &mut deferred_sleep => {
+                    let now = Instant::now();
+                    let batch = books.flush_deferred_due(now, now_ns());
+                    diagnostics.record_deferred(&batch);
+                    for diagnostic in batch.diagnostics {
+                        diagnostic_sampler.observe(now, diagnostic);
+                    }
+                    if !batch.repair_tokens.is_empty() {
+                        announce_clob_not_ready(
+                            &event_tx,
+                            &mut lifecycle,
+                            "persistent BBO mismatch; authoritative repair pending",
+                        );
+                    }
+                    request_clob_book_repairs(
+                        batch.repair_tokens,
+                        &mut repairs_in_flight,
+                        &repair_tx,
+                    );
+                    if !forward_clob_events(
+                        batch.events,
+                        &event_tx,
+                        &mut lifecycle,
+                        &mut health,
+                        &mut diagnostics,
+                        &books,
+                        &subscription.tokens,
+                        now,
+                    ) {
+                        break 'outer;
+                    }
+                }
+
+                repair = repair_rx.recv(), if !repairs_in_flight.is_empty() => {
+                    let Some(repair) = repair else {
+                        continue;
+                    };
+                    repairs_in_flight.remove(&repair.token);
+                    if !books.quarantined_tokens.contains(&repair.token) {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    match repair.result {
+                        Ok(fields) => match books.apply_book(fields, now, now_ns()) {
+                            Ok(event) => {
+                                info!(
+                                    "[Polymarket] authoritative BBO repair completed token={}",
+                                    repair.token,
+                                );
+                                if let Some(event) = event {
+                                    diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                    if !forward_clob_events(
+                                        vec![event],
+                                        &event_tx,
+                                        &mut lifecycle,
+                                        &mut health,
+                                        &mut diagnostics,
+                                        &books,
+                                        &subscription.tokens,
+                                        now,
+                                    ) {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                diagnostic_sampler.observe(now, ClobDiagnostic {
+                                    key: "bbo_repair_failed".to_string(),
+                                    detail: format!("token={} reason={error}", repair.token),
+                                });
+                                announce_clob_not_ready(
+                                    &event_tx,
+                                    &mut lifecycle,
+                                    format!("authoritative BBO repair rejected: {error}"),
+                                );
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            diagnostic_sampler.observe(now, ClobDiagnostic {
+                                key: "bbo_repair_failed".to_string(),
+                                detail: format!("token={} reason={error}", repair.token),
+                            });
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                format!("authoritative BBO repair failed: {error}"),
+                            );
+                            break;
+                        }
                     }
                 }
 
@@ -2242,6 +2447,18 @@ async fn clob_ws_task(
                             for diagnostic in batch.diagnostics {
                                 diagnostic_sampler.observe(received_at, diagnostic);
                             }
+                            if !batch.repair_tokens.is_empty() {
+                                announce_clob_not_ready(
+                                    &event_tx,
+                                    &mut lifecycle,
+                                    "persistent BBO mismatch; authoritative repair pending",
+                                );
+                            }
+                            request_clob_book_repairs(
+                                batch.repair_tokens,
+                                &mut repairs_in_flight,
+                                &repair_tx,
+                            );
                             if !forward_clob_events(
                                 batch.events,
                                 &event_tx,
@@ -2709,12 +2926,54 @@ struct PriceChangeFields {
     timestamp: Option<serde_json::Value>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ReportedBbo {
     /// Outer Option means the field was present; inner Option is the
     /// tradeable price after mapping terminal 0/1 sentinels to no level.
     bid: Option<Option<Decimal>>,
     ask: Option<Option<Decimal>>,
+}
+
+impl ReportedBbo {
+    fn merge(&mut self, newer: Self) {
+        if newer.bid.is_some() {
+            self.bid = newer.bid;
+        }
+        if newer.ask.is_some() {
+            self.ask = newer.ask;
+        }
+    }
+
+    fn matches(&self, actual: (Option<Decimal>, Option<Decimal>)) -> bool {
+        self.bid.is_none_or(|expected| expected == actual.0)
+            && self.ask.is_none_or(|expected| expected == actual.1)
+    }
+}
+
+#[derive(Debug)]
+struct PendingBboCheck {
+    exchange_timestamp_ns: u64,
+    expected: ReportedBbo,
+    last_update_at: Instant,
+    saw_mismatch: bool,
+    /// An off-grid price is evidence that a narrowing tick_size_change is in
+    /// the same logical market batch but may be delivered in a sibling frame.
+    /// Keep publication behind the tick event for the same quiet window.
+    awaiting_tick_change: bool,
+}
+
+#[derive(Debug)]
+struct PendingQuote {
+    quote: QuoteTick,
+    received_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ClobDeferredBatch {
+    events: Vec<MarketEvent>,
+    wire: ClobWireCounters,
+    diagnostics: Vec<ClobDiagnostic>,
+    repair_tokens: Vec<String>,
 }
 
 fn normalize_reported_bbo(price: Decimal) -> Option<Decimal> {
@@ -2801,6 +3060,7 @@ struct ClobParsedBatch {
     recognized_topic: bool,
     bbo_change_snapshots: usize,
     diagnostics: Vec<ClobDiagnostic>,
+    repair_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2894,9 +3154,14 @@ impl ClobLocalBook {
 struct ClobLocalBooks {
     token_books: HashMap<String, ClobLocalBook>,
     roles: HashMap<String, ClobCanonicalRole>,
+    current_ticks: HashMap<String, Decimal>,
+    tick_versions: HashMap<String, u64>,
     canonical_versions: HashMap<String, ClobBookVersion>,
     canonical_books: HashMap<String, OrderBookSnapshot>,
     quote_versions: HashMap<String, ClobBookVersion>,
+    pending_bbo: HashMap<String, PendingBboCheck>,
+    pending_quotes: HashMap<String, PendingQuote>,
+    quarantined_tokens: HashSet<String>,
     wire_sequence: u64,
 }
 
@@ -2904,6 +3169,9 @@ impl ClobLocalBooks {
     fn new(specs: &[CanonicalEventSpec]) -> Self {
         let mut state = Self::default();
         for spec in specs {
+            if let Ok(tick) = Decimal::from_str(&spec.tick_size.to_string()) {
+                state.current_ticks.insert(spec.condition_id.clone(), tick);
+            }
             state.roles.insert(
                 spec.up_token.clone(),
                 ClobCanonicalRole {
@@ -2924,6 +3192,28 @@ impl ClobLocalBooks {
         state
     }
 
+    fn market_key(&self, token: &str) -> String {
+        self.roles
+            .get(token)
+            .map(|role| role.condition_id.clone())
+            .unwrap_or_else(|| token.to_string())
+    }
+
+    fn price_is_on_current_tick(&self, token: &str, price: Decimal) -> bool {
+        let key = self.market_key(token);
+        self.current_ticks
+            .get(&key)
+            .filter(|tick| **tick > Decimal::ZERO)
+            .map_or(true, |tick| price % *tick == Decimal::ZERO)
+    }
+
+    fn market_is_quarantined(&self, token: &str) -> bool {
+        let key = self.market_key(token);
+        self.quarantined_tokens
+            .iter()
+            .any(|candidate| candidate == token || self.market_key(candidate) == key)
+    }
+
     fn next_sequence(&mut self) -> u64 {
         self.wire_sequence = self.wire_sequence.saturating_add(1);
         self.wire_sequence
@@ -2931,12 +3221,16 @@ impl ClobLocalBooks {
 
     fn has_all_seeded(&self, tokens: &[String]) -> bool {
         !tokens.is_empty()
+            && self.quarantined_tokens.is_empty()
             && tokens
                 .iter()
                 .all(|token| self.token_books.contains_key(token))
     }
 
     fn canonicalize_token(&mut self, token: &str, local_now: u64) -> Option<MarketEvent> {
+        if self.pending_bbo.contains_key(token) || self.market_is_quarantined(token) {
+            return None;
+        }
         let book = self.token_books.get(token)?;
         if !book.is_semantically_valid() {
             return None;
@@ -2976,8 +3270,11 @@ impl ClobLocalBooks {
             .map(MarketEvent::OrderBook)
     }
 
-    fn canonicalize_quote(&mut self, mut quote: QuoteTick) -> Option<MarketEvent> {
+    fn canonicalize_quote_ready(&mut self, mut quote: QuoteTick) -> Option<MarketEvent> {
         let sequence = self.next_sequence();
+        if self.market_is_quarantined(&quote.symbol) {
+            return None;
+        }
         let Some(role) = self.roles.get(&quote.symbol).cloned() else {
             return Some(MarketEvent::Quote(quote));
         };
@@ -3001,6 +3298,30 @@ impl ClobLocalBooks {
         quote.symbol = role.up_token;
         self.quote_versions.insert(role.condition_id, version);
         Some(MarketEvent::Quote(quote))
+    }
+
+    fn canonicalize_quote(
+        &mut self,
+        quote: QuoteTick,
+        received_at: Instant,
+    ) -> Option<MarketEvent> {
+        let prices_on_tick = [quote.bid_price, quote.ask_price].into_iter().all(|price| {
+            Decimal::from_str(&price.to_string())
+                .ok()
+                .is_some_and(|price| self.price_is_on_current_tick(&quote.symbol, price))
+        });
+        if !prices_on_tick {
+            let key = self.market_key(&quote.symbol);
+            let replace = self.pending_quotes.get(&key).map_or(true, |pending| {
+                quote.exchange_timestamp_ns >= pending.quote.exchange_timestamp_ns
+            });
+            if replace {
+                self.pending_quotes
+                    .insert(key, PendingQuote { quote, received_at });
+            }
+            return None;
+        }
+        self.canonicalize_quote_ready(quote)
     }
 
     fn apply_book(
@@ -3051,6 +3372,10 @@ impl ClobLocalBooks {
         if !book.is_semantically_valid() {
             return Err(format!("crossed book token={symbol}"));
         }
+        // A full book is authoritative for this token and ends any deferred
+        // validation/quarantine created by an incomplete price-change batch.
+        self.pending_bbo.remove(&symbol);
+        self.quarantined_tokens.remove(&symbol);
         self.token_books.insert(symbol.clone(), book);
         let _ = received_at;
         // An initial snapshot for the complementary token can be older than
@@ -3062,6 +3387,216 @@ impl ClobLocalBooks {
             .or_else(|| self.canonical_snapshot_for_token(&symbol)))
     }
 
+    fn finalize_pending_bbo(
+        &mut self,
+        token: &str,
+        local_now: u64,
+        counters: &mut ClobWireCounters,
+        diagnostics: &mut Vec<ClobDiagnostic>,
+    ) -> (Option<MarketEvent>, Option<String>) {
+        let Some(pending) = self.pending_bbo.remove(token) else {
+            return (None, None);
+        };
+        let actual = self
+            .token_books
+            .get(token)
+            .map(ClobLocalBook::top)
+            .unwrap_or_default();
+        if pending.expected.matches(actual) {
+            if pending.saw_mismatch {
+                counters.bbo_transient_recoveries =
+                    counters.bbo_transient_recoveries.saturating_add(1);
+            }
+            if pending.awaiting_tick_change {
+                diagnostics.push(ClobDiagnostic {
+                    key: "tick_size_change_lag".to_string(),
+                    detail: format!(
+                        "token={token} ts={} publication_released_after={}ms",
+                        pending.exchange_timestamp_ns,
+                        CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+                    ),
+                });
+            }
+            if let Some(book) = self.token_books.get_mut(token) {
+                book.dirty_since = None;
+            }
+            return (self.canonicalize_token(token, local_now), None);
+        }
+
+        counters.bbo_mismatches = counters.bbo_mismatches.saturating_add(1);
+        counters.bbo_repair_requests = counters.bbo_repair_requests.saturating_add(1);
+        diagnostics.push(ClobDiagnostic {
+            key: "price_change_bbo_mismatch".to_string(),
+            detail: format!(
+                "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={}",
+                pending.exchange_timestamp_ns,
+                pending.expected.bid,
+                pending.expected.ask,
+                actual.0,
+                actual.1,
+                CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+            ),
+        });
+        self.quarantined_tokens.insert(token.to_string());
+        (None, Some(token.to_string()))
+    }
+
+    fn resolve_pending_if_ready(&mut self, token: &str, counters: &mut ClobWireCounters) -> bool {
+        let Some(pending) = self.pending_bbo.get(token) else {
+            return false;
+        };
+        let actual = self
+            .token_books
+            .get(token)
+            .map(ClobLocalBook::top)
+            .unwrap_or_default();
+        if pending.awaiting_tick_change || !pending.expected.matches(actual) {
+            return false;
+        }
+        let pending = self
+            .pending_bbo
+            .remove(token)
+            .expect("pending BBO checked above");
+        if pending.saw_mismatch {
+            counters.bbo_transient_recoveries = counters.bbo_transient_recoveries.saturating_add(1);
+        }
+        true
+    }
+
+    fn apply_tick_size_change(
+        &mut self,
+        change: &TickSizeChange,
+        local_now: u64,
+        counters: &mut ClobWireCounters,
+    ) -> Vec<MarketEvent> {
+        let Ok(new_tick) = Decimal::from_str(&change.new_tick_size.to_string()) else {
+            return Vec::new();
+        };
+        let Ok(old_tick) = Decimal::from_str(&change.old_tick_size.to_string()) else {
+            return Vec::new();
+        };
+        let key = self.market_key(&change.symbol);
+        if self
+            .tick_versions
+            .get(&key)
+            .is_some_and(|timestamp| *timestamp > change.exchange_timestamp_ns)
+        {
+            return Vec::new();
+        }
+        if let Some(current_tick) = self.current_ticks.get(&key) {
+            let duplicate = *current_tick == new_tick;
+            if (!duplicate && *current_tick != old_tick) || new_tick > *current_tick {
+                return Vec::new();
+            }
+        }
+        self.current_ticks.insert(key.clone(), new_tick);
+        self.tick_versions
+            .insert(key.clone(), change.exchange_timestamp_ns);
+
+        let mut release_tokens: Vec<_> = self
+            .pending_bbo
+            .keys()
+            .filter(|token| self.market_key(token) == key)
+            .cloned()
+            .collect();
+        release_tokens.sort();
+        let mut events = Vec::new();
+        for token in release_tokens {
+            let all_levels_on_new_tick = self.token_books.get(&token).is_none_or(|book| {
+                book.bids
+                    .keys()
+                    .chain(book.asks.keys())
+                    .all(|price| *price % new_tick == Decimal::ZERO)
+            });
+            if all_levels_on_new_tick {
+                if let Some(pending) = self.pending_bbo.get_mut(&token) {
+                    pending.awaiting_tick_change = false;
+                }
+            }
+            if self.resolve_pending_if_ready(&token, counters) {
+                if let Some(book) = self.token_books.get_mut(&token) {
+                    book.dirty_since = None;
+                }
+                if let Some(event) = self.canonicalize_token(&token, local_now) {
+                    push_latest_order_book(&mut events, event);
+                }
+            }
+        }
+
+        if let Some(pending) = self.pending_quotes.remove(&key) {
+            if let Some(event) = self.canonicalize_quote_ready(pending.quote) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn next_deferred_deadline(&self) -> Option<Instant> {
+        self.pending_bbo
+            .values()
+            .map(|pending| pending.last_update_at + CLOB_BBO_SETTLE_INTERVAL)
+            .chain(
+                self.pending_quotes
+                    .values()
+                    .map(|pending| pending.received_at + CLOB_BBO_SETTLE_INTERVAL),
+            )
+            .min()
+    }
+
+    fn flush_deferred_due(&mut self, now: Instant, local_now: u64) -> ClobDeferredBatch {
+        let mut batch = ClobDeferredBatch::default();
+        let mut tokens: Vec<_> = self
+            .pending_bbo
+            .iter()
+            .filter_map(|(token, pending)| {
+                (now.saturating_duration_since(pending.last_update_at) >= CLOB_BBO_SETTLE_INTERVAL)
+                    .then_some(token.clone())
+            })
+            .collect();
+        tokens.sort();
+        for token in tokens {
+            let (event, repair) = self.finalize_pending_bbo(
+                &token,
+                local_now,
+                &mut batch.wire,
+                &mut batch.diagnostics,
+            );
+            if let Some(event) = event {
+                push_latest_order_book(&mut batch.events, event);
+            }
+            if let Some(token) = repair {
+                batch.repair_tokens.push(token);
+            }
+        }
+
+        let mut quote_keys: Vec<_> = self
+            .pending_quotes
+            .iter()
+            .filter_map(|(key, pending)| {
+                (now.saturating_duration_since(pending.received_at) >= CLOB_BBO_SETTLE_INTERVAL)
+                    .then_some(key.clone())
+            })
+            .collect();
+        quote_keys.sort();
+        for key in quote_keys {
+            let Some(pending) = self.pending_quotes.remove(&key) else {
+                continue;
+            };
+            batch.diagnostics.push(ClobDiagnostic {
+                key: "tick_size_change_lag".to_string(),
+                detail: format!(
+                    "market={key} quote_ts={} publication_released_after={}ms",
+                    pending.quote.exchange_timestamp_ns,
+                    CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+                ),
+            });
+            if let Some(event) = self.canonicalize_quote_ready(pending.quote) {
+                batch.events.push(event);
+            }
+        }
+        batch
+    }
+
     fn apply_price_change(
         &mut self,
         fields: PriceChangeFields,
@@ -3069,10 +3604,37 @@ impl ClobLocalBooks {
         local_now: u64,
         counters: &mut ClobWireCounters,
         diagnostics: &mut Vec<ClobDiagnostic>,
-    ) -> (Vec<MarketEvent>, usize) {
+    ) -> (Vec<MarketEvent>, usize, Vec<String>) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+        let mut immediate = Vec::new();
+        let mut repair_tokens = Vec::new();
+        let mut incoming_tokens: Vec<_> = fields
+            .price_changes
+            .iter()
+            .map(|change| change.asset_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        incoming_tokens.sort();
+        for token in incoming_tokens {
+            let finalize_older = self
+                .pending_bbo
+                .get(&token)
+                .is_some_and(|pending| pending.exchange_timestamp_ns < exchange_timestamp_ns);
+            if finalize_older {
+                let (event, repair) =
+                    self.finalize_pending_bbo(&token, local_now, counters, diagnostics);
+                if let Some(event) = event {
+                    push_latest_order_book(&mut immediate, event);
+                }
+                if let Some(token) = repair {
+                    repair_tokens.push(token);
+                }
+            }
+        }
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
         let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
+        let mut off_tick_tokens: HashSet<String> = HashSet::new();
 
         for change in fields.price_changes {
             counters.price_change_entries = counters.price_change_entries.saturating_add(1);
@@ -3100,6 +3662,9 @@ impl ClobLocalBooks {
                     detail: format!("token={token} price={price} size={size}"),
                 });
                 continue;
+            }
+            if !self.price_is_on_current_tick(&token, price) {
+                off_tick_tokens.insert(token.clone());
             }
             let Some(current_book) = self.token_books.get(&token) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
@@ -3178,34 +3743,43 @@ impl ClobLocalBooks {
             }
         }
 
-        // A price_change message is one atomic wire frame. Its reported BBO
-        // describes the completed frame, not every intermediate entry. Apply
-        // all entries first, then compare once per token. Boundary prices 0/1
-        // are venue sentinels for a missing tradeable side and intentionally
-        // match an empty side in the local (0,1)-only L2 book.
-        let mut reported_tokens: Vec<_> = reported_bbo.keys().cloned().collect();
-        reported_tokens.sort();
-        for token in reported_tokens {
-            let Some(book) = self.token_books.get(&token) else {
+        // The venue's advertised BBO describes a logical microbatch, but that
+        // batch can span multiple WebSocket frames with the same millisecond
+        // timestamp. Merge expectations by token+timestamp and publish only
+        // after the local top agrees (or the short quiet window expires).
+        let mut validation_tokens: HashSet<String> = reported_bbo.keys().cloned().collect();
+        validation_tokens.extend(off_tick_tokens.iter().cloned());
+        let mut validation_tokens: Vec<_> = validation_tokens.into_iter().collect();
+        validation_tokens.sort();
+        for token in validation_tokens {
+            if !before.contains_key(&token) {
                 continue;
-            };
-            let actual = book.top();
-            let expected = &reported_bbo[&token];
-            let bid_mismatch = expected.bid.is_some_and(|bid| bid != actual.0);
-            let ask_mismatch = expected.ask.is_some_and(|ask| ask != actual.1);
-            if bid_mismatch || ask_mismatch {
-                counters.bbo_mismatches = counters.bbo_mismatches.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "price_change_bbo_mismatch".to_string(),
-                    detail: format!(
-                        "token={token} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
-                        expected.bid, expected.ask, actual.0, actual.1,
-                    ),
-                });
+            }
+            let newer_expected = reported_bbo.remove(&token).unwrap_or_default();
+            let actual = self
+                .token_books
+                .get(&token)
+                .map(ClobLocalBook::top)
+                .unwrap_or_default();
+            let off_tick = off_tick_tokens.contains(&token);
+            let pending =
+                self.pending_bbo
+                    .entry(token.clone())
+                    .or_insert_with(|| PendingBboCheck {
+                        exchange_timestamp_ns,
+                        expected: ReportedBbo::default(),
+                        last_update_at: received_at,
+                        saw_mismatch: false,
+                        awaiting_tick_change: false,
+                    });
+            if pending.exchange_timestamp_ns == exchange_timestamp_ns {
+                pending.expected.merge(newer_expected);
+                pending.last_update_at = received_at;
+                pending.awaiting_tick_change |= off_tick;
+                pending.saw_mismatch |= !pending.expected.matches(actual);
             }
         }
 
-        let mut immediate = Vec::new();
         let mut touched_order: Vec<_> = before
             .keys()
             .filter_map(|token| {
@@ -3216,12 +3790,25 @@ impl ClobLocalBooks {
             .collect();
         touched_order.sort_by_key(|(sequence, _)| *sequence);
         for (_, token) in touched_order {
-            let Some(book) = self.token_books.get_mut(&token) else {
-                continue;
-            };
-            let top_changed = before.get(&token).copied() != Some(book.top());
-            if top_changed && book.is_semantically_valid() {
-                book.dirty_since = None;
+            let (top_changed, semantically_valid) = self
+                .token_books
+                .get(&token)
+                .map(|book| {
+                    (
+                        before.get(&token).copied() != Some(book.top()),
+                        book.is_semantically_valid(),
+                    )
+                })
+                .unwrap_or((false, false));
+            let _ = self.resolve_pending_if_ready(&token, counters);
+            if top_changed
+                && semantically_valid
+                && !self.pending_bbo.contains_key(&token)
+                && !self.market_is_quarantined(&token)
+            {
+                if let Some(book) = self.token_books.get_mut(&token) {
+                    book.dirty_since = None;
+                }
                 if let Some(event) = self.canonicalize_token(&token, local_now) {
                     push_latest_order_book(&mut immediate, event);
                 }
@@ -3229,7 +3816,7 @@ impl ClobLocalBooks {
         }
         let bbo_change_snapshots = immediate.len();
         let _ = fields.market;
-        (immediate, bbo_change_snapshots)
+        (immediate, bbo_change_snapshots, repair_tokens)
     }
 
     fn flush_due(&mut self, now: Instant, local_now: u64) -> Vec<MarketEvent> {
@@ -3237,6 +3824,9 @@ impl ClobLocalBooks {
             .token_books
             .iter()
             .filter_map(|(token, book)| {
+                if self.pending_bbo.contains_key(token) || self.market_is_quarantined(token) {
+                    return None;
+                }
                 let dirty_since = book.dirty_since?;
                 (now.saturating_duration_since(dirty_since) >= CLOB_BOOK_COALESCE_INTERVAL)
                     .then_some((book.wire_sequence, token.clone()))
@@ -3336,7 +3926,7 @@ fn process_clob_frame(
                     .price_changes
                     .iter()
                     .any(|change| subscribed_token(tokens, &change.asset_id));
-                let (events, bbo_snapshots) = books.apply_price_change(
+                let (events, bbo_snapshots, repair_tokens) = books.apply_price_change(
                     fields,
                     received_at,
                     local_now,
@@ -3345,6 +3935,7 @@ fn process_clob_frame(
                 );
                 batch.bbo_change_snapshots =
                     batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
+                batch.repair_tokens.extend(repair_tokens);
                 for event in events {
                     push_latest_order_book(&mut batch.events, event);
                 }
@@ -3370,7 +3961,7 @@ fn process_clob_frame(
                     local_now,
                 ) {
                     Some(MarketEvent::Quote(quote)) => {
-                        if let Some(event) = books.canonicalize_quote(quote) {
+                        if let Some(event) = books.canonicalize_quote(quote, received_at) {
                             batch.events.push(event);
                         }
                     }
@@ -3403,6 +3994,16 @@ fn process_clob_frame(
                 batch.wire.tick_size_changes = batch.wire.tick_size_changes.saturating_add(1);
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
                 match make_tick_size_event(fields, local_now) {
+                    Some(MarketEvent::TickSizeChange(change)) => {
+                        let released =
+                            books.apply_tick_size_change(&change, local_now, &mut batch.wire);
+                        // The strategy must observe the new grid before any
+                        // same-batch 0.001 book/quote that was held behind it.
+                        batch.events.push(MarketEvent::TickSizeChange(change));
+                        for event in released {
+                            push_latest_order_book(&mut batch.events, event);
+                        }
+                    }
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
                 }
@@ -3744,6 +4345,7 @@ impl ExchangeMarket for PolymarketMarket {
                             token_id: token_id.clone(),
                             _outcome: outcome,
                             _condition_id: condition.condition_id.clone(),
+                            _tick_size: condition.tick_size,
                         });
                     }
                 }
@@ -3824,6 +4426,7 @@ impl ExchangeMarket for PolymarketMarket {
                             token_id: token_id.clone(),
                             _outcome: outcome,
                             _condition_id: condition.condition_id.clone(),
+                            _tick_size: condition.tick_size,
                         });
                     }
                 }
@@ -4208,6 +4811,7 @@ mod pick_current_event_tests {
                     token_id: "old-up".to_string(),
                     _outcome: "Up".to_string(),
                     _condition_id: "old-condition".to_string(),
+                    _tick_size: 0.01,
                 }],
             },
             series_id: Some("10684".to_string()),
@@ -4235,6 +4839,99 @@ mod pick_current_event_tests {
             .pending_events
             .iter()
             .any(|event| matches!(event, MarketEvent::Instrument(_))));
+    }
+
+    #[test]
+    fn simultaneous_series_rotations_emit_one_combined_resubscribe() {
+        let started_ns = now_ns();
+        let make_market = |name: &str| PolyMarketInfo {
+            id: format!("{name}-market"),
+            question: format!("{name} up or down?"),
+            condition_id: format!("{name}-condition"),
+            slug: format!("{name}-market"),
+            clob_token_ids: vec![format!("{name}-up"), format!("{name}-down")],
+            outcomes: vec!["Up".to_string(), "Down".to_string()],
+            outcome_prices: vec!["0.5".to_string(), "0.5".to_string()],
+            active: true,
+            closed: false,
+            volume: 0.0,
+            liquidity: 0.0,
+            tick_size: 0.01,
+            order_min_size: 5.0,
+            group_item_title: String::new(),
+            event_start_time: String::new(),
+            base_fee: 0,
+            fee_schedule: FeeSchedule::default(),
+        };
+        let make_event = |name: &str| {
+            let mut event = mk_event(now() - 1, now() + 299);
+            event.id = format!("{name}-event");
+            event.slug = format!("{name}-slug");
+            event.markets.push(make_market(name));
+            event
+        };
+
+        let (btc_tx, btc_rx) = crossbeam_channel::bounded(1);
+        let (eth_tx, eth_rx) = crossbeam_channel::bounded(1);
+        btc_tx
+            .send(Ok(("btc-series-id".to_string(), make_event("btc"))))
+            .unwrap();
+
+        let expired_series =
+            |name: &str, old_token: &str, rx: crossbeam_channel::Receiver<RotationFetchResult>| {
+                SeriesState {
+                    name: format!("series:{name}"),
+                    interval_minutes: -1,
+                    market: MarketState {
+                        event_id: format!("old-{name}"),
+                        start_ns: started_ns.saturating_sub(300_000_000_000),
+                        end_ns: started_ns.saturating_sub(1),
+                        symbols: vec![SymbolState {
+                            token_id: old_token.to_string(),
+                            _outcome: "Up".to_string(),
+                            _condition_id: format!("old-{name}-condition"),
+                            _tick_size: 0.01,
+                        }],
+                    },
+                    series_id: Some(format!("{name}-series-id")),
+                    next_retry_ns: 0,
+                    refresh_fail_count: 0,
+                    refresh_fail_first_ns: 0,
+                    refresh_idling_logged: false,
+                    rotation_refresh: Some(RotationRefresh { started_ns, rx }),
+                }
+            };
+
+        let mut market = PolymarketMarket::new();
+        market.series.push(expired_series("btc", "old-btc", btc_rx));
+        market.series.push(expired_series("eth", "old-eth", eth_rx));
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        market.ws_ctrl_tx = Some(ctrl_tx);
+
+        market.check_rotation().unwrap();
+        assert!(market.clob_resubscribe_pending);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        eth_tx
+            .send(Ok(("eth-series-id".to_string(), make_event("eth"))))
+            .unwrap();
+        market.check_rotation().unwrap();
+        let WsCtrl::Resubscribe(subscription) = ctrl_rx.try_recv().unwrap() else {
+            panic!("rotation wave must emit one combined resubscribe");
+        };
+        assert_eq!(subscription.tokens.len(), 4);
+        assert!(subscription.tokens.contains(&"btc-up".to_string()));
+        assert!(subscription.tokens.contains(&"btc-down".to_string()));
+        assert!(subscription.tokens.contains(&"eth-up".to_string()));
+        assert!(subscription.tokens.contains(&"eth-down".to_string()));
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!market.clob_resubscribe_pending);
     }
 
     #[test]
@@ -4430,6 +5127,7 @@ mod pick_current_event_tests {
             condition_id: "condition".to_string(),
             up_token: "up".to_string(),
             down_token: "down".to_string(),
+            tick_size: 0.01,
         }
     }
 
@@ -4605,6 +5303,156 @@ mod pick_current_event_tests {
             .iter()
             .all(|diagnostic| diagnostic.key != "price_change_bbo_mismatch"));
         assert_eq!(order_book(&delta.events[0]).asks[0].price, 0.70);
+    }
+
+    #[test]
+    fn split_same_timestamp_bbo_recovers_without_warning_or_repair() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"},{"price":"0.43","size":"9"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"8000"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            16_000_000_000,
+        );
+
+        let first = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"8001"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(50),
+            16_001_000_000,
+        );
+        assert!(first.events.is_empty(), "intermediate top must not escape");
+        assert_eq!(first.wire.bbo_mismatches, 0);
+        assert!(first.repair_tokens.is_empty());
+
+        let second = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.44","size":"0","side":"BUY","best_bid":"0.42","best_ask":"0.45"},{"asset_id":"up","price":"0.43","size":"0","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"8001"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(250),
+            16_001_000_000,
+        );
+        assert_eq!(second.wire.bbo_transient_recoveries, 1);
+        assert_eq!(second.wire.bbo_mismatches, 0);
+        assert!(second.repair_tokens.is_empty());
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(order_book(&second.events[0]).bids[0].price, 0.42);
+    }
+
+    #[test]
+    fn persistent_bbo_mismatch_is_quarantined_and_requests_one_repair() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"8100"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            16_100_000_000,
+        );
+        let first = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"8101"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(50),
+            16_101_000_000,
+        );
+        assert!(first.events.is_empty());
+
+        let settled = books.flush_deferred_due(
+            received_at + CLOB_BBO_SETTLE_INTERVAL + Duration::from_millis(1),
+            16_105_000_000,
+        );
+        assert!(settled.events.is_empty());
+        assert_eq!(settled.wire.bbo_mismatches, 1);
+        assert_eq!(settled.wire.bbo_repair_requests, 1);
+        assert_eq!(settled.repair_tokens, vec!["up".to_string()]);
+        assert!(books.quarantined_tokens.contains("up"));
+
+        let again = books.flush_deferred_due(
+            received_at + CLOB_BBO_SETTLE_INTERVAL + Duration::from_millis(2),
+            16_106_000_000,
+        );
+        assert!(
+            again.repair_tokens.is_empty(),
+            "repair requests are deduped"
+        );
+        assert_eq!(again.wire.bbo_mismatches, 0);
+    }
+
+    #[test]
+    fn tick_narrowing_precedes_release_of_fine_grid_book() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.98","size":"10"}],"asks":[{"price":"0.99","size":"11"}],"timestamp":"8200"},{"event_type":"book","asset_id":"down","bids":[{"price":"0.01","size":"11"}],"asks":[{"price":"0.02","size":"10"}],"timestamp":"8200"}]"#,
+            &mut books,
+            &tokens,
+            received_at,
+            16_200_000_000,
+        );
+        let fine_grid = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.99","size":"0","side":"SELL","best_bid":"0.98","best_ask":"0.999"},{"asset_id":"up","price":"0.999","size":"9","side":"SELL","best_bid":"0.98","best_ask":"0.999"}],"timestamp":"8201"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(50),
+            16_201_000_000,
+        );
+        assert!(
+            fine_grid.events.is_empty(),
+            "0.001 book must wait for its tick transition"
+        );
+
+        let tick = process_clob_frame(
+            r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"8201"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(200),
+            16_201_000_000,
+        );
+        assert_eq!(tick.events.len(), 2);
+        assert!(matches!(tick.events[0], MarketEvent::TickSizeChange(_)));
+        assert_eq!(order_book(&tick.events[1]).asks[0].price, 0.999);
+        assert_eq!(
+            books.current_ticks.get("condition"),
+            Some(&Decimal::from_str("0.001").unwrap()),
+        );
+    }
+
+    #[test]
+    fn tick_narrowing_precedes_release_of_fine_grid_quote() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        let quote = process_clob_frame(
+            r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.998","best_ask":"0.999","timestamp":"8301"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            16_301_000_000,
+        );
+        assert!(quote.events.is_empty());
+
+        let tick = process_clob_frame(
+            r#"{"event_type":"tick_size_change","asset_id":"down","old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"8301"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_micros(200),
+            16_301_000_000,
+        );
+        assert_eq!(tick.events.len(), 2);
+        assert!(matches!(tick.events[0], MarketEvent::TickSizeChange(_)));
+        let MarketEvent::Quote(quote) = &tick.events[1] else {
+            panic!("fine-grid quote must follow the tick transition");
+        };
+        assert_eq!(quote.bid_price, 0.998);
+        assert_eq!(quote.ask_price, 0.999);
     }
 
     #[test]
