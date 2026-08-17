@@ -550,9 +550,10 @@ struct RiskBlocker {
 }
 
 /// Identity retained after a terminal trade's economics have been folded into
-/// `compacted_economic_effects`. It deliberately contains no bookable state:
-/// a matching replay can only prove ownership and no-op; a mismatch remains a
-/// sticky ownership anomaly.
+/// `compacted_economic_effects`. It deliberately contains no state that may be
+/// booked again: a matching replay can only prove ownership and no-op; a
+/// mismatch remains a sticky ownership anomaly. The immutable ownership and
+/// quantity still prove a surviving parent order's derived `filled_quantity`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RetiredTradeOwnershipTombstone {
     ownership: TradeOwnership,
@@ -7327,6 +7328,27 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             .entry(trade.ownership.client_order_id.clone())
             .or_insert(0.0) += trade.ownership.quantity;
     }
+    // Terminal pruning folds a confirmed trade's economics into
+    // `compacted_economic_effects` and retains only this exact ownership
+    // proof. A parent order may intentionally survive that pruning while it
+    // remains under startup recovery or terminal audit. Count only durable,
+    // economically-booked tombstones that still match every immutable order
+    // root; authenticated historical no-ops were never booked by this ledger
+    // and must not contribute.
+    for tombstone in state.retired_trade_ownership_tombstones.values() {
+        let ownership = &tombstone.ownership;
+        if tombstone.authenticated_terminal_noop || ownership.status != "CONFIRMED" {
+            continue;
+        }
+        let Some(order) = state.orders.get(&ownership.client_order_id) else {
+            continue;
+        };
+        if trade_ownership_matches_order_root(ownership, order) {
+            *booked_quantity_by_order
+                .entry(ownership.client_order_id.clone())
+                .or_insert(0.0) += ownership.quantity;
+        }
+    }
     let mut expected_cash_by_instance = HashMap::<String, f64>::new();
     let mut expected_positions_by_instance = HashMap::<String, HashMap<String, f64>>::new();
     for (coid, order) in &state.orders {
@@ -11436,7 +11458,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
-    fn live_query_repair_does_not_use_confirmed_trade_tombstone() {
+    fn live_query_repair_does_not_use_confirmed_tombstone_as_failed_proof() {
         let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
             "hexagent-confirmed-tombstone-query-repair-{}-{}.json",
@@ -11462,8 +11484,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 order_id: oid.to_string(),
                 token_id: token.to_string(),
                 side: Side::Sell,
-                quantity: 10.0,
-                filled_quantity: 0.0,
+                quantity: 20.0,
+                filled_quantity: 10.0,
                 terminal_matched_quantity: None,
                 terminal_trade_ids: Vec::new(),
                 terminal_trade_ids_authoritative: false,
@@ -11781,6 +11803,88 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.get_mut("maker-order").unwrap().filled_quantity = 0.5;
         let fill_error = validate_persisted_state("account", &state).unwrap_err();
         assert!(fill_error.contains("durable trades"), "{fill_error}");
+    }
+
+    #[test]
+    fn persisted_state_validator_counts_exact_confirmed_trade_tombstones_for_fill() {
+        let _persistence_guard = persistence_test_guard();
+        let account = seeded_account();
+        account
+            .reserve_order("a", "maker-order", "0xABC", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "trade",
+                "CONFIRMED",
+                "maker-order",
+                "0xABC",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                true,
+                1,
+            ),
+            TradeTransitionResult::Applied(_),
+        ));
+        assert_eq!(
+            account.prune_terminal_history(&HashSet::from(["UP".to_string()])),
+            (0, 1),
+        );
+        let state = account.state.lock().unwrap().clone();
+        assert!(state.trades.is_empty());
+        assert_eq!(state.retired_trade_ownership_tombstones.len(), 1);
+        let tombstone_validation = validate_persisted_state("acct", &state);
+        assert!(tombstone_validation.is_ok(), "{tombstone_validation:?}",);
+
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-confirmed-tombstone-fill-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: "acct".to_string(),
+                state: state.clone(),
+            },
+        )
+        .unwrap();
+        {
+            let restored = SharedAccount::new_persistent("acct", &path).unwrap();
+            assert_eq!(restored.order("maker-order").unwrap().filled_quantity, 1.0);
+            assert!(restored.trades().is_empty());
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+
+        let mut historical_noop = state.clone();
+        historical_noop
+            .settled_token_values
+            .insert("UP".to_string(), 1.0);
+        historical_noop
+            .retired_trade_ownership_tombstones
+            .get_mut("trade")
+            .unwrap()
+            .authenticated_terminal_noop = true;
+        let noop_error = validate_persisted_state("acct", &historical_noop).unwrap_err();
+        assert!(noop_error.contains("durable trades=0"), "{noop_error}");
+
+        let mut mismatched = state;
+        mismatched
+            .retired_trade_ownership_tombstones
+            .get_mut("trade")
+            .unwrap()
+            .ownership
+            .order_id = "0xOTHER".to_string();
+        let mismatch_error = validate_persisted_state("acct", &mismatched).unwrap_err();
+        assert!(
+            mismatch_error.contains("durable trades=0"),
+            "{mismatch_error}",
+        );
     }
 
     #[test]
