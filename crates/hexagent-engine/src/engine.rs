@@ -345,32 +345,6 @@ struct QueuedOrderUpdate {
     enqueued_at: std::time::Instant,
 }
 
-fn send_private_update_lossless(
-    tx: &Sender<QueuedOrderUpdate>,
-    instance_id: &str,
-    mut queued: QueuedOrderUpdate,
-    quarantined: &AtomicBool,
-) -> bool {
-    loop {
-        if quarantined.load(Ordering::Acquire) {
-            return false;
-        }
-        match tx.send_timeout(queued, std::time::Duration::from_secs(1)) {
-            Ok(()) => return true,
-            Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                queued = returned;
-                warn!(
-                    "[private_update_queue_metric] instance={} saturated=1 depth={} capacity={} blocked_ms=1000 action=lossless_backpressure",
-                    instance_id,
-                    tx.len(),
-                    CHANNEL_CAPACITY,
-                );
-            }
-            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
-        }
-    }
-}
-
 fn quarantine_strategy_worker(
     idx: usize,
     reason: &str,
@@ -4448,10 +4422,6 @@ impl Engine {
         // once per subscribing strategy instance.
         let mut market_txs: Vec<Sender<QueuedMarketEvent>> = Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
-        let mut update_dispatch_specs: Vec<(
-            Receiver<QueuedOrderUpdate>,
-            Sender<QueuedOrderUpdate>,
-        )> = Vec::with_capacity(strategies.len());
         let mut specs: Vec<(
             Box<dyn Strategy>,
             Receiver<QueuedMarketEvent>,
@@ -4459,16 +4429,12 @@ impl Engine {
         )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
-            // Private lifecycle updates are loss-intolerant but must not grow
-            // memory without limit if a worker stalls. The large bounded lane
-            // remains effectively non-blocking in healthy operation; reaching
-            // capacity deliberately applies backpressure instead of dropping a
-            // fill/cancel transition and corrupting local strategy state.
-            let (spool_tx, spool_rx) = unbounded::<QueuedOrderUpdate>();
-            let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
+            // One direct lossless lane per strategy. The router quarantines an
+            // instance at CHANNEL_CAPACITY depth, bounding memory without the
+            // extra dispatcher thread/hop on every private lifecycle update.
+            let (utx, urx) = unbounded::<QueuedOrderUpdate>();
             market_txs.push(mtx);
-            update_txs.push(spool_tx);
-            update_dispatch_specs.push((spool_rx, utx));
+            update_txs.push(utx);
             specs.push((s, mrx, urx));
         }
         let supervisor_origin = Arc::new(std::time::Instant::now());
@@ -4485,41 +4451,6 @@ impl Engine {
         thread::Builder::new()
             .name("strategy-router".into())
             .spawn(move || {
-                // A private update must never be dropped, but a stalled worker
-                // must also never stop the global market/private router. Each
-                // instance therefore owns an unbounded lossless spool plus one
-                // dispatcher that may backpressure only that instance's bounded
-                // worker lane.
-                let mut update_dispatch_handles =
-                    Vec::<thread::JoinHandle<()>>::with_capacity(update_dispatch_specs.len());
-                for (idx, (spool_rx, worker_tx)) in
-                    update_dispatch_specs.into_iter().enumerate()
-                {
-                    let iid = instance_ids[idx].clone();
-                    let quarantined = Arc::clone(&worker_quarantined[idx]);
-                    let handle = thread::Builder::new()
-                        .name(format!(
-                            "private-dispatch-{}",
-                            if iid.is_empty() { idx.to_string() } else { iid.clone() }
-                        ))
-                        .spawn(move || {
-                            while let Ok(queued) = spool_rx.recv() {
-                                if !send_private_update_lossless(&worker_tx, &iid, queued, &quarantined) {
-                                    break;
-                                }
-                                if spool_rx.len() >= CHANNEL_CAPACITY {
-                                    warn!(
-                                        "[private_update_spool_metric] instance={} depth={} action=instance_isolated_backlog",
-                                        iid,
-                                        spool_rx.len(),
-                                    );
-                                }
-                            }
-                        })
-                        .unwrap();
-                    update_dispatch_handles.push(handle);
-                }
-
                 // Spawn one worker per instance, each on its own core.
                 let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
                 let (worker_status_tx, worker_status_rx) = unbounded::<(usize, bool)>();
@@ -4672,6 +4603,7 @@ impl Engine {
                                     &update_txs,
                                     &worker_quarantined,
                                     &instance_ids,
+                                    &signal_tx,
                                 );
                             }
                             Err(_) => break,
@@ -4690,6 +4622,7 @@ impl Engine {
                                         &update_txs,
                                         &worker_quarantined,
                                         &instance_ids,
+                                        &signal_tx,
                                     );
                                 }
                                 break;
@@ -4739,12 +4672,9 @@ impl Engine {
                     }
                 }
 
-                // Close and fully drain the private-update spools before
-                // workers are released to generate their final reports.
+                // Close direct private-update lanes before workers are
+                // released to generate their final reports.
                 drop(update_txs);
-                for handle in update_dispatch_handles {
-                    let _ = handle.join();
-                }
                 drop(market_txs);
                 for (idx, handle) in handles.into_iter().enumerate() {
                     if worker_quarantined[idx].load(Ordering::Acquire) {
@@ -4766,6 +4696,7 @@ impl Engine {
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         instance_ids: &[String],
+        signal_tx: &Sender<Signal>,
     ) {
         let is_market_cancel_finality = update.error.as_deref().is_some_and(|error| {
             error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED)
@@ -4791,10 +4722,19 @@ impl Engine {
 
         match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
             PrivateUpdateRoute::Owner(i) => {
-                let _ = update_txs[i].send(QueuedOrderUpdate {
+                let sent = update_txs[i].send(QueuedOrderUpdate {
                     update,
                     enqueued_at: std::time::Instant::now(),
                 });
+                if sent.is_ok() && update_txs[i].len() >= CHANNEL_CAPACITY {
+                    quarantine_strategy_worker(
+                        i,
+                        "private update queue reached isolation limit",
+                        instance_ids,
+                        worker_quarantined,
+                        signal_tx,
+                    );
+                }
             }
             PrivateUpdateRoute::DropQuarantined(i) => {
                 warn!("[strategy_router] dropping private update for quarantined owner instance={} coid={}",
@@ -4812,10 +4752,19 @@ impl Engine {
                     if worker_quarantined[idx].load(Ordering::Acquire) {
                         continue;
                     }
-                    let _ = tx.send(QueuedOrderUpdate {
+                    let sent = tx.send(QueuedOrderUpdate {
                         update: update.clone(),
                         enqueued_at,
                     });
+                    if sent.is_ok() && tx.len() >= CHANNEL_CAPACITY {
+                        quarantine_strategy_worker(
+                            idx,
+                            "private update queue reached isolation limit",
+                            instance_ids,
+                            worker_quarantined,
+                            signal_tx,
+                        );
+                    }
                 }
             }
         }
@@ -5029,7 +4978,49 @@ impl Engine {
                 heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                 let _ = shutdown_ack_tx.send(idx);
             }
-            crossbeam_channel::select! {
+            // Private lifecycle changes have logical priority over public
+            // market ticks on the same strategy core. This avoids raising the
+            // entire user-feed runtime above the raw CLOB reader.
+            crossbeam_channel::select_biased! {
+                recv(update_rx) -> msg => match msg {
+                    Ok(queued) => {
+                        if quarantined.load(Ordering::Acquire) { return; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                        let queue_last_us = queued.enqueued_at.elapsed().as_micros()
+                            .min(u64::MAX as u128) as u64;
+                        update_queue_samples = update_queue_samples.saturating_add(1);
+                        update_queue_total_us = update_queue_total_us
+                            .saturating_add(queue_last_us as u128);
+                        update_queue_max_us = update_queue_max_us.max(queue_last_us);
+                        if update_queue_window_started.elapsed()
+                            >= std::time::Duration::from_secs(30)
+                        {
+                            let avg_us = update_queue_total_us as f64
+                                / update_queue_samples.max(1) as f64;
+                            info!(
+                                "[private_update_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} capacity={}",
+                                instance_id,
+                                update_queue_samples,
+                                queue_last_us,
+                                avg_us,
+                                update_queue_max_us,
+                                update_rx.len(),
+                                CHANNEL_CAPACITY,
+                            );
+                            update_queue_window_started = std::time::Instant::now();
+                            update_queue_samples = 0;
+                            update_queue_total_us = 0;
+                            update_queue_max_us = 0;
+                        }
+                        let signals = strategy.on_order_update(&queued.update);
+                        if !shutdown_started {
+                            for sig in signals {
+                                if !emit(sig) { return; }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                },
                 recv(watchdog_rx) -> _ => {
                     if quarantined.load(Ordering::Acquire) { return; }
                     heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
@@ -5141,45 +5132,6 @@ impl Engine {
                         }
                         for sig in signals {
                             if !emit(sig) { return; }
-                        }
-                    }
-                    Err(_) => break,
-                },
-                recv(update_rx) -> msg => match msg {
-                    Ok(queued) => {
-                        if quarantined.load(Ordering::Acquire) { return; }
-                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
-                        let queue_last_us = queued.enqueued_at.elapsed().as_micros()
-                            .min(u64::MAX as u128) as u64;
-                        update_queue_samples = update_queue_samples.saturating_add(1);
-                        update_queue_total_us = update_queue_total_us
-                            .saturating_add(queue_last_us as u128);
-                        update_queue_max_us = update_queue_max_us.max(queue_last_us);
-                        if update_queue_window_started.elapsed()
-                            >= std::time::Duration::from_secs(30)
-                        {
-                            let avg_us = update_queue_total_us as f64
-                                / update_queue_samples.max(1) as f64;
-                            info!(
-                                "[private_update_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} capacity={}",
-                                instance_id,
-                                update_queue_samples,
-                                queue_last_us,
-                                avg_us,
-                                update_queue_max_us,
-                                update_rx.len(),
-                                CHANNEL_CAPACITY,
-                            );
-                            update_queue_window_started = std::time::Instant::now();
-                            update_queue_samples = 0;
-                            update_queue_total_us = 0;
-                            update_queue_max_us = 0;
-                        }
-                        let signals = strategy.on_order_update(&queued.update);
-                        if !shutdown_started {
-                            for sig in signals {
-                                if !emit(sig) { return; }
-                            }
                         }
                     }
                     Err(_) => break,

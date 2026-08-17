@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -117,6 +122,11 @@ const CLOB_STALE_THRESHOLD: Duration = Duration::from_secs(90);
 /// drift in `polymarket.ws.clob_scheduler_lag`.
 const CLOB_SCHEDULER_PROBE_INTERVAL: Duration = Duration::from_millis(10);
 const CLOB_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
+/// Dirty non-BBO L2 changes are collapsed into at most four full snapshots
+/// per second per token. BBO changes still publish immediately.
+const CLOB_BOOK_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
+const CLOB_BURST_METRIC_INTERVAL: Duration = Duration::from_secs(1);
+const CLOB_DIAGNOSTIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
@@ -871,9 +881,22 @@ enum WsCtrl {
     /// subscription — the server treats a second subscribe as additive and
     /// there's no unsubscribe verb, so a fresh connection is the only
     /// portable way to drop stale tokens across a rotation.
-    Resubscribe(Vec<String>),
+    Resubscribe(ClobSubscription),
     /// Shutdown the WS task cleanly.
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalEventSpec {
+    condition_id: String,
+    up_token: String,
+    down_token: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClobSubscription {
+    tokens: Vec<String>,
+    canonical_events: Vec<CanonicalEventSpec>,
 }
 
 /// A single symbol (CLOB token) within a Polymarket event/market.
@@ -1004,12 +1027,42 @@ impl PolymarketMarket {
             .collect()
     }
 
+    fn current_clob_subscription(&self) -> ClobSubscription {
+        let tokens = self.current_tokens();
+        let mut by_condition: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        for symbol in self.series.iter().flat_map(|series| &series.market.symbols) {
+            let entry = by_condition
+                .entry(symbol._condition_id.clone())
+                .or_insert((None, None));
+            match symbol._outcome.trim().to_ascii_lowercase().as_str() {
+                "up" | "yes" => entry.0 = Some(symbol.token_id.clone()),
+                "down" | "no" => entry.1 = Some(symbol.token_id.clone()),
+                _ => {}
+            }
+        }
+        let mut canonical_events: Vec<_> = by_condition
+            .into_iter()
+            .filter_map(|(condition_id, (up_token, down_token))| {
+                Some(CanonicalEventSpec {
+                    condition_id,
+                    up_token: up_token?,
+                    down_token: down_token?,
+                })
+            })
+            .collect();
+        canonical_events.sort_by(|left, right| left.condition_id.cmp(&right.condition_id));
+        ClobSubscription {
+            tokens,
+            canonical_events,
+        }
+    }
+
     /// Send a Resubscribe message to the async WS task. No-op if the task
     /// hasn't been started yet (e.g. rotation fires before connect()).
     fn resubscribe_ws(&self) {
         if let Some(tx) = &self.ws_ctrl_tx {
-            let tokens = self.current_tokens();
-            let _ = tx.send(WsCtrl::Resubscribe(tokens));
+            let subscription = self.current_clob_subscription();
+            let _ = tx.send(WsCtrl::Resubscribe(subscription));
         }
     }
 
@@ -1187,6 +1240,55 @@ struct ClobLifecycle {
     subscribed_once: bool,
     ready: bool,
     not_ready_announced: bool,
+    not_ready_since: Option<Instant>,
+    not_ready_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct ClobReadyTransition {
+    recovery: Option<Duration>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ClobWireCounters {
+    books: u64,
+    price_changes: u64,
+    best_bid_asks: u64,
+    trades: u64,
+    last_trade_prices: u64,
+    tick_size_changes: u64,
+    inline_rtds: u64,
+    price_change_entries: u64,
+    level_upserts: u64,
+    level_deletes: u64,
+    bbo_mismatches: u64,
+    unseeded_deltas: u64,
+    ignored: u64,
+    unknown: u64,
+    parse_errors: u64,
+}
+
+impl ClobWireCounters {
+    fn add(&mut self, rhs: Self) {
+        self.books = self.books.saturating_add(rhs.books);
+        self.price_changes = self.price_changes.saturating_add(rhs.price_changes);
+        self.best_bid_asks = self.best_bid_asks.saturating_add(rhs.best_bid_asks);
+        self.trades = self.trades.saturating_add(rhs.trades);
+        self.last_trade_prices = self.last_trade_prices.saturating_add(rhs.last_trade_prices);
+        self.tick_size_changes = self.tick_size_changes.saturating_add(rhs.tick_size_changes);
+        self.inline_rtds = self.inline_rtds.saturating_add(rhs.inline_rtds);
+        self.price_change_entries = self
+            .price_change_entries
+            .saturating_add(rhs.price_change_entries);
+        self.level_upserts = self.level_upserts.saturating_add(rhs.level_upserts);
+        self.level_deletes = self.level_deletes.saturating_add(rhs.level_deletes);
+        self.bbo_mismatches = self.bbo_mismatches.saturating_add(rhs.bbo_mismatches);
+        self.unseeded_deltas = self.unseeded_deltas.saturating_add(rhs.unseeded_deltas);
+        self.ignored = self.ignored.saturating_add(rhs.ignored);
+        self.unknown = self.unknown.saturating_add(rhs.unknown);
+        self.parse_errors = self.parse_errors.saturating_add(rhs.parse_errors);
+    }
 }
 
 struct ClobWindowMetrics {
@@ -1203,6 +1305,12 @@ struct ClobWindowMetrics {
     max_frame_bytes: usize,
     max_events_per_frame: usize,
     max_event_queue_depth: usize,
+    bbo_change_snapshots: u64,
+    coalesced_snapshots: u64,
+    wire: ClobWireCounters,
+    ws_sends: u64,
+    ws_send_errors: u64,
+    ws_send_max_us: u64,
 }
 
 impl ClobWindowMetrics {
@@ -1221,10 +1329,16 @@ impl ClobWindowMetrics {
             max_frame_bytes: 0,
             max_events_per_frame: 0,
             max_event_queue_depth: 0,
+            bbo_change_snapshots: 0,
+            coalesced_snapshots: 0,
+            wire: ClobWireCounters::default(),
+            ws_sends: 0,
+            ws_send_errors: 0,
+            ws_send_max_us: 0,
         }
     }
 
-    fn record_frame(&mut self, now: Instant, frame_bytes: usize, events: &[MarketEvent]) {
+    fn record_frame(&mut self, now: Instant, frame_bytes: usize, batch: &ClobParsedBatch) {
         if let Some(previous) = self.last_data_frame_at {
             crate::latency::record_ns(
                 "polymarket.ws.clob_data_frame_gap",
@@ -1234,9 +1348,17 @@ impl ClobWindowMetrics {
         self.last_data_frame_at = Some(now);
         self.data_frames = self.data_frames.saturating_add(1);
         self.frame_bytes = self.frame_bytes.saturating_add(frame_bytes as u64);
-        self.events = self.events.saturating_add(events.len() as u64);
         self.max_frame_bytes = self.max_frame_bytes.max(frame_bytes);
-        self.max_events_per_frame = self.max_events_per_frame.max(events.len());
+        self.max_events_per_frame = self.max_events_per_frame.max(batch.events.len());
+        self.bbo_change_snapshots = self
+            .bbo_change_snapshots
+            .saturating_add(batch.bbo_change_snapshots as u64);
+        self.wire.add(batch.wire);
+        self.record_events(&batch.events);
+    }
+
+    fn record_events(&mut self, events: &[MarketEvent]) {
+        self.events = self.events.saturating_add(events.len() as u64);
         for event in events {
             match event {
                 MarketEvent::OrderBook(_) => self.books += 1,
@@ -1248,6 +1370,19 @@ impl ClobWindowMetrics {
         }
     }
 
+    fn record_coalesced(&mut self, events: &[MarketEvent]) {
+        self.coalesced_snapshots = self.coalesced_snapshots.saturating_add(events.len() as u64);
+        self.record_events(events);
+    }
+
+    fn record_ws_send(&mut self, elapsed: Duration, failed: bool) {
+        self.ws_sends = self.ws_sends.saturating_add(1);
+        self.ws_send_errors = self.ws_send_errors.saturating_add(u64::from(failed));
+        self.ws_send_max_us = self
+            .ws_send_max_us
+            .max(elapsed.as_micros().min(u64::MAX as u128) as u64);
+    }
+
     fn record_queue_depth(&mut self, depth: usize) {
         self.max_event_queue_depth = self.max_event_queue_depth.max(depth);
     }
@@ -1257,7 +1392,7 @@ impl ClobWindowMetrics {
             .saturating_duration_since(self.window_started_at)
             .as_secs_f64();
         info!(
-            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={}",
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_mismatches={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
             window_secs,
             self.data_frames,
             self.frame_bytes,
@@ -1271,11 +1406,208 @@ impl ClobWindowMetrics {
             self.max_events_per_frame,
             queue_depth_now,
             self.max_event_queue_depth,
+            self.bbo_change_snapshots,
+            self.coalesced_snapshots,
+            self.wire.books,
+            self.wire.price_changes,
+            self.wire.best_bid_asks,
+            self.wire.trades,
+            self.wire.last_trade_prices,
+            self.wire.tick_size_changes,
+            self.wire.inline_rtds,
+            self.wire.price_change_entries,
+            self.wire.level_upserts,
+            self.wire.level_deletes,
+            self.wire.bbo_mismatches,
+            self.wire.unseeded_deltas,
+            self.wire.ignored,
+            self.wire.unknown,
+            self.wire.parse_errors,
+            self.ws_sends,
+            self.ws_send_errors,
+            self.ws_send_max_us,
         );
         let last_data_frame_at = self.last_data_frame_at;
         *self = Self::new(now);
         self.last_data_frame_at = last_data_frame_at;
     }
+}
+
+struct ClobBurstMetrics {
+    window_started_at: Instant,
+    frames: u64,
+    bytes: u64,
+    max_frame_bytes: usize,
+}
+
+impl ClobBurstMetrics {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            frames: 0,
+            bytes: 0,
+            max_frame_bytes: 0,
+        }
+    }
+
+    fn record_frame(&mut self, bytes: usize) {
+        self.frames = self.frames.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.max_frame_bytes = self.max_frame_bytes.max(bytes);
+    }
+
+    fn log_and_reset(&mut self, now: Instant, tcp: TcpSocketMetrics) {
+        info!(
+            "[clob_1s_metric] window_ms={} frames={} frame_bytes={} max_frame_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} so_rcvbuf={}",
+            now.saturating_duration_since(self.window_started_at).as_millis(),
+            self.frames,
+            self.bytes,
+            self.max_frame_bytes,
+            tcp.rcv_space.map(i64::from).unwrap_or(-1),
+            tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+            tcp.rcv_ssthresh.map(i64::from).unwrap_or(-1),
+            tcp.rcv_wscale.map(i64::from).unwrap_or(-1),
+            tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
+        );
+        *self = Self::new(now);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TcpSocketMetrics {
+    rcv_space: Option<u32>,
+    rcv_wnd: Option<u32>,
+    rcv_ssthresh: Option<u32>,
+    rcv_wscale: Option<u8>,
+    so_rcvbuf: Option<i32>,
+}
+
+#[cfg(unix)]
+fn clob_socket_fd(
+    stream: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<i32> {
+    match stream.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => Some(tcp.as_raw_fd()),
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0.as_raw_fd()),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn clob_socket_fd(
+    _stream: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<i32> {
+    None
+}
+
+fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
+    let Some(fd) = fd else {
+        return TcpSocketMetrics::default();
+    };
+    let mut metrics = TcpSocketMetrics::default();
+    #[cfg(unix)]
+    unsafe {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        ) == 0
+        {
+            metrics.so_rcvbuf = Some(value);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut info: libc::tcp_info = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut len,
+        ) == 0
+        {
+            metrics.rcv_space = Some(info.tcpi_rcv_space);
+            // libc exposes the recent tcpi_rcv_wnd extension on glibc;
+            // musl's portable tcp_info currently stops at tcpi_snd_wnd.
+            #[cfg(target_env = "gnu")]
+            {
+                let rcv_wnd_end = std::mem::offset_of!(libc::tcp_info, tcpi_rcv_wnd)
+                    + std::mem::size_of::<u32>();
+                if (len as usize) >= rcv_wnd_end {
+                    metrics.rcv_wnd = Some(info.tcpi_rcv_wnd);
+                }
+            }
+            metrics.rcv_ssthresh = Some(info.tcpi_rcv_ssthresh);
+            metrics.rcv_wscale = Some((info.tcpi_snd_rcv_wscale >> 4) & 0x0f);
+        }
+    }
+    metrics
+}
+
+#[derive(Debug)]
+struct ClobDiagnostic {
+    key: String,
+    detail: String,
+}
+
+#[derive(Default)]
+struct ClobDiagnosticSampler {
+    last_logged: HashMap<String, Instant>,
+    suppressed: HashMap<String, u64>,
+}
+
+impl ClobDiagnosticSampler {
+    fn observe(&mut self, now: Instant, diagnostic: ClobDiagnostic) {
+        let should_log = self.last_logged.get(&diagnostic.key).map_or(true, |last| {
+            now.saturating_duration_since(*last) >= CLOB_DIAGNOSTIC_SAMPLE_INTERVAL
+        });
+        if should_log {
+            let suppressed = self.suppressed.remove(&diagnostic.key).unwrap_or(0);
+            warn!(
+                "[clob_event_sample] kind={} suppressed={} detail={}",
+                diagnostic.key, suppressed, diagnostic.detail,
+            );
+            self.last_logged.insert(diagnostic.key, now);
+        } else {
+            *self.suppressed.entry(diagnostic.key).or_default() += 1;
+        }
+    }
+}
+
+async fn timed_clob_ws_send<S>(
+    sink: &mut S,
+    msg: Message,
+    stage: &'static str,
+    metrics: &mut ClobWindowMetrics,
+) -> std::result::Result<(), String>
+where
+    S: futures_util::SinkExt<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    let started_at = Instant::now();
+    let result = ws_send(sink, msg).await;
+    let elapsed = started_at.elapsed();
+    crate::latency::record_ns(stage, elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    metrics.record_ws_send(elapsed, result.is_err());
+    if elapsed >= Duration::from_millis(10) {
+        warn!(
+            "[clob_send_metric] stage={} elapsed_us={} failed={}",
+            stage,
+            elapsed.as_micros(),
+            result.is_err(),
+        );
+    }
+    result
 }
 
 impl ClobLifecycle {
@@ -1288,7 +1620,11 @@ impl ClobLifecycle {
         self.ready = false;
     }
 
-    fn disconnected(&mut self) -> bool {
+    fn disconnected(&mut self, now: Instant, reason: &str) -> bool {
+        if self.not_ready_since.is_none() {
+            self.not_ready_since = Some(now);
+            self.not_ready_reason = Some(reason.to_string());
+        }
         if self.not_ready_announced {
             false
         } else {
@@ -1298,56 +1634,30 @@ impl ClobLifecycle {
         }
     }
 
-    fn valid_market_data(&mut self) -> bool {
+    fn valid_market_data(&mut self, now: Instant) -> Option<ClobReadyTransition> {
         if self.subscribed_once && !self.ready {
             self.ready = true;
             self.not_ready_announced = false;
-            true
+            Some(ClobReadyTransition {
+                recovery: self
+                    .not_ready_since
+                    .take()
+                    .map(|started| now.saturating_duration_since(started)),
+                reason: self.not_ready_reason.take(),
+            })
         } else {
-            false
+            None
         }
     }
 }
 
-fn clob_readiness_source(event: &MarketEvent, tokens: &[String]) -> Option<&'static str> {
-    match event {
-        MarketEvent::OrderBook(book) => (tokens.iter().any(|token| token == &book.symbol)
-            && (book.best_bid().is_some() || book.best_ask().is_some()))
-        .then_some("order_book"),
-        // `make_quote_event` has already rejected missing, non-finite,
-        // out-of-range, crossed, or one-sided best_bid_ask messages.
-        MarketEvent::Quote(quote) => tokens
-            .iter()
-            .any(|token| token == &quote.symbol)
-            .then_some("best_bid_ask"),
-        _ => None,
-    }
-}
-
-fn is_valid_subscribed_clob_event(event: &MarketEvent, tokens: &[String]) -> bool {
+fn is_usable_subscribed_book_event(event: &MarketEvent, tokens: &[String]) -> bool {
     let symbol = match event {
         MarketEvent::OrderBook(book) => &book.symbol,
-        MarketEvent::Trade(trade) => &trade.symbol,
         MarketEvent::Quote(quote) => &quote.symbol,
-        MarketEvent::TickSizeChange(change) => &change.symbol,
         _ => return false,
     };
     tokens.iter().any(|token| token == symbol)
-}
-
-fn record_valid_clob_topic_frame(
-    health: &mut WsHealth,
-    events: &[MarketEvent],
-    tokens: &[String],
-    received_at: Instant,
-) -> bool {
-    let accepted = events
-        .iter()
-        .any(|event| is_valid_subscribed_clob_event(event, tokens));
-    if accepted {
-        health.record_topic_frame(received_at);
-    }
-    accepted
 }
 
 fn has_complete_clob_subscription(tokens: &[String]) -> bool {
@@ -1374,7 +1684,7 @@ fn announce_clob_not_ready(
     reason: impl Into<String>,
 ) {
     let reason = reason.into();
-    if lifecycle.disconnected() {
+    if lifecycle.disconnected(Instant::now(), &reason) {
         let _ = event_tx.send(MarketEvent::Disconnected {
             exchange: Exchange::Polymarket,
             reason,
@@ -1382,15 +1692,67 @@ fn announce_clob_not_ready(
     }
 }
 
+fn forward_clob_events(
+    events: Vec<MarketEvent>,
+    event_tx: &crossbeam_channel::Sender<MarketEvent>,
+    lifecycle: &mut ClobLifecycle,
+    health: &mut WsHealth,
+    diagnostics: &mut ClobWindowMetrics,
+    books: &ClobLocalBooks,
+    tokens: &[String],
+    now: Instant,
+) -> bool {
+    let has_usable_book = events
+        .iter()
+        .any(|event| is_usable_subscribed_book_event(event, tokens));
+    if has_usable_book {
+        health.record_usable_book(now);
+    }
+    for event in events {
+        if event_tx.send(event).is_err() {
+            return false;
+        }
+    }
+    diagnostics.record_queue_depth(event_tx.len());
+
+    // The local L2 must be seeded for every subscribed token before the
+    // strategy is allowed back into READY. A best_bid_ask push alone cannot
+    // establish the quantities needed to apply subsequent price deltas.
+    if has_usable_book && books.has_all_seeded(tokens) {
+        if let Some(transition) = lifecycle.valid_market_data(now) {
+            let recovery_ms = transition
+                .recovery
+                .map(|duration| duration.as_secs_f64() * 1_000.0);
+            info!(
+                "[Polymarket] CLOB READY after seeded local L2 recovery_ms={} reason={}",
+                recovery_ms
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "initial".to_string()),
+                transition.reason.as_deref().unwrap_or("initial_startup"),
+            );
+            if event_tx
+                .send(MarketEvent::Connected {
+                    exchange: Exchange::Polymarket,
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 async fn clob_ws_task(
-    initial_tokens: Vec<String>,
+    initial_subscription: ClobSubscription,
     event_tx: crossbeam_channel::Sender<MarketEvent>,
     mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
     subscribed_once: Arc<AtomicBool>,
 ) {
-    let mut tokens = initial_tokens;
+    let mut subscription = initial_subscription;
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    let mut diagnostic_sampler = ClobDiagnosticSampler::default();
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
         subscribed_once: was_previously_subscribed,
@@ -1399,6 +1761,8 @@ async fn clob_ws_task(
         // the feed in NOT_READY. Preserve that recovery state so this task
         // still waits for a valid book.
         not_ready_announced: was_previously_subscribed,
+        not_ready_since: was_previously_subscribed.then(Instant::now),
+        not_ready_reason: was_previously_subscribed.then(|| "engine reconnect".to_string()),
     };
     // Guard: if we enter with shutdown already latched true we'll exit
     // immediately below — surface it so the silent-reconnect-loop failure
@@ -1416,8 +1780,8 @@ async fn clob_ws_task(
         // we don't churn through stale token lists if rotations piled up.
         loop {
             match ctrl_rx.try_recv() {
-                Ok(WsCtrl::Resubscribe(new_tokens)) => {
-                    tokens = new_tokens;
+                Ok(WsCtrl::Resubscribe(new_subscription)) => {
+                    subscription = new_subscription;
                 }
                 Ok(WsCtrl::Shutdown) => break 'outer,
                 Err(_) => break,
@@ -1427,7 +1791,7 @@ async fn clob_ws_task(
         info!(
             "[Polymarket] Connecting to {} ({} tokens)",
             POLYMARKET_WS_URL,
-            tokens.len()
+            subscription.tokens.len()
         );
         let stream = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
@@ -1472,17 +1836,27 @@ async fn clob_ws_task(
             }
         };
         backoff.reset();
+        let tcp_fd = clob_socket_fd(&stream);
         let (mut write, mut read) = stream.split();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
         let mut diagnostics = ClobWindowMetrics::new(connected_at);
+        let mut burst_metrics = ClobBurstMetrics::new(connected_at);
+        let mut books = ClobLocalBooks::new(&subscription.canonical_events);
 
         // Align with the official CLOB SDK: lowercase channel `"market"`
         // (the user channel already uses lowercase `"user"`; the server is
         // case-tolerant) plus `custom_feature_enabled`. Our frame parser
         // drops unknown messages/fields silently, so this can only add data.
-        let sub_msg = clob_subscription_message(&tokens);
-        if let Err(e) = ws_send(&mut write, Message::Text(sub_msg.to_string())).await {
+        let sub_msg = clob_subscription_message(&subscription.tokens);
+        if let Err(e) = timed_clob_ws_send(
+            &mut write,
+            Message::Text(sub_msg.to_string()),
+            "polymarket.ws.clob_send.subscribe",
+            &mut diagnostics,
+        )
+        .await
+        {
             announce_clob_not_ready(
                 &event_tx,
                 &mut lifecycle,
@@ -1491,8 +1865,12 @@ async fn clob_ws_task(
             warn!("[Polymarket] WS subscribe send failed: {}", e);
             continue;
         }
-        info!("[Polymarket] Subscribed to {} tokens", tokens.len());
-        if !has_complete_clob_subscription(&tokens) {
+        info!(
+            "[Polymarket] Subscribed to {} tokens across {} canonical events",
+            subscription.tokens.len(),
+            subscription.canonical_events.len(),
+        );
+        if !has_complete_clob_subscription(&subscription.tokens) {
             announce_clob_not_ready(
                 &event_tx,
                 &mut lifecycle,
@@ -1510,6 +1888,12 @@ async fn clob_ws_task(
         ping_interval.tick().await; // consume immediate tick
         let mut health_interval = tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
         health_interval.tick().await;
+        let mut burst_interval = tokio::time::interval(CLOB_BURST_METRIC_INTERVAL);
+        burst_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        burst_interval.tick().await;
+        let mut coalesce_interval = tokio::time::interval(CLOB_BOOK_COALESCE_INTERVAL);
+        coalesce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        coalesce_interval.tick().await;
         let mut scheduler_probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
         scheduler_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         scheduler_probe.tick().await;
@@ -1520,15 +1904,20 @@ async fn clob_ws_task(
 
                 ctrl = ctrl_rx.recv() => {
                     match ctrl {
-                        Some(WsCtrl::Resubscribe(new_tokens)) => {
-                            tokens = new_tokens;
+                        Some(WsCtrl::Resubscribe(new_subscription)) => {
+                            subscription = new_subscription;
                             announce_clob_not_ready(
                                 &event_tx,
                                 &mut lifecycle,
                                 "CLOB resubscribe requested",
                             );
-                            info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", tokens.len());
-                            let _ = ws_send(&mut write, Message::Close(None)).await;
+                            info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", subscription.tokens.len());
+                            let _ = timed_clob_ws_send(
+                                &mut write,
+                                Message::Close(None),
+                                "polymarket.ws.clob_send.close",
+                                &mut diagnostics,
+                            ).await;
                             continue 'outer;
                         }
                         Some(WsCtrl::Shutdown) | None => break 'outer,
@@ -1546,7 +1935,12 @@ async fn clob_ws_task(
                     let now = Instant::now();
                     // Send both the CLOB application-level text heartbeat and
                     // a WebSocket protocol Ping frame every 5s.
-                    if let Err(e) = ws_send(&mut write, Message::Text("PING".to_string())).await {
+                    if let Err(e) = timed_clob_ws_send(
+                        &mut write,
+                        Message::Text("PING".to_string()),
+                        "polymarket.ws.clob_send.heartbeat_text",
+                        &mut diagnostics,
+                    ).await {
                         announce_clob_not_ready(
                             &event_tx,
                             &mut lifecycle,
@@ -1555,11 +1949,16 @@ async fn clob_ws_task(
                         warn!(
                             "[Polymarket] PING send failed: {}; {}",
                             e,
-                            health.transport_summary(now),
+                            health.clob_summary(now),
                         );
                         break;
                     }
-                    if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
+                    if let Err(e) = timed_clob_ws_send(
+                        &mut write,
+                        Message::Ping(Vec::new()),
+                        "polymarket.ws.clob_send.heartbeat_frame",
+                        &mut diagnostics,
+                    ).await {
                         announce_clob_not_ready(
                             &event_tx,
                             &mut lifecycle,
@@ -1568,10 +1967,35 @@ async fn clob_ws_task(
                         warn!(
                             "[Polymarket] Frame Ping send failed: {}; {}",
                             e,
-                            health.transport_summary(now),
+                            health.clob_summary(now),
                         );
                         break;
                     }
+                }
+
+                _ = coalesce_interval.tick() => {
+                    let now = Instant::now();
+                    let events = books.flush_due(now, now_ns());
+                    if !events.is_empty() {
+                        diagnostics.record_coalesced(&events);
+                        if !forward_clob_events(
+                            events,
+                            &event_tx,
+                            &mut lifecycle,
+                            &mut health,
+                            &mut diagnostics,
+                            &books,
+                            &subscription.tokens,
+                            now,
+                        ) {
+                            break 'outer;
+                        }
+                    }
+                }
+
+                _ = burst_interval.tick() => {
+                    let now = Instant::now();
+                    burst_metrics.log_and_reset(now, sample_tcp_socket(tcp_fd));
                 }
 
                 _ = health_interval.tick() => {
@@ -1580,7 +2004,12 @@ async fn clob_ws_task(
                     if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
                         warn!(
                             "[Polymarket] CLOB topic silent; {}",
-                            health.transport_summary(now),
+                            health.clob_summary(now),
+                        );
+                    } else if health.usable_book_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
+                        warn!(
+                            "[Polymarket] CLOB topic active but usable book stale; {}",
+                            health.clob_summary(now),
                         );
                     }
                     // Topic-level stall watchdog. Only meaningful while we
@@ -1590,7 +2019,7 @@ async fn clob_ws_task(
                     // `has_complete_clob_subscription` is the in-task equivalent
                     // of that check, so reuse it rather than churning the socket
                     // every 90 s while nothing is trading.
-                    if has_complete_clob_subscription(&tokens)
+                    if has_complete_clob_subscription(&subscription.tokens)
                         && health.topic_is_stale(now, CLOB_TOPIC_STALL_THRESHOLD)
                     {
                         announce_clob_not_ready(
@@ -1605,7 +2034,7 @@ async fn clob_ws_task(
                             "[Polymarket] CLOB no topic frame for {:.0}s (topic stall watchdog) \
                              — reconnecting; {}",
                             CLOB_TOPIC_STALL_THRESHOLD.as_secs_f64(),
-                            health.transport_summary(now),
+                            health.clob_summary(now),
                         );
                         break;
                     }
@@ -1624,7 +2053,7 @@ async fn clob_ws_task(
                             warn!(
                                 "[Polymarket] WS read error: {} — reconnecting; {}",
                                 e,
-                                health.transport_summary(now),
+                                health.clob_summary(now),
                             );
                             break;
                         }
@@ -1637,7 +2066,7 @@ async fn clob_ws_task(
                             let now = Instant::now();
                             warn!(
                                 "[Polymarket] WS closed — reconnecting; {}",
-                                health.transport_summary(now),
+                                health.clob_summary(now),
                             );
                             break;
                         }
@@ -1654,7 +2083,7 @@ async fn clob_ws_task(
                             warn!(
                                 "[Polymarket] CLOB no raw frame for {:.0}s (stall watchdog) — reconnecting; {}",
                                 CLOB_STALE_THRESHOLD.as_secs_f64(),
-                                health.transport_summary(now),
+                                health.clob_summary(now),
                             );
                             break;
                         }
@@ -1678,40 +2107,41 @@ async fn clob_ws_task(
                                 continue;
                             }
                             if body.eq_ignore_ascii_case("PING") {
-                                let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
+                                let _ = timed_clob_ws_send(
+                                    &mut write,
+                                    Message::Text("PONG".to_string()),
+                                    "polymarket.ws.clob_send.text_pong",
+                                    &mut diagnostics,
+                                ).await;
                                 continue;
                             }
                             let t_parse = crate::latency::Instant::now();
-                            let events = parse_clob_frame(&text);
-                            diagnostics.record_frame(received_at, text.len(), &events);
-                            record_valid_clob_topic_frame(
-                                &mut health, &events, &tokens, received_at,
+                            let batch = process_clob_frame(
+                                &text,
+                                &mut books,
+                                &subscription.tokens,
+                                received_at,
+                                now_ns(),
                             );
-                            let readiness_source = events
-                                .iter()
-                                .find_map(|event| clob_readiness_source(event, &tokens));
-                            for event in events {
-                                if event_tx.send(event).is_err() {
-                                    break 'outer; // engine gone
-                                }
+                            burst_metrics.record_frame(text.len());
+                            diagnostics.record_frame(received_at, text.len(), &batch);
+                            if batch.recognized_topic {
+                                health.record_topic_frame(received_at);
                             }
-                            diagnostics.record_queue_depth(event_tx.len());
-                            // Queue READY after the qualifying market-data
-                            // event, so observers cannot see a recovered stream
-                            // before a usable full book or two-sided L1 was
-                            // delivered to the engine queue.
-                            if let Some(source) = readiness_source {
-                                if lifecycle.valid_market_data() {
-                                    info!(
-                                        "[Polymarket] CLOB READY after valid {}",
-                                        source,
-                                    );
-                                    if event_tx.send(MarketEvent::Connected {
-                                        exchange: Exchange::Polymarket,
-                                    }).is_err() {
-                                        break 'outer;
-                                    }
-                                }
+                            for diagnostic in batch.diagnostics {
+                                diagnostic_sampler.observe(received_at, diagnostic);
+                            }
+                            if !forward_clob_events(
+                                batch.events,
+                                &event_tx,
+                                &mut lifecycle,
+                                &mut health,
+                                &mut diagnostics,
+                                &books,
+                                &subscription.tokens,
+                                received_at,
+                            ) {
+                                break 'outer;
                             }
                             // Parse + dispatch latency for the whole
                             // CLOB WS frame (simd-json + typed deser +
@@ -1719,9 +2149,16 @@ async fn clob_ws_task(
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
                         }
                         Message::Ping(payload) => {
-                            let _ = ws_send(&mut write, Message::Pong(payload)).await;
+                            health.record_raw_frame(received_at);
+                            let _ = timed_clob_ws_send(
+                                &mut write,
+                                Message::Pong(payload),
+                                "polymarket.ws.clob_send.frame_pong",
+                                &mut diagnostics,
+                            ).await;
                         }
                         Message::Pong(_) => {
+                            health.record_raw_frame(received_at);
                             health.record_pong(received_at);
                         }
                         Message::Close(reason) => {
@@ -1730,14 +2167,26 @@ async fn clob_ws_task(
                                 &mut lifecycle,
                                 "Server closed WS",
                             );
+                            match reason.as_ref() {
+                                Some(frame) => warn!(
+                                    "[clob_close_metric] code={:?} reason={:?} {}",
+                                    frame.code,
+                                    frame.reason,
+                                    health.clob_summary(received_at),
+                                ),
+                                None => warn!(
+                                    "[clob_close_metric] code=none reason=none {}",
+                                    health.clob_summary(received_at),
+                                ),
+                            }
                             warn!(
                                 "[Polymarket] Server closed WS {:?} — reconnecting; {}",
                                 reason,
-                                health.transport_summary(received_at),
+                                health.clob_summary(received_at),
                             );
                             break;
                         }
-                        _ => {}
+                        _ => health.record_raw_frame(received_at),
                     }
                 }
             }
@@ -2052,9 +2501,10 @@ struct BookFields {
     bids: Vec<BookLevel>,
     #[serde(default)]
     asks: Vec<BookLevel>,
-    /// Polymarket emits timestamps as stringified ms (e.g. "1730000000123").
+    /// Polymarket normally emits stringified milliseconds; accept JSON
+    /// numbers too so server timestamps always drive event-level ordering.
     #[serde(default)]
-    timestamp: Option<String>,
+    timestamp: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2108,6 +2558,46 @@ struct BestBidAskFields {
     timestamp: Option<serde_json::Value>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum WireDecimal {
+    String(String),
+    Number(serde_json::Number),
+}
+
+impl WireDecimal {
+    fn decimal(&self) -> Option<Decimal> {
+        match self {
+            Self::String(value) => Decimal::from_str(value.trim()).ok(),
+            Self::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PriceChangeEntry {
+    asset_id: String,
+    price: WireDecimal,
+    size: WireDecimal,
+    side: String,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    best_bid: Option<WireDecimal>,
+    #[serde(default)]
+    best_ask: Option<WireDecimal>,
+}
+
+#[derive(serde::Deserialize)]
+struct PriceChangeFields {
+    #[serde(default)]
+    market: Option<String>,
+    #[serde(default)]
+    price_changes: Vec<PriceChangeEntry>,
+    #[serde(default)]
+    timestamp: Option<serde_json::Value>,
+}
+
 /// Inline RTDS spot-price record seen on the CLOB socket (distinct from
 /// the dedicated RTDS WS schema, which wraps in `topic`/`payload`).
 #[derive(serde::Deserialize)]
@@ -2136,7 +2626,7 @@ enum TaggedMessage {
     Trade(TradeFields),
     LastTradePrice(TradeFields),
     TickSizeChange(TickSizeFields),
-    PriceChange {},
+    PriceChange(PriceChangeFields),
     BestBidAsk(BestBidAskFields),
 }
 
@@ -2147,9 +2637,8 @@ enum ClobFrame {
     Tagged(TaggedMessage),
     /// Matches RTDS records inlined on the CLOB socket (no event_type).
     Rtds(InlineRtdsFields),
-    /// Anything else — silently dropped.
-    #[allow(dead_code)]
-    Unknown(serde::de::IgnoredAny),
+    /// Preserve unexpected values for rate-limited event-type sampling.
+    Unknown(serde_json::Value),
 }
 
 /// Deserialize a field that may arrive as a number or a string-encoded
@@ -2178,126 +2667,625 @@ where
     })
 }
 
-/// Parse a whole CLOB WS text frame (single object OR array of objects)
-/// using simd-json. Returns an owned Vec of MarketEvents to emit.
-fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    // simd-json mutates the input buffer in place, so we need an owned
-    // Vec<u8>. This is one allocation per frame — cheaper than the
-    // multiple HashMap allocations serde_json::Value does internally.
-    let mut buf = text.as_bytes().to_vec();
-    // Peek the first non-whitespace byte to decide array vs single.
-    let first = buf.iter().copied().find(|b| !b.is_ascii_whitespace());
-    let is_array = first == Some(b'[');
-
-    let frames: Vec<ClobFrame> = if is_array {
-        match simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut buf) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "[Polymarket] simd-json parse (array) failed: {} (raw: {})",
-                    e,
-                    &text[..text.len().min(200)]
-                );
-                return Vec::new();
-            }
-        }
-    } else {
-        match simd_json::serde::from_slice::<ClobFrame>(&mut buf) {
-            Ok(v) => vec![v],
-            Err(e) => {
-                warn!(
-                    "[Polymarket] simd-json parse (single) failed: {} (raw: {})",
-                    e,
-                    &text[..text.len().min(200)]
-                );
-                return Vec::new();
-            }
-        }
-    };
-
-    let now = now_ns();
-    let mut out = Vec::with_capacity(frames.len());
-    for f in frames {
-        match f {
-            ClobFrame::Tagged(TaggedMessage::Book(b)) => {
-                if let Some(event) = make_book_event(b, now) {
-                    out.push(event);
-                }
-            }
-            ClobFrame::Tagged(TaggedMessage::Trade(t))
-            | ClobFrame::Tagged(TaggedMessage::LastTradePrice(t)) => {
-                if let Some(e) = make_trade_event(t, now) {
-                    out.push(e);
-                }
-            }
-            ClobFrame::Tagged(TaggedMessage::TickSizeChange(t)) => {
-                if let Some(event) = make_tick_size_event(t, now) {
-                    out.push(event);
-                }
-            }
-            ClobFrame::Tagged(TaggedMessage::PriceChange {}) => { /* ignored */ }
-            ClobFrame::Tagged(TaggedMessage::BestBidAsk(q)) => {
-                let exchange_ts_ns = timestamp_value_to_ns(q.timestamp.as_ref(), now);
-                if let Some(event) =
-                    make_quote_event(q.asset_id, q.best_bid, q.best_ask, exchange_ts_ns, now)
-                {
-                    out.push(event);
-                }
-            }
-            ClobFrame::Rtds(r) => {
-                if let Some(e) = make_inline_rtds_event(r, now) {
-                    out.push(e);
-                }
-            }
-            ClobFrame::Unknown(_) => { /* ignored */ }
-        }
-    }
-    out
+#[derive(Debug, Default)]
+struct ClobParsedBatch {
+    events: Vec<MarketEvent>,
+    wire: ClobWireCounters,
+    recognized_topic: bool,
+    bbo_change_snapshots: usize,
+    diagnostics: Vec<ClobDiagnostic>,
 }
 
-fn make_book_event(b: BookFields, now: u64) -> Option<MarketEvent> {
-    let parse_side = |levels: Vec<BookLevel>| -> Option<Vec<PriceLevel>> {
-        levels
-            .into_iter()
-            .map(|l| {
-                let price: f64 = l.price.parse().ok()?;
-                let quantity: f64 = l.size.parse().ok()?;
-                if !price.is_finite()
-                    || !quantity.is_finite()
-                    || price <= 0.0
-                    || price >= 1.0
-                    || quantity <= 0.0
-                {
-                    return None;
-                }
-                Some(PriceLevel { price, quantity })
-            })
-            .collect()
-    };
-    let bids = parse_side(b.bids)?;
-    let asks = parse_side(b.asks)?;
-    let best_bid = bids.iter().map(|level| level.price).reduce(f64::max);
-    let best_ask = asks.iter().map(|level| level.price).reduce(f64::min);
-    if matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask) {
-        return None;
+#[derive(Debug, Clone)]
+struct ClobCanonicalRole {
+    condition_id: String,
+    up_token: String,
+    is_down: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClobBookVersion {
+    exchange_timestamp_ns: u64,
+    wire_sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClobLocalBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    exchange_timestamp_ns: u64,
+    wire_sequence: u64,
+    dirty_since: Option<Instant>,
+}
+
+impl ClobLocalBook {
+    fn top(&self) -> (Option<Decimal>, Option<Decimal>) {
+        (
+            self.bids.keys().next_back().copied(),
+            self.asks.keys().next().copied(),
+        )
     }
-    let exchange_ts_ns = b
-        .timestamp
-        .as_deref()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|ms| ms.saturating_mul(1_000_000))
-        .unwrap_or(now);
-    Some(MarketEvent::OrderBook(OrderBookSnapshot {
-        exchange: Exchange::Polymarket,
-        symbol: b.asset_id,
-        bids,
-        asks,
-        exchange_timestamp_ns: exchange_ts_ns,
-        local_timestamp_ns: now,
-    }))
+
+    fn is_semantically_valid(&self) -> bool {
+        !matches!((self.top().0, self.top().1), (Some(bid), Some(ask)) if bid >= ask)
+    }
+
+    fn snapshot(
+        &self,
+        symbol: String,
+        mirror_down: bool,
+        local_now: u64,
+    ) -> Option<OrderBookSnapshot> {
+        let level = |price: Decimal, quantity: Decimal| {
+            Some(PriceLevel {
+                price: price.to_f64()?,
+                quantity: quantity.to_f64()?,
+            })
+        };
+        let (bids, asks): (Vec<_>, Vec<_>) = if mirror_down {
+            // A bid to buy Down is an ask to sell Up at 1-p; a Down ask
+            // maps to an Up bid. Iteration order remains best-to-worst after
+            // the complement transformation.
+            let bids = self
+                .asks
+                .iter()
+                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity))
+                .collect::<Option<Vec<_>>>()?;
+            let asks = self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity))
+                .collect::<Option<Vec<_>>>()?;
+            (bids, asks)
+        } else {
+            let bids = self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, quantity)| level(*price, *quantity))
+                .collect::<Option<Vec<_>>>()?;
+            let asks = self
+                .asks
+                .iter()
+                .map(|(price, quantity)| level(*price, *quantity))
+                .collect::<Option<Vec<_>>>()?;
+            (bids, asks)
+        };
+        Some(OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol,
+            bids,
+            asks,
+            exchange_timestamp_ns: self.exchange_timestamp_ns,
+            local_timestamp_ns: local_now,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClobLocalBooks {
+    token_books: HashMap<String, ClobLocalBook>,
+    roles: HashMap<String, ClobCanonicalRole>,
+    canonical_versions: HashMap<String, ClobBookVersion>,
+    canonical_books: HashMap<String, OrderBookSnapshot>,
+    quote_versions: HashMap<String, ClobBookVersion>,
+    wire_sequence: u64,
+}
+
+impl ClobLocalBooks {
+    fn new(specs: &[CanonicalEventSpec]) -> Self {
+        let mut state = Self::default();
+        for spec in specs {
+            state.roles.insert(
+                spec.up_token.clone(),
+                ClobCanonicalRole {
+                    condition_id: spec.condition_id.clone(),
+                    up_token: spec.up_token.clone(),
+                    is_down: false,
+                },
+            );
+            state.roles.insert(
+                spec.down_token.clone(),
+                ClobCanonicalRole {
+                    condition_id: spec.condition_id.clone(),
+                    up_token: spec.up_token.clone(),
+                    is_down: true,
+                },
+            );
+        }
+        state
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.wire_sequence = self.wire_sequence.saturating_add(1);
+        self.wire_sequence
+    }
+
+    fn has_all_seeded(&self, tokens: &[String]) -> bool {
+        !tokens.is_empty()
+            && tokens
+                .iter()
+                .all(|token| self.token_books.contains_key(token))
+    }
+
+    fn canonicalize_token(&mut self, token: &str, local_now: u64) -> Option<MarketEvent> {
+        let book = self.token_books.get(token)?;
+        if !book.is_semantically_valid() {
+            return None;
+        }
+        let version = ClobBookVersion {
+            exchange_timestamp_ns: book.exchange_timestamp_ns,
+            wire_sequence: book.wire_sequence,
+        };
+        let role = self.roles.get(token).cloned();
+        let (condition_id, symbol, mirror_down) = match role {
+            Some(role) => (Some(role.condition_id), role.up_token, role.is_down),
+            None => (None, token.to_string(), false),
+        };
+        if let Some(condition_id) = condition_id.as_ref() {
+            if self
+                .canonical_versions
+                .get(condition_id)
+                .is_some_and(|current| version < *current)
+            {
+                return None;
+            }
+        }
+        let snapshot = book.snapshot(symbol, mirror_down, local_now)?;
+        if let Some(condition_id) = condition_id {
+            self.canonical_versions
+                .insert(condition_id.clone(), version);
+            self.canonical_books.insert(condition_id, snapshot.clone());
+        }
+        Some(MarketEvent::OrderBook(snapshot))
+    }
+
+    fn canonical_snapshot_for_token(&self, token: &str) -> Option<MarketEvent> {
+        let role = self.roles.get(token)?;
+        self.canonical_books
+            .get(&role.condition_id)
+            .cloned()
+            .map(MarketEvent::OrderBook)
+    }
+
+    fn canonicalize_quote(&mut self, mut quote: QuoteTick) -> Option<MarketEvent> {
+        let sequence = self.next_sequence();
+        let Some(role) = self.roles.get(&quote.symbol).cloned() else {
+            return Some(MarketEvent::Quote(quote));
+        };
+        let version = ClobBookVersion {
+            exchange_timestamp_ns: quote.exchange_timestamp_ns,
+            wire_sequence: sequence,
+        };
+        if self
+            .quote_versions
+            .get(&role.condition_id)
+            .is_some_and(|current| version < *current)
+        {
+            return None;
+        }
+        if role.is_down {
+            let down_bid = quote.bid_price;
+            let down_ask = quote.ask_price;
+            quote.bid_price = 1.0 - down_ask;
+            quote.ask_price = 1.0 - down_bid;
+        }
+        quote.symbol = role.up_token;
+        self.quote_versions.insert(role.condition_id, version);
+        Some(MarketEvent::Quote(quote))
+    }
+
+    fn apply_book(
+        &mut self,
+        fields: BookFields,
+        received_at: Instant,
+        local_now: u64,
+    ) -> std::result::Result<Option<MarketEvent>, String> {
+        let symbol = fields.asset_id;
+        if symbol.trim().is_empty() {
+            return Err("book has empty asset_id".to_string());
+        }
+        let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+        if self
+            .token_books
+            .get(&symbol)
+            .is_some_and(|current| exchange_timestamp_ns < current.exchange_timestamp_ns)
+        {
+            return Err(format!(
+                "stale book token={} incoming_ts={} current_ts={}",
+                symbol, exchange_timestamp_ns, self.token_books[&symbol].exchange_timestamp_ns,
+            ));
+        }
+        let parse_levels = |levels: Vec<BookLevel>| {
+            let mut parsed = BTreeMap::new();
+            for level in levels {
+                let price = Decimal::from_str(level.price.trim())
+                    .map_err(|_| format!("invalid price {}", level.price))?;
+                let size = Decimal::from_str(level.size.trim())
+                    .map_err(|_| format!("invalid size {}", level.size))?;
+                if price <= Decimal::ZERO || price >= Decimal::ONE || size <= Decimal::ZERO {
+                    return Err(format!("invalid level price={} size={}", price, size));
+                }
+                parsed.insert(price, size);
+            }
+            Ok(parsed)
+        };
+        let bids = parse_levels(fields.bids)?;
+        let asks = parse_levels(fields.asks)?;
+        let sequence = self.next_sequence();
+        let book = ClobLocalBook {
+            bids,
+            asks,
+            exchange_timestamp_ns,
+            wire_sequence: sequence,
+            dirty_since: None,
+        };
+        if !book.is_semantically_valid() {
+            return Err(format!("crossed book token={symbol}"));
+        }
+        self.token_books.insert(symbol.clone(), book);
+        let _ = received_at;
+        // An initial snapshot for the complementary token can be older than
+        // the event-level Up snapshot already accepted. Keep the newer event
+        // book, but re-emit it once so completion of initial L2 seeding can
+        // transition the feed to READY without letting the old Down book win.
+        Ok(self
+            .canonicalize_token(&symbol, local_now)
+            .or_else(|| self.canonical_snapshot_for_token(&symbol)))
+    }
+
+    fn apply_price_change(
+        &mut self,
+        fields: PriceChangeFields,
+        received_at: Instant,
+        local_now: u64,
+        counters: &mut ClobWireCounters,
+        diagnostics: &mut Vec<ClobDiagnostic>,
+    ) -> (Vec<MarketEvent>, usize) {
+        let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+        let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
+
+        for change in fields.price_changes {
+            counters.price_change_entries = counters.price_change_entries.saturating_add(1);
+            let token = change.asset_id;
+            let Some(price) = change.price.decimal() else {
+                counters.ignored = counters.ignored.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "invalid_price_change".to_string(),
+                    detail: format!("token={token} reason=invalid_price"),
+                });
+                continue;
+            };
+            let Some(size) = change.size.decimal() else {
+                counters.ignored = counters.ignored.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "invalid_price_change".to_string(),
+                    detail: format!("token={token} reason=invalid_size"),
+                });
+                continue;
+            };
+            if price <= Decimal::ZERO || price >= Decimal::ONE || size < Decimal::ZERO {
+                counters.ignored = counters.ignored.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "invalid_price_change".to_string(),
+                    detail: format!("token={token} price={price} size={size}"),
+                });
+                continue;
+            }
+            let Some(current_book) = self.token_books.get(&token) else {
+                counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
+                counters.ignored = counters.ignored.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "unseeded_price_change".to_string(),
+                    detail: format!("token={token} ts={exchange_timestamp_ns}"),
+                });
+                continue;
+            };
+            if exchange_timestamp_ns < current_book.exchange_timestamp_ns {
+                counters.ignored = counters.ignored.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "stale_price_change".to_string(),
+                    detail: format!(
+                        "token={token} incoming_ts={} current_ts={}",
+                        exchange_timestamp_ns, current_book.exchange_timestamp_ns,
+                    ),
+                });
+                continue;
+            }
+            let sequence = self.next_sequence();
+            let book = self
+                .token_books
+                .get_mut(&token)
+                .expect("book existence checked above");
+            if !before.contains_key(&token) {
+                before.insert(token.clone(), book.top());
+            }
+            let side = change.side.trim().to_ascii_uppercase();
+            let levels = match side.as_str() {
+                "BUY" => &mut book.bids,
+                "SELL" => &mut book.asks,
+                _ => {
+                    counters.ignored = counters.ignored.saturating_add(1);
+                    diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change".to_string(),
+                        detail: format!("token={token} reason=unknown_side side={side}"),
+                    });
+                    continue;
+                }
+            };
+            if size == Decimal::ZERO {
+                levels.remove(&price);
+                counters.level_deletes = counters.level_deletes.saturating_add(1);
+            } else {
+                levels.insert(price, size);
+                counters.level_upserts = counters.level_upserts.saturating_add(1);
+            }
+            book.exchange_timestamp_ns = exchange_timestamp_ns;
+            // Assign sequence per entry, not per token after the frame. This
+            // preserves the server's original price_changes[] order even when
+            // Up and Down entries for one event are interleaved.
+            book.wire_sequence = sequence;
+            book.dirty_since.get_or_insert(received_at);
+            let _ = change.hash;
+
+            let expected_bid = change.best_bid.as_ref().and_then(WireDecimal::decimal);
+            let expected_ask = change.best_ask.as_ref().and_then(WireDecimal::decimal);
+            let actual = book.top();
+            if (expected_bid.is_some() && expected_bid != actual.0)
+                || (expected_ask.is_some() && expected_ask != actual.1)
+            {
+                counters.bbo_mismatches = counters.bbo_mismatches.saturating_add(1);
+                diagnostics.push(ClobDiagnostic {
+                    key: "price_change_bbo_mismatch".to_string(),
+                    detail: format!(
+                        "token={token} expected_bid={expected_bid:?} expected_ask={expected_ask:?} actual_bid={:?} actual_ask={:?}",
+                        actual.0, actual.1,
+                    ),
+                });
+            }
+        }
+
+        let mut immediate = Vec::new();
+        let mut touched_order: Vec<_> = before
+            .keys()
+            .filter_map(|token| {
+                self.token_books
+                    .get(token)
+                    .map(|book| (book.wire_sequence, token.clone()))
+            })
+            .collect();
+        touched_order.sort_by_key(|(sequence, _)| *sequence);
+        for (_, token) in touched_order {
+            let Some(book) = self.token_books.get_mut(&token) else {
+                continue;
+            };
+            let top_changed = before.get(&token).copied() != Some(book.top());
+            if top_changed && book.is_semantically_valid() {
+                book.dirty_since = None;
+                if let Some(event) = self.canonicalize_token(&token, local_now) {
+                    push_latest_order_book(&mut immediate, event);
+                }
+            }
+        }
+        let bbo_change_snapshots = immediate.len();
+        let _ = fields.market;
+        (immediate, bbo_change_snapshots)
+    }
+
+    fn flush_due(&mut self, now: Instant, local_now: u64) -> Vec<MarketEvent> {
+        let mut due: Vec<_> = self
+            .token_books
+            .iter()
+            .filter_map(|(token, book)| {
+                let dirty_since = book.dirty_since?;
+                (now.saturating_duration_since(dirty_since) >= CLOB_BOOK_COALESCE_INTERVAL)
+                    .then_some((book.wire_sequence, token.clone()))
+            })
+            .collect();
+        due.sort_by_key(|(sequence, _)| *sequence);
+        let mut events = Vec::new();
+        for (_, token) in due {
+            if let Some(book) = self.token_books.get_mut(&token) {
+                book.dirty_since = None;
+            }
+            if let Some(event) = self.canonicalize_token(&token, local_now) {
+                push_latest_order_book(&mut events, event);
+            }
+        }
+        events
+    }
+}
+
+fn push_latest_order_book(events: &mut Vec<MarketEvent>, event: MarketEvent) {
+    let MarketEvent::OrderBook(incoming) = &event else {
+        events.push(event);
+        return;
+    };
+    if let Some(index) = events.iter().position(|existing| {
+        matches!(existing, MarketEvent::OrderBook(book) if book.symbol == incoming.symbol)
+    }) {
+        // Remove the prior event before appending so the final output order
+        // still follows the wire position of the newest event-level book.
+        events.remove(index);
+    }
+    events.push(event);
+}
+
+fn subscribed_token(tokens: &[String], token: &str) -> bool {
+    tokens.iter().any(|subscribed| subscribed == token)
+}
+
+fn diagnostic_preview(value: &serde_json::Value) -> String {
+    value.to_string().chars().take(300).collect()
+}
+
+fn process_clob_frame(
+    text: &str,
+    books: &mut ClobLocalBooks,
+    tokens: &[String],
+    received_at: Instant,
+    local_now: u64,
+) -> ClobParsedBatch {
+    let mut batch = ClobParsedBatch::default();
+    if text.is_empty() {
+        return batch;
+    }
+    let mut buf = text.as_bytes().to_vec();
+    let is_array = buf.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'[');
+    let frames = if is_array {
+        simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut buf)
+    } else {
+        simd_json::serde::from_slice::<ClobFrame>(&mut buf).map(|frame| vec![frame])
+    };
+    let frames = match frames {
+        Ok(frames) => frames,
+        Err(error) => {
+            batch.wire.parse_errors = 1;
+            batch.diagnostics.push(ClobDiagnostic {
+                key: "parse_error".to_string(),
+                detail: format!(
+                    "error={} raw={}",
+                    error,
+                    text.chars().take(300).collect::<String>(),
+                ),
+            });
+            return batch;
+        }
+    };
+
+    for frame in frames {
+        match frame {
+            ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
+                batch.wire.books = batch.wire.books.saturating_add(1);
+                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                match books.apply_book(fields, received_at, local_now) {
+                    Ok(Some(event)) => push_latest_order_book(&mut batch.events, event),
+                    Ok(None) => {}
+                    Err(detail) => {
+                        batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+                        batch.diagnostics.push(ClobDiagnostic {
+                            key: "invalid_book".to_string(),
+                            detail,
+                        });
+                    }
+                }
+            }
+            ClobFrame::Tagged(TaggedMessage::PriceChange(fields)) => {
+                batch.wire.price_changes = batch.wire.price_changes.saturating_add(1);
+                batch.recognized_topic |= fields
+                    .price_changes
+                    .iter()
+                    .any(|change| subscribed_token(tokens, &change.asset_id));
+                let (events, bbo_snapshots) = books.apply_price_change(
+                    fields,
+                    received_at,
+                    local_now,
+                    &mut batch.wire,
+                    &mut batch.diagnostics,
+                );
+                batch.bbo_change_snapshots =
+                    batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
+                for event in events {
+                    push_latest_order_book(&mut batch.events, event);
+                }
+            }
+            ClobFrame::Tagged(TaggedMessage::BestBidAsk(fields)) => {
+                batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);
+                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                let exchange_timestamp_ns =
+                    timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+                match make_quote_event(
+                    fields.asset_id,
+                    fields.best_bid,
+                    fields.best_ask,
+                    exchange_timestamp_ns,
+                    local_now,
+                ) {
+                    Some(MarketEvent::Quote(quote)) => {
+                        if let Some(event) = books.canonicalize_quote(quote) {
+                            batch.events.push(event);
+                        }
+                    }
+                    _ => {
+                        batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+                        batch.diagnostics.push(ClobDiagnostic {
+                            key: "invalid_best_bid_ask".to_string(),
+                            detail: format!("ts={exchange_timestamp_ns}"),
+                        });
+                    }
+                }
+            }
+            ClobFrame::Tagged(TaggedMessage::Trade(fields)) => {
+                batch.wire.trades = batch.wire.trades.saturating_add(1);
+                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                match make_trade_event(fields, local_now) {
+                    Some(event) => batch.events.push(event),
+                    None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
+                }
+            }
+            ClobFrame::Tagged(TaggedMessage::LastTradePrice(fields)) => {
+                batch.wire.last_trade_prices = batch.wire.last_trade_prices.saturating_add(1);
+                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                match make_trade_event(fields, local_now) {
+                    Some(event) => batch.events.push(event),
+                    None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
+                }
+            }
+            ClobFrame::Tagged(TaggedMessage::TickSizeChange(fields)) => {
+                batch.wire.tick_size_changes = batch.wire.tick_size_changes.saturating_add(1);
+                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                match make_tick_size_event(fields, local_now) {
+                    Some(event) => batch.events.push(event),
+                    None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
+                }
+            }
+            ClobFrame::Rtds(fields) => {
+                batch.wire.inline_rtds = batch.wire.inline_rtds.saturating_add(1);
+                match make_inline_rtds_event(fields, local_now) {
+                    Some(event) => batch.events.push(event),
+                    None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
+                }
+            }
+            ClobFrame::Unknown(value) => {
+                let event_type = value
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing");
+                let known_ignored = matches!(event_type, "new_market" | "market_resolved");
+                if known_ignored {
+                    batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+                } else {
+                    batch.wire.unknown = batch.wire.unknown.saturating_add(1);
+                }
+                batch.diagnostics.push(ClobDiagnostic {
+                    key: if known_ignored {
+                        format!("ignored_{event_type}")
+                    } else {
+                        format!("unknown_{event_type}")
+                    },
+                    detail: diagnostic_preview(&value),
+                });
+            }
+        }
+    }
+    batch
+}
+
+/// Stateless compatibility helper used by focused parser tests. Stateful
+/// PriceChange behavior is tested through `process_clob_frame` with one
+/// persistent `ClobLocalBooks` instance.
+#[cfg(test)]
+fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
+    let now = now_ns();
+    process_clob_frame(
+        text,
+        &mut ClobLocalBooks::default(),
+        &[],
+        Instant::now(),
+        now,
+    )
+    .events
 }
 
 fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64) -> u64 {
@@ -2487,14 +3475,15 @@ impl ExchangeMarket for PolymarketMarket {
         // Spawn the main CLOB async task on its dedicated runtime. Bridge into
         // the sync engine via a crossbeam event channel; take control input
         // (resubscribe / shutdown) via a tokio mpsc.
-        let all_tokens = self.current_tokens();
+        let clob_subscription = self.current_clob_subscription();
+        let clob_token_count = clob_subscription.tokens.len();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<WsCtrl>();
         self.event_rx = Some(event_rx);
         self.ws_ctrl_tx = Some(ctrl_tx);
 
         crate::async_rt::clob_handle().spawn(clob_ws_task(
-            all_tokens.clone(),
+            clob_subscription,
             event_tx,
             ctrl_rx,
             shutdown,
@@ -2512,7 +3501,7 @@ impl ExchangeMarket for PolymarketMarket {
 
         info!(
             "[Polymarket] WS tasks launched — {} CLOB tokens, {} rtds sources",
-            all_tokens.len(),
+            clob_token_count,
             self.rtds_subscriptions.len(),
         );
         Ok(())
@@ -2707,15 +3696,18 @@ impl ExchangeMarket for PolymarketMarket {
             return Ok(Some(event));
         }
 
-        // Drain one event from the async WS task if available.
+        // Wait for one event from the async WS task. A short blocking receive
+        // is wake-driven (the sender unparks us immediately) and avoids the
+        // old 100 µs SCHED_FIFO polling loop burning this shared CLOB core.
+        // The timeout keeps rotation/readiness watchdogs responsive.
         if let Some(rx) = &self.event_rx {
-            match rx.try_recv() {
+            match rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(mut event) => {
                     self.map_event_symbol(&mut event);
                     return Ok(Some(event));
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     return Err(anyhow!("Polymarket WS task ended unexpectedly"));
                 }
             }
@@ -3067,6 +4059,228 @@ mod pick_current_event_tests {
         }
     }
 
+    fn canonical_event_spec() -> CanonicalEventSpec {
+        CanonicalEventSpec {
+            condition_id: "condition".to_string(),
+            up_token: "up".to_string(),
+            down_token: "down".to_string(),
+        }
+    }
+
+    fn order_book(event: &MarketEvent) -> &OrderBookSnapshot {
+        let MarketEvent::OrderBook(book) = event else {
+            panic!("expected order book, got {event:?}");
+        };
+        book
+    }
+
+    #[test]
+    fn event_book_maps_down_to_up_and_newer_server_timestamp_wins() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        let batch = process_clob_frame(
+            r#"[
+                {"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"2000"},
+                {"event_type":"book","asset_id":"down","bids":[{"price":"0.30","size":"20"}],"asks":[{"price":"0.70","size":"21"}],"timestamp":"1999"}
+            ]"#,
+            &mut books,
+            &tokens,
+            received_at,
+            9_000_000_000,
+        );
+
+        assert!(batch.recognized_topic);
+        assert!(books.has_all_seeded(&tokens));
+        assert_eq!(batch.events.len(), 1, "one latest book per event");
+        let current = order_book(&batch.events[0]);
+        assert_eq!(current.symbol, "up");
+        assert_eq!(current.exchange_timestamp_ns, 2_000_000_000);
+        assert_eq!(current.bids[0].price, 0.40);
+        assert_eq!(current.asks[0].price, 0.60);
+
+        let newer_down = process_clob_frame(
+            r#"{
+                "event_type":"price_change",
+                "market":"condition",
+                "price_changes":[
+                    {"asset_id":"down","price":"0.65","size":"7","side":"SELL","best_bid":"0.30","best_ask":"0.65"}
+                ],
+                "timestamp":"2001"
+            }"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            9_001_000_000,
+        );
+        assert_eq!(newer_down.events.len(), 1, "BBO changes emit immediately");
+        let mapped = order_book(&newer_down.events[0]);
+        assert_eq!(mapped.symbol, "up");
+        assert_eq!(mapped.exchange_timestamp_ns, 2_001_000_000);
+        assert_eq!(mapped.bids[0].price, 0.35);
+        assert_eq!(mapped.bids[0].quantity, 7.0);
+        assert_eq!(mapped.asks[0].price, 0.70);
+        assert_eq!(mapped.asks[0].quantity, 20.0);
+
+        let stale_up = process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.45","size":"99"}],"asks":[{"price":"0.55","size":"99"}],"timestamp":"2000"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(2),
+            9_002_000_000,
+        );
+        assert_eq!(stale_up.events.len(), 1);
+        let still_newer = order_book(&stale_up.events[0]);
+        assert_eq!(still_newer.exchange_timestamp_ns, 2_001_000_000);
+        assert_eq!(still_newer.bids[0].price, 0.35);
+    }
+
+    #[test]
+    fn price_change_applies_all_entries_and_coalesces_depth_only_updates() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let received_at = Instant::now();
+        let seed = process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"3000"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            10_000_000_000,
+        );
+        assert_eq!(seed.events.len(), 1);
+
+        let delta = process_clob_frame(
+            r#"{
+                "event_type":"price_change",
+                "market":"condition",
+                "price_changes":[
+                    {"asset_id":"up","price":"0.20","size":"5","side":"BUY","best_bid":"0.40","best_ask":"0.60"},
+                    {"asset_id":"up","price":"0.80","size":"6","side":"SELL","best_bid":"0.40","best_ask":"0.60"}
+                ],
+                "timestamp":"3001"
+            }"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            10_001_000_000,
+        );
+        assert_eq!(delta.wire.price_change_entries, 2);
+        assert_eq!(delta.wire.level_upserts, 2);
+        assert!(
+            delta.events.is_empty(),
+            "unchanged BBO waits for coalescing"
+        );
+        assert!(books
+            .flush_due(received_at + CLOB_BOOK_COALESCE_INTERVAL, 10_250_000_000,)
+            .is_empty());
+        let flushed = books.flush_due(
+            received_at + CLOB_BOOK_COALESCE_INTERVAL + Duration::from_millis(1),
+            10_251_000_000,
+        );
+        assert_eq!(flushed.len(), 1);
+        let book = order_book(&flushed[0]);
+        assert!(book
+            .bids
+            .iter()
+            .any(|level| level.price == 0.20 && level.quantity == 5.0));
+        assert!(book
+            .asks
+            .iter()
+            .any(|level| level.price == 0.80 && level.quantity == 6.0));
+
+        let deletion = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.20","size":"0","side":"BUY","best_bid":"0.40","best_ask":"0.60"}],"timestamp":"3002"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(300),
+            10_300_000_000,
+        );
+        assert_eq!(deletion.wire.level_deletes, 1);
+        assert!(deletion.events.is_empty());
+        let flushed = books.flush_due(received_at + Duration::from_millis(551), 10_551_000_000);
+        assert_eq!(flushed.len(), 1);
+        assert!(!order_book(&flushed[0])
+            .bids
+            .iter()
+            .any(|level| level.price == 0.20));
+    }
+
+    #[test]
+    fn equal_timestamp_up_down_deltas_follow_wire_order() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        let seed = process_clob_frame(
+            r#"[
+                {"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"5000"},
+                {"event_type":"book","asset_id":"down","bids":[{"price":"0.40","size":"12"}],"asks":[{"price":"0.60","size":"13"}],"timestamp":"5000"}
+            ]"#,
+            &mut books,
+            &tokens,
+            received_at,
+            12_000_000_000,
+        );
+        assert_eq!(seed.events.len(), 1);
+
+        let delta = process_clob_frame(
+            r#"{
+                "event_type":"price_change",
+                "price_changes":[
+                    {"asset_id":"down","price":"0.55","size":"7","side":"SELL","best_bid":"0.40","best_ask":"0.55"},
+                    {"asset_id":"up","price":"0.46","size":"8","side":"BUY","best_bid":"0.46","best_ask":"0.60"}
+                ],
+                "timestamp":"5001"
+            }"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            12_001_000_000,
+        );
+        assert_eq!(delta.events.len(), 1, "one canonical event book per frame");
+        let latest = order_book(&delta.events[0]);
+        assert_eq!(latest.symbol, "up");
+        assert_eq!(latest.exchange_timestamp_ns, 5_001_000_000);
+        assert_eq!(latest.bids[0].price, 0.46, "later Up delta wins tie");
+        assert_eq!(latest.bids[0].quantity, 8.0);
+    }
+
+    #[test]
+    fn unseeded_price_change_is_recognized_but_not_usable() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let batch = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.40","size":"2","side":"BUY"}],"timestamp":"4000"}"#,
+            &mut books,
+            &tokens,
+            Instant::now(),
+            11_000_000_000,
+        );
+        assert!(batch.recognized_topic);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.wire.price_changes, 1);
+        assert_eq!(batch.wire.price_change_entries, 1);
+        assert_eq!(batch.wire.unseeded_deltas, 1);
+        assert_eq!(batch.wire.ignored, 1);
+    }
+
+    #[test]
+    fn ignored_and_unknown_event_types_are_counted_separately() {
+        let mut books = ClobLocalBooks::default();
+        let batch = process_clob_frame(
+            r#"[
+                {"event_type":"new_market","market":"condition"},
+                {"event_type":"future_wire_type","asset_id":"up"}
+            ]"#,
+            &mut books,
+            &["up".to_string()],
+            Instant::now(),
+            13_000_000_000,
+        );
+        assert_eq!(batch.wire.ignored, 1);
+        assert_eq!(batch.wire.unknown, 1);
+        assert_eq!(batch.diagnostics.len(), 2);
+    }
+
     #[test]
     fn binary_market_structure_rejects_ambiguous_token_arrays() {
         let market = |tokens: Vec<&str>, outcomes: Vec<&str>| PolyMarketInfo {
@@ -3102,19 +4316,8 @@ mod pick_current_event_tests {
             .is_err());
     }
 
-    fn book(symbol: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> MarketEvent {
-        MarketEvent::OrderBook(OrderBookSnapshot {
-            exchange: Exchange::Polymarket,
-            symbol: symbol.to_string(),
-            bids,
-            asks,
-            exchange_timestamp_ns: 1,
-            local_timestamp_ns: 2,
-        })
-    }
-
     #[test]
-    fn startup_and_reconnect_wait_for_valid_book_or_l1() {
+    fn startup_and_reconnect_wait_for_seeded_local_l2() {
         assert!(!has_complete_clob_subscription(&[]));
         assert!(has_complete_clob_subscription(
             &["only-outcome".to_string()]
@@ -3128,9 +4331,13 @@ mod pick_current_event_tests {
         lifecycle.subscribed();
         assert!(!lifecycle.ready, "subscription alone must remain NOT_READY");
 
-        assert!(lifecycle.disconnected(), "read error emits NOT_READY once");
+        let disconnected_at = Instant::now();
         assert!(
-            !lifecycle.disconnected(),
+            lifecycle.disconnected(disconnected_at, "read error"),
+            "read error emits NOT_READY once"
+        );
+        assert!(
+            !lifecycle.disconnected(disconnected_at, "second error"),
             "retry failures do not flap NOT_READY"
         );
         lifecycle.subscribed();
@@ -3139,101 +4346,15 @@ mod pick_current_event_tests {
             "re-subscribe alone must not restore READY"
         );
 
-        let tokens = vec!["up".to_string(), "down".to_string()];
-        let trade = MarketEvent::Trade(TradeTick {
-            exchange: Exchange::Polymarket,
-            symbol: "up".to_string(),
-            exchange_trade_id: None,
-            price: 0.5,
-            quantity: 1.0,
-            side: Side::Buy,
-            exchange_timestamp_ns: 1,
-            local_timestamp_ns: 2,
-        });
-        assert!(is_valid_subscribed_clob_event(&trade, &tokens));
-        let mut other_trade = trade.clone();
-        let MarketEvent::Trade(other) = &mut other_trade else {
-            unreachable!()
-        };
-        other.symbol = "other".to_string();
-        assert!(!is_valid_subscribed_clob_event(&other_trade, &tokens));
-        let connected_at = Instant::now();
-        let mut health = WsHealth::new(connected_at);
-        assert!(!record_valid_clob_topic_frame(
-            &mut health,
-            &[],
-            &tokens,
-            connected_at,
-        ));
-        assert!(health.topic_is_stale(
-            connected_at + Duration::from_secs(2),
-            Duration::from_secs(1),
-        ));
-        assert!(record_valid_clob_topic_frame(
-            &mut health,
-            std::slice::from_ref(&trade),
-            &tokens,
-            connected_at,
-        ));
-        assert!(!health.topic_is_stale(connected_at, Duration::from_secs(1),));
-        assert_eq!(clob_readiness_source(&trade, &tokens), None);
-        assert_eq!(
-            clob_readiness_source(&book("up", vec![], vec![]), &tokens),
-            None
-        );
-        assert_eq!(
-            clob_readiness_source(
-                &book(
-                    "other",
-                    vec![PriceLevel {
-                        price: 0.49,
-                        quantity: 1.0
-                    }],
-                    vec![],
-                ),
-                &tokens,
-            ),
-            None
-        );
-        assert_eq!(
-            clob_readiness_source(
-                &book(
-                    "up",
-                    vec![PriceLevel {
-                        price: 0.49,
-                        quantity: 1.0
-                    }],
-                    vec![],
-                ),
-                &tokens,
-            ),
-            Some("order_book")
-        );
+        let ready_at = disconnected_at + Duration::from_secs(2);
+        let transition = lifecycle
+            .valid_market_data(ready_at)
+            .expect("seeded local L2 restores READY");
+        assert_eq!(transition.recovery, Some(Duration::from_secs(2)));
+        assert_eq!(transition.reason.as_deref(), Some("read error"));
         assert!(
-            lifecycle.valid_market_data(),
-            "first valid subscribed book restores READY"
-        );
-        assert!(
-            !lifecycle.valid_market_data(),
+            lifecycle.valid_market_data(ready_at).is_none(),
             "subsequent books do not duplicate READY"
-        );
-
-        assert!(lifecycle.disconnected());
-        lifecycle.subscribed();
-        let quote = MarketEvent::Quote(QuoteTick {
-            exchange: Exchange::Polymarket,
-            symbol: "down".to_string(),
-            bid_price: 0.48,
-            bid_qty: 0.0,
-            ask_price: 0.52,
-            ask_qty: 0.0,
-            exchange_timestamp_ns: 1,
-            local_timestamp_ns: 2,
-        });
-        assert_eq!(clob_readiness_source(&quote, &tokens), Some("best_bid_ask"));
-        assert!(
-            lifecycle.valid_market_data(),
-            "valid subscribed L1 restores READY"
         );
     }
 
@@ -3250,9 +4371,11 @@ mod pick_current_event_tests {
             subscribed_once: true,
             ready: false,
             not_ready_announced: true,
+            not_ready_since: Some(Instant::now()),
+            not_ready_reason: Some("engine reconnect".to_string()),
         };
         lifecycle.subscribed();
         assert!(!lifecycle.ready);
-        assert!(lifecycle.valid_market_data());
+        assert!(lifecycle.valid_market_data(Instant::now()).is_some());
     }
 }

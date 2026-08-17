@@ -40,6 +40,13 @@ pub struct OsTuneConfig {
     /// whose isolated-core layout is part of the latency SLO.
     #[serde(default)]
     pub strict_core_isolation: bool,
+    /// Allow ordinary-priority background threads to share only the
+    /// `execution_core`. This is an explicit production escape hatch for
+    /// hosts whose system/IRQ cores must be kept completely free of bot
+    /// work. Strict isolation still rejects background overlap with every
+    /// other latency-critical role.
+    #[serde(default)]
+    pub allow_background_on_execution_core: bool,
     pub async_rt_core: Option<usize>,
     /// Core for the dedicated order-I/O tokio runtime thread
     /// (`hexbot-async-ord`, hosts CLOB place/cancel HTTP futures so WS
@@ -82,6 +89,12 @@ pub struct OsTuneConfig {
     pub fifo_async_rt: Option<u8>,
     pub fifo_strategy: Option<u8>,
     pub fifo_execution: Option<u8>,
+    /// Priority for the synchronous Polymarket CLOB bridge/drain thread.
+    /// Unset keeps `fifo_execution` for backwards compatibility.
+    pub fifo_polymarket_feed: Option<u8>,
+    /// Priority for `poly-done-*` completion/accounting threads. Unset keeps
+    /// `fifo_execution` for backwards compatibility.
+    pub fifo_completion: Option<u8>,
 }
 
 impl Default for OsTuneConfig {
@@ -90,6 +103,7 @@ impl Default for OsTuneConfig {
             enable_pin: true,
             enable_fifo: true,
             strict_core_isolation: false,
+            allow_background_on_execution_core: false,
             async_rt_core: None,
             async_ord_core: None,
             strategy_core: None,
@@ -102,7 +116,32 @@ impl Default for OsTuneConfig {
             fifo_async_rt: None,
             fifo_strategy: None,
             fifo_execution: None,
+            fifo_polymarket_feed: None,
+            fifo_completion: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod os_tune_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_background_execution_opt_in_and_role_priorities() {
+        let cfg: OsTuneConfig = toml::from_str(
+            "strict_core_isolation = true\n\
+             allow_background_on_execution_core = true\n\
+             execution_core = 4\n\
+             background_cores = [4]\n\
+             fifo_execution = 50\n\
+             fifo_polymarket_feed = 71\n\
+             fifo_completion = 55\n",
+        )
+        .unwrap();
+        assert!(cfg.allow_background_on_execution_core);
+        assert_eq!(cfg.background_cores, vec![4]);
+        assert_eq!(cfg.fifo_polymarket_feed, Some(71));
+        assert_eq!(cfg.fifo_completion, Some(55));
     }
 }
 

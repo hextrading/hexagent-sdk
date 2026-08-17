@@ -86,6 +86,7 @@ pub struct CorePlan {
     pub enable_pin: bool,
     pub enable_fifo: bool,
     pub strict_core_isolation: bool,
+    pub allow_background_on_execution_core: bool,
     pub async_rt: usize,
     /// Core for the order-I/O runtime thread (`hexbot-async-ord`).
     /// `None` = leave the thread unpinned at normal priority (safe
@@ -109,6 +110,8 @@ pub struct CorePlan {
     pub fifo_async_rt: u8,
     pub fifo_strategy: u8,
     pub fifo_execution: u8,
+    pub fifo_polymarket_feed: u8,
+    pub fifo_completion: u8,
 }
 
 impl CorePlan {
@@ -117,6 +120,7 @@ impl CorePlan {
             enable_pin: true,
             enable_fifo: true,
             strict_core_isolation: false,
+            allow_background_on_execution_core: false,
             async_rt: DEFAULT_ASYNC_RT_CORE,
             async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
@@ -129,6 +133,8 @@ impl CorePlan {
             fifo_async_rt: DEFAULT_PRIO_ASYNC_RT,
             fifo_strategy: DEFAULT_PRIO_STRATEGY,
             fifo_execution: DEFAULT_PRIO_EXECUTION,
+            fifo_polymarket_feed: DEFAULT_PRIO_EXECUTION,
+            fifo_completion: DEFAULT_PRIO_EXECUTION,
         }
     }
 
@@ -142,6 +148,7 @@ impl CorePlan {
             enable_pin: cfg.enable_pin,
             enable_fifo: cfg.enable_fifo,
             strict_core_isolation: cfg.strict_core_isolation,
+            allow_background_on_execution_core: cfg.allow_background_on_execution_core,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
             async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
@@ -154,6 +161,14 @@ impl CorePlan {
             fifo_async_rt: cfg.fifo_async_rt.unwrap_or(DEFAULT_PRIO_ASYNC_RT),
             fifo_strategy: cfg.fifo_strategy.unwrap_or(DEFAULT_PRIO_STRATEGY),
             fifo_execution: cfg.fifo_execution.unwrap_or(DEFAULT_PRIO_EXECUTION),
+            fifo_polymarket_feed: cfg
+                .fifo_polymarket_feed
+                .or(cfg.fifo_execution)
+                .unwrap_or(DEFAULT_PRIO_EXECUTION),
+            fifo_completion: cfg
+                .fifo_completion
+                .or(cfg.fifo_execution)
+                .unwrap_or(DEFAULT_PRIO_EXECUTION),
         }
     }
 
@@ -293,6 +308,9 @@ impl CorePlan {
         latency_cores.extend(hex_cores);
         for &core in &self.background_cores {
             if latency_cores.contains(&core) {
+                if self.allow_background_on_execution_core && core == self.execution {
+                    continue;
+                }
                 return Err(format!(
                     "background core {} overlaps a latency-critical core",
                     core
@@ -329,11 +347,13 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={}) enable_pin={} enable_fifo={} strict_isolation={}",
+        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
         plan.async_rt, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
+        plan.fifo_polymarket_feed, plan.fifo_completion,
         plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
+        plan.allow_background_on_execution_core,
     );
     let _ = CORE_PLAN.set(plan);
 }
@@ -582,7 +602,14 @@ pub fn pin_execution(thread_name: &str) {
     let p = plan();
     let core = p.route_execution(thread_name);
     pin_current(core, thread_name);
-    set_fifo(p.fifo_execution, thread_name);
+    let priority = if thread_name == "feed-polymarket" {
+        p.fifo_polymarket_feed
+    } else if thread_name.starts_with("poly-done-") {
+        p.fifo_completion
+    } else {
+        p.fifo_execution
+    };
+    set_fifo(priority, thread_name);
 }
 
 /// Pin a non-critical I/O-bound background thread to the background
@@ -590,6 +617,27 @@ pub fn pin_execution(thread_name: &str) {
 /// 60 s), latency-dump, paper-exec, async-task joiner threads
 /// (poly-heartbeat-join, poly-user-feed-join, hex-user-feed-join).
 pub fn pin_background(thread_name: &str) {
+    // pthreads inherit their creator's scheduling policy. Several background
+    // join/persistence workers are spawned by FIFO runtime threads, so affinity
+    // alone is not enough: explicitly demote before sharing an execution CPU.
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 0 };
+        let rc = unsafe {
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param)
+        };
+        if rc != 0 {
+            let err = std::io::Error::from_raw_os_error(rc);
+            warn!(
+                "[os_tune] failed to demote background '{}' to SCHED_OTHER: {}",
+                thread_name, err,
+            );
+            abort_if_strict(&format!(
+                "demote background '{}' to SCHED_OTHER: {}",
+                thread_name, err
+            ));
+        }
+    }
     let core = plan().route_background();
     pin_current(core, thread_name);
 }
@@ -607,18 +655,21 @@ pub fn pin_background(thread_name: &str) {
 ///     `CORE_PLAN` entirely, so `init_from_config` can still install
 ///     the real plan.
 ///
-/// Default mask = cores {0, 1}, matching the typical
-/// `irqaffinity=0-1` grub range. These are the same cores the kernel
-/// runs IRQ/softirq on, and main-thread + tracing appender worker
-/// are both idle/sporadic — sharing with kernel housekeeping is fine.
-/// Respects `HEXBOT_NO_PIN=1`.
+/// Default mask = cores {0, 1} for backwards compatibility. Production
+/// deployments that reserve those CPUs exclusively for the kernel/IRQs must
+/// set `HEXBOT_BOOTSTRAP_CORE` to a bot-owned core. Respects
+/// `HEXBOT_NO_PIN=1`.
 pub fn pin_main_early(thread_name: &str) {
     if std::env::var("HEXBOT_NO_PIN").ok().as_deref() == Some("1") {
         return;
     }
     #[cfg(target_os = "linux")]
     {
-        let cores = [0_usize, 1];
+        let configured_core = std::env::var("HEXBOT_BOOTSTRAP_CORE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let cores: Vec<usize> = configured_core
+            .map_or_else(|| vec![0_usize, 1], |core| vec![core]);
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             for &c in &cores {
@@ -639,7 +690,7 @@ pub fn pin_main_early(thread_name: &str) {
                 let err = std::io::Error::last_os_error();
                 warn!(
                     "[os_tune] pin_main_early '{}' failed: {} — main thread and tracing-appender worker \
-                     will keep default affinity ({{0,1,11-15}} with isolcpus=2-10)",
+                     will keep the process affinity inherited from the service manager",
                     thread_name, err,
                 );
             }
@@ -714,6 +765,41 @@ mod tests {
     fn strict_plan_accepts_five_dedicated_strategy_cores() {
         let plan = CorePlan::from_config(&five_instance_config());
         assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+    }
+
+    #[test]
+    fn strict_plan_allows_only_opted_in_background_execution_overlap() {
+        let mut cfg = five_instance_config();
+        cfg.background_cores = vec![4];
+        let instances = five_instances();
+        let err = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&instances)
+            .unwrap_err();
+        assert!(err.contains("background core 4"));
+
+        cfg.allow_background_on_execution_core = true;
+        assert_eq!(
+            CorePlan::from_config(&cfg).validate_strategy_isolation(&instances),
+            Ok(())
+        );
+
+        cfg.background_cores = vec![3];
+        let err = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&instances)
+            .unwrap_err();
+        assert!(err.contains("background core 3"));
+    }
+
+    #[test]
+    fn role_specific_execution_priorities_are_resolved() {
+        let mut cfg = five_instance_config();
+        cfg.fifo_execution = Some(50);
+        cfg.fifo_polymarket_feed = Some(71);
+        cfg.fifo_completion = Some(55);
+        let plan = CorePlan::from_config(&cfg);
+        assert_eq!(plan.fifo_execution, 50);
+        assert_eq!(plan.fifo_polymarket_feed, 71);
+        assert_eq!(plan.fifo_completion, 55);
     }
 
     #[test]
