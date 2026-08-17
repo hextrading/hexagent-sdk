@@ -6052,6 +6052,53 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
     }
 }
 
+fn trade_ownership_matches_order_root(
+    ownership: &TradeOwnership,
+    order: &OrderOwnership,
+) -> bool {
+    ownership.account_id == order.account_id
+        && ownership.instance_id == order.instance_id
+        && ownership.client_order_id == order.client_order_id
+        && normalize_order_id(&ownership.order_id) == normalize_order_id(&order.order_id)
+        && ownership.token_id == order.token_id
+        && ownership.side == order.side
+}
+
+fn failed_trade_keys_by_order_for_query(
+    state: &SharedAccountState,
+) -> HashMap<String, HashSet<String>> {
+    let mut by_order: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut record = |trade_key: &str, ownership: &TradeOwnership| {
+        let Some(order) = state.orders.get(&ownership.client_order_id) else {
+            return;
+        };
+        if trade_ownership_matches_order_root(ownership, order) {
+            by_order
+                .entry(ownership.client_order_id.clone())
+                .or_default()
+                .insert(trade_key.to_string());
+        }
+    };
+
+    for (trade_key, trade) in &state.trades {
+        if trade.failed {
+            record(trade_key, &trade.ownership);
+        }
+    }
+
+    let now_ms = wall_clock_ms();
+    for (trade_key, tombstone) in &state.retired_trade_ownership_tombstones {
+        if !tombstone.authenticated_terminal_noop
+            && tombstone.ownership.status == "FAILED"
+            && retired_trade_tombstone_is_live(tombstone, now_ms)
+        {
+            record(trade_key, &tombstone.ownership);
+        }
+    }
+
+    by_order
+}
+
 /// Convert only a FAILED-trade order under-reservation into a conservative,
 /// queryable startup-recovery record. FAILED is terminal for the trade but can
 /// return its parent maker order to the book. A crash/racy terminal callback
@@ -6072,17 +6119,7 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
 fn repair_failed_trade_under_reservations_for_query(
     state: &mut SharedAccountState,
 ) -> Result<(HashSet<String>, bool), String> {
-    let failed_trade_keys_by_order: HashMap<String, HashSet<String>> = state
-        .trades
-        .iter()
-        .filter(|(_, trade)| trade.failed)
-        .fold(HashMap::new(), |mut by_order, (trade_key, trade)| {
-            by_order
-                .entry(trade.ownership.client_order_id.clone())
-                .or_default()
-                .insert(trade_key.clone());
-            by_order
-        });
+    let failed_trade_keys_by_order = failed_trade_keys_by_order_for_query(state);
     let mut query_orders = state.startup_query_repair_orders.clone();
     let mut mutated = false;
 
@@ -11291,6 +11328,193 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         lock_path.push(".lock");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn live_query_repair_uses_retired_failed_trade_tombstone() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-retired-failed-query-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "retired-query-repair";
+        let instance_id = "btc";
+        let coid = "btc-retired-failed-1";
+        let oid = "0xRETIREDFAILED";
+        let token = "BTC-UP";
+        let trade_key = "trade-retired-failed:0xRETIREDFAILED";
+        let mut state = SharedAccountState::default();
+        state
+            .instances
+            .insert(instance_id.to_string(), InstanceLedger::new(1.0));
+        state.orders.insert(
+            coid.to_string(),
+            OrderOwnership {
+                account_id: account_id.to_string(),
+                instance_id: instance_id.to_string(),
+                client_order_id: coid.to_string(),
+                order_id: oid.to_string(),
+                token_id: token.to_string(),
+                side: Side::Sell,
+                quantity: 40.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: Some(40.0),
+                terminal_trade_ids: vec!["trade-retired-failed".to_string()],
+                terminal_trade_ids_authoritative: true,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Filled,
+            },
+        );
+        state
+            .oid_to_coid
+            .insert(normalize_order_id(oid), coid.to_string());
+        state.recovery_pending_orders.insert(coid.to_string());
+        state.retired_trade_ownership_tombstones.insert(
+            trade_key.to_string(),
+            RetiredTradeOwnershipTombstone {
+                ownership: TradeOwnership {
+                    account_id: account_id.to_string(),
+                    instance_id: instance_id.to_string(),
+                    trade_key: trade_key.to_string(),
+                    client_order_id: coid.to_string(),
+                    order_id: oid.to_string(),
+                    token_id: token.to_string(),
+                    side: Side::Sell,
+                    quantity: 40.0,
+                    price: 0.5,
+                    status: "FAILED".to_string(),
+                },
+                is_maker: Some(true),
+                authenticated_terminal_noop: false,
+                retired_at_ms: wall_clock_ms(),
+            },
+        );
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.to_string(),
+                state,
+            },
+        )
+        .unwrap();
+
+        let strict_error = SharedAccount::new_persistent(account_id, &path).unwrap_err();
+        assert!(
+            strict_error.contains("reservation disagrees with effective remaining quantity"),
+            "{strict_error}",
+        );
+
+        let restored =
+            SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+        assert_eq!(
+            restored.startup_query_repair_pending_order_ids(),
+            vec![coid.to_string()],
+        );
+        let order = restored.order(coid).unwrap();
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.reserved_quantity, 40.0);
+        assert_eq!(order.terminal_matched_quantity, None);
+        assert!(order.terminal_trade_ids.is_empty());
+        assert_eq!(
+            restored.instance_snapshot(instance_id).unwrap().reserved_positions[token],
+            40.0,
+        );
+        assert_eq!(
+            restored.trade_ownership(trade_key).unwrap().client_order_id,
+            coid,
+        );
+        drop(restored);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn live_query_repair_does_not_use_confirmed_trade_tombstone() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-confirmed-tombstone-query-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "confirmed-tombstone";
+        let instance_id = "maker";
+        let coid = "maker-confirmed-1";
+        let oid = "0xCONFIRMED";
+        let token = "UP";
+        let trade_key = "trade-confirmed:0xCONFIRMED";
+        let mut state = SharedAccountState::default();
+        state
+            .instances
+            .insert(instance_id.to_string(), InstanceLedger::new(1.0));
+        state.orders.insert(
+            coid.to_string(),
+            OrderOwnership {
+                account_id: account_id.to_string(),
+                instance_id: instance_id.to_string(),
+                client_order_id: coid.to_string(),
+                order_id: oid.to_string(),
+                token_id: token.to_string(),
+                side: Side::Sell,
+                quantity: 10.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                terminal_trade_ids: Vec::new(),
+                terminal_trade_ids_authoritative: false,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        state
+            .oid_to_coid
+            .insert(normalize_order_id(oid), coid.to_string());
+        state.recovery_pending_orders.insert(coid.to_string());
+        state.retired_trade_ownership_tombstones.insert(
+            trade_key.to_string(),
+            RetiredTradeOwnershipTombstone {
+                ownership: TradeOwnership {
+                    account_id: account_id.to_string(),
+                    instance_id: instance_id.to_string(),
+                    trade_key: trade_key.to_string(),
+                    client_order_id: coid.to_string(),
+                    order_id: oid.to_string(),
+                    token_id: token.to_string(),
+                    side: Side::Sell,
+                    quantity: 10.0,
+                    price: 0.5,
+                    status: "CONFIRMED".to_string(),
+                },
+                is_maker: Some(true),
+                authenticated_terminal_noop: false,
+                retired_at_ms: wall_clock_ms(),
+            },
+        );
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.to_string(),
+                state,
+            },
+        )
+        .unwrap();
+
+        let error =
+            SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap_err();
+        assert!(
+            error.contains("reservation disagrees with effective remaining quantity"),
+            "{error}",
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
