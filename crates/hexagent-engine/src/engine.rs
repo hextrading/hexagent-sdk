@@ -6142,7 +6142,7 @@ impl Engine {
                     std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
                 );
             }
-            match PolymarketTrade::new_with_pool(
+            match PolymarketTrade::new_with_pool_for_startup_query_repair(
                 &creds.api_key,
                 &creds.api_secret,
                 &creds.api_passphrase,
@@ -6375,8 +6375,46 @@ impl Engine {
             shared
                 .account_state
                 .reconcile_configured_instances(&configured_instances);
+            let startup_query_repairs = shared
+                .account_state
+                .startup_query_repair_pending_order_ids();
+            if !startup_query_repairs.is_empty() {
+                warn!(
+                    "[Engine] Polymarket account={} repairing {} durable FAILED-trade reservation mismatch(es) from authoritative order queries before LIVE admission: coids={:?}",
+                    account_id,
+                    startup_query_repairs.len(),
+                    startup_query_repairs,
+                );
+            }
             let recovery = PolymarketTrade::from_shared(shared.clone(), "", "");
             let unresolved = recovery.reconcile_recovered_orders();
+            if !startup_query_repairs.is_empty() {
+                if let Err(error) = shared
+                    .account_state
+                    .flush_persistence(std::time::Duration::from_secs(5))
+                {
+                    error!(
+                        "[Engine] refusing every Polymarket strategy: account={} startup query repair fsync failed: {}",
+                        account_id, error,
+                    );
+                    return HashMap::new();
+                }
+                let unresolved_query_repairs = shared
+                    .account_state
+                    .startup_query_repair_pending_order_ids();
+                if !unresolved_query_repairs.is_empty() {
+                    error!(
+                        "[Engine] refusing every Polymarket strategy: account={} authoritative startup query could not resolve repaired ledger order(s) {:?}; conservative reservations were fsynced and no feeds or strategies will start",
+                        account_id, unresolved_query_repairs,
+                    );
+                    return HashMap::new();
+                }
+                info!(
+                    "[Engine] Polymarket account={} startup ledger query repair complete for {} order(s); repaired state fsynced before LIVE admission",
+                    account_id,
+                    startup_query_repairs.len(),
+                );
+            }
             if unresolved > 0 {
                 warn!(
                     "[Engine] Polymarket account={} startup recovery pending for {} order(s); quoting continues under retained reservations while owner maintenance waits for authoritative metadata",

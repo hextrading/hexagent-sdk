@@ -657,6 +657,11 @@ struct SharedAccountState {
     /// can continue concurrently with admission.
     #[serde(default)]
     recovery_pending_orders: HashSet<String>,
+    /// Orders whose otherwise-invalid reservation was conservatively rebuilt
+    /// from durable FAILED-trade roots. This marker survives a crash so only
+    /// those exact rows remain behind the authoritative startup-query gate.
+    #[serde(default)]
+    startup_query_repair_orders: HashSet<String>,
     /// Successful ordinary cancels awaiting an authoritative cumulative
     /// `size_matched` read. Kept separate from true trade recovery so normal
     /// cancellation does not pause the shared account.
@@ -1002,8 +1007,28 @@ impl SharedAccount {
         account_id: impl Into<String>,
         path: impl Into<PathBuf>,
     ) -> Result<Self, String> {
-        let account_id = account_id.into();
-        let path = path.into();
+        Self::new_persistent_inner(account_id.into(), path.into(), false)
+    }
+
+    /// Open a durable live-trading ledger while admitting only the narrow
+    /// class of under-reservations that can be repaired by an authoritative
+    /// per-order CLOB lookup. The repair first restores the worst-case
+    /// reservation from durable order/FAILED-trade roots and marks the order
+    /// for startup recovery. Callers must query and resolve every id returned
+    /// by [`Self::startup_query_repair_pending_order_ids`] before allowing
+    /// live strategy workers to start.
+    pub fn new_persistent_for_query_repair(
+        account_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::new_persistent_inner(account_id.into(), path.into(), true)
+    }
+
+    fn new_persistent_inner(
+        account_id: String,
+        path: PathBuf,
+        allow_query_repair: bool,
+    ) -> Result<Self, String> {
         let (state, migrated_state) = if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("read account ledger {}: {error}", path.display()))?;
@@ -1026,6 +1051,18 @@ impl SharedAccount {
                 ));
             }
             let mut state = persisted.state;
+            if !allow_query_repair && !state.startup_query_repair_orders.is_empty() {
+                let mut pending: Vec<String> = state
+                    .startup_query_repair_orders
+                    .iter()
+                    .cloned()
+                    .collect();
+                pending.sort();
+                return Err(format!(
+                    "account ledger {} has unfinished authoritative startup query repair(s): coids={pending:?}",
+                    path.display(),
+                ));
+            }
             let persisted_uncertainty = state.uncertain.then(|| {
                 (
                     state.uncertain_reason.clone(),
@@ -1123,6 +1160,25 @@ impl SharedAccount {
                 migrated = true;
                 recompute_reconciliation(&mut state, "durable trade-persistence blocker recovery");
             }
+            if allow_query_repair {
+                let (query_orders, repair_mutated) =
+                    repair_failed_trade_under_reservations_for_query(&mut state)?;
+                if repair_mutated {
+                    migrated = true;
+                    recompute_reconciliation(
+                        &mut state,
+                        "startup FAILED-trade reservation query repair",
+                    );
+                }
+                if !query_orders.is_empty() {
+                    log::warn!(
+                        "[shared_account] account={} admitted {} FAILED-trade order(s) only for authoritative startup query after conservatively restoring reservations: coids={:?}",
+                        account_id,
+                        query_orders.len(),
+                        query_orders,
+                    );
+                }
+            }
             // Rebuild startup recovery admission before validating resource
             // availability. An order can legitimately outlive the event's
             // wallet position while its crash-durable reservation is still
@@ -1185,6 +1241,16 @@ impl SharedAccount {
             account.schedule_persist(&state);
         }
         Ok(account)
+    }
+
+    /// Query-repair orders that still lack authoritative terminal/live
+    /// resolution. An empty result is the live-startup admission condition.
+    pub fn startup_query_repair_pending_order_ids(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut pending: Vec<String> =
+            state.startup_query_repair_orders.iter().cloned().collect();
+        pending.sort();
+        pending
     }
 
     pub fn account_id(&self) -> &str {
@@ -2387,7 +2453,11 @@ impl SharedAccount {
 
     pub fn finish_order_recovery(&self, client_order_id: &str) {
         let mut state = self.state.lock().unwrap();
-        if state.recovery_pending_orders.remove(client_order_id) {
+        let recovery_removed = state.recovery_pending_orders.remove(client_order_id);
+        let query_repair_removed = state
+            .startup_query_repair_orders
+            .remove(client_order_id);
+        if recovery_removed || query_repair_removed {
             recompute_reconciliation(&mut state, "startup order recovery");
             self.schedule_persist(&state);
         }
@@ -3458,6 +3528,7 @@ impl SharedAccount {
         order.terminal_trade_ids.clear();
         order.terminal_trade_ids_authoritative = false;
         state.recovery_pending_orders.remove(client_order_id);
+        state.startup_query_repair_orders.remove(client_order_id);
         let newly_pending = state
             .routine_cancel_audits
             .insert(client_order_id.to_string());
@@ -5979,6 +6050,169 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
         ),
         Side::Sell => (0.0, remaining),
     }
+}
+
+/// Convert only a FAILED-trade order under-reservation into a conservative,
+/// queryable startup-recovery record. FAILED is terminal for the trade but can
+/// return its parent maker order to the book. A crash/racy terminal callback
+/// may therefore persist the durable FAILED tombstone and zero reservation
+/// while the parent still needs an authoritative CLOB status lookup.
+///
+/// This is deliberately not a general ledger auto-fixer:
+///
+/// * a durable FAILED trade must own the order;
+/// * the order must still carry a recovery/live marker (or an authoritative
+///   terminal audit that references the failed trade);
+/// * only missing reservation may be added; over-reservation and every other
+///   invariant mismatch remain fatal under normal validation.
+///
+/// Returns `(query_order_ids, mutated)`. The ids, recovery markers and
+/// worst-case reservations are all persisted so a crash during the query
+/// cannot reopen availability or broaden repair matching on the next start.
+fn repair_failed_trade_under_reservations_for_query(
+    state: &mut SharedAccountState,
+) -> Result<(HashSet<String>, bool), String> {
+    let failed_trade_keys_by_order: HashMap<String, HashSet<String>> = state
+        .trades
+        .iter()
+        .filter(|(_, trade)| trade.failed)
+        .fold(HashMap::new(), |mut by_order, (trade_key, trade)| {
+            by_order
+                .entry(trade.ownership.client_order_id.clone())
+                .or_default()
+                .insert(trade_key.clone());
+            by_order
+        });
+    let mut query_orders = state.startup_query_repair_orders.clone();
+    let mut mutated = false;
+
+    for coid in &query_orders {
+        if !state.recovery_pending_orders.contains(coid) {
+            return Err(format!(
+                "query-repair order `{coid}` is missing its recovery marker"
+            ));
+        }
+        if !state.orders.contains_key(coid) {
+            return Err(format!(
+                "query-repair order `{coid}` is missing its durable order root"
+            ));
+        }
+        if !failed_trade_keys_by_order.contains_key(coid) {
+            return Err(format!(
+                "query-repair order `{coid}` is missing its durable FAILED-trade root"
+            ));
+        }
+    }
+
+    for (coid, failed_trade_keys) in failed_trade_keys_by_order {
+        let Some(snapshot) = state.orders.get(&coid).cloned() else {
+            continue;
+        };
+        if snapshot.status == OrderStatus::Rejected {
+            continue;
+        }
+        let terminal_audit_references_failed = snapshot.terminal_trade_ids.iter().any(|expected| {
+            failed_trade_keys
+                .iter()
+                .any(|trade_key| terminal_trade_id_matches(trade_key, expected))
+        });
+        let lifecycle_may_be_live = !matches!(
+            snapshot.status,
+            OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
+        );
+        let already_recovering = state.recovery_pending_orders.contains(&coid)
+            || state.routine_cancel_audits.contains(&coid);
+        let retains_reservation = snapshot.reserved_cash > EPS || snapshot.reserved_quantity > EPS;
+        if !lifecycle_may_be_live
+            && !already_recovering
+            && !retains_reservation
+            && !terminal_audit_references_failed
+        {
+            continue;
+        }
+
+        let mut repaired_order = snapshot.clone();
+        let terminal_status_needs_normalization = matches!(
+            repaired_order.status,
+            OrderStatus::Filled | OrderStatus::Failed
+        );
+        if terminal_status_needs_normalization {
+            repaired_order.status = if repaired_order.filled_quantity > EPS {
+                OrderStatus::PartiallyFilled
+            } else {
+                OrderStatus::Accepted
+            };
+        }
+        if terminal_audit_references_failed {
+            repaired_order.terminal_matched_quantity = None;
+            repaired_order.terminal_trade_ids.clear();
+            repaired_order.terminal_trade_ids_authoritative = false;
+        }
+
+        let (expected_cash, expected_quantity) = desired_order_reservation(&repaired_order);
+        let cash_tolerance = reconciliation_tolerance(expected_cash, snapshot.reserved_cash);
+        let quantity_tolerance =
+            reconciliation_tolerance(expected_quantity, snapshot.reserved_quantity);
+        let reservation_under = snapshot.reserved_cash + cash_tolerance < expected_cash
+            || snapshot.reserved_quantity + quantity_tolerance < expected_quantity;
+        let status_changed = terminal_status_needs_normalization
+            && (terminal_audit_references_failed || reservation_under);
+        if snapshot.reserved_cash > expected_cash + cash_tolerance
+            || snapshot.reserved_quantity > expected_quantity + quantity_tolerance
+        {
+            // Never reduce a persisted reservation automatically. The normal
+            // validator will reject this unrelated/unsafe corruption.
+            continue;
+        }
+        if expected_cash <= EPS && expected_quantity <= EPS {
+            continue;
+        }
+        if !terminal_audit_references_failed && !reservation_under {
+            // A normally reserved live order may have historical FAILED trade
+            // tombstones. It belongs to ordinary startup recovery, not this
+            // stricter inconsistency-repair gate.
+            continue;
+        }
+
+        let instance_id = snapshot.instance_id.clone();
+        let token_id = snapshot.token_id.clone();
+        let cash_delta = expected_cash - snapshot.reserved_cash;
+        let quantity_delta = expected_quantity - snapshot.reserved_quantity;
+        let order = state
+            .orders
+            .get_mut(&coid)
+            .expect("FAILED-trade order disappeared during startup repair");
+        if status_changed {
+            order.status = repaired_order.status;
+            mutated = true;
+        }
+        if terminal_audit_references_failed {
+            order.terminal_matched_quantity = None;
+            order.terminal_trade_ids.clear();
+            order.terminal_trade_ids_authoritative = false;
+            mutated = true;
+        }
+        if cash_delta.abs() > cash_tolerance || quantity_delta.abs() > quantity_tolerance {
+            order.reserved_cash = expected_cash;
+            order.reserved_quantity = expected_quantity;
+            let instance = state.instances.get_mut(&instance_id).ok_or_else(|| {
+                format!(
+                    "query-repair order `{coid}` references missing instance `{instance_id}`"
+                )
+            })?;
+            instance.reserved_cash += cash_delta;
+            if quantity_delta.abs() > quantity_tolerance {
+                *instance.reserved_positions.entry(token_id).or_insert(0.0) += quantity_delta;
+            }
+            mutated = true;
+        }
+        mutated |= state.routine_cancel_audits.remove(&coid);
+        mutated |= state.recovery_pending_orders.insert(coid.clone());
+        mutated |= state.startup_query_repair_orders.insert(coid.clone());
+        query_orders.insert(coid);
+    }
+
+    Ok((query_orders, mutated))
 }
 
 fn order_has_startup_reservation_deficit(
@@ -10920,6 +11154,194 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         .unwrap();
         let error = SharedAccount::new_persistent("invalid", &path).unwrap_err();
         assert!(error.contains("invalid account ledger"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_query_repair_restores_failed_trade_order_reservation_before_open() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-failed-trade-query-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "query-repair";
+        let instance_id = "btc";
+        let coid = "btc-failed-1";
+        let oid = "0xFAILED";
+        let token = "BTC-UP";
+        let trade_key = "trade-failed:0xFAILED";
+        let mut state = SharedAccountState::default();
+        state
+            .instances
+            .insert(instance_id.to_string(), InstanceLedger::new(1.0));
+        state.orders.insert(
+            coid.to_string(),
+            OrderOwnership {
+                account_id: account_id.to_string(),
+                instance_id: instance_id.to_string(),
+                client_order_id: coid.to_string(),
+                order_id: oid.to_string(),
+                token_id: token.to_string(),
+                side: Side::Sell,
+                quantity: 40.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: Some(40.0),
+                terminal_trade_ids: vec!["trade-failed".to_string()],
+                terminal_trade_ids_authoritative: true,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Filled,
+            },
+        );
+        state
+            .oid_to_coid
+            .insert(normalize_order_id(oid), coid.to_string());
+        state.recovery_pending_orders.insert(coid.to_string());
+        state.trades.insert(
+            trade_key.to_string(),
+            AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: account_id.to_string(),
+                    instance_id: instance_id.to_string(),
+                    trade_key: trade_key.to_string(),
+                    client_order_id: coid.to_string(),
+                    order_id: oid.to_string(),
+                    token_id: token.to_string(),
+                    side: Side::Sell,
+                    quantity: 40.0,
+                    price: 0.5,
+                    status: "FAILED".to_string(),
+                },
+                booked: false,
+                physical_booked: false,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: false,
+                physical_fee_booked: false,
+                failed: true,
+                failure_reconciled: true,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: 0,
+            },
+        );
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.to_string(),
+                state,
+            },
+        )
+        .unwrap();
+
+        let strict_error = SharedAccount::new_persistent(account_id, &path).unwrap_err();
+        assert!(
+            strict_error.contains("reservation disagrees with effective remaining quantity"),
+            "{strict_error}",
+        );
+
+        let restored =
+            SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+        assert_eq!(
+            restored.startup_query_repair_pending_order_ids(),
+            vec![coid.to_string()],
+        );
+        let order = restored.order(coid).unwrap();
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.reserved_quantity, 40.0);
+        assert_eq!(order.terminal_matched_quantity, None);
+        assert!(order.terminal_trade_ids.is_empty());
+        assert!(!order.terminal_trade_ids_authoritative);
+        let instance = restored.instance_snapshot(instance_id).unwrap();
+        assert_eq!(instance.reserved_positions[token], 40.0);
+        assert_eq!(restored.monitoring_snapshot().recovery_pending_orders, 1);
+        restored
+            .flush_persistence(Duration::from_secs(2))
+            .unwrap();
+        drop(restored);
+
+        // A crash after the conservative reservation was fsynced but before
+        // the CLOB query completed must remain a fail-closed query repair on
+        // the next process start, without double-counting the reservation.
+        let unfinished_error = SharedAccount::new_persistent(account_id, &path).unwrap_err();
+        assert!(
+            unfinished_error.contains("unfinished authoritative startup query repair"),
+            "{unfinished_error}",
+        );
+        let reopened =
+            SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+        assert_eq!(
+            reopened.startup_query_repair_pending_order_ids(),
+            vec![coid.to_string()],
+        );
+        assert_eq!(
+            reopened.instance_snapshot(instance_id).unwrap().reserved_positions[token],
+            40.0,
+        );
+        assert!(reopened.mark_cancelled_pending_audit(coid));
+        assert!(reopened
+            .startup_query_repair_pending_order_ids()
+            .is_empty());
+        drop(reopened);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn live_query_repair_does_not_admit_unowned_under_reservation() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-unowned-query-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let mut state = SharedAccountState::default();
+        state
+            .instances
+            .insert("maker".to_string(), InstanceLedger::new(1.0));
+        state.orders.insert(
+            "maker-1".to_string(),
+            OrderOwnership {
+                account_id: "unowned".to_string(),
+                instance_id: "maker".to_string(),
+                client_order_id: "maker-1".to_string(),
+                order_id: "0xABC".to_string(),
+                token_id: "UP".to_string(),
+                side: Side::Sell,
+                quantity: 10.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                terminal_trade_ids: Vec::new(),
+                terminal_trade_ids_authoritative: false,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: "unowned".to_string(),
+                state,
+            },
+        )
+        .unwrap();
+
+        let error =
+            SharedAccount::new_persistent_for_query_repair("unowned", &path).unwrap_err();
+        assert!(
+            error.contains("reservation disagrees with effective remaining quantity"),
+            "{error}",
+        );
         let _ = std::fs::remove_file(&path);
     }
 

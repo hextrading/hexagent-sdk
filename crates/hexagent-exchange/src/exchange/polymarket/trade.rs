@@ -174,6 +174,28 @@ fn recovered_order_close_reason(
         .then_some(RecoveredOrderCloseReason::JsonNull)
 }
 
+/// Query-repair rows must receive an actual CLOB order lookup. An event-end
+/// marker can close ordinary recovered orders before I/O, but is only fallback
+/// evidence for query repair after the bounded lookup attempts complete.
+fn prequery_recovered_order_close_reason(
+    is_recovered: bool,
+    event_has_ended: bool,
+    requires_query_repair: bool,
+) -> Option<RecoveredOrderCloseReason> {
+    if requires_query_repair {
+        None
+    } else {
+        recovered_order_close_reason(is_recovered, event_has_ended, None)
+    }
+}
+
+fn can_reuse_persisted_terminal_audit(
+    terminal_trade_ids_authoritative: bool,
+    requires_query_repair: bool,
+) -> bool {
+    terminal_trade_ids_authoritative && !requires_query_repair
+}
+
 /// The same bounded retry pass owns both crash-recovered orders and routine
 /// post-cancel size-matched audits.  Returning when only the first counter is
 /// zero restarts the outer background loop and resets every log to attempt=1.
@@ -2691,6 +2713,84 @@ impl PolymarketTrade {
         gap_replay: GapReplayConfig,
         account_ledger_path: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::new_with_pool_inner(
+            api_key,
+            api_secret,
+            passphrase,
+            private_key,
+            neg_risk,
+            rate_limit_per_second,
+            sig_type,
+            clob_version,
+            builder_code,
+            api_url_prefix,
+            use_batch_orders,
+            instance_id,
+            funder,
+            gap_replay,
+            account_ledger_path,
+            false,
+        )
+    }
+
+    /// Live-engine constructor that may conservatively open a narrowly
+    /// repairable FAILED-trade under-reservation. The engine must run and
+    /// complete authoritative startup order queries before strategy admission.
+    pub fn new_with_pool_for_startup_query_repair(
+        api_key: &str,
+        api_secret: &str,
+        passphrase: &str,
+        private_key: &str,
+        neg_risk: bool,
+        rate_limit_per_second: u32,
+        sig_type: SignatureType,
+        clob_version: ClobVersion,
+        builder_code: &str,
+        api_url_prefix: &str,
+        use_batch_orders: bool,
+        instance_id: &str,
+        funder: &str,
+        gap_replay: GapReplayConfig,
+        account_ledger_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        Self::new_with_pool_inner(
+            api_key,
+            api_secret,
+            passphrase,
+            private_key,
+            neg_risk,
+            rate_limit_per_second,
+            sig_type,
+            clob_version,
+            builder_code,
+            api_url_prefix,
+            use_batch_orders,
+            instance_id,
+            funder,
+            gap_replay,
+            account_ledger_path,
+            true,
+        )
+    }
+
+    fn new_with_pool_inner(
+        api_key: &str,
+        api_secret: &str,
+        passphrase: &str,
+        private_key: &str,
+        neg_risk: bool,
+        rate_limit_per_second: u32,
+        sig_type: SignatureType,
+        clob_version: ClobVersion,
+        builder_code: &str,
+        api_url_prefix: &str,
+        use_batch_orders: bool,
+        instance_id: &str,
+        funder: &str,
+        gap_replay: GapReplayConfig,
+        account_ledger_path: Option<&std::path::Path>,
+        startup_query_repair: bool,
+    ) -> Result<Self> {
         let signer = OrderSigner::new(private_key, neg_risk, sig_type)?;
         // Build v2 signer eagerly iff v2 mode — it's tiny (a few keys +
         // strings) and keeps the sign-hot-path branch a simple Option
@@ -2766,13 +2866,18 @@ impl PolymarketTrade {
             .unwrap_or_else(|| signer.maker_address.clone());
 
         let account_state = if let Some(path) = account_ledger_path {
-            Arc::new(
+            let account = if startup_query_repair {
+                hexagent_account::account::shared_account::SharedAccount::new_persistent_for_query_repair(
+                    instance_id,
+                    path,
+                )
+            } else {
                 hexagent_account::account::shared_account::SharedAccount::new_persistent(
                     instance_id,
                     path,
-            )
-                .map_err(anyhow::Error::msg)?,
-            )
+                )
+            };
+            Arc::new(account.map_err(anyhow::Error::msg)?)
         } else {
             Arc::new(hexagent_account::account::shared_account::SharedAccount::new(instance_id))
         };
@@ -3068,12 +3173,18 @@ impl PolymarketTrade {
             let mut unavailable_count = 0usize;
             let mut unavailable_samples = Vec::new();
             let mut json_null_count = 0usize;
-            let pending: Vec<(String, String, OrderOwnership, bool)> = {
+            let pending: Vec<(String, String, OrderOwnership, bool, bool)> = {
                 let coids = self.shared.account_state.pending_order_audit_ids();
                 let recovered: HashSet<String> = self
                     .shared
                     .account_state
                     .recovery_pending_order_ids()
+                    .into_iter()
+                    .collect();
+                let query_repairs: HashSet<String> = self
+                    .shared
+                    .account_state
+                    .startup_query_repair_pending_order_ids()
                     .into_iter()
                     .collect();
                 let ids = self.shared.coid_to_oid.lock().unwrap();
@@ -3082,8 +3193,17 @@ impl PolymarketTrade {
                     .filter_map(|coid| {
                         let ownership = self.shared.account_state.order(&coid)?;
                         let is_recovered = recovered.contains(&coid);
+                        let requires_query_repair = query_repairs.contains(&coid);
                         ids.get(&coid)
-                            .map(|oid| (coid, oid.clone(), ownership, is_recovered))
+                            .map(|oid| {
+                                (
+                                    coid,
+                                    oid.clone(),
+                                    ownership,
+                                    is_recovered,
+                                    requires_query_repair,
+                                )
+                            })
                     })
                     .collect()
             };
@@ -3096,13 +3216,15 @@ impl PolymarketTrade {
                 return (unresolved, replayed_updates);
             }
 
-            for (coid, order_id, ownership, is_recovered) in pending {
-                if let Some(reason) = recovered_order_close_reason(
+            for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
+                let event_has_ended = self
+                    .shared
+                    .account_state
+                    .token_event_has_ended(&ownership.token_id);
+                if let Some(reason) = prequery_recovered_order_close_reason(
                     is_recovered,
-                    self.shared
-                        .account_state
-                        .token_event_has_ended(&ownership.token_id),
-                    None,
+                    event_has_ended,
+                    requires_query_repair,
                 ) {
                     replayed_updates.push(self.close_recovered_order(
                         &ownership,
@@ -3111,7 +3233,10 @@ impl PolymarketTrade {
                     ));
                     continue;
                 }
-                if ownership.terminal_trade_ids_authoritative {
+                if can_reuse_persisted_terminal_audit(
+                    ownership.terminal_trade_ids_authoritative,
+                    requires_query_repair,
+                ) {
                     let terminal_status = if ownership.status == OrderStatus::Cancelled {
                         OrderStatus::Cancelled
                     } else {
@@ -3248,10 +3373,28 @@ impl PolymarketTrade {
                         }
                     }
                     FetchOrderResult::NotFound(evidence) => {
-                        warn!(
-                            "[PolymarketTrade] startup recovery coid={} orderID={} not found attempt={} evidence={} — retaining reservation",
-                            coid, order_id, attempt + 1, evidence,
-                        );
+                        if requires_query_repair
+                            && event_has_ended
+                            && attempt + 1 == RETRY_DELAYS_MS.len()
+                        {
+                            warn!(
+                                "[PolymarketTrade] startup query repair coid={} orderID={} not found after {} attempts evidence={} and event ended — closing recovered order",
+                                coid,
+                                order_id,
+                                RETRY_DELAYS_MS.len(),
+                                evidence,
+                            );
+                            replayed_updates.push(self.close_recovered_order(
+                                &ownership,
+                                &order_id,
+                                RecoveredOrderCloseReason::EventEnded.as_str(),
+                            ));
+                        } else {
+                            warn!(
+                                "[PolymarketTrade] startup recovery coid={} orderID={} not found attempt={} evidence={} — retaining reservation",
+                                coid, order_id, attempt + 1, evidence,
+                            );
+                        }
                     }
                     FetchOrderResult::Unavailable(kind)
                         if recovered_order_close_reason(is_recovered, false, Some(&kind))
@@ -7799,6 +7942,20 @@ mod tests {
             assert!(!startup_recovery_warn_attempt(attempt, attempts));
         }
         assert!(startup_recovery_warn_attempt(attempts - 1, attempts));
+    }
+
+    #[test]
+    fn query_repair_never_uses_event_end_to_skip_the_order_lookup() {
+        assert_eq!(
+            prequery_recovered_order_close_reason(true, true, false),
+            Some(RecoveredOrderCloseReason::EventEnded),
+        );
+        assert_eq!(
+            prequery_recovered_order_close_reason(true, true, true),
+            None,
+        );
+        assert!(can_reuse_persisted_terminal_audit(true, false));
+        assert!(!can_reuse_persisted_terminal_audit(true, true));
     }
 
     #[test]
