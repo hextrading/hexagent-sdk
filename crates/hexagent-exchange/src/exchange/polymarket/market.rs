@@ -26,6 +26,8 @@ const MAX_PUBLIC_EVENT_FUTURE_SKEW_NS: u64 = 2_000_000_000;
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const GAMMA_EVENT_CACHE_TTL: Duration = Duration::from_secs(120);
 const GAMMA_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const ROTATION_GAMMA_ATTEMPTS: u32 = 2;
+const ROTATION_REFRESH_TIMEOUT_NS: u64 = 15_000_000_000;
 
 /// Gamma is control-plane traffic (startup metadata and event rotation), not
 /// an order-path service. Keep one ordinary client for opportunistic HTTP/1.1
@@ -528,16 +530,18 @@ struct PolymarketSeries {
 /// "series not found" failure during those transitions; matching by
 /// slug alone is enough.
 fn fetch_series_id(series_slug: &str) -> Result<String> {
+    fetch_series_id_with_attempts(series_slug, 5)
+}
+
+fn fetch_series_id_with_attempts(series_slug: &str, attempts: u32) -> Result<String> {
     let url = format!(
         "{}/series?slug={}&exclude_events=true",
         GAMMA_API_BASE, series_slug
     );
     info!("[Polymarket] Fetching series by slug: {}", url);
 
-    // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
-    // covers brief gamma-api 5xx blips during event rotation without
-    // permanently stalling the subscribe / maintenance path.
-    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
+    // Startup uses five attempts; the detached rotation worker uses two.
+    let resp_text = gamma_get_text_retry(&url, attempts, 200)?;
     let series_list: Vec<PolymarketSeries> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse series response: {}", e))?;
 
@@ -571,6 +575,14 @@ fn fetch_active_events_by_series_id(
     series_id: &str,
     series_slug: &str,
 ) -> Result<Vec<PolymarketEvent>> {
+    fetch_active_events_by_series_id_with_attempts(series_id, series_slug, 5)
+}
+
+fn fetch_active_events_by_series_id_with_attempts(
+    series_id: &str,
+    series_slug: &str,
+    attempts: u32,
+) -> Result<Vec<PolymarketEvent>> {
     let now_secs = chrono::Utc::now().timestamp() as u64;
     let guard_secs = min_event_remaining_secs(series_slug);
     let end_min_iso =
@@ -586,10 +598,9 @@ fn fetch_active_events_by_series_id(
         series_id, url
     );
 
-    // 5 attempts × exponential backoff (200 ms base) ≈ 6 s ceiling —
-    // covers brief gamma-api 5xx blips during event rotation without
-    // permanently stalling the subscribe / maintenance path.
-    let resp_text = gamma_get_text_retry(&url, 5, 200)?;
+    // Startup uses five attempts; the detached rotation worker uses two and
+    // is additionally bounded by its poll-side deadline.
+    let resp_text = gamma_get_text_retry(&url, attempts, 200)?;
     let events: Vec<PolymarketEvent> = serde_json::from_str(&resp_text)
         .map_err(|e| anyhow!("Failed to parse events response: {}", e))?;
 
@@ -855,8 +866,11 @@ pub fn fetch_next_event_condition_id(
         .filter(|s| !s.is_empty()))
 }
 
-/// Fetch the currently trading event using a cached series_id (rotation calls).
-fn fetch_active_event_by_series_id(series_id: &str, series_slug: &str) -> Result<PolymarketEvent> {
+fn fetch_active_event_by_series_id_with_attempts(
+    series_id: &str,
+    series_slug: &str,
+    attempts: u32,
+) -> Result<PolymarketEvent> {
     let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
     let end_date_min_secs = now_secs.saturating_add(min_event_remaining_secs(series_slug));
     if let Some(event) = cached_gamma_event_after(series_id, end_date_min_secs) {
@@ -867,7 +881,7 @@ fn fetch_active_event_by_series_id(series_id: &str, series_slug: &str) -> Result
         return pick_current_event(vec![event], series_slug);
     }
 
-    let events = fetch_active_events_by_series_id(series_id, series_slug)?;
+    let events = fetch_active_events_by_series_id_with_attempts(series_id, series_slug, attempts)?;
     pick_current_event(events, series_slug)
 }
 
@@ -923,6 +937,41 @@ impl MarketState {
     }
 }
 
+type RotationFetchResult = std::result::Result<(String, PolymarketEvent), String>;
+
+struct RotationRefresh {
+    started_ns: u64,
+    rx: crossbeam_channel::Receiver<RotationFetchResult>,
+}
+
+fn spawn_rotation_refresh(
+    series_slug: String,
+    cached_series_id: Option<String>,
+    started_ns: u64,
+) -> Result<RotationRefresh> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("polymarket-rotation".to_string())
+        .spawn(move || {
+            let result = (|| -> Result<(String, PolymarketEvent)> {
+                let series_id = match cached_series_id {
+                    Some(id) => id,
+                    None => fetch_series_id_with_attempts(&series_slug, ROTATION_GAMMA_ATTEMPTS)?,
+                };
+                let event = fetch_active_event_by_series_id_with_attempts(
+                    &series_id,
+                    &series_slug,
+                    ROTATION_GAMMA_ATTEMPTS,
+                )?;
+                Ok((series_id, event))
+            })()
+            .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        })
+        .map_err(|error| anyhow!("spawn rotation refresh worker: {error}"))?;
+    Ok(RotationRefresh { started_ns, rx })
+}
+
 /// A subscription entry. interval_minutes: 0 = static slug, -1 = event series (auto-refresh).
 struct SeriesState {
     name: String,
@@ -941,6 +990,9 @@ struct SeriesState {
     refresh_fail_first_ns: u64,
     /// Whether we've already logged the idling banner for this streak.
     refresh_idling_logged: bool,
+    /// In-flight Gamma lookup. Rotation is control-plane work and must never
+    /// block the synchronous market-feed loop or its liveness watchdogs.
+    rotation_refresh: Option<RotationRefresh>,
 }
 
 /// RTDS (Real-Time Data Source) subscription config.
@@ -1083,23 +1135,57 @@ impl PolymarketMarket {
             // Event series mode: re-fetch active markets
             if self.series[i].interval_minutes == -1 {
                 let series_slug = self.series[i].name["series:".len()..].to_string();
-                let cached_id = self.series[i].series_id.clone();
-                let result = match &cached_id {
-                    Some(id) => fetch_active_event_by_series_id(id, &series_slug),
-                    None => match fetch_active_event_with_series_id(&series_slug) {
-                        Ok((id, ev)) => {
-                            self.series[i].series_id = Some(id);
-                            Ok(ev)
+                let refresh_result = match self.series[i]
+                    .rotation_refresh
+                    .as_ref()
+                    .map(|refresh| (refresh.started_ns, refresh.rx.try_recv()))
+                {
+                    Some((_, Ok(result))) => {
+                        self.series[i].rotation_refresh = None;
+                        result
+                    }
+                    Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty)))
+                        if now.saturating_sub(started_ns) < ROTATION_REFRESH_TIMEOUT_NS =>
+                    {
+                        continue;
+                    }
+                    Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty))) => {
+                        self.series[i].rotation_refresh = None;
+                        Err(format!(
+                            "Gamma rotation lookup timed out after {:.1}s",
+                            now.saturating_sub(started_ns) as f64 / 1e9,
+                        ))
+                    }
+                    Some((_, Err(crossbeam_channel::TryRecvError::Disconnected))) => {
+                        self.series[i].rotation_refresh = None;
+                        Err("Gamma rotation lookup worker disconnected".to_string())
+                    }
+                    None => {
+                        let refresh = spawn_rotation_refresh(
+                            series_slug.clone(),
+                            self.series[i].series_id.clone(),
+                            now,
+                        );
+                        match refresh {
+                            Ok(refresh) => {
+                                info!(
+                                    "[Polymarket] Event series '{}' rotation refresh started",
+                                    series_slug,
+                                );
+                                self.series[i].rotation_refresh = Some(refresh);
+                                continue;
+                            }
+                            Err(error) => Err(error.to_string()),
                         }
-                        Err(e) => Err(e),
-                    },
+                    }
                 };
-                match result {
-                    Ok(event) => {
+                match refresh_result {
+                    Ok((series_id, event)) => {
                         info!(
                             "[Polymarket] Event series '{}' refresh: '{}'",
                             series_slug, event.title
                         );
+                        self.series[i].series_id = Some(series_id);
 
                         // Remove old token mappings
                         for sym in &self.series[i].market.symbols {
@@ -2623,6 +2709,22 @@ struct PriceChangeFields {
     timestamp: Option<serde_json::Value>,
 }
 
+#[derive(Default)]
+struct ReportedBbo {
+    /// Outer Option means the field was present; inner Option is the
+    /// tradeable price after mapping terminal 0/1 sentinels to no level.
+    bid: Option<Option<Decimal>>,
+    ask: Option<Option<Decimal>>,
+}
+
+fn normalize_reported_bbo(price: Decimal) -> Option<Decimal> {
+    if price == Decimal::ZERO || price == Decimal::ONE {
+        None
+    } else {
+        Some(price)
+    }
+}
+
 /// Inline RTDS spot-price record seen on the CLOB socket (distinct from
 /// the dedicated RTDS WS schema, which wraps in `topic`/`payload`).
 #[derive(serde::Deserialize)]
@@ -2970,6 +3072,7 @@ impl ClobLocalBooks {
     ) -> (Vec<MarketEvent>, usize) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
+        let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
 
         for change in fields.price_changes {
             counters.price_change_entries = counters.price_change_entries.saturating_add(1);
@@ -3054,18 +3157,49 @@ impl ClobLocalBooks {
             book.dirty_since.get_or_insert(received_at);
             let _ = change.hash;
 
-            let expected_bid = change.best_bid.as_ref().and_then(WireDecimal::decimal);
-            let expected_ask = change.best_ask.as_ref().and_then(WireDecimal::decimal);
+            let reported = reported_bbo.entry(token.clone()).or_default();
+            if let Some(value) = change.best_bid.as_ref() {
+                match value.decimal() {
+                    Some(price) => reported.bid = Some(normalize_reported_bbo(price)),
+                    None => diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change_bbo".to_string(),
+                        detail: format!("token={token} side=bid"),
+                    }),
+                }
+            }
+            if let Some(value) = change.best_ask.as_ref() {
+                match value.decimal() {
+                    Some(price) => reported.ask = Some(normalize_reported_bbo(price)),
+                    None => diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change_bbo".to_string(),
+                        detail: format!("token={token} side=ask"),
+                    }),
+                }
+            }
+        }
+
+        // A price_change message is one atomic wire frame. Its reported BBO
+        // describes the completed frame, not every intermediate entry. Apply
+        // all entries first, then compare once per token. Boundary prices 0/1
+        // are venue sentinels for a missing tradeable side and intentionally
+        // match an empty side in the local (0,1)-only L2 book.
+        let mut reported_tokens: Vec<_> = reported_bbo.keys().cloned().collect();
+        reported_tokens.sort();
+        for token in reported_tokens {
+            let Some(book) = self.token_books.get(&token) else {
+                continue;
+            };
             let actual = book.top();
-            if (expected_bid.is_some() && expected_bid != actual.0)
-                || (expected_ask.is_some() && expected_ask != actual.1)
-            {
+            let expected = &reported_bbo[&token];
+            let bid_mismatch = expected.bid.is_some_and(|bid| bid != actual.0);
+            let ask_mismatch = expected.ask.is_some_and(|ask| ask != actual.1);
+            if bid_mismatch || ask_mismatch {
                 counters.bbo_mismatches = counters.bbo_mismatches.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
                     key: "price_change_bbo_mismatch".to_string(),
                     detail: format!(
-                        "token={token} expected_bid={expected_bid:?} expected_ask={expected_ask:?} actual_bid={:?} actual_ask={:?}",
-                        actual.0, actual.1,
+                        "token={token} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
+                        expected.bid, expected.ask, actual.0, actual.1,
                     ),
                 });
             }
@@ -3220,6 +3354,14 @@ fn process_clob_frame(
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
                 let exchange_timestamp_ns =
                     timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+                if is_non_tradeable_bbo(fields.best_bid, fields.best_ask) {
+                    // A missing side or an exact 0/1 boundary is the normal
+                    // terminal representation of an empty tradeable side.
+                    // QuoteTick requires two prices strictly inside (0,1), so
+                    // consume this frame without emitting a false warning.
+                    batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+                    continue;
+                }
                 match make_quote_event(
                     fields.asset_id,
                     fields.best_bid,
@@ -3330,6 +3472,25 @@ fn normalized_timestamp_ns(timestamp: Option<&serde_json::Value>) -> Option<u64>
         Some(ts) => Some(ts),
         None => None,
     }
+}
+
+fn is_non_tradeable_bbo(best_bid: Option<f64>, best_ask: Option<f64>) -> bool {
+    let in_venue_range = |price: f64| price.is_finite() && (0.0..=1.0).contains(&price);
+    if best_bid.is_some_and(|price| !in_venue_range(price))
+        || best_ask.is_some_and(|price| !in_venue_range(price))
+    {
+        return false;
+    }
+
+    let bid = best_bid.unwrap_or(0.0);
+    let ask = best_ask.unwrap_or(1.0);
+    let missing_or_boundary = best_bid.is_none()
+        || best_ask.is_none()
+        || bid == 0.0
+        || bid == 1.0
+        || ask == 0.0
+        || ask == 1.0;
+    missing_or_boundary && bid <= ask
 }
 
 fn make_quote_event(
@@ -3637,6 +3798,7 @@ impl ExchangeMarket for PolymarketMarket {
                     refresh_fail_count: 0,
                     refresh_fail_first_ns: 0,
                     refresh_idling_logged: false,
+                    rotation_refresh: None,
                 });
             } else {
                 // Event slug format: subscribe by slug for price reference (no rotation)
@@ -3695,6 +3857,7 @@ impl ExchangeMarket for PolymarketMarket {
                     refresh_fail_count: 0,
                     refresh_fail_first_ns: 0,
                     refresh_idling_logged: false,
+                    rotation_refresh: None,
                 });
             }
         }
@@ -3970,6 +4133,111 @@ mod pick_current_event_tests {
     }
 
     #[test]
+    fn in_flight_rotation_refresh_does_not_block_market_loop() {
+        let started_ns = now_ns();
+        let (_rotation_tx, rotation_rx) = crossbeam_channel::bounded(1);
+        let mut market = PolymarketMarket::new();
+        market.series.push(SeriesState {
+            name: "series:btc-up-or-down-5m".to_string(),
+            interval_minutes: -1,
+            market: MarketState {
+                event_id: "expired".to_string(),
+                start_ns: started_ns.saturating_sub(300_000_000_000),
+                end_ns: started_ns.saturating_sub(1),
+                symbols: Vec::new(),
+            },
+            series_id: Some("10684".to_string()),
+            next_retry_ns: 0,
+            refresh_fail_count: 0,
+            refresh_fail_first_ns: 0,
+            refresh_idling_logged: false,
+            rotation_refresh: Some(RotationRefresh {
+                started_ns,
+                rx: rotation_rx,
+            }),
+        });
+
+        let call_started = Instant::now();
+        market.check_rotation().unwrap();
+        assert!(
+            call_started.elapsed() < Duration::from_millis(100),
+            "an in-flight Gamma lookup must not stall next_event"
+        );
+        assert!(market.series[0].rotation_refresh.is_some());
+    }
+
+    #[test]
+    fn completed_rotation_refresh_replaces_tokens_and_queues_metadata() {
+        let started_ns = now_ns();
+        let (rotation_tx, rotation_rx) = crossbeam_channel::bounded(1);
+        let mut next_event = mk_event(now() - 1, now() + 299);
+        next_event.markets.push(PolyMarketInfo {
+            id: "new-market".to_string(),
+            question: "BTC up or down?".to_string(),
+            condition_id: "new-condition".to_string(),
+            slug: "new-market".to_string(),
+            clob_token_ids: vec!["new-up".to_string(), "new-down".to_string()],
+            outcomes: vec!["Up".to_string(), "Down".to_string()],
+            outcome_prices: vec!["0.5".to_string(), "0.5".to_string()],
+            active: true,
+            closed: false,
+            volume: 0.0,
+            liquidity: 0.0,
+            tick_size: 0.01,
+            order_min_size: 5.0,
+            group_item_title: String::new(),
+            event_start_time: String::new(),
+            base_fee: 0,
+            fee_schedule: FeeSchedule::default(),
+        });
+        let next_event_id = next_event.id.clone();
+        rotation_tx
+            .send(Ok(("10684".to_string(), next_event)))
+            .unwrap();
+
+        let mut market = PolymarketMarket::new();
+        market.token_to_series.insert("old-up".to_string(), 0);
+        market.series.push(SeriesState {
+            name: "series:btc-up-or-down-5m".to_string(),
+            interval_minutes: -1,
+            market: MarketState {
+                event_id: "expired".to_string(),
+                start_ns: started_ns.saturating_sub(300_000_000_000),
+                end_ns: started_ns.saturating_sub(1),
+                symbols: vec![SymbolState {
+                    token_id: "old-up".to_string(),
+                    _outcome: "Up".to_string(),
+                    _condition_id: "old-condition".to_string(),
+                }],
+            },
+            series_id: Some("10684".to_string()),
+            next_retry_ns: 0,
+            refresh_fail_count: 0,
+            refresh_fail_first_ns: 0,
+            refresh_idling_logged: false,
+            rotation_refresh: Some(RotationRefresh {
+                started_ns,
+                rx: rotation_rx,
+            }),
+        });
+
+        market.check_rotation().unwrap();
+        assert_eq!(market.series[0].market.event_id, next_event_id);
+        assert!(market.series[0].rotation_refresh.is_none());
+        assert!(!market.token_to_series.contains_key("old-up"));
+        assert_eq!(market.token_to_series.get("new-up"), Some(&0));
+        assert_eq!(market.token_to_series.get("new-down"), Some(&0));
+        assert!(matches!(
+            market.pending_events.front(),
+            Some(MarketEvent::EventStart { .. })
+        ));
+        assert!(market
+            .pending_events
+            .iter()
+            .any(|event| matches!(event, MarketEvent::Instrument(_))));
+    }
+
+    #[test]
     fn parses_best_bid_ask_as_quote_with_server_timestamp() {
         let events = parse_clob_frame(
             r#"{
@@ -4029,6 +4297,28 @@ mod pick_current_event_tests {
             }"#,
         );
         assert!(crossed.is_empty());
+    }
+
+    #[test]
+    fn terminal_boundary_bbo_is_silent_and_not_a_quote() {
+        let mut books = ClobLocalBooks::default();
+        let batch = process_clob_frame(
+            r#"{
+                "event_type":"best_bid_ask",
+                "asset_id":"token",
+                "best_bid":"0.99",
+                "best_ask":"1",
+                "timestamp":"1757908892351"
+            }"#,
+            &mut books,
+            &["token".to_string()],
+            Instant::now(),
+            1_757_908_892_351_000_000,
+        );
+        assert!(batch.recognized_topic);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.wire.ignored, 1);
+        assert!(batch.diagnostics.is_empty());
     }
 
     #[test]
@@ -4279,6 +4569,78 @@ mod pick_current_event_tests {
             .bids
             .iter()
             .any(|level| level.price == 0.20));
+    }
+
+    #[test]
+    fn price_change_bbo_is_checked_after_the_complete_frame() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let received_at = Instant::now();
+        let seed = process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"6000"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            14_000_000_000,
+        );
+        assert_eq!(seed.events.len(), 1);
+
+        let delta = process_clob_frame(
+            r#"{
+                "event_type":"price_change",
+                "price_changes":[
+                    {"asset_id":"up","price":"0.60","size":"0","side":"SELL","best_bid":"0.40","best_ask":"0.70"},
+                    {"asset_id":"up","price":"0.70","size":"9","side":"SELL","best_bid":"0.40","best_ask":"0.70"}
+                ],
+                "timestamp":"6001"
+            }"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            14_001_000_000,
+        );
+        assert_eq!(delta.wire.bbo_mismatches, 0);
+        assert!(delta
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.key != "price_change_bbo_mismatch"));
+        assert_eq!(order_book(&delta.events[0]).asks[0].price, 0.70);
+    }
+
+    #[test]
+    fn terminal_price_change_boundary_matches_empty_book_side() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.99","size":"10"}],"asks":[{"price":"0.999","size":"11"}],"timestamp":"7000"}"#,
+            &mut books,
+            &tokens,
+            received_at,
+            15_000_000_000,
+        );
+
+        let terminal = process_clob_frame(
+            r#"{
+                "event_type":"price_change",
+                "price_changes":[
+                    {"asset_id":"up","price":"0.999","size":"0","side":"SELL","best_bid":"0.99","best_ask":"1"}
+                ],
+                "timestamp":"7001"
+            }"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            15_001_000_000,
+        );
+        assert_eq!(terminal.wire.bbo_mismatches, 0);
+        assert!(terminal
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.key != "price_change_bbo_mismatch"));
+        let book = order_book(&terminal.events[0]);
+        assert_eq!(book.bids[0].price, 0.99);
+        assert!(book.asks.is_empty());
     }
 
     #[test]
