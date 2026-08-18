@@ -346,6 +346,27 @@ pub fn new_maintenance_status_handle() -> MaintenanceStatusHandle {
     std::sync::Arc::new(std::sync::Mutex::new(MaintenanceStatus::NotStarted))
 }
 
+/// Positive, condition-scoped proof that a maintenance split reached finality
+/// and its virtual allocation was committed for one strategy instance.
+///
+/// This is deliberately separate from [`MaintenanceStatus`]: the status is a
+/// compact health gate for the latest run, while this notification carries the
+/// exact event identity needed to invalidate a pre-split account snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryReady {
+    pub condition_id: String,
+    pub token_ids: Vec<String>,
+    pub amount_usdc: f64,
+}
+
+pub type InventoryReadySender = crossbeam_channel::Sender<InventoryReady>;
+pub type InventoryReadyReceiver = crossbeam_channel::Receiver<InventoryReady>;
+
+/// Create the per-strategy notification channel used by live maintenance.
+pub fn inventory_ready_channel() -> (InventoryReadySender, InventoryReadyReceiver) {
+    crossbeam_channel::unbounded()
+}
+
 /// Standard "no wallet credentials" error. Credentials are sourced ONLY
 /// from the secrets file (per-instance `[poly.<id>]`); `.env` is no longer
 /// a credential source.
@@ -4061,6 +4082,12 @@ fn run_split_one(
 pub struct MaintenanceJob {
     pub split_series_id: Option<String>,
     pub split_end_date_min_secs: u64,
+    /// Exact start of the immediately-following event. When present, Gamma
+    /// candidates that skip one or more intervals are rejected and retried.
+    pub split_expected_start_secs: Option<u64>,
+    /// Expected event duration used together with `split_expected_start_secs`
+    /// to validate both sides of the future-event boundary.
+    pub split_expected_duration_secs: Option<u64>,
     /// Last wall-clock second at which this split still seeds the intended
     /// event. A queued job that reaches the worker at/after this deadline is
     /// rejected before reserving funds or submitting a transaction.
@@ -4080,6 +4107,9 @@ pub struct MaintenanceJob {
     /// routed through here and always redeems.
     pub redeem_enabled: bool,
     pub status: Option<MaintenanceStatusHandle>,
+    /// Receives one condition-scoped notification only after the split and
+    /// this instance's virtual allocation have both completed successfully.
+    pub inventory_ready_tx: Option<InventoryReadySender>,
     /// Account whose wallet runs this split/redeem. Resolves per-account
     /// creds from the registry (multi-account safe); empty → global env.
     /// Also the executor key: jobs with the same `account_id` run serially
@@ -4266,7 +4296,12 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
         return;
     }
     let Some(series_id) = job.split_series_id.as_deref() else { return; };
-    match cached_maintenance_split_target(series_id, job.split_end_date_min_secs) {
+    match cached_maintenance_split_target(
+        series_id,
+        job.split_end_date_min_secs,
+        job.split_expected_start_secs,
+        job.split_expected_duration_secs,
+    ) {
         Ok(Some(target)) => {
             job.split_target_condition_id = Some(target.condition_id);
             job.split_target_token_ids = target.token_ids;
@@ -4298,7 +4333,7 @@ enum MaintenanceTargetCacheEntry {
     },
 }
 
-type MaintenanceTargetKey = (String, u64);
+type MaintenanceTargetKey = (String, u64, Option<u64>, Option<u64>);
 type MaintenanceTargetCache = (
     std::sync::Mutex<std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>>,
     std::sync::Condvar,
@@ -4310,9 +4345,16 @@ static MAINTENANCE_TARGET_CACHE: std::sync::OnceLock<MaintenanceTargetCache> =
 fn cached_maintenance_split_target(
     series_id: &str,
     end_date_min_secs: u64,
+    expected_start_secs: Option<u64>,
+    expected_duration_secs: Option<u64>,
 ) -> std::result::Result<Option<ResolvedMaintenanceTarget>, String> {
     const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-    let key = (series_id.to_string(), end_date_min_secs);
+    let key = (
+        series_id.to_string(),
+        end_date_min_secs,
+        expected_start_secs,
+        expected_duration_secs,
+    );
     let (cache, ready) = MAINTENANCE_TARGET_CACHE.get_or_init(|| {
         (std::sync::Mutex::new(std::collections::HashMap::new()), std::sync::Condvar::new())
     });
@@ -4342,7 +4384,17 @@ fn cached_maintenance_split_target(
         }
     }
 
-    let fetched = super::market::fetch_next_event(series_id, end_date_min_secs)
+    let fetched = match (expected_start_secs, expected_duration_secs) {
+        (Some(expected_start), Some(expected_duration)) => {
+            super::market::fetch_contiguous_next_event(
+                series_id,
+                end_date_min_secs,
+                expected_start,
+                expected_duration,
+            )
+        }
+        _ => super::market::fetch_next_event(series_id, end_date_min_secs),
+    }
         .map_err(|error| error.to_string())
         .map(|event| {
             event.and_then(|event| {
@@ -4406,6 +4458,12 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     let mut done = vec![first_done];
     let mut statuses: Vec<MaintenanceStatusHandle> =
         job.status.iter().cloned().collect();
+    let mut inventory_ready_subscribers: Vec<(String, f64, InventoryReadySender)> = job
+        .inventory_ready_tx
+        .take()
+        .map(|sender| (job.instance_id.clone(), job.split_amount_usdc, sender))
+        .into_iter()
+        .collect();
     let mut allocations = std::collections::HashMap::<String, f64>::new();
     if !job.instance_id.is_empty() && job.split_amount_usdc > 0.0 {
         allocations.insert(job.instance_id.clone(), job.split_amount_usdc);
@@ -4429,10 +4487,17 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
             job.account_state = sibling.account_state.clone();
         }
         if !sibling.instance_id.is_empty() && sibling.split_amount_usdc > 0.0 {
-            *allocations.entry(sibling.instance_id).or_insert(0.0) +=
+            *allocations.entry(sibling.instance_id.clone()).or_insert(0.0) +=
                 sibling.split_amount_usdc;
         }
         if let Some(status) = sibling.status { statuses.push(status); }
+        if let Some(sender) = sibling.inventory_ready_tx {
+            inventory_ready_subscribers.push((
+                sibling.instance_id.clone(),
+                sibling.split_amount_usdc,
+                sender,
+            ));
+        }
         done.push(sibling_done);
     }
     if job.status.is_none() {
@@ -4447,12 +4512,40 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     let _operation_guard = account_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ready_condition_id = job.split_target_condition_id.clone();
+    let ready_token_ids = job.split_target_token_ids.clone();
     run_maintenance_job(job, allocations);
     let terminal = statuses.first()
         .map(|status| status.lock().unwrap().clone());
-    if let Some(terminal) = terminal {
+    if let Some(ref terminal) = terminal {
         for status in statuses.iter().skip(1) {
             *status.lock().unwrap() = terminal.clone();
+        }
+    }
+    if terminal.as_ref().is_some_and(MaintenanceStatus::produced_seed_inventory) {
+        if let Some(condition_id) = ready_condition_id.filter(|condition| !condition.is_empty()) {
+            for (instance_id, amount_usdc, sender) in inventory_ready_subscribers {
+                let notification = InventoryReady {
+                    condition_id: condition_id.clone(),
+                    token_ids: ready_token_ids.clone(),
+                    amount_usdc,
+                };
+                if let Err(error) = sender.send(notification) {
+                    log::warn!(
+                        "[Maintenance] inventory-ready delivery failed instance={} cid={}: {}",
+                        instance_id,
+                        condition_id,
+                        error,
+                    );
+                } else {
+                    log::info!(
+                        "[Maintenance] inventory-ready instance={} cid={} amount_usdc={:.4}",
+                        instance_id,
+                        condition_id,
+                        amount_usdc,
+                    );
+                }
+            }
         }
     }
     for sender in done.into_iter().flatten() {
@@ -4869,6 +4962,8 @@ fn run_maintenance_job(
     let MaintenanceJob {
         split_series_id,
         split_end_date_min_secs: _,
+        split_expected_start_secs: _,
+        split_expected_duration_secs: _,
         split_execute_before_secs,
         split_target_condition_id,
         split_target_token_ids,
@@ -4877,6 +4972,7 @@ fn run_maintenance_job(
         gas_via_signer,
         redeem_enabled,
         status,
+        inventory_ready_tx: _,
         account_id,
         instance_id: _,
         account_state,
@@ -5256,6 +5352,8 @@ pub fn run_split() -> Result<()> {
     run_maintenance_blocking(MaintenanceJob {
         split_series_id: Some(series_id),
         split_end_date_min_secs: end_date_min_secs,
+        split_expected_start_secs: None,
+        split_expected_duration_secs: None,
         split_execute_before_secs: None,
         split_target_condition_id: None,
         split_target_token_ids: Vec::new(),
@@ -5264,6 +5362,7 @@ pub fn run_split() -> Result<()> {
         gas_via_signer,
         redeem_enabled: true,
         status: None,
+        inventory_ready_tx: None,
         // CLI: empty account_id → resolve creds from the global POLY_*
         // env (set by `apply_account_to_env` for the `--account` flag).
         account_id: String::new(),
@@ -5284,6 +5383,8 @@ mod maintenance_status_tests {
         MaintenanceJob {
             split_series_id: Some("series".to_string()),
             split_end_date_min_secs: end_date_min_secs,
+            split_expected_start_secs: None,
+            split_expected_duration_secs: None,
             split_execute_before_secs: None,
             split_target_condition_id: target.map(str::to_string),
             split_target_token_ids: Vec::new(),
@@ -5292,6 +5393,7 @@ mod maintenance_status_tests {
             gas_via_signer: false,
             redeem_enabled: false,
             status: None,
+            inventory_ready_tx: None,
             account_id: "account".to_string(),
             instance_id: "instance".to_string(),
             account_state: None,
@@ -5436,6 +5538,25 @@ mod maintenance_status_tests {
         });
         t.join().unwrap();
         assert_eq!(*h.lock().unwrap(), MaintenanceStatus::Succeeded);
+    }
+
+    #[test]
+    fn inventory_ready_channel_preserves_exact_condition_and_tokens() {
+        let (tx, rx) = inventory_ready_channel();
+        tx.send(InventoryReady {
+            condition_id: "condition-a".to_string(),
+            token_ids: vec!["up-a".to_string(), "down-a".to_string()],
+            amount_usdc: 30.0,
+        })
+        .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            InventoryReady {
+                condition_id: "condition-a".to_string(),
+                token_ids: vec!["up-a".to_string(), "down-a".to_string()],
+                amount_usdc: 30.0,
+            },
+        );
     }
 
     #[test]

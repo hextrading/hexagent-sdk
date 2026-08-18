@@ -1068,13 +1068,26 @@ pub fn fetch_next_event(
     series_id: &str,
     end_date_min_secs: u64,
 ) -> Result<Option<PolymarketEvent>> {
-    if let Some(event) = cached_gamma_event_after(series_id, end_date_min_secs) {
-        info!(
-            "[Polymarket] Next event cache hit: series_id={} id={} slug={}",
-            series_id, event.id, event.slug,
-        );
-        publish_rest_future_event(series_id, &event);
-        return Ok(Some(event));
+    fetch_next_event_inner(series_id, end_date_min_secs, true, true)
+}
+
+fn fetch_next_event_inner(
+    series_id: &str,
+    end_date_min_secs: u64,
+    allow_cache: bool,
+    publish: bool,
+) -> Result<Option<PolymarketEvent>> {
+    if allow_cache {
+        if let Some(event) = cached_gamma_event_after(series_id, end_date_min_secs) {
+            info!(
+                "[Polymarket] Next event cache hit: series_id={} id={} slug={}",
+                series_id, event.id, event.slug,
+            );
+            if publish {
+                publish_rest_future_event(series_id, &event);
+            }
+            return Ok(Some(event));
+        }
     }
 
     // Polymarket gamma API accepts RFC3339 / ISO8601 for `end_date_min`.
@@ -1116,8 +1129,104 @@ pub fn fetch_next_event(
         "[Polymarket] Next event: title='{}' id={} slug={} start={} end={} cid={}",
         event.title, event.id, event.slug, start_time, event.end_date, cid,
     );
-    publish_rest_future_event(series_id, &event);
+    if publish {
+        publish_rest_future_event(series_id, &event);
+    }
     Ok(Some(event))
+}
+
+fn event_bounds_secs(event: &PolymarketEvent) -> Option<(u64, u64)> {
+    let start = event
+        .markets
+        .first()
+        .and_then(|market| chrono::DateTime::parse_from_rfc3339(&market.event_start_time).ok())
+        .and_then(|time| u64::try_from(time.timestamp()).ok())?;
+    let end = chrono::DateTime::parse_from_rfc3339(&event.end_date)
+        .ok()
+        .and_then(|time| u64::try_from(time.timestamp()).ok())?;
+    Some((start, end))
+}
+
+fn contiguous_event_error(
+    event: &PolymarketEvent,
+    expected_start_secs: u64,
+    expected_duration_secs: u64,
+) -> Option<String> {
+    let Some((actual_start, actual_end)) = event_bounds_secs(event) else {
+        return Some(format!(
+            "future event has invalid start/end timestamps: id={} slug={}",
+            event.id, event.slug,
+        ));
+    };
+    let expected_end = expected_start_secs.saturating_add(expected_duration_secs);
+    if actual_start == expected_start_secs && actual_end == expected_end {
+        None
+    } else {
+        Some(format!(
+            "future-event continuity gap: expected_start={} expected_end={} actual_start={} actual_end={} id={} slug={}",
+            expected_start_secs,
+            expected_end,
+            actual_start,
+            actual_end,
+            event.id,
+            event.slug,
+        ))
+    }
+}
+
+/// Resolve only the immediately-following event. A later Gamma candidate is
+/// never published to the strategy registration channel as if it were the
+/// next rotation; brief publication gaps are retried with uncached reads.
+pub fn fetch_contiguous_next_event(
+    series_id: &str,
+    end_date_min_secs: u64,
+    expected_start_secs: u64,
+    expected_duration_secs: u64,
+) -> Result<Option<PolymarketEvent>> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 1..=ATTEMPTS {
+        let event = fetch_next_event_inner(
+            series_id,
+            end_date_min_secs,
+            attempt == 1,
+            false,
+        )?;
+        match event {
+            Some(event) => {
+                if let Some(reason) = contiguous_event_error(
+                    &event,
+                    expected_start_secs,
+                    expected_duration_secs,
+                ) {
+                    warn!(
+                        "[Polymarket] {} attempt={}/{}; retrying exact next event",
+                        reason,
+                        attempt,
+                        ATTEMPTS,
+                    );
+                } else {
+                    publish_rest_future_event(series_id, &event);
+                    return Ok(Some(event));
+                }
+            }
+            None => info!(
+                "[Polymarket] contiguous future event not published yet expected_start={} attempt={}/{}",
+                expected_start_secs,
+                attempt,
+                ATTEMPTS,
+            ),
+        }
+        if attempt < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+        }
+    }
+    Err(anyhow!(
+        "future-event continuity unresolved after {} attempts: series_id={} expected_start={} expected_end={}",
+        ATTEMPTS,
+        series_id,
+        expected_start_secs,
+        expected_start_secs.saturating_add(expected_duration_secs),
+    ))
 }
 
 /// Convenience wrapper: return just the first market's condition_id of the
@@ -1460,6 +1569,28 @@ impl PolymarketMarket {
                 continue;
             };
             if candidate_end_ns <= current.market.end_ns {
+                continue;
+            }
+            let expected_start_secs = current.market.end_ns / 1_000_000_000;
+            let Some((candidate_start_secs, _)) = event_bounds_secs(&candidate.event) else {
+                warn!(
+                    "[Polymarket] REST future event rejected: invalid bounds series='{}' event_id={} slug={}",
+                    current.name,
+                    candidate.event.id,
+                    candidate.event.slug,
+                );
+                continue;
+            };
+            if candidate_start_secs != expected_start_secs {
+                warn!(
+                    "[Polymarket] REST future-event continuity gap: series='{}' current_event_id={} expected_start={} actual_start={} candidate_id={} slug={} — registration deferred",
+                    current.name,
+                    current.market.event_id,
+                    expected_start_secs,
+                    candidate_start_secs,
+                    candidate.event.id,
+                    candidate.event.slug,
+                );
                 continue;
             }
 
@@ -5473,6 +5604,59 @@ mod pick_current_event_tests {
     }
 
     #[test]
+    fn future_event_continuity_rejects_a_skipped_five_minute_interval() {
+        let start = now() + 300;
+        let exact = mk_binary_event("btc", start, start + 300);
+        assert_eq!(contiguous_event_error(&exact, start, 300), None);
+
+        let skipped = mk_binary_event("btc", start + 300, start + 600);
+        let error = contiguous_event_error(&skipped, start, 300)
+            .expect("skipping one event must be explicit");
+        assert!(error.contains("future-event continuity gap"));
+        assert!(error.contains(&format!("expected_start={start}")));
+        assert!(error.contains(&format!("actual_start={}", start + 300)));
+    }
+
+    #[test]
+    fn rest_discovery_gap_is_not_registered_as_the_next_event() {
+        let base = now();
+        let current_end_secs = base + 120;
+        let series_id = format!("future-gap-{}", clob_monotonic_now_ns());
+        let skipped = mk_binary_event(
+            "btc",
+            current_end_secs + 300,
+            current_end_secs + 600,
+        );
+        let mut market = PolymarketMarket::new();
+        market.series.push(SeriesState {
+            name: "series:btc-up-or-down-5m".to_string(),
+            interval_minutes: -1,
+            market: MarketState {
+                event_id: "current-event".to_string(),
+                start_ns: base.saturating_sub(180).saturating_mul(1_000_000_000),
+                end_ns: current_end_secs.saturating_mul(1_000_000_000),
+                symbols: Vec::new(),
+            },
+            series_id: Some(series_id.clone()),
+            next_retry_ns: 0,
+            refresh_fail_count: 0,
+            refresh_fail_first_ns: 0,
+            refresh_idling_logged: false,
+            rotation_refresh: None,
+        });
+
+        publish_rest_future_event(&series_id, &skipped);
+        market.drain_rest_future_events();
+        assert!(market.pending_events.iter().all(|event| {
+            !matches!(
+                event,
+                MarketEvent::Instrument(Instrument::BinaryOption(instrument))
+                    if instrument.condition_id == skipped.markets[0].condition_id
+            )
+        }));
+    }
+
+    #[test]
     fn rest_channel_supports_many_consecutive_rotations() {
         let base = now();
         let series_id = format!("continuous-rotation-{}", clob_monotonic_now_ns());
@@ -5483,7 +5667,7 @@ mod pick_current_event_tests {
             market: MarketState {
                 event_id: "seed-event".to_string(),
                 start_ns: base.saturating_sub(300).saturating_mul(1_000_000_000),
-                end_ns: now_ns().saturating_sub(1),
+                end_ns: base.saturating_mul(1_000_000_000),
                 symbols: Vec::new(),
             },
             series_id: Some(series_id.clone()),
