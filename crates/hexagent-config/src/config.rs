@@ -151,6 +151,12 @@ pub struct GeneralConfig {
     pub mode: RunMode,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Global Polymarket Predictions status policy shared by every strategy
+    /// instance. When true, callers may keep trading while the Predictions
+    /// parent is OPERATIONAL and every child is either OPERATIONAL or
+    /// DEGRADEDPERFORMANCE. Default false (fail-safe).
+    #[serde(default)]
+    pub is_degraded_performance_trading: bool,
     /// Path (absolute or relative to this config file's directory) to
     /// the secrets file containing `[poly.<instance_id>]` blocks. When
     /// empty, falls back to `$HEXBOT_SECRETS` then
@@ -213,6 +219,21 @@ fn default_latency_record() -> String {
 
 fn default_live_max_data_gap_secs() -> f64 {
     3600.0
+}
+
+#[cfg(test)]
+mod general_config_tests {
+    use super::*;
+
+    #[test]
+    fn degraded_performance_trading_is_global_and_defaults_off() {
+        let default: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!default.is_degraded_performance_trading);
+
+        let enabled: GeneralConfig =
+            toml::from_str("is_degraded_performance_trading = true").unwrap();
+        assert!(enabled.is_degraded_performance_trading);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
