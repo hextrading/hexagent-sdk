@@ -104,10 +104,12 @@ fn parse_predictions_status(body: &str) -> Result<PredictionsStatus> {
     })?;
 
     let mut matched_components = 0;
+    let mut matched_parent = false;
     let mut non_operational = Vec::new();
 
     for component in parsed.components {
-        let belongs_to_predictions = component.name == PREDICTIONS_NAME
+        let is_predictions_parent = component.name == PREDICTIONS_NAME;
+        let belongs_to_predictions = is_predictions_parent
             || component
                 .group
                 .as_ref()
@@ -117,6 +119,7 @@ fn parse_predictions_status(body: &str) -> Result<PredictionsStatus> {
         }
 
         matched_components += 1;
+        matched_parent |= is_predictions_parent;
         let Some(status) = component.status.as_deref() else {
             let name = if component.name.is_empty() {
                 "<unnamed>"
@@ -140,6 +143,11 @@ fn parse_predictions_status(body: &str) -> Result<PredictionsStatus> {
     if matched_components == 0 {
         return Err(anyhow!(
             "Polymarket component status contains no Predictions components"
+        ));
+    }
+    if !matched_parent {
+        return Err(anyhow!(
+            "Polymarket component status contains no Predictions parent component"
         ));
     }
 
@@ -213,6 +221,17 @@ mod tests {
         let body = r#"{
             "components": [
                 {"name":"Perpetuals","status":"OPERATIONAL","group":null}
+            ]
+        }"#;
+
+        assert!(parse_predictions_status(body).is_err());
+    }
+
+    #[test]
+    fn predictions_children_without_parent_are_an_error() {
+        let body = r#"{
+            "components": [
+                {"name":"Clob Websocket","status":"OPERATIONAL","group":{"name":"Predictions"}}
             ]
         }"#;
 
