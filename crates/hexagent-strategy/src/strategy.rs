@@ -1,4 +1,4 @@
-use crate::types::{AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick};
+use crate::types::{AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, MarketDataHealth, OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick};
 
 /// Trait for trading strategies.
 pub trait Strategy: Send {
@@ -59,6 +59,9 @@ pub trait Strategy: Send {
     fn on_asset_ctx(&mut self, _ctx: &AssetCtxTick) {}
     fn on_instrument(&mut self, _inst: &Instrument) {}
     fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> { Vec::new() }
+    /// Condition-scoped market-data readiness.  Implementations may cancel
+    /// only the affected market while the exchange transport remains live.
+    fn on_market_data_health(&mut self, _health: &MarketDataHealth) -> Vec<Signal> { Vec::new() }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
     /// Wall-clock safety callback for live workers. It runs even when every

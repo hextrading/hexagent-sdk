@@ -403,7 +403,13 @@ const CLOB_BOOK_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
 /// Polymarket may split one logical price update across several WebSocket
 /// frames carrying the same exchange timestamp.  Give those sibling frames a
 /// small quiet window before declaring their advertised BBO irreconcilable.
-const CLOB_BBO_SETTLE_INTERVAL: Duration = Duration::from_millis(3);
+// Polymarket can split one logical BBO update across adjacent websocket
+// frames (including a delayed deletion carrying a newer millisecond
+// timestamp).  Three milliseconds was below observed scheduler/network
+// jitter and promoted harmless frame reordering into REST repairs.
+const CLOB_BBO_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+const CLOB_BBO_DIAGNOSTIC_FRAMES: usize = 4;
+const CLOB_BBO_MAX_SUPERSEDED_REPAIRS: u8 = 2;
 const CLOB_BURST_METRIC_INTERVAL: Duration = Duration::from_secs(1);
 const CLOB_DIAGNOSTIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
@@ -1984,6 +1990,20 @@ struct ClobWireCounters {
     bbo_transient_recoveries: u64,
     bbo_mismatches: u64,
     bbo_repair_requests: u64,
+    bbo_recovery_same_timestamp: u64,
+    bbo_recovery_newer_timestamp: u64,
+    bbo_recovery_book: u64,
+    bbo_recovery_rest: u64,
+    bbo_repair_superseded_by_ws: u64,
+    bbo_settle_samples: u64,
+    bbo_settle_total_us: u64,
+    bbo_settle_max_us: u64,
+    bbo_recovery_samples: u64,
+    bbo_recovery_total_us: u64,
+    bbo_recovery_max_us: u64,
+    bbo_tick_distance_samples: u64,
+    bbo_tick_distance_total: u64,
+    bbo_tick_distance_max: u64,
     unseeded_deltas: u64,
     ignored: u64,
     unknown: u64,
@@ -2011,6 +2031,38 @@ impl ClobWireCounters {
         self.bbo_repair_requests = self
             .bbo_repair_requests
             .saturating_add(rhs.bbo_repair_requests);
+        self.bbo_recovery_same_timestamp = self
+            .bbo_recovery_same_timestamp
+            .saturating_add(rhs.bbo_recovery_same_timestamp);
+        self.bbo_recovery_newer_timestamp = self
+            .bbo_recovery_newer_timestamp
+            .saturating_add(rhs.bbo_recovery_newer_timestamp);
+        self.bbo_recovery_book = self.bbo_recovery_book.saturating_add(rhs.bbo_recovery_book);
+        self.bbo_recovery_rest = self.bbo_recovery_rest.saturating_add(rhs.bbo_recovery_rest);
+        self.bbo_repair_superseded_by_ws = self
+            .bbo_repair_superseded_by_ws
+            .saturating_add(rhs.bbo_repair_superseded_by_ws);
+        self.bbo_settle_samples = self.bbo_settle_samples.saturating_add(rhs.bbo_settle_samples);
+        self.bbo_settle_total_us = self
+            .bbo_settle_total_us
+            .saturating_add(rhs.bbo_settle_total_us);
+        self.bbo_settle_max_us = self.bbo_settle_max_us.max(rhs.bbo_settle_max_us);
+        self.bbo_recovery_samples = self
+            .bbo_recovery_samples
+            .saturating_add(rhs.bbo_recovery_samples);
+        self.bbo_recovery_total_us = self
+            .bbo_recovery_total_us
+            .saturating_add(rhs.bbo_recovery_total_us);
+        self.bbo_recovery_max_us = self.bbo_recovery_max_us.max(rhs.bbo_recovery_max_us);
+        self.bbo_tick_distance_samples = self
+            .bbo_tick_distance_samples
+            .saturating_add(rhs.bbo_tick_distance_samples);
+        self.bbo_tick_distance_total = self
+            .bbo_tick_distance_total
+            .saturating_add(rhs.bbo_tick_distance_total);
+        self.bbo_tick_distance_max = self
+            .bbo_tick_distance_max
+            .max(rhs.bbo_tick_distance_max);
         self.unseeded_deltas = self.unseeded_deltas.saturating_add(rhs.unseeded_deltas);
         self.ignored = self.ignored.saturating_add(rhs.ignored);
         self.unknown = self.unknown.saturating_add(rhs.unknown);
@@ -2029,6 +2081,10 @@ struct ClobWindowMetrics {
     trades: u64,
     tick_size_changes: u64,
     other_events: u64,
+    health_healthy: u64,
+    health_settling: u64,
+    health_repairing: u64,
+    health_degraded: u64,
     max_frame_bytes: usize,
     max_events_per_frame: usize,
     max_event_queue_depth: usize,
@@ -2053,6 +2109,10 @@ impl ClobWindowMetrics {
             trades: 0,
             tick_size_changes: 0,
             other_events: 0,
+            health_healthy: 0,
+            health_settling: 0,
+            health_repairing: 0,
+            health_degraded: 0,
             max_frame_bytes: 0,
             max_events_per_frame: 0,
             max_event_queue_depth: 0,
@@ -2092,6 +2152,12 @@ impl ClobWindowMetrics {
                 MarketEvent::Quote(_) => self.quotes += 1,
                 MarketEvent::Trade(_) => self.trades += 1,
                 MarketEvent::TickSizeChange(_) => self.tick_size_changes += 1,
+                MarketEvent::MarketDataHealth(health) => match health.state {
+                    MarketDataHealthState::Healthy => self.health_healthy += 1,
+                    MarketDataHealthState::Settling => self.health_settling += 1,
+                    MarketDataHealthState::Repairing => self.health_repairing += 1,
+                    MarketDataHealthState::Degraded => self.health_degraded += 1,
+                },
                 _ => self.other_events += 1,
             }
         }
@@ -2131,7 +2197,7 @@ impl ClobWindowMetrics {
             .saturating_duration_since(self.window_started_at)
             .as_secs_f64();
         info!(
-            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} health_healthy={} health_settling={} health_repairing={} health_degraded={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} bbo_recovery_same_ts={} bbo_recovery_newer_ts={} bbo_recovery_book={} bbo_recovery_rest={} bbo_repair_superseded_by_ws={} bbo_settle_samples={} bbo_settle_total_us={} bbo_settle_max_us={} bbo_recovery_samples={} bbo_recovery_total_us={} bbo_recovery_max_us={} bbo_tick_distance_samples={} bbo_tick_distance_total={} bbo_tick_distance_max={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
             window_secs,
             self.data_frames,
             self.frame_bytes,
@@ -2141,6 +2207,10 @@ impl ClobWindowMetrics {
             self.trades,
             self.tick_size_changes,
             self.other_events,
+            self.health_healthy,
+            self.health_settling,
+            self.health_repairing,
+            self.health_degraded,
             self.max_frame_bytes,
             self.max_events_per_frame,
             queue_depth_now,
@@ -2160,6 +2230,20 @@ impl ClobWindowMetrics {
             self.wire.bbo_transient_recoveries,
             self.wire.bbo_mismatches,
             self.wire.bbo_repair_requests,
+            self.wire.bbo_recovery_same_timestamp,
+            self.wire.bbo_recovery_newer_timestamp,
+            self.wire.bbo_recovery_book,
+            self.wire.bbo_recovery_rest,
+            self.wire.bbo_repair_superseded_by_ws,
+            self.wire.bbo_settle_samples,
+            self.wire.bbo_settle_total_us,
+            self.wire.bbo_settle_max_us,
+            self.wire.bbo_recovery_samples,
+            self.wire.bbo_recovery_total_us,
+            self.wire.bbo_recovery_max_us,
+            self.wire.bbo_tick_distance_samples,
+            self.wire.bbo_tick_distance_total,
+            self.wire.bbo_tick_distance_max,
             self.wire.unseeded_deltas,
             self.wire.ignored,
             self.wire.unknown,
@@ -2567,6 +2651,23 @@ fn request_clob_book_repairs(
     }
 }
 
+fn request_clob_book_repair_after(
+    token: String,
+    delay: Duration,
+    in_flight: &mut HashSet<String>,
+    tx: &tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
+) {
+    if !in_flight.insert(token.clone()) {
+        return;
+    }
+    let tx = tx.clone();
+    crate::async_rt::handle().spawn(async move {
+        tokio::time::sleep(delay).await;
+        let result = fetch_authoritative_clob_book(&token).await;
+        let _ = tx.send(ClobBookRepairResult { token, result });
+    });
+}
+
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
     event_tx: crossbeam_channel::Sender<MarketEvent>,
@@ -2672,6 +2773,7 @@ async fn clob_ws_task(
         let (repair_tx, mut repair_rx) =
             tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
         let mut repairs_in_flight = HashSet::new();
+        let mut repair_superseded_attempts: HashMap<String, u8> = HashMap::new();
 
         // Align with the official CLOB SDK: lowercase channel `"market"`
         // (the user channel already uses lowercase `"user"`; the server is
@@ -2767,12 +2869,8 @@ async fn clob_ws_task(
                     for diagnostic in batch.diagnostics {
                         diagnostic_sampler.observe(now, diagnostic);
                     }
-                    if !batch.repair_tokens.is_empty() {
-                        announce_clob_not_ready(
-                            &event_tx,
-                            &mut lifecycle,
-                            "persistent BBO mismatch; authoritative repair pending",
-                        );
+                    for token in &batch.repair_tokens {
+                        repair_superseded_attempts.entry(token.clone()).or_insert(0);
                     }
                     request_clob_book_repairs(
                         batch.repair_tokens,
@@ -2799,17 +2897,78 @@ async fn clob_ws_task(
                     };
                     repairs_in_flight.remove(&repair.token);
                     if !books.quarantined_tokens.contains(&repair.token) {
+                        repair_superseded_attempts.remove(&repair.token);
                         continue;
                     }
                     let now = Instant::now();
+                    let local_now = now_ns();
                     match repair.result {
-                        Ok(fields) => match books.apply_book(fields, now, now_ns()) {
-                            Ok(event) => {
+                        Ok(fields) => match books.apply_book(
+                            fields,
+                            now,
+                            local_now,
+                            ClobBookSource::RestRepair,
+                            &mut diagnostics.wire,
+                        ) {
+                            Ok(ClobBookApplyOutcome::Applied(events)) => {
+                                repair_superseded_attempts.remove(&repair.token);
                                 info!(
                                     "[Polymarket] authoritative BBO repair completed token={}",
                                     repair.token,
                                 );
-                                if let Some(event) = event {
+                                if !events.is_empty() {
+                                    diagnostics.record_coalesced(&events);
+                                    if !forward_clob_events(
+                                        events,
+                                        &event_tx,
+                                        &mut lifecycle,
+                                        &mut health,
+                                        &mut diagnostics,
+                                        &books,
+                                        &subscription.tokens,
+                                        now,
+                                    ) {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                            Ok(ClobBookApplyOutcome::Superseded {
+                                incoming_timestamp_ns,
+                                current_timestamp_ns,
+                            }) => {
+                                let attempts = repair_superseded_attempts
+                                    .entry(repair.token.clone())
+                                    .or_insert(0);
+                                *attempts = attempts.saturating_add(1);
+                                let retry = *attempts <= CLOB_BBO_MAX_SUPERSEDED_REPAIRS;
+                                diagnostic_sampler.observe(now, ClobDiagnostic {
+                                    key: "bbo_repair_superseded_by_ws".to_string(),
+                                    detail: format!(
+                                        "token={} repair_ts={} ws_ts={} attempt={} action={}",
+                                        repair.token,
+                                        incoming_timestamp_ns,
+                                        current_timestamp_ns,
+                                        *attempts,
+                                        if retry { "retry" } else { "degrade" },
+                                    ),
+                                });
+                                if retry {
+                                    let delay = Duration::from_millis(
+                                        CLOB_BBO_SETTLE_INTERVAL.as_millis() as u64
+                                            * (1_u64 << attempts.saturating_sub(1)),
+                                    );
+                                    request_clob_book_repair_after(
+                                        repair.token,
+                                        delay,
+                                        &mut repairs_in_flight,
+                                        &repair_tx,
+                                    );
+                                } else if let Some(event) = books.mark_repair_failed(
+                                    &repair.token,
+                                    "authoritative BBO repair remained older than websocket state",
+                                    local_now,
+                                ) {
+                                    repair_superseded_attempts.remove(&repair.token);
                                     diagnostics.record_coalesced(std::slice::from_ref(&event));
                                     if !forward_clob_events(
                                         vec![event],
@@ -2826,29 +2985,57 @@ async fn clob_ws_task(
                                 }
                             }
                             Err(error) => {
+                                repair_superseded_attempts.remove(&repair.token);
                                 diagnostic_sampler.observe(now, ClobDiagnostic {
                                     key: "bbo_repair_failed".to_string(),
                                     detail: format!("token={} reason={error}", repair.token),
                                 });
-                                announce_clob_not_ready(
-                                    &event_tx,
-                                    &mut lifecycle,
+                                if let Some(event) = books.mark_repair_failed(
+                                    &repair.token,
                                     format!("authoritative BBO repair rejected: {error}"),
-                                );
-                                break;
+                                    local_now,
+                                ) {
+                                    diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                    if !forward_clob_events(
+                                        vec![event],
+                                        &event_tx,
+                                        &mut lifecycle,
+                                        &mut health,
+                                        &mut diagnostics,
+                                        &books,
+                                        &subscription.tokens,
+                                        now,
+                                    ) {
+                                        break 'outer;
+                                    }
+                                }
                             }
                         },
                         Err(error) => {
+                            repair_superseded_attempts.remove(&repair.token);
                             diagnostic_sampler.observe(now, ClobDiagnostic {
                                 key: "bbo_repair_failed".to_string(),
                                 detail: format!("token={} reason={error}", repair.token),
                             });
-                            announce_clob_not_ready(
-                                &event_tx,
-                                &mut lifecycle,
+                            if let Some(event) = books.mark_repair_failed(
+                                &repair.token,
                                 format!("authoritative BBO repair failed: {error}"),
-                            );
-                            break;
+                                local_now,
+                            ) {
+                                diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                if !forward_clob_events(
+                                    vec![event],
+                                    &event_tx,
+                                    &mut lifecycle,
+                                    &mut health,
+                                    &mut diagnostics,
+                                    &books,
+                                    &subscription.tokens,
+                                    now,
+                                ) {
+                                    break 'outer;
+                                }
+                            }
                         }
                     }
                 }
@@ -3062,12 +3249,8 @@ async fn clob_ws_task(
                             for diagnostic in batch.diagnostics {
                                 diagnostic_sampler.observe(received_at, diagnostic);
                             }
-                            if !batch.repair_tokens.is_empty() {
-                                announce_clob_not_ready(
-                                    &event_tx,
-                                    &mut lifecycle,
-                                    "persistent BBO mismatch; authoritative repair pending",
-                                );
+                            for token in &batch.repair_tokens {
+                                repair_superseded_attempts.entry(token.clone()).or_insert(0);
                             }
                             request_clob_book_repairs(
                                 batch.repair_tokens,
@@ -3577,8 +3760,13 @@ impl ReportedBbo {
 struct PendingBboCheck {
     exchange_timestamp_ns: u64,
     expected: ReportedBbo,
+    first_observed_at: Instant,
     last_update_at: Instant,
     saw_mismatch: bool,
+    saw_newer_checkpoint: bool,
+    /// Bounded, sanitized summaries only.  Raw public frames can be large and
+    /// may contain fields unrelated to the failing condition.
+    frame_summaries: VecDeque<String>,
     /// An off-grid price is evidence that a narrowing tick_size_change is in
     /// the same logical market batch but may be delivered in a sibling frame.
     /// Keep publication behind the tick event for the same quiet window.
@@ -3599,12 +3787,82 @@ struct ClobDeferredBatch {
     repair_tokens: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClobBookSource {
+    Websocket,
+    RestRepair,
+}
+
+#[derive(Debug)]
+enum ClobBookApplyOutcome {
+    Applied(Vec<MarketEvent>),
+    /// A REST snapshot older than already-applied websocket state is a benign
+    /// race, not a transport failure.  The caller may request a fresh repair
+    /// while the condition stays locally scoped.
+    Superseded {
+        incoming_timestamp_ns: u64,
+        current_timestamp_ns: u64,
+    },
+}
+
 fn normalize_reported_bbo(price: Decimal) -> Option<Decimal> {
     if price == Decimal::ZERO || price == Decimal::ONE {
         None
     } else {
         Some(price)
     }
+}
+
+fn record_bbo_settle_duration(
+    counters: &mut ClobWireCounters,
+    finished_at: Instant,
+    started_at: Instant,
+) {
+    let elapsed_us = finished_at
+        .saturating_duration_since(started_at)
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
+    counters.bbo_settle_samples = counters.bbo_settle_samples.saturating_add(1);
+    counters.bbo_settle_total_us = counters.bbo_settle_total_us.saturating_add(elapsed_us);
+    counters.bbo_settle_max_us = counters.bbo_settle_max_us.max(elapsed_us);
+}
+
+fn record_bbo_recovery_duration(
+    counters: &mut ClobWireCounters,
+    finished_at: Instant,
+    started_at: Instant,
+) {
+    let elapsed_us = finished_at
+        .saturating_duration_since(started_at)
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
+    counters.bbo_recovery_samples = counters.bbo_recovery_samples.saturating_add(1);
+    counters.bbo_recovery_total_us = counters.bbo_recovery_total_us.saturating_add(elapsed_us);
+    counters.bbo_recovery_max_us = counters.bbo_recovery_max_us.max(elapsed_us);
+}
+
+fn bbo_tick_distance(
+    expected: &ReportedBbo,
+    actual: (Option<Decimal>, Option<Decimal>),
+    tick: Option<Decimal>,
+) -> Option<u64> {
+    let tick = tick.filter(|tick| *tick > Decimal::ZERO)?;
+    let mut max_distance = None;
+    for (expected, actual) in [(expected.bid, actual.0), (expected.ask, actual.1)] {
+        let Some(expected) = expected else { continue };
+        let distance = match (expected, actual) {
+            (Some(expected), Some(actual)) => ((expected - actual).abs() / tick)
+                .floor()
+                .to_u64()
+                .unwrap_or(u64::MAX),
+            (None, None) => 0,
+            // One side unexpectedly appeared/disappeared. Count it as at
+            // least one tick while retaining exact prices in the diagnostic.
+            _ => 1,
+        };
+        max_distance = Some(max_distance.unwrap_or(0).max(distance));
+    }
+    max_distance
 }
 
 /// Inline RTDS spot-price record seen on the CLOB socket (distinct from
@@ -3785,6 +4043,9 @@ struct ClobLocalBooks {
     pending_bbo: HashMap<String, PendingBboCheck>,
     pending_quotes: HashMap<String, PendingQuote>,
     quarantined_tokens: HashSet<String>,
+    repair_started_at: HashMap<String, Instant>,
+    degraded_tokens: HashSet<String>,
+    health_states: HashMap<String, MarketDataHealthState>,
     wire_sequence: u64,
 }
 
@@ -3822,6 +4083,98 @@ impl ClobLocalBooks {
             .unwrap_or_else(|| token.to_string())
     }
 
+    fn condition_is_seeded(&self, condition_id: &str) -> bool {
+        let tokens: Vec<_> = self
+            .roles
+            .iter()
+            .filter_map(|(token, role)| {
+                (role.condition_id == condition_id).then_some(token.as_str())
+            })
+            .collect();
+        !tokens.is_empty()
+            && tokens
+                .iter()
+                .all(|token| self.token_books.contains_key(*token))
+    }
+
+    fn desired_health_state(&self, condition_id: &str) -> Option<MarketDataHealthState> {
+        if !self.condition_is_seeded(condition_id) {
+            return None;
+        }
+        if self
+            .degraded_tokens
+            .iter()
+            .any(|token| self.market_key(token) == condition_id)
+        {
+            return Some(MarketDataHealthState::Degraded);
+        }
+        if self
+            .quarantined_tokens
+            .iter()
+            .any(|token| self.market_key(token) == condition_id)
+        {
+            return Some(MarketDataHealthState::Repairing);
+        }
+        if self
+            .pending_bbo
+            .keys()
+            .any(|token| self.market_key(token) == condition_id)
+        {
+            return Some(MarketDataHealthState::Settling);
+        }
+        Some(MarketDataHealthState::Healthy)
+    }
+
+    fn reconcile_health(
+        &mut self,
+        token: &str,
+        reason: impl Into<String>,
+        local_now: u64,
+    ) -> Option<MarketEvent> {
+        let condition_id = self.market_key(token);
+        let state = self.desired_health_state(&condition_id)?;
+        if self.health_states.get(&condition_id) == Some(&state) {
+            return None;
+        }
+        self.health_states.insert(condition_id.clone(), state);
+        let symbol = self
+            .roles
+            .iter()
+            .find_map(|(candidate, role)| {
+                (role.condition_id == condition_id && !role.is_down)
+                    .then_some(candidate.clone())
+            })
+            .unwrap_or_else(|| token.to_string());
+        let (passive_ready, taker_ready) = match state {
+            MarketDataHealthState::Healthy => (true, true),
+            // L1 advertised by the venue remains available for passive
+            // pricing, but inconsistent L2 quantities must never drive a
+            // taker decision.
+            MarketDataHealthState::Settling | MarketDataHealthState::Repairing => (true, false),
+            MarketDataHealthState::Degraded => (false, false),
+        };
+        Some(MarketEvent::MarketDataHealth(MarketDataHealth {
+            exchange: Exchange::Polymarket,
+            market_id: condition_id,
+            symbol,
+            state,
+            passive_ready,
+            taker_ready,
+            reason: reason.into(),
+            local_timestamp_ns: local_now,
+        }))
+    }
+
+    fn mark_repair_failed(
+        &mut self,
+        token: &str,
+        reason: impl Into<String>,
+        local_now: u64,
+    ) -> Option<MarketEvent> {
+        self.degraded_tokens.insert(token.to_string());
+        self.reconcile_health(token, reason, local_now)
+    }
+
     fn price_is_on_current_tick(&self, token: &str, price: Decimal) -> bool {
         let key = self.market_key(token);
         self.current_ticks
@@ -3844,7 +4197,6 @@ impl ClobLocalBooks {
 
     fn has_all_seeded(&self, tokens: &[String]) -> bool {
         !tokens.is_empty()
-            && self.quarantined_tokens.is_empty()
             && tokens
                 .iter()
                 .all(|token| self.token_books.contains_key(token))
@@ -3895,9 +4247,6 @@ impl ClobLocalBooks {
 
     fn canonicalize_quote_ready(&mut self, mut quote: QuoteTick) -> Option<MarketEvent> {
         let sequence = self.next_sequence();
-        if self.market_is_quarantined(&quote.symbol) {
-            return None;
-        }
         let Some(role) = self.roles.get(&quote.symbol).cloned() else {
             return Some(MarketEvent::Quote(quote));
         };
@@ -3952,21 +4301,26 @@ impl ClobLocalBooks {
         fields: BookFields,
         received_at: Instant,
         local_now: u64,
-    ) -> std::result::Result<Option<MarketEvent>, String> {
+        source: ClobBookSource,
+        counters: &mut ClobWireCounters,
+    ) -> std::result::Result<ClobBookApplyOutcome, String> {
         let symbol = fields.asset_id;
         if symbol.trim().is_empty() {
             return Err("book has empty asset_id".to_string());
         }
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
-        if self
-            .token_books
-            .get(&symbol)
-            .is_some_and(|current| exchange_timestamp_ns < current.exchange_timestamp_ns)
-        {
-            return Err(format!(
-                "stale book token={} incoming_ts={} current_ts={}",
-                symbol, exchange_timestamp_ns, self.token_books[&symbol].exchange_timestamp_ns,
-            ));
+        if let Some(current) = self.token_books.get(&symbol) {
+            if exchange_timestamp_ns < current.exchange_timestamp_ns {
+                if source == ClobBookSource::RestRepair {
+                    counters.bbo_repair_superseded_by_ws = counters
+                        .bbo_repair_superseded_by_ws
+                        .saturating_add(1);
+                }
+                return Ok(ClobBookApplyOutcome::Superseded {
+                    incoming_timestamp_ns: exchange_timestamp_ns,
+                    current_timestamp_ns: current.exchange_timestamp_ns,
+                });
+            }
         }
         let parse_levels = |levels: Vec<BookLevel>| {
             let mut parsed = BTreeMap::new();
@@ -3997,22 +4351,66 @@ impl ClobLocalBooks {
         }
         // A full book is authoritative for this token and ends any deferred
         // validation/quarantine created by an incomplete price-change batch.
-        self.pending_bbo.remove(&symbol);
-        self.quarantined_tokens.remove(&symbol);
+        let pending = self.pending_bbo.remove(&symbol);
+        let was_quarantined = self.quarantined_tokens.remove(&symbol);
+        if let Some(pending) = pending.as_ref().filter(|pending| pending.saw_mismatch) {
+            record_bbo_settle_duration(counters, received_at, pending.first_observed_at);
+            if !was_quarantined {
+                match source {
+                    ClobBookSource::Websocket => {
+                        counters.bbo_recovery_book =
+                            counters.bbo_recovery_book.saturating_add(1)
+                    }
+                    ClobBookSource::RestRepair => {
+                        counters.bbo_recovery_rest =
+                            counters.bbo_recovery_rest.saturating_add(1)
+                    }
+                }
+            }
+        }
+        if was_quarantined {
+            if let Some(started_at) = self.repair_started_at.remove(&symbol) {
+                record_bbo_recovery_duration(counters, received_at, started_at);
+            }
+            match source {
+                ClobBookSource::Websocket => {
+                    counters.bbo_recovery_book = counters.bbo_recovery_book.saturating_add(1)
+                }
+                ClobBookSource::RestRepair => {
+                    counters.bbo_recovery_rest = counters.bbo_recovery_rest.saturating_add(1)
+                }
+            }
+        }
+        self.degraded_tokens.remove(&symbol);
         self.token_books.insert(symbol.clone(), book);
-        let _ = received_at;
         // An initial snapshot for the complementary token can be older than
         // the event-level Up snapshot already accepted. Keep the newer event
         // book, but re-emit it once so completion of initial L2 seeding can
         // transition the feed to READY without letting the old Down book win.
-        Ok(self
+        let mut events = Vec::new();
+        if let Some(event) = self
             .canonicalize_token(&symbol, local_now)
-            .or_else(|| self.canonical_snapshot_for_token(&symbol)))
+            .or_else(|| self.canonical_snapshot_for_token(&symbol))
+        {
+            events.push(event);
+        }
+        if let Some(event) = self.reconcile_health(
+            &symbol,
+            match source {
+                ClobBookSource::Websocket => "authoritative websocket book",
+                ClobBookSource::RestRepair => "authoritative REST repair",
+            },
+            local_now,
+        ) {
+            events.push(event);
+        }
+        Ok(ClobBookApplyOutcome::Applied(events))
     }
 
     fn finalize_pending_bbo(
         &mut self,
         token: &str,
+        finished_at: Instant,
         local_now: u64,
         counters: &mut ClobWireCounters,
         diagnostics: &mut Vec<ClobDiagnostic>,
@@ -4029,6 +4427,16 @@ impl ClobLocalBooks {
             if pending.saw_mismatch {
                 counters.bbo_transient_recoveries =
                     counters.bbo_transient_recoveries.saturating_add(1);
+                record_bbo_settle_duration(counters, finished_at, pending.first_observed_at);
+                if pending.saw_newer_checkpoint {
+                    counters.bbo_recovery_newer_timestamp = counters
+                        .bbo_recovery_newer_timestamp
+                        .saturating_add(1);
+                } else {
+                    counters.bbo_recovery_same_timestamp = counters
+                        .bbo_recovery_same_timestamp
+                        .saturating_add(1);
+                }
             }
             if pending.awaiting_tick_change {
                 diagnostics.push(ClobDiagnostic {
@@ -4048,23 +4456,41 @@ impl ClobLocalBooks {
 
         counters.bbo_mismatches = counters.bbo_mismatches.saturating_add(1);
         counters.bbo_repair_requests = counters.bbo_repair_requests.saturating_add(1);
+        record_bbo_settle_duration(counters, finished_at, pending.first_observed_at);
+        let tick = self.current_ticks.get(&self.market_key(token)).copied();
+        if let Some(distance) = bbo_tick_distance(&pending.expected, actual, tick) {
+            counters.bbo_tick_distance_samples =
+                counters.bbo_tick_distance_samples.saturating_add(1);
+            counters.bbo_tick_distance_total =
+                counters.bbo_tick_distance_total.saturating_add(distance);
+            counters.bbo_tick_distance_max = counters.bbo_tick_distance_max.max(distance);
+        }
         diagnostics.push(ClobDiagnostic {
             key: "price_change_bbo_mismatch".to_string(),
             detail: format!(
-                "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={}",
+                "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={} frames={:?}",
                 pending.exchange_timestamp_ns,
                 pending.expected.bid,
                 pending.expected.ask,
                 actual.0,
                 actual.1,
                 CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+                pending.frame_summaries,
             ),
         });
         self.quarantined_tokens.insert(token.to_string());
+        self.repair_started_at
+            .entry(token.to_string())
+            .or_insert(finished_at);
         (None, Some(token.to_string()))
     }
 
-    fn resolve_pending_if_ready(&mut self, token: &str, counters: &mut ClobWireCounters) -> bool {
+    fn resolve_pending_if_ready(
+        &mut self,
+        token: &str,
+        now: Instant,
+        counters: &mut ClobWireCounters,
+    ) -> bool {
         let Some(pending) = self.pending_bbo.get(token) else {
             return false;
         };
@@ -4082,7 +4508,26 @@ impl ClobLocalBooks {
             .expect("pending BBO checked above");
         if pending.saw_mismatch {
             counters.bbo_transient_recoveries = counters.bbo_transient_recoveries.saturating_add(1);
+            record_bbo_settle_duration(counters, now, pending.first_observed_at);
+            if pending.saw_newer_checkpoint {
+                counters.bbo_recovery_newer_timestamp = counters
+                    .bbo_recovery_newer_timestamp
+                    .saturating_add(1);
+            } else {
+                counters.bbo_recovery_same_timestamp = counters
+                    .bbo_recovery_same_timestamp
+                    .saturating_add(1);
+            }
         }
+        if self.quarantined_tokens.remove(token) {
+            counters.bbo_repair_superseded_by_ws = counters
+                .bbo_repair_superseded_by_ws
+                .saturating_add(1);
+            if let Some(started_at) = self.repair_started_at.remove(token) {
+                record_bbo_recovery_duration(counters, now, started_at);
+            }
+        }
+        self.degraded_tokens.remove(token);
         true
     }
 
@@ -4136,13 +4581,18 @@ impl ClobLocalBooks {
                     pending.awaiting_tick_change = false;
                 }
             }
-            if self.resolve_pending_if_ready(&token, counters) {
+            if self.resolve_pending_if_ready(&token, Instant::now(), counters) {
                 if let Some(book) = self.token_books.get_mut(&token) {
                     book.dirty_since = None;
                 }
                 if let Some(event) = self.canonicalize_token(&token, local_now) {
                     push_latest_order_book(&mut events, event);
                 }
+            }
+            if let Some(event) =
+                self.reconcile_health(&token, "tick-size/BBO batch settled", local_now)
+            {
+                events.push(event);
             }
         }
 
@@ -4180,6 +4630,7 @@ impl ClobLocalBooks {
         for token in tokens {
             let (event, repair) = self.finalize_pending_bbo(
                 &token,
+                now,
                 local_now,
                 &mut batch.wire,
                 &mut batch.diagnostics,
@@ -4189,6 +4640,17 @@ impl ClobLocalBooks {
             }
             if let Some(token) = repair {
                 batch.repair_tokens.push(token);
+            }
+            if let Some(event) = self.reconcile_health(
+                &token,
+                if batch.repair_tokens.last() == Some(&token) {
+                    "BBO settle window expired; authoritative repair pending"
+                } else {
+                    "BBO settled"
+                },
+                local_now,
+            ) {
+                batch.events.push(event);
             }
         }
 
@@ -4230,31 +4692,13 @@ impl ClobLocalBooks {
     ) -> (Vec<MarketEvent>, usize, Vec<String>) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
         let mut immediate = Vec::new();
-        let mut repair_tokens = Vec::new();
-        let mut incoming_tokens: Vec<_> = fields
+        let entry_counts: HashMap<String, usize> = fields
             .price_changes
             .iter()
-            .map(|change| change.asset_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        incoming_tokens.sort();
-        for token in incoming_tokens {
-            let finalize_older = self
-                .pending_bbo
-                .get(&token)
-                .is_some_and(|pending| pending.exchange_timestamp_ns < exchange_timestamp_ns);
-            if finalize_older {
-                let (event, repair) =
-                    self.finalize_pending_bbo(&token, local_now, counters, diagnostics);
-                if let Some(event) = event {
-                    push_latest_order_book(&mut immediate, event);
-                }
-                if let Some(token) = repair {
-                    repair_tokens.push(token);
-                }
-            }
-        }
+            .fold(HashMap::new(), |mut counts, change| {
+                *counts.entry(change.asset_id.clone()).or_insert(0) += 1;
+                counts
+            });
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
         let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
         let mut off_tick_tokens: HashSet<String> = HashSet::new();
@@ -4385,21 +4829,74 @@ impl ClobLocalBooks {
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
             let off_tick = off_tick_tokens.contains(&token);
-            let pending =
-                self.pending_bbo
-                    .entry(token.clone())
-                    .or_insert_with(|| PendingBboCheck {
-                        exchange_timestamp_ns,
-                        expected: ReportedBbo::default(),
-                        last_update_at: received_at,
-                        saw_mismatch: false,
-                        awaiting_tick_change: false,
-                    });
-            if pending.exchange_timestamp_ns == exchange_timestamp_ns {
+            let summary = format!(
+                "ts={} entries={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
+                exchange_timestamp_ns,
+                entry_counts.get(&token).copied().unwrap_or(0),
+                newer_expected.bid,
+                newer_expected.ask,
+                actual.0,
+                actual.1,
+            );
+            let pending = self
+                .pending_bbo
+                .entry(token.clone())
+                .or_insert_with(|| PendingBboCheck {
+                    exchange_timestamp_ns,
+                    expected: ReportedBbo::default(),
+                    first_observed_at: received_at,
+                    last_update_at: received_at,
+                    saw_mismatch: false,
+                    saw_newer_checkpoint: false,
+                    frame_summaries: VecDeque::new(),
+                    awaiting_tick_change: false,
+                });
+            if exchange_timestamp_ns > pending.exchange_timestamp_ns {
+                // A newer advertised checkpoint supersedes the unfinished
+                // older one. Apply the newer delta first, then validate the
+                // latest state; never fail an old checkpoint at this boundary.
+                pending.exchange_timestamp_ns = exchange_timestamp_ns;
+                pending.expected = newer_expected;
+                pending.last_update_at = received_at;
+                pending.saw_newer_checkpoint = true;
+                pending.awaiting_tick_change = off_tick;
+                pending.saw_mismatch |= !pending.expected.matches(actual);
+            } else if pending.exchange_timestamp_ns == exchange_timestamp_ns {
                 pending.expected.merge(newer_expected);
                 pending.last_update_at = received_at;
                 pending.awaiting_tick_change |= off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
+            }
+            pending.frame_summaries.push_back(summary);
+            while pending.frame_summaries.len() > CLOB_BBO_DIAGNOSTIC_FRAMES {
+                pending.frame_summaries.pop_front();
+            }
+            let advertised_l1 = if !pending.expected.matches(actual) {
+                match (pending.expected.bid.flatten(), pending.expected.ask.flatten()) {
+                    (Some(bid), Some(ask)) if bid < ask => Some((bid, ask)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if self.roles.contains_key(&token) {
+                if let Some((bid, ask)) = advertised_l1 {
+                    if let (Some(bid_price), Some(ask_price)) = (bid.to_f64(), ask.to_f64()) {
+                        let quote = QuoteTick {
+                            exchange: Exchange::Polymarket,
+                            symbol: token.clone(),
+                            bid_price,
+                            bid_qty: 0.0,
+                            ask_price,
+                            ask_qty: 0.0,
+                            exchange_timestamp_ns,
+                            local_timestamp_ns: local_now,
+                        };
+                        if let Some(event) = self.canonicalize_quote(quote, received_at) {
+                            immediate.push(event);
+                        }
+                    }
+                }
             }
         }
 
@@ -4412,6 +4909,10 @@ impl ClobLocalBooks {
             })
             .collect();
         touched_order.sort_by_key(|(sequence, _)| *sequence);
+        let health_tokens: Vec<String> = touched_order
+            .iter()
+            .map(|(_, token)| token.clone())
+            .collect();
         for (_, token) in touched_order {
             let (top_changed, semantically_valid) = self
                 .token_books
@@ -4423,7 +4924,7 @@ impl ClobLocalBooks {
                     )
                 })
                 .unwrap_or((false, false));
-            let _ = self.resolve_pending_if_ready(&token, counters);
+            let _ = self.resolve_pending_if_ready(&token, received_at, counters);
             if top_changed
                 && semantically_valid
                 && !self.pending_bbo.contains_key(&token)
@@ -4437,9 +4938,22 @@ impl ClobLocalBooks {
                 }
             }
         }
-        let bbo_change_snapshots = immediate.len();
+        let mut reconciled_markets = HashSet::new();
+        for token in health_tokens {
+            if reconciled_markets.insert(self.market_key(&token)) {
+                if let Some(event) =
+                    self.reconcile_health(&token, "BBO checkpoint state changed", local_now)
+                {
+                    immediate.push(event);
+                }
+            }
+        }
+        let bbo_change_snapshots = immediate
+            .iter()
+            .filter(|event| matches!(event, MarketEvent::OrderBook(_)))
+            .count();
         let _ = fields.market;
-        (immediate, bbo_change_snapshots, repair_tokens)
+        (immediate, bbo_change_snapshots, Vec::new())
     }
 
     fn flush_due(&mut self, now: Instant, local_now: u64) -> Vec<MarketEvent> {
@@ -4531,9 +5045,34 @@ fn process_clob_frame(
             ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
                 batch.wire.books = batch.wire.books.saturating_add(1);
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
-                match books.apply_book(fields, received_at, local_now) {
-                    Ok(Some(event)) => push_latest_order_book(&mut batch.events, event),
-                    Ok(None) => {}
+                match books.apply_book(
+                    fields,
+                    received_at,
+                    local_now,
+                    ClobBookSource::Websocket,
+                    &mut batch.wire,
+                ) {
+                    Ok(ClobBookApplyOutcome::Applied(events)) => {
+                        for event in events {
+                            if matches!(event, MarketEvent::OrderBook(_)) {
+                                push_latest_order_book(&mut batch.events, event);
+                            } else {
+                                batch.events.push(event);
+                            }
+                        }
+                    }
+                    Ok(ClobBookApplyOutcome::Superseded {
+                        incoming_timestamp_ns,
+                        current_timestamp_ns,
+                    }) => {
+                        batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+                        batch.diagnostics.push(ClobDiagnostic {
+                            key: "stale_book".to_string(),
+                            detail: format!(
+                                "incoming_ts={incoming_timestamp_ns} current_ts={current_timestamp_ns}"
+                            ),
+                        });
+                    }
                     Err(detail) => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
                         batch.diagnostics.push(ClobDiagnostic {
@@ -6083,6 +6622,16 @@ mod pick_current_event_tests {
         book
     }
 
+    fn first_order_book(events: &[MarketEvent]) -> &OrderBookSnapshot {
+        events
+            .iter()
+            .find_map(|event| match event {
+                MarketEvent::OrderBook(book) => Some(book),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected order book in {events:?}"))
+    }
+
     #[test]
     fn event_book_maps_down_to_up_and_newer_server_timestamp_wins() {
         let tokens = vec!["up".to_string(), "down".to_string()];
@@ -6101,8 +6650,16 @@ mod pick_current_event_tests {
 
         assert!(batch.recognized_topic);
         assert!(books.has_all_seeded(&tokens));
-        assert_eq!(batch.events.len(), 1, "one latest book per event");
-        let current = order_book(&batch.events[0]);
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|event| matches!(event, MarketEvent::OrderBook(_)))
+                .count(),
+            1,
+            "one latest book per event"
+        );
+        let current = first_order_book(&batch.events);
         assert_eq!(current.symbol, "up");
         assert_eq!(current.exchange_timestamp_ns, 2_000_000_000);
         assert_eq!(current.bids[0].price, 0.40);
@@ -6331,6 +6888,210 @@ mod pick_current_event_tests {
     }
 
     #[test]
+    fn newer_timestamp_checkpoint_heals_delayed_delete_without_repair() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"},{"price":"0.43","size":"9"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9000"},{"event_type":"book","asset_id":"down","bids":[{"price":"0.55","size":"11"}],"asks":[{"price":"0.56","size":"10"}],"timestamp":"9000"}]"#,
+            &mut books,
+            &tokens,
+            received_at,
+            17_000_000_000,
+        );
+
+        let first = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"9001"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            17_001_000_000,
+        );
+        assert!(first.events.iter().any(|event| matches!(
+            event,
+            MarketEvent::MarketDataHealth(MarketDataHealth {
+                state: MarketDataHealthState::Settling,
+                ..
+            })
+        )));
+        assert!(first.events.iter().any(|event| matches!(
+            event,
+            MarketEvent::Quote(QuoteTick {
+                bid_price,
+                ask_price,
+                ..
+            }) if *bid_price == 0.42 && *ask_price == 0.45
+        )), "advertised L1 remains available for passive pricing");
+
+        // The deletion arrives with a newer timestamp. It must be applied
+        // before deciding whether the older checkpoint failed.
+        let healed = process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.44","size":"0","side":"BUY","best_bid":"0.42","best_ask":"0.45"},{"asset_id":"up","price":"0.43","size":"0","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"9002"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(8),
+            17_008_000_000,
+        );
+        assert_eq!(healed.wire.bbo_recovery_newer_timestamp, 1);
+        assert_eq!(healed.wire.bbo_mismatches, 0);
+        assert!(healed.repair_tokens.is_empty());
+        assert_eq!(first_order_book(&healed.events).bids[0].price, 0.42);
+        assert!(healed.events.iter().any(|event| matches!(
+            event,
+            MarketEvent::MarketDataHealth(MarketDataHealth {
+                state: MarketDataHealthState::Healthy,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn stale_rest_repair_is_superseded_not_rejected() {
+        let tokens = vec!["up".to_string()];
+        let mut books = ClobLocalBooks::default();
+        process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"9102"}"#,
+            &mut books,
+            &tokens,
+            Instant::now(),
+            17_100_000_000,
+        );
+        books.quarantined_tokens.insert("up".to_string());
+        let fields: BookFields = serde_json::from_str(
+            r#"{"asset_id":"up","bids":[{"price":"0.39","size":"10"}],"asks":[{"price":"0.61","size":"11"}],"timestamp":"9101"}"#,
+        )
+        .unwrap();
+        let mut counters = ClobWireCounters::default();
+        let outcome = books
+            .apply_book(
+                fields,
+                Instant::now(),
+                17_101_000_000,
+                ClobBookSource::RestRepair,
+                &mut counters,
+            )
+            .unwrap();
+        assert!(matches!(outcome, ClobBookApplyOutcome::Superseded { .. }));
+        assert_eq!(counters.bbo_repair_superseded_by_ws, 1);
+        assert!(books.quarantined_tokens.contains("up"));
+    }
+
+    #[test]
+    fn authoritative_repair_records_recovery_and_returns_condition_healthy() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let received_at = Instant::now();
+        process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9300"},{"event_type":"book","asset_id":"down","bids":[{"price":"0.55","size":"11"}],"asks":[{"price":"0.56","size":"10"}],"timestamp":"9300"}]"#,
+            &mut books,
+            &tokens,
+            received_at,
+            17_300_000_000,
+        );
+        process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"9301"}"#,
+            &mut books,
+            &tokens,
+            received_at + Duration::from_millis(1),
+            17_301_000_000,
+        );
+        let repairing = books.flush_deferred_due(
+            received_at + Duration::from_millis(52),
+            17_352_000_000,
+        );
+        assert_eq!(repairing.repair_tokens, vec!["up".to_string()]);
+
+        let fields: BookFields = serde_json::from_str(
+            r#"{"asset_id":"up","bids":[{"price":"0.42","size":"8"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9302"}"#,
+        )
+        .unwrap();
+        let mut counters = ClobWireCounters::default();
+        let outcome = books
+            .apply_book(
+                fields,
+                received_at + Duration::from_millis(60),
+                17_360_000_000,
+                ClobBookSource::RestRepair,
+                &mut counters,
+            )
+            .unwrap();
+        let ClobBookApplyOutcome::Applied(events) = outcome else {
+            panic!("repair must apply");
+        };
+        assert_eq!(counters.bbo_recovery_rest, 1);
+        assert_eq!(counters.bbo_recovery_samples, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MarketEvent::MarketDataHealth(MarketDataHealth {
+                state: MarketDataHealthState::Healthy,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn bbo_tick_distance_reports_largest_side_gap() {
+        let expected = ReportedBbo {
+            bid: Some(Some(Decimal::from_str("0.42").unwrap())),
+            ask: Some(Some(Decimal::from_str("0.47").unwrap())),
+        };
+        assert_eq!(
+            bbo_tick_distance(
+                &expected,
+                (
+                    Some(Decimal::from_str("0.44").unwrap()),
+                    Some(Decimal::from_str("0.46").unwrap()),
+                ),
+                Some(Decimal::from_str("0.01").unwrap()),
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn degraded_bbo_health_is_condition_scoped() {
+        let specs = [
+            canonical_event_spec(),
+            CanonicalEventSpec {
+                condition_id: "condition-2".to_string(),
+                up_token: "up-2".to_string(),
+                down_token: "down-2".to_string(),
+                tick_size: 0.01,
+            },
+        ];
+        let mut books = ClobLocalBooks::new(&specs);
+        let tokens = vec![
+            "up".to_string(),
+            "down".to_string(),
+            "up-2".to_string(),
+            "down-2".to_string(),
+        ];
+        process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"10"}],"timestamp":"9200"},{"event_type":"book","asset_id":"down","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"10"}],"timestamp":"9200"},{"event_type":"book","asset_id":"up-2","bids":[{"price":"0.30","size":"10"}],"asks":[{"price":"0.70","size":"10"}],"timestamp":"9200"},{"event_type":"book","asset_id":"down-2","bids":[{"price":"0.30","size":"10"}],"asks":[{"price":"0.70","size":"10"}],"timestamp":"9200"}]"#,
+            &mut books,
+            &tokens,
+            Instant::now(),
+            17_200_000_000,
+        );
+
+        let degraded = books
+            .mark_repair_failed("up", "injected REST failure", 17_201_000_000)
+            .expect("condition must transition");
+        let MarketEvent::MarketDataHealth(health) = degraded else {
+            panic!("expected health event");
+        };
+        assert_eq!(health.market_id, "condition");
+        assert_eq!(health.state, MarketDataHealthState::Degraded);
+        assert!(!health.passive_ready);
+        assert!(!health.taker_ready);
+        assert_eq!(
+            books.desired_health_state("condition-2"),
+            Some(MarketDataHealthState::Healthy)
+        );
+        assert!(!books.market_is_quarantined("up-2"));
+    }
+
+    #[test]
     fn tick_narrowing_precedes_release_of_fine_grid_book() {
         let tokens = vec!["up".to_string(), "down".to_string()];
         let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
@@ -6350,9 +7111,19 @@ mod pick_current_event_tests {
             16_201_000_000,
         );
         assert!(
-            fine_grid.events.is_empty(),
+            fine_grid
+                .events
+                .iter()
+                .all(|event| !matches!(event, MarketEvent::OrderBook(_))),
             "0.001 book must wait for its tick transition"
         );
+        assert!(fine_grid.events.iter().any(|event| matches!(
+            event,
+            MarketEvent::MarketDataHealth(MarketDataHealth {
+                state: MarketDataHealthState::Settling,
+                ..
+            })
+        )));
 
         let tick = process_clob_frame(
             r#"{"event_type":"tick_size_change","asset_id":"up","old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"8201"}"#,
@@ -6361,9 +7132,15 @@ mod pick_current_event_tests {
             received_at + Duration::from_micros(200),
             16_201_000_000,
         );
-        assert_eq!(tick.events.len(), 2);
+        assert_eq!(
+            tick.events
+                .iter()
+                .filter(|event| matches!(event, MarketEvent::TickSizeChange(_) | MarketEvent::OrderBook(_)))
+                .count(),
+            2
+        );
         assert!(matches!(tick.events[0], MarketEvent::TickSizeChange(_)));
-        assert_eq!(order_book(&tick.events[1]).asks[0].price, 0.999);
+        assert_eq!(first_order_book(&tick.events).asks[0].price, 0.999);
         assert_eq!(
             books.current_ticks.get("condition"),
             Some(&Decimal::from_str("0.001").unwrap()),
@@ -6451,7 +7228,13 @@ mod pick_current_event_tests {
             received_at,
             12_000_000_000,
         );
-        assert_eq!(seed.events.len(), 1);
+        assert_eq!(
+            seed.events
+                .iter()
+                .filter(|event| matches!(event, MarketEvent::OrderBook(_)))
+                .count(),
+            1
+        );
 
         let delta = process_clob_frame(
             r#"{

@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use futures_util::{stream, StreamExt};
 use log::info;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
@@ -11,6 +12,11 @@ use crate::account::position::Position;
 
 const DATA_API_BASE: &str = "https://data-api.polymarket.com";
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
+const SETTLEMENT_REQUEST_SPACING: Duration = Duration::from_millis(250);
+const SETTLEMENT_IN_FLIGHT_LEASE: Duration = Duration::from_secs(5 * 60);
+const ACTIVE_MARKET_RECHECK: Duration = Duration::from_secs(60);
+const DEFAULT_SETTLEMENT_RETRY: Duration = Duration::from_secs(5);
+const DEFAULT_RATE_LIMIT_RETRY: Duration = Duration::from_secs(30);
 
 /// Raw position record from Polymarket Data API.
 #[derive(Debug, Deserialize)]
@@ -168,41 +174,181 @@ fn authoritative_resolution(
     Ok(Some(values))
 }
 
+#[derive(Debug)]
+enum SettlementLookupEntry {
+    InFlight { lease_until: Instant },
+    RetryAt(Instant),
+    Ready(HashMap<String, f64>),
+}
+
+#[derive(Debug)]
+enum SettlementLookupDecision {
+    Fetch,
+    Deferred,
+    Cached(HashMap<String, f64>),
+}
+
+#[derive(Debug, Default)]
+struct SettlementLookupState {
+    entries: HashMap<String, SettlementLookupEntry>,
+    next_request_at: Option<Instant>,
+}
+
+impl SettlementLookupState {
+    fn claim(&mut self, condition_id: &str, now: Instant) -> SettlementLookupDecision {
+        match self.entries.get(condition_id) {
+            Some(SettlementLookupEntry::Ready(values)) => {
+                return SettlementLookupDecision::Cached(values.clone());
+            }
+            Some(SettlementLookupEntry::InFlight { lease_until }) if *lease_until > now => {
+                return SettlementLookupDecision::Deferred;
+            }
+            Some(SettlementLookupEntry::RetryAt(retry_at)) if *retry_at > now => {
+                return SettlementLookupDecision::Deferred;
+            }
+            _ => {}
+        }
+        self.entries.insert(condition_id.to_string(), SettlementLookupEntry::InFlight {
+            lease_until: now + SETTLEMENT_IN_FLIGHT_LEASE,
+        });
+        SettlementLookupDecision::Fetch
+    }
+
+    fn reserve_request_delay(&mut self, now: Instant) -> Duration {
+        let request_at = self.next_request_at.unwrap_or(now).max(now);
+        self.next_request_at = Some(request_at + SETTLEMENT_REQUEST_SPACING);
+        request_at.saturating_duration_since(now)
+    }
+
+    fn complete(
+        &mut self,
+        condition_id: &str,
+        resolution: Option<HashMap<String, f64>>,
+        now: Instant,
+    ) {
+        let entry = match resolution {
+            Some(values) => SettlementLookupEntry::Ready(values),
+            None => SettlementLookupEntry::RetryAt(now + ACTIVE_MARKET_RECHECK),
+        };
+        self.entries.insert(condition_id.to_string(), entry);
+    }
+
+    fn defer_after_error(&mut self, condition_id: &str, retry_after: Duration, now: Instant) {
+        self.entries.insert(
+            condition_id.to_string(),
+            SettlementLookupEntry::RetryAt(now + retry_after),
+        );
+    }
+}
+
+fn settlement_lookup_state() -> &'static Mutex<SettlementLookupState> {
+    static STATE: OnceLock<Mutex<SettlementLookupState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(SettlementLookupState::default()))
+}
+
+fn with_settlement_lookup_state<T>(f: impl FnOnce(&mut SettlementLookupState) -> T) -> T {
+    let mut state = settlement_lookup_state().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
+}
+
+#[derive(Debug)]
+struct SettlementFetchError {
+    message: String,
+    retry_after: Duration,
+}
+
+fn parse_retry_after(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RATE_LIMIT_RETRY)
+        .clamp(Duration::from_secs(1), Duration::from_secs(60 * 60))
+}
+
+fn response_retry_after(response: &reqwest::Response) -> Duration {
+    parse_retry_after(response.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok()))
+}
+
+async fn fetch_authoritative_resolution(
+    client: &reqwest::Client,
+    condition_id: &str,
+) -> std::result::Result<Option<HashMap<String, f64>>, SettlementFetchError> {
+    let url = format!("{}/markets/{}", CLOB_API_BASE, condition_id);
+    let response = client.get(&url).send().await.map_err(|error| SettlementFetchError {
+        message: format!("fetch settlement {}: {}", condition_id, error),
+        retry_after: DEFAULT_SETTLEMENT_RETRY,
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            response_retry_after(&response)
+        } else if status.is_server_error() {
+            DEFAULT_SETTLEMENT_RETRY
+        } else {
+            ACTIVE_MARKET_RECHECK
+        };
+        return Err(SettlementFetchError {
+            message: format!("fetch settlement {}: status {}", condition_id, status),
+            retry_after,
+        });
+    }
+    let market = response.json::<ClobMarketResolution>().await
+        .map_err(|error| SettlementFetchError {
+            message: format!("parse settlement {}: {}", condition_id, error),
+            retry_after: DEFAULT_SETTLEMENT_RETRY,
+        })?;
+    authoritative_resolution(condition_id, market).map_err(|error| SettlementFetchError {
+        message: error.to_string(),
+        retry_after: ACTIVE_MARKET_RECHECK,
+    })
+}
+
 async fn fetch_authoritative_resolutions(
     condition_ids: HashSet<String>,
 ) -> HashMap<String, f64> {
     let client = crate::async_rt::http_client();
-    let results = stream::iter(condition_ids.into_iter().map(|condition_id| {
-        let client = client.clone();
-        async move {
-            let url = format!("{}/markets/{}", CLOB_API_BASE, condition_id);
-            let response = client.get(&url).send().await
-                .map_err(|error| anyhow!("fetch settlement {}: {}", condition_id, error))?;
-            if !response.status().is_success() {
-                return Err(anyhow!(
-                    "fetch settlement {}: status {}",
-                    condition_id,
-                    response.status(),
-                ));
-            }
-            let market = response.json::<ClobMarketResolution>().await
-                .map_err(|error| anyhow!("parse settlement {}: {}", condition_id, error))?;
-            authoritative_resolution(&condition_id, market)
-        }
-    }))
-    .buffer_unordered(8)
-    .collect::<Vec<_>>()
-    .await;
-
     let mut values = HashMap::new();
-    for result in results {
+    for condition_id in condition_ids {
+        let decision = with_settlement_lookup_state(|state| {
+            state.claim(&condition_id, Instant::now())
+        });
+        match decision {
+            SettlementLookupDecision::Cached(resolution) => {
+                values.extend(resolution);
+                continue;
+            }
+            SettlementLookupDecision::Deferred => continue,
+            SettlementLookupDecision::Fetch => {}
+        }
+
+        let delay = with_settlement_lookup_state(|state| {
+            state.reserve_request_delay(Instant::now())
+        });
+        if !delay.is_zero() { tokio::time::sleep(delay).await; }
+
+        let result = fetch_authoritative_resolution(&client, &condition_id).await;
         match result {
-            Ok(Some(resolution)) => values.extend(resolution),
-            Ok(None) => {}
-            Err(error) => log::warn!(
-                "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value: {}",
-                error,
-            ),
+            Ok(resolution) => {
+                if let Some(resolution) = resolution.as_ref() {
+                    values.extend(resolution.clone());
+                }
+                with_settlement_lookup_state(|state| {
+                    state.complete(&condition_id, resolution, Instant::now());
+                });
+            }
+            Err(error) => {
+                with_settlement_lookup_state(|state| {
+                    state.defer_after_error(&condition_id, error.retry_after, Instant::now());
+                });
+                log::warn!(
+                    "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value and suppressing duplicate requests for {:?}: {}",
+                    error.retry_after,
+                    error.message,
+                );
+            }
         }
     }
     values
@@ -466,6 +612,54 @@ fn validate_balance(balance: f64) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_lookup_is_singleflight_and_caches_final_resolution() {
+        let now = Instant::now();
+        let mut state = SettlementLookupState::default();
+        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Fetch));
+        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Deferred));
+
+        let expected = HashMap::from([("winner".to_string(), 1.0)]);
+        state.complete("condition", Some(expected.clone()), now);
+        match state.claim("condition", now) {
+            SettlementLookupDecision::Cached(actual) => assert_eq!(actual, expected),
+            other => panic!("expected cached settlement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settlement_lookup_respects_rate_limit_retry_deadline() {
+        let now = Instant::now();
+        let mut state = SettlementLookupState::default();
+        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Fetch));
+        state.defer_after_error("condition", Duration::from_secs(30), now);
+        assert!(matches!(
+            state.claim("condition", now + Duration::from_secs(29)),
+            SettlementLookupDecision::Deferred
+        ));
+        assert!(matches!(
+            state.claim("condition", now + Duration::from_secs(30)),
+            SettlementLookupDecision::Fetch
+        ));
+    }
+
+    #[test]
+    fn settlement_retry_after_uses_header_with_safe_default_and_bounds() {
+        assert_eq!(parse_retry_after(Some("17")), Duration::from_secs(17));
+        assert_eq!(parse_retry_after(None), DEFAULT_RATE_LIMIT_RETRY);
+        assert_eq!(parse_retry_after(Some("invalid")), DEFAULT_RATE_LIMIT_RETRY);
+        assert_eq!(parse_retry_after(Some("0")), Duration::from_secs(1));
+        assert_eq!(parse_retry_after(Some("99999")), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn settlement_requests_are_globally_spaced() {
+        let now = Instant::now();
+        let mut state = SettlementLookupState::default();
+        assert_eq!(state.reserve_request_delay(now), Duration::ZERO);
+        assert_eq!(state.reserve_request_delay(now), SETTLEMENT_REQUEST_SPACING);
+    }
 
     fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
         ApiPosition {

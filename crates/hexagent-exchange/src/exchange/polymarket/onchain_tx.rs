@@ -20,9 +20,8 @@ use k256::ecdsa::SigningKey;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::deploy_wallet::{
     address_to_bytes32, keccak256, sign_eip712_safe, u256_bytes,
@@ -521,11 +520,11 @@ pub fn poll_onchain_tx(tx_hash: &str) -> Result<(String, String)> {
 /// Resolve the Polygon RPC pool.
 ///
 /// Preferred source is `$POLYGON_RPC_LIST` — a comma-separated pool built
-/// from `[polygon].rpc_list` in the secrets file. `rpc_call` round-robins
-/// across the pool (spreading load so no single node sees all the
-/// concurrency) and, on a node fault, rotates to the next node before
-/// failing. Falls back to `$POLYGON_RPC` (+ optional `$POLYGON_RPC_2`)
-/// when the list is unset, so the legacy scalar config still works.
+/// from `[polygon].rpc_list` in the secrets file. `rpc_call` sticks to the
+/// last successful node and, on a node fault, quarantines it before rotating
+/// to a healthy alternative. Falls back to `$POLYGON_RPC` (+ optional
+/// `$POLYGON_RPC_2`) when the list is unset, so the legacy scalar config still
+/// works.
 ///
 /// A node "fault" is `-32000` (often a stale-state false "insufficient
 /// funds"), `-32603` ("Internal error"), or any 5xx / transport error —
@@ -599,6 +598,102 @@ fn describe_err<E: Error + ?Sized>(e: &E) -> String {
     msg
 }
 
+const RPC_NODE_COOLDOWN: Duration = Duration::from_secs(30);
+const RPC_NODE_MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Default)]
+struct RpcNodeHealth {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RpcPoolHealth {
+    nodes: HashMap<String, RpcNodeHealth>,
+    preferred: Option<String>,
+    round_robin: usize,
+}
+
+impl RpcPoolHealth {
+    /// Prefer the last successful node, then healthy alternatives, and only
+    /// then nodes whose circuit is still cooling down. A cooled node remains
+    /// at the tail so the current request can still recover if every healthy
+    /// candidate fails.
+    fn attempt_order(&mut self, urls: &[String], now: Instant) -> Vec<usize> {
+        let is_available = |url: &String| self.nodes
+            .get(url)
+            .and_then(|node| node.retry_at)
+            .map_or(true, |retry_at| retry_at <= now);
+        let preferred = self.preferred.as_ref()
+            .and_then(|url| urls.iter().position(|candidate| candidate == url))
+            .filter(|index| is_available(&urls[*index]));
+
+        let n = urls.len();
+        let start = self.round_robin % n;
+        self.round_robin = self.round_robin.wrapping_add(1);
+        let mut available = Vec::with_capacity(n);
+        let mut cooling = Vec::with_capacity(n);
+        for step in 0..n {
+            let index = (start + step) % n;
+            if Some(index) == preferred { continue; }
+            if is_available(&urls[index]) {
+                available.push(index);
+            } else {
+                cooling.push(index);
+            }
+        }
+
+        let mut order = Vec::with_capacity(n);
+        if let Some(index) = preferred { order.push(index); }
+        order.extend(available);
+        cooling.sort_by_key(|index| self.nodes
+            .get(&urls[*index])
+            .and_then(|node| node.retry_at));
+        order.extend(cooling);
+        order
+    }
+
+    fn record_success(&mut self, url: &str) {
+        self.preferred = Some(url.to_string());
+        self.nodes.remove(url);
+    }
+
+    fn record_failure(&mut self, url: &str, now: Instant) -> Duration {
+        if self.preferred.as_deref() == Some(url) { self.preferred = None; }
+        let node = self.nodes.entry(url.to_string()).or_default();
+        node.consecutive_failures = node.consecutive_failures.saturating_add(1);
+        let shift = node.consecutive_failures.saturating_sub(1).min(4);
+        let cooldown = RPC_NODE_COOLDOWN
+            .saturating_mul(1u32 << shift)
+            .min(RPC_NODE_MAX_COOLDOWN);
+        node.retry_at = Some(now + cooldown);
+        cooldown
+    }
+}
+
+fn rpc_pool_health() -> &'static Mutex<RpcPoolHealth> {
+    static HEALTH: OnceLock<Mutex<RpcPoolHealth>> = OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(RpcPoolHealth::default()))
+}
+
+fn rpc_attempt_order(urls: &[String]) -> Vec<usize> {
+    rpc_pool_health().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .attempt_order(urls, Instant::now())
+}
+
+fn record_rpc_success(url: &str) {
+    rpc_pool_health().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_success(url);
+}
+
+fn record_rpc_failure(url: &str) -> Duration {
+    rpc_pool_health().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_failure(url, Instant::now())
+}
+
 /// POST a JSON-RPC request across the RPC pool, with two layers of retry:
 ///   1. Transient transport / 5xx errors: up to 3 attempts per node with
 ///      500 ms backoff (same endpoint, same answer expected eventually).
@@ -607,9 +702,10 @@ fn describe_err<E: Error + ?Sized>(e: &E) -> String {
 ///      almost always node-side (forked / overloaded / rate-limited),
 ///      not request-side, so a different node is the right fix.
 ///
-/// Each call starts at a round-robin offset into the pool, so concurrent
-/// calls fan out across nodes (lower per-node load) while still walking
-/// every node from that offset before failing (full failover).
+/// Calls stick to the last successful node. Nodes that return an internal
+/// error or exhaust transport retries enter a bounded exponential cooldown,
+/// preventing concurrent maintenance calls from repeatedly rediscovering the
+/// same bad nodes. Healthy alternatives still use round-robin ordering.
 ///
 /// Genuine logical RPC errors (e.g. revert reasons, malformed params)
 /// surface immediately — same endpoint will give the same answer, and
@@ -630,16 +726,11 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
     const MAX_TRANSIENT_ATTEMPTS: usize = 3;
     let mut last_err: Option<anyhow::Error> = None;
 
-    // Round-robin starting node: each call begins at the next node in the
-    // pool so concurrent calls spread out instead of all hammering node #0.
-    // We still walk the whole pool from that offset, so failover tries
-    // every node before giving up. (`urls` is guaranteed non-empty.)
-    static RR: AtomicUsize = AtomicUsize::new(0);
     let n = urls.len();
-    let start = RR.fetch_add(1, Ordering::Relaxed) % n;
+    let attempt_order = rpc_attempt_order(&urls);
+    let start = attempt_order[0];
 
-    'urls: for step in 0..n {
-        let url_idx = (start + step) % n;
+    'urls: for (step, url_idx) in attempt_order.into_iter().enumerate() {
         let url = &urls[url_idx];
         if step > 0 {
             warn!("[OnchainTx] RPC {} failing over to pool node #{} (started at #{}, {} nodes) after: {}",
@@ -677,6 +768,15 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
                         if is_node_fault {
                             // Same URL won't change its mind — switch URL.
                             last_err = Some(anyhow!("rpc error: {}", rpc_err));
+                            // -32603 is endpoint health. -32000 also carries
+                            // logical tx errors (for example underpriced), so
+                            // preserve failover without poisoning node health
+                            // for that broad code.
+                            if code == Some(-32603) {
+                                let cooldown = record_rpc_failure(url);
+                                info!("[OnchainTx] RPC {} pool node #{} cooling down for {:?}",
+                                    method, url_idx, cooldown);
+                            }
                             continue 'urls;
                         }
                         // Genuine logical error — retry won't help on any URL.
@@ -686,6 +786,7 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
                         info!("[OnchainTx] RPC {} succeeded on pool node #{} attempt {}",
                             method, url_idx, attempt);
                     }
+                    record_rpc_success(url);
                     return Ok(v);
                 }
                 Err(e) => {
@@ -698,6 +799,9 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
                         continue;
                     }
                     // Exhausted transient retries on this URL — fall through to next URL.
+                    let cooldown = record_rpc_failure(url);
+                    info!("[OnchainTx] RPC {} pool node #{} cooling down for {:?}",
+                        method, url_idx, cooldown);
                 }
             }
         }
@@ -934,6 +1038,28 @@ fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_health_sticks_to_success_and_quarantines_failures() {
+        let urls = vec!["rpc-a".to_string(), "rpc-b".to_string(), "rpc-c".to_string()];
+        let now = Instant::now();
+        let mut health = RpcPoolHealth::default();
+        health.record_success("rpc-c");
+        health.record_failure("rpc-a", now);
+        health.record_failure("rpc-b", now);
+        assert_eq!(health.attempt_order(&urls, now), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn rpc_health_retries_a_node_after_exponential_cooldown() {
+        let urls = vec!["rpc-a".to_string(), "rpc-b".to_string()];
+        let now = Instant::now();
+        let mut health = RpcPoolHealth::default();
+        assert_eq!(health.record_failure("rpc-a", now), Duration::from_secs(30));
+        assert_eq!(health.record_failure("rpc-a", now), Duration::from_secs(60));
+        assert_eq!(health.attempt_order(&urls, now)[0], 1);
+        assert!(health.attempt_order(&urls, now + Duration::from_secs(60)).contains(&0));
+    }
 
     #[test]
     fn rlp_single_byte() {
