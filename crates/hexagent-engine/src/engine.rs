@@ -42,6 +42,8 @@ const POLY_MARKET_DATA_STALL_NS: u64 = 45_000_000_000;
 const POLY_FEED_LOOP_RECONNECT_NS: u64 = 3_000_000_000;
 const POLY_FEED_LOOP_FAIL_FAST_NS: u64 = 10_000_000_000;
 const POLY_ROTATION_GRACE_NS: u64 = 3_000_000_000;
+const POLY_REPLACEMENT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PolymarketSupervisorAction {
@@ -53,6 +55,7 @@ enum PolymarketSupervisorAction {
 struct PolymarketWorkerEpoch {
     generation: u64,
     liveness: Arc<PolymarketLiveness>,
+    force_clob_runtime_fallback: bool,
 }
 
 struct PolymarketWorkerSlot {
@@ -65,6 +68,7 @@ impl PolymarketWorkerSlot {
             current: RwLock::new(PolymarketWorkerEpoch {
                 generation: 0,
                 liveness: Arc::new(PolymarketLiveness::default()),
+                force_clob_runtime_fallback: false,
             }),
         }
     }
@@ -87,6 +91,7 @@ impl PolymarketWorkerSlot {
         let replacement = PolymarketWorkerEpoch {
             generation: expected_generation.saturating_add(1),
             liveness: Arc::new(PolymarketLiveness::default()),
+            force_clob_runtime_fallback: true,
         };
         *current = replacement.clone();
         Some(replacement)
@@ -105,6 +110,57 @@ impl PolymarketWorkerSlot {
 struct PolymarketWorkerRebuild {
     generation: u64,
     reason: String,
+}
+
+fn pending_polymarket_recovery_stage(
+    snapshot: &PolymarketLivenessSnapshot,
+) -> Option<&'static str> {
+    if !snapshot.connecting_seen {
+        Some("Connecting")
+    } else if !snapshot.subscribed_seen {
+        Some("Subscribed")
+    } else if !snapshot.first_raw_frame_seen {
+        Some("first raw frame")
+    } else if !snapshot.ready_seen {
+        Some("READY")
+    } else {
+        None
+    }
+}
+
+fn assess_polymarket_replacement_recovery(
+    generation: u64,
+    snapshot: &PolymarketLivenessSnapshot,
+) -> Option<PolymarketSupervisorAction> {
+    if generation == 0 || !snapshot.active || snapshot.ready_seen {
+        return None;
+    }
+    let recovery_age = std::time::Duration::from_nanos(snapshot.recovery_age_ns?);
+    if recovery_age < POLY_REPLACEMENT_READY_TIMEOUT {
+        return None;
+    }
+    let missing = pending_polymarket_recovery_stage(snapshot).unwrap_or("READY");
+    Some(PolymarketSupervisorAction::Reconnect(format!(
+        "replacement recovery timeout after {:.1}s missing={} milestones=Connecting:{} Subscribed:{} first_raw_frame:{} READY:{}",
+        recovery_age.as_secs_f64(),
+        missing,
+        snapshot.connecting_seen,
+        snapshot.subscribed_seen,
+        snapshot.first_raw_frame_seen,
+        snapshot.ready_seen,
+    )))
+}
+
+fn next_failed_replacement_count(
+    generation: u64,
+    ready_seen: bool,
+    consecutive_failed: u32,
+) -> u32 {
+    if generation == 0 || ready_seen {
+        0
+    } else {
+        consecutive_failed.saturating_add(1)
+    }
 }
 
 fn assess_polymarket_liveness(
@@ -208,19 +264,30 @@ fn spawn_polymarket_supervisor(
                 let snapshot = epoch.liveness.snapshot();
                 if last_log.elapsed() >= POLY_SUPERVISOR_LOG_INTERVAL {
                     info!(
-                        "[feed_phase] polymarket phase={} phase_age_ms={} active={} raw_age_ms={} market_data_age_ms={} feed_loop_age_ms={} event_end_ns={}",
+                        "[feed_phase] polymarket generation={} phase={} phase_age_ms={} active={} recovery_age_ms={} raw_age_ms={} market_data_age_ms={} feed_loop_age_ms={} recovery=Connecting:{} Subscribed:{} first_raw_frame:{} READY:{} event_end_ns={}",
+                        epoch.generation,
                         snapshot.phase.as_str(),
                         snapshot.phase_age_ns / 1_000_000,
                         snapshot.active,
+                        snapshot.recovery_age_ns.unwrap_or(0) / 1_000_000,
                         snapshot.raw_frame_age_ns.unwrap_or(0) / 1_000_000,
                         snapshot.market_data_age_ns.unwrap_or(0) / 1_000_000,
                         snapshot.feed_loop_age_ns.unwrap_or(0) / 1_000_000,
+                        snapshot.connecting_seen,
+                        snapshot.subscribed_seen,
+                        snapshot.first_raw_frame_seen,
+                        snapshot.ready_seen,
                         snapshot.current_event_end_ns,
                     );
                     last_log = std::time::Instant::now();
                 }
 
-                match assess_polymarket_liveness(snapshot, crate::types::now_ns()) {
+                let action = assess_polymarket_replacement_recovery(
+                    epoch.generation,
+                    &snapshot,
+                )
+                .or_else(|| assess_polymarket_liveness(snapshot, crate::types::now_ns()));
+                match action {
                     Some(PolymarketSupervisorAction::Reconnect(reason)) => {
                         if epoch.liveness.request_reconnect(reason.clone()) {
                             set_feed_readiness(
@@ -300,12 +367,16 @@ fn spawn_polymarket_feed_worker(
             crate::os_tune::pin_execution("feed-polymarket");
             let liveness = epoch.liveness;
             let generation = epoch.generation;
+            let force_clob_runtime_fallback = epoch.force_clob_runtime_fallback;
             let still_current = || worker_slot.is_current(generation);
             liveness.set_phase(PolymarketFeedPhase::Starting);
             liveness.heartbeat_feed_loop();
 
             let make_feed = || {
                 let mut feed = PolymarketMarket::with_liveness(liveness.clone());
+                if force_clob_runtime_fallback {
+                    feed.force_clob_runtime_fallback();
+                }
                 feed.set_market_tx(tx.clone(), shutdown.clone());
                 feed
             };
@@ -462,10 +533,13 @@ fn spawn_polymarket_feed_worker(
                             if let Some(state) = polymarket_readiness_transition(&event) {
                                 set_feed_readiness(&feed_readiness, "polymarket", state.clone());
                                 match state {
-                                    FeedReadiness::Ready => info!(
-                                        "[feed_health] polymarket readiness=READY stage=market_stream generation={}",
-                                        generation,
-                                    ),
+                                    FeedReadiness::Ready => {
+                                        liveness.mark_ready();
+                                        info!(
+                                            "[feed_health] polymarket readiness=READY stage=market_stream generation={}",
+                                            generation,
+                                        );
+                                    }
                                     FeedReadiness::NotReady { reason, .. } => {
                                         if is_routine_clob_resubscribe(&reason) {
                                             info!(
@@ -630,6 +704,7 @@ fn spawn_polymarket_feed_manager(
             crate::os_tune::pin_background("polymarket-feed-manager");
             let initial = worker_slot.current();
             let mut workers = Vec::new();
+            let mut consecutive_failed_replacements = 0_u32;
             match spawn_polymarket_feed_worker(
                 cfg.clone(),
                 tx.clone(),
@@ -651,6 +726,56 @@ fn spawn_polymarket_feed_manager(
             while !shutdown.load(Ordering::Acquire) {
                 match rebuild_rx.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(command) => {
+                        let current = worker_slot.current();
+                        if current.generation != command.generation {
+                            info!(
+                                "[polymarket_manager] stale rebuild ignored generation={} reason={}",
+                                command.generation,
+                                command.reason,
+                            );
+                            continue;
+                        }
+                        let recovery = current.liveness.snapshot();
+                        consecutive_failed_replacements = next_failed_replacement_count(
+                            current.generation,
+                            recovery.ready_seen,
+                            consecutive_failed_replacements,
+                        );
+                        if consecutive_failed_replacements
+                            >= POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS
+                        {
+                            let missing = pending_polymarket_recovery_stage(&recovery)
+                                .unwrap_or("READY");
+                            let reason = format!(
+                                "CLOB replacement circuit breaker tripped after {} consecutive generations without READY; generation={} missing={} milestones=Connecting:{} Subscribed:{} first_raw_frame:{} READY:{} last_reason={}",
+                                consecutive_failed_replacements,
+                                current.generation,
+                                missing,
+                                recovery.connecting_seen,
+                                recovery.subscribed_seen,
+                                recovery.first_raw_frame_seen,
+                                recovery.ready_seen,
+                                command.reason,
+                            );
+                            set_feed_readiness(
+                                &feed_readiness,
+                                "polymarket",
+                                FeedReadiness::NotReady {
+                                    stage: "replacement_circuit_breaker".to_string(),
+                                    reason: reason.clone(),
+                                },
+                            );
+                            let _ = send_feed_event_with_timeout(
+                                &tx,
+                                MarketEvent::Disconnected {
+                                    exchange: Exchange::Polymarket,
+                                    reason: reason.clone(),
+                                },
+                                FEED_SEND_TIMEOUT,
+                            );
+                            request_feed_process_shutdown(&reason);
+                            return;
+                        }
                         let Some(replacement) = worker_slot.replace(command.generation) else {
                             info!(
                                 "[polymarket_manager] stale rebuild ignored generation={} reason={}",
@@ -660,9 +785,10 @@ fn spawn_polymarket_feed_manager(
                             continue;
                         };
                         warn!(
-                            "[polymarket_manager] rebuilding entire feed worker old_generation={} new_generation={} reason={}",
+                            "[polymarket_manager] rebuilding entire feed worker old_generation={} new_generation={} runtime=general-fallback consecutive_failed_replacements={} reason={}",
                             command.generation,
                             replacement.generation,
+                            consecutive_failed_replacements,
                             command.reason,
                         );
                         match spawn_polymarket_feed_worker(
@@ -717,6 +843,11 @@ mod polymarket_supervisor_tests {
             active: true,
             phase: PolymarketFeedPhase::Poll,
             phase_age_ns: 1_000_000_000,
+            connecting_seen: true,
+            subscribed_seen: true,
+            first_raw_frame_seen: true,
+            ready_seen: true,
+            recovery_age_ns: Some(1_000_000_000),
             raw_frame_age_ns: Some(1_000_000_000),
             market_data_age_ns: Some(1_000_000_000),
             feed_loop_age_ns: Some(1_000_000),
@@ -825,10 +956,66 @@ mod polymarket_supervisor_tests {
         assert!(!slot.is_current(stuck.generation));
         assert!(slot.is_current(replacement.generation));
         assert!(!Arc::ptr_eq(&stuck.liveness, &replacement.liveness));
+        assert!(replacement.force_clob_runtime_fallback);
         assert!(
             slot.replace(stuck.generation).is_none(),
             "a delayed duplicate rebuild cannot replace the fresh worker",
         );
+    }
+
+    #[test]
+    fn replacement_timeout_reports_the_first_missing_recovery_milestone() {
+        let mut snapshot = healthy_snapshot();
+        snapshot.ready_seen = false;
+        snapshot.first_raw_frame_seen = false;
+        snapshot.recovery_age_ns = Some(
+            POLY_REPLACEMENT_READY_TIMEOUT
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+        let action = assess_polymarket_replacement_recovery(
+            1,
+            &snapshot,
+        );
+        assert!(matches!(
+            action,
+            Some(PolymarketSupervisorAction::Reconnect(reason))
+                if reason.contains("missing=first raw frame")
+                    && reason.contains("READY:false")
+        ));
+
+        snapshot.recovery_age_ns = Some(
+            (POLY_REPLACEMENT_READY_TIMEOUT - std::time::Duration::from_millis(1))
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+        assert_eq!(
+            assess_polymarket_replacement_recovery(1, &snapshot),
+            None,
+            "a replacement gets the full bounded recovery window",
+        );
+    }
+
+    #[test]
+    fn replacement_timeout_is_suspended_while_legitimately_between_events() {
+        let mut snapshot = healthy_snapshot();
+        snapshot.active = false;
+        snapshot.ready_seen = false;
+        snapshot.recovery_age_ns = Some(u64::MAX);
+        assert_eq!(assess_polymarket_replacement_recovery(1, &snapshot), None);
+    }
+
+    #[test]
+    fn three_consecutive_non_ready_replacements_trip_and_ready_resets_count() {
+        let mut failures = next_failed_replacement_count(0, false, 0);
+        assert_eq!(failures, 0, "the initial worker is not a replacement");
+        failures = next_failed_replacement_count(1, false, failures);
+        failures = next_failed_replacement_count(2, false, failures);
+        failures = next_failed_replacement_count(3, false, failures);
+        assert_eq!(failures, POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS);
+
+        failures = next_failed_replacement_count(4, true, failures);
+        assert_eq!(failures, 0, "a generation that reached READY resets the breaker");
     }
 }
 
