@@ -35,13 +35,21 @@ use hdrhistogram::Histogram;
 
 pub use quanta::Instant;
 
-/// Highest value we expect to ever record (1 minute in nanoseconds).
-/// HDR histogram needs an upper bound; values above this are clamped
-/// and counted as `high`.
+/// Default highest request/processing latency (1 minute). Long-lived state
+/// ages use a stage-specific bound; the default previously hid a live
+/// 106.8-minute orphan as 60 seconds.
 const HISTOGRAM_MAX_NS: u64 = 60_000_000_000;
+const ORPHAN_AGE_HISTOGRAM_MAX_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 /// Three significant digits is the standard recommendation — gives ~0.1%
 /// bucket accuracy across the full range with ~few KB per histogram.
 const HISTOGRAM_SIGFIG: u8 = 3;
+
+fn histogram_max_ns(stage: &str) -> u64 {
+    match stage {
+        "polymarket.orphan.age" => ORPHAN_AGE_HISTOGRAM_MAX_NS,
+        _ => HISTOGRAM_MAX_NS,
+    }
+}
 
 struct Registry {
     /// Maps stage name → its histogram. Read-mostly (first record for a
@@ -55,7 +63,8 @@ impl Registry {
     }
 
     fn record(&self, stage: &'static str, ns: u64) {
-        let v = ns.min(HISTOGRAM_MAX_NS);
+        let max_ns = histogram_max_ns(stage);
+        let v = ns.min(max_ns);
         // Fast path: read lock, find entry, take inner mutex briefly.
         {
             let guard = self.stages.read().expect("stages RwLock poisoned");
@@ -73,7 +82,7 @@ impl Registry {
             let mut guard = self.stages.write().expect("stages RwLock poisoned");
             guard.entry(stage).or_insert_with(|| {
                 Mutex::new(
-                    Histogram::<u64>::new_with_bounds(1, HISTOGRAM_MAX_NS, HISTOGRAM_SIGFIG)
+                    Histogram::<u64>::new_with_bounds(1, max_ns, HISTOGRAM_SIGFIG)
                         .expect("histogram bounds are valid"),
                 )
             });
@@ -231,4 +240,22 @@ pub fn spawn_periodic_dump(interval: std::time::Duration) {
             }
         })
         .expect("spawn latency-dump thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_age_histogram_covers_multi_hour_incidents() {
+        assert_eq!(histogram_max_ns("ordinary.stage"), 60_000_000_000);
+        assert!(histogram_max_ns("polymarket.orphan.age") >= 2 * 60 * 60 * 1_000_000_000);
+
+        let max = histogram_max_ns("polymarket.orphan.age");
+        let mut histogram =
+            Histogram::<u64>::new_with_bounds(1, max, HISTOGRAM_SIGFIG).unwrap();
+        let observed = 106 * 60 * 1_000_000_000;
+        histogram.record(observed).unwrap();
+        assert!(histogram.max() >= observed);
+    }
 }
