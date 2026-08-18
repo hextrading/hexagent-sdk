@@ -23,6 +23,9 @@ pub mod rtt_probe;
 pub mod user_feed;
 pub mod wallet;
 
-pub use market::{PolymarketMarket, PolymarketEvent, PolyMarketInfo};
+pub use market::{
+    PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
+    PolymarketEvent, PolyMarketInfo,
+};
 pub use trade::PolymarketTrade;
 pub use position::{fetch_positions, fetch_balance};
