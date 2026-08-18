@@ -67,6 +67,9 @@ struct RuntimeOrderAuditPass {
     updates: Vec<OrderUpdate>,
     errors: Vec<String>,
     not_found: Vec<RuntimeMissingOrder>,
+    /// Order-specific not-found/null evidence which becomes terminal only
+    /// after the expiry endpoint proves that every market token is retired.
+    retired_market_absent: Vec<RuntimeMissingOrder>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +78,22 @@ struct RuntimeMissingOrder {
     tracked: TrackedOrder,
     order_id: String,
     evidence: String,
+}
+
+const RETIRED_MARKET_TERMINAL_ATTEMPTS: usize = 3;
+
+fn retired_market_terminalization_allowed(
+    consecutive_evidence_passes: usize,
+    token_count: usize,
+    invalid_token_responses: usize,
+    audit_error_count: usize,
+    absent_order_count: usize,
+) -> bool {
+    consecutive_evidence_passes >= RETIRED_MARKET_TERMINAL_ATTEMPTS
+        && token_count > 0
+        && invalid_token_responses == token_count
+        // Unrelated transport/schema/ledger failures must break the chain.
+        && audit_error_count == absent_order_count
 }
 
 /// Polymarket L2 HMAC signs the endpoint path only. Query parameters are sent
@@ -274,6 +293,27 @@ fn compact_order_lookup_evidence_text(raw: &str) -> String {
 fn compact_order_lookup_evidence(json: &serde_json::Value) -> String {
     let raw = serde_json::to_string(json).unwrap_or_else(|_| "<unserializable>".to_string());
     compact_order_lookup_evidence_text(&raw)
+}
+
+fn preflight_rejection_reason_code(reason: &str) -> &'static str {
+    let reason = reason.trim().to_ascii_lowercase();
+    if reason == "rate limited" {
+        "rate_limit"
+    } else if reason == "balance backoff" {
+        "balance_backoff"
+    } else if reason == "invalid token backoff" {
+        "invalid_token_backoff"
+    } else if reason.starts_with("shared-account admission:") {
+        "account_admission"
+    } else if reason.starts_with("body serialize:") {
+        "serialization"
+    } else if reason.contains("sign") || reason.contains("signature") {
+        "signing"
+    } else if reason.is_empty() {
+        "unknown"
+    } else {
+        "validation"
+    }
 }
 
 /// Polymarket may answer a singular `/data/order/{id}` lookup with HTTP 2xx
@@ -1793,6 +1833,45 @@ impl SharedState {
         status: Option<OrderStatus>,
         trade_id: Option<&str>,
     ) {
+        self.log_order_lifecycle_detail(
+            client_order_id,
+            stage,
+            exchange_order_id,
+            status,
+            trade_id,
+            "",
+            "",
+        );
+    }
+
+    pub(crate) fn log_preflight_rejected(
+        &self,
+        client_order_id: &str,
+        exchange_order_id: Option<&str>,
+        update: &OrderUpdate,
+    ) {
+        let reason = update.error.as_deref().unwrap_or("unknown");
+        self.log_order_lifecycle_detail(
+            client_order_id,
+            "preflight_rejected",
+            exchange_order_id,
+            Some(update.status),
+            None,
+            preflight_rejection_reason_code(reason),
+            reason,
+        );
+    }
+
+    fn log_order_lifecycle_detail(
+        &self,
+        client_order_id: &str,
+        stage: &str,
+        exchange_order_id: Option<&str>,
+        status: Option<OrderStatus>,
+        trade_id: Option<&str>,
+        reason_code: &str,
+        reason: &str,
+    ) {
         let stage_ns = now_ns();
         let trace = self
             .order_lifecycle_traces
@@ -1832,7 +1911,7 @@ impl SharedState {
                 ),
             };
         info!(
-            "[order_lifecycle] stage={} coid={} oid={} trade_id={} status={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+            "[order_lifecycle] stage={} coid={} oid={} trade_id={} status={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3} reason_code={} reason={}",
             stage,
             client_order_id,
             exchange_order_id.unwrap_or(""),
@@ -1850,6 +1929,8 @@ impl SharedState {
             lifecycle_delta_ms(stage_ns, trigger_exchange_ns),
             lifecycle_delta_ms(stage_ns, trigger_local_ns),
             lifecycle_delta_ms(stage_ns, quote_emit_ns),
+            reason_code,
+            serde_json::to_string(reason).unwrap_or_else(|_| "\"unserializable\"".to_string()),
         );
     }
 
@@ -3585,6 +3666,50 @@ impl PolymarketTrade {
         self.reconcile_runtime_orders_pass(Some(tokens))
     }
 
+    /// The venue has retired the event, so the residual cannot still rest.
+    /// Preserve coid/oid/token mappings for late trade attribution while
+    /// releasing active reservation and strategy orphan state.
+    fn close_retired_market_order(
+        &self,
+        missing: &RuntimeMissingOrder,
+        market_condition_id: &str,
+    ) -> Option<OrderUpdate> {
+        let ownership = self.shared.account_state.order(&missing.client_order_id)?;
+        let durable_status = if ownership.status == OrderStatus::Filled {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Cancelled
+        };
+        self.shared
+            .remove_order_resolved_as(&missing.client_order_id, durable_status);
+        warn!(
+            "[orphan_metric] retired_market_order_terminal=1 market={} coid={} orderID={} token={} prior_status={:?} durable_status={:?} evidence={} terminal=Cancelled lock_release=allowed late_trade_mapping=retained",
+            market_condition_id,
+            missing.client_order_id,
+            missing.order_id,
+            ownership.token_id,
+            ownership.status,
+            durable_status,
+            missing.evidence,
+        );
+        Some(OrderUpdate {
+            client_order_id: missing.client_order_id.clone(),
+            exchange: Exchange::Polymarket,
+            symbol: missing.tracked.symbol.clone(),
+            side: missing.tracked.side,
+            exchange_order_id: Some(missing.order_id.clone()),
+            status: OrderStatus::Cancelled,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: (ownership.quantity - ownership.filled_quantity).max(0.0),
+            avg_fill_price: ownership.price,
+            timestamp_ns: now_ns(),
+            trade_id: None,
+            order_audit: None,
+            error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
+        })
+    }
+
     fn reconcile_runtime_orders_pass(
         &self,
         token_filter: Option<&HashSet<String>>,
@@ -3634,6 +3759,7 @@ impl PolymarketTrade {
         let mut updates = Vec::new();
         let mut errors = Vec::new();
         let mut not_found = Vec::new();
+        let mut retired_market_absent = Vec::new();
         let recovered: HashSet<String> = self
             .shared
             .account_state
@@ -3667,12 +3793,14 @@ impl PolymarketTrade {
                     errors.push(format!(
                         "open order coid={coid} orderID={order_id} was not found: {evidence}"
                     ));
-                    not_found.push(RuntimeMissingOrder {
+                    let missing = RuntimeMissingOrder {
                         client_order_id: coid,
                         tracked,
                         order_id,
                         evidence,
-                    });
+                    };
+                    not_found.push(missing.clone());
+                    retired_market_absent.push(missing);
                     continue;
                 }
                 FetchOrderResult::Unavailable(kind)
@@ -3690,6 +3818,14 @@ impl PolymarketTrade {
                     errors.push(format!(
                         "open order coid={coid} orderID={order_id} audit unavailable: {kind:?}"
                     ));
+                    if kind.is_json_null() {
+                        retired_market_absent.push(RuntimeMissingOrder {
+                            client_order_id: coid,
+                            tracked,
+                            order_id,
+                            evidence: "single_order_lookup_json_null".to_string(),
+                        });
+                    }
                     continue;
                 }
             };
@@ -3833,6 +3969,7 @@ impl PolymarketTrade {
             updates,
             errors,
             not_found,
+            retired_market_absent,
         }
     }
 
@@ -4115,12 +4252,14 @@ impl PolymarketTrade {
         let retry_delays_ms = [0_u64, 100, 250];
         let mut all_updates = Vec::new();
         let mut last_detail = String::new();
+        let mut retired_market_evidence_streak = 0usize;
         for (attempt_idx, delay_ms) in retry_delays_ms.into_iter().enumerate() {
             if delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
             let mut remote_clean = true;
             let mut remote_details = Vec::new();
+            let mut invalid_token_responses = 0usize;
             for asset_id in &tokens {
                 let body = serde_json::json!({
                     "market": market_condition_id,
@@ -4163,6 +4302,9 @@ impl PolymarketTrade {
                     },
                     Err(error) => {
                         remote_clean = false;
+                        if SharedState::is_invalid_token_error(&error.to_string()) {
+                            invalid_token_responses = invalid_token_responses.saturating_add(1);
+                        }
                         remote_details.push(format!("asset={asset_id} request failed: {error}"));
                     }
                 }
@@ -4170,6 +4312,32 @@ impl PolymarketTrade {
 
             let audit = self.reconcile_runtime_orders_for_tokens_pass(&tokens);
             all_updates.extend(audit.updates);
+            let complete_retired_evidence_pass = invalid_token_responses == tokens.len()
+                && audit.errors.len() == audit.retired_market_absent.len();
+            if complete_retired_evidence_pass {
+                retired_market_evidence_streak = retired_market_evidence_streak.saturating_add(1);
+            } else {
+                retired_market_evidence_streak = 0;
+            }
+            let retired_market_terminal = retired_market_terminalization_allowed(
+                retired_market_evidence_streak,
+                tokens.len(),
+                invalid_token_responses,
+                audit.errors.len(),
+                audit.retired_market_absent.len(),
+            );
+            let retired_absent_count = audit.retired_market_absent.len();
+            let mut retired_closed = 0usize;
+            if retired_market_terminal {
+                for missing in &audit.retired_market_absent {
+                    if let Some(update) =
+                        self.close_retired_market_order(missing, market_condition_id)
+                    {
+                        all_updates.push(update);
+                        retired_closed = retired_closed.saturating_add(1);
+                    }
+                }
+            }
             let open_orders = self
                 .shared
                 .open_orders
@@ -4190,16 +4358,29 @@ impl PolymarketTrade {
                         .is_some_and(|order| tokens.contains(&order.token_id))
                 })
                 .count();
-            let local_clean = audit.errors.is_empty() && open_orders == 0 && recovery_pending == 0;
+            let remote_final = remote_clean || retired_market_terminal;
+            let local_clean = if retired_market_terminal {
+                retired_closed == retired_absent_count
+                    && open_orders == 0
+                    && recovery_pending == 0
+            } else {
+                audit.errors.is_empty() && open_orders == 0 && recovery_pending == 0
+            };
             last_detail = format!(
-                "attempt={} remote=[{}] open_orders={} recovery_pending={} audit_errors={:?}",
+                "attempt={} remote=[{}] invalid_token_responses={}/{} retired_evidence_streak={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
                 attempt_idx + 1,
                 remote_details.join(", "),
+                invalid_token_responses,
+                tokens.len(),
+                retired_market_evidence_streak,
+                retired_market_terminal,
+                retired_closed,
+                retired_absent_count,
                 open_orders,
                 recovery_pending,
                 audit.errors,
             );
-            if remote_clean && local_clean {
+            if remote_final && local_clean {
                 info!(
                     "[PolymarketTrade] market cancel finality confirmed market={}: {}",
                     market_condition_id, last_detail,
@@ -4599,6 +4780,24 @@ impl PolymarketTrade {
                 Some(msg.to_string())
             },
         }
+    }
+
+    fn make_logged_preflight_rejections(
+        &self,
+        orders: &[OrderRequest],
+        reason: &str,
+    ) -> Vec<OrderUpdate> {
+        orders.iter().map(|order| {
+            self.shared.register_order_lifecycle(order);
+            let rejected = Self::make_rejected(order, reason);
+            self.shared.log_preflight_rejected(
+                &order.client_order_id,
+                rejected.exchange_order_id.as_deref(),
+                &rejected,
+            );
+            self.shared.forget_order_lifecycle(&order.client_order_id);
+            rejected
+        }).collect()
     }
 
     /// Make a timeout OrderUpdate for a placement whose HTTP call timed
@@ -5598,12 +5797,10 @@ impl PolymarketTrade {
         let (local_oid, body_str) = match self.submit_prep(order) {
             Ok(prepared) => prepared,
             Err(update) => {
-                self.shared.log_order_lifecycle(
+                self.shared.log_preflight_rejected(
                     &order.client_order_id,
-                    "preflight_rejected",
                     update.exchange_order_id.as_deref(),
-                    Some(update.status),
-                    None,
+                    &update,
                 );
                 self.shared.forget_order_lifecycle(&order.client_order_id);
                 return Err(update);
@@ -5639,12 +5836,10 @@ impl PolymarketTrade {
         let (local_oid, body_str) = match self.submit_prep(order) {
             Ok(prepared) => prepared,
             Err(update) => {
-                self.shared.log_order_lifecycle(
+                self.shared.log_preflight_rejected(
                     &order.client_order_id,
-                    "preflight_rejected",
                     update.exchange_order_id.as_deref(),
-                    Some(update.status),
-                    None,
+                    &update,
                 );
                 self.shared.forget_order_lifecycle(&order.client_order_id);
                 return Err(update);
@@ -6491,10 +6686,7 @@ impl ExchangeTrade for PolymarketTrade {
     ) -> Result<Vec<OrderUpdate>> {
         // Balance-backoff short-circuit (see `submit_order` for rationale).
         if self.shared.in_balance_backoff(&self.instance_id) {
-            return Ok(orders
-                .iter()
-                .map(|o| Self::make_rejected(o, "balance backoff"))
-                .collect());
+            return Ok(self.make_logged_preflight_rejections(orders, "balance backoff"));
         }
         // Single-endpoint mode: per `use_batch_orders=false`, dispatch
         // each order through `POST /order` concurrently — kickoff all
@@ -6565,12 +6757,10 @@ impl ExchangeTrade for PolymarketTrade {
                         );
                         let b = serde_json::to_value(&b).unwrap_or_default();
                         if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
-                            self.shared.log_order_lifecycle(
+                            self.shared.log_preflight_rejected(
                                 &o.client_order_id,
-                                "preflight_rejected",
                                 Some(&order_hash),
-                                Some(rejected.status),
-                                None,
+                                &rejected,
                             );
                             self.shared.forget_order_lifecycle(&o.client_order_id);
                             all_updates.push(rejected);
@@ -6608,12 +6798,10 @@ impl ExchangeTrade for PolymarketTrade {
                             o.client_order_id, e,
                         );
                         let rejected = Self::make_rejected(o, &e.to_string());
-                        self.shared.log_order_lifecycle(
+                        self.shared.log_preflight_rejected(
                             &o.client_order_id,
-                            "preflight_rejected",
                             None,
-                            Some(rejected.status),
-                            None,
+                            &rejected,
                         );
                         self.shared.forget_order_lifecycle(&o.client_order_id);
                         all_updates.push(rejected);
@@ -7154,10 +7342,8 @@ impl ExchangeTrade for PolymarketTrade {
         // every place during the 200 ms window so doomed submits
         // don't get hammered while the cancels race to land.
         if self.shared.in_balance_backoff(&self.instance_id) && !place_orders.is_empty() {
-            let mut pre: Vec<OrderUpdate> = place_orders
-                .iter()
-                .map(|o| Self::make_rejected(o, "balance backoff"))
-                .collect();
+            let mut pre =
+                self.make_logged_preflight_rejections(place_orders, "balance backoff");
             // Still process cancels — recurse into the cancel-only path.
             let rest =
                 self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
@@ -7178,10 +7364,8 @@ impl ExchangeTrade for PolymarketTrade {
                 .iter()
                 .cloned()
                     .partition(|o| self.shared.in_invalid_token_backoff(&o.symbol));
-            let mut pre: Vec<OrderUpdate> = blocked
-                .iter()
-                .map(|o| Self::make_rejected(o, "invalid token backoff"))
-                .collect();
+            let mut pre =
+                self.make_logged_preflight_rejections(&blocked, "invalid token backoff");
             let rest =
                 self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &allowed)?;
             pre.extend(rest);
@@ -7343,12 +7527,10 @@ impl ExchangeTrade for PolymarketTrade {
                     );
                     let b = serde_json::to_value(&b).unwrap_or_default();
                     if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
-                        self.shared.log_order_lifecycle(
+                        self.shared.log_preflight_rejected(
                             &o.client_order_id,
-                            "preflight_rejected",
                             Some(&order_hash),
-                            Some(rejected.status),
-                            None,
+                            &rejected,
                         );
                         self.shared.forget_order_lifecycle(&o.client_order_id);
                         place_sign_failures.push(rejected);
@@ -7384,12 +7566,10 @@ impl ExchangeTrade for PolymarketTrade {
                         o.client_order_id, e,
                     );
                     let rejected = Self::make_rejected(o, &e.to_string());
-                    self.shared.log_order_lifecycle(
+                    self.shared.log_preflight_rejected(
                         &o.client_order_id,
-                        "preflight_rejected",
                         None,
-                        Some(rejected.status),
-                        None,
+                        &rejected,
                     );
                     self.shared.forget_order_lifecycle(&o.client_order_id);
                     place_sign_failures.push(rejected);
@@ -8381,6 +8561,29 @@ mod tests {
             CancelReasonOutcome::Cancelled,
             "third reconcile DELETE observation must be a Cancelled terminal",
         );
+    }
+
+    #[test]
+    fn retired_market_requires_three_complete_invalid_token_and_absence_passes() {
+        assert!(!retired_market_terminalization_allowed(2, 2, 2, 1, 1));
+        assert!(!retired_market_terminalization_allowed(3, 2, 1, 1, 1));
+        assert!(!retired_market_terminalization_allowed(3, 2, 2, 2, 1));
+        assert!(retired_market_terminalization_allowed(3, 2, 2, 1, 1));
+        assert!(retired_market_terminalization_allowed(3, 2, 2, 0, 0));
+    }
+
+    #[test]
+    fn preflight_rejection_reason_codes_are_stable_and_structured() {
+        assert_eq!(preflight_rejection_reason_code("rate limited"), "rate_limit");
+        assert_eq!(
+            preflight_rejection_reason_code("shared-account admission: cash exhausted"),
+            "account_admission"
+        );
+        assert_eq!(
+            preflight_rejection_reason_code("invalid token backoff"),
+            "invalid_token_backoff"
+        );
+        assert_eq!(preflight_rejection_reason_code("bad price"), "validation");
     }
 
     #[test]

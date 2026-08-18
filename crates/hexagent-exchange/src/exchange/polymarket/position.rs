@@ -17,6 +17,7 @@ const SETTLEMENT_IN_FLIGHT_LEASE: Duration = Duration::from_secs(5 * 60);
 const ACTIVE_MARKET_RECHECK: Duration = Duration::from_secs(60);
 const DEFAULT_SETTLEMENT_RETRY: Duration = Duration::from_secs(5);
 const DEFAULT_RATE_LIMIT_RETRY: Duration = Duration::from_secs(30);
+const SETTLEMENT_MAX_CONCURRENT_REQUESTS: usize = 1;
 
 /// Raw position record from Polymarket Data API.
 #[derive(Debug, Deserialize)]
@@ -192,14 +193,19 @@ enum SettlementLookupDecision {
 struct SettlementLookupState {
     entries: HashMap<String, SettlementLookupEntry>,
     next_request_at: Option<Instant>,
+    /// Retry-After from 429 is endpoint-wide, not condition-specific.
+    global_retry_at: Option<Instant>,
 }
 
 impl SettlementLookupState {
     fn claim(&mut self, condition_id: &str, now: Instant) -> SettlementLookupDecision {
+        if let Some(SettlementLookupEntry::Ready(values)) = self.entries.get(condition_id) {
+            return SettlementLookupDecision::Cached(values.clone());
+        }
+        if self.global_retry_at.is_some_and(|retry_at| retry_at > now) {
+            return SettlementLookupDecision::Deferred;
+        }
         match self.entries.get(condition_id) {
-            Some(SettlementLookupEntry::Ready(values)) => {
-                return SettlementLookupDecision::Cached(values.clone());
-            }
             Some(SettlementLookupEntry::InFlight { lease_until }) if *lease_until > now => {
                 return SettlementLookupDecision::Deferred;
             }
@@ -215,9 +221,38 @@ impl SettlementLookupState {
     }
 
     fn reserve_request_delay(&mut self, now: Instant) -> Duration {
-        let request_at = self.next_request_at.unwrap_or(now).max(now);
+        let request_at = self
+            .next_request_at
+            .unwrap_or(now)
+            .max(self.global_retry_at.unwrap_or(now))
+            .max(now);
         self.next_request_at = Some(request_at + SETTLEMENT_REQUEST_SPACING);
         request_at.saturating_duration_since(now)
+    }
+
+    /// Recheck after waiting for the global semaphore/rate slot: another CID
+    /// may have received 429 while this request was queued.
+    fn request_allowed(&mut self, condition_id: &str, now: Instant) -> bool {
+        if let Some(retry_at) = self.global_retry_at.filter(|retry_at| *retry_at > now) {
+            self.entries.insert(
+                condition_id.to_string(),
+                SettlementLookupEntry::RetryAt(retry_at),
+            );
+            return false;
+        }
+        match self.entries.get(condition_id) {
+            Some(SettlementLookupEntry::InFlight { lease_until }) if *lease_until > now => true,
+            Some(SettlementLookupEntry::RetryAt(retry_at)) if *retry_at <= now => {
+                self.entries.insert(
+                    condition_id.to_string(),
+                    SettlementLookupEntry::InFlight {
+                        lease_until: now + SETTLEMENT_IN_FLIGHT_LEASE,
+                    },
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     fn complete(
@@ -233,11 +268,40 @@ impl SettlementLookupState {
         self.entries.insert(condition_id.to_string(), entry);
     }
 
-    fn defer_after_error(&mut self, condition_id: &str, retry_after: Duration, now: Instant) {
+    fn defer_after_error(
+        &mut self,
+        condition_id: &str,
+        retry_after: Duration,
+        rate_limited: bool,
+        now: Instant,
+    ) {
+        let retry_at = now + retry_after;
         self.entries.insert(
             condition_id.to_string(),
-            SettlementLookupEntry::RetryAt(now + retry_after),
+            SettlementLookupEntry::RetryAt(retry_at),
         );
+        if !rate_limited {
+            return;
+        }
+
+        let global_retry_at = self
+            .global_retry_at
+            .map_or(retry_at, |current| current.max(retry_at));
+        self.global_retry_at = Some(global_retry_at);
+        // Invalidate queued logical flights so one 429 suppresses the rest of
+        // the batch instead of allowing every CID to hit the same limit.
+        for entry in self.entries.values_mut() {
+            match entry {
+                SettlementLookupEntry::Ready(_) => {}
+                SettlementLookupEntry::InFlight { .. } => {
+                    *entry = SettlementLookupEntry::RetryAt(global_retry_at);
+                }
+                SettlementLookupEntry::RetryAt(current) if *current < global_retry_at => {
+                    *current = global_retry_at;
+                }
+                SettlementLookupEntry::RetryAt(_) => {}
+            }
+        }
     }
 }
 
@@ -252,10 +316,16 @@ fn with_settlement_lookup_state<T>(f: impl FnOnce(&mut SettlementLookupState) ->
     f(&mut state)
 }
 
+fn settlement_request_limiter() -> &'static tokio::sync::Semaphore {
+    static LIMITER: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(SETTLEMENT_MAX_CONCURRENT_REQUESTS))
+}
+
 #[derive(Debug)]
 struct SettlementFetchError {
     message: String,
     retry_after: Duration,
+    rate_limited: bool,
 }
 
 fn parse_retry_after(value: Option<&str>) -> Duration {
@@ -280,6 +350,7 @@ async fn fetch_authoritative_resolution(
     let response = client.get(&url).send().await.map_err(|error| SettlementFetchError {
         message: format!("fetch settlement {}: {}", condition_id, error),
         retry_after: DEFAULT_SETTLEMENT_RETRY,
+        rate_limited: false,
     })?;
     let status = response.status();
     if !status.is_success() {
@@ -293,16 +364,19 @@ async fn fetch_authoritative_resolution(
         return Err(SettlementFetchError {
             message: format!("fetch settlement {}: status {}", condition_id, status),
             retry_after,
+            rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
         });
     }
     let market = response.json::<ClobMarketResolution>().await
         .map_err(|error| SettlementFetchError {
             message: format!("parse settlement {}: {}", condition_id, error),
             retry_after: DEFAULT_SETTLEMENT_RETRY,
+            rate_limited: false,
         })?;
     authoritative_resolution(condition_id, market).map_err(|error| SettlementFetchError {
         message: error.to_string(),
         retry_after: ACTIVE_MARKET_RECHECK,
+        rate_limited: false,
     })
 }
 
@@ -324,10 +398,27 @@ async fn fetch_authoritative_resolutions(
             SettlementLookupDecision::Fetch => {}
         }
 
+        let Ok(_permit) = settlement_request_limiter().acquire().await else {
+            with_settlement_lookup_state(|state| {
+                state.defer_after_error(
+                    &condition_id,
+                    DEFAULT_SETTLEMENT_RETRY,
+                    false,
+                    Instant::now(),
+                );
+            });
+            continue;
+        };
         let delay = with_settlement_lookup_state(|state| {
             state.reserve_request_delay(Instant::now())
         });
         if !delay.is_zero() { tokio::time::sleep(delay).await; }
+        let allowed = with_settlement_lookup_state(|state| {
+            state.request_allowed(&condition_id, Instant::now())
+        });
+        if !allowed {
+            continue;
+        }
 
         let result = fetch_authoritative_resolution(&client, &condition_id).await;
         match result {
@@ -341,11 +432,17 @@ async fn fetch_authoritative_resolutions(
             }
             Err(error) => {
                 with_settlement_lookup_state(|state| {
-                    state.defer_after_error(&condition_id, error.retry_after, Instant::now());
+                    state.defer_after_error(
+                        &condition_id,
+                        error.retry_after,
+                        error.rate_limited,
+                        Instant::now(),
+                    );
                 });
                 log::warn!(
-                    "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value and suppressing duplicate requests for {:?}: {}",
+                    "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value and suppressing duplicate requests for {:?} global_cooldown={}: {}",
                     error.retry_after,
+                    error.rate_limited,
                     error.message,
                 );
             }
@@ -633,7 +730,7 @@ mod tests {
         let now = Instant::now();
         let mut state = SettlementLookupState::default();
         assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Fetch));
-        state.defer_after_error("condition", Duration::from_secs(30), now);
+        state.defer_after_error("condition", Duration::from_secs(30), false, now);
         assert!(matches!(
             state.claim("condition", now + Duration::from_secs(29)),
             SettlementLookupDecision::Deferred
@@ -659,6 +756,32 @@ mod tests {
         let mut state = SettlementLookupState::default();
         assert_eq!(state.reserve_request_delay(now), Duration::ZERO);
         assert_eq!(state.reserve_request_delay(now), SETTLEMENT_REQUEST_SPACING);
+    }
+
+    #[test]
+    fn settlement_429_defers_other_cids_and_invalidates_queued_flights() {
+        let now = Instant::now();
+        let mut state = SettlementLookupState::default();
+        assert!(matches!(state.claim("condition-a", now), SettlementLookupDecision::Fetch));
+        assert!(matches!(state.claim("condition-b", now), SettlementLookupDecision::Fetch));
+
+        let cached = HashMap::from([("winner".to_string(), 1.0)]);
+        state.complete("resolved", Some(cached.clone()), now);
+        state.defer_after_error("condition-a", Duration::from_secs(30), true, now);
+        assert!(matches!(
+            state.claim("condition-c", now + Duration::from_secs(29)),
+            SettlementLookupDecision::Deferred
+        ));
+        assert!(!state.request_allowed("condition-b", now + Duration::from_secs(1)));
+        assert!(matches!(
+            state.claim("resolved", now + Duration::from_secs(1)),
+            SettlementLookupDecision::Cached(values) if values == cached
+        ));
+        assert!(matches!(
+            state.claim("condition-c", now + Duration::from_secs(30)),
+            SettlementLookupDecision::Fetch
+        ));
+        assert!(state.request_allowed("condition-b", now + Duration::from_secs(30)));
     }
 
     fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
