@@ -49,6 +49,64 @@ enum PolymarketSupervisorAction {
     FailFast(String),
 }
 
+#[derive(Clone)]
+struct PolymarketWorkerEpoch {
+    generation: u64,
+    liveness: Arc<PolymarketLiveness>,
+}
+
+struct PolymarketWorkerSlot {
+    current: RwLock<PolymarketWorkerEpoch>,
+}
+
+impl PolymarketWorkerSlot {
+    fn new() -> Self {
+        Self {
+            current: RwLock::new(PolymarketWorkerEpoch {
+                generation: 0,
+                liveness: Arc::new(PolymarketLiveness::default()),
+            }),
+        }
+    }
+
+    fn current(&self) -> PolymarketWorkerEpoch {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace(&self, expected_generation: u64) -> Option<PolymarketWorkerEpoch> {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.generation != expected_generation {
+            return None;
+        }
+        let replacement = PolymarketWorkerEpoch {
+            generation: expected_generation.saturating_add(1),
+            liveness: Arc::new(PolymarketLiveness::default()),
+        };
+        *current = replacement.clone();
+        Some(replacement)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+            == generation
+    }
+}
+
+#[derive(Debug)]
+struct PolymarketWorkerRebuild {
+    generation: u64,
+    reason: String,
+}
+
 fn assess_polymarket_liveness(
     snapshot: PolymarketLivenessSnapshot,
     wall_now_ns: u64,
@@ -132,7 +190,8 @@ fn request_feed_process_shutdown(reason: &str) {
 }
 
 fn spawn_polymarket_supervisor(
-    liveness: Arc<PolymarketLiveness>,
+    worker_slot: Arc<PolymarketWorkerSlot>,
+    rebuild_tx: Sender<PolymarketWorkerRebuild>,
     readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
     market_tx: Sender<MarketEvent>,
     shutdown: Arc<AtomicBool>,
@@ -145,7 +204,8 @@ fn spawn_polymarket_supervisor(
                 .checked_sub(POLY_SUPERVISOR_LOG_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now);
             while !shutdown.load(Ordering::Acquire) {
-                let snapshot = liveness.snapshot();
+                let epoch = worker_slot.current();
+                let snapshot = epoch.liveness.snapshot();
                 if last_log.elapsed() >= POLY_SUPERVISOR_LOG_INTERVAL {
                     info!(
                         "[feed_phase] polymarket phase={} phase_age_ms={} active={} raw_age_ms={} market_data_age_ms={} feed_loop_age_ms={} event_end_ns={}",
@@ -162,7 +222,7 @@ fn spawn_polymarket_supervisor(
 
                 match assess_polymarket_liveness(snapshot, crate::types::now_ns()) {
                     Some(PolymarketSupervisorAction::Reconnect(reason)) => {
-                        if liveness.request_reconnect(reason.clone()) {
+                        if epoch.liveness.request_reconnect(reason.clone()) {
                             set_feed_readiness(
                                 &readiness,
                                 "polymarket",
@@ -172,9 +232,20 @@ fn spawn_polymarket_supervisor(
                                 },
                             );
                             warn!(
-                                "[polymarket_supervisor] reconnect requested: {}",
+                                "[polymarket_supervisor] external worker rebuild requested: generation={} {}",
+                                epoch.generation,
                                 reason,
                             );
+                            if let Err(error) = rebuild_tx.try_send(PolymarketWorkerRebuild {
+                                generation: epoch.generation,
+                                reason: reason.clone(),
+                            }) {
+                                error!(
+                                    "[polymarket_supervisor] failed to enqueue external worker rebuild generation={}: {}",
+                                    epoch.generation,
+                                    error,
+                                );
+                            }
                             let _ = send_feed_event_with_timeout(
                                 &market_tx,
                                 MarketEvent::Disconnected {
@@ -212,6 +283,429 @@ fn spawn_polymarket_supervisor(
                 thread::sleep(POLY_SUPERVISOR_TICK);
             }
         })
+}
+
+fn spawn_polymarket_feed_worker(
+    cfg: ExchangeConfig,
+    tx: Sender<MarketEvent>,
+    sim_tx: Option<Sender<MarketEvent>>,
+    shutdown: Arc<AtomicBool>,
+    feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
+    worker_slot: Arc<PolymarketWorkerSlot>,
+    epoch: PolymarketWorkerEpoch,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("feed-polymarket-{}", epoch.generation))
+        .spawn(move || {
+            crate::os_tune::pin_execution("feed-polymarket");
+            let liveness = epoch.liveness;
+            let generation = epoch.generation;
+            let still_current = || worker_slot.is_current(generation);
+            liveness.set_phase(PolymarketFeedPhase::Starting);
+            liveness.heartbeat_feed_loop();
+
+            let make_feed = || {
+                let mut feed = PolymarketMarket::with_liveness(liveness.clone());
+                feed.set_market_tx(tx.clone(), shutdown.clone());
+                feed
+            };
+            let mut feed = make_feed();
+            let mut subscribe_backoff = crate::exchange::ReconnectBackoff::new(1_000, 30_000);
+            let mut subscribe_failures = 0_u64;
+            let subscribe_started = std::time::Instant::now();
+
+            loop {
+                liveness.set_phase(PolymarketFeedPhase::Subscribe);
+                liveness.heartbeat_feed_loop();
+                if shutdown.load(Ordering::Relaxed) || !still_current() {
+                    feed.disconnect();
+                    liveness.set_phase(PolymarketFeedPhase::Stopped);
+                    return;
+                }
+                match feed.subscribe(&cfg.symbols) {
+                    Ok(()) => {
+                        if subscribe_failures > 0 {
+                            info!(
+                                "[feed_health] polymarket readiness=SUBSCRIBED recovered_after={:.1}s attempts={} generation={}",
+                                subscribe_started.elapsed().as_secs_f64(),
+                                subscribe_failures + 1,
+                                generation,
+                            );
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        subscribe_failures = subscribe_failures.saturating_add(1);
+                        let delay = subscribe_backoff
+                            .next_delay()
+                            .min(std::time::Duration::from_secs(30));
+                        set_feed_readiness(
+                            &feed_readiness,
+                            "polymarket",
+                            FeedReadiness::NotReady {
+                                stage: "subscribe".to_string(),
+                                reason: error.to_string(),
+                            },
+                        );
+                        if subscribe_failures == 1 {
+                            error!(
+                                "[feed_health] polymarket readiness=NOT_READY stage=subscribe error={} retrying_in={:.1}s generation={}",
+                                error,
+                                delay.as_secs_f64(),
+                                generation,
+                            );
+                        } else {
+                            warn!(
+                                "[polymarket] Subscribe attempt {} failed: {}; retrying in {:.1}s generation={}",
+                                subscribe_failures,
+                                error,
+                                delay.as_secs_f64(),
+                                generation,
+                            );
+                        }
+                        let _ = send_feed_event_with_timeout(
+                            &tx,
+                            MarketEvent::Disconnected {
+                                exchange: Exchange::Polymarket,
+                                reason: format!("subscription unavailable: {error}"),
+                            },
+                            FEED_SEND_TIMEOUT,
+                        );
+                        feed.disconnect();
+                        feed = make_feed();
+                        liveness.set_phase(PolymarketFeedPhase::Backoff);
+                        liveness.heartbeat_feed_loop();
+                        if !sleep_with_shutdown(&shutdown, delay) || !still_current() {
+                            feed.disconnect();
+                            liveness.set_phase(PolymarketFeedPhase::Stopped);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let mut backoff = crate::exchange::ReconnectBackoff::new(100, 30_000);
+            'connections: loop {
+                if shutdown.load(Ordering::Relaxed) || !still_current() {
+                    break;
+                }
+                liveness.set_phase(PolymarketFeedPhase::Connect);
+                liveness.heartbeat_feed_loop();
+                if let Err(error) = feed.connect() {
+                    let delay = backoff.next_delay();
+                    set_feed_readiness(
+                        &feed_readiness,
+                        "polymarket",
+                        FeedReadiness::NotReady {
+                            stage: "connect".to_string(),
+                            reason: error.to_string(),
+                        },
+                    );
+                    warn!(
+                        "[polymarket] Connect error: {}, retrying in {:.1}s generation={}",
+                        error,
+                        delay.as_secs_f64(),
+                        generation,
+                    );
+                    let _ = send_feed_event_with_timeout(
+                        &tx,
+                        MarketEvent::Disconnected {
+                            exchange: Exchange::Polymarket,
+                            reason: error.to_string(),
+                        },
+                        FEED_SEND_TIMEOUT,
+                    );
+                    liveness.set_phase(PolymarketFeedPhase::Backoff);
+                    liveness.heartbeat_feed_loop();
+                    if !sleep_with_shutdown(&shutdown, delay) {
+                        break;
+                    }
+                    continue;
+                }
+
+                let connected_at = std::time::Instant::now();
+                set_feed_readiness(
+                    &feed_readiness,
+                    "polymarket",
+                    FeedReadiness::NotReady {
+                        stage: "subscription".to_string(),
+                        reason: "awaiting CLOB subscription confirmation".to_string(),
+                    },
+                );
+                info!(
+                    "[feed_health] polymarket readiness=NOT_READY stage=subscription reason=awaiting_clob_subscription generation={}",
+                    generation,
+                );
+                let mut last_data_at = std::time::Instant::now();
+                let data_timeout = std::time::Duration::from_secs(45);
+
+                loop {
+                    liveness.set_phase(PolymarketFeedPhase::Poll);
+                    liveness.heartbeat_feed_loop();
+                    if shutdown.load(Ordering::Relaxed) || !still_current() {
+                        break 'connections;
+                    }
+                    let next_event = feed.next_event();
+                    liveness.heartbeat_feed_loop();
+                    if !still_current() {
+                        break 'connections;
+                    }
+                    match next_event {
+                        Ok(Some(event)) => {
+                            if !event.has_finite_market_values() {
+                                warn!(
+                                    "[feed_health] polymarket rejected market event with NaN/Infinity before dispatch"
+                                );
+                                continue;
+                            }
+                            last_data_at = std::time::Instant::now();
+                            if let Some(state) = polymarket_readiness_transition(&event) {
+                                set_feed_readiness(&feed_readiness, "polymarket", state.clone());
+                                match state {
+                                    FeedReadiness::Ready => info!(
+                                        "[feed_health] polymarket readiness=READY stage=market_stream generation={}",
+                                        generation,
+                                    ),
+                                    FeedReadiness::NotReady { reason, .. } => {
+                                        if is_routine_clob_resubscribe(&reason) {
+                                            info!(
+                                                "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={} generation={}",
+                                                reason,
+                                                generation,
+                                            );
+                                        } else {
+                                            warn!(
+                                                "[feed_health] polymarket readiness=NOT_READY stage=data_stream error={} generation={}",
+                                                reason,
+                                                generation,
+                                            );
+                                        }
+                                    }
+                                    FeedReadiness::Starting => {}
+                                }
+                            }
+                            if let Some(ref sim_sender) = sim_tx {
+                                if let Err(error) = sim_sender.send_timeout(
+                                    event.clone(),
+                                    FEED_SEND_TIMEOUT,
+                                ) {
+                                    request_feed_process_shutdown(&format!(
+                                        "polymarket sim-feed dispatch blocked for {}ms: {}",
+                                        FEED_SEND_TIMEOUT.as_millis(),
+                                        error,
+                                    ));
+                                    return;
+                                }
+                            }
+                            liveness.set_phase(PolymarketFeedPhase::Dispatch);
+                            if let Err(error) = send_feed_event_with_timeout(
+                                &tx,
+                                event,
+                                FEED_SEND_TIMEOUT,
+                            ) {
+                                set_feed_readiness(
+                                    &feed_readiness,
+                                    "polymarket",
+                                    FeedReadiness::NotReady {
+                                        stage: "dispatch".to_string(),
+                                        reason: error.to_string(),
+                                    },
+                                );
+                                request_feed_process_shutdown(&format!(
+                                    "polymarket market dispatch blocked for {}ms: {}",
+                                    FEED_SEND_TIMEOUT.as_millis(),
+                                    error,
+                                ));
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            if last_data_at.elapsed() > data_timeout
+                                && feed.has_active_subscription()
+                            {
+                                set_feed_readiness(
+                                    &feed_readiness,
+                                    "polymarket",
+                                    FeedReadiness::NotReady {
+                                        stage: "data_stream".to_string(),
+                                        reason: "data timeout".to_string(),
+                                    },
+                                );
+                                warn!(
+                                    "[polymarket] No data for {:.0}s, reconnecting generation={}...",
+                                    last_data_at.elapsed().as_secs_f64(),
+                                    generation,
+                                );
+                                let _ = send_feed_event_with_timeout(
+                                    &tx,
+                                    MarketEvent::Disconnected {
+                                        exchange: Exchange::Polymarket,
+                                        reason: "data timeout".to_string(),
+                                    },
+                                    FEED_SEND_TIMEOUT,
+                                );
+                                break;
+                            }
+                            if !feed.has_active_subscription() {
+                                last_data_at = std::time::Instant::now();
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                        }
+                        Err(error) => {
+                            if !still_current() {
+                                break 'connections;
+                            }
+                            set_feed_readiness(
+                                &feed_readiness,
+                                "polymarket",
+                                FeedReadiness::NotReady {
+                                    stage: "data_stream".to_string(),
+                                    reason: error.to_string(),
+                                },
+                            );
+                            warn!("[polymarket] Feed error: {}", error);
+                            let _ = send_feed_event_with_timeout(
+                                &tx,
+                                MarketEvent::Disconnected {
+                                    exchange: Exchange::Polymarket,
+                                    reason: error.to_string(),
+                                },
+                                FEED_SEND_TIMEOUT,
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                feed.disconnect();
+                if connected_at.elapsed().as_secs() > 30 {
+                    backoff.reset();
+                }
+                if shutdown.load(Ordering::Relaxed) || !still_current() {
+                    break;
+                }
+                let delay = backoff.next_delay();
+                warn!(
+                    "[polymarket] Disconnected, reconnecting in {:.1}s generation={}...",
+                    delay.as_secs_f64(),
+                    generation,
+                );
+                liveness.set_phase(PolymarketFeedPhase::Backoff);
+                liveness.heartbeat_feed_loop();
+                if !sleep_with_shutdown(&shutdown, delay) {
+                    break;
+                }
+            }
+
+            feed.disconnect();
+            liveness.set_phase(PolymarketFeedPhase::Stopped);
+            liveness.heartbeat_feed_loop();
+            info!(
+                "[polymarket_worker] stopped generation={} current={}",
+                generation,
+                still_current(),
+            );
+        })
+}
+
+fn spawn_polymarket_feed_manager(
+    cfg: ExchangeConfig,
+    tx: Sender<MarketEvent>,
+    sim_tx: Option<Sender<MarketEvent>>,
+    shutdown: Arc<AtomicBool>,
+    feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
+) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    let worker_slot = Arc::new(PolymarketWorkerSlot::new());
+    let (rebuild_tx, rebuild_rx) = bounded::<PolymarketWorkerRebuild>(1);
+    let supervisor = spawn_polymarket_supervisor(
+        worker_slot.clone(),
+        rebuild_tx,
+        feed_readiness.clone(),
+        tx.clone(),
+        shutdown.clone(),
+    )?;
+    let manager = thread::Builder::new()
+        .name("polymarket-feed-manager".to_string())
+        .spawn(move || {
+            crate::os_tune::pin_background("polymarket-feed-manager");
+            let initial = worker_slot.current();
+            let mut workers = Vec::new();
+            match spawn_polymarket_feed_worker(
+                cfg.clone(),
+                tx.clone(),
+                sim_tx.clone(),
+                shutdown.clone(),
+                feed_readiness.clone(),
+                worker_slot.clone(),
+                initial,
+            ) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    request_feed_process_shutdown(&format!(
+                        "failed to spawn initial polymarket feed worker: {error}"
+                    ));
+                    return;
+                }
+            }
+
+            while !shutdown.load(Ordering::Acquire) {
+                match rebuild_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(command) => {
+                        let Some(replacement) = worker_slot.replace(command.generation) else {
+                            info!(
+                                "[polymarket_manager] stale rebuild ignored generation={} reason={}",
+                                command.generation,
+                                command.reason,
+                            );
+                            continue;
+                        };
+                        warn!(
+                            "[polymarket_manager] rebuilding entire feed worker old_generation={} new_generation={} reason={}",
+                            command.generation,
+                            replacement.generation,
+                            command.reason,
+                        );
+                        match spawn_polymarket_feed_worker(
+                            cfg.clone(),
+                            tx.clone(),
+                            sim_tx.clone(),
+                            shutdown.clone(),
+                            feed_readiness.clone(),
+                            worker_slot.clone(),
+                            replacement,
+                        ) {
+                            Ok(worker) => workers.push(worker),
+                            Err(error) => {
+                                request_feed_process_shutdown(&format!(
+                                    "failed to rebuild polymarket feed worker: {error}"
+                                ));
+                                return;
+                            }
+                        }
+                        let mut idx = 0;
+                        while idx < workers.len() {
+                            if workers[idx].is_finished() {
+                                let worker = workers.swap_remove(idx);
+                                let _ = worker.join();
+                            } else {
+                                idx += 1;
+                            }
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let current = worker_slot.current();
+            current.liveness.request_reconnect("process shutdown");
+            let finished = workers.iter().filter(|worker| worker.is_finished()).count();
+            info!(
+                "[polymarket_manager] stopping generations={} finished={}",
+                workers.len(),
+                finished,
+            );
+        })?;
+    Ok(vec![supervisor, manager])
 }
 
 #[cfg(test)]
@@ -316,6 +810,25 @@ mod polymarket_supervisor_tests {
         let liveness = PolymarketLiveness::default();
         liveness.set_phase(PolymarketFeedPhase::Dispatch);
         assert_eq!(liveness.snapshot().phase, PolymarketFeedPhase::Dispatch);
+    }
+
+    #[test]
+    fn external_rebuild_revokes_stuck_worker_generation_without_its_cooperation() {
+        let slot = PolymarketWorkerSlot::new();
+        let stuck = slot.current();
+        assert!(slot.is_current(stuck.generation));
+
+        let replacement = slot
+            .replace(stuck.generation)
+            .expect("supervisor replaces current generation");
+        assert_eq!(replacement.generation, stuck.generation + 1);
+        assert!(!slot.is_current(stuck.generation));
+        assert!(slot.is_current(replacement.generation));
+        assert!(!Arc::ptr_eq(&stuck.liveness, &replacement.liveness));
+        assert!(
+            slot.replace(stuck.generation).is_none(),
+            "a delayed duplicate rebuild cannot replace the fresh worker",
+        );
     }
 }
 
@@ -5605,16 +6118,17 @@ impl Engine {
             let cfg = exchange_cfg.clone();
             let shutdown = shutdown.clone();
             let feed_readiness = self.feed_readiness.clone();
-            let polymarket_liveness =
-                (cfg.name == "polymarket").then(|| Arc::new(PolymarketLiveness::default()));
-            if let Some(liveness) = polymarket_liveness.as_ref() {
-                handles.push(spawn_polymarket_supervisor(
-                    liveness.clone(),
-                    feed_readiness.clone(),
-                    tx.clone(),
-                    shutdown.clone(),
+            if cfg.name == "polymarket" {
+                handles.extend(spawn_polymarket_feed_manager(
+                    cfg,
+                    tx,
+                    sim_tx,
+                    shutdown,
+                    feed_readiness,
                 )?);
+                continue;
             }
+            let polymarket_liveness: Option<Arc<PolymarketLiveness>> = None;
             // Resolve the spot kline interval BEFORE moving into the
             // feed thread — `self` (or its &refs) can't escape the
             // method into the thread closure's 'static bound.
