@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
@@ -119,6 +119,13 @@ pub(crate) fn gamma_get_text_retry(
 /// own 45 s Polymarket data-timeout, so the engine remains the first
 /// responder and this is the backstop it was always documented to be.
 const CLOB_STALE_THRESHOLD: Duration = Duration::from_secs(90);
+/// Out-of-task raw-frame watchdog. Unlike the in-task timers below, this is
+/// evaluated by the synchronous feed thread, so it still fires when the
+/// single-threaded CLOB runtime is wedged and can no longer poll its own
+/// heartbeat/health intervals. A healthy connection receives the server's
+/// PONG at least every five seconds; 20 seconds allows three missed beats
+/// without sacrificing most of a five-minute event.
+const CLOB_EXTERNAL_FRAME_STALL_THRESHOLD: Duration = Duration::from_secs(20);
 /// Cooperative-scheduler probe for the dedicated CLOB runtime.  Any long
 /// synchronous task accidentally moved onto that runtime appears as timer
 /// drift in `polymarket.ws.clob_scheduler_lag`.
@@ -1024,6 +1031,46 @@ impl RtdsSubscription {
     }
 }
 
+#[derive(Default)]
+struct ClobExternalHealth {
+    connected_at_ns: AtomicU64,
+    last_frame_at_ns: AtomicU64,
+}
+
+impl ClobExternalHealth {
+    fn reset(&self, now_ns: u64) {
+        self.connected_at_ns.store(now_ns.max(1), Ordering::Relaxed);
+        self.last_frame_at_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn record_frame(&self, now_ns: u64) {
+        self.last_frame_at_ns
+            .store(now_ns.max(1), Ordering::Relaxed);
+    }
+
+    fn last_frame_age_ns(&self, now_ns: u64) -> Option<u64> {
+        let connected_at = self.connected_at_ns.load(Ordering::Relaxed);
+        if connected_at == 0 {
+            return None;
+        }
+        let last_frame_at = self.last_frame_at_ns.load(Ordering::Relaxed);
+        Some(now_ns.saturating_sub(if last_frame_at == 0 {
+            connected_at
+        } else {
+            last_frame_at
+        }))
+    }
+}
+
+fn clob_monotonic_now_ns() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
 pub struct PolymarketMarket {
     series: Vec<SeriesState>,
     /// Maps CLOB token_id → index into `series`, so we can tag events with the series symbol.
@@ -1050,6 +1097,13 @@ pub struct PolymarketMarket {
     /// expired series has finished its in-flight lookup, then send one exact
     /// full-state subscription instead of reconnecting once per series.
     clob_resubscribe_pending: bool,
+    /// Raw-frame heartbeat shared with the synchronous feed thread. This is
+    /// independent of `WsHealth`, which cannot supervise its own runtime.
+    clob_external_health: Arc<ClobExternalHealth>,
+    /// Abort handle for the current reader; used after an external stall.
+    clob_task_abort: Option<tokio::task::AbortHandle>,
+    /// A stalled dedicated runtime is bypassed for later reconnects.
+    clob_runtime_fallback: bool,
 }
 
 impl PolymarketMarket {
@@ -1066,6 +1120,9 @@ impl PolymarketMarket {
             rtds_tx: None,
             rtds_shutdown: Arc::new(AtomicBool::new(false)),
             clob_resubscribe_pending: false,
+            clob_external_health: Arc::new(ClobExternalHealth::default()),
+            clob_task_abort: None,
+            clob_runtime_fallback: false,
         }
     }
 
@@ -1127,6 +1184,32 @@ impl PolymarketMarket {
         }
     }
 
+    fn clob_last_frame_stall_age(&self, now_ns: u64) -> Option<Duration> {
+        if self.ws_ctrl_tx.is_none() || self.current_tokens().is_empty() {
+            return None;
+        }
+        let age_ns = self.clob_external_health.last_frame_age_ns(now_ns)?;
+        let age = Duration::from_nanos(age_ns);
+        (age >= CLOB_EXTERNAL_FRAME_STALL_THRESHOLD).then_some(age)
+    }
+
+    fn fail_stalled_clob_task(&mut self, age: Duration) -> anyhow::Error {
+        self.clob_runtime_fallback = true;
+        self.ws_shutdown.store(true, Ordering::Relaxed);
+        if let Some(tx) = self.ws_ctrl_tx.take() {
+            let _ = tx.send(WsCtrl::Shutdown);
+        }
+        if let Some(abort) = self.clob_task_abort.take() {
+            abort.abort();
+        }
+        self.event_rx = None;
+        anyhow!(
+            "CLOB last_frame_age={:.1}s exceeded {:.0}s; forced reconnect on fallback runtime",
+            age.as_secs_f64(),
+            CLOB_EXTERNAL_FRAME_STALL_THRESHOLD.as_secs_f64(),
+        )
+    }
+
     /// Send a Resubscribe message to the async WS task. No-op if the task
     /// hasn't been started yet (e.g. rotation fires before connect()).
     fn resubscribe_ws(&self) {
@@ -1153,47 +1236,68 @@ impl PolymarketMarket {
             // Event series mode: re-fetch active markets
             if self.series[i].interval_minutes == -1 {
                 let series_slug = self.series[i].name["series:".len()..].to_string();
-                let refresh_result = match self.series[i]
-                    .rotation_refresh
-                    .as_ref()
-                    .map(|refresh| (refresh.started_ns, refresh.rx.try_recv()))
-                {
-                    Some((_, Ok(result))) => {
-                        self.series[i].rotation_refresh = None;
-                        result
-                    }
-                    Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty)))
-                        if now.saturating_sub(started_ns) < ROTATION_REFRESH_TIMEOUT_NS =>
+                // Maintenance resolves the next split target through REST up
+                // to a minute before rotation and deposits the full Gamma
+                // event in the process cache. Promote that discovery directly
+                // into the normal Instrument/EventStart path instead of using
+                // it only for splitPosition and starting a second lookup here.
+                let cached_rest_event = self.series[i].series_id.as_deref().and_then(|series_id| {
+                    cached_gamma_event_after(
+                        series_id,
+                        self.series[i].market.end_ns / 1_000_000_000,
+                    )
+                    .map(|event| (series_id.to_string(), event))
+                });
+                let refresh_result = if let Some((series_id, event)) = cached_rest_event {
+                    self.series[i].rotation_refresh = None;
+                    info!(
+                        "[Polymarket] REST-discovered event promoted to strategy registration: series='{}' event_id={} slug={}",
+                        series_slug, event.id, event.slug,
+                    );
+                    Ok((series_id, event))
+                } else {
+                    match self.series[i]
+                        .rotation_refresh
+                        .as_ref()
+                        .map(|refresh| (refresh.started_ns, refresh.rx.try_recv()))
                     {
-                        continue;
-                    }
-                    Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty))) => {
-                        self.series[i].rotation_refresh = None;
-                        Err(format!(
-                            "Gamma rotation lookup timed out after {:.1}s",
-                            now.saturating_sub(started_ns) as f64 / 1e9,
-                        ))
-                    }
-                    Some((_, Err(crossbeam_channel::TryRecvError::Disconnected))) => {
-                        self.series[i].rotation_refresh = None;
-                        Err("Gamma rotation lookup worker disconnected".to_string())
-                    }
-                    None => {
-                        let refresh = spawn_rotation_refresh(
-                            series_slug.clone(),
-                            self.series[i].series_id.clone(),
-                            now,
-                        );
-                        match refresh {
-                            Ok(refresh) => {
-                                info!(
-                                    "[Polymarket] Event series '{}' rotation refresh started",
-                                    series_slug,
-                                );
-                                self.series[i].rotation_refresh = Some(refresh);
-                                continue;
+                        Some((_, Ok(result))) => {
+                            self.series[i].rotation_refresh = None;
+                            result
+                        }
+                        Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty)))
+                            if now.saturating_sub(started_ns) < ROTATION_REFRESH_TIMEOUT_NS =>
+                        {
+                            continue;
+                        }
+                        Some((started_ns, Err(crossbeam_channel::TryRecvError::Empty))) => {
+                            self.series[i].rotation_refresh = None;
+                            Err(format!(
+                                "Gamma rotation lookup timed out after {:.1}s",
+                                now.saturating_sub(started_ns) as f64 / 1e9,
+                            ))
+                        }
+                        Some((_, Err(crossbeam_channel::TryRecvError::Disconnected))) => {
+                            self.series[i].rotation_refresh = None;
+                            Err("Gamma rotation lookup worker disconnected".to_string())
+                        }
+                        None => {
+                            let refresh = spawn_rotation_refresh(
+                                series_slug.clone(),
+                                self.series[i].series_id.clone(),
+                                now,
+                            );
+                            match refresh {
+                                Ok(refresh) => {
+                                    info!(
+                                        "[Polymarket] Event series '{}' rotation refresh started",
+                                        series_slug,
+                                    );
+                                    self.series[i].rotation_refresh = Some(refresh);
+                                    continue;
+                                }
+                                Err(error) => Err(error.to_string()),
                             }
-                            Err(error) => Err(error.to_string()),
                         }
                     }
                 };
@@ -1950,7 +2054,10 @@ fn request_clob_book_repairs(
             continue;
         }
         let tx = tx.clone();
-        crate::async_rt::clob_handle().spawn(async move {
+        // REST repair is control-plane I/O, not socket reading. Keep it off
+        // the single-threaded CLOB runtime so a slow HTTP client/future cannot
+        // stop frame reads and the runtime's own watchdog timers together.
+        crate::async_rt::handle().spawn(async move {
             let result = fetch_authoritative_clob_book(&token).await;
             let _ = tx.send(ClobBookRepairResult { token, result });
         });
@@ -1963,6 +2070,7 @@ async fn clob_ws_task(
     mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
     subscribed_once: Arc<AtomicBool>,
+    external_health: Arc<ClobExternalHealth>,
 ) {
     let mut subscription = initial_subscription;
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -2405,6 +2513,7 @@ async fn clob_ws_task(
                         }
                     };
                     let received_at = Instant::now();
+                    external_health.record_frame(clob_monotonic_now_ns());
                     match msg {
                         Message::Text(text) => {
                             // Record only non-Close transport traffic here.
@@ -4269,13 +4378,22 @@ impl ExchangeMarket for PolymarketMarket {
         self.event_rx = Some(event_rx);
         self.ws_ctrl_tx = Some(ctrl_tx);
 
-        crate::async_rt::clob_handle().spawn(clob_ws_task(
+        self.clob_external_health.reset(clob_monotonic_now_ns());
+        let task = clob_ws_task(
             clob_subscription,
             event_tx,
             ctrl_rx,
             shutdown,
             self.clob_subscribed_once.clone(),
-        ));
+            self.clob_external_health.clone(),
+        );
+        let join = if self.clob_runtime_fallback {
+            warn!("[Polymarket] CLOB reader using general-runtime fallback after external stall");
+            crate::async_rt::handle().spawn(task)
+        } else {
+            crate::async_rt::clob_handle().spawn(task)
+        };
+        self.clob_task_abort = Some(join.abort_handle());
 
         // Spawn RTDS task if subscriptions exist (only once)
         if !self.rtds_subscriptions.is_empty() && self.rtds_tx.is_some() {
@@ -4476,6 +4594,19 @@ impl ExchangeMarket for PolymarketMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
+        // This watchdog intentionally lives outside the async CLOB task. If
+        // that single-threaded runtime wedges, its own tokio timers stop too;
+        // the synchronous feed thread can still abort it and force the engine
+        // reconnect path onto the independent general runtime.
+        if let Some(age) = self.clob_last_frame_stall_age(clob_monotonic_now_ns()) {
+            warn!(
+                "[Polymarket] CLOB external watchdog fired: last_frame_age={:.1}s threshold={:.0}s — forcing reconnect",
+                age.as_secs_f64(),
+                CLOB_EXTERNAL_FRAME_STALL_THRESHOLD.as_secs_f64(),
+            );
+            return Err(self.fail_stalled_clob_task(age));
+        }
+
         // Drain pending synthetic events first (EventStart, Instrument, ...)
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
@@ -4511,6 +4642,9 @@ impl ExchangeMarket for PolymarketMarket {
         if let Some(tx) = self.ws_ctrl_tx.take() {
             let _ = tx.send(WsCtrl::Shutdown);
         }
+        if let Some(abort) = self.clob_task_abort.take() {
+            abort.abort();
+        }
         self.event_rx = None;
         info!("[Polymarket] Disconnected");
     }
@@ -4532,6 +4666,22 @@ impl ExchangeMarket for PolymarketMarket {
 #[cfg(test)]
 mod pick_current_event_tests {
     use super::*;
+
+    #[test]
+    fn external_clob_health_tracks_last_frame_age_outside_async_task() {
+        let health = ClobExternalHealth::default();
+        assert_eq!(health.last_frame_age_ns(10_000_000_000), None);
+
+        health.reset(1_000_000_000);
+        assert_eq!(
+            health.last_frame_age_ns(6_000_000_000),
+            Some(5_000_000_000),
+            "before the first frame, age is measured from connect",
+        );
+
+        health.record_frame(5_000_000_000);
+        assert_eq!(health.last_frame_age_ns(7_500_000_000), Some(2_500_000_000),);
+    }
 
     #[test]
     fn linux_tcp_info_tail_is_parsed_without_libc_field_support() {
@@ -4839,6 +4989,71 @@ mod pick_current_event_tests {
             .pending_events
             .iter()
             .any(|event| matches!(event, MarketEvent::Instrument(_))));
+    }
+
+    #[test]
+    fn maintenance_rest_cache_promotes_event_into_strategy_registration() {
+        let started_ns = now_ns();
+        let current_end_secs = now().saturating_sub(1);
+        let series_id = format!("rest-promotion-{started_ns}");
+        let mut next_event = mk_event(current_end_secs, current_end_secs + 300);
+        next_event.markets.push(PolyMarketInfo {
+            id: "rest-market".to_string(),
+            question: "BTC up or down?".to_string(),
+            condition_id: "rest-condition".to_string(),
+            slug: "rest-market".to_string(),
+            clob_token_ids: vec!["rest-up".to_string(), "rest-down".to_string()],
+            outcomes: vec!["Up".to_string(), "Down".to_string()],
+            outcome_prices: vec!["0.5".to_string(), "0.5".to_string()],
+            active: true,
+            closed: false,
+            volume: 0.0,
+            liquidity: 0.0,
+            tick_size: 0.01,
+            order_min_size: 5.0,
+            group_item_title: String::new(),
+            event_start_time: String::new(),
+            base_fee: 0,
+            fee_schedule: FeeSchedule::default(),
+        });
+        cache_gamma_events(&series_id, std::slice::from_ref(&next_event));
+
+        let mut market = PolymarketMarket::new();
+        market.series.push(SeriesState {
+            name: "series:btc-up-or-down-5m".to_string(),
+            interval_minutes: -1,
+            market: MarketState {
+                event_id: "expired".to_string(),
+                start_ns: current_end_secs
+                    .saturating_sub(300)
+                    .saturating_mul(1_000_000_000),
+                end_ns: current_end_secs.saturating_mul(1_000_000_000),
+                symbols: vec![SymbolState {
+                    token_id: "old-up".to_string(),
+                    _outcome: "Up".to_string(),
+                    _condition_id: "old-condition".to_string(),
+                    _tick_size: 0.01,
+                }],
+            },
+            series_id: Some(series_id),
+            next_retry_ns: 0,
+            refresh_fail_count: 0,
+            refresh_fail_first_ns: 0,
+            refresh_idling_logged: false,
+            rotation_refresh: None,
+        });
+
+        market.check_rotation().unwrap();
+
+        assert_eq!(market.series[0].market.event_id, next_event.id);
+        assert_eq!(market.token_to_series.get("rest-up"), Some(&0));
+        assert!(market.pending_events.iter().any(|event| {
+            matches!(
+                event,
+                MarketEvent::Instrument(Instrument::BinaryOption(instrument))
+                    if instrument.condition_id == "rest-condition"
+            )
+        }));
     }
 
     #[test]
