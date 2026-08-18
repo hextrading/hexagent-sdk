@@ -5,11 +5,11 @@
 //! but under the hood the WS read loop runs as a tokio task on the shared
 //! async runtime.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -32,6 +32,46 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
+const FAILED_TRADE_DIAGNOSTIC_CAPACITY: usize = 4096;
+
+#[derive(Debug)]
+struct FailedTradeDiagnosticDedupe {
+    capacity: usize,
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl FailedTradeDiagnosticDedupe {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn admit(&mut self, venue_trade_id: &str) -> bool {
+        if venue_trade_id.is_empty() || !self.seen.insert(venue_trade_id.to_string()) {
+            return false;
+        }
+        self.order.push_back(venue_trade_id.to_string());
+        while self.order.len() > self.capacity {
+            if let Some(expired) = self.order.pop_front() {
+                self.seen.remove(&expired);
+            }
+        }
+        true
+    }
+}
+
+fn admit_failed_trade_diagnostic(venue_trade_id: &str) -> bool {
+    static DEDUPE: OnceLock<Mutex<FailedTradeDiagnosticDedupe>> = OnceLock::new();
+    DEDUPE.get_or_init(|| Mutex::new(FailedTradeDiagnosticDedupe::new(
+        FAILED_TRADE_DIAGNOSTIC_CAPACITY,
+    ))).lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit(venue_trade_id)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapReplayOutcome {
@@ -1484,13 +1524,26 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 updates.push(update);
             }
 
-            if status == OrderStatus::Failed && failure_reason.is_none() && !updates.is_empty() {
-                // Warn only for the accepted terminal edge. Periodic REST
-                // replay can return the same FAILED trade indefinitely.
+            if status == OrderStatus::Failed
+                && failure_reason.is_none()
+                && !updates.is_empty()
+                && admit_failed_trade_diagnostic(trade_id)
+            {
+                // A venue trade can legitimately contain maker legs owned by
+                // several configured accounts. Keep every account-scoped
+                // OrderUpdate above, but emit the venue-level missing-reason
+                // diagnostic only once across all account feeds.
+                let tx_hash = data.get("transaction_hash")
+                    .or_else(|| data.get("transactionHash"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<missing>");
+                let maker_legs = data.get("maker_orders")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
                 warn!(
-                    "[PolyUserFeed] FAILED trade {} carries no known \
-                      reason field; raw payload: {}",
-                    trade_id, data
+                    "[PolyUserFeed] FAILED venue trade {} carries no known reason field \
+                     (tx_hash={}, maker_legs={}); account-scoped reversals remain enabled",
+                    trade_id, tx_hash, maker_legs,
                 );
             }
 
@@ -2333,6 +2386,16 @@ pub fn spawn_user_feed(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn failed_trade_diagnostic_is_venue_scoped_bounded_and_non_business() {
+        let mut dedupe = FailedTradeDiagnosticDedupe::new(2);
+        assert!(dedupe.admit("venue-trade-a"));
+        assert!(!dedupe.admit("venue-trade-a"));
+        assert!(dedupe.admit("venue-trade-b"));
+        assert!(dedupe.admit("venue-trade-c"));
+        assert!(dedupe.admit("venue-trade-a"), "old diagnostics may be evicted");
+    }
 
     fn test_shared() -> Arc<SharedState> {
         super::super::trade::PolymarketTrade::new(

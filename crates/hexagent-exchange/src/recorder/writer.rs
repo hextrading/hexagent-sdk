@@ -660,6 +660,7 @@ impl MarketRecorder {
             }
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
+            | MarketEvent::MarketDataHealth(_)
             | MarketEvent::Exit => {}
         }
 

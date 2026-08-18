@@ -4927,6 +4927,9 @@ impl Engine {
                             MarketEvent::Disconnected { exchange, reason } => {
                                 strategy.on_disconnected(*exchange, reason)
                             }
+                            MarketEvent::MarketDataHealth(health) => {
+                                let _ = strategy.on_market_data_health(health);
+                            }
                             MarketEvent::TickSizeChange(tsc) => {
                                 let _ = strategy.on_tick_size_change(tsc);
                             }
@@ -5118,6 +5121,9 @@ impl Engine {
                             MarketEvent::Disconnected { exchange, reason } => {
                                 strategy.on_disconnected(*exchange, reason)
                             }
+                            MarketEvent::MarketDataHealth(health) => {
+                                let _ = strategy.on_market_data_health(health);
+                            }
                             MarketEvent::TickSizeChange(tsc) => {
                                 let _ = strategy.on_tick_size_change(tsc);
                             }
@@ -5284,6 +5290,7 @@ impl Engine {
                                             }
                                             MarketEvent::Connected { exchange } => { strategy.on_connected(*exchange); Vec::new() }
                                             MarketEvent::Disconnected { exchange, reason } => { strategy.on_disconnected(*exchange, reason); Vec::new() }
+                                            MarketEvent::MarketDataHealth(health) => strategy.on_market_data_health(health),
                                             MarketEvent::TickSizeChange(tsc) => { strategy.on_tick_size_change(tsc) }
                                             MarketEvent::EventStart { .. } | MarketEvent::Exit => Vec::new(),
                                         };
@@ -5878,6 +5885,12 @@ impl Engine {
             MarketEvent::AssetCtx(ac) => sym_to_instances
                 .get(&ac.symbol.to_ascii_lowercase())
                 .cloned(),
+            MarketEvent::MarketDataHealth(health) => Some(
+                token_to_instances
+                    .get(&health.symbol.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
             MarketEvent::EventStart { symbol, .. } => {
                 sym_to_instances.get(&symbol.to_ascii_lowercase()).cloned()
             }
@@ -6088,6 +6101,7 @@ impl Engine {
                             }
                             MarketEvent::Connected { exchange } => { strategy.on_connected(*exchange); Vec::new() }
                             MarketEvent::Disconnected { exchange, reason } => { strategy.on_disconnected(*exchange, reason); Vec::new() }
+                            MarketEvent::MarketDataHealth(health) => strategy.on_market_data_health(health),
                             MarketEvent::TickSizeChange(tsc) => strategy.on_tick_size_change(tsc),
                             MarketEvent::EventStart { .. } | MarketEvent::Exit => Vec::new(),
                         };
@@ -10472,6 +10486,24 @@ mod market_router_tests {
         );
         assert_eq!(drain(&rx0), 1, "poly OB routed to learned owner");
         assert_eq!(drain(&rx1), 0, "ETH instance must not see BTC poly OB");
+
+        Engine::route_market_event(
+            Arc::new(MarketEvent::MarketDataHealth(MarketDataHealth {
+                exchange: Exchange::Polymarket,
+                market_id: "btc-condition".into(),
+                symbol: "TOKxyz".into(),
+                state: MarketDataHealthState::Repairing,
+                passive_ready: true,
+                taker_ready: false,
+                reason: "injected mismatch".into(),
+                local_timestamp_ns: 1,
+            })),
+            &sym,
+            &mut tok,
+            &txs,
+        );
+        assert_eq!(drain(&rx0), 1, "condition health routed to learned owner");
+        assert_eq!(drain(&rx1), 0, "other instances stay isolated");
     }
 
     #[test]
@@ -10522,6 +10554,21 @@ mod market_router_tests {
             &txs,
         );
         Engine::route_market_event(Arc::new(tick_size("UNMAPPED-TOKEN")), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(MarketEvent::MarketDataHealth(MarketDataHealth {
+                exchange: Exchange::Polymarket,
+                market_id: "unknown-condition".into(),
+                symbol: "UNMAPPED-TOKEN".into(),
+                state: MarketDataHealthState::Degraded,
+                passive_ready: false,
+                taker_ready: false,
+                reason: "test".into(),
+                local_timestamp_ns: 1,
+            })),
+            &sym,
+            &mut tok,
+            &txs,
+        );
         assert_eq!(drain(&rx0), 0);
         assert_eq!(drain(&rx1), 0);
     }

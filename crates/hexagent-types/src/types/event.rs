@@ -4,6 +4,32 @@ use super::instrument::Instrument;
 use super::market::{AssetCtxTick, BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange, TradeTick};
 use super::order::OrderRequest;
 
+/// Condition-scoped public market-data health.  Unlike `Connected` /
+/// `Disconnected`, this does not describe the whole exchange transport: one
+/// Polymarket condition can settle or repair its L2 while unrelated markets
+/// remain fully tradeable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MarketDataHealthState {
+    Healthy,
+    Settling,
+    Repairing,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarketDataHealth {
+    pub exchange: Exchange,
+    /// Venue market identifier (Polymarket condition_id).
+    pub market_id: String,
+    /// Canonical routing symbol (the Up token for a binary market).
+    pub symbol: String,
+    pub state: MarketDataHealthState,
+    pub passive_ready: bool,
+    pub taker_ready: bool,
+    pub reason: String,
+    pub local_timestamp_ns: u64,
+}
+
 /// Events flowing from market data sources to the strategy engine
 #[derive(
     Debug, Clone, Serialize, Deserialize,
@@ -19,6 +45,7 @@ pub enum MarketEvent {
     /// `activeAssetCtx`, ~1 msg/s per coin.
     AssetCtx(AssetCtxTick),
     Instrument(Instrument),
+    MarketDataHealth(MarketDataHealth),
     Connected { exchange: Exchange },
     Disconnected { exchange: Exchange, reason: String },
     /// Signals the start of a new event for continuous recording (e.g. Polymarket series rotation).
@@ -196,6 +223,7 @@ impl MarketEvent {
                 ctx.open_interest, ctx.premium, ctx.impact_bid_px, ctx.impact_ask_px,
                 ctx.day_ntl_vlm, ctx.prev_day_px].into_iter().all(f64::is_finite),
             MarketEvent::Instrument(_)
+            | MarketEvent::MarketDataHealth(_)
             | MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
             | MarketEvent::EventStart { .. }
@@ -212,6 +240,7 @@ impl MarketEvent {
             MarketEvent::TickSizeChange(ts) => ts.local_timestamp_ns,
             MarketEvent::SpotPrice(sp) => sp.local_timestamp_ns,
             MarketEvent::AssetCtx(ac) => ac.local_timestamp_ns,
+            MarketEvent::MarketDataHealth(health) => health.local_timestamp_ns,
             MarketEvent::EventStart { event_start_ns, .. } => *event_start_ns,
             MarketEvent::Instrument(_)
             | MarketEvent::Connected { .. }
@@ -247,6 +276,7 @@ impl MarketEvent {
                 Instrument::Spot(s) => s.exchange,
                 Instrument::BinaryOption(bo) => bo.exchange,
             },
+            MarketEvent::MarketDataHealth(health) => health.exchange,
             MarketEvent::Connected { exchange }
             | MarketEvent::Disconnected { exchange, .. }
             | MarketEvent::EventStart { exchange, .. } => *exchange,
