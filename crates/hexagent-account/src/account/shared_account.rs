@@ -8018,6 +8018,32 @@ mod tests {
     }
 
     #[test]
+    fn cash_only_migration_can_retire_old_instance_into_single_replacement() {
+        let account = SharedAccount::new("replacement");
+        account.register_instance("btc02", 1.0);
+        account
+            .apply_physical_snapshot(1_490.390_728, HashMap::new())
+            .unwrap();
+        account.register_instance("eth02", 1.0);
+
+        let weights = BTreeMap::from([("eth02".to_string(), 1.0)]);
+        let first = account
+            .migrate_cash_allocation("zhu03-btc02-to-eth02-v1", &weights)
+            .unwrap();
+        let retry = account
+            .migrate_cash_allocation("zhu03-btc02-to-eth02-v1", &weights)
+            .unwrap();
+
+        assert_eq!(first, retry);
+        assert_eq!(account.instance_snapshot("btc02").unwrap().cash, 0.0);
+        assert_eq!(
+            account.instance_snapshot("eth02").unwrap().cash,
+            1_490.390_728,
+        );
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
     fn reservation_checks_virtual_and_physical_limits_atomically() {
         let account = seeded_account();
         account
