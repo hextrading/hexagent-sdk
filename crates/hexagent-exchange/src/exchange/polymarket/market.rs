@@ -79,6 +79,15 @@ pub struct PolymarketLivenessSnapshot {
     pub active: bool,
     pub phase: PolymarketFeedPhase,
     pub phase_age_ns: u64,
+    /// Sticky recovery milestones for the lifetime of one engine worker
+    /// generation. They are intentionally not reset by an in-worker reconnect.
+    pub connecting_seen: bool,
+    pub subscribed_seen: bool,
+    pub first_raw_frame_seen: bool,
+    pub ready_seen: bool,
+    /// Time since this generation first became responsible for an active
+    /// subscription. None while legitimately idle between events.
+    pub recovery_age_ns: Option<u64>,
     pub raw_frame_age_ns: Option<u64>,
     pub market_data_age_ns: Option<u64>,
     pub feed_loop_age_ns: Option<u64>,
@@ -102,6 +111,11 @@ pub struct PolymarketLiveness {
     phase_started_ns: AtomicU64,
     connected: AtomicBool,
     active: AtomicBool,
+    connecting_seen: AtomicBool,
+    subscribed_seen: AtomicBool,
+    first_raw_frame_seen: AtomicBool,
+    ready_seen: AtomicBool,
+    recovery_started_ns: AtomicU64,
     reconnect_requested: AtomicBool,
     reconnect_reason: Mutex<String>,
     clob_abort: Mutex<Option<tokio::task::AbortHandle>>,
@@ -120,6 +134,11 @@ impl Default for PolymarketLiveness {
             phase_started_ns: AtomicU64::new(now),
             connected: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            connecting_seen: AtomicBool::new(false),
+            subscribed_seen: AtomicBool::new(false),
+            first_raw_frame_seen: AtomicBool::new(false),
+            ready_seen: AtomicBool::new(false),
+            recovery_started_ns: AtomicU64::new(0),
             reconnect_requested: AtomicBool::new(false),
             reconnect_reason: Mutex::new(String::new()),
             clob_abort: Mutex::new(None),
@@ -155,6 +174,11 @@ impl PolymarketLiveness {
             active: self.active.load(Ordering::Acquire),
             phase: PolymarketFeedPhase::from_u8(self.phase.load(Ordering::Acquire)),
             phase_age_ns: now_ns.saturating_sub(self.phase_started_ns.load(Ordering::Acquire)),
+            connecting_seen: self.connecting_seen.load(Ordering::Acquire),
+            subscribed_seen: self.subscribed_seen.load(Ordering::Acquire),
+            first_raw_frame_seen: self.first_raw_frame_seen.load(Ordering::Acquire),
+            ready_seen: self.ready_seen.load(Ordering::Acquire),
+            recovery_age_ns: age(self.recovery_started_ns.load(Ordering::Acquire), 0),
             raw_frame_age_ns: age(
                 self.last_raw_frame_ns.load(Ordering::Acquire),
                 connection_started,
@@ -211,6 +235,26 @@ impl PolymarketLiveness {
             .clear();
         self.connected.store(true, Ordering::Release);
         self.active.store(active, Ordering::Release);
+        if active {
+            let _ = self.recovery_started_ns.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    fn mark_connecting(&self) {
+        self.connecting_seen.store(true, Ordering::Release);
+    }
+
+    fn mark_subscribed(&self) {
+        self.subscribed_seen.store(true, Ordering::Release);
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready_seen.store(true, Ordering::Release);
     }
 
     fn install_abort(&self, abort: tokio::task::AbortHandle) {
@@ -231,6 +275,7 @@ impl PolymarketLiveness {
     }
 
     fn record_raw_frame(&self, now_ns: u64) {
+        self.first_raw_frame_seen.store(true, Ordering::Release);
         self.last_raw_frame_ns
             .store(now_ns.max(1), Ordering::Release);
     }
@@ -241,10 +286,17 @@ impl PolymarketLiveness {
     }
 
     fn update_subscription(&self, active: bool, current_event_end_ns: u64) {
-        self.active.store(
-            active && self.connected.load(Ordering::Acquire),
-            Ordering::Release,
-        );
+        let connected = self.connected.load(Ordering::Acquire);
+        let active = active && connected;
+        let was_active = self.active.swap(active, Ordering::AcqRel);
+        if active && !was_active && !self.ready_seen.load(Ordering::Acquire) {
+            self.recovery_started_ns
+                .store(clob_monotonic_now_ns().max(1), Ordering::Release);
+        } else if !active && connected {
+            // A connected worker with no event tokens is legitimately idle.
+            // Its next event gets a fresh bounded recovery window.
+            self.recovery_started_ns.store(0, Ordering::Release);
+        }
         self.current_event_end_ns
             .store(current_event_end_ns, Ordering::Release);
     }
@@ -1470,6 +1522,14 @@ impl PolymarketMarket {
         }
     }
 
+    /// Force the CLOB reader onto the general runtime. Engine-level worker
+    /// replacements use this because the dedicated reader runtime may be the
+    /// component that stopped scheduling; the replacement must not inherit
+    /// the same execution path that just stalled.
+    pub fn force_clob_runtime_fallback(&mut self) {
+        self.clob_runtime_fallback = true;
+    }
+
     /// Set the engine's market_tx and shutdown flag so RTDS task can send events directly.
     pub fn set_market_tx(
         &mut self,
@@ -2553,6 +2613,7 @@ async fn clob_ws_task(
             }
         }
 
+        liveness.mark_connecting();
         info!(
             "[Polymarket] Connecting to {} ({} tokens)",
             POLYMARKET_WS_URL,
@@ -2650,6 +2711,7 @@ async fn clob_ws_task(
         } else {
             lifecycle.subscribed();
             subscribed_once.store(true, Ordering::Relaxed);
+            liveness.mark_subscribed();
         }
 
         let mut ping_interval = tokio::time::interval(POLYMARKET_WS_HEARTBEAT_INTERVAL);
@@ -5140,6 +5202,36 @@ mod pick_current_event_tests {
         assert_eq!(snapshot.raw_frame_age_ns, Some(2_500_000_000));
         assert_eq!(snapshot.market_data_age_ns, Some(3_500_000_000));
         assert_eq!(snapshot.feed_loop_age_ns, Some(5_500_000_000));
+        assert!(snapshot.first_raw_frame_seen);
+    }
+
+    #[test]
+    fn recovery_milestones_are_sticky_across_in_worker_reconnects() {
+        let health = PolymarketLiveness::default();
+        health.mark_connecting();
+        health.mark_subscribed();
+        health.record_raw_frame(1);
+        health.mark_ready();
+
+        health.begin_connection(true);
+        let snapshot = health.snapshot_at(2);
+        assert!(snapshot.connecting_seen);
+        assert!(snapshot.subscribed_seen);
+        assert!(snapshot.first_raw_frame_seen);
+        assert!(snapshot.ready_seen);
+    }
+
+    #[test]
+    fn replacement_recovery_clock_pauses_between_events_and_restarts_on_tokens() {
+        let health = PolymarketLiveness::default();
+        health.begin_connection(true);
+        assert!(health.snapshot().recovery_age_ns.is_some());
+
+        health.update_subscription(false, 0);
+        assert_eq!(health.snapshot().recovery_age_ns, None);
+
+        health.update_subscription(true, 123);
+        assert!(health.snapshot().recovery_age_ns.is_some());
     }
 
     #[test]
