@@ -85,15 +85,27 @@ const RETIRED_MARKET_TERMINAL_ATTEMPTS: usize = 3;
 fn retired_market_terminalization_allowed(
     consecutive_evidence_passes: usize,
     token_count: usize,
-    invalid_token_responses: usize,
+    terminal_token_responses: usize,
     audit_error_count: usize,
     absent_order_count: usize,
 ) -> bool {
     consecutive_evidence_passes >= RETIRED_MARKET_TERMINAL_ATTEMPTS
         && token_count > 0
-        && invalid_token_responses == token_count
+        && terminal_token_responses == token_count
         // Unrelated transport/schema/ledger failures must break the chain.
         && audit_error_count == absent_order_count
+}
+
+fn is_cancels_disabled_error(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("cancels are disabled")
+}
+
+fn is_retired_market_terminal_error(
+    text: &str,
+    allow_expired_market_terminalization: bool,
+) -> bool {
+    SharedState::is_invalid_token_error(text)
+        || (allow_expired_market_terminalization && is_cancels_disabled_error(text))
 }
 
 /// Polymarket L2 HMAC signs the endpoint path only. Query parameters are sent
@@ -4261,10 +4273,14 @@ impl PolymarketTrade {
     /// would otherwise rest unmanaged to settlement. Scoped to a single
     /// `condition_id` so an account trading several markets concurrently
     /// keeps the others' orders intact — used as the event-expiry backstop.
+    /// Routine expiry callers may treat repeated token-wide "cancels are
+    /// disabled" responses as retired-market evidence, but finality still
+    /// requires three complete passes and a clean local order/audit ledger.
     pub fn cancel_market_orders_until_final(
         &self,
         market_condition_id: &str,
         asset_ids: &[String],
+        allow_expired_market_terminalization: bool,
     ) -> MarketCancelFinality {
         let tokens: HashSet<String> = asset_ids
             .iter()
@@ -4297,6 +4313,7 @@ impl PolymarketTrade {
             let mut remote_clean = true;
             let mut remote_details = Vec::new();
             let mut invalid_token_responses = 0usize;
+            let mut cancels_disabled_responses = 0usize;
             for asset_id in &tokens {
                 let body = serde_json::json!({
                     "market": market_condition_id,
@@ -4339,8 +4356,15 @@ impl PolymarketTrade {
                     },
                     Err(error) => {
                         remote_clean = false;
-                        if SharedState::is_invalid_token_error(&error.to_string()) {
+                        let error_text = error.to_string();
+                        if SharedState::is_invalid_token_error(&error_text) {
                             invalid_token_responses = invalid_token_responses.saturating_add(1);
+                        } else if is_retired_market_terminal_error(
+                            &error_text,
+                            allow_expired_market_terminalization,
+                        ) {
+                            cancels_disabled_responses =
+                                cancels_disabled_responses.saturating_add(1);
                         }
                         remote_details.push(format!("asset={asset_id} request failed: {error}"));
                     }
@@ -4349,7 +4373,9 @@ impl PolymarketTrade {
 
             let audit = self.reconcile_runtime_orders_for_tokens_pass(&tokens);
             all_updates.extend(audit.updates);
-            let complete_retired_evidence_pass = invalid_token_responses == tokens.len()
+            let terminal_token_responses =
+                invalid_token_responses.saturating_add(cancels_disabled_responses);
+            let complete_retired_evidence_pass = terminal_token_responses == tokens.len()
                 && audit.errors.len() == audit.retired_market_absent.len();
             if complete_retired_evidence_pass {
                 retired_market_evidence_streak = retired_market_evidence_streak.saturating_add(1);
@@ -4359,7 +4385,7 @@ impl PolymarketTrade {
             let retired_market_terminal = retired_market_terminalization_allowed(
                 retired_market_evidence_streak,
                 tokens.len(),
-                invalid_token_responses,
+                terminal_token_responses,
                 audit.errors.len(),
                 audit.retired_market_absent.len(),
             );
@@ -4404,10 +4430,12 @@ impl PolymarketTrade {
                 audit.errors.is_empty() && open_orders == 0 && recovery_pending == 0
             };
             last_detail = format!(
-                "attempt={} remote=[{}] invalid_token_responses={}/{} retired_evidence_streak={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
+                "attempt={} remote=[{}] invalid_token_responses={} cancels_disabled_responses={} terminal_token_responses={}/{} retired_evidence_streak={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
                 attempt_idx + 1,
                 remote_details.join(", "),
                 invalid_token_responses,
+                cancels_disabled_responses,
+                terminal_token_responses,
                 tokens.len(),
                 retired_market_evidence_streak,
                 retired_market_terminal,
@@ -4428,11 +4456,12 @@ impl PolymarketTrade {
                     detail: last_detail,
                 };
             }
-            warn!(
-                "[PolymarketTrade] market cancel finality pending market={}: {}",
-                market_condition_id, last_detail,
-            );
         }
+
+        warn!(
+            "[PolymarketTrade] market cancel finality pending market={}: {}",
+            market_condition_id, last_detail,
+        );
 
         MarketCancelFinality {
             confirmed: false,
@@ -8631,6 +8660,15 @@ mod tests {
         assert!(!retired_market_terminalization_allowed(3, 2, 2, 2, 1));
         assert!(retired_market_terminalization_allowed(3, 2, 2, 1, 1));
         assert!(retired_market_terminalization_allowed(3, 2, 2, 0, 0));
+    }
+
+    #[test]
+    fn cancels_disabled_is_terminal_evidence_only_for_expired_market_sweeps() {
+        let error = "503 Service Unavailable: {\"error\":\"cancels are disabled\"}";
+        assert!(is_cancels_disabled_error(error));
+        assert!(is_retired_market_terminal_error(error, true));
+        assert!(!is_retired_market_terminal_error(error, false));
+        assert!(is_retired_market_terminal_error("invalid token id", false));
     }
 
     #[test]
