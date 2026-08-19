@@ -443,7 +443,7 @@ impl PositionManager {
                     ownership.trade_key,
                 ));
             }
-            let result = manager.upsert_trade(
+            let result = manager.upsert_trade_inner(
                 &ownership.trade_key,
                 &ownership.token_id,
                 ownership.side,
@@ -454,6 +454,7 @@ impl PositionManager {
                 row.usdc_fee,
                 row.shares_fee,
                 None,
+                false,
             );
             if !result.applied {
                 return Err(format!(
@@ -524,6 +525,36 @@ impl PositionManager {
         // error context (e.g. legacy code paths or non-Failed status
         // pushes that arrive without error metadata).
         error: Option<&str>,
+    ) -> UpsertResult {
+        self.upsert_trade_inner(
+            trade_id,
+            asset_id,
+            side,
+            size,
+            price,
+            status,
+            is_maker,
+            usdc_fee,
+            shares_fee,
+            error,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_trade_inner(
+        &mut self,
+        trade_id: &str,
+        asset_id: &str,
+        side: Side,
+        size: f64,
+        price: f64,
+        status: TradeStatus,
+        is_maker: bool,
+        usdc_fee: f64,
+        shares_fee: f64,
+        error: Option<&str>,
+        log_transition: bool,
     ) -> UpsertResult {
         if trade_id.trim().is_empty() || asset_id.trim().is_empty()
             || !size.is_finite() || size <= 0.0
@@ -598,22 +629,24 @@ impl PositionManager {
         // Tail-append `error="..."` ONLY when the upstream supplied a
         // non-empty reason. Keeps the happy-path log shape identical
         // for downstream parsers that key on the legacy fields.
-        let error_part = match error {
-            Some(s) if !s.is_empty() => format!(" error=\"{}\"", s),
-            _ => String::new(),
-        };
-        info!(
-            "[PositionManager] {} {} {} {:.4} @ {:.4} ({}) status={:?} fee_usdc={:.4} fee_shares={:.4} sign={:+}{}",
-            match outcome.accumulator_sign {
-                1 => "new",
-                -1 => "rev",
-                _ => "upd",
-            },
-            asset_id, side, size, price,
-            if is_maker { "maker" } else { "taker" },
-            status, usdc_fee, shares_fee, outcome.accumulator_sign,
-            error_part,
-        );
+        if log_transition {
+            let error_part = match error {
+                Some(s) if !s.is_empty() => format!(" error=\"{}\"", s),
+                _ => String::new(),
+            };
+            info!(
+                "[PositionManager] {} {} {} {:.4} @ {:.4} ({}) status={:?} fee_usdc={:.4} fee_shares={:.4} sign={:+}{}",
+                match outcome.accumulator_sign {
+                    1 => "new",
+                    -1 => "rev",
+                    _ => "upd",
+                },
+                asset_id, side, size, price,
+                if is_maker { "maker" } else { "taker" },
+                status, usdc_fee, shares_fee, outcome.accumulator_sign,
+                error_part,
+            );
+        }
 
         outcome
     }
