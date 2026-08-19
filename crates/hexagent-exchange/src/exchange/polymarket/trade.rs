@@ -6080,7 +6080,7 @@ impl PolymarketTrade {
                 );
             }
             if matched > 0 {
-                info!(
+                debug!(
                     "[orphan_metric] terminal_trade_backfill_updates={} trade_id={}",
                     matched, trade_id,
                 );
@@ -6849,7 +6849,7 @@ impl PolymarketTrade {
                                     warn!("[PolymarketTrade] Cancel response contradictory for coid={} orderID={}... (canceled + not_canceled reason={}) → orphan",
                                         client_order_id, oid_short, matching_reason.unwrap_or(""));
                                 } else if let Some(reason) = matching_reason {
-                                    info!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
+                                    debug!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
                                         reason, client_order_id);
                                 } else {
                                     warn!("[PolymarketTrade] Cancel response omitted coid={} orderID={}... → orphan",

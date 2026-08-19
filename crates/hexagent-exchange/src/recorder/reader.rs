@@ -32,6 +32,10 @@ pub struct MarketReplayer {
     start_ns: u64,
     end_ns: u64,
     event_count: u64,
+    source: String,
+    loaded_files: usize,
+    loaded_rows: u64,
+    summary_logged: bool,
 }
 
 impl MarketReplayer {
@@ -75,6 +79,10 @@ impl MarketReplayer {
             start_ns,
             end_ns,
             event_count: 0,
+            source: format!("{exchange}/{symbol}"),
+            loaded_files: 0,
+            loaded_rows: 0,
+            summary_logged: false,
         })
     }
 
@@ -87,7 +95,13 @@ impl MarketReplayer {
                 Ok(mut file_rows) => {
                     file_rows.sort_by_key(|r| r.local_timestamp_ns);
                     if !file_rows.is_empty() {
-                        info!("[Replayer] Loaded {} rows from {}", file_rows.len(), path.display());
+                        self.loaded_files = self.loaded_files.saturating_add(1);
+                        self.loaded_rows = self.loaded_rows.saturating_add(file_rows.len() as u64);
+                        log::debug!(
+                            "[Replayer] Loaded {} rows from {}",
+                            file_rows.len(),
+                            path.display(),
+                        );
                         self.rows = file_rows;
                         self.row_cursor = 0;
                         return true;
@@ -116,6 +130,16 @@ impl MarketReplayer {
                     }
                 }
             }
+        }
+        if !self.summary_logged {
+            info!(
+                "[Replayer] Replay source summary source={} candidate_files={} loaded_files={} loaded_rows={}",
+                self.source,
+                self.files.len(),
+                self.loaded_files,
+                self.loaded_rows,
+            );
+            self.summary_logged = true;
         }
         false
     }
