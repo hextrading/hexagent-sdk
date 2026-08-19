@@ -27,6 +27,7 @@
 //! ```toml
 //! [os_tune]
 //! async_rt_core    = 2
+//! async_clob_core  = 5
 //! strategy_core    = 3
 //! execution_core   = 4
 //! feed_cores       = { polymarket = 5, binance = 6, binance_futures = 7, coinbase = 8, chainlink = 9 }
@@ -88,6 +89,9 @@ pub struct CorePlan {
     pub strict_core_isolation: bool,
     pub allow_background_on_execution_core: bool,
     pub async_rt: usize,
+    /// Dedicated public-CLOB socket runtime core. `None` preserves the legacy
+    /// placement beside `feed-polymarket`.
+    pub async_clob: Option<usize>,
     /// Core for the order-I/O runtime thread (`hexbot-async-ord`).
     /// `None` = leave the thread unpinned at normal priority (safe
     /// default — pinning it onto an already-claimed core with FIFO
@@ -122,6 +126,7 @@ impl CorePlan {
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
             async_rt: DEFAULT_ASYNC_RT_CORE,
+            async_clob: None,
             async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
@@ -150,6 +155,7 @@ impl CorePlan {
             strict_core_isolation: cfg.strict_core_isolation,
             allow_background_on_execution_core: cfg.allow_background_on_execution_core,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
+            async_clob: cfg.async_clob_core,
             async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
@@ -235,6 +241,9 @@ impl CorePlan {
         };
 
         claim(self.async_rt, "async_rt".into(), &mut exclusive)?;
+        if let Some(core) = self.async_clob {
+            claim(core, "async_clob".into(), &mut exclusive)?;
+        }
         claim(self.async_ord.unwrap(), "async_ord".into(), &mut exclusive)?;
         claim(
             self.strategy,
@@ -347,8 +356,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
-        plan.async_rt, plan.async_ord, plan.strategy, plan.execution,
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
+        plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
         plan.fifo_polymarket_feed, plan.fifo_completion,
@@ -435,7 +444,7 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
     }
     // Fine-grained opt-outs per tier. Matched against the resolved core id.
     let p = plan();
-    let skip = if core_id == p.async_rt {
+    let skip = if core_id == p.async_rt || p.async_clob == Some(core_id) {
         "HEXBOT_NO_PIN_ASYNC_RT"
     } else if core_id == p.strategy || p.strategy_cores.values().any(|&c| c == core_id) {
         "HEXBOT_NO_PIN_STRATEGY"
@@ -562,7 +571,10 @@ pub fn pin_async_ord(thread_name: &str) {
 /// than silently colliding with another FIFO role.
 pub fn pin_async_clob(thread_name: &str) {
     let p = plan();
-    if let Some(&core) = p.feed_cores.get("polymarket") {
+    if let Some(core) = p
+        .async_clob
+        .or_else(|| p.feed_cores.get("polymarket").copied())
+    {
         pin_current(core, thread_name);
         set_fifo(p.fifo_async_rt, thread_name);
     }
@@ -623,9 +635,8 @@ pub fn pin_background(thread_name: &str) {
     #[cfg(target_os = "linux")]
     {
         let param = libc::sched_param { sched_priority: 0 };
-        let rc = unsafe {
-            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param)
-        };
+        let rc =
+            unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param) };
         if rc != 0 {
             let err = std::io::Error::from_raw_os_error(rc);
             warn!(
@@ -668,8 +679,7 @@ pub fn pin_main_early(thread_name: &str) {
         let configured_core = std::env::var("HEXBOT_BOOTSTRAP_CORE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok());
-        let cores: Vec<usize> = configured_core
-            .map_or_else(|| vec![0_usize, 1], |core| vec![core]);
+        let cores: Vec<usize> = configured_core.map_or_else(|| vec![0_usize, 1], |core| vec![core]);
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             for &c in &cores {
@@ -763,8 +773,21 @@ mod tests {
 
     #[test]
     fn strict_plan_accepts_five_dedicated_strategy_cores() {
-        let plan = CorePlan::from_config(&five_instance_config());
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        let plan = CorePlan::from_config(&cfg);
+        assert_eq!(plan.async_clob, Some(16));
         assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+    }
+
+    #[test]
+    fn strict_plan_rejects_async_clob_overlap() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(6);
+        let err = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&five_instances())
+            .unwrap_err();
+        assert!(err.contains("feed core 6") && err.contains("async_clob"));
     }
 
     #[test]

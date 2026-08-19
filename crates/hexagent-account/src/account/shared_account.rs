@@ -7,7 +7,9 @@
 
 use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +35,133 @@ const FEE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "fee_attribution:";
 const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
+const ROUTE_SHARD_COUNT: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LockMonitoringSnapshot {
+    pub wait_last_us: u64,
+    pub wait_max_us: u64,
+    pub hold_last_us: u64,
+    pub hold_max_us: u64,
+    pub acquisitions: u64,
+}
+
+#[derive(Debug, Default)]
+struct LockLatencyMetrics {
+    wait_last_us: AtomicU64,
+    wait_max_us: AtomicU64,
+    hold_last_us: AtomicU64,
+    hold_max_us: AtomicU64,
+    acquisitions: AtomicU64,
+}
+
+impl LockLatencyMetrics {
+    fn acquired(&self, wait_started: Instant) -> HeldLockMetric<'_> {
+        let acquired_at = Instant::now();
+        let wait_us = acquired_at
+            .saturating_duration_since(wait_started)
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        self.wait_last_us.store(wait_us, Ordering::Relaxed);
+        self.wait_max_us.fetch_max(wait_us, Ordering::Relaxed);
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        HeldLockMetric {
+            metrics: self,
+            acquired_at,
+        }
+    }
+
+    fn snapshot(&self) -> LockMonitoringSnapshot {
+        LockMonitoringSnapshot {
+            wait_last_us: self.wait_last_us.load(Ordering::Relaxed),
+            wait_max_us: self.wait_max_us.load(Ordering::Relaxed),
+            hold_last_us: self.hold_last_us.load(Ordering::Relaxed),
+            hold_max_us: self.hold_max_us.load(Ordering::Relaxed),
+            acquisitions: self.acquisitions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct HeldLockMetric<'a> {
+    metrics: &'a LockLatencyMetrics,
+    acquired_at: Instant,
+}
+
+impl Drop for HeldLockMetric<'_> {
+    fn drop(&mut self) {
+        let hold_us = self.acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.metrics.hold_last_us.store(hold_us, Ordering::Relaxed);
+        self.metrics
+            .hold_max_us
+            .fetch_max(hold_us, Ordering::Relaxed);
+    }
+}
+
+/// A fixed-size ownership index keeps unrelated strategy instances from
+/// contending on one account-wide route map. The shard hash is process-local;
+/// route entries themselves are rebuilt from the durable lifecycle ledger.
+#[derive(Debug)]
+struct ShardedRouteMap {
+    shards: Box<[RwLock<HashMap<String, String>>]>,
+}
+
+impl ShardedRouteMap {
+    fn new() -> Self {
+        let shards = (0..ROUTE_SHARD_COUNT)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
+
+    fn shard_index(key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % ROUTE_SHARD_COUNT
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.shards[Self::shard_index(key)]
+            .read()
+            .unwrap()
+            .get(key)
+            .cloned()
+    }
+
+    fn write_shard(&self, key: &str) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        self.shards[Self::shard_index(key)].write().unwrap()
+    }
+
+    fn insert(&self, key: String, owner: String) {
+        self.write_shard(&key).insert(key, owner);
+    }
+
+    fn remove(&self, key: &str) -> Option<String> {
+        self.write_shard(key).remove(key)
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.write().unwrap().clear();
+        }
+    }
+
+    fn retain_other_owners(&self, owner: &str) {
+        for shard in &self.shards {
+            shard
+                .write()
+                .unwrap()
+                .retain(|_, route_owner| route_owner != owner);
+        }
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.read().unwrap().keys().cloned().collect::<Vec<_>>())
+            .collect()
+    }
+}
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
 /// the same hash with mixed hex casing and, on some paths, without the `0x`
@@ -183,6 +312,12 @@ pub struct AccountMonitoringSnapshot {
     pub account_lock_hold_last_us: u64,
     pub account_lock_hold_max_us: u64,
     pub account_lock_acquisitions: u64,
+    /// Reservation fast-path lock timings, split by lock class so a route-map
+    /// collision cannot be mistaken for account-ledger contention.
+    pub reservation_control_lock: LockMonitoringSnapshot,
+    pub reservation_coid_route_lock: LockMonitoringSnapshot,
+    pub reservation_oid_route_lock: LockMonitoringSnapshot,
+    pub reservation_lifecycle_lock: LockMonitoringSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -985,10 +1120,27 @@ struct PersistenceWalRecord {
 #[derive(Debug, Clone)]
 struct PersistenceJob {
     generation: u64,
-    /// `None` is the compatibility fallback for cold/complex mutations. The
-    /// writer snapshots those under the account lock. Hot order/trade paths
-    /// provide concrete changes and never require a full-state clone.
-    changes: Option<Vec<PersistenceWalChange>>,
+    payload: PersistenceJobPayload,
+}
+
+#[derive(Debug, Clone)]
+enum PersistenceJobPayload {
+    /// Compatibility fallback for cold/complex mutations. The writer snapshots
+    /// those under the account lock.
+    FullSnapshot,
+    Changes(Vec<PersistenceWalChange>),
+    /// Raw reservation data is converted to JSON only on the WAL writer. This
+    /// keeps path allocation and serde work off the signed-to-dispatch lane.
+    Reservation(ReservationPersistenceDelta),
+}
+
+#[derive(Debug, Clone)]
+struct ReservationPersistenceDelta {
+    instance_id: String,
+    client_order_id: String,
+    order: OrderOwnership,
+    reserved_cash: f64,
+    reserved_position: f64,
 }
 
 #[derive(Debug)]
@@ -1026,6 +1178,24 @@ struct AccountPersistence {
 }
 
 impl AccountPersistence {
+    fn enqueue(&self, payload: PersistenceJobPayload) {
+        // Generation assignment and queue insertion are one critical section.
+        // Route sharding permits concurrent instance writers; assigning the
+        // generation before taking this lock could publish [N+1, N] and make
+        // the WAL writer replay absolute virtual-account counters backwards.
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        pending.push(PersistenceJob {
+            generation,
+            payload,
+        });
+        drop(pending);
+        let _ = self.wake.try_send(PersistenceSignal::Wake);
+    }
+
     fn start(
         path: PathBuf,
         account_id: String,
@@ -1120,8 +1290,9 @@ impl AccountPersistence {
                         let generation = last.generation;
                         let started = std::time::Instant::now();
                         let result = (|| -> Result<serde_json::Value, String> {
-                            let last_full_snapshot =
-                                jobs.iter().rposition(|job| job.changes.is_none());
+                            let last_full_snapshot = jobs.iter().rposition(|job| {
+                                matches!(job.payload, PersistenceJobPayload::FullSnapshot)
+                            });
                             let (changes, next_state) = if let Some(full_index) = last_full_snapshot
                             {
                                 // schedule_persist() runs while the same state
@@ -1143,30 +1314,20 @@ impl AccountPersistence {
                                 // `thread_state`. Replay only that suffix on top
                                 // of the snapshot; earlier absolute deltas were
                                 // already folded by the cold control transaction.
-                                for change in jobs
-                                    .iter()
-                                    .skip(full_index + 1)
-                                    .filter_map(|job| job.changes.as_ref())
-                                    .flatten()
-                                    .cloned()
-                                {
-                                    apply_persistence_wal_change(&mut next_state, change)?;
+                                for job in jobs.iter().skip(full_index + 1) {
+                                    for change in materialize_persistence_job(job)? {
+                                        apply_persistence_wal_change(&mut next_state, change)?;
+                                    }
                                 }
                                 (
                                     persistence_json_diff(&durable_state, &next_state),
                                     next_state,
                                 )
                             } else {
-                                let changes: Vec<PersistenceWalChange> = jobs
-                                    .iter()
-                                    .flat_map(|job| {
-                                        job.changes
-                                            .as_ref()
-                                            .expect("typed WAL job checked above")
-                                            .iter()
-                                            .cloned()
-                                    })
-                                    .collect();
+                                let mut changes = Vec::new();
+                                for job in &jobs {
+                                    changes.extend(materialize_persistence_job(job)?);
+                                }
                                 // Validate paths against a detached JSON value.
                                 // This can be CPU-heavy for a large ledger, but
                                 // never holds the account mutex or delays order
@@ -1236,30 +1397,18 @@ impl AccountPersistence {
     }
 
     fn schedule(&self) {
-        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(PersistenceJob {
-                generation,
-                changes: None,
-            });
-        let _ = self.wake.try_send(PersistenceSignal::Wake);
+        self.enqueue(PersistenceJobPayload::FullSnapshot);
     }
 
     fn schedule_delta(&self, changes: Vec<PersistenceWalChange>) {
         if changes.is_empty() {
             return;
         }
-        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(PersistenceJob {
-                generation,
-                changes: Some(changes),
-            });
-        let _ = self.wake.try_send(PersistenceSignal::Wake);
+        self.enqueue(PersistenceJobPayload::Changes(changes));
+    }
+
+    fn schedule_reservation(&self, delta: ReservationPersistenceDelta) {
+        self.enqueue(PersistenceJobPayload::Reservation(delta));
     }
 
     fn scheduled_generation(&self) -> u64 {
@@ -1479,6 +1628,60 @@ fn persistence_wal_set_membership<T: Serialize>(
         PersistenceWalChange::SetRemove { path, value }
     });
     Ok(())
+}
+
+fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWalChange>, String> {
+    match &job.payload {
+        PersistenceJobPayload::FullSnapshot => {
+            Err("full snapshot persistence job cannot be materialized as a typed delta".to_string())
+        }
+        PersistenceJobPayload::Changes(changes) => Ok(changes.clone()),
+        PersistenceJobPayload::Reservation(delta) => {
+            let mut changes = Vec::with_capacity(7);
+            persistence_wal_set(
+                &mut changes,
+                [
+                    "instances".to_string(),
+                    delta.instance_id.clone(),
+                    "reserved_cash".to_string(),
+                ],
+                &delta.reserved_cash,
+            )?;
+            persistence_wal_map_entry(
+                &mut changes,
+                "orders",
+                &delta.client_order_id,
+                Some(&delta.order),
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                [
+                    "instances".to_string(),
+                    delta.instance_id.clone(),
+                    "reserved_positions".to_string(),
+                    delta.order.token_id.clone(),
+                ],
+                &delta.reserved_position,
+            )?;
+            persistence_wal_map_entry(
+                &mut changes,
+                "oid_to_coid",
+                &normalize_order_id(&delta.order.order_id),
+                Some(&delta.client_order_id),
+            )?;
+            // A newly reserved order cannot yet be in any audit set. Emitting
+            // explicit removes makes replay deterministic if a coid is ever
+            // reused after an operator-led repair.
+            for set in [
+                "recovery_pending_orders",
+                "startup_query_repair_orders",
+                "routine_cancel_audits",
+            ] {
+                persistence_wal_set_membership(&mut changes, set, &delta.client_order_id, false)?;
+            }
+            Ok(changes)
+        }
+    }
 }
 
 fn apply_persistence_wal_change(
@@ -1828,8 +2031,8 @@ pub struct SharedAccount {
     /// only a shared guard and then mutate one virtual account shard.
     control_gate: RwLock<()>,
     virtual_accounts: RwLock<BTreeMap<String, Arc<VirtualAccount>>>,
-    coid_routes: RwLock<HashMap<String, String>>,
-    oid_routes: RwLock<HashMap<String, String>>,
+    coid_routes: ShardedRouteMap,
+    oid_routes: ShardedRouteMap,
     /// Read-mostly ownership index for private-fill ids. This is deliberately
     /// separate from the physical ledger lock: it prevents one exchange trade
     /// from being booked into two instance shards without serializing unrelated
@@ -1866,6 +2069,10 @@ pub struct SharedAccount {
     account_lock_hold_last_us: AtomicU64,
     account_lock_hold_max_us: AtomicU64,
     account_lock_acquisitions: AtomicU64,
+    reservation_control_lock: LockLatencyMetrics,
+    reservation_coid_route_lock: LockLatencyMetrics,
+    reservation_oid_route_lock: LockLatencyMetrics,
+    reservation_lifecycle_lock: LockLatencyMetrics,
 }
 
 struct AccountStateGuard<'a> {
@@ -1925,8 +2132,8 @@ impl SharedAccount {
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
-            coid_routes: RwLock::new(HashMap::new()),
-            oid_routes: RwLock::new(HashMap::new()),
+            coid_routes: ShardedRouteMap::new(),
+            oid_routes: ShardedRouteMap::new(),
             trade_routes: RwLock::new(HashMap::new()),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
@@ -1944,6 +2151,10 @@ impl SharedAccount {
             account_lock_hold_last_us: AtomicU64::new(0),
             account_lock_hold_max_us: AtomicU64::new(0),
             account_lock_acquisitions: AtomicU64::new(0),
+            reservation_control_lock: LockLatencyMetrics::default(),
+            reservation_coid_route_lock: LockLatencyMetrics::default(),
+            reservation_oid_route_lock: LockLatencyMetrics::default(),
+            reservation_lifecycle_lock: LockLatencyMetrics::default(),
         };
         account.sync_state_to_virtual_accounts(&SharedAccountState::default());
         account
@@ -2191,8 +2402,8 @@ impl SharedAccount {
             state,
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
-            coid_routes: RwLock::new(HashMap::new()),
-            oid_routes: RwLock::new(HashMap::new()),
+            coid_routes: ShardedRouteMap::new(),
+            oid_routes: ShardedRouteMap::new(),
             trade_routes: RwLock::new(HashMap::new()),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
@@ -2210,6 +2421,10 @@ impl SharedAccount {
             account_lock_hold_last_us: AtomicU64::new(0),
             account_lock_hold_max_us: AtomicU64::new(0),
             account_lock_acquisitions: AtomicU64::new(0),
+            reservation_control_lock: LockLatencyMetrics::default(),
+            reservation_coid_route_lock: LockLatencyMetrics::default(),
+            reservation_oid_route_lock: LockLatencyMetrics::default(),
+            reservation_lifecycle_lock: LockLatencyMetrics::default(),
         };
         {
             let state = account.lock_state();
@@ -2275,12 +2490,7 @@ impl SharedAccount {
     }
 
     fn virtual_account_for_coid(&self, client_order_id: &str) -> Option<Arc<VirtualAccount>> {
-        let instance_id = self
-            .coid_routes
-            .read()
-            .unwrap()
-            .get(client_order_id)
-            .cloned()?;
+        let instance_id = self.coid_routes.get(client_order_id)?;
         self.virtual_account(&instance_id)
     }
 
@@ -2459,17 +2669,16 @@ impl SharedAccount {
             lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
         }
 
-        let mut coid_routes = self.coid_routes.write().unwrap();
-        let mut oid_routes = self.oid_routes.write().unwrap();
         let mut trade_routes = self.trade_routes.write().unwrap();
-        coid_routes.clear();
-        oid_routes.clear();
+        self.coid_routes.clear();
+        self.oid_routes.clear();
         trade_routes.clear();
         for (instance_id, account) in accounts.iter() {
             let lifecycle = account.lifecycle.lock().unwrap();
             for (coid, order) in &lifecycle.orders {
-                coid_routes.insert(coid.clone(), instance_id.clone());
-                oid_routes.insert(normalize_order_id(&order.order_id), instance_id.clone());
+                self.coid_routes.insert(coid.clone(), instance_id.clone());
+                self.oid_routes
+                    .insert(normalize_order_id(&order.order_id), instance_id.clone());
             }
             for trade_key in lifecycle.trades.keys() {
                 trade_routes.insert(trade_key.clone(), instance_id.clone());
@@ -2554,16 +2763,16 @@ impl SharedAccount {
         lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
         drop(lifecycle);
 
-        let mut coid_routes = self.coid_routes.write().unwrap();
-        let mut oid_routes = self.oid_routes.write().unwrap();
         let mut trade_routes = self.trade_routes.write().unwrap();
-        coid_routes.retain(|_, owner| owner != instance_id);
-        oid_routes.retain(|_, owner| owner != instance_id);
+        self.coid_routes.retain_other_owners(instance_id);
+        self.oid_routes.retain_other_owners(instance_id);
         trade_routes.retain(|_, owner| owner != instance_id);
         let lifecycle = account.lifecycle.lock().unwrap();
         for (coid, order) in &lifecycle.orders {
-            coid_routes.insert(coid.clone(), instance_id.to_string());
-            oid_routes.insert(normalize_order_id(&order.order_id), instance_id.to_string());
+            self.coid_routes
+                .insert(coid.clone(), instance_id.to_string());
+            self.oid_routes
+                .insert(normalize_order_id(&order.order_id), instance_id.to_string());
         }
         for trade_key in lifecycle.trades.keys() {
             trade_routes.insert(trade_key.clone(), instance_id.to_string());
@@ -4698,6 +4907,10 @@ impl SharedAccount {
             account_lock_hold_last_us: self.account_lock_hold_last_us.load(Ordering::Relaxed),
             account_lock_hold_max_us: self.account_lock_hold_max_us.load(Ordering::Relaxed),
             account_lock_acquisitions: self.account_lock_acquisitions.load(Ordering::Relaxed),
+            reservation_control_lock: self.reservation_control_lock.snapshot(),
+            reservation_coid_route_lock: self.reservation_coid_route_lock.snapshot(),
+            reservation_oid_route_lock: self.reservation_oid_route_lock.snapshot(),
+            reservation_lifecycle_lock: self.reservation_lifecycle_lock.snapshot(),
         }
     }
 
@@ -4889,14 +5102,22 @@ impl SharedAccount {
         if !admission_allowed {
             return Err(ReservationError::AccountUncertain);
         }
-        let _control = self.control_gate.read().unwrap();
+        let control_wait = Instant::now();
+        let control = self.control_gate.read().unwrap();
+        let control_metric = self.reservation_control_lock.acquired(control_wait);
         let account = self
             .virtual_account(instance_id)
             .ok_or_else(|| ReservationError::UnknownInstance(instance_id.into()))?;
         let normalized_order_id = normalize_order_id(order_id);
-        let mut coid_routes = self.coid_routes.write().unwrap();
-        let mut oid_routes = self.oid_routes.write().unwrap();
+        let lifecycle_wait = Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle_metric = self.reservation_lifecycle_lock.acquired(lifecycle_wait);
+        let coid_wait = Instant::now();
+        let mut coid_routes = self.coid_routes.write_shard(client_order_id);
+        let coid_metric = self.reservation_coid_route_lock.acquired(coid_wait);
+        let oid_wait = Instant::now();
+        let mut oid_routes = self.oid_routes.write_shard(&normalized_order_id);
+        let oid_metric = self.reservation_oid_route_lock.acquired(oid_wait);
         if let Some(existing) = lifecycle.orders.get(client_order_id) {
             if normalize_order_id(&existing.order_id) == normalize_order_id(order_id)
                 && existing.instance_id == instance_id
@@ -4979,12 +5200,44 @@ impl SharedAccount {
             .insert(client_order_id.into(), ownership.clone());
         coid_routes.insert(client_order_id.into(), instance_id.into());
         oid_routes.insert(normalized_order_id, instance_id.into());
+        let persisted_reserved_cash = account.reserved_cash.load();
+        let persisted_reserved_position = account
+            .positions
+            .read()
+            .unwrap()
+            .get(token_id)
+            .map(|position| position.reserved.load())
+            .unwrap_or(0.0);
+
+        // Queue the raw command while the instance lifecycle is still held so
+        // two reservations for the same virtual account cannot publish their
+        // absolute counter snapshots out of order. The queued payload contains
+        // no JSON paths or serialized values; the writer constructs those.
+        if let Some(persistence) = &self.persistence {
+            persistence.schedule_reservation(ReservationPersistenceDelta {
+                instance_id: instance_id.to_string(),
+                client_order_id: client_order_id.to_string(),
+                order: ownership.clone(),
+                reserved_cash: persisted_reserved_cash,
+                reserved_position: persisted_reserved_position,
+            });
+        }
+
+        // End every admission lock before allocating WAL paths or invoking
+        // serde. The writer materializes this raw command into typed JSON.
+        drop(oid_metric);
+        drop(oid_routes);
+        drop(coid_metric);
+        drop(coid_routes);
+        drop(lifecycle_metric);
+        drop(lifecycle);
+        drop(control_metric);
+        drop(control);
         // Deliberately asynchronous: startup exchange reconciliation is the
         // recovery authority for the crash window between POST acceptance and
         // this WAL generation reaching disk. In-process reservations remain
         // atomic across strategies, while order submission never waits for
-        // serialization, append, or fsync.
-        self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+        // typed-delta construction, serialization, append, or fsync.
         Ok(ownership)
     }
 
@@ -5018,13 +5271,12 @@ impl SharedAccount {
             let conflicts = lifecycle.orders.iter().any(|(coid, order)| {
                 coid != client_order_id && normalize_order_id(&order.order_id) == normalized
             });
-            let routed_elsewhere = self
-                .oid_routes
-                .read()
-                .unwrap()
+            let mut new_oid_routes = self.oid_routes.write_shard(&normalized);
+            let routed_elsewhere = new_oid_routes
                 .get(&normalized)
                 .is_some_and(|owner| owner != &account.instance_id);
             if conflicts || routed_elsewhere {
+                drop(new_oid_routes);
                 drop(lifecycle);
                 drop(control);
                 return self.record_order_binding_anomaly(
@@ -5039,11 +5291,9 @@ impl SharedAccount {
                 .get_mut(client_order_id)
                 .expect("order checked above")
                 .order_id = order_id.into();
-            {
-                let mut routes = self.oid_routes.write().unwrap();
-                routes.remove(&normalized_old);
-                routes.insert(normalized, account.instance_id.clone());
-            }
+            new_oid_routes.insert(normalized, account.instance_id.clone());
+            drop(new_oid_routes);
+            self.oid_routes.remove(&normalized_old);
             self.schedule_virtual_rebind_persist(
                 &account,
                 &lifecycle,
@@ -5205,19 +5455,11 @@ impl SharedAccount {
     }
 
     pub fn order_owner_by_coid(&self, client_order_id: &str) -> Option<String> {
-        self.coid_routes
-            .read()
-            .unwrap()
-            .get(client_order_id)
-            .cloned()
+        self.coid_routes.get(client_order_id)
     }
 
     pub fn order_owner_by_oid(&self, order_id: &str) -> Option<String> {
-        self.oid_routes
-            .read()
-            .unwrap()
-            .get(&normalize_order_id(order_id))
-            .cloned()
+        self.oid_routes.get(&normalize_order_id(order_id))
     }
 
     pub fn order(&self, client_order_id: &str) -> Option<OrderOwnership> {
@@ -5630,7 +5872,7 @@ impl SharedAccount {
     }
 
     pub fn release_all_orders(&self) {
-        let coids: Vec<String> = self.coid_routes.read().unwrap().keys().cloned().collect();
+        let coids = self.coid_routes.keys();
         for coid in coids {
             self.release_order(&coid, OrderStatus::Cancelled);
         }
@@ -7165,18 +7407,8 @@ impl SharedAccount {
             "CONFIRMED" | "FAILED" => 3,
             _ => return None,
         };
-        let coid_scope = self
-            .coid_routes
-            .read()
-            .unwrap()
-            .get(client_order_id)
-            .cloned();
-        let oid_scope = self
-            .oid_routes
-            .read()
-            .unwrap()
-            .get(&normalize_order_id(order_id))
-            .cloned();
+        let coid_scope = self.coid_routes.get(client_order_id);
+        let oid_scope = self.oid_routes.get(&normalize_order_id(order_id));
         let trade_scope = self.trade_routes.read().unwrap().get(trade_key).cloned();
         let anomalous_trade = self
             .anomalous_trade_keys
@@ -10723,6 +10955,11 @@ mod tests {
         account
             .reserve_order("a", "a-1", "oid-a-1", "UP", Side::Buy, 100.0, 1.0, 0)
             .unwrap();
+        let locks = account.monitoring_snapshot();
+        assert_eq!(locks.reservation_control_lock.acquisitions, 1);
+        assert_eq!(locks.reservation_lifecycle_lock.acquisitions, 1);
+        assert_eq!(locks.reservation_coid_route_lock.acquisitions, 1);
+        assert_eq!(locks.reservation_oid_route_lock.acquisitions, 1);
         let err = account
             .reserve_order("a", "a-2", "oid-a-2", "UP", Side::Buy, 0.1, 1.0, 0)
             .unwrap_err();

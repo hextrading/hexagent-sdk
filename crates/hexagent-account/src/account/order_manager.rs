@@ -307,7 +307,7 @@ impl OrderManager {
             LocalOrderStatus::Submitted => {
                 if self.cancel_intents.insert(client_order_id.to_string()) {
                     self.cancel_before_ack_count = self.cancel_before_ack_count.saturating_add(1);
-                    log::info!(
+                    log::debug!(
                         "[orphan_metric] cancel_before_ack=1 cancel_before_ack_total={} symbol={} coid={} state=Submitted",
                         self.cancel_before_ack_count, self.symbol, client_order_id,
                     );

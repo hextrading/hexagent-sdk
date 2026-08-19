@@ -48,6 +48,11 @@ pub struct OsTuneConfig {
     #[serde(default)]
     pub allow_background_on_execution_core: bool,
     pub async_rt_core: Option<usize>,
+    /// Core for the dedicated public Polymarket CLOB socket runtime. Unset
+    /// keeps the backwards-compatible feed-core placement; production can
+    /// assign a separate isolated CPU so downstream book decoding never
+    /// competes with socket polling.
+    pub async_clob_core: Option<usize>,
     /// Core for the dedicated order-I/O tokio runtime thread
     /// (`hexbot-async-ord`, hosts CLOB place/cancel HTTP futures so WS
     /// feed bursts on `async_rt_core` can't head-of-line-block them).
@@ -105,6 +110,7 @@ impl Default for OsTuneConfig {
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
             async_rt_core: None,
+            async_clob_core: None,
             async_ord_core: None,
             strategy_core: None,
             strategy_cores: HashMap::new(),
@@ -131,6 +137,7 @@ mod os_tune_config_tests {
         let cfg: OsTuneConfig = toml::from_str(
             "strict_core_isolation = true\n\
              allow_background_on_execution_core = true\n\
+             async_clob_core = 11\n\
              execution_core = 4\n\
              background_cores = [4]\n\
              fifo_execution = 50\n\
@@ -139,6 +146,7 @@ mod os_tune_config_tests {
         )
         .unwrap();
         assert!(cfg.allow_background_on_execution_core);
+        assert_eq!(cfg.async_clob_core, Some(11));
         assert_eq!(cfg.background_cores, vec![4]);
         assert_eq!(cfg.fifo_polymarket_feed, Some(71));
         assert_eq!(cfg.fifo_completion, Some(55));

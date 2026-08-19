@@ -32,6 +32,7 @@ use crate::types::*;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
+const PRIVATE_UPDATE_BURST_BUDGET: usize = 32;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
 const ACCOUNT_METRIC_POSITION_EPS: f64 = 1e-9;
 const FEED_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1488,9 +1489,105 @@ fn register_polymarket_wallet_identity(
 }
 
 #[derive(Debug, Clone)]
-struct QueuedMarketEvent {
+struct QueuedMarketPayload {
     event: Arc<MarketEvent>,
     enqueued_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LatestMarketKey {
+    epoch: u64,
+    kind: u8,
+    exchange: Exchange,
+    symbol: String,
+}
+
+#[derive(Debug, Clone)]
+enum QueuedMarketEvent {
+    Direct(QueuedMarketPayload),
+    Latest(LatestMarketKey),
+}
+
+#[derive(Debug, Default)]
+struct LatestMarketStore {
+    events: std::sync::Mutex<HashMap<LatestMarketKey, QueuedMarketPayload>>,
+    replacements: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct MarketEventLane {
+    tx: Sender<QueuedMarketEvent>,
+    latest: Arc<LatestMarketStore>,
+    /// Non-coverable events advance the epoch so a later book cannot replace
+    /// a marker queued before an intervening trade/lifecycle event.
+    barrier_epoch: Arc<AtomicU64>,
+}
+
+fn latest_market_key(event: &MarketEvent, epoch: u64) -> Option<LatestMarketKey> {
+    match event {
+        MarketEvent::OrderBook(book) => Some(LatestMarketKey {
+            epoch,
+            kind: 0,
+            exchange: book.exchange,
+            symbol: book.symbol.to_ascii_lowercase(),
+        }),
+        MarketEvent::Quote(quote) => Some(LatestMarketKey {
+            epoch,
+            kind: 1,
+            exchange: quote.exchange,
+            symbol: quote.symbol.to_ascii_lowercase(),
+        }),
+        _ => None,
+    }
+}
+
+fn enqueue_market_event(lane: &MarketEventLane, event: Arc<MarketEvent>) -> bool {
+    let payload = QueuedMarketPayload {
+        event: Arc::clone(&event),
+        enqueued_at: std::time::Instant::now(),
+    };
+    let epoch = lane.barrier_epoch.load(Ordering::Relaxed);
+    let Some(key) = latest_market_key(event.as_ref(), epoch) else {
+        lane.barrier_epoch.fetch_add(1, Ordering::Relaxed);
+        return lane.tx.try_send(QueuedMarketEvent::Direct(payload)).is_ok();
+    };
+    let marker_needed = {
+        let mut latest = lane.latest.events.lock().unwrap();
+        let replaced = latest.insert(key.clone(), payload).is_some();
+        if replaced {
+            lane.latest.replacements.fetch_add(1, Ordering::Relaxed);
+        }
+        !replaced
+    };
+    if !marker_needed {
+        return true;
+    }
+    if lane
+        .tx
+        .try_send(QueuedMarketEvent::Latest(key.clone()))
+        .is_ok()
+    {
+        true
+    } else {
+        // No marker exists for a newly inserted key, so retaining it would
+        // create an update that can never be observed.
+        lane.latest.events.lock().unwrap().remove(&key);
+        false
+    }
+}
+
+fn resolve_market_event(
+    queued: QueuedMarketEvent,
+    latest: &LatestMarketStore,
+) -> Option<QueuedMarketPayload> {
+    match queued {
+        QueuedMarketEvent::Direct(payload) => Some(payload),
+        QueuedMarketEvent::Latest(key) => latest.events.lock().unwrap().remove(&key),
+    }
+}
+
+fn private_update_lane_enabled(private_burst: usize, market_waiting: bool) -> bool {
+    private_burst < PRIVATE_UPDATE_BURST_BUDGET || !market_waiting
 }
 
 #[derive(Debug)]
@@ -1918,7 +2015,7 @@ mod public_subscription_coalesce_tests {
         {
             let account =
                 crate::account::shared_account::SharedAccount::new_persistent("new001", &path)
-            .unwrap();
+                    .unwrap();
             account.register_instance("btc-new", 1.0);
             account.register_instance("eth-new", 1.0);
             account.register_market_scope("btc-new", "btc-up-or-down-5m");
@@ -1941,12 +2038,12 @@ mod public_subscription_coalesce_tests {
         let enabled = HashSet::from(["new001".to_string()]);
         assert!(
             validate_account_ledger_bootstrap_accounts(&[], true, &enabled)
-            .unwrap()
+                .unwrap()
                 .is_empty()
         );
         assert_eq!(
             validate_account_ledger_bootstrap_accounts(&["new001".to_string()], true, &enabled,)
-            .unwrap(),
+                .unwrap(),
             enabled.clone(),
         );
         assert!(validate_account_ledger_bootstrap_accounts(
@@ -5584,23 +5681,29 @@ impl Engine {
         // Market events are immutable after parsing. Fan out one allocation
         // through Arc instead of deep-cloning order-book vectors and Strings
         // once per subscribing strategy instance.
-        let mut market_txs: Vec<Sender<QueuedMarketEvent>> = Vec::with_capacity(strategies.len());
+        let mut market_lanes: Vec<MarketEventLane> = Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
         let mut specs: Vec<(
             Box<dyn Strategy>,
             Receiver<QueuedMarketEvent>,
+            Arc<LatestMarketStore>,
             Receiver<QueuedOrderUpdate>,
         )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
+            let latest = Arc::new(LatestMarketStore::default());
             // One direct bounded lane per strategy. Private updates must never
             // block the shared router behind a stalled instance: a full lane is
             // treated as event loss, quarantines only that owner, and triggers
             // its fail-closed emergency cancellation path.
             let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
-            market_txs.push(mtx);
+            market_lanes.push(MarketEventLane {
+                tx: mtx,
+                latest: Arc::clone(&latest),
+                barrier_epoch: Arc::new(AtomicU64::new(0)),
+            });
             update_txs.push(utx);
-            specs.push((s, mrx, urx));
+            specs.push((s, mrx, latest, urx));
         }
         let supervisor_origin = Arc::new(std::time::Instant::now());
         let worker_heartbeats: Vec<Arc<AtomicU64>> = (0..instance_ids.len())
@@ -5620,7 +5723,7 @@ impl Engine {
                 let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
                 let (worker_status_tx, worker_status_rx) = unbounded::<(usize, bool)>();
                 let (shutdown_ack_tx, shutdown_ack_rx) = unbounded::<usize>();
-                for (idx, (strategy, mrx, urx)) in specs.into_iter().enumerate() {
+                for (idx, (strategy, mrx, latest, urx)) in specs.into_iter().enumerate() {
                     let stx = signal_tx.clone();
                     let dd = data_dirs.clone();
                     let iid = instance_ids[idx].clone();
@@ -5636,7 +5739,7 @@ impl Engine {
                         .spawn(move || {
                             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 Self::run_strategy_worker(
-                                    strategy, mrx, urx, stx, dd, &iid, idx, reg,
+                                    strategy, mrx, latest, urx, stx, dd, &iid, idx, reg,
                                     heartbeat, quarantined, shutdown_requested,
                                     ack_tx, clock_origin,
                                 );
@@ -5723,7 +5826,7 @@ impl Engine {
                                     Arc::new(event),
                                     &sym_to_instances,
                                     &mut token_to_instances,
-                                    &market_txs,
+                                    &market_lanes,
                                 ) {
                                     if let Some(drops) = market_overflow_drops.get_mut(idx) {
                                         *drops = drops.saturating_add(1);
@@ -5840,7 +5943,7 @@ impl Engine {
                 // Close direct private-update lanes before workers are
                 // released to generate their final reports.
                 drop(update_txs);
-                drop(market_txs);
+                drop(market_lanes);
                 for (idx, handle) in handles.into_iter().enumerate() {
                     if worker_quarantined[idx].load(Ordering::Acquire) {
                         drop(handle);
@@ -5948,36 +6051,22 @@ impl Engine {
         event: Arc<MarketEvent>,
         sym_to_instances: &HashMap<String, Vec<usize>>,
         token_to_instances: &mut HashMap<String, Vec<usize>>,
-        market_txs: &[Sender<QueuedMarketEvent>],
+        market_lanes: &[MarketEventLane],
     ) -> Vec<usize> {
-        let broadcast = |txs: &[Sender<QueuedMarketEvent>]| {
-            let enqueued_at = std::time::Instant::now();
+        let broadcast = |lanes: &[MarketEventLane]| {
             let mut dropped = Vec::new();
-            for (idx, tx) in txs.iter().enumerate() {
-                if tx
-                    .try_send(QueuedMarketEvent {
-                        event: Arc::clone(&event),
-                        enqueued_at,
-                    })
-                    .is_err()
-                {
+            for (idx, lane) in lanes.iter().enumerate() {
+                if !enqueue_market_event(lane, Arc::clone(&event)) {
                     dropped.push(idx);
                 }
             }
             dropped
         };
-        let send_to = |idxs: &[usize], txs: &[Sender<QueuedMarketEvent>]| {
-            let enqueued_at = std::time::Instant::now();
+        let send_to = |idxs: &[usize], lanes: &[MarketEventLane]| {
             let mut dropped = Vec::new();
             for &i in idxs {
-                if let Some(tx) = txs.get(i) {
-                    if tx
-                        .try_send(QueuedMarketEvent {
-                            event: Arc::clone(&event),
-                            enqueued_at,
-                        })
-                        .is_err()
-                    {
+                if let Some(lane) = lanes.get(i) {
+                    if !enqueue_market_event(lane, Arc::clone(&event)) {
                         dropped.push(i);
                     }
                 }
@@ -5997,7 +6086,7 @@ impl Engine {
                 for tok in &bo.clob_token_ids {
                     token_to_instances.insert(tok.to_ascii_lowercase(), owners.clone());
                 }
-                return send_to(&owners, market_txs);
+                return send_to(&owners, market_lanes);
             } else {
                 warn!(
                     "[strategy_router] dropping unroutable Polymarket instrument series={} event_slug={}",
@@ -6068,9 +6157,9 @@ impl Engine {
             MarketEvent::Exit => Some(Vec::new()),
         };
         match targets {
-            Some(idxs) if !idxs.is_empty() => send_to(&idxs, market_txs),
+            Some(idxs) if !idxs.is_empty() => send_to(&idxs, market_lanes),
             Some(_) => Vec::new(), // Exit handled by caller; empty = drop
-            None => broadcast(market_txs),
+            None => broadcast(market_lanes),
         }
     }
 
@@ -6109,6 +6198,7 @@ impl Engine {
     fn run_strategy_worker(
         mut strategy: Box<dyn Strategy>,
         market_rx: Receiver<QueuedMarketEvent>,
+        latest_market: Arc<LatestMarketStore>,
         update_rx: Receiver<QueuedOrderUpdate>,
         signal_tx: Sender<Signal>,
         data_dirs: Vec<PathBuf>,
@@ -6140,8 +6230,10 @@ impl Engine {
         let mut update_queue_samples = 0u64;
         let mut update_queue_total_us = 0u128;
         let mut update_queue_max_us = 0u64;
+        let mut private_update_burst = 0usize;
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
+        let never_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
         loop {
             if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
                 strategy.on_exit();
@@ -6149,12 +6241,19 @@ impl Engine {
                 heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                 let _ = shutdown_ack_tx.send(idx);
             }
-            // Private lifecycle changes have logical priority over public
-            // market ticks on the same strategy core. This avoids raising the
-            // entire user-feed runtime above the raw CLOB reader.
+            // Private lifecycle changes retain priority, but only for a finite
+            // burst. Once market work is waiting, force one public event so a
+            // fill storm cannot indefinitely starve quote freshness.
+            let selectable_update_rx =
+                if !private_update_lane_enabled(private_update_burst, !market_rx.is_empty()) {
+                    &never_update_rx
+                } else {
+                    &update_rx
+                };
             crossbeam_channel::select_biased! {
-                recv(update_rx) -> msg => match msg {
+                recv(selectable_update_rx) -> msg => match msg {
                     Ok(queued) => {
+                        private_update_burst = private_update_burst.saturating_add(1);
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         let queue_last_us = queued.enqueued_at.elapsed().as_micros()
@@ -6201,15 +6300,19 @@ impl Engine {
                     }
                 },
                 recv(market_rx) -> msg => match msg {
-                    Ok(queued) if matches!(queued.event.as_ref(), MarketEvent::Exit) => {
+                    Ok(queued) => {
+                        private_update_burst = 0;
+                        let Some(queued) = resolve_market_event(queued, &latest_market) else {
+                            continue;
+                        };
+                        if matches!(queued.event.as_ref(), MarketEvent::Exit) {
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if !shutdown_started {
                             strategy.on_exit();
                             shutdown_started = true;
                         }
                         break;
-                    }
-                    Ok(queued) => {
+                        }
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if shutdown_started { continue; }
@@ -6225,13 +6328,14 @@ impl Engine {
                                 queue_total_us as f64 / queue_samples as f64
                             };
                             info!(
-                                "[market_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={}",
+                                "[market_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} latest_replaced={}",
                                 instance_id,
                                 queue_samples,
                                 queue_last_us,
                                 avg_us,
                                 queue_max_us,
                                 market_rx.len(),
+                                latest_market.replacements.swap(0, Ordering::Relaxed),
                             );
                             queue_window_started = std::time::Instant::now();
                             queue_samples = 0;
@@ -7848,6 +7952,8 @@ impl Engine {
                         recovery_shared.account_state.order_audit_generation();
                     let mut warned_pending_ids = Vec::<String>::new();
                     let mut delivered_audit_fingerprints = HashMap::<String, String>::new();
+                    let mut completed_recoveries = 0u64;
+                    let mut completion_log_started = std::time::Instant::now();
                     while !recovery_shutdown.load(Ordering::Relaxed) {
                         let before = recovery_shared.account_state.monitoring_snapshot();
                         let pending = before
@@ -7886,17 +7992,25 @@ impl Engine {
                                 }
                             }
                             let after = recovery_shared.account_state.monitoring_snapshot();
+                            completed_recoveries = completed_recoveries.saturating_add(
+                                u64::try_from(
+                                    before
+                                        .recovery_pending_orders
+                                        .saturating_sub(after.recovery_pending_orders),
+                                )
+                                .unwrap_or(u64::MAX),
+                            );
                             if unresolved > 0 {
                                 let pending_ids = recovery_shared
                                     .account_state
                                     .recovery_pending_order_ids();
                                 if pending_ids != warned_pending_ids {
-                                warn!(
+                                    warn!(
                                         "[Engine] Polymarket account={} background recovery still pending: {} order(s) coids={:?}",
-                                    recovery_account_id,
-                                    unresolved,
+                                        recovery_account_id,
+                                        unresolved,
                                         pending_ids,
-                                );
+                                    );
                                     warned_pending_ids = pending_ids;
                                 } else {
                                     log::debug!(
@@ -7908,22 +8022,34 @@ impl Engine {
                             } else {
                                 warned_pending_ids.clear();
                                 if after.routine_cancel_audits > 0 {
-                                log::debug!(
-                                    "[Engine] Polymarket account={} routine cancel audits still pending: {} order(s)",
-                                    recovery_account_id,
-                                    after.routine_cancel_audits,
-                                );
-                            } else if before.recovery_pending_orders > 0 {
-                                info!(
-                                    "[Engine] Polymarket account={} background order recovery complete",
-                                    recovery_account_id,
-                                );
+                                    log::debug!(
+                                        "[Engine] Polymarket account={} routine cancel audits still pending: {} order(s)",
+                                        recovery_account_id,
+                                        after.routine_cancel_audits,
+                                    );
+                                }
                             }
-                        }
                         } else {
                             // A later audit for the same coid is a fresh edge
                             // and should receive one new WARN.
                             warned_pending_ids.clear();
+                        }
+
+                        // Flush on the worker's regular wakeup as well as on a
+                        // completion edge. Low-volume accounts must not retain
+                        // a non-empty aggregation bucket indefinitely.
+                        if completed_recoveries > 0
+                            && completion_log_started.elapsed()
+                                >= std::time::Duration::from_secs(30)
+                        {
+                            info!(
+                                "[Engine] Polymarket account={} background order recovery summary completed={} window_ms={}",
+                                recovery_account_id,
+                                completed_recoveries,
+                                completion_log_started.elapsed().as_millis(),
+                            );
+                            completed_recoveries = 0;
+                            completion_log_started = std::time::Instant::now();
                         }
                         // New terminal audits wake this account worker on the
                         // insertion edge. The bounded 500 ms timeout is only
@@ -7936,6 +8062,14 @@ impl Engine {
                                 audit_generation,
                                 std::time::Duration::from_millis(500),
                             );
+                    }
+                    if completed_recoveries > 0 {
+                        info!(
+                            "[Engine] Polymarket account={} background order recovery summary completed={} window_ms={} shutdown=true",
+                            recovery_account_id,
+                            completed_recoveries,
+                            completion_log_started.elapsed().as_millis(),
+                        );
                     }
                 })
             {
@@ -8333,6 +8467,7 @@ impl Engine {
                                 crate::os_tune::pin_background("poly-admission-stats");
                                 let mut prev = HashMap::new();
                                 let mut gap_prev: HashMap<String, (u64, u64)> = HashMap::new();
+                                let mut reservation_lock_prev: HashMap<String, u64> = HashMap::new();
                                 loop {
                                     let mut slept = 0;
                                     while slept < 30 {
@@ -8391,6 +8526,36 @@ impl Engine {
                                     }
                                     for account in &monitoring_accounts {
                                         let snapshot = account.monitoring_snapshot();
+                                        let reservation_acquisitions = snapshot
+                                            .reservation_control_lock
+                                            .acquisitions
+                                            .saturating_add(snapshot.reservation_coid_route_lock.acquisitions)
+                                            .saturating_add(snapshot.reservation_oid_route_lock.acquisitions)
+                                            .saturating_add(snapshot.reservation_lifecycle_lock.acquisitions);
+                                        let prior_acquisitions = reservation_lock_prev
+                                            .insert(snapshot.account_id.clone(), reservation_acquisitions)
+                                            .unwrap_or(0);
+                                        if reservation_acquisitions != prior_acquisitions {
+                                            let lock = |name: &str, metrics: &hexagent_account::account::shared_account::LockMonitoringSnapshot| {
+                                                format!(
+                                                    "{}:wait={}/{} hold={}/{} count={}",
+                                                    name,
+                                                    metrics.wait_last_us,
+                                                    metrics.wait_max_us,
+                                                    metrics.hold_last_us,
+                                                    metrics.hold_max_us,
+                                                    metrics.acquisitions,
+                                                )
+                                            };
+                                            info!(
+                                                "[account_lock_metric] account={} units=us {} {} {} {}",
+                                                snapshot.account_id,
+                                                lock("reservation_control", &snapshot.reservation_control_lock),
+                                                lock("coid_route", &snapshot.reservation_coid_route_lock),
+                                                lock("oid_route", &snapshot.reservation_oid_route_lock),
+                                                lock("lifecycle", &snapshot.reservation_lifecycle_lock),
+                                            );
+                                        }
                                         let log_account = || {
                                             format!(
                                                 "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
@@ -9391,42 +9556,42 @@ fn fire_or_execute(
             pending_trade_ids,
             ..
         } if !iid.is_empty() => match try_acquire(&iid, Role::Reconcile) {
-                None => {
-                    for update in reconcile_deferred_updates(
+            None => {
+                for update in reconcile_deferred_updates(
                     &iid,
                     &pending_places,
                     &pending_cancels,
                     &pending_trade_ids,
-                    ) {
+                ) {
                     if utx.send(update).is_err() {
                         break;
                     }
-                    }
                 }
-                Some(permit) => {
-                    let updates = match worker.poly_route_mut(&iid) {
-                        Ok(route) => route.reconcile_orphans_on(
-                            &permit,
+            }
+            Some(permit) => {
+                let updates = match worker.poly_route_mut(&iid) {
+                    Ok(route) => route.reconcile_orphans_on(
+                        &permit,
+                        &pending_places,
+                        &pending_cancels,
+                        &pending_trade_ids,
+                    ),
+                    Err(error) => {
+                        error!("[Executor] Polymarket reconcile route error: {}", error);
+                        reconcile_deferred_updates(
+                            &iid,
                             &pending_places,
                             &pending_cancels,
                             &pending_trade_ids,
-                        ),
-                        Err(error) => {
-                            error!("[Executor] Polymarket reconcile route error: {}", error);
-                            reconcile_deferred_updates(
-                                &iid,
-                                &pending_places,
-                                &pending_cancels,
-                                &pending_trade_ids,
-                            )
-                        }
-                    };
-                    for update in updates {
-                        if utx.send(update).is_err() {
-                            break;
-                        }
+                        )
+                    }
+                };
+                for update in updates {
+                    if utx.send(update).is_err() {
+                        break;
                     }
                 }
+            }
         },
         // Batch / cancel-all / non-poly / empty-iid → synchronous fallback.
         // polymaker's only batch signals are BatchCancelOrders (a leg pulling
@@ -10792,13 +10957,82 @@ mod market_router_tests {
         m
     }
 
+    fn test_market_lane(capacity: usize) -> (MarketEventLane, Receiver<QueuedMarketEvent>) {
+        let (tx, rx) = bounded(capacity);
+        (
+            MarketEventLane {
+                tx,
+                latest: Arc::new(LatestMarketStore::default()),
+                barrier_epoch: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn quote_and_orderbook_lane_keeps_only_latest_payload() {
+        let (lane, rx) = test_market_lane(8);
+        let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
+        let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
+        assert!(enqueue_market_event(&lane, first));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second)));
+        assert_eq!(rx.len(), 1, "one latest-only marker per venue/symbol/kind");
+        let payload = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        assert!(Arc::ptr_eq(&payload.event, &second));
+        assert_eq!(lane.latest.replacements.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn latest_only_never_reorders_across_a_direct_event() {
+        let (lane, rx) = test_market_lane(8);
+        let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
+        let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
+        assert!(enqueue_market_event(&lane, Arc::clone(&first)));
+        assert!(enqueue_market_event(
+            &lane,
+            Arc::new(MarketEvent::Connected {
+                exchange: Exchange::Binance,
+            }),
+        ));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second)));
+        assert_eq!(rx.len(), 3);
+
+        let before_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        assert!(Arc::ptr_eq(&before_barrier.event, &first));
+        let barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        assert!(matches!(
+            barrier.event.as_ref(),
+            MarketEvent::Connected {
+                exchange: Exchange::Binance
+            }
+        ));
+        let after_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        assert!(Arc::ptr_eq(&after_barrier.event, &second));
+    }
+
+    #[test]
+    fn private_update_priority_yields_after_bounded_burst() {
+        assert!(private_update_lane_enabled(
+            PRIVATE_UPDATE_BURST_BUDGET - 1,
+            true,
+        ));
+        assert!(!private_update_lane_enabled(
+            PRIVATE_UPDATE_BURST_BUDGET,
+            true,
+        ));
+        assert!(private_update_lane_enabled(
+            PRIVATE_UPDATE_BURST_BUDGET,
+            false,
+        ));
+    }
+
     #[test]
     fn spot_and_binance_ob_route_to_owning_instance_only() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (lane0, rx0) = test_market_lane(64);
+        let (lane1, rx1) = test_market_lane(64);
+        let txs = [lane0, lane1];
 
         // BTC Binance OB → only instance 0 (fixes cross-asset cadence).
         Engine::route_market_event(
@@ -10825,9 +11059,9 @@ mod market_router_tests {
     fn full_market_queue_drops_only_that_instance_without_blocking_router() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, _rx0) = bounded::<QueuedMarketEvent>(1);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(1);
-        let txs = [tx0, tx1];
+        let (lane0, _rx0) = test_market_lane(1);
+        let (lane1, rx1) = test_market_lane(1);
+        let txs = [lane0, lane1];
 
         assert_eq!(
             Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs,),
@@ -10849,9 +11083,9 @@ mod market_router_tests {
     fn polymarket_token_learned_from_instrument_then_routed() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (lane0, rx0) = test_market_lane(64);
+        let (lane1, rx1) = test_market_lane(64);
+        let txs = [lane0, lane1];
 
         // Instrument for BTC series carrying token "TOKxyz" → instance 0,
         // and the router learns TOKxyz → [0].
@@ -10902,9 +11136,9 @@ mod market_router_tests {
     fn unknown_polymarket_series_is_never_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (lane0, rx0) = test_market_lane(64);
+        let (lane1, rx1) = test_market_lane(64);
+        let txs = [lane0, lane1];
         Engine::route_market_event(
             Arc::new(MarketEvent::Instrument(binary_option(
                 "sol-up-or-down-5m",
@@ -10923,9 +11157,9 @@ mod market_router_tests {
     fn unknown_polymarket_market_data_is_never_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (lane0, rx0) = test_market_lane(64);
+        let (lane1, rx1) = test_market_lane(64);
+        let txs = [lane0, lane1];
 
         Engine::route_market_event(
             Arc::new(ob(Exchange::Polymarket, "UNMAPPED-TOKEN")),
@@ -10969,9 +11203,9 @@ mod market_router_tests {
     fn lifecycle_and_unknown_spot_symbols_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (tx0, rx0) = bounded::<QueuedMarketEvent>(64);
-        let (tx1, rx1) = bounded::<QueuedMarketEvent>(64);
-        let txs = [tx0, tx1];
+        let (lane0, rx0) = test_market_lane(64);
+        let (lane1, rx1) = test_market_lane(64);
+        let txs = [lane0, lane1];
 
         // Connected → all instances.
         Engine::route_market_event(
@@ -11042,9 +11276,9 @@ mod market_router_tests {
         let orders: Vec<&OrderRequest> = signals
             .iter()
             .flat_map(|signal| match signal {
-            Signal::NewOrder(order) => vec![order],
-            Signal::BatchNewOrders { orders, .. } => orders.iter().collect(),
-            _ => Vec::new(),
+                Signal::NewOrder(order) => vec![order],
+                Signal::BatchNewOrders { orders, .. } => orders.iter().collect(),
+                _ => Vec::new(),
             })
             .collect();
         assert_eq!(orders.len(), 2);
@@ -11354,7 +11588,7 @@ mod market_router_tests {
         let mut sym: HashMap<String, Vec<usize>> = HashMap::new();
         sym.insert("btcusdt".into(), vec![0, 1, 2, 3, 4]);
         let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
-        let (txs, rxs): (Vec<_>, Vec<_>) = (0..5).map(|_| bounded::<QueuedMarketEvent>(64)).unzip();
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..5).map(|_| test_market_lane(64)).unzip();
 
         Engine::route_market_event(
             Arc::new(ob(Exchange::Binance, "BTCUSDT")),
@@ -11362,11 +11596,16 @@ mod market_router_tests {
             &mut tok,
             &txs,
         );
-        let first = rxs[0].try_recv().expect("instance 0 event");
+        let first =
+            resolve_market_event(rxs[0].try_recv().expect("instance 0 event"), &txs[0].latest)
+                .expect("instance 0 payload");
         for (idx, rx) in rxs.iter().enumerate().skip(1) {
-            let event = rx
-                .try_recv()
-                .unwrap_or_else(|_| panic!("instance {idx} event"));
+            let event = resolve_market_event(
+                rx.try_recv()
+                    .unwrap_or_else(|_| panic!("instance {idx} event")),
+                &txs[idx].latest,
+            )
+            .unwrap_or_else(|| panic!("instance {idx} payload"));
             assert!(
                 Arc::ptr_eq(&first.event, &event.event),
                 "all five subscribers must share one MarketEvent allocation"

@@ -2221,14 +2221,25 @@ async fn user_feed_loop(
                                 continue;
                             }
 
-                            let t_parse = crate::latency::Instant::now();
+                            let frame_started = crate::latency::Instant::now();
+                            let json_started = crate::latency::Instant::now();
                             // simd-json drop-in for SIMD parse speedup.
                             let mut buf = text.as_bytes().to_vec();
                             let data = match simd_json::serde::from_slice::<serde_json::Value>(
                                 &mut buf,
                             ) {
-                                Ok(data) => data,
+                                Ok(data) => {
+                                    crate::latency::record(
+                                        "polymarket.user.json_parse",
+                                        json_started,
+                                    );
+                                    data
+                                }
                                 Err(error) => {
+                                    crate::latency::record(
+                                        "polymarket.user.json_parse",
+                                        json_started,
+                                    );
                                     shared.user_feed_health.set_recovering(true);
                                     shared.user_feed_health.set_inventory_uncertain(true);
                                     let raw: String = text.chars().take(256).collect();
@@ -2248,10 +2259,16 @@ async fn user_feed_loop(
                             let mut frame_has_invalid_business = false;
 
                             for event in &events {
+                                let account_apply_started = crate::latency::Instant::now();
                                 let parsed = parse_user_event_with_health(event, &shared);
+                                crate::latency::record(
+                                    "polymarket.user.account_apply",
+                                    account_apply_started,
+                                );
                                 frame_has_valid_business |= parsed.valid_business_event;
                                 frame_has_invalid_business |= parsed.invalid_business_event;
                                 for update in parsed.updates {
+                                    let dispatch_started = crate::latency::Instant::now();
                                     // RTT-probe traffic: the probe's synthetic
                                     // resting orders have no coid mapping, so
                                     // their placement / cancellation pushes
@@ -2288,7 +2305,7 @@ async fn user_feed_loop(
                                     } else {
                                         update.client_order_id.clone()
                                     };
-                                    info!(
+                                    debug!(
                                         "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
                                         update.symbol,
                                         coid_str,
@@ -2300,25 +2317,53 @@ async fn user_feed_loop(
                                     if update_tx.send(update).is_err() {
                                         return; // Channel closed
                                     }
+                                    crate::latency::record(
+                                        "polymarket.user.dispatch",
+                                        dispatch_started,
+                                    );
                                 }
                             }
+                            let health_apply_started = crate::latency::Instant::now();
                             if frame_has_valid_business {
                                 last_valid_business = Instant::now();
                                 shared
                                     .user_feed_health
                                     .record_valid_business_event(now_ns());
                             }
-                            // Full frame parse + dispatch latency: wall
-                            // time from text arrival to last OrderUpdate
-                            // forwarded to the engine.
-                            crate::latency::record("polymarket.user.event_parse", t_parse);
                             if frame_has_invalid_business {
                                 shared.user_feed_health.set_recovering(true);
                                 warn!(
                                     "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit",
                                 );
+                                crate::latency::record(
+                                    "polymarket.user.health_apply",
+                                    health_apply_started,
+                                );
+                                crate::latency::record(
+                                    "polymarket.user.frame_total",
+                                    frame_started,
+                                );
+                                crate::latency::record(
+                                    "polymarket.user.event_parse",
+                                    frame_started,
+                                );
                                 break;
                             }
+                            crate::latency::record(
+                                "polymarket.user.health_apply",
+                                health_apply_started,
+                            );
+                            crate::latency::record(
+                                "polymarket.user.frame_total",
+                                frame_started,
+                            );
+                            // Compatibility aggregate for existing live
+                            // dashboards; the four stage metrics above are the
+                            // actionable breakdown.
+                            crate::latency::record(
+                                "polymarket.user.event_parse",
+                                frame_started,
+                            );
                         }
                         Message::Ping(payload) => {
                             last_transport = Instant::now();

@@ -412,6 +412,12 @@ const CLOB_BOOK_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
 // timestamp).  Three milliseconds was below observed scheduler/network
 // jitter and promoted harmless frame reordering into REST repairs.
 const CLOB_BBO_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+/// A recovered checkpoint must remain continuously Healthy before strategy
+/// callbacks resume taker/requote activity. This is deliberately longer than
+/// the 50ms wire-level BBO settle window: repeated one-frame mismatches remain
+/// fail-closed immediately, but no longer produce a recovery order burst on
+/// every micro-flap.
+const CLOB_HEALTH_RECOVERY_STABLE_INTERVAL: Duration = Duration::from_millis(500);
 const CLOB_BBO_DIAGNOSTIC_FRAMES: usize = 4;
 const CLOB_BBO_MAX_SUPERSEDED_REPAIRS: u8 = 2;
 const CLOB_BURST_METRIC_INTERVAL: Duration = Duration::from_secs(1);
@@ -4306,16 +4312,17 @@ impl ClobLocalBooks {
         let reason = reason.into();
         let previous = self.health_states.get(&condition_id).copied();
 
-        // Entering a restrictive state is edge-triggered and immediate.  Only
-        // the noisy Settling→Healthy recovery is coalesced; a stable recovery
-        // is released by `flush_deferred_due` below.
+        // Entering a restrictive state is edge-triggered and immediate. Every
+        // non-healthy→Healthy edge is delayed; a stable recovery is released
+        // by `flush_deferred_due` below. A renewed restrictive observation
+        // removes the pending edge and restarts the full stable window.
         if state == MarketDataHealthState::Healthy
-            && previous == Some(MarketDataHealthState::Settling)
+            && previous.is_some_and(|previous| previous != MarketDataHealthState::Healthy)
         {
             self.pending_health_recoveries
                 .entry(condition_id)
                 .or_insert_with(|| PendingHealthRecovery {
-                    due_at: observed_at + CLOB_BBO_SETTLE_INTERVAL,
+                    due_at: observed_at + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL,
                     reason,
                 });
             return None;
@@ -4378,7 +4385,10 @@ impl ClobLocalBooks {
                 continue;
             };
             if self.desired_health_state(&condition_id) != Some(MarketDataHealthState::Healthy)
-                || self.health_states.get(&condition_id) != Some(&MarketDataHealthState::Settling)
+                || !self
+                    .health_states
+                    .get(&condition_id)
+                    .is_some_and(|state| *state != MarketDataHealthState::Healthy)
             {
                 continue;
             }
@@ -7202,8 +7212,10 @@ mod pick_current_event_tests {
             )),
             "Settling→Healthy recovery is coalesced until stable"
         );
-        let stable =
-            books.flush_deferred_due(received_at + Duration::from_millis(60), 17_060_000_000);
+        let stable = books.flush_deferred_due(
+            received_at + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL + Duration::from_millis(10),
+            17_510_000_000,
+        );
         assert!(
             stable.events.iter().any(|event| matches!(
                 event,
@@ -7289,7 +7301,21 @@ mod pick_current_event_tests {
         };
         assert_eq!(counters.bbo_recovery_rest, 1);
         assert_eq!(counters.bbo_recovery_samples, 1);
-        assert!(events.iter().any(|event| matches!(
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            MarketEvent::MarketDataHealth(MarketDataHealth {
+                state: MarketDataHealthState::Healthy,
+                ..
+            })
+        )));
+        let stable = books.flush_deferred_due(
+            received_at
+                + Duration::from_millis(60)
+                + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL
+                + Duration::from_millis(10),
+            17_870_000_000,
+        );
+        assert!(stable.events.iter().any(|event| matches!(
             event,
             MarketEvent::MarketDataHealth(MarketDataHealth {
                 state: MarketDataHealthState::Healthy,
