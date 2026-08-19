@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -935,10 +935,7 @@ mod polymarket_supervisor_tests {
         let event_end = 2_000_000_000_000;
 
         assert!(gate.admit(event_end, now));
-        assert!(!gate.admit(
-            event_end,
-            now + POLY_MARKET_DATA_REBUILD_COOLDOWN_NS - 1
-        ));
+        assert!(!gate.admit(event_end, now + POLY_MARKET_DATA_REBUILD_COOLDOWN_NS - 1));
         assert!(
             !gate.admit(event_end + 300_000_000_000, now + 1),
             "a routine event rotation must not bypass the worker rebuild cooldown"
@@ -1042,10 +1039,7 @@ mod polymarket_supervisor_tests {
                 .as_nanos()
                 .min(u64::MAX as u128) as u64,
         );
-        let action = assess_polymarket_replacement_recovery(
-            1,
-            &snapshot,
-        );
+        let action = assess_polymarket_replacement_recovery(1, &snapshot);
         assert!(matches!(
             action,
             Some(PolymarketSupervisorAction::Reconnect(reason))
@@ -1084,7 +1078,10 @@ mod polymarket_supervisor_tests {
         assert_eq!(failures, POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS);
 
         failures = next_failed_replacement_count(4, true, failures);
-        assert_eq!(failures, 0, "a generation that reached READY resets the breaker");
+        assert_eq!(
+            failures, 0,
+            "a generation that reached READY resets the breaker"
+        );
     }
 }
 
@@ -1277,6 +1274,41 @@ fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
     (stage_ns as i128 - origin_ns as i128) as f64 / 1_000_000.0
 }
 
+const QUOTE_TRIGGER_SLOW_NS: u64 = 10_000_000;
+const QUOTE_EXECUTOR_QUEUE_SLOW_NS: u64 = 5_000_000;
+const LIFECYCLE_SLOW_LOG_INTERVAL_NS: u64 = 10_000_000_000;
+static QUOTE_TRIGGER_SLOW_LOG_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+static QUOTE_TRIGGER_SLOW_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static QUOTE_EXECUTOR_SLOW_LOG_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+static QUOTE_EXECUTOR_SLOW_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+fn claim_lifecycle_slow_log(
+    silent_until_ns: &AtomicU64,
+    suppressed: &AtomicU64,
+    now: u64,
+) -> Option<u64> {
+    loop {
+        let current = silent_until_ns.load(Ordering::Relaxed);
+        if now < current {
+            suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        match silent_until_ns.compare_exchange_weak(
+            current,
+            now.saturating_add(LIFECYCLE_SLOW_LOG_INTERVAL_NS),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(suppressed.swap(0, Ordering::Relaxed)),
+            Err(observed) if now < observed => {
+                suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
 /// Attach the exact OrderBook event that caused `Strategy::on_quote` to run.
 /// The strategy only receives the local timestamp, so this engine boundary is
 /// the last place where both exchange and local clocks are still available.
@@ -1288,11 +1320,28 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
         order.quote_trigger_local_timestamp_ns = trigger.local_timestamp_ns;
         order.quote_trigger_source.clone_from(&source);
         if log_lifecycle {
-            info!(
-                "[order_lifecycle] stage=quote_signal coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
-                order.client_order_id,
-                order.instance_id,
-                order.quote_event_id,
+            let trigger_to_stage_ns = if order.quote_trigger_local_timestamp_ns == 0 {
+                0
+            } else {
+                stage_ns.saturating_sub(order.quote_trigger_local_timestamp_ns)
+            };
+            hexagent_runtime::latency::record_ns(
+                "strategy.trigger_to_quote_signal",
+                trigger_to_stage_ns,
+            );
+            if trigger_to_stage_ns >= QUOTE_TRIGGER_SLOW_NS {
+                let Some(suppressed) = claim_lifecycle_slow_log(
+                    &QUOTE_TRIGGER_SLOW_LOG_UNTIL_NS,
+                    &QUOTE_TRIGGER_SLOW_SUPPRESSED,
+                    stage_ns,
+                ) else {
+                    return;
+                };
+                warn!(
+                    "[order_lifecycle_slow] stage=quote_signal coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3} threshold_ms={:.3} suppressed_since_last={} log_interval_s={}",
+                    order.client_order_id,
+                    order.instance_id,
+                    order.quote_event_id,
                 order.symbol,
                 order.side,
                 order.quote_trigger_source,
@@ -1300,10 +1349,26 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
                 order.quote_trigger_local_timestamp_ns,
                 order.timestamp_ns,
                 stage_ns,
-                lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
-                lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
-                lifecycle_delta_ms(stage_ns, order.timestamp_ns),
-            );
+                    lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
+                    lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+                    lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+                    QUOTE_TRIGGER_SLOW_NS as f64 / 1_000_000.0,
+                    suppressed,
+                    LIFECYCLE_SLOW_LOG_INTERVAL_NS / 1_000_000_000,
+                );
+            } else {
+                debug!(
+                    "[order_lifecycle] stage=quote_signal coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+                    order.client_order_id,
+                    order.instance_id,
+                    order.quote_event_id,
+                    order.symbol,
+                    order.side,
+                    order.quote_trigger_source,
+                    lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+                    lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+                );
+            }
         }
     };
     for signal in signals {
@@ -1330,11 +1395,28 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
 fn log_executor_receive(signal: &Signal) {
     let stage_ns = now_ns();
     let log_order = |order: &OrderRequest| {
-        info!(
-            "[order_lifecycle] stage=executor_receive coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
-            order.client_order_id,
-            order.instance_id,
-            order.quote_event_id,
+        let quote_to_stage_ns = if order.timestamp_ns == 0 {
+            0
+        } else {
+            stage_ns.saturating_sub(order.timestamp_ns)
+        };
+        hexagent_runtime::latency::record_ns(
+            "strategy.quote_signal_to_executor",
+            quote_to_stage_ns,
+        );
+        if quote_to_stage_ns >= QUOTE_EXECUTOR_QUEUE_SLOW_NS {
+            let Some(suppressed) = claim_lifecycle_slow_log(
+                &QUOTE_EXECUTOR_SLOW_LOG_UNTIL_NS,
+                &QUOTE_EXECUTOR_SLOW_SUPPRESSED,
+                stage_ns,
+            ) else {
+                return;
+            };
+            warn!(
+                "[order_lifecycle_slow] stage=executor_receive coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3} threshold_ms={:.3} suppressed_since_last={} log_interval_s={}",
+                order.client_order_id,
+                order.instance_id,
+                order.quote_event_id,
             order.symbol,
             order.side,
             order.quote_trigger_source,
@@ -1342,10 +1424,26 @@ fn log_executor_receive(signal: &Signal) {
             order.quote_trigger_local_timestamp_ns,
             order.timestamp_ns,
             stage_ns,
-            lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
-            lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
-            lifecycle_delta_ms(stage_ns, order.timestamp_ns),
-        );
+                lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
+                lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+                lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+                QUOTE_EXECUTOR_QUEUE_SLOW_NS as f64 / 1_000_000.0,
+                suppressed,
+                LIFECYCLE_SLOW_LOG_INTERVAL_NS / 1_000_000_000,
+            );
+        } else {
+            debug!(
+                "[order_lifecycle] stage=executor_receive coid={} iid={} event={} symbol={} side={} trigger_source={} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3}",
+                order.client_order_id,
+                order.instance_id,
+                order.quote_event_id,
+                order.symbol,
+                order.side,
+                order.quote_trigger_source,
+                lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
+                lifecycle_delta_ms(stage_ns, order.timestamp_ns),
+            );
+        }
     };
     match signal {
         Signal::NewOrder(order) => log_order(order),
@@ -5495,10 +5593,11 @@ impl Engine {
         )> = Vec::with_capacity(strategies.len());
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
-            // One direct lossless lane per strategy. The router quarantines an
-            // instance at CHANNEL_CAPACITY depth, bounding memory without the
-            // extra dispatcher thread/hop on every private lifecycle update.
-            let (utx, urx) = unbounded::<QueuedOrderUpdate>();
+            // One direct bounded lane per strategy. Private updates must never
+            // block the shared router behind a stalled instance: a full lane is
+            // treated as event loss, quarantines only that owner, and triggers
+            // its fail-closed emergency cancellation path.
+            let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
             market_txs.push(mtx);
             update_txs.push(utx);
             specs.push((s, mrx, urx));
@@ -5788,14 +5887,14 @@ impl Engine {
 
         match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
             PrivateUpdateRoute::Owner(i) => {
-                let sent = update_txs[i].send(QueuedOrderUpdate {
+                let sent = update_txs[i].try_send(QueuedOrderUpdate {
                     update,
                     enqueued_at: std::time::Instant::now(),
                 });
-                if sent.is_ok() && update_txs[i].len() >= CHANNEL_CAPACITY {
+                if sent.is_err() {
                     quarantine_strategy_worker(
                         i,
-                        "private update queue reached isolation limit",
+                        "private update queue overflow/disconnect (event loss)",
                         instance_ids,
                         worker_quarantined,
                         signal_tx,
@@ -5818,14 +5917,14 @@ impl Engine {
                     if worker_quarantined[idx].load(Ordering::Acquire) {
                         continue;
                     }
-                    let sent = tx.send(QueuedOrderUpdate {
+                    let sent = tx.try_send(QueuedOrderUpdate {
                         update: update.clone(),
                         enqueued_at,
                     });
-                    if sent.is_ok() && tx.len() >= CHANNEL_CAPACITY {
+                    if sent.is_err() {
                         quarantine_strategy_worker(
                             idx,
-                            "private update queue reached isolation limit",
+                            "private update broadcast queue overflow/disconnect (event loss)",
                             instance_ids,
                             worker_quarantined,
                             signal_tx,
@@ -8103,8 +8202,8 @@ impl Engine {
                 let mut poly_stats_handle: Option<thread::JoinHandle<()>> = None;
                 if !poly_states.is_empty() {
                     // Hot-path admission is account-scoped: all instances on
-                    // one wallet share 4N order and 2N reconcile slots; each
-                    // account also owns two gap-replay slots. The pools were
+                    // one wallet share 4N placement, 4N cancel, and 2N
+                    // reconcile slots; each account also owns two gap-replay slots. The pools were
                     // built before SharedState prewarm.
                     if !hexagent_runtime::http1_pool::account_pools_ready() {
                         warn!(
@@ -8112,7 +8211,7 @@ impl Engine {
                         );
                     }
                     // One drainer per possible in-flight fired request
-                    // (Σ account order slots) + slack, so a fired request
+                    // (Σ account placement+cancel slots) + slack, so a fired request
                     // never waits for a drainer while holding its permit. Derived
                     // from the actual registry rather than duplicating sizing.
                     let n_drainers =
@@ -8158,8 +8257,8 @@ impl Engine {
                             .unwrap();
                         poly_worker_handles.push(h);
                     }
-                    let cancel_worker_n = hexagent_runtime::http1_pool::total_account_order_capacity()
-                        .max(1);
+                    let cancel_worker_n =
+                        hexagent_runtime::http1_pool::total_account_cancel_capacity().max(1);
                     for i in 0..cancel_worker_n {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_cancel_rx.clone();
@@ -8294,7 +8393,7 @@ impl Engine {
                                         let snapshot = account.monitoring_snapshot();
                                         let log_account = || {
                                             format!(
-                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
+                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
                                                 snapshot.physical_cash,
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
@@ -8316,6 +8415,11 @@ impl Engine {
                                                 snapshot.maintenance_queue_last_wait_ms,
                                                 snapshot.maintenance_queue_max_wait_ms,
                                                 snapshot.maintenance_queue_jobs,
+                                                snapshot.account_lock_wait_last_us,
+                                                snapshot.account_lock_wait_max_us,
+                                                snapshot.account_lock_hold_last_us,
+                                                snapshot.account_lock_hold_max_us,
+                                                snapshot.account_lock_acquisitions,
                                                 snapshot.persistence_path,
                                                 snapshot.persistence_error,
                                                 snapshot.persistence_write_last_us,
@@ -9001,14 +9105,12 @@ fn shed_saturated_place_signal(
             timestamp_ns,
             instance_id,
         } => {
-            let cancel = (!cancel_client_order_ids.is_empty()).then(|| {
-                Signal::BatchCancelOrders {
-                    exchange,
-                    market_id,
-                    client_order_ids: cancel_client_order_ids,
-                    instance_id,
-                    timestamp_ns,
-                }
+            let cancel = (!cancel_client_order_ids.is_empty()).then(|| Signal::BatchCancelOrders {
+                exchange,
+                market_id,
+                client_order_ids: cancel_client_order_ids,
+                instance_id,
+                timestamp_ns,
             });
             (place_orders, cancel)
         }
@@ -9049,12 +9151,9 @@ fn defer_reconcile_signal(signal: Signal, utx: &Sender<OrderUpdate>) {
         "[Executor] Polymarket reconcile lane saturated iid={}; returning deferred feedback",
         iid,
     );
-    for update in reconcile_deferred_updates(
-        &iid,
-        &pending_places,
-        &pending_cancels,
-        &pending_trade_ids,
-    ) {
+    for update in
+        reconcile_deferred_updates(&iid, &pending_places, &pending_cancels, &pending_trade_ids)
+    {
         if utx.send(update).is_err() {
             break;
         }

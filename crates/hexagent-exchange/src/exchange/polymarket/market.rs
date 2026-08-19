@@ -1247,12 +1247,7 @@ pub fn fetch_contiguous_next_event(
 ) -> Result<Option<PolymarketEvent>> {
     const ATTEMPTS: usize = 5;
     for attempt in 1..=ATTEMPTS {
-        let event = fetch_next_event_inner(
-            series_id,
-            end_date_min_secs,
-            attempt == 1,
-            false,
-        )?;
+        let event = fetch_next_event_inner(series_id, end_date_min_secs, attempt == 1, false)?;
         match event {
             Some(event) => {
                 if let Some(reason) = contiguous_event_error(
@@ -2046,7 +2041,9 @@ impl ClobWireCounters {
         self.bbo_repair_superseded_by_ws = self
             .bbo_repair_superseded_by_ws
             .saturating_add(rhs.bbo_repair_superseded_by_ws);
-        self.bbo_settle_samples = self.bbo_settle_samples.saturating_add(rhs.bbo_settle_samples);
+        self.bbo_settle_samples = self
+            .bbo_settle_samples
+            .saturating_add(rhs.bbo_settle_samples);
         self.bbo_settle_total_us = self
             .bbo_settle_total_us
             .saturating_add(rhs.bbo_settle_total_us);
@@ -2064,9 +2061,7 @@ impl ClobWireCounters {
         self.bbo_tick_distance_total = self
             .bbo_tick_distance_total
             .saturating_add(rhs.bbo_tick_distance_total);
-        self.bbo_tick_distance_max = self
-            .bbo_tick_distance_max
-            .max(rhs.bbo_tick_distance_max);
+        self.bbo_tick_distance_max = self.bbo_tick_distance_max.max(rhs.bbo_tick_distance_max);
         self.unseeded_deltas = self.unseeded_deltas.saturating_add(rhs.unseeded_deltas);
         self.ignored = self.ignored.saturating_add(rhs.ignored);
         self.unknown = self.unknown.saturating_add(rhs.unknown);
@@ -2098,6 +2093,13 @@ struct ClobWindowMetrics {
     ws_sends: u64,
     ws_send_errors: u64,
     ws_send_max_us: u64,
+    forward_calls: u64,
+    forward_events: u64,
+    forward_total_us: u64,
+    forward_max_us: u64,
+    event_send_max_us: u64,
+    event_send_over_1ms: u64,
+    event_send_full: u64,
 }
 
 impl ClobWindowMetrics {
@@ -2126,6 +2128,13 @@ impl ClobWindowMetrics {
             ws_sends: 0,
             ws_send_errors: 0,
             ws_send_max_us: 0,
+            forward_calls: 0,
+            forward_events: 0,
+            forward_total_us: 0,
+            forward_max_us: 0,
+            event_send_max_us: 0,
+            event_send_over_1ms: 0,
+            event_send_full: 0,
         }
     }
 
@@ -2196,12 +2205,60 @@ impl ClobWindowMetrics {
         self.max_event_queue_depth = self.max_event_queue_depth.max(depth);
     }
 
+    fn record_event_send(&mut self, elapsed: Duration, was_full: bool) {
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.event_send_max_us = self.event_send_max_us.max(elapsed_us);
+        self.event_send_over_1ms = self
+            .event_send_over_1ms
+            .saturating_add(u64::from(elapsed >= Duration::from_millis(1)));
+        self.event_send_full = self.event_send_full.saturating_add(u64::from(was_full));
+    }
+
+    fn record_forward(&mut self, elapsed: Duration, event_count: usize) {
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.forward_calls = self.forward_calls.saturating_add(1);
+        self.forward_events = self.forward_events.saturating_add(event_count as u64);
+        self.forward_total_us = self.forward_total_us.saturating_add(elapsed_us);
+        self.forward_max_us = self.forward_max_us.max(elapsed_us);
+    }
+
+    fn close_summary(&self, now: Instant, queue_depth_now: usize) -> String {
+        format!(
+            "clob_window_ms={} frames={} frame_bytes={} max_frame_bytes={} events={} forward_calls={} forward_events={} forward_avg_us={:.1} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} event_queue_depth={} event_queue_high_water={} health_healthy={} health_settling={} health_repairing={} health_degraded={} bbo_settle_max_us={} parse_errors={} ws_send_max_us={}",
+            now.saturating_duration_since(self.window_started_at).as_millis(),
+            self.data_frames,
+            self.frame_bytes,
+            self.max_frame_bytes,
+            self.events,
+            self.forward_calls,
+            self.forward_events,
+            if self.forward_calls == 0 {
+                0.0
+            } else {
+                self.forward_total_us as f64 / self.forward_calls as f64
+            },
+            self.forward_max_us,
+            self.event_send_max_us,
+            self.event_send_over_1ms,
+            self.event_send_full,
+            queue_depth_now,
+            self.max_event_queue_depth,
+            self.health_healthy,
+            self.health_settling,
+            self.health_repairing,
+            self.health_degraded,
+            self.wire.bbo_settle_max_us,
+            self.wire.parse_errors,
+            self.ws_send_max_us,
+        )
+    }
+
     fn log_and_reset(&mut self, now: Instant, queue_depth_now: usize) {
         let window_secs = now
             .saturating_duration_since(self.window_started_at)
             .as_secs_f64();
         info!(
-            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} health_healthy={} health_settling={} health_repairing={} health_degraded={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} bbo_recovery_same_ts={} bbo_recovery_newer_ts={} bbo_recovery_book={} bbo_recovery_rest={} bbo_repair_superseded_by_ws={} bbo_settle_samples={} bbo_settle_total_us={} bbo_settle_max_us={} bbo_recovery_samples={} bbo_recovery_total_us={} bbo_recovery_max_us={} bbo_tick_distance_samples={} bbo_tick_distance_total={} bbo_tick_distance_max={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} health_healthy={} health_settling={} health_repairing={} health_degraded={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} forward_calls={} forward_events={} forward_total_us={} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} bbo_recovery_same_ts={} bbo_recovery_newer_ts={} bbo_recovery_book={} bbo_recovery_rest={} bbo_repair_superseded_by_ws={} bbo_settle_samples={} bbo_settle_total_us={} bbo_settle_max_us={} bbo_recovery_samples={} bbo_recovery_total_us={} bbo_recovery_max_us={} bbo_tick_distance_samples={} bbo_tick_distance_total={} bbo_tick_distance_max={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
             window_secs,
             self.data_frames,
             self.frame_bytes,
@@ -2219,6 +2276,13 @@ impl ClobWindowMetrics {
             self.max_events_per_frame,
             queue_depth_now,
             self.max_event_queue_depth,
+            self.forward_calls,
+            self.forward_events,
+            self.forward_total_us,
+            self.forward_max_us,
+            self.event_send_max_us,
+            self.event_send_over_1ms,
+            self.event_send_full,
             self.bbo_change_snapshots,
             self.coalesced_snapshots,
             self.wire.books,
@@ -2602,6 +2666,8 @@ fn forward_clob_events(
     tokens: &[String],
     now: Instant,
 ) -> bool {
+    let forward_started = Instant::now();
+    let mut forwarded = 0usize;
     let has_usable_book = events
         .iter()
         .any(|event| is_usable_subscribed_book_event(event, tokens));
@@ -2609,9 +2675,20 @@ fn forward_clob_events(
         health.record_usable_book(now);
     }
     for event in events {
-        if event_tx.send(event).is_err() {
+        let was_full = event_tx.is_full();
+        let send_started = Instant::now();
+        let send_result = event_tx.send(event);
+        diagnostics.record_event_send(send_started.elapsed(), was_full);
+        if send_result.is_err() {
+            let elapsed = forward_started.elapsed();
+            diagnostics.record_forward(elapsed, forwarded);
+            crate::latency::record_ns(
+                "polymarket.ws.clob_forward",
+                elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            );
             return false;
         }
+        forwarded += 1;
     }
     diagnostics.record_queue_depth(event_tx.len());
 
@@ -2630,16 +2707,31 @@ fn forward_clob_events(
                     .unwrap_or_else(|| "initial".to_string()),
                 transition.reason.as_deref().unwrap_or("initial_startup"),
             );
-            if event_tx
-                .send(MarketEvent::Connected {
-                    exchange: Exchange::Polymarket,
-                })
-                .is_err()
-            {
+            let was_full = event_tx.is_full();
+            let send_started = Instant::now();
+            let send_result = event_tx.send(MarketEvent::Connected {
+                exchange: Exchange::Polymarket,
+            });
+            diagnostics.record_event_send(send_started.elapsed(), was_full);
+            if send_result.is_err() {
+                let elapsed = forward_started.elapsed();
+                diagnostics.record_forward(elapsed, forwarded);
+                crate::latency::record_ns(
+                    "polymarket.ws.clob_forward",
+                    elapsed.as_nanos().min(u64::MAX as u128) as u64,
+                );
                 return false;
             }
+            forwarded += 1;
         }
     }
+    diagnostics.record_queue_depth(event_tx.len());
+    let elapsed = forward_started.elapsed();
+    diagnostics.record_forward(elapsed, forwarded);
+    crate::latency::record_ns(
+        "polymarket.ws.clob_forward",
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+    );
     true
 }
 
@@ -3026,6 +3118,7 @@ async fn clob_ws_task(
                                 } else if let Some(event) = books.mark_repair_failed(
                                     &repair.token,
                                     "authoritative BBO repair remained older than websocket state",
+                                    now,
                                     local_now,
                                 ) {
                                     repair_superseded_attempts.remove(&repair.token);
@@ -3053,6 +3146,7 @@ async fn clob_ws_task(
                                 if let Some(event) = books.mark_repair_failed(
                                     &repair.token,
                                     format!("authoritative BBO repair rejected: {error}"),
+                                    now,
                                     local_now,
                                 ) {
                                     diagnostics.record_coalesced(std::slice::from_ref(&event));
@@ -3080,6 +3174,7 @@ async fn clob_ws_task(
                             if let Some(event) = books.mark_repair_failed(
                                 &repair.token,
                                 format!("authoritative BBO repair failed: {error}"),
+                                now,
                                 local_now,
                             ) {
                                 diagnostics.record_coalesced(std::slice::from_ref(&event));
@@ -3357,14 +3452,16 @@ async fn clob_ws_task(
                             );
                             match reason.as_ref() {
                                 Some(frame) => warn!(
-                                    "[clob_close_metric] code={:?} reason={:?} {}",
+                                    "[clob_close_metric] code={:?} reason={:?} {} {}",
                                     frame.code,
                                     frame.reason,
                                     health.clob_summary(received_at),
+                                    diagnostics.close_summary(received_at, event_tx.len()),
                                 ),
                                 None => warn!(
-                                    "[clob_close_metric] code=none reason=none {}",
+                                    "[clob_close_metric] code=none reason=none {} {}",
                                     health.clob_summary(received_at),
+                                    diagnostics.close_summary(received_at, event_tx.len()),
                                 ),
                             }
                             warn!(
@@ -4106,7 +4203,19 @@ struct ClobLocalBooks {
     repair_started_at: HashMap<String, Instant>,
     degraded_tokens: HashSet<String>,
     health_states: HashMap<String, MarketDataHealthState>,
+    /// A transient BBO mismatch must stop taker use immediately, but a
+    /// matching checkpoint in the very next frame should not produce a
+    /// Settling→Healthy callback pair for every microbatch.  Keep the
+    /// condition in Settling until Healthy has remained stable for one settle
+    /// interval.  Any renewed non-Healthy state cancels the pending recovery.
+    pending_health_recoveries: HashMap<String, PendingHealthRecovery>,
     wire_sequence: u64,
+}
+
+#[derive(Debug)]
+struct PendingHealthRecovery {
+    due_at: Instant,
+    reason: String,
 }
 
 impl ClobLocalBooks {
@@ -4189,22 +4298,51 @@ impl ClobLocalBooks {
         &mut self,
         token: &str,
         reason: impl Into<String>,
+        observed_at: Instant,
         local_now: u64,
     ) -> Option<MarketEvent> {
         let condition_id = self.market_key(token);
         let state = self.desired_health_state(&condition_id)?;
+        let reason = reason.into();
+        let previous = self.health_states.get(&condition_id).copied();
+
+        // Entering a restrictive state is edge-triggered and immediate.  Only
+        // the noisy Settling→Healthy recovery is coalesced; a stable recovery
+        // is released by `flush_deferred_due` below.
+        if state == MarketDataHealthState::Healthy
+            && previous == Some(MarketDataHealthState::Settling)
+        {
+            self.pending_health_recoveries
+                .entry(condition_id)
+                .or_insert_with(|| PendingHealthRecovery {
+                    due_at: observed_at + CLOB_BBO_SETTLE_INTERVAL,
+                    reason,
+                });
+            return None;
+        }
+        self.pending_health_recoveries.remove(&condition_id);
         if self.health_states.get(&condition_id) == Some(&state) {
             return None;
         }
         self.health_states.insert(condition_id.clone(), state);
+        Some(self.health_event(&condition_id, token, state, reason, local_now))
+    }
+
+    fn health_event(
+        &self,
+        condition_id: &str,
+        fallback_token: &str,
+        state: MarketDataHealthState,
+        reason: String,
+        local_now: u64,
+    ) -> MarketEvent {
         let symbol = self
             .roles
             .iter()
             .find_map(|(candidate, role)| {
-                (role.condition_id == condition_id && !role.is_down)
-                    .then_some(candidate.clone())
+                (role.condition_id == condition_id && !role.is_down).then_some(candidate.clone())
             })
-            .unwrap_or_else(|| token.to_string());
+            .unwrap_or_else(|| fallback_token.to_string());
         let (passive_ready, taker_ready) = match state {
             MarketDataHealthState::Healthy => (true, true),
             // L1 advertised by the venue remains available for passive
@@ -4213,26 +4351,59 @@ impl ClobLocalBooks {
             MarketDataHealthState::Settling | MarketDataHealthState::Repairing => (true, false),
             MarketDataHealthState::Degraded => (false, false),
         };
-        Some(MarketEvent::MarketDataHealth(MarketDataHealth {
+        MarketEvent::MarketDataHealth(MarketDataHealth {
             exchange: Exchange::Polymarket,
-            market_id: condition_id,
+            market_id: condition_id.to_string(),
             symbol,
             state,
             passive_ready,
             taker_ready,
-            reason: reason.into(),
+            reason,
             local_timestamp_ns: local_now,
-        }))
+        })
+    }
+
+    fn flush_health_recoveries_due(&mut self, now: Instant, local_now: u64) -> Vec<MarketEvent> {
+        let mut due: Vec<_> = self
+            .pending_health_recoveries
+            .iter()
+            .filter_map(|(condition_id, pending)| {
+                (now >= pending.due_at).then_some(condition_id.clone())
+            })
+            .collect();
+        due.sort();
+        let mut events = Vec::with_capacity(due.len());
+        for condition_id in due {
+            let Some(pending) = self.pending_health_recoveries.remove(&condition_id) else {
+                continue;
+            };
+            if self.desired_health_state(&condition_id) != Some(MarketDataHealthState::Healthy)
+                || self.health_states.get(&condition_id) != Some(&MarketDataHealthState::Settling)
+            {
+                continue;
+            }
+            self.health_states
+                .insert(condition_id.clone(), MarketDataHealthState::Healthy);
+            events.push(self.health_event(
+                &condition_id,
+                &condition_id,
+                MarketDataHealthState::Healthy,
+                pending.reason,
+                local_now,
+            ));
+        }
+        events
     }
 
     fn mark_repair_failed(
         &mut self,
         token: &str,
         reason: impl Into<String>,
+        observed_at: Instant,
         local_now: u64,
     ) -> Option<MarketEvent> {
         self.degraded_tokens.insert(token.to_string());
-        self.reconcile_health(token, reason, local_now)
+        self.reconcile_health(token, reason, observed_at, local_now)
     }
 
     fn price_is_on_current_tick(&self, token: &str, price: Decimal) -> bool {
@@ -4372,9 +4543,8 @@ impl ClobLocalBooks {
         if let Some(current) = self.token_books.get(&symbol) {
             if exchange_timestamp_ns < current.exchange_timestamp_ns {
                 if source == ClobBookSource::RestRepair {
-                    counters.bbo_repair_superseded_by_ws = counters
-                        .bbo_repair_superseded_by_ws
-                        .saturating_add(1);
+                    counters.bbo_repair_superseded_by_ws =
+                        counters.bbo_repair_superseded_by_ws.saturating_add(1);
                 }
                 return Ok(ClobBookApplyOutcome::Superseded {
                     incoming_timestamp_ns: exchange_timestamp_ns,
@@ -4418,12 +4588,10 @@ impl ClobLocalBooks {
             if !was_quarantined {
                 match source {
                     ClobBookSource::Websocket => {
-                        counters.bbo_recovery_book =
-                            counters.bbo_recovery_book.saturating_add(1)
+                        counters.bbo_recovery_book = counters.bbo_recovery_book.saturating_add(1)
                     }
                     ClobBookSource::RestRepair => {
-                        counters.bbo_recovery_rest =
-                            counters.bbo_recovery_rest.saturating_add(1)
+                        counters.bbo_recovery_rest = counters.bbo_recovery_rest.saturating_add(1)
                     }
                 }
             }
@@ -4460,6 +4628,7 @@ impl ClobLocalBooks {
                 ClobBookSource::Websocket => "authoritative websocket book",
                 ClobBookSource::RestRepair => "authoritative REST repair",
             },
+            received_at,
             local_now,
         ) {
             events.push(event);
@@ -4489,13 +4658,11 @@ impl ClobLocalBooks {
                     counters.bbo_transient_recoveries.saturating_add(1);
                 record_bbo_settle_duration(counters, finished_at, pending.first_observed_at);
                 if pending.saw_newer_checkpoint {
-                    counters.bbo_recovery_newer_timestamp = counters
-                        .bbo_recovery_newer_timestamp
-                        .saturating_add(1);
+                    counters.bbo_recovery_newer_timestamp =
+                        counters.bbo_recovery_newer_timestamp.saturating_add(1);
                 } else {
-                    counters.bbo_recovery_same_timestamp = counters
-                        .bbo_recovery_same_timestamp
-                        .saturating_add(1);
+                    counters.bbo_recovery_same_timestamp =
+                        counters.bbo_recovery_same_timestamp.saturating_add(1);
                 }
             }
             if pending.awaiting_tick_change {
@@ -4570,19 +4737,16 @@ impl ClobLocalBooks {
             counters.bbo_transient_recoveries = counters.bbo_transient_recoveries.saturating_add(1);
             record_bbo_settle_duration(counters, now, pending.first_observed_at);
             if pending.saw_newer_checkpoint {
-                counters.bbo_recovery_newer_timestamp = counters
-                    .bbo_recovery_newer_timestamp
-                    .saturating_add(1);
+                counters.bbo_recovery_newer_timestamp =
+                    counters.bbo_recovery_newer_timestamp.saturating_add(1);
             } else {
-                counters.bbo_recovery_same_timestamp = counters
-                    .bbo_recovery_same_timestamp
-                    .saturating_add(1);
+                counters.bbo_recovery_same_timestamp =
+                    counters.bbo_recovery_same_timestamp.saturating_add(1);
             }
         }
         if self.quarantined_tokens.remove(token) {
-            counters.bbo_repair_superseded_by_ws = counters
-                .bbo_repair_superseded_by_ws
-                .saturating_add(1);
+            counters.bbo_repair_superseded_by_ws =
+                counters.bbo_repair_superseded_by_ws.saturating_add(1);
             if let Some(started_at) = self.repair_started_at.remove(token) {
                 record_bbo_recovery_duration(counters, now, started_at);
             }
@@ -4594,6 +4758,7 @@ impl ClobLocalBooks {
     fn apply_tick_size_change(
         &mut self,
         change: &TickSizeChange,
+        received_at: Instant,
         local_now: u64,
         counters: &mut ClobWireCounters,
     ) -> Vec<MarketEvent> {
@@ -4641,7 +4806,7 @@ impl ClobLocalBooks {
                     pending.awaiting_tick_change = false;
                 }
             }
-            if self.resolve_pending_if_ready(&token, Instant::now(), counters) {
+            if self.resolve_pending_if_ready(&token, received_at, counters) {
                 if let Some(book) = self.token_books.get_mut(&token) {
                     book.dirty_since = None;
                 }
@@ -4649,9 +4814,12 @@ impl ClobLocalBooks {
                     push_latest_order_book(&mut events, event);
                 }
             }
-            if let Some(event) =
-                self.reconcile_health(&token, "tick-size/BBO batch settled", local_now)
-            {
+            if let Some(event) = self.reconcile_health(
+                &token,
+                "tick-size/BBO batch settled",
+                received_at,
+                local_now,
+            ) {
                 events.push(event);
             }
         }
@@ -4672,6 +4840,11 @@ impl ClobLocalBooks {
                 self.pending_quotes
                     .values()
                     .map(|pending| pending.received_at + CLOB_BBO_SETTLE_INTERVAL),
+            )
+            .chain(
+                self.pending_health_recoveries
+                    .values()
+                    .map(|pending| pending.due_at),
             )
             .min()
     }
@@ -4708,6 +4881,7 @@ impl ClobLocalBooks {
                 } else {
                     "BBO settled"
                 },
+                now,
                 local_now,
             ) {
                 batch.events.push(event);
@@ -4740,6 +4914,9 @@ impl ClobLocalBooks {
             }
         }
         batch
+            .events
+            .extend(self.flush_health_recoveries_due(now, local_now));
+        batch
     }
 
     fn apply_price_change(
@@ -4752,10 +4929,11 @@ impl ClobLocalBooks {
     ) -> (Vec<MarketEvent>, usize, Vec<String>) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
         let mut immediate = Vec::new();
-        let entry_counts: HashMap<String, usize> = fields
-            .price_changes
-            .iter()
-            .fold(HashMap::new(), |mut counts, change| {
+        let entry_counts: HashMap<String, usize> =
+            fields
+                .price_changes
+                .iter()
+                .fold(HashMap::new(), |mut counts, change| {
                 *counts.entry(change.asset_id.clone()).or_insert(0) += 1;
                 counts
             });
@@ -4898,11 +5076,11 @@ impl ClobLocalBooks {
                 actual.0,
                 actual.1,
             );
-            let pending = self
-                .pending_bbo
-                .entry(token.clone())
-                .or_insert_with(|| PendingBboCheck {
-                    exchange_timestamp_ns,
+            let pending =
+                self.pending_bbo
+                    .entry(token.clone())
+                    .or_insert_with(|| PendingBboCheck {
+                        exchange_timestamp_ns,
                     expected: ReportedBbo::default(),
                     first_observed_at: received_at,
                     last_update_at: received_at,
@@ -4932,7 +5110,10 @@ impl ClobLocalBooks {
                 pending.frame_summaries.pop_front();
             }
             let advertised_l1 = if !pending.expected.matches(actual) {
-                match (pending.expected.bid.flatten(), pending.expected.ask.flatten()) {
+                match (
+                    pending.expected.bid.flatten(),
+                    pending.expected.ask.flatten(),
+                ) {
                     (Some(bid), Some(ask)) if bid < ask => Some((bid, ask)),
                     _ => None,
                 }
@@ -5001,9 +5182,12 @@ impl ClobLocalBooks {
         let mut reconciled_markets = HashSet::new();
         for token in health_tokens {
             if reconciled_markets.insert(self.market_key(&token)) {
-                if let Some(event) =
-                    self.reconcile_health(&token, "BBO checkpoint state changed", local_now)
-                {
+                if let Some(event) = self.reconcile_health(
+                    &token,
+                    "BBO checkpoint state changed",
+                    received_at,
+                    local_now,
+                ) {
                     immediate.push(event);
                 }
             }
@@ -5217,8 +5401,12 @@ fn process_clob_frame(
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
                 match make_tick_size_event(fields, local_now) {
                     Some(MarketEvent::TickSizeChange(change)) => {
-                        let released =
-                            books.apply_tick_size_change(&change, local_now, &mut batch.wire);
+                        let released = books.apply_tick_size_change(
+                            &change,
+                            received_at,
+                            local_now,
+                            &mut batch.wire,
+                        );
                         // The strategy must observe the new grid before any
                         // same-batch 0.001 book/quote that was held behind it.
                         batch.events.push(MarketEvent::TickSizeChange(change));
@@ -6322,11 +6510,7 @@ mod pick_current_event_tests {
         let base = now();
         let current_end_secs = base + 120;
         let series_id = format!("future-gap-{}", clob_monotonic_now_ns());
-        let skipped = mk_binary_event(
-            "btc",
-            current_end_secs + 300,
-            current_end_secs + 600,
-        );
+        let skipped = mk_binary_event("btc", current_end_secs + 300, current_end_secs + 600);
         let mut market = PolymarketMarket::new();
         market.series.push(SeriesState {
             name: "series:btc-up-or-down-5m".to_string(),
@@ -6983,14 +7167,17 @@ mod pick_current_event_tests {
                 ..
             })
         )));
-        assert!(first.events.iter().any(|event| matches!(
-            event,
-            MarketEvent::Quote(QuoteTick {
-                bid_price,
-                ask_price,
-                ..
-            }) if *bid_price == 0.42 && *ask_price == 0.45
-        )), "advertised L1 remains available for passive pricing");
+        assert!(
+            first.events.iter().any(|event| matches!(
+                event,
+                MarketEvent::Quote(QuoteTick {
+                    bid_price,
+                    ask_price,
+                    ..
+                }) if *bid_price == 0.42 && *ask_price == 0.45
+            )),
+            "advertised L1 remains available for passive pricing"
+        );
 
         // The deletion arrives with a newer timestamp. It must be applied
         // before deciding whether the older checkpoint failed.
@@ -7005,13 +7192,28 @@ mod pick_current_event_tests {
         assert_eq!(healed.wire.bbo_mismatches, 0);
         assert!(healed.repair_tokens.is_empty());
         assert_eq!(first_order_book(&healed.events).bids[0].price, 0.42);
-        assert!(healed.events.iter().any(|event| matches!(
-            event,
-            MarketEvent::MarketDataHealth(MarketDataHealth {
-                state: MarketDataHealthState::Healthy,
-                ..
-            })
-        )));
+        assert!(
+            !healed.events.iter().any(|event| matches!(
+                event,
+                MarketEvent::MarketDataHealth(MarketDataHealth {
+                    state: MarketDataHealthState::Healthy,
+                    ..
+                })
+            )),
+            "Settling→Healthy recovery is coalesced until stable"
+        );
+        let stable =
+            books.flush_deferred_due(received_at + Duration::from_millis(60), 17_060_000_000);
+        assert!(
+            stable.events.iter().any(|event| matches!(
+                event,
+                MarketEvent::MarketDataHealth(MarketDataHealth {
+                    state: MarketDataHealthState::Healthy,
+                    ..
+                })
+            )),
+            "stable Healthy recovery is emitted after the merge window"
+        );
     }
 
     #[test]
@@ -7064,10 +7266,8 @@ mod pick_current_event_tests {
             received_at + Duration::from_millis(1),
             17_301_000_000,
         );
-        let repairing = books.flush_deferred_due(
-            received_at + Duration::from_millis(52),
-            17_352_000_000,
-        );
+        let repairing =
+            books.flush_deferred_due(received_at + Duration::from_millis(52), 17_352_000_000);
         assert_eq!(repairing.repair_tokens, vec!["up".to_string()]);
 
         let fields: BookFields = serde_json::from_str(
@@ -7144,7 +7344,12 @@ mod pick_current_event_tests {
         );
 
         let degraded = books
-            .mark_repair_failed("up", "injected REST failure", 17_201_000_000)
+            .mark_repair_failed(
+                "up",
+                "injected REST failure",
+                Instant::now(),
+                17_201_000_000,
+            )
             .expect("condition must transition");
         let MarketEvent::MarketDataHealth(health) = degraded else {
             panic!("expected health event");
@@ -7204,7 +7409,10 @@ mod pick_current_event_tests {
         assert_eq!(
             tick.events
                 .iter()
-                .filter(|event| matches!(event, MarketEvent::TickSizeChange(_) | MarketEvent::OrderBook(_)))
+                .filter(|event| matches!(
+                    event,
+                    MarketEvent::TickSizeChange(_) | MarketEvent::OrderBook(_)
+                ))
                 .count(),
             2
         );
