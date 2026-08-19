@@ -3227,6 +3227,15 @@ impl SharedAccount {
                 && status != current_status)
                 || (current_status == OrderStatus::PartiallyFilled
                     && status == OrderStatus::Accepted)
+                || (matches!(current_status, OrderStatus::Cancelled | OrderStatus::Rejected)
+                    && matches!(
+                        status,
+                        OrderStatus::Pending
+                            | OrderStatus::ExecutorRejected
+                            | OrderStatus::NewOrderTimeout
+                            | OrderStatus::CancelOrderTimeout
+                            | OrderStatus::CancelUncertain
+                    ))
             {
                 return Some(current_status);
             }
@@ -8353,6 +8362,43 @@ mod tests {
         assert_eq!(
             account.order("a-partial").unwrap().status,
             OrderStatus::PartiallyFilled
+        );
+    }
+
+    #[test]
+    fn ambiguous_cancel_reply_cannot_regress_terminal_order_status() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-cancel-race",
+                "oid-cancel-race",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert!(account.mark_cancelled_pending_audit("a-cancel-race"));
+
+        assert_eq!(
+            account.mark_order_status_effective(
+                "a-cancel-race",
+                OrderStatus::CancelUncertain,
+            ),
+            Some(OrderStatus::Cancelled),
+        );
+        assert_eq!(
+            account.mark_order_status_effective(
+                "a-cancel-race",
+                OrderStatus::CancelOrderTimeout,
+            ),
+            Some(OrderStatus::Cancelled),
+        );
+        assert_eq!(
+            account.order("a-cancel-race").unwrap().status,
+            OrderStatus::Cancelled,
         );
     }
 

@@ -2042,6 +2042,43 @@ impl SharedState {
         effective
     }
 
+    /// Apply the weak outcome of one cancel attempt without allowing a late
+    /// HTTP/reconcile reply to overwrite terminal private-feed evidence. An
+    /// explicit LIVE lookup is handled by `mark_order_live`; `Accepted` here
+    /// only means this cancel attempt failed and therefore must not resurrect
+    /// an order that was concurrently finalized.
+    fn effective_cancel_attempt_status(
+        &self,
+        client_order_id: &str,
+        candidate: OrderStatus,
+    ) -> OrderStatus {
+        let effective = match candidate {
+            OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain => self
+                .account_state
+                .mark_order_status_effective(client_order_id, candidate)
+                .unwrap_or(candidate),
+            OrderStatus::Accepted => self
+                .account_state
+                .order(client_order_id)
+                .map(|order| match order.status {
+                    terminal @ (OrderStatus::Cancelled
+                    | OrderStatus::Filled
+                    | OrderStatus::Rejected
+                    | OrderStatus::Failed) => terminal,
+                    _ => candidate,
+                })
+                .unwrap_or(candidate),
+            _ => candidate,
+        };
+        if effective != candidate {
+            info!(
+                "[order_lifecycle_race] coid={} ignored_stale_cancel_status={:?} retained_terminal={:?}",
+                client_order_id, candidate, effective,
+            );
+        }
+        effective
+    }
+
     /// Drop the order from the **active-order** tracker.
     ///
     /// Deliberately KEEPS the `coid_to_oid` / `oid_to_coid` / `coid_to_token`
@@ -5542,6 +5579,9 @@ impl PolymarketTrade {
                     ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX, backoff_ms, attempts,
                 ));
             }
+            let status = self
+                .shared
+                .effective_cancel_attempt_status(coid, status);
             let authoritative_terminal_audit = order_audit.as_ref().filter(|_| {
                 matches!(
                     status_str.as_str(),
@@ -6480,7 +6520,16 @@ impl PolymarketTrade {
         }
 
         if let Some(status) = orphan_status {
-            return Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, status);
+            let effective = self
+                .shared
+                .effective_cancel_attempt_status(client_order_id, status);
+            return Self::make_orphan_cancel(
+                client_order_id,
+                &symbol,
+                side,
+                local_oid,
+                effective,
+            );
         }
         if should_remove {
             self.shared.remove_order_as(client_order_id, ok_status);
@@ -6490,6 +6539,9 @@ impl PolymarketTrade {
             } else {
                 OrderStatus::Accepted
             };
+        let status = self
+            .shared
+            .effective_cancel_attempt_status(client_order_id, status);
 
         OrderUpdate {
             client_order_id: client_order_id.to_string(),
@@ -6635,6 +6687,9 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 })
                 .unwrap_or(fallback_status);
+            let status = self
+                .shared
+                .effective_cancel_attempt_status(coid, status);
             if matches!(
                 status,
                 OrderStatus::CancelUncertain | OrderStatus::CancelOrderTimeout
@@ -7263,6 +7318,9 @@ impl ExchangeTrade for PolymarketTrade {
                     // of wedging forever in Cancelling or releasing the lock.
                     outcome = OrderStatus::Accepted;
                 }
+                outcome = self
+                    .shared
+                    .effective_cancel_attempt_status(coid, outcome);
                 // Drop local tracking for terminal outcomes; keep for
                 // CancelOrderTimeout so the orphan reconciler can re-query.
                 if matches!(outcome, OrderStatus::Cancelled | OrderStatus::Filled) {
@@ -7794,6 +7852,9 @@ impl ExchangeTrade for PolymarketTrade {
                 {
                     outcome = OrderStatus::Accepted;
                 }
+                outcome = self
+                    .shared
+                    .effective_cancel_attempt_status(coid, outcome);
                 // Drop local tracking for terminal (Cancelled / Filled)
                 // outcomes — keep for CancelOrderTimeout so the orphan
                 // reconciler can re-query by orderID.
