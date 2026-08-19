@@ -104,6 +104,8 @@ pub struct CorePlan {
     /// instances run on separate cores and never preempt each other).
     /// Instances absent from this map fall back to `strategy`.
     pub strategy_cores: HashMap<String, usize>,
+    /// Per-account private order/trade application cores.
+    pub private_apply_cores: HashMap<String, usize>,
     pub execution: usize,
     pub feed_cores: HashMap<String, usize>,
     pub hex_worker_cores: Vec<usize>,
@@ -130,6 +132,7 @@ impl CorePlan {
             async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
+            private_apply_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -159,6 +162,7 @@ impl CorePlan {
             async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
+            private_apply_cores: cfg.private_apply_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
             feed_cores: cfg.feed_cores.clone(),
             hex_worker_cores: cfg.hex_worker_cores.clone(),
@@ -273,6 +277,16 @@ impl CorePlan {
             claim(core, format!("strategy:{instance_id}"), &mut exclusive)?;
         }
 
+        let mut private_apply: Vec<_> = self.private_apply_cores.iter().collect();
+        private_apply.sort_by(|left, right| left.0.cmp(right.0));
+        for (account_id, &core) in private_apply {
+            claim(
+                core,
+                format!("private_account_apply:{account_id}"),
+                &mut exclusive,
+            )?;
+        }
+
         // Feed-to-feed sharing is allowed, but a feed may not overlap an
         // exclusive role. Deduplicate values before checking shared feeds.
         let feed_cores: HashSet<usize> = self.feed_cores.values().copied().collect();
@@ -356,9 +370,9 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
-        plan.feed_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
+        plan.feed_cores, plan.private_apply_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
         plan.fifo_polymarket_feed, plan.fifo_completion,
         plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
@@ -446,6 +460,11 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
     let p = plan();
     let skip = if core_id == p.async_rt || p.async_clob == Some(core_id) {
         "HEXBOT_NO_PIN_ASYNC_RT"
+    } else if p.private_apply_cores.values().any(|&c| c == core_id) {
+        // A disabled strategy may leave its configured core available for a
+        // live account-apply worker.  Classify that worker by its active role,
+        // not by the dormant strategy_cores entry for the same CPU.
+        "HEXBOT_NO_PIN_EXECUTION"
     } else if core_id == p.strategy || p.strategy_cores.values().any(|&c| c == core_id) {
         "HEXBOT_NO_PIN_STRATEGY"
     } else if core_id == p.execution
@@ -601,6 +620,20 @@ pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
         .unwrap_or(p.strategy);
     pin_current(core, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
+}
+
+/// Pin the authenticated private account-apply worker to its account-specific
+/// core.  It uses completion priority: private fills should preempt order
+/// signing and housekeeping, while public market-data and strategy decisions
+/// retain their higher priorities.
+pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
+    let p = plan();
+    if let Some(core) = p.private_apply_cores.get(account_id).copied() {
+        pin_current(core, thread_name);
+        set_fifo(p.fifo_completion, thread_name);
+    } else {
+        pin_background(thread_name);
+    }
 }
 
 /// Pin a critical execution-path thread (`execution` dispatcher,
@@ -788,6 +821,24 @@ mod tests {
             .validate_strategy_isolation(&five_instances())
             .unwrap_err();
         assert!(err.contains("feed core 6") && err.contains("async_clob"));
+    }
+
+    #[test]
+    fn strict_plan_allows_private_apply_on_dormant_strategy_cores_only() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11), ("zhu03".into(), 12)]);
+        let plan = CorePlan::from_config(&cfg);
+        let enabled = vec!["btc01".to_string(), "btc02".to_string()];
+        assert_eq!(plan.validate_strategy_isolation(&enabled), Ok(()));
+
+        let err = plan
+            .validate_strategy_isolation(&five_instances())
+            .unwrap_err();
+        assert!(
+            err.contains("strategy:btc03") && err.contains("private_account_apply:zhu02"),
+            "unexpected validation error: {err}",
+        );
     }
 
     #[test]

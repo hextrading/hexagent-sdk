@@ -68,6 +68,12 @@ pub struct OsTuneConfig {
     /// this entirely (the lone instance uses `strategy_core`).
     #[serde(default)]
     pub strategy_cores: HashMap<String, usize>,
+    /// Shared-account id -> dedicated private event application core.  These
+    /// workers parse authenticated order/trade updates and mutate only their
+    /// instance shards; keeping them off the housekeeping core prevents WAL,
+    /// settlement and recorder work from delaying private fills.
+    #[serde(default)]
+    pub private_apply_cores: HashMap<String, usize>,
     pub execution_core: Option<usize>,
     /// Exchange name → core id. Matched against the suffix of
     /// `feed-<name>` thread names. Missing entries fall back to
@@ -114,6 +120,7 @@ impl Default for OsTuneConfig {
             async_ord_core: None,
             strategy_core: None,
             strategy_cores: HashMap::new(),
+            private_apply_cores: HashMap::new(),
             execution_core: None,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -138,6 +145,7 @@ mod os_tune_config_tests {
             "strict_core_isolation = true\n\
              allow_background_on_execution_core = true\n\
              async_clob_core = 11\n\
+             private_apply_cores = { zhu02 = 12, zhu03 = 13 }\n\
              execution_core = 4\n\
              background_cores = [4]\n\
              fifo_execution = 50\n\
@@ -147,6 +155,7 @@ mod os_tune_config_tests {
         .unwrap();
         assert!(cfg.allow_background_on_execution_core);
         assert_eq!(cfg.async_clob_core, Some(11));
+        assert_eq!(cfg.private_apply_cores.get("zhu02"), Some(&12));
         assert_eq!(cfg.background_cores, vec![4]);
         assert_eq!(cfg.fifo_polymarket_feed, Some(71));
         assert_eq!(cfg.fifo_completion, Some(55));

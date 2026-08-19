@@ -8,7 +8,7 @@
 use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
 const ROUTE_SHARD_COUNT: usize = 64;
+const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LockMonitoringSnapshot {
@@ -177,6 +178,14 @@ pub fn normalize_order_id(order_id: &str) -> String {
         .or_else(|| order_id.trim().strip_prefix("0X"))
         .unwrap_or(order_id.trim())
         .to_ascii_lowercase()
+}
+
+fn legacy_orphan_order_coid(reason: &str) -> Option<String> {
+    const MARKER: &str = "runtime mapping but no ledger row coid `";
+    let (_, tail) = reason.split_once(MARKER)?;
+    let (coid, _) = tail.split_once('`')?;
+    let coid = coid.trim();
+    (!coid.is_empty()).then(|| coid.to_string())
 }
 
 fn fill_violates_limit(side: Side, limit_price: f64, fill_price: f64, fill_quantity: f64) -> bool {
@@ -363,6 +372,19 @@ pub struct OrderOwnership {
     pub reserved_cash: f64,
     pub reserved_quantity: f64,
     pub status: OrderStatus,
+}
+
+/// Durable recovery input for an order lifecycle event whose process-local
+/// oid/coid route survived long enough to receive the event, but whose
+/// instance lifecycle row did not.  New anomalies persist this structured
+/// hint; startup also synthesizes it from the legacy human-readable reason so
+/// ledgers written before the structured field was introduced remain
+/// repairable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedOrphanOrderAnomaly {
+    pub anomaly_key: String,
+    pub order_id: String,
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -722,6 +744,20 @@ struct VirtualLifecycle {
     /// that cold-path state without consulting the aggregate on every edge.
     cancel_audit_anomalies: HashSet<String>,
     sidecar_checkpoint: Option<DurableSidecarCheckpoint>,
+    /// Bounded, per-instance publication hints for private trades that land
+    /// while a cold account transaction is materializing its aggregate copy.
+    /// The payload stays typed and tiny; the control-plane publisher uses it
+    /// to merge only the touched order/trade/token instead of overwriting the
+    /// hot shard or copying the whole account.
+    recent_trade_mutations: VecDeque<VirtualTradeMutationHint>,
+}
+
+#[derive(Debug, Clone)]
+struct VirtualTradeMutationHint {
+    epoch: u64,
+    trade_key: String,
+    client_order_id: String,
+    token_id: String,
 }
 
 /// Runtime account shard owned by one strategy instance. Ordinary order
@@ -742,6 +778,11 @@ struct VirtualAccount {
     /// Cold account snapshots use it to retain reservations admitted while a
     /// control transaction was in progress.
     reservation_epoch: AtomicU64,
+    /// Advances after every private-trade mutation. Unlike
+    /// `reservation_epoch`, this is paired with typed touched-key hints so a
+    /// concurrent cold publisher can preserve both unrelated control changes
+    /// and the just-applied fill without taking `control_gate` on the feed.
+    trade_epoch: AtomicU64,
 }
 
 impl VirtualAccount {
@@ -782,6 +823,7 @@ impl VirtualAccount {
             lifecycle: Mutex::new(VirtualLifecycle::default()),
             reservation_publish: Mutex::new(()),
             reservation_epoch: AtomicU64::new(0),
+            trade_epoch: AtomicU64::new(0),
         }
     }
 
@@ -961,6 +1003,34 @@ struct RetiredTradeOwnershipTombstone {
     retired_at_ms: u64,
 }
 
+/// Economic-free proof that an authenticated order lookup found a terminal
+/// order with an authoritative zero matched quantity and empty trade set.
+/// Keeping the proof prevents a late replay of the same private order event
+/// from recreating an account-wide blocker after its original lifecycle row
+/// has already been retired.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetiredOrderAuditTombstone {
+    order_id: String,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    status: OrderStatus,
+    original_size: f64,
+    size_matched: f64,
+    #[serde(default)]
+    associate_trades: Vec<String>,
+    evidence: String,
+    audited_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrphanOrderAnomalyHint {
+    /// Preserve the authenticated wire spelling (including a possible `0x`
+    /// prefix) for the authoritative REST lookup.
+    order_id: String,
+    #[serde(default)]
+    client_order_id: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -992,6 +1062,8 @@ struct SharedAccountState {
     trades: HashMap<String, AppliedTrade>,
     #[serde(default)]
     retired_trade_ownership_tombstones: HashMap<String, RetiredTradeOwnershipTombstone>,
+    #[serde(default)]
+    retired_order_audit_tombstones: HashMap<String, RetiredOrderAuditTombstone>,
     #[serde(default)]
     verified_trade_replay_recoveries: u64,
     /// Advances only when the virtual trade/fee ledger changes.
@@ -1078,6 +1150,12 @@ struct SharedAccountState {
     /// the explicit repair API.
     #[serde(default)]
     ownership_anomalies: BTreeMap<String, String>,
+    /// normalized order id -> authenticated wire id plus optional client id.
+    /// This is deliberately separate from `oid_to_coid`: the latter is an
+    /// active lifecycle index, while this map is recovery provenance for a row
+    /// that is known to be absent.
+    #[serde(default)]
+    orphan_order_anomaly_hints: BTreeMap<String, OrphanOrderAnomalyHint>,
     /// Server match_time for private trades whose order ownership could not yet
     /// be resolved. Gap replay must never advance its `after` lower bound past
     /// the earliest row in this durable set.
@@ -2117,6 +2195,7 @@ struct AccountStateGuard<'a> {
     state: MutexGuard<'a, SharedAccountState>,
     instance_scope: Option<String>,
     reservation_epochs: BTreeMap<String, u64>,
+    trade_epochs: BTreeMap<String, u64>,
     acquired_at: Instant,
 }
 
@@ -2141,10 +2220,14 @@ impl Drop for AccountStateGuard<'_> {
                 &mut self.state,
                 instance_id,
                 self.reservation_epochs.get(instance_id).copied(),
+                self.trade_epochs.get(instance_id).copied(),
             );
         } else {
-            self.account
-                .sync_state_to_virtual_accounts(&mut self.state, Some(&self.reservation_epochs));
+            self.account.sync_state_to_virtual_accounts(
+                &mut self.state,
+                Some(&self.reservation_epochs),
+                Some(&self.trade_epochs),
+            );
         }
         let hold_us = self.acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account
@@ -2200,7 +2283,7 @@ impl SharedAccount {
             reservation_lifecycle_lock: LockLatencyMetrics::default(),
         };
         let mut state = SharedAccountState::default();
-        account.sync_state_to_virtual_accounts(&mut state, None);
+        account.sync_state_to_virtual_accounts(&mut state, None, None);
         account
     }
 
@@ -2493,18 +2576,28 @@ impl SharedAccount {
         // Capture before copying the virtual shards. A reservation that lands
         // after this point either appears in the copy or advances the epoch,
         // causing the guard's final publication step to merge it explicitly.
-        let reservation_epochs = self
-            .virtual_accounts
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(instance_id, account)| {
-                (
-                    instance_id.clone(),
-                    account.reservation_epoch.load(Ordering::Acquire),
-                )
-            })
-            .collect();
+        let (reservation_epochs, trade_epochs) = {
+            let accounts = self.virtual_accounts.read().unwrap();
+            let reservation_epochs = accounts
+                .iter()
+                .map(|(instance_id, account)| {
+                    (
+                        instance_id.clone(),
+                        account.reservation_epoch.load(Ordering::Acquire),
+                    )
+                })
+                .collect();
+            let trade_epochs = accounts
+                .iter()
+                .map(|(instance_id, account)| {
+                    (
+                        instance_id.clone(),
+                        account.trade_epoch.load(Ordering::Acquire),
+                    )
+                })
+                .collect();
+            (reservation_epochs, trade_epochs)
+        };
         self.sync_virtual_accounts_to_state(&mut state);
         // Account snapshots/reconcile workers own aggregate reconciliation.
         // Keeping this on the already-cold control transaction means hot fills
@@ -2516,6 +2609,7 @@ impl SharedAccount {
             state,
             instance_scope: None,
             reservation_epochs,
+            trade_epochs,
             acquired_at,
         }
     }
@@ -2532,13 +2626,19 @@ impl SharedAccount {
             .fetch_max(wait_us, Ordering::Relaxed);
         self.account_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
-        let reservation_epochs = self
+        let (reservation_epochs, trade_epochs) = self
             .virtual_account(instance_id)
             .map(|account| {
-                BTreeMap::from([(
-                    instance_id.to_string(),
-                    account.reservation_epoch.load(Ordering::Acquire),
-                )])
+                (
+                    BTreeMap::from([(
+                        instance_id.to_string(),
+                        account.reservation_epoch.load(Ordering::Acquire),
+                    )]),
+                    BTreeMap::from([(
+                        instance_id.to_string(),
+                        account.trade_epoch.load(Ordering::Acquire),
+                    )]),
+                )
             })
             .unwrap_or_default();
         self.sync_virtual_account_to_state(&mut state, instance_id);
@@ -2548,6 +2648,7 @@ impl SharedAccount {
             state,
             instance_scope: Some(instance_id.to_string()),
             reservation_epochs,
+            trade_epochs,
             acquired_at,
         }
     }
@@ -2723,10 +2824,179 @@ impl SharedAccount {
         }
     }
 
+    /// Fold private-trade mutations that committed after a cold transaction's
+    /// initial shard snapshot into that transaction before it republishes.
+    /// Hot fills remain completely outside `control_gate`; only the cold
+    /// publisher pays for this touched-key merge.
+    fn merge_concurrent_trade_mutations(
+        state: &mut SharedAccountState,
+        account: &VirtualAccount,
+        lifecycle: &mut VirtualLifecycle,
+        observed_epoch: Option<u64>,
+    ) -> bool {
+        let Some(observed_epoch) = observed_epoch else {
+            return false;
+        };
+        let current_epoch = account.trade_epoch.load(Ordering::Acquire);
+        if observed_epoch == current_epoch {
+            while lifecycle
+                .recent_trade_mutations
+                .front()
+                .is_some_and(|hint| hint.epoch <= current_epoch)
+            {
+                lifecycle.recent_trade_mutations.pop_front();
+            }
+            return false;
+        }
+        let hints = lifecycle
+            .recent_trade_mutations
+            .iter()
+            .filter(|hint| hint.epoch > observed_epoch)
+            .collect::<Vec<_>>();
+        let complete = hints
+            .first()
+            .is_some_and(|hint| hint.epoch == observed_epoch.saturating_add(1))
+            && hints
+                .last()
+                .is_some_and(|hint| hint.epoch == current_epoch);
+        let (coids, trade_keys, tokens) = if complete {
+            (
+                hints
+                    .iter()
+                    .map(|hint| hint.client_order_id.clone())
+                    .collect::<HashSet<_>>(),
+                hints
+                    .iter()
+                    .map(|hint| hint.trade_key.clone())
+                    .collect::<HashSet<_>>(),
+                hints
+                    .iter()
+                    .map(|hint| hint.token_id.clone())
+                    .collect::<HashSet<_>>(),
+            )
+        } else {
+            // A transaction spanning more than the retained hint window is
+            // exceptional. Fail safe by preserving the entire hot shard; the
+            // asynchronous physical snapshot will converge any same-instance
+            // control adjustment on its next pass.
+            log::warn!(
+                "[shared_account] instance={} private trade merge hint window overrun observed_epoch={} current_epoch={}; preserving full hot shard",
+                account.instance_id,
+                observed_epoch,
+                current_epoch,
+            );
+            (
+                lifecycle.orders.keys().cloned().collect(),
+                lifecycle.trades.keys().cloned().collect(),
+                account.positions.read().unwrap().keys().cloned().collect(),
+            )
+        };
+
+        if let Some(instance) = state.instances.get_mut(&account.instance_id) {
+            instance.cash = account.cash.load();
+            instance.reserved_cash = account.reserved_cash.load();
+            let positions = account.positions.read().unwrap();
+            for token in &tokens {
+                if let Some(position) = positions.get(token) {
+                    instance.positions.insert(token.clone(), position.balance.load());
+                    instance
+                        .reserved_positions
+                        .insert(token.clone(), position.reserved.load());
+                }
+            }
+        }
+        for coid in &coids {
+            if let Some(previous) = state.orders.get(coid) {
+                let previous_oid = normalize_order_id(&previous.order_id);
+                if state
+                    .oid_to_coid
+                    .get(&previous_oid)
+                    .is_some_and(|mapped| mapped == coid)
+                {
+                    state.oid_to_coid.remove(&previous_oid);
+                }
+            }
+            if let Some(order) = lifecycle.orders.get(coid) {
+                state.oid_to_coid.insert(
+                    normalize_order_id(&order.order_id),
+                    order.client_order_id.clone(),
+                );
+                state.orders.insert(coid.clone(), order.clone());
+            } else {
+                state.orders.remove(coid);
+            }
+            if lifecycle.recovery_pending_orders.contains(coid) {
+                state.recovery_pending_orders.insert(coid.clone());
+            } else {
+                state.recovery_pending_orders.remove(coid);
+            }
+            if lifecycle.routine_cancel_audits.contains(coid) {
+                state.routine_cancel_audits.insert(coid.clone());
+            } else {
+                state.routine_cancel_audits.remove(coid);
+            }
+        }
+        for trade_key in &trade_keys {
+            if let Some(trade) = lifecycle.trades.get(trade_key) {
+                state.trades.insert(trade_key.clone(), trade.clone());
+            } else {
+                state.trades.remove(trade_key);
+            }
+            if lifecycle.fee_attribution_pending.contains(trade_key) {
+                state.fee_attribution_pending.insert(trade_key.clone());
+            } else {
+                state.fee_attribution_pending.remove(trade_key);
+            }
+        }
+        state.ledger_generation = state
+            .ledger_generation
+            .max(
+                lifecycle
+                    .trades
+                    .values()
+                    .map(|trade| trade.ledger_generation)
+                    .max()
+                    .unwrap_or(0),
+            );
+        while lifecycle
+            .recent_trade_mutations
+            .front()
+            .is_some_and(|hint| hint.epoch <= current_epoch)
+        {
+            lifecycle.recent_trade_mutations.pop_front();
+        }
+        true
+    }
+
+    fn record_virtual_trade_mutation(
+        account: &VirtualAccount,
+        lifecycle: &mut VirtualLifecycle,
+        trade_key: &str,
+        client_order_id: &str,
+        token_id: &str,
+    ) {
+        let epoch = account
+            .trade_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        lifecycle
+            .recent_trade_mutations
+            .push_back(VirtualTradeMutationHint {
+                epoch,
+                trade_key: trade_key.to_string(),
+                client_order_id: client_order_id.to_string(),
+                token_id: token_id.to_string(),
+            });
+        while lifecycle.recent_trade_mutations.len() > RECENT_VIRTUAL_TRADE_MUTATIONS {
+            lifecycle.recent_trade_mutations.pop_front();
+        }
+    }
+
     fn sync_state_to_virtual_accounts(
         &self,
         state: &mut SharedAccountState,
         reservation_epochs: Option<&BTreeMap<String, u64>>,
+        trade_epochs: Option<&BTreeMap<String, u64>>,
     ) {
         let ledgers: Vec<(String, InstanceLedger)> = state
             .instances
@@ -2752,6 +3022,7 @@ impl SharedAccount {
                 })
                 .collect()
         };
+        let mut merged_concurrent_trade = false;
         for (instance_id, account) in &accounts {
             let _publication = account.reservation_publish.lock().unwrap();
             let mut lifecycle = account.lifecycle.lock().unwrap();
@@ -2760,6 +3031,12 @@ impl SharedAccount {
                 &account,
                 &lifecycle,
                 reservation_epochs.and_then(|epochs| epochs.get(instance_id).copied()),
+            );
+            merged_concurrent_trade |= Self::merge_concurrent_trade_mutations(
+                state,
+                &account,
+                &mut lifecycle,
+                trade_epochs.and_then(|epochs| epochs.get(instance_id).copied()),
             );
             if let Some(ledger) = state.instances.get(instance_id) {
                 account.replace_ledger(ledger);
@@ -2808,6 +3085,9 @@ impl SharedAccount {
                 .map(str::to_string)
                 .collect();
             lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
+        }
+        if merged_concurrent_trade {
+            recompute_reconciliation(state, "concurrent private trade publication merge");
         }
 
         // Never clear a live route index before rebuilding it. Private events
@@ -2886,6 +3166,7 @@ impl SharedAccount {
         state: &mut SharedAccountState,
         instance_id: &str,
         observed_reservation_epoch: Option<u64>,
+        observed_trade_epoch: Option<u64>,
     ) {
         let Some(ledger) = state.instances.get(instance_id).cloned() else {
             return;
@@ -2904,6 +3185,12 @@ impl SharedAccount {
             &account,
             &lifecycle,
             observed_reservation_epoch,
+        );
+        let merged_concurrent_trade = Self::merge_concurrent_trade_mutations(
+            state,
+            &account,
+            &mut lifecycle,
+            observed_trade_epoch,
         );
         if let Some(ledger) = state.instances.get(instance_id) {
             account.replace_ledger(ledger);
@@ -2952,6 +3239,9 @@ impl SharedAccount {
             .map(str::to_string)
             .collect();
         lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
+        if merged_concurrent_trade {
+            recompute_reconciliation(state, "concurrent private trade publication merge");
+        }
         let coids: HashSet<String> = lifecycle.orders.keys().cloned().collect();
         let oids: HashSet<String> = lifecycle
             .orders
@@ -5606,6 +5896,165 @@ impl SharedAccount {
         self.schedule_persist(&state);
     }
 
+    /// Persist an order-specific recovery hint together with the ordinary
+    /// private-event anomaly.  The hint is not an active route and is never
+    /// consulted by live attribution; it exists solely so a later process can
+    /// audit the oid even when the lifecycle row and runtime maps are absent.
+    pub fn mark_private_order_event_anomaly(
+        &self,
+        order_id: &str,
+        client_order_id: Option<&str>,
+        reason: impl Into<String>,
+    ) {
+        let normalized = normalize_order_id(order_id);
+        if normalized.is_empty() {
+            return;
+        }
+        let payload_key = format!("order:{normalized}");
+        let _transition = self.private_anomaly_transition.lock().unwrap();
+        let mut state = self.lock_state();
+        // A prior authenticated zero-fill terminal audit is stronger than a
+        // delayed lifecycle replay.  Never recreate the historical blocker.
+        if state.retired_order_audit_tombstones.contains_key(&normalized) {
+            return;
+        }
+        state.orphan_order_anomaly_hints.insert(
+            normalized.clone(),
+            OrphanOrderAnomalyHint {
+                order_id: order_id.trim().to_string(),
+                client_order_id: client_order_id
+                    .map(str::trim)
+                    .filter(|coid| !coid.is_empty())
+                    .map(str::to_string),
+            },
+        );
+        set_ownership_anomaly(
+            &mut state,
+            format!("private_event:{payload_key}"),
+            reason.into(),
+        );
+        self.schedule_persist(&state);
+    }
+
+    /// Enumerate persisted order anomalies independently of active order rows.
+    /// Legacy ledgers embedded the coid only in the reason text; preserve a
+    /// narrow parser for that exact format so they can be repaired once and
+    /// rewritten with structured provenance.
+    pub fn persisted_orphan_order_anomalies(&self) -> Vec<PersistedOrphanOrderAnomaly> {
+        let state = self.lock_state();
+        let mut anomalies = Vec::new();
+        for (anomaly_key, reason) in &state.ownership_anomalies {
+            let Some(order_id) = anomaly_key.strip_prefix("private_event:order:") else {
+                continue;
+            };
+            let normalized = normalize_order_id(order_id);
+            if normalized.is_empty()
+                || state.retired_order_audit_tombstones.contains_key(&normalized)
+            {
+                continue;
+            }
+            let hint = state.orphan_order_anomaly_hints.get(&normalized);
+            let client_order_id = hint
+                .and_then(|hint| hint.client_order_id.clone())
+                .or_else(|| legacy_orphan_order_coid(reason));
+            anomalies.push(PersistedOrphanOrderAnomaly {
+                anomaly_key: anomaly_key.clone(),
+                order_id: hint
+                    .map(|hint| hint.order_id.clone())
+                    .unwrap_or_else(|| order_id.trim().to_string()),
+                client_order_id,
+            });
+        }
+        anomalies.sort_by(|left, right| {
+            normalize_order_id(&left.order_id).cmp(&normalize_order_id(&right.order_id))
+        });
+        anomalies
+    }
+
+    /// Retain an authenticated, economic-free terminal proof and clear only
+    /// its exact private-order anomaly.  Orders with any matched quantity or
+    /// trade id are intentionally rejected: those require ownership rebuild
+    /// plus exact trade replay and must remain fail-closed if that cannot be
+    /// completed.
+    pub fn record_terminal_orphan_order_audit(
+        &self,
+        order_id: &str,
+        client_order_id: Option<&str>,
+        status: OrderStatus,
+        original_size: f64,
+        size_matched: f64,
+        associate_trades: &[String],
+        evidence: &str,
+    ) -> bool {
+        let normalized = normalize_order_id(order_id);
+        if normalized.is_empty()
+            || !matches!(status, OrderStatus::Cancelled | OrderStatus::Rejected)
+            || !original_size.is_finite()
+            || original_size <= 0.0
+            || !size_matched.is_finite()
+            || size_matched.abs() > 1e-9
+            || !associate_trades.is_empty()
+            || evidence.trim().is_empty()
+        {
+            return false;
+        }
+        let _transition = self.private_anomaly_transition.lock().unwrap();
+        let mut state = self.lock_state();
+        if state
+            .orders
+            .values()
+            .any(|order| normalize_order_id(&order.order_id) == normalized)
+        {
+            return false;
+        }
+        state.retired_order_audit_tombstones.insert(
+            normalized.clone(),
+            RetiredOrderAuditTombstone {
+                order_id: normalized.clone(),
+                client_order_id: client_order_id
+                    .map(str::trim)
+                    .filter(|coid| !coid.is_empty())
+                    .map(str::to_string),
+                status,
+                original_size,
+                size_matched,
+                associate_trades: Vec::new(),
+                evidence: evidence.to_string(),
+                audited_at_ms: wall_clock_ms(),
+            },
+        );
+        state.ownership_anomalies.retain(|key, _| {
+            key.strip_prefix("private_event:order:")
+                .is_none_or(|order_id| normalize_order_id(order_id) != normalized)
+        });
+        state.orphan_order_anomaly_hints.remove(&normalized);
+        recompute_reconciliation(&mut state, "authenticated terminal orphan order audit");
+        self.schedule_persist(&state);
+        true
+    }
+
+    /// True only when a late private lifecycle row is covered by a retained
+    /// zero-fill terminal audit.  This is the replay guard that keeps a
+    /// repaired historical oid from re-entering `ownership_anomalies`.
+    pub fn retired_order_audit_covers(
+        &self,
+        order_id: &str,
+        original_size: f64,
+        size_matched: f64,
+    ) -> bool {
+        let normalized = normalize_order_id(order_id);
+        let state = self.lock_state();
+        state
+            .retired_order_audit_tombstones
+            .get(&normalized)
+            .is_some_and(|audit| {
+                (audit.original_size - original_size).abs()
+                    <= 1e-9_f64.max(audit.original_size.abs().max(original_size.abs()) * 1e-8)
+                    && size_matched.abs() <= 1e-9
+                    && audit.size_matched.abs() <= 1e-9
+            })
+    }
+
     pub fn resolve_private_event_anomaly(&self, payload_key: &str) {
         if payload_key.is_empty() {
             return;
@@ -5625,6 +6074,11 @@ impl SharedAccount {
             .remove(&format!("private_event:{payload_key}"))
             .is_some()
         {
+            if let Some(order_id) = payload_key.strip_prefix("order:") {
+                state
+                    .orphan_order_anomaly_hints
+                    .remove(&normalize_order_id(order_id));
+            }
             recompute_reconciliation(&mut state, "corrected private event replay");
             self.schedule_persist(&state);
         }
@@ -5686,6 +6140,23 @@ impl SharedAccount {
 
     pub fn order_owner_by_oid(&self, order_id: &str) -> Option<String> {
         self.oid_routes.get(&normalize_order_id(order_id))
+    }
+
+    /// Resolve a persisted client-order-id hint against currently configured
+    /// virtual shards without publishing an active route.  Instance ids may
+    /// themselves contain dashes, so choose the longest registered `id-`
+    /// prefix rather than splitting at the first dash.
+    pub fn instance_id_for_historical_coid(&self, client_order_id: &str) -> Option<String> {
+        let accounts = self.virtual_accounts.read().unwrap();
+        accounts
+            .keys()
+            .filter(|instance_id| {
+                client_order_id
+                    .strip_prefix(instance_id.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+            .max_by_key(|instance_id| instance_id.len())
+            .cloned()
     }
 
     pub fn order(&self, client_order_id: &str) -> Option<OrderOwnership> {
@@ -7278,7 +7749,6 @@ impl SharedAccount {
         {
             return VirtualTradeAttempt::Fallback;
         }
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account(instance_id) else {
             return VirtualTradeAttempt::Fallback;
         };
@@ -7353,6 +7823,13 @@ impl SharedAccount {
                     }
                 }
                 if changed {
+                    Self::record_virtual_trade_mutation(
+                        &account,
+                        &mut lifecycle,
+                        trade_key,
+                        &applied.ownership.client_order_id,
+                        token_id,
+                    );
                     self.schedule_virtual_trade_persist(
                         &account,
                         &lifecycle,
@@ -7509,6 +7986,13 @@ impl SharedAccount {
                     self.mark_virtual_fee_pending();
                 }
             }
+            Self::record_virtual_trade_mutation(
+                &account,
+                &mut lifecycle,
+                trade_key,
+                &resolved_coid,
+                token_id,
+            );
             self.schedule_virtual_trade_persist(
                 &account,
                 &lifecycle,
@@ -7719,6 +8203,13 @@ impl SharedAccount {
                 trade.ledger_generation = generation;
             }
         }
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            trade_key,
+            &resolved_coid,
+            token_id,
+        );
         self.schedule_virtual_trade_persist(
             &account,
             &lifecycle,
@@ -10839,6 +11330,47 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         .any(|(key, reason)| key.trim().is_empty() || reason.trim().is_empty())
     {
         return Err("invalid durable ownership anomaly".to_string());
+    }
+    for (order_id, hint) in &state.orphan_order_anomaly_hints {
+        if order_id.trim().is_empty()
+            || normalize_order_id(&hint.order_id) != *order_id
+            || hint
+                .client_order_id
+                .as_deref()
+                .is_some_and(|coid| coid.trim().is_empty())
+            || !state.ownership_anomalies.keys().any(|key| {
+                key.strip_prefix("private_event:order:")
+                    .is_some_and(|candidate| normalize_order_id(candidate) == *order_id)
+            })
+        {
+            return Err(format!(
+                "invalid orphan order anomaly hint `{order_id}`"
+            ));
+        }
+    }
+    for (order_id, audit) in &state.retired_order_audit_tombstones {
+        if order_id.trim().is_empty()
+            || normalize_order_id(&audit.order_id) != *order_id
+            || !matches!(audit.status, OrderStatus::Cancelled | OrderStatus::Rejected)
+            || !audit.original_size.is_finite()
+            || audit.original_size <= 0.0
+            || !audit.size_matched.is_finite()
+            || audit.size_matched.abs() > EPS
+            || !audit.associate_trades.is_empty()
+            || audit.evidence.trim().is_empty()
+            || audit.audited_at_ms == 0
+            || audit
+                .client_order_id
+                .as_deref()
+                .is_some_and(|coid| coid.trim().is_empty())
+            || state.ownership_anomalies.keys().any(|key| {
+                key.strip_prefix("private_event:order:")
+                    .is_some_and(|candidate| normalize_order_id(candidate) == *order_id)
+            })
+            || state.orphan_order_anomaly_hints.contains_key(order_id)
+        {
+            return Err(format!("invalid retired orphan order audit `{order_id}`"));
+        }
     }
     if state.risk_blockers.iter().any(|(source, blocker)| {
         source.trim().is_empty() || blocker.reason.trim().is_empty() || blocker.since_ms == 0
@@ -16200,6 +16732,107 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn legacy_orphan_order_anomaly_is_enumerated_without_a_ledger_row() {
+        let account = seeded_account();
+        account.mark_private_event_anomaly(
+            "order:ABCDEF",
+            "invalid Polymarket private event `order:abcdef`: order lifecycle event has runtime mapping but no ledger row coid `a-123`",
+        );
+        assert_eq!(
+            account.persisted_orphan_order_anomalies(),
+            vec![PersistedOrphanOrderAnomaly {
+                anomaly_key: "private_event:order:ABCDEF".to_string(),
+                order_id: "ABCDEF".to_string(),
+                client_order_id: Some("a-123".to_string()),
+            }],
+        );
+        assert!(account.record_terminal_orphan_order_audit(
+            "abcdef",
+            Some("a-123"),
+            OrderStatus::Cancelled,
+            1.0,
+            0.0,
+            &[],
+            "authenticated legacy zero-fill audit",
+        ));
+        assert!(account.ownership_anomalies().is_empty());
+    }
+
+    #[test]
+    fn zero_fill_terminal_orphan_audit_tombstone_reopens_and_covers_replay() {
+        let account = seeded_account();
+        account.mark_private_order_event_anomaly(
+            "0xABCDEF",
+            Some("a-123"),
+            "missing instance lifecycle row",
+        );
+        assert!(account.is_uncertain());
+        assert!(account.record_terminal_orphan_order_audit(
+            "abcdef",
+            Some("a-123"),
+            OrderStatus::Cancelled,
+            10.0,
+            0.0,
+            &[],
+            "authenticated zero-fill cancellation",
+        ));
+        assert!(!account.is_uncertain());
+        assert!(account.ownership_anomalies().is_empty());
+        assert!(account.retired_order_audit_covers("0xABCDEF", 10.0, 0.0));
+        account.mark_private_order_event_anomaly(
+            "0xabcdef",
+            Some("a-123"),
+            "late duplicate lifecycle",
+        );
+        assert!(account.ownership_anomalies().is_empty());
+    }
+
+    #[test]
+    fn orphan_order_hint_and_terminal_audit_survive_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-orphan-order-audit-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("orphan-audit", &path).unwrap();
+            account.mark_private_order_event_anomaly(
+                "0xDURABLE",
+                Some("maker-42"),
+                "missing lifecycle row",
+            );
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        {
+            let account = SharedAccount::new_persistent("orphan-audit", &path).unwrap();
+            assert_eq!(
+                account.persisted_orphan_order_anomalies(),
+                vec![PersistedOrphanOrderAnomaly {
+                    anomaly_key: "private_event:order:durable".to_string(),
+                    order_id: "0xDURABLE".to_string(),
+                    client_order_id: Some("maker-42".to_string()),
+                }],
+            );
+            assert!(account.record_terminal_orphan_order_audit(
+                "durable",
+                Some("maker-42"),
+                OrderStatus::Cancelled,
+                5.0,
+                0.0,
+                &[],
+                "authenticated terminal zero-fill lookup",
+            ));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("orphan-audit", &path).unwrap();
+        assert!(restored.persisted_orphan_order_anomalies().is_empty());
+        assert!(restored.retired_order_audit_covers("0xDURABLE", 5.0, 0.0));
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
     fn virtual_order_lifecycle_does_not_wait_for_account_state_mutex() {
         let account = Arc::new(seeded_account());
         account
@@ -16362,6 +16995,50 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         worker.join().unwrap();
         drop(account);
         remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn normal_private_trade_does_not_wait_for_account_control_gate() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-trade-no-control",
+                "oid-trade-no-control",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        // Hold a real cold transaction, including its pre-trade aggregate
+        // snapshot. The fill must both complete without the gate and survive
+        // the guard's later shard publication.
+        let control = account.lock_state();
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let transition = worker_account.apply_trade_transition_with_context(
+                "trade-no-control",
+                "MATCHED",
+                "a-trade-no-control",
+                "oid-trade-no-control",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                true,
+                123,
+            );
+            tx.send(transition.ownership().is_some()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        drop(control);
+        worker.join().unwrap();
+        let trade = account.trade_ownership("trade-no-control").unwrap();
+        assert_eq!(trade.client_order_id, "a-trade-no-control");
+        assert_eq!(account.order("a-trade-no-control").unwrap().filled_quantity, 1.0);
     }
 
     #[test]

@@ -61,6 +61,16 @@ const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
 struct FetchedOrder {
     status: String,
     audit: AuthoritativeOrderAudit,
+    rebuild_identity: Option<FetchedOrderIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct FetchedOrderIdentity {
+    maker_address: String,
+    asset_id: String,
+    side: Side,
+    price: f64,
+    fee_rate_bps: Option<u32>,
 }
 
 struct RuntimeOrderAuditPass {
@@ -144,6 +154,14 @@ pub struct MarketCancelFinality {
     pub confirmed: bool,
     pub updates: Vec<OrderUpdate>,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanOrderStartupRepair {
+    pub examined: usize,
+    pub rebuilt: usize,
+    pub tombstoned: usize,
+    pub unresolved: usize,
 }
 
 /// Result of an orphan order lookup. Keep an explicit server not-found result
@@ -443,6 +461,46 @@ fn parse_fetched_order(
     {
         return Err(());
     }
+    let rebuild_identity = (|| {
+        let maker_address = ["maker_address", "maker"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(serde_json::Value::as_str))?
+            .trim();
+        let asset_id = ["asset_id", "token_id"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(serde_json::Value::as_str))?
+            .trim();
+        let side = match object
+            .get("side")
+            .and_then(serde_json::Value::as_str)?
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "BUY" => Side::Buy,
+            "SELL" => Side::Sell,
+            _ => return None,
+        };
+        let price = string_field("price")?.parse::<f64>().ok()?;
+        let fee_rate_bps = string_field("fee_rate_bps")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value <= 10_000);
+        if maker_address.is_empty()
+            || asset_id.is_empty()
+            || !price.is_finite()
+            || price <= 0.0
+            || price > 1.0 + 1e-8
+        {
+            return None;
+        }
+        Some(FetchedOrderIdentity {
+            maker_address: maker_address.to_string(),
+            asset_id: asset_id.to_string(),
+            side,
+            price,
+            fee_rate_bps,
+        })
+    })();
     Ok(FetchedOrder {
         status,
         audit: AuthoritativeOrderAudit {
@@ -450,6 +508,7 @@ fn parse_fetched_order(
             size_matched: Some(size_matched),
             associate_trades,
         },
+        rebuild_identity,
     })
 }
 
@@ -3625,6 +3684,182 @@ impl PolymarketTrade {
     /// The bounded retry window covers the common pending/delayed write-index
     /// race without turning startup into an unbounded wait. Anything still
     /// ambiguous is deliberately left reserved and operator-visible.
+    pub fn reconcile_persisted_orphan_order_anomalies(&self) -> OrphanOrderStartupRepair {
+        const REBUILD_FEE_RESERVE_BPS: u32 = 10_000;
+        let anomalies = self
+            .shared
+            .account_state
+            .persisted_orphan_order_anomalies();
+        let mut summary = OrphanOrderStartupRepair {
+            examined: anomalies.len(),
+            ..OrphanOrderStartupRepair::default()
+        };
+        for anomaly in anomalies {
+            let coid = anomaly.client_order_id.as_deref().unwrap_or("");
+            let fetched = self.fetch_order_by_id(coid, &anomaly.order_id, None);
+            let FetchOrderResult::Found(fetched) = fetched else {
+                summary.unresolved = summary.unresolved.saturating_add(1);
+                continue;
+            };
+            let original_size = fetched
+                .audit
+                .original_size
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok());
+            let size_matched = fetched
+                .audit
+                .size_matched
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok());
+            let terminal_status = match fetched.status.as_str() {
+                "MATCHED" | "FILLED" => Some(OrderStatus::Filled),
+                "INVALID" => Some(OrderStatus::Rejected),
+                status if status.starts_with("CANCELED") || status.starts_with("CANCELLED") => {
+                    Some(OrderStatus::Cancelled)
+                }
+                _ => None,
+            };
+
+            let rebuilt = anomaly
+                .client_order_id
+                .as_deref()
+                .zip(fetched.rebuild_identity.as_ref())
+                .and_then(|(client_order_id, identity)| {
+                    if !identity
+                        .maker_address
+                        .eq_ignore_ascii_case(&self.shared.order_maker_address)
+                    {
+                        return None;
+                    }
+                    let instance_id = self
+                        .shared
+                        .account_state
+                        .instance_id_for_historical_coid(client_order_id)?;
+                    let quantity = original_size?;
+                    let fee_rate_bps = identity
+                        .fee_rate_bps
+                        .unwrap_or(REBUILD_FEE_RESERVE_BPS);
+                    let reserve_cash = if identity.side == Side::Buy {
+                        quantity
+                            * identity.price
+                            * (1.0 + f64::from(fee_rate_bps) / 10_000.0)
+                    } else {
+                        0.0
+                    };
+                    let reserve_quantity = if identity.side == Side::Sell {
+                        quantity
+                    } else {
+                        0.0
+                    };
+                    let ownership = OrderOwnership {
+                        account_id: self.shared.account_state.account_id().to_string(),
+                        instance_id: instance_id.clone(),
+                        client_order_id: client_order_id.to_string(),
+                        order_id: anomaly.order_id.clone(),
+                        token_id: identity.asset_id.clone(),
+                        side: identity.side,
+                        quantity,
+                        filled_quantity: 0.0,
+                        terminal_matched_quantity: None,
+                        terminal_trade_ids: Vec::new(),
+                        terminal_trade_ids_authoritative: false,
+                        price: identity.price,
+                        fee_rate_bps,
+                        reserved_cash: reserve_cash,
+                        reserved_quantity: reserve_quantity,
+                        status: OrderStatus::Pending,
+                    };
+                    let ownership = self
+                        .shared
+                        .account_state
+                        .backfill_order_ownership(&ownership)?;
+                    self.shared.install_runtime_order_id(
+                        client_order_id,
+                        &anomaly.order_id,
+                        &identity.asset_id,
+                        Some(&ownership),
+                    );
+                    Some((client_order_id.to_string(), instance_id, identity.clone()))
+                });
+
+            if let Some((client_order_id, instance_id, identity)) = rebuilt {
+                if let Some(status) = terminal_status {
+                    self.shared.commit_authoritative_terminal_audit(
+                        &client_order_id,
+                        status,
+                        &fetched.audit,
+                    );
+                    if !fetched.audit.associate_trades.is_empty() {
+                        let _ = self.reconcile_orphans(
+                            &[],
+                            &[],
+                            &fetched.audit.associate_trades,
+                        );
+                    }
+                    if self
+                        .shared
+                        .account_state
+                        .terminal_order_audit_complete(&client_order_id)
+                    {
+                        self.shared.remove_order_resolved_as(&client_order_id, status);
+                    }
+                } else {
+                    self.shared.open_orders.lock().unwrap().insert(
+                        client_order_id.clone(),
+                        TrackedOrder {
+                            symbol: identity.asset_id,
+                            side: identity.side,
+                            instance_id,
+                        },
+                    );
+                    self.shared
+                        .account_state
+                        .begin_order_recovery([client_order_id.as_str()]);
+                }
+                summary.rebuilt = summary.rebuilt.saturating_add(1);
+                info!(
+                    "[PolymarketTrade] startup orphan ownership repaired oid={} coid={} status={}",
+                    anomaly.order_id, client_order_id, fetched.status,
+                );
+                continue;
+            }
+
+            let zero_fill_terminal = terminal_status
+                .zip(original_size)
+                .zip(size_matched)
+                .filter(|((status, _), matched)| {
+                    matches!(status, OrderStatus::Cancelled | OrderStatus::Rejected)
+                        && matched.abs() <= 1e-9
+                        && fetched.audit.associate_trades.is_empty()
+                });
+            if let Some(((status, quantity), matched)) = zero_fill_terminal {
+                let evidence = format!(
+                    "authenticated /data/order terminal status={} size_matched=0 associate_trades=[]",
+                    fetched.status,
+                );
+                if self.shared.account_state.record_terminal_orphan_order_audit(
+                    &anomaly.order_id,
+                    anomaly.client_order_id.as_deref(),
+                    status,
+                    quantity,
+                    matched,
+                    &fetched.audit.associate_trades,
+                    &evidence,
+                ) {
+                    summary.tombstoned = summary.tombstoned.saturating_add(1);
+                    info!(
+                        "[PolymarketTrade] startup orphan ownership retired by zero-fill audit oid={} coid={}",
+                        anomaly.order_id,
+                        anomaly.client_order_id.as_deref().unwrap_or("<unknown>"),
+                    );
+                    continue;
+                }
+            }
+            summary.unresolved = summary.unresolved.saturating_add(1);
+        }
+        summary
+    }
+
     pub fn reconcile_recovered_orders(&self) -> usize {
         self.reconcile_recovered_orders_with_updates().0
     }
@@ -8947,7 +9182,12 @@ mod tests {
             "status": "MATCHED",
             "original_size": "40",
             "size_matched": "39.993332",
-            "associate_trades": ["trade-1", "trade-2", "trade-3", "trade-4"]
+            "associate_trades": ["trade-1", "trade-2", "trade-3", "trade-4"],
+            "maker_address": "0x1234",
+            "asset_id": "up-token",
+            "side": "BUY",
+            "price": "0.42",
+            "fee_rate_bps": "200"
         });
         let fetched = parse_fetched_order(&json, "0xabc").expect("matched order");
         assert_eq!(fetched.status, "MATCHED");
@@ -8957,6 +9197,12 @@ mod tests {
             fetched.audit.associate_trades,
             vec!["trade-1", "trade-2", "trade-3", "trade-4"]
         );
+        let identity = fetched.rebuild_identity.expect("rebuild identity");
+        assert_eq!(identity.maker_address, "0x1234");
+        assert_eq!(identity.asset_id, "up-token");
+        assert_eq!(identity.side, Side::Buy);
+        assert_eq!(identity.price, 0.42);
+        assert_eq!(identity.fee_rate_bps, Some(200));
     }
 
     #[test]
