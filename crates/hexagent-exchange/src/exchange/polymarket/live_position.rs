@@ -390,7 +390,7 @@ impl LivePositionManager {
             let Some(status) = TradeStatus::from_str(&row.ownership.status) else {
                 continue;
             };
-            manager.update_trade(
+            manager.update_trade_inner(
                 &row.ownership.trade_key,
                 status,
                 &row.ownership.token_id,
@@ -399,6 +399,7 @@ impl LivePositionManager {
                 row.ownership.price,
                 row.is_maker,
                 None,
+                false,
             );
         }
         manager
@@ -442,6 +443,24 @@ impl LivePositionManager {
         // the actual chain-revert cause (e.g. `INSUFFICIENT_BALANCE`,
         // `INVALID_NONCE`) instead of being silent.
         reason: Option<&str>,
+    ) -> bool {
+        self.update_trade_inner(
+            trade_id, status, asset_id, side, size, price, is_maker, reason, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_trade_inner(
+        &mut self,
+        trade_id: &str,
+        status: TradeStatus,
+        asset_id: &str,
+        side: Side,
+        size: f64,
+        price: f64,
+        is_maker: bool,
+        reason: Option<&str>,
+        log_transition: bool,
     ) -> bool {
         // Transient retry state: never written to the ledger (we wait for the
         // resolving Mined/Confirmed/Failed). Covers first-sighting too.
@@ -498,7 +517,10 @@ impl LivePositionManager {
             Some(s) if !s.is_empty() => format!(" reason=\"{}\"", s),
             _ => String::new(),
         };
-        if is_new {
+        if !log_transition {
+            // Restored rows are summarized by the account startup log. Per-row
+            // lifecycle output here used to dominate cold-start logs.
+        } else if is_new {
             info!(
                 "[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
                 trade_id, side, asset_id, size, price, status, is_maker, reason_part

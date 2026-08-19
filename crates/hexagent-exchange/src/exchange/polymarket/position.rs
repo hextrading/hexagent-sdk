@@ -69,13 +69,21 @@ fn validate_position_row(position: &ApiPosition, row: usize) -> Result<()> {
         || position.condition_id.trim().is_empty()
         || position.outcome.trim().is_empty()
     {
-        return Err(anyhow!("position row {row} is missing asset, conditionId, or outcome"));
+        return Err(anyhow!(
+            "position row {row} is missing asset, conditionId, or outcome"
+        ));
     }
     if !position.size.is_finite() || position.size < 0.0 {
-        return Err(anyhow!("position row {row} has invalid size {}", position.size));
+        return Err(anyhow!(
+            "position row {row} has invalid size {}",
+            position.size
+        ));
     }
     if !position.avg_price.is_finite() || !(0.0..=1.0).contains(&position.avg_price) {
-        return Err(anyhow!("position row {row} has invalid avgPrice {}", position.avg_price));
+        return Err(anyhow!(
+            "position row {row} has invalid avgPrice {}",
+            position.avg_price
+        ));
     }
     if !position.current_value.is_finite()
         || position.current_value < 0.0
@@ -94,20 +102,32 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> Result<PositionSnapshot>
     for (row, position) in resp.iter().enumerate() {
         validate_position_row(position, row)?;
     }
-    let resolved_conditions: HashSet<&str> = resp.iter()
+    let resolved_conditions: HashSet<&str> = resp
+        .iter()
         .filter(|position| position.redeemable)
         .map(|position| position.condition_id.as_str())
         .collect();
     let mut positions = HashMap::new();
     let mut settled_token_values = HashMap::new();
     for p in resp {
-        if p.size <= 0.0 { continue; }
-        if positions.insert(p.asset.clone(), Position {
+        if p.size <= 0.0 {
+            continue;
+        }
+        if positions
+            .insert(
+                p.asset.clone(),
+                Position {
             quantity: p.size,
             avg_price: p.avg_price,
             current_value: p.current_value,
-        }).is_some() {
-            return Err(anyhow!("position snapshot contains duplicate asset {}", p.asset));
+                },
+            )
+            .is_some()
+        {
+            return Err(anyhow!(
+                "position snapshot contains duplicate asset {}",
+                p.asset
+            ));
         }
         if resolved_conditions.contains(p.condition_id.as_str()) {
             let unit_value = p.current_value / p.size;
@@ -123,7 +143,10 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> Result<PositionSnapshot>
             }
         }
     }
-    Ok(PositionSnapshot { positions, settled_token_values })
+    Ok(PositionSnapshot {
+        positions,
+        settled_token_values,
+    })
 }
 
 fn authoritative_resolution(
@@ -153,16 +176,29 @@ fn authoritative_resolution(
     for token in market.tokens {
         let token_id = token.token_id.trim();
         if token_id.is_empty() {
-            return Err(anyhow!("closed market {} returned an empty token id", expected_condition_id));
+            return Err(anyhow!(
+                "closed market {} returned an empty token id",
+                expected_condition_id
+            ));
         }
-        let winner = token.winner.ok_or_else(|| anyhow!(
+        let winner = token.winner.ok_or_else(|| {
+            anyhow!(
             "closed market {} has no authoritative winner flag for token {}",
             expected_condition_id,
             token_id,
-        ))?;
-        if winner { winners += 1; }
-        if values.insert(token_id.to_string(), if winner { 1.0 } else { 0.0 }).is_some() {
-            return Err(anyhow!("closed market {} returned duplicate token ids", expected_condition_id));
+            )
+        })?;
+        if winner {
+            winners += 1;
+        }
+        if values
+            .insert(token_id.to_string(), if winner { 1.0 } else { 0.0 })
+            .is_some()
+        {
+            return Err(anyhow!(
+                "closed market {} returned duplicate token ids",
+                expected_condition_id
+            ));
         }
     }
     if winners != 1 {
@@ -214,9 +250,12 @@ impl SettlementLookupState {
             }
             _ => {}
         }
-        self.entries.insert(condition_id.to_string(), SettlementLookupEntry::InFlight {
+        self.entries.insert(
+            condition_id.to_string(),
+            SettlementLookupEntry::InFlight {
             lease_until: now + SETTLEMENT_IN_FLIGHT_LEASE,
-        });
+            },
+        );
         SettlementLookupDecision::Fetch
     }
 
@@ -311,7 +350,8 @@ fn settlement_lookup_state() -> &'static Mutex<SettlementLookupState> {
 }
 
 fn with_settlement_lookup_state<T>(f: impl FnOnce(&mut SettlementLookupState) -> T) -> T {
-    let mut state = settlement_lookup_state().lock()
+    let mut state = settlement_lookup_state()
+        .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut state)
 }
@@ -337,9 +377,12 @@ fn parse_retry_after(value: Option<&str>) -> Duration {
 }
 
 fn response_retry_after(response: &reqwest::Response) -> Duration {
-    parse_retry_after(response.headers()
+    parse_retry_after(
+        response
+            .headers()
         .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok()))
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 async fn fetch_authoritative_resolution(
@@ -347,7 +390,11 @@ async fn fetch_authoritative_resolution(
     condition_id: &str,
 ) -> std::result::Result<Option<HashMap<String, f64>>, SettlementFetchError> {
     let url = format!("{}/markets/{}", CLOB_API_BASE, condition_id);
-    let response = client.get(&url).send().await.map_err(|error| SettlementFetchError {
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| SettlementFetchError {
         message: format!("fetch settlement {}: {}", condition_id, error),
         retry_after: DEFAULT_SETTLEMENT_RETRY,
         rate_limited: false,
@@ -367,7 +414,9 @@ async fn fetch_authoritative_resolution(
             rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
         });
     }
-    let market = response.json::<ClobMarketResolution>().await
+    let market = response
+        .json::<ClobMarketResolution>()
+        .await
         .map_err(|error| SettlementFetchError {
             message: format!("parse settlement {}: {}", condition_id, error),
             retry_after: DEFAULT_SETTLEMENT_RETRY,
@@ -380,15 +429,12 @@ async fn fetch_authoritative_resolution(
     })
 }
 
-async fn fetch_authoritative_resolutions(
-    condition_ids: HashSet<String>,
-) -> HashMap<String, f64> {
+async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> HashMap<String, f64> {
     let client = crate::async_rt::http_client();
     let mut values = HashMap::new();
     for condition_id in condition_ids {
-        let decision = with_settlement_lookup_state(|state| {
-            state.claim(&condition_id, Instant::now())
-        });
+        let decision =
+            with_settlement_lookup_state(|state| state.claim(&condition_id, Instant::now()));
         match decision {
             SettlementLookupDecision::Cached(resolution) => {
                 values.extend(resolution);
@@ -409,10 +455,11 @@ async fn fetch_authoritative_resolutions(
             });
             continue;
         };
-        let delay = with_settlement_lookup_state(|state| {
-            state.reserve_request_delay(Instant::now())
-        });
-        if !delay.is_zero() { tokio::time::sleep(delay).await; }
+        let delay =
+            with_settlement_lookup_state(|state| state.reserve_request_delay(Instant::now()));
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let allowed = with_settlement_lookup_state(|state| {
             state.request_allowed(&condition_id, Instant::now())
         });
@@ -458,16 +505,13 @@ async fn fetch_authoritative_resolutions(
 /// separate entries — we do NOT collapse by conditionId.
 ///
 /// API: `GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0`
-fn fetch_position_snapshot_with_conditions(
-    wallet_address: &str,
-    mut settlement_conditions: HashSet<String>,
-) -> Result<PositionSnapshot> {
+fn fetch_position_rows(wallet_address: &str) -> Result<Vec<ApiPosition>> {
     info!("[Polymarket] Fetching positions for {}", wallet_address);
 
     // Route through the shared async runtime + HTTP/2 client.
     let client = crate::async_rt::http_client();
     let wallet = wallet_address.to_string();
-    let resp: Vec<ApiPosition> = crate::async_rt::block_on_runtime(async move {
+    crate::async_rt::block_on_runtime(async move {
         const PAGE_SIZE: usize = 500;
         const MAX_PAGES: usize = 100;
         let mut all = Vec::new();
@@ -483,24 +527,65 @@ fn fetch_position_snapshot_with_conditions(
             if !r.status().is_success() {
                 return Err(anyhow::anyhow!(
                     "fetch_positions page={} offset={}: status {}",
-                    page + 1, offset, r.status(),
+                    page + 1,
+                    offset,
+                    r.status(),
                 ));
             }
             let mut rows = r.json::<Vec<ApiPosition>>().await.map_err(|e| {
                 anyhow::anyhow!(
                     "fetch_positions parse page={} offset={}: {}",
-                    page + 1, offset, e,
+                    page + 1,
+                    offset,
+                    e,
                 )
             })?;
             let complete = rows.len() < PAGE_SIZE;
             all.append(&mut rows);
-            if complete { return Ok(all); }
+            if complete {
+                return Ok(all);
+            }
         }
         Err(anyhow::anyhow!(
             "fetch_positions exceeded {} pages; refusing a potentially incomplete authoritative snapshot",
             MAX_PAGES,
         ))
-    })?;
+    })
+}
+
+fn log_position_snapshot(snapshot: &PositionSnapshot, raw_records: usize) {
+    info!(
+        "[Polymarket] Fetched {} positions ({} raw records)",
+        snapshot.positions.len(),
+        raw_records,
+    );
+    for (token_id, pos) in &snapshot.positions {
+        let short: String = token_id.chars().take(16).collect();
+        log::debug!(
+            "[Polymarket] token={}... qty={:.4} avg_price={:.4}",
+            short,
+            pos.quantity,
+            pos.avg_price,
+        );
+    }
+}
+
+/// Fast startup view: the Data API response is authoritative for current
+/// positions and already carries direct redeemable 0/1 values. Historical
+/// CLOB market-resolution audits are intentionally excluded so account
+/// admission never waits for a long serial settlement sweep.
+pub fn fetch_position_snapshot_fast(wallet_address: &str) -> Result<PositionSnapshot> {
+    let rows = fetch_position_rows(wallet_address)?;
+    let snapshot = position_snapshot_from_rows(&rows)?;
+    log_position_snapshot(&snapshot, rows.len());
+    Ok(snapshot)
+}
+
+fn fetch_position_snapshot_with_conditions(
+    wallet_address: &str,
+    mut settlement_conditions: HashSet<String>,
+) -> Result<PositionSnapshot> {
+    let resp = fetch_position_rows(wallet_address)?;
 
     // Query every condition represented by a non-zero historical position.
     // This is deliberately broader than `redeemable`: after a new process
@@ -514,24 +599,12 @@ fn fetch_position_snapshot_with_conditions(
             .filter(|condition_id| !condition_id.is_empty())
             .map(str::to_string),
     );
-    let authoritative = crate::async_rt::block_on_runtime(
-        fetch_authoritative_resolutions(settlement_conditions),
-    );
+    let authoritative =
+        crate::async_rt::block_on_runtime(fetch_authoritative_resolutions(settlement_conditions));
     let mut snapshot = position_snapshot_from_rows(&resp)?;
     snapshot.settled_token_values.extend(authoritative);
 
-    info!(
-        "[Polymarket] Fetched {} positions ({} raw records)",
-        snapshot.positions.len(),
-        resp.len(),
-    );
-    for (token_id, pos) in &snapshot.positions {
-        let short: String = token_id.chars().take(16).collect();
-        info!(
-            "[Polymarket]   token={}... qty={:.4} avg_price={:.4}",
-            short, pos.quantity, pos.avg_price,
-        );
-    }
+    log_position_snapshot(&snapshot, resp.len());
 
     Ok(snapshot)
 }
@@ -541,7 +614,13 @@ pub fn fetch_position_snapshot(wallet_address: &str) -> Result<PositionSnapshot>
 }
 
 pub fn fetch_positions(wallet_address: &str) -> Result<HashMap<String, Position>> {
-    Ok(fetch_position_snapshot(wallet_address)?.positions)
+    Ok(fetch_position_snapshot_fast(wallet_address)?.positions)
+}
+
+pub fn fetch_authoritative_settlements_for_conditions(
+    condition_ids: HashSet<String>,
+) -> HashMap<String, f64> {
+    crate::async_rt::block_on_runtime(fetch_authoritative_resolutions(condition_ids))
 }
 
 /// pUSD on Polygon — v2 CLOB collateral (6 decimals).
@@ -574,9 +653,11 @@ pub fn try_fetch_balance_and_positions_versioned(
         .spawn(move || fetch_positions(&wp))
         .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
 
-    let balance = t_bal.join()
+    let balance = t_bal
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let positions = t_pos.join()
+    let positions = t_pos
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
     Ok((balance, positions))
 }
@@ -600,9 +681,40 @@ pub fn try_fetch_balance_positions_and_settlements_versioned(
         .spawn(move || fetch_position_snapshot(&wp))
         .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
 
-    let balance = t_bal.join()
+    let balance = t_bal
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let snapshot = t_pos.join()
+    let snapshot = t_pos
+        .join()
+        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    Ok((balance, snapshot.positions, snapshot.settled_token_values))
+}
+
+/// Startup-critical balance/position snapshot. Settlement values directly
+/// present in the Data API are returned immediately; ledger-only historical
+/// condition resolution runs on a separate background lane.
+pub fn try_fetch_balance_positions_fast_versioned(
+    wallet_address: &str,
+    is_v2: bool,
+) -> Result<(f64, HashMap<String, Position>, HashMap<String, f64>)> {
+    let token = active_collateral_token(is_v2);
+    let wb = wallet_address.to_string();
+    let tok = token.to_string();
+    let t_bal = std::thread::Builder::new()
+        .name("poly-fetch-balance".into())
+        .spawn(move || fetch_balance_for_token(&wb, &tok))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
+    let wp = wallet_address.to_string();
+    let t_pos = std::thread::Builder::new()
+        .name("poly-fetch-positions".into())
+        .spawn(move || fetch_position_snapshot_fast(&wp))
+        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
+
+    let balance = t_bal
+        .join()
+        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
+    let snapshot = t_pos
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
@@ -628,9 +740,11 @@ pub fn try_fetch_balance_positions_and_settlements_for_conditions_versioned(
         .spawn(move || fetch_position_snapshot_with_conditions(&wp, settlement_conditions))
         .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
 
-    let balance = t_bal.join()
+    let balance = t_bal
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let snapshot = t_pos.join()
+    let snapshot = t_pos
+        .join()
         .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
@@ -642,14 +756,18 @@ pub fn fetch_balance(wallet_address: &str) -> Result<f64> {
 
 /// Fetch an ERC-20 balance from Polygon via strict `eth_call balanceOf`.
 pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64> {
-    info!("[Polymarket] Fetching balance for {} (token={})", wallet_address, token);
+    info!(
+        "[Polymarket] Fetching balance for {} (token={})",
+        wallet_address, token
+    );
 
     // Primary: on-chain balanceOf(address) via Polygon RPC
     let selector: [u8; 4] = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
     let mut calldata = Vec::with_capacity(4 + 32);
     calldata.extend_from_slice(&selector);
     let addr_bytes = parse_evm_address(wallet_address)?;
-    parse_evm_address(token).map_err(|error| anyhow!("invalid collateral token address: {error}"))?;
+    parse_evm_address(token)
+        .map_err(|error| anyhow!("invalid collateral token address: {error}"))?;
     let mut padded = [0u8; 32];
     padded[12..].copy_from_slice(&addr_bytes);
     calldata.extend_from_slice(&padded);
@@ -657,7 +775,10 @@ pub fn fetch_balance_for_token(wallet_address: &str, token: &str) -> Result<f64>
 
     if let Some(result) = super::deploy_wallet::eth_call(token, &data) {
         let balance = parse_erc20_balance_result(&result)?;
-        info!("[Polymarket] Balance: {:.4} (on-chain, token={})", balance, token);
+        info!(
+            "[Polymarket] Balance: {:.4} (on-chain, token={})",
+            balance, token
+        );
         return Ok(balance);
     }
 
@@ -673,10 +794,15 @@ fn parse_evm_address(address: &str) -> Result<[u8; 20]> {
         .or_else(|| address.strip_prefix("0X"))
         .unwrap_or(address);
     if encoded.len() != 40 {
-        return Err(anyhow!("EVM address must contain exactly 40 hex characters"));
+        return Err(anyhow!(
+            "EVM address must contain exactly 40 hex characters"
+        ));
     }
-    let decoded = hex::decode(encoded).map_err(|error| anyhow!("invalid EVM address hex: {error}"))?;
-    decoded.try_into().map_err(|_| anyhow!("EVM address must decode to 20 bytes"))
+    let decoded =
+        hex::decode(encoded).map_err(|error| anyhow!("invalid EVM address hex: {error}"))?;
+    decoded
+        .try_into()
+        .map_err(|_| anyhow!("EVM address must decode to 20 bytes"))
 }
 
 fn parse_erc20_balance_result(result: &str) -> Result<f64> {
@@ -690,10 +816,11 @@ fn parse_erc20_balance_result(result: &str) -> Result<f64> {
             encoded.len(),
         ));
     }
-    let bytes = hex::decode(encoded)
-        .map_err(|error| anyhow!("invalid eth_call balance hex: {error}"))?;
+    let bytes =
+        hex::decode(encoded).map_err(|error| anyhow!("invalid eth_call balance hex: {error}"))?;
     let raw = BigUint::from_bytes_be(&bytes);
-    let balance = raw.to_f64()
+    let balance = raw
+        .to_f64()
         .ok_or_else(|| anyhow!("eth_call balance does not fit in finite f64"))?
         / 1_000_000.0;
     validate_balance(balance)
@@ -701,7 +828,9 @@ fn parse_erc20_balance_result(result: &str) -> Result<f64> {
 
 fn validate_balance(balance: f64) -> Result<f64> {
     if !balance.is_finite() || balance < 0.0 {
-        return Err(anyhow!("balance must be finite and non-negative, got {balance}"));
+        return Err(anyhow!(
+            "balance must be finite and non-negative, got {balance}"
+        ));
     }
     Ok(balance)
 }
@@ -714,8 +843,14 @@ mod tests {
     fn settlement_lookup_is_singleflight_and_caches_final_resolution() {
         let now = Instant::now();
         let mut state = SettlementLookupState::default();
-        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Fetch));
-        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Deferred));
+        assert!(matches!(
+            state.claim("condition", now),
+            SettlementLookupDecision::Fetch
+        ));
+        assert!(matches!(
+            state.claim("condition", now),
+            SettlementLookupDecision::Deferred
+        ));
 
         let expected = HashMap::from([("winner".to_string(), 1.0)]);
         state.complete("condition", Some(expected.clone()), now);
@@ -729,7 +864,10 @@ mod tests {
     fn settlement_lookup_respects_rate_limit_retry_deadline() {
         let now = Instant::now();
         let mut state = SettlementLookupState::default();
-        assert!(matches!(state.claim("condition", now), SettlementLookupDecision::Fetch));
+        assert!(matches!(
+            state.claim("condition", now),
+            SettlementLookupDecision::Fetch
+        ));
         state.defer_after_error("condition", Duration::from_secs(30), false, now);
         assert!(matches!(
             state.claim("condition", now + Duration::from_secs(29)),
@@ -762,8 +900,14 @@ mod tests {
     fn settlement_429_defers_other_cids_and_invalidates_queued_flights() {
         let now = Instant::now();
         let mut state = SettlementLookupState::default();
-        assert!(matches!(state.claim("condition-a", now), SettlementLookupDecision::Fetch));
-        assert!(matches!(state.claim("condition-b", now), SettlementLookupDecision::Fetch));
+        assert!(matches!(
+            state.claim("condition-a", now),
+            SettlementLookupDecision::Fetch
+        ));
+        assert!(matches!(
+            state.claim("condition-b", now),
+            SettlementLookupDecision::Fetch
+        ));
 
         let cached = HashMap::from([("winner".to_string(), 1.0)]);
         state.complete("resolved", Some(cached.clone()), now);
@@ -786,9 +930,14 @@ mod tests {
 
     fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
         ApiPosition {
-            asset: asset.to_string(), condition_id: condition.to_string(), size,
-            avg_price: 0.4, current_value: value, outcome: asset.to_string(),
-            title: None, redeemable,
+            asset: asset.to_string(),
+            condition_id: condition.to_string(),
+            size,
+            avg_price: 0.4,
+            current_value: value,
+            outcome: asset.to_string(),
+            title: None,
+            redeemable,
         }
     }
 
@@ -798,7 +947,8 @@ mod tests {
             row("winner", "resolved", 3.0, 3.0, true),
             row("loser", "resolved", 4.0, 0.0, false),
             row("active", "active", 2.0, 1.0, false),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(snapshot.settled_token_values.get("winner"), Some(&1.0));
         assert_eq!(snapshot.settled_token_values.get("loser"), Some(&0.0));
         assert!(!snapshot.settled_token_values.contains_key("active"));
@@ -806,42 +956,67 @@ mod tests {
 
     #[test]
     fn redeemable_metadata_does_not_authorize_non_binary_unit_values() {
-        let snapshot = position_snapshot_from_rows(&[
-            row("ambiguous", "resolved", 2.0, 1.0, true),
-        ]).unwrap();
+        let snapshot =
+            position_snapshot_from_rows(&[row("ambiguous", "resolved", 2.0, 1.0, true)]).unwrap();
         assert!(snapshot.settled_token_values.is_empty());
         assert_eq!(snapshot.positions["ambiguous"].quantity, 2.0);
     }
 
     #[test]
     fn closed_market_winner_flags_converge_both_tokens() {
-        let resolution = authoritative_resolution("condition", ClobMarketResolution {
+        let resolution = authoritative_resolution(
+            "condition",
+            ClobMarketResolution {
             condition_id: "condition".to_string(),
             closed: true,
             tokens: vec![
-                ClobMarketToken { token_id: "up".to_string(), winner: Some(false) },
-                ClobMarketToken { token_id: "down".to_string(), winner: Some(true) },
+                    ClobMarketToken {
+                        token_id: "up".to_string(),
+                        winner: Some(false),
+                    },
+                    ClobMarketToken {
+                        token_id: "down".to_string(),
+                        winner: Some(true),
+                    },
             ],
-        }).unwrap().unwrap();
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(resolution.get("up"), Some(&0.0));
         assert_eq!(resolution.get("down"), Some(&1.0));
     }
 
     #[test]
     fn active_or_ambiguous_market_is_not_authoritative() {
-        assert!(authoritative_resolution("condition", ClobMarketResolution {
+        assert!(authoritative_resolution(
+            "condition",
+            ClobMarketResolution {
             condition_id: "condition".to_string(),
             closed: false,
             tokens: vec![],
-        }).unwrap().is_none());
-        assert!(authoritative_resolution("condition", ClobMarketResolution {
+            }
+        )
+        .unwrap()
+        .is_none());
+        assert!(authoritative_resolution(
+            "condition",
+            ClobMarketResolution {
             condition_id: "condition".to_string(),
             closed: true,
             tokens: vec![
-                ClobMarketToken { token_id: "up".to_string(), winner: Some(false) },
-                ClobMarketToken { token_id: "down".to_string(), winner: Some(false) },
+                    ClobMarketToken {
+                        token_id: "up".to_string(),
+                        winner: Some(false)
+                    },
+                    ClobMarketToken {
+                        token_id: "down".to_string(),
+                        winner: Some(false)
+                    },
             ],
-        }).is_err());
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -858,14 +1033,15 @@ mod tests {
     fn one_abnormal_position_rejects_the_entire_snapshot() {
         let mut malformed = row("bad", "active", 2.0, 1.0, false);
         malformed.current_value = f64::NAN;
-        assert!(position_snapshot_from_rows(&[
-            row("good", "active", 1.0, 0.5, false),
-            malformed,
-        ]).is_err());
+        assert!(
+            position_snapshot_from_rows(&[row("good", "active", 1.0, 0.5, false), malformed,])
+                .is_err()
+        );
         assert!(position_snapshot_from_rows(&[
             row("duplicate", "a", 1.0, 0.5, false),
             row("duplicate", "b", 1.0, 0.5, false),
-        ]).is_err());
+        ])
+        .is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -2356,7 +2356,7 @@ impl ClobBurstMetrics {
     }
 
     fn log_and_reset(&mut self, now: Instant, tcp: TcpSocketMetrics) {
-        info!(
+        debug!(
             "[clob_1s_metric] window_ms={} frames={} frame_bytes={} max_frame_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} so_rcvbuf={}",
             now.saturating_duration_since(self.window_started_at).as_millis(),
             self.frames,

@@ -1552,6 +1552,11 @@ pub struct SharedState {
     pub coid_to_oid: Mutex<HashMap<String, String>>,
     /// Polymarket orderID → client_order_id
     pub oid_to_coid: Mutex<HashMap<String, String>>,
+    /// Complete ownership captured at the same publication edge as the
+    /// runtime OID maps. It is a conservative repair root for the rare case
+    /// where a cold snapshot replaces an instance lifecycle row before its
+    /// asynchronous typed WAL delta is folded into the aggregate state.
+    runtime_order_ownership: Mutex<HashMap<String, OrderOwnership>>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -1869,7 +1874,14 @@ impl SharedState {
         client_order_id: &str,
         exchange_order_id: &str,
         token: &str,
+        ownership: Option<&OrderOwnership>,
     ) {
+        if let Some(ownership) = ownership {
+            self.runtime_order_ownership
+                .lock()
+                .unwrap()
+                .insert(client_order_id.to_string(), ownership.clone());
+        }
         let previous = self
             .coid_to_oid
             .lock()
@@ -1900,8 +1912,9 @@ impl SharedState {
         client_order_id: &str,
         exchange_order_id: &str,
         token: &str,
+        ownership: Option<&OrderOwnership>,
     ) {
-        self.install_runtime_order_id(client_order_id, exchange_order_id, token);
+        self.install_runtime_order_id(client_order_id, exchange_order_id, token, ownership);
     }
 
     pub(crate) fn register_order_lifecycle(&self, order: &OrderRequest) {
@@ -2195,7 +2208,13 @@ impl SharedState {
             );
             return;
         }
-        self.install_runtime_order_id(client_order_id, exchange_order_id, token);
+        let ownership = self.account_state.order(client_order_id);
+        self.install_runtime_order_id(
+            client_order_id,
+            exchange_order_id,
+            token,
+            ownership.as_ref(),
+        );
     }
 
     /// Look up client_order_id from Polymarket orderID.
@@ -2205,6 +2224,26 @@ impl SharedState {
             .unwrap()
             .get(&normalize_order_id(exchange_order_id))
             .cloned()
+    }
+
+    pub(crate) fn lookup_order_ownership(&self, exchange_order_id: &str) -> Option<OrderOwnership> {
+        let coid = self.lookup_coid(exchange_order_id)?;
+        if let Some(order) = self
+            .account_state
+            .reconcile_order_route(&coid, exchange_order_id)
+        {
+            return Some(order);
+        }
+        let mirrored = self
+            .runtime_order_ownership
+            .lock()
+            .unwrap()
+            .get(&coid)
+            .cloned()?;
+        if normalize_order_id(&mirrored.order_id) != normalize_order_id(exchange_order_id) {
+            return None;
+        }
+        self.account_state.backfill_order_ownership(&mirrored)
     }
 
     /// Complete account-global settled-audit cleanup only after the durable
@@ -3309,6 +3348,7 @@ impl PolymarketTrade {
         let mut recovered_coid_to_oid = HashMap::new();
         let mut recovered_oid_to_coid = HashMap::new();
         let mut recovered_coid_to_token = HashMap::new();
+        let mut recovered_runtime_ownership = HashMap::new();
         for order in &recovered_orders {
             // Restore terminal mappings too: a late private trade lifecycle
             // must still resolve to the placing instance after restart.
@@ -3322,6 +3362,9 @@ impl PolymarketTrade {
             if !order.client_order_id.is_empty() && !order.token_id.is_empty() {
                 recovered_coid_to_token
                     .insert(order.client_order_id.clone(), order.token_id.clone());
+            }
+            if !order.client_order_id.is_empty() {
+                recovered_runtime_ownership.insert(order.client_order_id.clone(), order.clone());
             }
             if matches!(
                 order.status,
@@ -3362,6 +3405,7 @@ impl PolymarketTrade {
                 open_orders: Mutex::new(recovered_open),
                 coid_to_oid: Mutex::new(recovered_coid_to_oid),
                 oid_to_coid: Mutex::new(recovered_oid_to_coid),
+                runtime_order_ownership: Mutex::new(recovered_runtime_ownership),
                 coid_to_token: Mutex::new(recovered_coid_to_token),
                 order_lifecycle_traces: Mutex::new(HashMap::new()),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
@@ -4822,6 +4866,12 @@ impl PolymarketTrade {
                 let mut traces = shared.order_lifecycle_traces.lock().unwrap();
                 for coid in &owned_coids {
                     traces.remove(coid);
+                }
+            }
+            {
+                let mut ownership = shared.runtime_order_ownership.lock().unwrap();
+                for coid in &owned_coids {
+                    ownership.remove(coid);
                 }
             }
             let (ledger_orders, ledger_trades) = shared
@@ -6316,12 +6366,12 @@ impl PolymarketTrade {
         &self,
         order: &OrderRequest,
         local_oid: &str,
-    ) -> std::result::Result<(), OrderUpdate> {
+    ) -> std::result::Result<Option<OrderOwnership>, OrderUpdate> {
         // CLI/legacy one-off routes have no strategy instance and therefore
         // no virtual allocation. Engine-built routes are always registered
         // in the shared account before strategy startup.
         if self.instance_id.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let reserve = if order.post_only
             && !matches!(
@@ -6352,7 +6402,7 @@ impl PolymarketTrade {
             order.fee_rate_bps,
             )
         };
-        reserve.map(|_| ()).map_err(|error| {
+        reserve.map(Some).map_err(|error| {
             Self::make_rejected(order, &format!("shared-account admission: {error}"))
         })
     }
@@ -6402,7 +6452,7 @@ impl PolymarketTrade {
                 ))
             }
         };
-        self.reserve_account_order(order, &local_oid)?;
+        let ownership = self.reserve_account_order(order, &local_oid)?;
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "account_reserved",
@@ -6410,8 +6460,12 @@ impl PolymarketTrade {
             Some(OrderStatus::Pending),
             None,
         );
-        self.shared
-            .register_local_order_id(&order.client_order_id, &local_oid, &order.symbol);
+        self.shared.register_local_order_id(
+            &order.client_order_id,
+            &local_oid,
+            &order.symbol,
+            ownership.as_ref(),
+        );
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
         // point on the order may already be live on the server (a
         // POST landing but its reply timing out leaves an orphan-place
@@ -7186,7 +7240,9 @@ impl ExchangeTrade for PolymarketTrade {
                             None,
                         );
                         let b = serde_json::to_value(&b).unwrap_or_default();
-                        if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                        let ownership = match self.reserve_account_order(o, &order_hash) {
+                            Ok(ownership) => ownership,
+                            Err(rejected) => {
                             self.shared.log_preflight_rejected(
                                 &o.client_order_id,
                                 Some(&order_hash),
@@ -7196,6 +7252,7 @@ impl ExchangeTrade for PolymarketTrade {
                             all_updates.push(rejected);
                             continue;
                         }
+                        };
                         self.shared.log_order_lifecycle(
                             &o.client_order_id,
                             "account_reserved",
@@ -7212,6 +7269,7 @@ impl ExchangeTrade for PolymarketTrade {
                             &o.client_order_id,
                             &order_hash,
                             &o.symbol,
+                            ownership.as_ref(),
                         );
                         self.shared.open_orders.lock().unwrap().insert(
                             o.client_order_id.clone(),
@@ -7985,7 +8043,9 @@ impl ExchangeTrade for PolymarketTrade {
                         None,
                     );
                     let b = serde_json::to_value(&b).unwrap_or_default();
-                    if let Err(rejected) = self.reserve_account_order(o, &order_hash) {
+                    let ownership = match self.reserve_account_order(o, &order_hash) {
+                        Ok(ownership) => ownership,
+                        Err(rejected) => {
                         self.shared.log_preflight_rejected(
                             &o.client_order_id,
                             Some(&order_hash),
@@ -7995,6 +8055,7 @@ impl ExchangeTrade for PolymarketTrade {
                         place_sign_failures.push(rejected);
                         continue;
                     }
+                    };
                     self.shared.log_order_lifecycle(
                         &o.client_order_id,
                         "account_reserved",
@@ -8006,6 +8067,7 @@ impl ExchangeTrade for PolymarketTrade {
                         &o.client_order_id,
                         &order_hash,
                         &o.symbol,
+                        ownership.as_ref(),
                     );
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share

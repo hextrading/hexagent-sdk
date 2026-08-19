@@ -140,18 +140,21 @@ impl ShardedRouteMap {
         self.write_shard(key).remove(key)
     }
 
-    fn clear(&self) {
-        for shard in &self.shards {
-            shard.write().unwrap().clear();
-        }
-    }
-
-    fn retain_other_owners(&self, owner: &str) {
+    fn retain_owner_keys(&self, owner: &str, desired: &HashSet<String>) {
         for shard in &self.shards {
             shard
                 .write()
                 .unwrap()
-                .retain(|_, route_owner| route_owner != owner);
+                .retain(|key, route_owner| route_owner != owner || desired.contains(key));
+        }
+    }
+
+    fn retain_owners(&self, owners: &HashSet<String>) {
+        for shard in &self.shards {
+            shard
+                .write()
+                .unwrap()
+                .retain(|_, route_owner| owners.contains(route_owner));
         }
     }
 
@@ -650,6 +653,25 @@ impl AtomicF64 {
         }
     }
 
+    fn ensure_at_least(&self, minimum: f64) -> f64 {
+        let mut current_bits = self.0.load(Ordering::Acquire);
+        loop {
+            let current = f64::from_bits(current_bits);
+            if current + EPS >= minimum {
+                return current;
+            }
+            match self.0.compare_exchange_weak(
+                current_bits,
+                minimum.to_bits(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return minimum,
+                Err(observed) => current_bits = observed,
+            }
+        }
+    }
+
     fn try_reserve(&self, limit: &AtomicF64, amount: f64) -> Result<f64, f64> {
         let mut current_bits = self.0.load(Ordering::Acquire);
         loop {
@@ -715,6 +737,11 @@ struct VirtualAccount {
     token_interests: Mutex<BTreeMap<String, TokenInterest>>,
     market_scopes: Mutex<HashSet<String>>,
     lifecycle: Mutex<VirtualLifecycle>,
+    reservation_publish: Mutex<()>,
+    /// Published after a new order row and both route entries are installed.
+    /// Cold account snapshots use it to retain reservations admitted while a
+    /// control transaction was in progress.
+    reservation_epoch: AtomicU64,
 }
 
 impl VirtualAccount {
@@ -753,6 +780,8 @@ impl VirtualAccount {
             token_interests: Mutex::new(ledger.token_interests.clone()),
             market_scopes: Mutex::new(ledger.market_scopes.clone()),
             lifecycle: Mutex::new(VirtualLifecycle::default()),
+            reservation_publish: Mutex::new(()),
+            reservation_epoch: AtomicU64::new(0),
         }
     }
 
@@ -2041,6 +2070,13 @@ pub struct SharedAccount {
     /// Only anomalous trade ids are present. Exact replays for those ids take
     /// the cold audit path until a verified replay clears the durable anomaly.
     anomalous_trade_keys: RwLock<HashSet<String>>,
+    /// Exact private-event anomaly keys mirrored from the durable account.
+    /// Successful ordinary events can skip the account-wide reconciliation
+    /// lock unless their own key is known to need repair.
+    anomalous_private_event_keys: RwLock<HashSet<String>>,
+    /// Serializes the rare mark/resolve transition so a corrected replay
+    /// cannot race between the fast anomaly index and its durable row.
+    private_anomaly_transition: Mutex<()>,
     /// Fee curves are account-scoped control data but read on every taker-fill
     /// hot path. The cold account transaction refreshes this read-mostly copy.
     token_fee_configs_fast: RwLock<HashMap<String, TokenFeeConfig>>,
@@ -2080,6 +2116,7 @@ struct AccountStateGuard<'a> {
     _control: RwLockWriteGuard<'a, ()>,
     state: MutexGuard<'a, SharedAccountState>,
     instance_scope: Option<String>,
+    reservation_epochs: BTreeMap<String, u64>,
     acquired_at: Instant,
 }
 
@@ -2100,10 +2137,14 @@ impl DerefMut for AccountStateGuard<'_> {
 impl Drop for AccountStateGuard<'_> {
     fn drop(&mut self) {
         if let Some(instance_id) = self.instance_scope.as_deref() {
-            self.account
-                .sync_state_to_virtual_account(&self.state, instance_id);
+            self.account.sync_state_to_virtual_account(
+                &mut self.state,
+                instance_id,
+                self.reservation_epochs.get(instance_id).copied(),
+            );
         } else {
-            self.account.sync_state_to_virtual_accounts(&self.state);
+            self.account
+                .sync_state_to_virtual_accounts(&mut self.state, Some(&self.reservation_epochs));
         }
         let hold_us = self.acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account
@@ -2136,6 +2177,8 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: RwLock::new(HashMap::new()),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
+            anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
@@ -2156,7 +2199,8 @@ impl SharedAccount {
             reservation_oid_route_lock: LockLatencyMetrics::default(),
             reservation_lifecycle_lock: LockLatencyMetrics::default(),
         };
-        account.sync_state_to_virtual_accounts(&SharedAccountState::default());
+        let mut state = SharedAccountState::default();
+        account.sync_state_to_virtual_accounts(&mut state, None);
         account
     }
 
@@ -2406,6 +2450,8 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: RwLock::new(HashMap::new()),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
+            anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
@@ -2427,8 +2473,7 @@ impl SharedAccount {
             reservation_lifecycle_lock: LockLatencyMetrics::default(),
         };
         {
-            let state = account.lock_state();
-            account.sync_state_to_virtual_accounts(&state);
+            let _state = account.lock_state();
         }
         Ok(account)
     }
@@ -2445,6 +2490,21 @@ impl SharedAccount {
             .fetch_max(wait_us, Ordering::Relaxed);
         self.account_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
+        // Capture before copying the virtual shards. A reservation that lands
+        // after this point either appears in the copy or advances the epoch,
+        // causing the guard's final publication step to merge it explicitly.
+        let reservation_epochs = self
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(instance_id, account)| {
+                (
+                    instance_id.clone(),
+                    account.reservation_epoch.load(Ordering::Acquire),
+                )
+            })
+            .collect();
         self.sync_virtual_accounts_to_state(&mut state);
         // Account snapshots/reconcile workers own aggregate reconciliation.
         // Keeping this on the already-cold control transaction means hot fills
@@ -2455,6 +2515,7 @@ impl SharedAccount {
             _control: control,
             state,
             instance_scope: None,
+            reservation_epochs,
             acquired_at,
         }
     }
@@ -2471,12 +2532,22 @@ impl SharedAccount {
             .fetch_max(wait_us, Ordering::Relaxed);
         self.account_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
+        let reservation_epochs = self
+            .virtual_account(instance_id)
+            .map(|account| {
+                BTreeMap::from([(
+                    instance_id.to_string(),
+                    account.reservation_epoch.load(Ordering::Acquire),
+                )])
+            })
+            .unwrap_or_default();
         self.sync_virtual_account_to_state(&mut state, instance_id);
         AccountStateGuard {
             account: self,
             _control: control,
             state,
             instance_scope: Some(instance_id.to_string()),
+            reservation_epochs,
             acquired_at,
         }
     }
@@ -2613,16 +2684,86 @@ impl SharedAccount {
             .collect();
     }
 
-    fn sync_state_to_virtual_accounts(&self, state: &SharedAccountState) {
-        let mut accounts = self.virtual_accounts.write().unwrap();
-        accounts.retain(|instance_id, _| state.instances.contains_key(instance_id));
-        for (instance_id, ledger) in &state.instances {
-            let account = accounts
-                .entry(instance_id.clone())
-                .or_insert_with(|| Arc::new(VirtualAccount::new(instance_id.clone(), ledger)))
-                .clone();
-            account.replace_ledger(ledger);
+    fn merge_concurrent_reservations(
+        state: &mut SharedAccountState,
+        account: &VirtualAccount,
+        lifecycle: &VirtualLifecycle,
+        observed_epoch: Option<u64>,
+    ) {
+        if observed_epoch
+            .is_none_or(|observed| observed == account.reservation_epoch.load(Ordering::Acquire))
+        {
+            return;
+        }
+        let missing: Vec<OrderOwnership> = lifecycle
+            .orders
+            .iter()
+            .filter(|(coid, _)| !state.orders.contains_key(*coid))
+            .map(|(_, order)| order.clone())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let Some(instance) = state.instances.get_mut(&account.instance_id) else {
+            return;
+        };
+        for order in missing {
+            instance.reserved_cash += order.reserved_cash;
+            if order.reserved_quantity > EPS {
+                *instance
+                    .reserved_positions
+                    .entry(order.token_id.clone())
+                    .or_insert(0.0) += order.reserved_quantity;
+            }
+            state.oid_to_coid.insert(
+                normalize_order_id(&order.order_id),
+                order.client_order_id.clone(),
+            );
+            state.orders.insert(order.client_order_id.clone(), order);
+        }
+    }
+
+    fn sync_state_to_virtual_accounts(
+        &self,
+        state: &mut SharedAccountState,
+        reservation_epochs: Option<&BTreeMap<String, u64>>,
+    ) {
+        let ledgers: Vec<(String, InstanceLedger)> = state
+            .instances
+            .iter()
+            .map(|(instance_id, ledger)| (instance_id.clone(), ledger.clone()))
+            .collect();
+        // Keep the account-map writer scoped to membership publication only.
+        // Reservation lookup must never wait for the subsequent per-instance
+        // snapshot copies performed by a cold control transaction.
+        let accounts: Vec<(String, Arc<VirtualAccount>)> = {
+            let mut accounts = self.virtual_accounts.write().unwrap();
+            accounts.retain(|instance_id, _| state.instances.contains_key(instance_id));
+            ledgers
+                .iter()
+                .map(|(instance_id, ledger)| {
+                    let account = accounts
+                        .entry(instance_id.clone())
+                        .or_insert_with(|| {
+                            Arc::new(VirtualAccount::new(instance_id.clone(), ledger))
+                        })
+                        .clone();
+                    (instance_id.clone(), account)
+                })
+                .collect()
+        };
+        for (instance_id, account) in &accounts {
+            let _publication = account.reservation_publish.lock().unwrap();
             let mut lifecycle = account.lifecycle.lock().unwrap();
+            Self::merge_concurrent_reservations(
+                state,
+                &account,
+                &lifecycle,
+                reservation_epochs.and_then(|epochs| epochs.get(instance_id).copied()),
+            );
+            if let Some(ledger) = state.instances.get(instance_id) {
+                account.replace_ledger(ledger);
+            }
             lifecycle.orders = state
                 .orders
                 .iter()
@@ -2669,25 +2810,61 @@ impl SharedAccount {
             lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
         }
 
+        // Never clear a live route index before rebuilding it. Private events
+        // resolve through these maps without the cold control gate; a
+        // clear-then-insert window previously produced false "runtime mapping
+        // but no ledger row" ownership failures. Settled GC removes truly
+        // retired routes explicitly, so snapshot convergence only needs
+        // idempotent upserts here.
+        let route_snapshots: Vec<_> = accounts
+            .iter()
+            .map(|(instance_id, account)| {
+                let lifecycle = account.lifecycle.lock().unwrap();
+                let coids: HashSet<String> = lifecycle.orders.keys().cloned().collect();
+                let oids: HashSet<String> = lifecycle
+                    .orders
+                    .values()
+                    .map(|order| normalize_order_id(&order.order_id))
+                    .collect();
+                let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
+                (instance_id.clone(), coids, oids, trade_keys)
+            })
+            .collect();
+        let live_owners: HashSet<String> = route_snapshots
+            .iter()
+            .map(|(instance_id, _, _, _)| instance_id.clone())
+            .collect();
         let mut trade_routes = self.trade_routes.write().unwrap();
-        self.coid_routes.clear();
-        self.oid_routes.clear();
-        trade_routes.clear();
-        for (instance_id, account) in accounts.iter() {
-            let lifecycle = account.lifecycle.lock().unwrap();
-            for (coid, order) in &lifecycle.orders {
+        for (instance_id, coids, oids, trade_keys) in route_snapshots {
+            for coid in &coids {
                 self.coid_routes.insert(coid.clone(), instance_id.clone());
-                self.oid_routes
-                    .insert(normalize_order_id(&order.order_id), instance_id.clone());
             }
-            for trade_key in lifecycle.trades.keys() {
+            for oid in &oids {
+                self.oid_routes.insert(oid.clone(), instance_id.clone());
+            }
+            for trade_key in &trade_keys {
                 trade_routes.insert(trade_key.clone(), instance_id.clone());
             }
+            // Publish desired keys first, then prune keys no longer present in
+            // this owner's shard. Readers therefore never observe a valid
+            // order without a route while settled GC still removes tombstones.
+            self.coid_routes.retain_owner_keys(&instance_id, &coids);
+            self.oid_routes.retain_owner_keys(&instance_id, &oids);
+            trade_routes.retain(|key, owner| owner != &instance_id || trade_keys.contains(key));
         }
+        self.coid_routes.retain_owners(&live_owners);
+        self.oid_routes.retain_owners(&live_owners);
+        trade_routes.retain(|_, owner| live_owners.contains(owner));
         *self.anomalous_trade_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
             .filter_map(|key| key.strip_prefix("trade:"))
+            .map(str::to_string)
+            .collect();
+        *self.anomalous_private_event_keys.write().unwrap() = state
+            .ownership_anomalies
+            .keys()
+            .filter_map(|key| key.strip_prefix("private_event:"))
             .map(str::to_string)
             .collect();
         let seeded = state.seeded;
@@ -2704,19 +2881,33 @@ impl SharedAccount {
         *self.token_fee_configs_fast.write().unwrap() = state.token_fee_configs.clone();
     }
 
-    fn sync_state_to_virtual_account(&self, state: &SharedAccountState, instance_id: &str) {
-        let Some(ledger) = state.instances.get(instance_id) else {
+    fn sync_state_to_virtual_account(
+        &self,
+        state: &mut SharedAccountState,
+        instance_id: &str,
+        observed_reservation_epoch: Option<u64>,
+    ) {
+        let Some(ledger) = state.instances.get(instance_id).cloned() else {
             return;
         };
         let account = {
             let mut accounts = self.virtual_accounts.write().unwrap();
             accounts
                 .entry(instance_id.to_string())
-                .or_insert_with(|| Arc::new(VirtualAccount::new(instance_id.to_string(), ledger)))
+                .or_insert_with(|| Arc::new(VirtualAccount::new(instance_id.to_string(), &ledger)))
                 .clone()
         };
-        account.replace_ledger(ledger);
+        let _publication = account.reservation_publish.lock().unwrap();
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        Self::merge_concurrent_reservations(
+            state,
+            &account,
+            &lifecycle,
+            observed_reservation_epoch,
+        );
+        if let Some(ledger) = state.instances.get(instance_id) {
+            account.replace_ledger(ledger);
+        }
         lifecycle.orders = state
             .orders
             .iter()
@@ -2761,26 +2952,43 @@ impl SharedAccount {
             .map(str::to_string)
             .collect();
         lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
+        let coids: HashSet<String> = lifecycle.orders.keys().cloned().collect();
+        let oids: HashSet<String> = lifecycle
+            .orders
+            .values()
+            .map(|order| normalize_order_id(&order.order_id))
+            .collect();
+        let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
         drop(lifecycle);
 
         let mut trade_routes = self.trade_routes.write().unwrap();
-        self.coid_routes.retain_other_owners(instance_id);
-        self.oid_routes.retain_other_owners(instance_id);
-        trade_routes.retain(|_, owner| owner != instance_id);
-        let lifecycle = account.lifecycle.lock().unwrap();
-        for (coid, order) in &lifecycle.orders {
+        // Route retirement is explicit and event-scoped. Destructively
+        // removing every route for an instance makes lock-free private reads
+        // observe a transient hole while this snapshot is republished.
+        for coid in &coids {
             self.coid_routes
                 .insert(coid.clone(), instance_id.to_string());
-            self.oid_routes
-                .insert(normalize_order_id(&order.order_id), instance_id.to_string());
         }
-        for trade_key in lifecycle.trades.keys() {
+        for oid in &oids {
+            self.oid_routes
+                .insert(oid.clone(), instance_id.to_string());
+        }
+        for trade_key in &trade_keys {
             trade_routes.insert(trade_key.clone(), instance_id.to_string());
         }
+        self.coid_routes.retain_owner_keys(instance_id, &coids);
+        self.oid_routes.retain_owner_keys(instance_id, &oids);
+        trade_routes.retain(|key, owner| owner != instance_id || trade_keys.contains(key));
         *self.anomalous_trade_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
             .filter_map(|key| key.strip_prefix("trade:"))
+            .map(str::to_string)
+            .collect();
+        *self.anomalous_private_event_keys.write().unwrap() = state
+            .ownership_anomalies
+            .keys()
+            .filter_map(|key| key.strip_prefix("private_event:"))
             .map(str::to_string)
             .collect();
         self.seeded_fast.store(state.seeded, Ordering::Release);
@@ -5102,12 +5310,13 @@ impl SharedAccount {
         if !admission_allowed {
             return Err(ReservationError::AccountUncertain);
         }
-        let control_wait = Instant::now();
-        let control = self.control_gate.read().unwrap();
-        let control_metric = self.reservation_control_lock.acquired(control_wait);
         let account = self
             .virtual_account(instance_id)
             .ok_or_else(|| ReservationError::UnknownInstance(instance_id.into()))?;
+        // Reservation is entirely instance-scoped. The narrow publication
+        // mutex only coordinates this shard with the final snapshot-copy
+        // phase; it never waits for an account control transaction.
+        let _publication = account.reservation_publish.lock().unwrap();
         let normalized_order_id = normalize_order_id(order_id);
         let lifecycle_wait = Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
@@ -5200,6 +5409,7 @@ impl SharedAccount {
             .insert(client_order_id.into(), ownership.clone());
         coid_routes.insert(client_order_id.into(), instance_id.into());
         oid_routes.insert(normalized_order_id, instance_id.into());
+        account.reservation_epoch.fetch_add(1, Ordering::Release);
         let persisted_reserved_cash = account.reserved_cash.load();
         let persisted_reserved_position = account
             .positions
@@ -5231,8 +5441,6 @@ impl SharedAccount {
         drop(coid_routes);
         drop(lifecycle_metric);
         drop(lifecycle);
-        drop(control_metric);
-        drop(control);
         // Deliberately asynchronous: startup exchange reconciliation is the
         // recovery authority for the crash window between POST acceptance and
         // this WAL generation reaching disk. In-process reservations remain
@@ -5380,6 +5588,15 @@ impl SharedAccount {
         if payload_key.is_empty() {
             return;
         }
+        let _transition = self.private_anomaly_transition.lock().unwrap();
+        if self
+            .anomalous_private_event_keys
+            .read()
+            .unwrap()
+            .contains(payload_key)
+        {
+            return;
+        }
         let mut state = self.lock_state();
         set_ownership_anomaly(
             &mut state,
@@ -5391,6 +5608,15 @@ impl SharedAccount {
 
     pub fn resolve_private_event_anomaly(&self, payload_key: &str) {
         if payload_key.is_empty() {
+            return;
+        }
+        let _transition = self.private_anomaly_transition.lock().unwrap();
+        if !self
+            .anomalous_private_event_keys
+            .read()
+            .unwrap()
+            .contains(payload_key)
+        {
             return;
         }
         let mut state = self.lock_state();
@@ -5463,7 +5689,30 @@ impl SharedAccount {
     }
 
     pub fn order(&self, client_order_id: &str) -> Option<OrderOwnership> {
-        let account = self.virtual_account_for_coid(client_order_id)?;
+        if let Some(account) = self.virtual_account_for_coid(client_order_id) {
+            if let Some(order) = account
+                .lifecycle
+                .lock()
+                .unwrap()
+                .orders
+                .get(client_order_id)
+                .cloned()
+            {
+                return Some(order);
+            }
+        }
+        // Snapshot publication is intentionally lock-free to private readers.
+        // If a route is temporarily absent/stale, scan the small instance map
+        // and repair both indexes instead of turning a valid event into an
+        // account-wide ownership anomaly.
+        let accounts: Vec<Arc<VirtualAccount>> = self
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for account in accounts {
         let order = account
             .lifecycle
             .lock()
@@ -5471,7 +5720,109 @@ impl SharedAccount {
             .orders
             .get(client_order_id)
             .cloned();
-        order
+            if let Some(order) = order {
+                self.coid_routes
+                    .insert(client_order_id.to_string(), account.instance_id.clone());
+                self.oid_routes.insert(
+                    normalize_order_id(&order.order_id),
+                    account.instance_id.clone(),
+                );
+                return Some(order);
+            }
+        }
+        None
+    }
+
+    /// Resolve an order through its durable instance shard and repair any
+    /// transient route hole. A successful authoritative reconcile also clears
+    /// the exact private-event anomaly that previously blocked admission.
+    pub fn reconcile_order_route(
+        &self,
+        client_order_id: &str,
+        order_id: &str,
+    ) -> Option<OrderOwnership> {
+        let order = self.order(client_order_id)?;
+        if normalize_order_id(&order.order_id) != normalize_order_id(order_id) {
+            return None;
+        }
+        self.resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(order_id)));
+        Some(order)
+    }
+
+    /// Restore a missing instance lifecycle row from the complete ownership
+    /// mirror captured at reservation publication. The operation is
+    /// idempotent and raises reservation counters only to the conservative
+    /// minimum implied by all retained orders, so it cannot double-reserve.
+    pub fn backfill_order_ownership(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
+        if ownership.account_id != self.account_id
+            || ownership.client_order_id.is_empty()
+            || ownership.order_id.is_empty()
+        {
+            return None;
+        }
+        let account = self.virtual_account(&ownership.instance_id)?;
+        let _publication = account.reservation_publish.lock().unwrap();
+        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let normalized = normalize_order_id(&ownership.order_id);
+        let existing = lifecycle.orders.get(&ownership.client_order_id).cloned();
+        if existing.as_ref().is_some_and(|existing| {
+            normalize_order_id(&existing.order_id) != normalized
+                || existing.instance_id != ownership.instance_id
+        }) {
+            return None;
+        }
+        let mut coid_routes = self.coid_routes.write_shard(&ownership.client_order_id);
+        let mut oid_routes = self.oid_routes.write_shard(&normalized);
+        if coid_routes
+            .get(&ownership.client_order_id)
+            .is_some_and(|owner| owner != &ownership.instance_id)
+            || oid_routes
+                .get(&normalized)
+                .is_some_and(|owner| owner != &ownership.instance_id)
+        {
+            return None;
+        }
+        let inserted = existing.is_none();
+        if inserted {
+            lifecycle
+                .orders
+                .insert(ownership.client_order_id.clone(), ownership.clone());
+            let minimum_cash: f64 = lifecycle
+                .orders
+                .values()
+                .map(|order| order.reserved_cash)
+                .sum();
+            account.reserved_cash.ensure_at_least(minimum_cash);
+            let minimum_position: f64 = lifecycle
+                .orders
+                .values()
+                .filter(|order| order.token_id == ownership.token_id)
+                .map(|order| order.reserved_quantity)
+                .sum();
+            account
+                .position(&ownership.token_id)
+                .reserved
+                .ensure_at_least(minimum_position);
+        }
+        coid_routes.insert(
+            ownership.client_order_id.clone(),
+            ownership.instance_id.clone(),
+        );
+        oid_routes.insert(normalized.clone(), ownership.instance_id.clone());
+        if inserted {
+            account.reservation_epoch.fetch_add(1, Ordering::Release);
+            self.schedule_virtual_lifecycle_persist(
+                &account,
+                &lifecycle,
+                &ownership.client_order_id,
+            );
+        }
+        drop(oid_routes);
+        drop(coid_routes);
+        drop(lifecycle);
+        drop(_publication);
+        self.resolve_private_event_anomaly(&format!("order:{normalized}"));
+        Some(existing.unwrap_or_else(|| ownership.clone()))
     }
 
     pub fn mark_order_status(&self, client_order_id: &str, status: OrderStatus) {
@@ -10956,7 +11307,7 @@ mod tests {
             .reserve_order("a", "a-1", "oid-a-1", "UP", Side::Buy, 100.0, 1.0, 0)
             .unwrap();
         let locks = account.monitoring_snapshot();
-        assert_eq!(locks.reservation_control_lock.acquisitions, 1);
+        assert_eq!(locks.reservation_control_lock.acquisitions, 0);
         assert_eq!(locks.reservation_lifecycle_lock.acquisitions, 1);
         assert_eq!(locks.reservation_coid_route_lock.acquisitions, 1);
         assert_eq!(locks.reservation_oid_route_lock.acquisitions, 1);
@@ -15729,6 +16080,123 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         }
         assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 100.0);
         assert_eq!(account.instance_snapshot("b").unwrap().reserved_cash, 300.0);
+        assert_eq!(
+            account
+                .monitoring_snapshot()
+                .reservation_control_lock
+                .acquisitions,
+            0,
+            "instance reservation must not acquire the account control gate",
+        );
+    }
+
+    #[test]
+    fn cold_control_snapshot_preserves_concurrent_instance_reservation() {
+        let account = Arc::new(seeded_account());
+        let cold_state = account.lock_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_account = Arc::clone(&account);
+        let worker = std::thread::spawn(move || {
+            let result = worker_account.reserve_order(
+                "a",
+                "a-during-control",
+                "oid-during-control",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            );
+            tx.send(result).unwrap();
+        });
+
+        let ownership = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reservation must not wait for the control transaction")
+            .unwrap();
+        drop(cold_state);
+        worker.join().unwrap();
+
+        assert_eq!(account.order(&ownership.client_order_id), Some(ownership));
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+        assert_eq!(
+            account
+                .monitoring_snapshot()
+                .reservation_control_lock
+                .acquisitions,
+            0,
+        );
+    }
+
+    #[test]
+    fn order_lookup_repairs_route_hole_without_account_uncertainty() {
+        let account = seeded_account();
+        let ownership = account
+            .reserve_order(
+                "a",
+                "a-route-repair",
+                "oid-route-repair",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        account.coid_routes.remove(&ownership.client_order_id);
+        account
+            .oid_routes
+            .remove(&normalize_order_id(&ownership.order_id));
+
+        assert_eq!(
+            account.order(&ownership.client_order_id),
+            Some(ownership.clone())
+        );
+        assert_eq!(
+            account.order_owner_by_oid(&ownership.order_id).as_deref(),
+            Some("a"),
+        );
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn mirrored_order_backfill_is_idempotent_and_clears_exact_private_anomaly() {
+        let account = seeded_account();
+        let ownership = account
+            .reserve_order(
+                "a",
+                "a-row-backfill",
+                "oid-row-backfill",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        account.mark_private_event_anomaly(
+            "order:oid-row-backfill",
+            "test runtime mapping without lifecycle row",
+        );
+        let virtual_account = account.virtual_account("a").unwrap();
+        virtual_account
+            .lifecycle
+            .lock()
+            .unwrap()
+            .orders
+            .remove(&ownership.client_order_id);
+
+        assert_eq!(
+            account.backfill_order_ownership(&ownership),
+            Some(ownership.clone()),
+        );
+        assert_eq!(
+            account.backfill_order_ownership(&ownership),
+            Some(ownership)
+        );
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+        assert!(!account.is_uncertain());
+        assert!(account.ownership_anomalies().is_empty());
     }
 
     #[test]

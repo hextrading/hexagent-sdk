@@ -1086,16 +1086,23 @@ mod polymarket_supervisor_tests {
     }
 }
 
-fn nonzero_account_metric_positions(
-    positions: &HashMap<String, f64>,
-) -> std::collections::BTreeMap<&str, f64> {
-    positions
-        .iter()
-        .filter(|(_, quantity)| {
-            !quantity.is_finite() || quantity.abs() > ACCOUNT_METRIC_POSITION_EPS
-        })
-        .map(|(asset, quantity)| (asset.as_str(), *quantity))
-        .collect()
+fn account_metric_position_summary(positions: &HashMap<String, f64>) -> (usize, f64, usize) {
+    positions.values().fold(
+        (0usize, 0.0f64, 0usize),
+        |(count, total_abs, invalid), quantity| {
+            if !quantity.is_finite() {
+                (
+                    count.saturating_add(1),
+                    total_abs,
+                    invalid.saturating_add(1),
+                )
+            } else if quantity.abs() > ACCOUNT_METRIC_POSITION_EPS {
+                (count.saturating_add(1), total_abs + quantity.abs(), invalid)
+            } else {
+                (count, total_abs, invalid)
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1115,12 +1122,11 @@ mod account_metric_tests {
             ("invalid".to_string(), f64::NAN),
         ]);
 
-        let logged = nonzero_account_metric_positions(&positions);
+        let (count, total_abs, invalid) = account_metric_position_summary(&positions);
 
-        assert_eq!(logged.len(), 3);
-        assert_eq!(logged.get("long"), Some(&1e-6));
-        assert_eq!(logged.get("short"), Some(&-0.25));
-        assert!(logged.get("invalid").is_some_and(|value| value.is_nan()));
+        assert_eq!(count, 3);
+        assert!((total_abs - 0.250001).abs() < 1e-12);
+        assert_eq!(invalid, 1);
     }
 }
 
@@ -8557,16 +8563,20 @@ impl Engine {
                                             );
                                         }
                                         let log_account = || {
+                                            let physical = account_metric_position_summary(&snapshot.physical_positions);
+                                            let virtual_total = account_metric_position_summary(&snapshot.virtual_positions);
+                                            let unallocated = account_metric_position_summary(&snapshot.unallocated_positions);
+                                            let reserved = account_metric_position_summary(&snapshot.reserved_positions);
                                             format!(
-                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} physical_pos={:?} virtual_pos={:?} unallocated_pos={:?} reserved_pos={:?} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
+                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} pos_physical(count/abs/invalid)={}/{:.4}/{} pos_virtual={}/{:.4}/{} pos_unallocated={}/{:.4}/{} pos_reserved={}/{:.4}/{} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
                                                 snapshot.physical_cash,
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
                                                 snapshot.reserved_cash,
-                                                nonzero_account_metric_positions(&snapshot.physical_positions),
-                                                nonzero_account_metric_positions(&snapshot.virtual_positions),
-                                                nonzero_account_metric_positions(&snapshot.unallocated_positions),
-                                                nonzero_account_metric_positions(&snapshot.reserved_positions),
+                                                physical.0, physical.1, physical.2,
+                                                virtual_total.0, virtual_total.1, virtual_total.2,
+                                                unallocated.0, unallocated.1, unallocated.2,
+                                                reserved.0, reserved.1, reserved.2,
                                                 snapshot.uncertain,
                                                 snapshot.uncertain_since_ms,
                                                 snapshot.uncertain_reason,
@@ -8602,15 +8612,17 @@ impl Engine {
                                                 log_account(),
                                             );
                                             for instance in snapshot.instances {
+                                                let positions = account_metric_position_summary(&instance.positions);
+                                                let reserved_positions = account_metric_position_summary(&instance.reserved_positions);
                                                 warn!(
-                                                    "[account_metric] account={} instance={} weight={:.4} virtual_cash={:.6} reserved_cash={:.6} virtual_pos={:?} reserved_pos={:?}",
+                                                    "[account_metric] account={} instance={} weight={:.4} virtual_cash={:.6} reserved_cash={:.6} positions(count/abs/invalid)={}/{:.4}/{} reserved_positions={}/{:.4}/{}",
                                                     snapshot.account_id,
                                                     instance.instance_id,
                                                     instance.weight,
                                                     instance.cash,
                                                     instance.reserved_cash,
-                                                    nonzero_account_metric_positions(&instance.positions),
-                                                    nonzero_account_metric_positions(&instance.reserved_positions),
+                                                    positions.0, positions.1, positions.2,
+                                                    reserved_positions.0, reserved_positions.1, reserved_positions.2,
                                                 );
                                             }
                                         }
