@@ -2277,8 +2277,11 @@ impl Engine {
         }
 
         let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
-        let (signal_tx, signal_rx) = bounded::<Signal>(CHANNEL_CAPACITY);
-        let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
+        // Strategy↔executor control traffic must not stall quote processing or
+        // HTTP completion threads. Venue-specific queues below enforce the
+        // actual place/cancel/reconcile admission policy.
+        let (signal_tx, signal_rx) = unbounded::<Signal>();
+        let (update_tx, update_rx) = unbounded::<OrderUpdate>();
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2570,8 +2573,8 @@ impl Engine {
 
         let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
-        let (signal_tx, signal_rx) = bounded::<Signal>(CHANNEL_CAPACITY);
-        let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
+        let (signal_tx, signal_rx) = unbounded::<Signal>();
+        let (update_tx, update_rx) = unbounded::<OrderUpdate>();
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -8068,14 +8071,30 @@ impl Engine {
                     .map(|e| e.executor_workers).unwrap_or(8).max(1);
                 let (poly_pool_tx, poly_pool_rx) =
                     bounded::<(Signal, u64, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
+                // Must-complete cancel work owns a lossless lane. Its workers
+                // are allowed to wait for a Cancel permit without consuming a
+                // place worker and aging unrelated quote signals.
+                let (poly_cancel_tx, poly_cancel_rx) =
+                    unbounded::<(Signal, u64, Sender<OrderUpdate>)>();
+                // Reconcile performs synchronous multi-request HTTP. Keep it
+                // off both the place and cancel lanes; bounded admission lets
+                // the strategy receive explicit deferred feedback instead of
+                // building an unbounded orphan backlog.
+                let (poly_reconcile_tx, poly_reconcile_rx) =
+                    bounded::<(Signal, u64, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
                 // Fire-and-track completion lane: a worker fires (admission
                 // permit + kickoff on the reserved connection) then hands the
                 // "await reply + book it" closure here; a pool of drainers runs
                 // them so no worker `block_on`s the RTT. The permit is captured
                 // by the closure and released when it completes.
+                // Fired completions are already bounded by held HTTP permits,
+                // so an unbounded channel removes a redundant blocking send
+                // without removing effective admission control.
                 let (poly_done_tx, poly_done_rx) =
-                    bounded::<(PolyCompletionFn, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
+                    unbounded::<(PolyCompletionFn, Sender<OrderUpdate>)>();
                 let mut poly_worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_cancel_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_reconcile_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 let mut poly_drainer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 // Admission-control observability (component 7): a stop flag +
                 // handle for the periodic stats daemon, set/joined at shutdown.
@@ -8119,21 +8138,80 @@ impl Engine {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_pool_rx.clone();
                         let done_tx = poly_done_tx.clone();
+                        let cancel_tx = poly_cancel_tx.clone();
                         let wname = format!("poly-exec-{}", i);
                         let h = thread::Builder::new()
                             .name(wname.clone())
                             .spawn(move || {
                                 crate::os_tune::pin_execution(&wname);
                                 while let Ok((signal, stale_ms, utx)) = rx.recv() {
-                                    fire_or_execute(&mut worker, signal, stale_ms, &done_tx, &utx);
+                                    fire_or_execute(
+                                        &mut worker,
+                                        signal,
+                                        stale_ms,
+                                        &done_tx,
+                                        &cancel_tx,
+                                        &utx,
+                                    );
                                 }
                             })
                             .unwrap();
                         poly_worker_handles.push(h);
                     }
+                    let cancel_worker_n = hexagent_runtime::http1_pool::total_account_order_capacity()
+                        .max(1);
+                    for i in 0..cancel_worker_n {
+                        let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let rx = poly_cancel_rx.clone();
+                        let done_tx = poly_done_tx.clone();
+                        let cancel_tx = poly_cancel_tx.clone();
+                        let wname = format!("poly-cancel-{}", i);
+                        let h = thread::Builder::new()
+                            .name(wname.clone())
+                            .spawn(move || {
+                                crate::os_tune::pin_execution(&wname);
+                                while let Ok((signal, stale_ms, utx)) = rx.recv() {
+                                    fire_or_execute(
+                                        &mut worker,
+                                        signal,
+                                        stale_ms,
+                                        &done_tx,
+                                        &cancel_tx,
+                                        &utx,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        poly_cancel_handles.push(h);
+                    }
+                    let reconcile_worker_n = poly_states.len().saturating_mul(2).max(1);
+                    for i in 0..reconcile_worker_n {
+                        let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let rx = poly_reconcile_rx.clone();
+                        let done_tx = poly_done_tx.clone();
+                        let cancel_tx = poly_cancel_tx.clone();
+                        let wname = format!("poly-reconcile-{}", i);
+                        let h = thread::Builder::new()
+                            .name(wname.clone())
+                            .spawn(move || {
+                                crate::os_tune::pin_background(&wname);
+                                while let Ok((signal, stale_ms, utx)) = rx.recv() {
+                                    fire_or_execute(
+                                        &mut worker,
+                                        signal,
+                                        stale_ms,
+                                        &done_tx,
+                                        &cancel_tx,
+                                        &utx,
+                                    );
+                                }
+                            })
+                            .unwrap();
+                        poly_reconcile_handles.push(h);
+                    }
                     info!(
-                        "[Executor] Polymarket dispatch pool: {} workers, {} completion drainers",
-                        poly_worker_n, n_drainers
+                        "[Executor] Polymarket dispatch pools: place={} cancel={} reconcile={} completion={}",
+                        poly_worker_n, cancel_worker_n, reconcile_worker_n, n_drainers
                     );
                     // Admission-control observability daemon: every 30 s log the
                     // per-(account,role) delta — acquires/skips, retained cancel
@@ -8275,11 +8353,15 @@ impl Engine {
                     }
                 }
                 drop(poly_pool_rx); // main loop only sends; workers hold their clones
+                drop(poly_cancel_rx);
+                drop(poly_reconcile_rx);
                 drop(poly_done_rx); // workers hold their clones of done_tx
                 // Options so Exit can drop senders + join (drain all in-flight
                 // dispatches AND completions) BEFORE the shutdown cancel-all, so
                 // nothing places an order after cancel-all snapshots the book.
                 let mut poly_pool_tx = Some(poly_pool_tx);
+                let mut poly_cancel_tx = Some(poly_cancel_tx);
+                let mut poly_reconcile_tx = Some(poly_reconcile_tx);
                 let mut poly_done_tx = Some(poly_done_tx);
 
                 // Stale-signal threshold — read from the shared
@@ -8339,6 +8421,17 @@ impl Engine {
                                 // cancel-all can snapshot the remote book.
                                 poly_pool_tx = None;
                                 for h in std::mem::take(&mut poly_worker_handles) {
+                                    let _ = h.join();
+                                }
+                                // Place workers may enqueue the cancel leg of a
+                                // ReplaceOrder, so close/join the lossless cancel
+                                // lane only after every place worker is gone.
+                                poly_cancel_tx = None;
+                                for h in std::mem::take(&mut poly_cancel_handles) {
+                                    let _ = h.join();
+                                }
+                                poly_reconcile_tx = None;
+                                for h in std::mem::take(&mut poly_reconcile_handles) {
                                     let _ = h.join();
                                 }
                                 // Drain every fired completion before the
@@ -8415,8 +8508,77 @@ impl Engine {
                             // (binance, unknown iid, or pool disabled) runs
                             // inline on this thread as before.
                             if poly_states.contains_key(&iid) && poly_pool_tx.is_some() {
-                                let _ = poly_pool_tx.as_ref().unwrap()
-                                    .send((signal, stale_threshold_ms, update_tx.clone()));
+                                let work = (signal, stale_threshold_ms, update_tx.clone());
+                                match &work.0 {
+                                    Signal::CancelOrder {
+                                        exchange: Exchange::Polymarket,
+                                        ..
+                                    }
+                                    | Signal::CancelAll {
+                                        exchange: Exchange::Polymarket,
+                                        ..
+                                    }
+                                    | Signal::BatchCancelOrders {
+                                        exchange: Exchange::Polymarket,
+                                        ..
+                                    }
+                                    | Signal::PolymarketCancelAllOrders { .. } => {
+                                        if let Some(tx) = poly_cancel_tx.as_ref() {
+                                            let _ = tx.send(work);
+                                        }
+                                    }
+                                    Signal::ReconcilePolymarket { .. } => {
+                                        if let Some(tx) = poly_reconcile_tx.as_ref() {
+                                            match tx.try_send(work) {
+                                                Ok(()) => {}
+                                                Err(crossbeam_channel::TrySendError::Full((
+                                                    signal,
+                                                    _,
+                                                    utx,
+                                                )))
+                                                | Err(crossbeam_channel::TrySendError::Disconnected((
+                                                    signal,
+                                                    _,
+                                                    utx,
+                                                ))) => defer_reconcile_signal(signal, &utx),
+                                            }
+                                        }
+                                    }
+                                    Signal::NewOrder(_)
+                                    | Signal::BatchNewOrders { .. }
+                                    | Signal::BatchUpdateOrders { .. }
+                                    | Signal::ReplaceOrder { .. } => {
+                                        match poly_pool_tx.as_ref().unwrap().try_send(work) {
+                                            Ok(()) => {}
+                                            Err(crossbeam_channel::TrySendError::Full((
+                                                signal,
+                                                stale_ms,
+                                                utx,
+                                            )))
+                                            | Err(crossbeam_channel::TrySendError::Disconnected((
+                                                signal,
+                                                stale_ms,
+                                                utx,
+                                            ))) => shed_saturated_place_signal(
+                                                signal,
+                                                stale_ms,
+                                                poly_cancel_tx
+                                                    .as_ref()
+                                                    .expect("cancel lane active with place lane"),
+                                                &utx,
+                                            ),
+                                        }
+                                    }
+                                    _ => {
+                                        // Lifecycle/audit control messages are
+                                        // low-volume and lossless. Reuse the
+                                        // unbounded must-complete lane so place
+                                        // pressure cannot delay the dispatcher.
+                                        if let Some(tx) = poly_cancel_tx.as_ref() {
+                                            let _ = tx.send(work);
+                                        }
+                                    }
+                                }
                             } else {
                                 let updates = execute_fallback_signal(&mut fallback, signal, stale_threshold_ms);
                                 for update in updates {
@@ -8432,6 +8594,10 @@ impl Engine {
                 // in-flight dispatch finishes before the executor thread exits.
                 drop(poly_pool_tx.take());
                 for h in poly_worker_handles { let _ = h.join(); }
+                drop(poly_cancel_tx.take());
+                for h in poly_cancel_handles { let _ = h.join(); }
+                drop(poly_reconcile_tx.take());
+                for h in poly_reconcile_handles { let _ = h.join(); }
                 // Drain fire-and-track completions after the workers stop.
                 drop(poly_done_tx.take());
                 for h in poly_drainer_handles { let _ = h.join(); }
@@ -8806,6 +8972,95 @@ fn reconcile_deferred_updates(
     updates
 }
 
+/// Shed only place work when the bounded hot lane is saturated. Any cancel
+/// half of a combined update is converted to a lossless cancel-lane job, while
+/// each unsent place gets an explicit ExecutorRejected update so its account
+/// reservation is released by the normal lifecycle path.
+fn shed_saturated_place_signal(
+    signal: Signal,
+    stale_ms: u64,
+    cancel_tx: &Sender<(Signal, u64, Sender<OrderUpdate>)>,
+    utx: &Sender<OrderUpdate>,
+) {
+    let (places, cancel) = match signal {
+        Signal::NewOrder(order) => (vec![order], None),
+        Signal::BatchNewOrders { orders, .. } => (orders, None),
+        Signal::ReplaceOrder {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            instance_id,
+        }
+        | Signal::BatchUpdateOrders {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            instance_id,
+        } => {
+            let cancel = (!cancel_client_order_ids.is_empty()).then(|| {
+                Signal::BatchCancelOrders {
+                    exchange,
+                    market_id,
+                    client_order_ids: cancel_client_order_ids,
+                    instance_id,
+                    timestamp_ns,
+                }
+            });
+            (place_orders, cancel)
+        }
+        other => {
+            // The dispatcher only calls this helper for place-bearing signals.
+            // Preserve a future control variant losslessly if classification
+            // and the Signal enum temporarily drift apart.
+            let _ = cancel_tx.send((other, stale_ms, utx.clone()));
+            return;
+        }
+    };
+    if let Some(cancel) = cancel {
+        let _ = cancel_tx.send((cancel, stale_ms, utx.clone()));
+    }
+    warn!(
+        "[Executor] Polymarket place lane saturated; shedding {} unsent place(s), cancels retained",
+        places.len(),
+    );
+    for order in places {
+        if utx.send(exec_rejected_place(&order)).is_err() {
+            break;
+        }
+    }
+}
+
+fn defer_reconcile_signal(signal: Signal, utx: &Sender<OrderUpdate>) {
+    let iid = extract_instance_id(&signal);
+    let Signal::ReconcilePolymarket {
+        pending_places,
+        pending_cancels,
+        pending_trade_ids,
+        ..
+    } = signal
+    else {
+        return;
+    };
+    warn!(
+        "[Executor] Polymarket reconcile lane saturated iid={}; returning deferred feedback",
+        iid,
+    );
+    for update in reconcile_deferred_updates(
+        &iid,
+        &pending_places,
+        &pending_cancels,
+        &pending_trade_ids,
+    ) {
+        if utx.send(update).is_err() {
+            break;
+        }
+    }
+}
+
 /// Fire-and-track + admission dispatch for the hot single-leg Polymarket
 /// paths (place / cancel / 1×1 replace). Maps instance→account, acquires an
 /// account-pool permit, fires on the reserved connection WITHOUT blocking, and hands the
@@ -8818,6 +9073,7 @@ fn fire_or_execute(
     signal: Signal,
     stale_ms: u64,
     done_tx: &Sender<(PolyCompletionFn, Sender<OrderUpdate>)>,
+    cancel_tx: &Sender<(Signal, u64, Sender<OrderUpdate>)>,
     utx: &Sender<OrderUpdate>,
 ) {
     use hexagent_runtime::http1_pool::{acquire, try_acquire, Role};
@@ -9007,58 +9263,21 @@ fn fire_or_execute(
                 }
             }
 
-            // Cancel remains monotonic and lossless. It is dispatched on its
-            // own pool even if the place was stale, saturated, or rejected.
-            let wait_started = std::time::Instant::now();
-            let cancel_permit = match acquire(&iid, Role::Cancel) {
-                Some(p) => p,
-                None => {
-                    let _ = utx.send(exec_rejected_cancel(coid, exchange));
-                    return;
-                }
+            // Cancel remains monotonic and lossless, but its permit wait must
+            // never occupy this place worker. The dedicated cancel lane owns
+            // both waiting and fire/track completion for the split leg.
+            let cancel_signal = Signal::CancelOrder {
+                exchange,
+                client_order_id: coid.clone(),
+                instance_id: iid,
+                timestamp_ns,
             };
-            let wait = wait_started.elapsed();
-            if wait >= std::time::Duration::from_millis(1) {
-                info!(
-                    "[Executor] retained replace-cancel acquired iid={} coid={} wait_ms={:.3}",
-                    iid,
-                    coid,
-                    wait.as_secs_f64() * 1000.0,
-                );
+            if cancel_tx
+                .send((cancel_signal, stale_ms, utx.clone()))
+                .is_err()
+            {
+                let _ = utx.send(exec_rejected_cancel(coid, exchange));
             }
-            let cclient = cancel_permit.pooled_client();
-            let route = match worker.poly_route_mut(&iid) {
-                Ok(route) => route,
-                Err(error) => {
-                    error!(
-                        "[Executor] Polymarket replace-cancel route error: {}",
-                        error
-                    );
-                    drop(cancel_permit);
-                    let _ = utx.send(exec_rejected_cancel(coid, exchange));
-                    return;
-                }
-            };
-            route.set_gen_ns_hint(timestamp_ns);
-            let cpending = route.cancel_fire(&coid, cclient);
-            let iid_c = iid.clone();
-            let cf: PolyCompletionFn = Box::new(move |r| {
-                let route = match r.poly_route_mut(&iid_c) {
-                    Ok(route) => route,
-                    Err(error) => {
-                        error!(
-                            "[Executor] Polymarket replace-cancel completion route error: {}",
-                            error
-                        );
-                        drop(cancel_permit);
-                        return vec![exec_rejected_cancel(coid, exchange)];
-                    }
-                };
-                let u = route.complete_cancel(exchange, &coid, cpending);
-                drop(cancel_permit);
-                vec![u]
-            });
-            let _ = done_tx.send((cf, utx.clone()));
         }
         // Reconcile: concurrency gate on the dedicated per-account Reconcile
         // pool (NOT full fire-track). The permit's exact client is threaded
@@ -10834,6 +11053,39 @@ mod market_router_tests {
                 .collect::<Vec<_>>(),
             vec!["trade-1"]
         );
+    }
+
+    #[test]
+    fn saturated_replace_sheds_place_but_retains_cancel_lane_work() {
+        let (cancel_tx, cancel_rx) = unbounded();
+        let (update_tx, update_rx) = unbounded();
+        shed_saturated_place_signal(
+            Signal::ReplaceOrder {
+                exchange: Exchange::Polymarket,
+                market_id: "market".into(),
+                cancel_client_order_ids: vec!["old-coid".into()],
+                place_orders: vec![order_req("new-coid", "zhu-03")],
+                timestamp_ns: 42,
+                instance_id: "zhu-03".into(),
+            },
+            150,
+            &cancel_tx,
+            &update_tx,
+        );
+
+        let (cancel, stale_ms, _) = cancel_rx.try_recv().unwrap();
+        assert_eq!(stale_ms, 150);
+        assert!(matches!(
+            cancel,
+            Signal::BatchCancelOrders {
+                client_order_ids,
+                instance_id,
+                ..
+            } if client_order_ids == vec!["old-coid"] && instance_id == "zhu-03"
+        ));
+        let rejected = update_rx.try_recv().unwrap();
+        assert_eq!(rejected.client_order_id, "new-coid");
+        assert_eq!(rejected.status, OrderStatus::ExecutorRejected);
     }
 
     #[test]
