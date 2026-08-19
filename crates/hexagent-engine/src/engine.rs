@@ -38,11 +38,11 @@ const FEED_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 const POLY_SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 const POLY_SUPERVISOR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const POLY_RAW_FRAME_STALL_NS: u64 = 20_000_000_000;
-const POLY_MARKET_DATA_STALL_NS: u64 = 45_000_000_000;
+const POLY_MARKET_DATA_STALL_NS: u64 = 120_000_000_000;
 // A live raw transport plus a silent topic can be a non-operational or quiet
 // market. One rebuild probes recovery; subsequent full worker replacement is
 // rate-limited while raw/feed-loop and rotation watchdogs remain fail-safe.
-const POLY_MARKET_DATA_REBUILD_COOLDOWN_NS: u64 = 300_000_000_000;
+const POLY_MARKET_DATA_REBUILD_COOLDOWN_NS: u64 = 900_000_000_000;
 const POLY_FEED_LOOP_RECONNECT_NS: u64 = 3_000_000_000;
 const POLY_FEED_LOOP_FAIL_FAST_NS: u64 = 10_000_000_000;
 const POLY_ROTATION_GRACE_NS: u64 = 3_000_000_000;
@@ -58,18 +58,15 @@ enum PolymarketSupervisorAction {
 
 #[derive(Default)]
 struct PolymarketMarketDataRebuildGate {
-    event_end_ns: Option<u64>,
     next_rebuild_ns: u64,
     suppression_logged: bool,
 }
 
 impl PolymarketMarketDataRebuildGate {
-    fn admit(&mut self, event_end_ns: u64, now_ns: u64) -> bool {
-        let new_event = self.event_end_ns != Some(event_end_ns);
-        if !new_event && now_ns < self.next_rebuild_ns {
+    fn admit(&mut self, _event_end_ns: u64, now_ns: u64) -> bool {
+        if now_ns < self.next_rebuild_ns {
             return false;
         }
-        self.event_end_ns = Some(event_end_ns);
         self.next_rebuild_ns = now_ns.saturating_add(POLY_MARKET_DATA_REBUILD_COOLDOWN_NS);
         self.suppression_logged = false;
         true
@@ -932,7 +929,7 @@ mod polymarket_supervisor_tests {
     }
 
     #[test]
-    fn market_data_only_rebuild_is_rate_limited_per_event() {
+    fn market_data_only_rebuild_is_rate_limited_across_event_rotations() {
         let mut gate = PolymarketMarketDataRebuildGate::default();
         let now = 1_000_000_000_000;
         let event_end = 2_000_000_000_000;
@@ -942,11 +939,11 @@ mod polymarket_supervisor_tests {
             event_end,
             now + POLY_MARKET_DATA_REBUILD_COOLDOWN_NS - 1
         ));
-        assert!(gate.admit(event_end, now + POLY_MARKET_DATA_REBUILD_COOLDOWN_NS));
         assert!(
-            gate.admit(event_end + 300_000_000_000, now + 1),
-            "a newly rotated event gets one immediate recovery attempt"
+            !gate.admit(event_end + 300_000_000_000, now + 1),
+            "a routine event rotation must not bypass the worker rebuild cooldown"
         );
+        assert!(gate.admit(event_end, now + POLY_MARKET_DATA_REBUILD_COOLDOWN_NS));
     }
 
     #[test]

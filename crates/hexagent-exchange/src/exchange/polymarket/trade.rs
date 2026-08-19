@@ -687,15 +687,27 @@ impl HttpErr {
     /// response reached us. Keep this separate from `is_unknown_state` so
     /// adding the transport case does not change cancel/GET semantics.
     pub(crate) fn is_submit_unknown_state(&self) -> bool {
-        self.is_unknown_state()
+        (self.is_unknown_state() && !self.is_trading_disabled_rejection())
             || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
+    }
+
+    /// Polymarket returns this policy rejection as HTTP 503 even though the
+    /// request is authoritative: no order was admitted while trading was
+    /// disabled. It must not enter timeout/orphan reconciliation.
+    fn is_trading_disabled_rejection(&self) -> bool {
+        matches!(
+            self,
+            HttpErr::Status(_, body)
+                if body.to_ascii_lowercase().contains("trading is disabled")
+        )
     }
 
     /// A completed 4xx placement response is authoritative rejection evidence.
     /// 425 remains unknown-state because Polymarket uses it for transient
     /// service backpressure and may have accepted the signed request.
     fn is_definitive_submit_rejection(&self) -> bool {
-        matches!(self, HttpErr::Status(code, _) if (400..500).contains(code) && *code != 425)
+        self.is_trading_disabled_rejection()
+            || matches!(self, HttpErr::Status(code, _) if (400..500).contains(code) && *code != 425)
     }
 }
 
@@ -1593,6 +1605,12 @@ pub struct SharedState {
     /// balance` never pauses a shared-wallet sibling's submits. Absent or
     /// past = not in backoff.
     pub(crate) balance_backoff_until_ns: Mutex<HashMap<String, u64>>,
+    /// Account-wide policy backoff after the CLOB explicitly responds
+    /// `trading is disabled`. Unlike an ordinary 5xx this is a definitive
+    /// rejection, so no orphan is created. The short circuit also prevents
+    /// every strategy instance sharing this account from retrying at quote
+    /// cadence while the market is administratively disabled.
+    pub(crate) trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64,
     /// Per-token (asset_id) `invalid token id` backoff. The CLOB rejects an
     /// order with `invalid token id` when the token isn't registered on the
     /// orderbook — e.g. Gamma lists a 5-min event before its CLOB book is
@@ -2327,6 +2345,35 @@ impl SharedState {
         let prev = map.insert(instance_id.to_string(), now + Self::BALANCE_BACKOFF_NS);
         // Edge = no prior deadline, or the prior one already expired.
         prev.map_or(true, |p| p < now)
+    }
+
+    /// Policy rejections normally persist for more than a quote tick. Keep
+    /// the SDK quiet long enough for strategies to observe the rejection and
+    /// arm their own market-level gate, without turning this into a permanent
+    /// latch if trading is re-enabled.
+    pub(crate) const TRADING_DISABLED_BACKOFF_NS: u64 = 30_000_000_000;
+
+    pub(crate) fn is_trading_disabled_error(text: &str) -> bool {
+        text.to_ascii_lowercase().contains("trading is disabled")
+    }
+
+    #[inline]
+    pub(crate) fn in_trading_disabled_backoff(&self) -> bool {
+        crate::types::now_ns()
+            < self
+                .trading_disabled_backoff_until_ns
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns true only on the edge into a new backoff window so callers can
+    /// keep the operator warning to one line per outage window.
+    pub(crate) fn record_trading_disabled(&self) -> bool {
+        let now = crate::types::now_ns();
+        let until = now.saturating_add(Self::TRADING_DISABLED_BACKOFF_NS);
+        let previous = self
+            .trading_disabled_backoff_until_ns
+            .swap(until, std::sync::atomic::Ordering::Relaxed);
+        previous <= now
     }
 
     /// Detect a `not enough balance / allowance` error in either HTTP 400
@@ -3085,6 +3132,7 @@ impl PolymarketTrade {
                 gap_replay,
                 rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
                 balance_backoff_until_ns: Mutex::new(HashMap::new()),
+                trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
                 invalid_token_backoff: Mutex::new(HashMap::new()),
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
@@ -4545,6 +4593,16 @@ impl PolymarketTrade {
         );
     }
 
+    fn handle_trading_disabled(&self, error: &str) {
+        if self.shared.record_trading_disabled() {
+            warn!(
+                "[PolymarketTrade] CLOB trading disabled; rejecting placements definitively and pausing SDK submits for {}s: {}",
+                SharedState::TRADING_DISABLED_BACKOFF_NS / 1_000_000_000,
+                error,
+            );
+        }
+    }
+
     /// React to a `not enough balance / allowance` rejection.
     ///
     /// Root cause observed in live.log: a cancel DELETE times out (p95
@@ -4988,7 +5046,7 @@ impl PolymarketTrade {
 
         // --- Placements: deterministic per-orderID lookup ---
         if !pending_places.is_empty() {
-            info!(
+            debug!(
                 "[PolymarketTrade] Reconcile: {} orphan placements",
                 pending_places.len(),
             );
@@ -6045,6 +6103,9 @@ impl PolymarketTrade {
         if !self.shared.check_rate_limit() {
             return Err(Self::make_rejected(order, "rate limited"));
         }
+        if self.shared.in_trading_disabled_backoff() {
+            return Err(Self::make_rejected(order, "trading disabled backoff"));
+        }
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Err(Self::make_rejected(order, "balance backoff"));
         }
@@ -6156,7 +6217,9 @@ impl PolymarketTrade {
             }
             Err(e) => {
                 let err_s = e.to_string();
-                if SharedState::is_balance_error(&err_s) {
+                if SharedState::is_trading_disabled_error(&err_s) {
+                    self.handle_trading_disabled(&err_s);
+                } else if SharedState::is_balance_error(&err_s) {
                         self.handle_balance_error(
                             &order.client_order_id,
                             order.side,
@@ -6206,7 +6269,9 @@ impl PolymarketTrade {
         if !success {
                 self.shared
                     .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-            if SharedState::is_balance_error(&error_msg) {
+            if SharedState::is_trading_disabled_error(&error_msg) {
+                self.handle_trading_disabled(&error_msg);
+            } else if SharedState::is_balance_error(&error_msg) {
                 self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
             } else if SharedState::is_invalid_token_error(&error_msg) {
                 self.handle_invalid_token(&order.symbol);
@@ -6768,6 +6833,10 @@ impl ExchangeTrade for PolymarketTrade {
         _market_id: &str,
         orders: &[OrderRequest],
     ) -> Result<Vec<OrderUpdate>> {
+        if self.shared.in_trading_disabled_backoff() {
+            return Ok(self
+                .make_logged_preflight_rejections(orders, "trading disabled backoff"));
+        }
         // Balance-backoff short-circuit (see `submit_order` for rationale).
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Ok(self.make_logged_preflight_rejections(orders, "balance backoff"));
@@ -7013,7 +7082,9 @@ impl ExchangeTrade for PolymarketTrade {
                             rejected_coids.push(order.client_order_id.clone());
                             self.shared
                                 .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-                            if SharedState::is_balance_error(&error_msg) {
+                            if SharedState::is_trading_disabled_error(&error_msg) {
+                                self.handle_trading_disabled(&error_msg);
+                            } else if SharedState::is_balance_error(&error_msg) {
                                 self.handle_balance_error(
                                 &order.client_order_id,
                                     order.side,
@@ -7098,7 +7169,9 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 Err(e) => {
                     let err_s = e.to_string();
-                    if SharedState::is_balance_error(&err_s) {
+                    if SharedState::is_trading_disabled_error(&err_s) {
+                        self.handle_trading_disabled(&err_s);
+                    } else if SharedState::is_balance_error(&err_s) {
                         // Use the first chunk order's side+symbol as the
                         // representative for the targeted-cancel scope.
                         // Polymarket batches sent by the strategy are
@@ -7419,6 +7492,17 @@ impl ExchangeTrade for PolymarketTrade {
         // `DELETE /order`) when there's exactly one op, and the batch
         // endpoint (`POST /orders` / `DELETE /orders`) when there are two
         // or more. Critical path ≈ max(cancel_rtt, place_rtt).
+
+        // Trading-disabled and balance backoffs short-circuit the PLACE side
+        // only — cancels must still dispatch so local/server state converges.
+        if self.shared.in_trading_disabled_backoff() && !place_orders.is_empty() {
+            let mut pre =
+                self.make_logged_preflight_rejections(place_orders, "trading disabled backoff");
+            let rest =
+                self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
+            pre.extend(rest);
+            return Ok(pre);
+        }
 
         // Balance-backoff short-circuit on the PLACE side only — let
         // the cancels still dispatch. The strategy's coid-specific
@@ -8003,8 +8087,16 @@ impl ExchangeTrade for PolymarketTrade {
                             rejected_coids.push(order.client_order_id.clone());
                             self.shared
                                 .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
+                            let is_trading_disabled =
+                                SharedState::is_trading_disabled_error(&error_msg);
                             let is_balance_err = SharedState::is_balance_error(&error_msg);
-                            if is_balance_err {
+                            if is_trading_disabled {
+                                self.handle_trading_disabled(&error_msg);
+                                warn!(
+                                    "[PolymarketTrade] Submit rejected: coid={} err=\"{}\" status={}",
+                                    order.client_order_id, error_msg, status_str,
+                                );
+                            } else if is_balance_err {
                                 // Balance rejects in batch_update_orders
                                 // are usually a cancel/submit race: the
                                 // server evaluated our new submit's
@@ -8129,7 +8221,9 @@ impl ExchangeTrade for PolymarketTrade {
                 }
                 Err(e) => {
                     let err_s = e.to_string();
-                    if SharedState::is_balance_error(&err_s) {
+                    if SharedState::is_trading_disabled_error(&err_s) {
+                        self.handle_trading_disabled(&err_s);
+                    } else if SharedState::is_balance_error(&err_s) {
                         // Pick the first place_chunk order (mapped via
                         // place_body_to_chunk) as the targeted-cancel
                         // scope representative. See `batch_submit_orders`
@@ -9155,6 +9249,15 @@ mod tests {
         assert!(HttpErr::Status(400, "bad request".to_string()).is_definitive_submit_rejection());
         assert!(!HttpErr::Status(425, "too early".to_string()).is_definitive_submit_rejection());
         assert!(!HttpErr::Status(503, "unavailable".to_string()).is_definitive_submit_rejection());
+        let trading_disabled = HttpErr::Status(
+            503,
+            r#"{"error":"trading is disabled"}"#.to_string(),
+        );
+        assert!(
+            !trading_disabled.is_submit_unknown_state(),
+            "an explicit policy rejection must not create an orphan",
+        );
+        assert!(trading_disabled.is_definitive_submit_rejection());
         assert!(!HttpErr::Other("local validation".to_string()).is_definitive_submit_rejection());
     }
 

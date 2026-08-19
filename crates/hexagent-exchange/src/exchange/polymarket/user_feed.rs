@@ -33,6 +33,21 @@ const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 const FAILED_TRADE_DIAGNOSTIC_CAPACITY: usize = 4096;
+const PERIODIC_GAP_RETRY_MAX_MS: u64 = 30_000;
+
+fn periodic_gap_retry_delay(base: Duration, failures: u32) -> Duration {
+    let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX).max(1);
+    let multiplier = 1u64.checked_shl(failures.min(63)).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        base_ms
+            .saturating_mul(multiplier)
+            .min(PERIODIC_GAP_RETRY_MAX_MS),
+    )
+}
+
+fn periodic_gap_failure_reminder(attempt: u32) -> bool {
+    attempt >= 4 && attempt.is_power_of_two()
+}
 
 #[derive(Debug)]
 struct FailedTradeDiagnosticDedupe {
@@ -1887,8 +1902,9 @@ async fn user_feed_loop(
                 let mut did_startup_deep = false;
                 let mut periodic_checkpoint: Option<GapReplayCheckpoint> = None;
                 let mut consecutive_failures = 0u32;
+                let mut next_delay = interval;
                 loop {
-                    sleep(interval).await;
+                    sleep(next_delay).await;
                     if shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -1938,11 +1954,13 @@ async fn user_feed_loop(
                             );
                             }
                             consecutive_failures = 0;
+                            next_delay = interval;
                             periodic_checkpoint = None;
                             shared.user_feed_health.set_gap_replay_degraded(false);
                         }
                         Err(e) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
+                            next_delay = periodic_gap_retry_delay(interval, consecutive_failures);
                             {
                                 let newly_degraded = !shared.user_feed_health.gap_replay_degraded();
                                 shared.user_feed_health.set_gap_replay_degraded(true);
@@ -1954,24 +1972,36 @@ async fn user_feed_loop(
                                     "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
                                      consecutive failures; after={} remains pinned; live WS \
                                      inventory stays authoritative and quoting continues while \
-                                     background catch-up retries; \
+                                     background catch-up retries in {}ms; error={}; \
                                      account={} GapReplay pool slots={:?} acquires={} skips={} busy={}",
                                     consecutive_failures,
                                     after,
+                                    next_delay.as_millis(),
+                                    e,
                                     account_id,
                                     slots,
                                     acquires,
                                     skips,
                                     busy,
                                 );
+                                } else if periodic_gap_failure_reminder(consecutive_failures) {
+                                    warn!(
+                                        "[PolyUserFeed] Periodic gap replay still degraded: attempt={} pinned_after={} next_retry_ms={} error={}",
+                                        consecutive_failures,
+                                        after,
+                                        next_delay.as_millis(),
+                                        e,
+                                    );
+                                } else {
+                                    debug!(
+                                        "[PolyUserFeed] Periodic gap replay retry failed: attempt={} pinned_after={} next_retry_ms={} error={}",
+                                        consecutive_failures,
+                                        after,
+                                        next_delay.as_millis(),
+                                        e,
+                                    );
                                 }
                             }
-                            warn!(
-                            "[PolyUserFeed] Periodic gap replay failed: {} (attempt={} pinned_after={})",
-                            e,
-                            consecutive_failures,
-                            after,
-                        );
                         }
                     }
                 }
@@ -2395,6 +2425,29 @@ mod tests {
         assert!(dedupe.admit("venue-trade-b"));
         assert!(dedupe.admit("venue-trade-c"));
         assert!(dedupe.admit("venue-trade-a"), "old diagnostics may be evicted");
+    }
+
+    #[test]
+    fn periodic_gap_retry_uses_bounded_exponential_backoff_and_sparse_warns() {
+        let base = Duration::from_secs(2);
+        let delays: Vec<_> = (0..6)
+            .map(|failures| periodic_gap_retry_delay(base, failures))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ],
+        );
+        let reminders: Vec<_> = (1..=20)
+            .filter(|attempt| periodic_gap_failure_reminder(*attempt))
+            .collect();
+        assert_eq!(reminders, vec![4, 8, 16]);
     }
 
     fn test_shared() -> Arc<SharedState> {
