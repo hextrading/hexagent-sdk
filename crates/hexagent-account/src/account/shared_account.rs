@@ -31,6 +31,7 @@ const FEE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "fee_attribution:";
 /// attributable no-op instead of becoming an `unowned trade`.
 const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
+const PERSISTENCE_WAL_VERSION: u32 = 1;
 
 /// Canonical lookup form for Polymarket order hashes. The CLOB has returned
 /// the same hash with mixed hex casing and, on some paths, without the `0x`
@@ -718,13 +719,46 @@ const PERSISTENCE_VERSION: u32 = 1;
 struct PersistedAccount {
     version: u32,
     account_id: String,
+    /// Highest WAL generation folded into this snapshot. Legacy snapshots
+    /// deserialize as generation zero and are upgraded on the next startup.
+    #[serde(default)]
+    persistence_generation: u64,
     state: SharedAccountState,
 }
 
-#[derive(Debug)]
-struct PersistJob {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum PersistenceWalChange {
+    Set {
+        path: Vec<String>,
+        value: serde_json::Value,
+    },
+    Remove {
+        path: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistenceWalRecord {
+    version: u32,
+    account_id: String,
     generation: u64,
-    snapshot: PersistedAccount,
+    changes: Vec<PersistenceWalChange>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistenceJob {
+    generation: u64,
+    /// `None` is the compatibility fallback for cold/complex mutations. The
+    /// writer snapshots those under the account lock. Hot order/trade paths
+    /// provide concrete changes and never require a full-state clone.
+    changes: Option<Vec<PersistenceWalChange>>,
+}
+
+#[derive(Debug)]
+enum PersistenceSignal {
+    Wake,
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -736,24 +770,32 @@ struct PersistenceProgress {
     write_max_us: u64,
 }
 
-/// Latest-value asynchronous writer. Serialization and filesystem I/O stay on
-/// the writer thread; admission paths may wait for its fsync generation before
-/// sending externally visible work. Bursts coalesce to the newest generation.
+/// Single-writer incremental WAL. Hot order/trade mutations enqueue typed
+/// entry deltas while they already hold the account mutex; the writer never
+/// re-locks or clones the full account for those generations. Cold/complex
+/// mutations retain a full-snapshot fallback until their domain gets a typed
+/// delta. Filesystem I/O is always confined to this thread.
 #[derive(Debug)]
 struct AccountPersistence {
     path: PathBuf,
     _lock_file: std::fs::File,
-    pending: Arc<Mutex<Option<PersistJob>>>,
-    wake: std::sync::mpsc::SyncSender<()>,
-    next_generation: AtomicU64,
+    pending: Arc<Mutex<Vec<PersistenceJob>>>,
+    wake: std::sync::mpsc::SyncSender<PersistenceSignal>,
+    next_generation: Arc<AtomicU64>,
     progress: Arc<(Mutex<PersistenceProgress>, Condvar)>,
     flushes: AtomicU64,
     flush_last_us: AtomicU64,
     flush_max_us: AtomicU64,
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AccountPersistence {
-    fn start(path: PathBuf) -> Result<Self, String> {
+    fn start(
+        path: PathBuf,
+        account_id: String,
+        state: Arc<Mutex<SharedAccountState>>,
+        initial_generation: u64,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 format!("create ledger directory {}: {error}", parent.display())
@@ -776,10 +818,30 @@ impl AccountPersistence {
                 path.display(),
             )
         })?;
-        let pending = Arc::new(Mutex::new(None::<PersistJob>));
+
+        // Startup is the only full-snapshot commit. It folds every recovered
+        // WAL record and any schema/reconciliation migration into one atomic
+        // image, then resets the incremental log before live workers start.
+        let initial_state = state.lock().unwrap().clone();
+        let initial_snapshot = PersistedAccount {
+            version: PERSISTENCE_VERSION,
+            account_id: account_id.clone(),
+            persistence_generation: initial_generation,
+            state: initial_state.clone(),
+        };
+        write_persisted_account(&path, &initial_snapshot)?;
+        reset_persistence_wal(&path)?;
+        log::info!(
+            "[shared_account] account={} persistence=incremental_wal snapshot={} wal={} generation={}",
+            account_id,
+            path.display(),
+            persistence_wal_path(&path).display(),
+            initial_generation,
+        );
+
         let progress = Arc::new((
             Mutex::new(PersistenceProgress {
-                completed_generation: 0,
+                completed_generation: initial_generation,
                 last_error: None,
                 writes: 0,
                 write_last_us: 0,
@@ -787,11 +849,20 @@ impl AccountPersistence {
             }),
             Condvar::new(),
         ));
-        let (wake, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let next_generation = Arc::new(AtomicU64::new(initial_generation));
+        let pending = Arc::new(Mutex::new(Vec::<PersistenceJob>::new()));
+        let (wake, rx) = std::sync::mpsc::sync_channel::<PersistenceSignal>(1);
         let thread_pending = Arc::clone(&pending);
         let thread_progress = Arc::clone(&progress);
         let thread_path = path.clone();
-        std::thread::Builder::new()
+        let thread_state = Arc::clone(&state);
+        let mut durable_state = serde_json::to_value(initial_state).map_err(|error| {
+            format!(
+                "serialize account ledger WAL baseline {}: {error}",
+                path.display()
+            )
+        })?;
+        let writer = std::thread::Builder::new()
             .name(format!(
                 "account-ledger-{}",
                 path.file_stem()
@@ -800,22 +871,99 @@ impl AccountPersistence {
             ))
             .spawn(move || {
                 hexagent_runtime::os_tune::pin_background("account-ledger-writer");
-                while rx.recv().is_ok() {
+                let mut durable_wal_len = 0u64;
+                while let Ok(signal) = rx.recv() {
                     loop {
-                        let Some(job) = thread_pending.lock().unwrap().take() else {
+                        let jobs = thread_pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        let Some(last) = jobs.last() else {
                             break;
                         };
+                        let generation = last.generation;
                         let started = std::time::Instant::now();
-                        let result = write_persisted_account(&thread_path, &job.snapshot);
+                        let result = (|| -> Result<serde_json::Value, String> {
+                            let has_full_snapshot = jobs.iter().any(|job| job.changes.is_none());
+                            let (changes, next_state) = if has_full_snapshot {
+                                // schedule_persist() runs while the same state
+                                // mutex is held, so once the writer acquires it
+                                // this clone includes every queued generation.
+                                let snapshot = thread_state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                let next_state = serde_json::to_value(snapshot).map_err(|error| {
+                                    format!(
+                                        "serialize account ledger WAL fallback {}: {error}",
+                                        thread_path.display()
+                                    )
+                                })?;
+                                (
+                                    persistence_json_diff(&durable_state, &next_state),
+                                    next_state,
+                                )
+                            } else {
+                                let changes: Vec<PersistenceWalChange> = jobs
+                                    .iter()
+                                    .flat_map(|job| {
+                                        job.changes
+                                            .as_ref()
+                                            .expect("typed WAL job checked above")
+                                            .iter()
+                                            .cloned()
+                                    })
+                                    .collect();
+                                // Validate paths against a detached JSON value.
+                                // This can be CPU-heavy for a large ledger, but
+                                // never holds the account mutex or delays order
+                                // admission/private-feed processing.
+                                let mut next_state = durable_state.clone();
+                                for change in changes.iter().cloned() {
+                                    apply_persistence_wal_change(&mut next_state, change)?;
+                                }
+                                (changes, next_state)
+                            };
+                            if !changes.is_empty() {
+                                append_persistence_wal(
+                                    &thread_path,
+                                    &PersistenceWalRecord {
+                                        version: PERSISTENCE_WAL_VERSION,
+                                        account_id: account_id.clone(),
+                                        generation,
+                                        changes,
+                                    },
+                                    &mut durable_wal_len,
+                                )?;
+                            }
+                            Ok(next_state)
+                        })();
+                        if let Ok(next_state) = &result {
+                            durable_state = next_state.clone();
+                            thread_pending
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .retain(|job| job.generation > generation);
+                        }
                         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
                         let (lock, cv) = &*thread_progress;
-                        let mut state = lock.lock().unwrap();
-                        state.completed_generation = state.completed_generation.max(job.generation);
-                        state.last_error = result.err();
-                        state.writes = state.writes.saturating_add(1);
-                        state.write_last_us = elapsed_us;
-                        state.write_max_us = state.write_max_us.max(elapsed_us);
+                        let mut progress =
+                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if result.is_ok() {
+                            progress.completed_generation =
+                                progress.completed_generation.max(generation);
+                        }
+                        progress.last_error = result.err();
+                        progress.writes = progress.writes.saturating_add(1);
+                        progress.write_last_us = elapsed_us;
+                        progress.write_max_us = progress.write_max_us.max(elapsed_us);
                         cv.notify_all();
+                        if progress.last_error.is_some() {
+                            break;
+                        }
+                    }
+                    if matches!(signal, PersistenceSignal::Shutdown) {
+                        break;
                     }
                 }
             })
@@ -825,21 +973,40 @@ impl AccountPersistence {
             _lock_file: lock_file,
             pending,
             wake,
-            next_generation: AtomicU64::new(0),
+            next_generation,
             progress,
             flushes: AtomicU64::new(0),
             flush_last_us: AtomicU64::new(0),
             flush_max_us: AtomicU64::new(0),
+            writer: Some(writer),
         })
     }
 
-    fn schedule(&self, snapshot: PersistedAccount) {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        *self.pending.lock().unwrap() = Some(PersistJob {
-            generation,
-            snapshot,
-        });
-        let _ = self.wake.try_send(());
+    fn schedule(&self) {
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PersistenceJob {
+                generation,
+                changes: None,
+            });
+        let _ = self.wake.try_send(PersistenceSignal::Wake);
+    }
+
+    fn schedule_delta(&self, changes: Vec<PersistenceWalChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PersistenceJob {
+                generation,
+                changes: Some(changes),
+            });
+        let _ = self.wake.try_send(PersistenceSignal::Wake);
     }
 
     fn scheduled_generation(&self) -> u64 {
@@ -872,11 +1039,13 @@ impl AccountPersistence {
             record_latency();
             return Ok(());
         }
-        let _ = self.wake.try_send(());
+        let _ = self.wake.try_send(PersistenceSignal::Wake);
         let (lock, cv) = &*self.progress;
         let progress = lock.lock().unwrap();
         let (progress, wait) = cv
-            .wait_timeout_while(progress, timeout, |p| p.completed_generation < target)
+            .wait_timeout_while(progress, timeout, |p| {
+                p.completed_generation < target && p.last_error.is_none()
+            })
             .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
         if progress.completed_generation < target && wait.timed_out() {
             record_latency();
@@ -893,33 +1062,25 @@ impl AccountPersistence {
         Ok(())
     }
 
-    /// Error-only admission rollback barrier. Returning before this generation
-    /// is durable could restore a never-submitted reservation after a crash.
-    fn flush_blocking(&self) -> Result<(), String> {
-        let target = self.next_generation.load(Ordering::Relaxed);
-        if target == 0 {
-            return Ok(());
-        }
-        let _ = self.wake.try_send(());
-        let (lock, cv) = &*self.progress;
-        let progress = lock
-            .lock()
-            .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
-        let progress = cv
-            .wait_while(progress, |state| state.completed_generation < target)
-            .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
-        if let Some(error) = &progress.last_error {
-            return Err(error.clone());
-        }
-        Ok(())
-    }
-
     fn last_error(&self) -> Option<String> {
         self.progress
             .0
             .lock()
             .ok()
             .and_then(|p| p.last_error.clone())
+    }
+
+    fn is_current(&self) -> Result<bool, String> {
+        let target = self.scheduled_generation();
+        let progress = self
+            .progress
+            .0
+            .lock()
+            .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
+        if let Some(error) = &progress.last_error {
+            return Err(error.clone());
+        }
+        Ok(progress.completed_generation >= target)
     }
 
     fn metrics(&self) -> (u64, u64, u64, u64, u64, u64) {
@@ -944,6 +1105,381 @@ impl AccountPersistence {
             self.flush_max_us.load(Ordering::Relaxed),
         )
     }
+}
+
+impl Drop for AccountPersistence {
+    fn drop(&mut self) {
+        // A blocking shutdown send cannot lose a coalesced wake: if the queue
+        // is full, the writer first consumes that wake and drains the latest
+        // generation before receiving Shutdown.
+        let _ = self.wake.send(PersistenceSignal::Shutdown);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
+}
+
+fn persistence_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
+fn persistence_checksum(bytes: &[u8]) -> u64 {
+    // FNV-1a is deliberately simple and stable across Rust releases. This is
+    // corruption/torn-write detection, not an authenticity boundary.
+    let mut checksum = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        checksum ^= u64::from(*byte);
+        checksum = checksum.wrapping_mul(0x100000001b3);
+    }
+    checksum
+}
+
+fn persistence_json_diff(
+    durable: &serde_json::Value,
+    next: &serde_json::Value,
+) -> Vec<PersistenceWalChange> {
+    fn visit(
+        durable: &serde_json::Value,
+        next: &serde_json::Value,
+        path: &mut Vec<String>,
+        changes: &mut Vec<PersistenceWalChange>,
+    ) {
+        if durable == next {
+            return;
+        }
+        match (durable.as_object(), next.as_object()) {
+            (Some(durable), Some(next)) => {
+                let keys: BTreeSet<&String> = durable.keys().chain(next.keys()).collect();
+                for key in keys {
+                    path.push(key.clone());
+                    match (durable.get(key), next.get(key)) {
+                        (Some(before), Some(after)) => visit(before, after, path, changes),
+                        (None, Some(value)) => changes.push(PersistenceWalChange::Set {
+                            path: path.clone(),
+                            value: value.clone(),
+                        }),
+                        (Some(_), None) => changes.push(PersistenceWalChange::Remove {
+                            path: path.clone(),
+                        }),
+                        (None, None) => unreachable!("union key must exist in one object"),
+                    }
+                    path.pop();
+                }
+            }
+            _ => changes.push(PersistenceWalChange::Set {
+                path: path.clone(),
+                value: next.clone(),
+            }),
+        }
+    }
+
+    let mut changes = Vec::new();
+    visit(durable, next, &mut Vec::new(), &mut changes);
+    changes
+}
+
+fn persistence_wal_set<T: Serialize>(
+    changes: &mut Vec<PersistenceWalChange>,
+    path: impl IntoIterator<Item = String>,
+    value: &T,
+) -> Result<(), String> {
+    let path: Vec<String> = path.into_iter().collect();
+    let value = serde_json::to_value(value).map_err(|error| {
+        format!(
+            "serialize typed account WAL delta {}: {error}",
+            path.join("/")
+        )
+    })?;
+    changes.push(PersistenceWalChange::Set { path, value });
+    Ok(())
+}
+
+fn persistence_wal_map_entry<T: Serialize>(
+    changes: &mut Vec<PersistenceWalChange>,
+    map: &str,
+    key: &str,
+    value: Option<&T>,
+) -> Result<(), String> {
+    let path = vec![map.to_string(), key.to_string()];
+    if let Some(value) = value {
+        persistence_wal_set(changes, path, value)
+    } else {
+        changes.push(PersistenceWalChange::Remove { path });
+        Ok(())
+    }
+}
+
+fn apply_persistence_wal_change(
+    state: &mut serde_json::Value,
+    change: PersistenceWalChange,
+) -> Result<(), String> {
+    let (path, value) = match change {
+        PersistenceWalChange::Set { path, value } => (path, Some(value)),
+        PersistenceWalChange::Remove { path } => (path, None),
+    };
+    if path.is_empty() {
+        let Some(value) = value else {
+            return Err("account ledger WAL cannot remove the state root".to_string());
+        };
+        *state = value;
+        return Ok(());
+    }
+
+    let (key, parents) = path
+        .split_last()
+        .expect("empty WAL path handled above");
+    let mut target = state;
+    for component in parents {
+        target = target
+            .as_object_mut()
+            .and_then(|object| object.get_mut(component))
+            .ok_or_else(|| {
+                format!(
+                    "account ledger WAL path has missing/non-object parent: {}",
+                    path.join("/")
+                )
+            })?;
+    }
+    let object = target.as_object_mut().ok_or_else(|| {
+        format!(
+            "account ledger WAL path parent is not an object: {}",
+            path.join("/")
+        )
+    })?;
+    if let Some(value) = value {
+        object.insert(key.clone(), value);
+    } else {
+        // Typed jobs may coalesce repeated removal of the same map entry before
+        // the writer drains them. Removal is intentionally idempotent.
+        object.remove(key);
+    }
+    Ok(())
+}
+
+fn append_persistence_wal(
+    path: &Path,
+    record: &PersistenceWalRecord,
+    durable_wal_len: &mut u64,
+) -> Result<(), String> {
+    use std::io::{Seek as _, Write as _};
+
+    let payload = serde_json::to_vec(record).map_err(|error| {
+        format!(
+            "serialize account ledger WAL {}: {error}",
+            persistence_wal_path(path).display()
+        )
+    })?;
+    let header = format!("{} {:016x} ", payload.len(), persistence_checksum(&payload));
+    let mut frame = Vec::with_capacity(header.len() + payload.len() + 1);
+    frame.extend_from_slice(header.as_bytes());
+    frame.extend_from_slice(&payload);
+    frame.push(b'\n');
+
+    let wal_path = persistence_wal_path(path);
+    let mut wal = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&wal_path)
+        .map_err(|error| format!("open account ledger WAL {}: {error}", wal_path.display()))?;
+    // A prior failed write may have left an incomplete frame. Rewind to the
+    // last fsync acknowledged by this writer before appending its replacement.
+    wal.set_len(*durable_wal_len).map_err(|error| {
+        format!(
+            "truncate account ledger WAL {} to {}: {error}",
+            wal_path.display(),
+            *durable_wal_len
+        )
+    })?;
+    wal.seek(std::io::SeekFrom::Start(*durable_wal_len))
+        .map_err(|error| format!("seek account ledger WAL {}: {error}", wal_path.display()))?;
+    wal.write_all(&frame)
+        .map_err(|error| format!("append account ledger WAL {}: {error}", wal_path.display()))?;
+    wal.sync_data()
+        .map_err(|error| format!("sync account ledger WAL {}: {error}", wal_path.display()))?;
+    *durable_wal_len = durable_wal_len.saturating_add(frame.len() as u64);
+    Ok(())
+}
+
+fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Result<(), String> {
+    use std::io::BufRead as _;
+
+    let wal_path = persistence_wal_path(path);
+    let wal = match std::fs::File::open(&wal_path) {
+        Ok(wal) => wal,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "open account ledger WAL {}: {error}",
+                wal_path.display()
+            ));
+        }
+    };
+    let mut state = serde_json::to_value(&persisted.state).map_err(|error| {
+        format!(
+            "serialize account ledger state before WAL replay {}: {error}",
+            wal_path.display()
+        )
+    })?;
+    let snapshot_generation = persisted.persistence_generation;
+    let mut applied_generation = snapshot_generation;
+    let mut reader = std::io::BufReader::new(wal);
+    let mut line_number = 0usize;
+    loop {
+        let mut frame = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut frame)
+            .map_err(|error| format!("read account ledger WAL {}: {error}", wal_path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        if frame.last() != Some(&b'\n') {
+            log::warn!(
+                "[shared_account] ignoring torn final WAL frame path={} line={} bytes={}",
+                wal_path.display(),
+                line_number,
+                frame.len(),
+            );
+            break;
+        }
+        frame.pop();
+        let Some(first_space) = frame.iter().position(|byte| *byte == b' ') else {
+            return Err(format!(
+                "invalid account ledger WAL frame {}:{}: missing length delimiter",
+                wal_path.display(),
+                line_number
+            ));
+        };
+        let Some(second_relative) = frame[first_space + 1..]
+            .iter()
+            .position(|byte| *byte == b' ')
+        else {
+            return Err(format!(
+                "invalid account ledger WAL frame {}:{}: missing checksum delimiter",
+                wal_path.display(),
+                line_number
+            ));
+        };
+        let second_space = first_space + 1 + second_relative;
+        let expected_len = std::str::from_utf8(&frame[..first_space])
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "invalid account ledger WAL frame {}:{}: bad payload length",
+                    wal_path.display(),
+                    line_number
+                )
+            })?;
+        let expected_checksum = std::str::from_utf8(&frame[first_space + 1..second_space])
+            .ok()
+            .and_then(|text| u64::from_str_radix(text, 16).ok())
+            .ok_or_else(|| {
+                format!(
+                    "invalid account ledger WAL frame {}:{}: bad checksum",
+                    wal_path.display(),
+                    line_number
+                )
+            })?;
+        let payload = &frame[second_space + 1..];
+        if payload.len() != expected_len {
+            return Err(format!(
+                "invalid account ledger WAL frame {}:{}: payload length {} != {}",
+                wal_path.display(),
+                line_number,
+                payload.len(),
+                expected_len
+            ));
+        }
+        if persistence_checksum(payload) != expected_checksum {
+            return Err(format!(
+                "invalid account ledger WAL frame {}:{}: checksum mismatch",
+                wal_path.display(),
+                line_number
+            ));
+        }
+        let record: PersistenceWalRecord = serde_json::from_slice(payload).map_err(|error| {
+            format!(
+                "parse account ledger WAL frame {}:{}: {error}",
+                wal_path.display(),
+                line_number
+            )
+        })?;
+        if record.version != PERSISTENCE_WAL_VERSION {
+            return Err(format!(
+                "unsupported account ledger WAL version {} in {}:{} (expected {})",
+                record.version,
+                wal_path.display(),
+                line_number,
+                PERSISTENCE_WAL_VERSION
+            ));
+        }
+        if record.account_id != persisted.account_id {
+            return Err(format!(
+                "account ledger WAL {}:{} belongs to `{}`, not `{}`",
+                wal_path.display(),
+                line_number,
+                record.account_id,
+                persisted.account_id
+            ));
+        }
+        // A crash after snapshot rename but before WAL truncation leaves old
+        // frames behind. The snapshot generation makes them idempotently stale.
+        if record.generation <= snapshot_generation {
+            continue;
+        }
+        if record.generation <= applied_generation {
+            return Err(format!(
+                "non-monotonic account ledger WAL generation {} after {} in {}:{}",
+                record.generation,
+                applied_generation,
+                wal_path.display(),
+                line_number
+            ));
+        }
+        for change in record.changes {
+            apply_persistence_wal_change(&mut state, change).map_err(|error| {
+                format!(
+                    "apply account ledger WAL frame {}:{}: {error}",
+                    wal_path.display(),
+                    line_number
+                )
+            })?;
+        }
+        applied_generation = record.generation;
+    }
+    if applied_generation > snapshot_generation {
+        persisted.state = serde_json::from_value(state).map_err(|error| {
+            format!(
+                "decode account ledger state after WAL replay {}: {error}",
+                wal_path.display()
+            )
+        })?;
+        persisted.persistence_generation = applied_generation;
+    }
+    Ok(())
+}
+
+fn reset_persistence_wal(path: &Path) -> Result<(), String> {
+    let wal_path = persistence_wal_path(path);
+    let wal = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&wal_path)
+        .map_err(|error| format!("reset account ledger WAL {}: {error}", wal_path.display()))?;
+    wal.sync_all()
+        .map_err(|error| format!("sync reset account ledger WAL {}: {error}", wal_path.display()))?;
+    let parent = wal_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync WAL directory {}: {error}", parent.display()))
 }
 
 fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(), String> {
@@ -978,11 +1514,13 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
 #[derive(Debug)]
 pub struct SharedAccount {
     account_id: String,
-    state: Mutex<SharedAccountState>,
+    state: Arc<Mutex<SharedAccountState>>,
     persistence: Option<AccountPersistence>,
-    /// Highest account-persistence generation whose trade mutation timed out
-    /// at the synchronous durability barrier. Non-blocking health reads clear
-    /// the corresponding blocker once the worker proves this generation.
+    /// Highest account-persistence generation containing a trade mutation.
+    /// Trade ingestion never waits for this generation: subsequent admission
+    /// paths inspect writer progress non-blockingly, install the source-owned
+    /// blocker only after an actual writer failure, and clear it once a later
+    /// generation is durable.
     trade_persistence_pending_generation: AtomicU64,
     /// Edge-triggered wakeup for the account-scoped order-audit worker. The
     /// generation prevents missed notifications between the worker's health
@@ -994,7 +1532,7 @@ impl SharedAccount {
     pub fn new(account_id: impl Into<String>) -> Self {
         Self {
             account_id: account_id.into(),
-            state: Mutex::new(SharedAccountState::default()),
+            state: Arc::new(Mutex::new(SharedAccountState::default())),
             persistence: None,
             trade_persistence_pending_generation: AtomicU64::new(0),
             order_audit_wakeup: (Mutex::new(0), Condvar::new()),
@@ -1030,10 +1568,10 @@ impl SharedAccount {
         path: PathBuf,
         allow_query_repair: bool,
     ) -> Result<Self, String> {
-        let (state, migrated_state) = if path.exists() {
+        let (state, initial_generation) = if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("read account ledger {}: {error}", path.display()))?;
-            let persisted: PersistedAccount = serde_json::from_slice(&bytes)
+            let mut persisted: PersistedAccount = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("parse account ledger {}: {error}", path.display()))?;
             if persisted.version != PERSISTENCE_VERSION {
                 return Err(format!(
@@ -1051,6 +1589,8 @@ impl SharedAccount {
                     account_id,
                 ));
             }
+            replay_persistence_wal(&path, &mut persisted)?;
+            let initial_generation = persisted.persistence_generation;
             let mut state = persisted.state;
             if !allow_query_repair && !state.startup_query_repair_orders.is_empty() {
                 let mut pending: Vec<String> = state
@@ -1118,13 +1658,12 @@ impl SharedAccount {
                     ),
                 );
             }
-            let mut migrated = normalize_terminal_failed_state(&mut state);
-            if migrated {
+            let terminal_failed_migrated = normalize_terminal_failed_state(&mut state);
+            if terminal_failed_migrated {
                 recompute_reconciliation(&mut state, "terminal FAILED ledger migration");
             }
             if state.seeded && state.seed_baseline.is_none() {
                 state.seed_baseline = Some(derive_legacy_seed_baseline(&state));
-                migrated = true;
                 log::warn!(
                     "[shared_account] account={} upgraded legacy ledger with a synthetic immutable seed baseline",
                     account_id,
@@ -1145,7 +1684,6 @@ impl SharedAccount {
             for trade_key in unresolved_roles {
                 role_migrated |= state.fee_attribution_pending.insert(trade_key);
             }
-            migrated |= role_migrated;
             if role_migrated {
                 recompute_reconciliation(&mut state, "legacy trade-role attribution migration");
             }
@@ -1158,14 +1696,12 @@ impl SharedAccount {
                 .remove(TRADE_PERSISTENCE_RISK_BLOCKER)
                 .is_some()
             {
-                migrated = true;
                 recompute_reconciliation(&mut state, "durable trade-persistence blocker recovery");
             }
             if allow_query_repair {
                 let (query_orders, repair_mutated) =
                     repair_failed_trade_under_reservations_for_query(&mut state)?;
                 if repair_mutated {
-                    migrated = true;
                     recompute_reconciliation(
                         &mut state,
                         "startup FAILED-trade reservation query repair",
@@ -1196,7 +1732,6 @@ impl SharedAccount {
             let recovered_before = state.recovery_pending_orders.len();
             state.recovery_pending_orders.extend(startup_deficit_orders);
             if state.recovery_pending_orders.len() != recovered_before {
-                migrated = true;
                 recompute_reconciliation(&mut state, "startup order recovery rebuild");
                 log::warn!(
                     "[shared_account] account={} restored {} potentially-live order(s) into owner-instance startup recovery before ledger validation",
@@ -1212,7 +1747,6 @@ impl SharedAccount {
             if let Some((previous_reason, previous_since_ms)) = persisted_uncertainty {
                 recompute_reconciliation(&mut state, "persisted uncertainty migration");
                 if !state.uncertain {
-                    migrated = true;
                     log::warn!(
                         "[shared_account] account={} reset legacy persisted uncertainty reason={:?} since_ms={:?}; preserving wallet residual unallocated_cash={:+.6} unallocated_positions={:?}",
                         account_id,
@@ -1225,23 +1759,32 @@ impl SharedAccount {
             }
             validate_persisted_state(&account_id, &state)
                 .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
-            (state, migrated)
+            (state, initial_generation)
         } else {
-            (SharedAccountState::default(), false)
+            let wal_path = persistence_wal_path(&path);
+            if wal_path.exists() {
+                return Err(format!(
+                    "account ledger snapshot {} is missing while WAL {} exists",
+                    path.display(),
+                    wal_path.display()
+                ));
+            }
+            (SharedAccountState::default(), 0)
         };
-        let persistence = AccountPersistence::start(path)?;
-        let account = Self {
+        let state = Arc::new(Mutex::new(state));
+        let persistence = AccountPersistence::start(
+            path,
+            account_id.clone(),
+            Arc::clone(&state),
+            initial_generation,
+        )?;
+        Ok(Self {
             account_id,
-            state: Mutex::new(state),
+            state,
             persistence: Some(persistence),
             trade_persistence_pending_generation: AtomicU64::new(0),
             order_audit_wakeup: (Mutex::new(0), Condvar::new()),
-        };
-        if migrated_state {
-            let state = account.state.lock().unwrap();
-            account.schedule_persist(&state);
-        }
-        Ok(account)
+        })
     }
 
     /// Query-repair orders that still lack authoritative terminal/live
@@ -1282,20 +1825,247 @@ impl SharedAccount {
         *current
     }
 
-    fn schedule_persist(&self, state: &SharedAccountState) {
+    fn schedule_persist(&self, _state: &SharedAccountState) {
         if let Some(persistence) = &self.persistence {
-            persistence.schedule(PersistedAccount {
-                version: PERSISTENCE_VERSION,
-                account_id: self.account_id.clone(),
-                state: state.clone(),
-            });
+            persistence.schedule();
         }
+    }
+
+    fn schedule_typed_persist(
+        &self,
+        state: &SharedAccountState,
+        changes: Result<Vec<PersistenceWalChange>, String>,
+    ) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        match changes {
+            Ok(changes) if !changes.is_empty() => persistence.schedule_delta(changes),
+            Ok(_) => {}
+            Err(error) => {
+                log::error!(
+                    "[shared_account] account={} typed WAL delta capture failed; falling back to full snapshot: {}",
+                    self.account_id,
+                    error,
+                );
+                let _ = state;
+                persistence.schedule();
+            }
+        }
+    }
+
+    /// Capture only the reservation domain touched by an ordinary place. This
+    /// runs while the caller already owns `state`; cloning one instance and one
+    /// order replaces the writer's previous full-ledger clone under the same
+    /// mutex.
+    fn schedule_order_persist(
+        &self,
+        state: &SharedAccountState,
+        instance_id: &str,
+        client_order_id: &str,
+        order_id: &str,
+    ) {
+        if self.persistence.is_none() {
+            return;
+        }
+        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+            let mut changes = Vec::with_capacity(3);
+            persistence_wal_map_entry(
+                &mut changes,
+                "instances",
+                instance_id,
+                state.instances.get(instance_id),
+            )?;
+            persistence_wal_map_entry(
+                &mut changes,
+                "orders",
+                client_order_id,
+                state.orders.get(client_order_id),
+            )?;
+            let normalized_order_id = normalize_order_id(order_id);
+            persistence_wal_map_entry(
+                &mut changes,
+                "oid_to_coid",
+                &normalized_order_id,
+                state.oid_to_coid.get(&normalized_order_id),
+            )?;
+            Ok(changes)
+        })();
+        self.schedule_typed_persist(state, changes);
+    }
+
+    /// Capture the exact account entries a private trade transition can touch.
+    /// Large historical maps are updated by key; no complete `trades`,
+    /// `orders`, or `instances` collection is cloned on the user-feed thread.
+    fn schedule_trade_persist(
+        &self,
+        state: &SharedAccountState,
+        trade_key: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+    ) {
+        if self.persistence.is_none() {
+            return;
+        }
+        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+            let normalized_order_id = normalize_order_id(order_id);
+            let resolved_coid = state
+                .oid_to_coid
+                .get(&normalized_order_id)
+                .map(String::as_str)
+                .or_else(|| (!client_order_id.is_empty()).then_some(client_order_id))
+                .unwrap_or_default();
+            let instance_id = state
+                .orders
+                .get(resolved_coid)
+                .map(|order| order.instance_id.as_str())
+                .or_else(|| {
+                    state
+                        .trades
+                        .get(trade_key)
+                        .map(|trade| trade.ownership.instance_id.as_str())
+                });
+            let mut changes = Vec::with_capacity(20);
+            persistence_wal_set(
+                &mut changes,
+                ["physical_cash".to_string()],
+                &state.physical_cash,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["unallocated_cash".to_string()],
+                &state.unallocated_cash,
+            )?;
+            persistence_wal_map_entry(
+                &mut changes,
+                "physical_positions",
+                token_id,
+                state.physical_positions.get(token_id),
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["unallocated_positions".to_string()],
+                &state.unallocated_positions,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["provisional_position_owners".to_string()],
+                &state.provisional_position_owners,
+            )?;
+            if let Some(instance_id) = instance_id {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "instances",
+                    instance_id,
+                    state.instances.get(instance_id),
+                )?;
+            }
+            if !resolved_coid.is_empty() {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "orders",
+                    resolved_coid,
+                    state.orders.get(resolved_coid),
+                )?;
+            }
+            if !normalized_order_id.is_empty() {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "oid_to_coid",
+                    &normalized_order_id,
+                    state.oid_to_coid.get(&normalized_order_id),
+                )?;
+            }
+            if !trade_key.is_empty() {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "trades",
+                    trade_key,
+                    state.trades.get(trade_key),
+                )?;
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "retired_trade_ownership_tombstones",
+                    trade_key,
+                    state.retired_trade_ownership_tombstones.get(trade_key),
+                )?;
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "unresolved_trade_match_times",
+                    trade_key,
+                    state.unresolved_trade_match_times.get(trade_key),
+                )?;
+            }
+            let anomaly_key = if trade_key.is_empty() {
+                format!("trade:<missing>:{order_id}")
+            } else {
+                format!("trade:{trade_key}")
+            };
+            persistence_wal_map_entry(
+                &mut changes,
+                "ownership_anomalies",
+                &anomaly_key,
+                state.ownership_anomalies.get(&anomaly_key),
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["fee_attribution_pending".to_string()],
+                &state.fee_attribution_pending,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["recovery_pending_orders".to_string()],
+                &state.recovery_pending_orders,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["routine_cancel_audits".to_string()],
+                &state.routine_cancel_audits,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["verified_trade_replay_recoveries".to_string()],
+                &state.verified_trade_replay_recoveries,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["ledger_generation".to_string()],
+                &state.ledger_generation,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["uncertain".to_string()],
+                &state.uncertain,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["uncertain_reason".to_string()],
+                &state.uncertain_reason,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["uncertain_since_ms".to_string()],
+                &state.uncertain_since_ms,
+            )?;
+            Ok(changes)
+        })();
+        self.schedule_typed_persist(state, changes);
     }
 
     pub fn flush_persistence(&self, timeout: Duration) -> Result<(), String> {
         self.persistence
             .as_ref()
             .map_or(Ok(()), |p| p.flush(timeout))
+    }
+
+    /// Non-blocking persistence health probe for event-loop callers. Returns
+    /// `Ok(false)` while the single writer is catching up and `Err` only after
+    /// the writer has observed a real persistence failure.
+    pub fn persistence_is_current(&self) -> Result<bool, String> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(true), AccountPersistence::is_current)
     }
 
     fn refresh_trade_persistence_blocker(&self) {
@@ -1305,10 +2075,28 @@ impl SharedAccount {
         if generation == 0 {
             return;
         }
-        let durable = self
-            .persistence
-            .as_ref()
-            .is_none_or(|persistence| persistence.generation_is_durable(generation));
+        let Some(persistence) = self.persistence.as_ref() else {
+            self.trade_persistence_pending_generation
+                .store(0, Ordering::Release);
+            return;
+        };
+        if let Some(error) = persistence.last_error() {
+            let reason = format!(
+                "trade generation {generation} is not durable: {error}"
+            );
+            let already_blocked = self
+                .state
+                .lock()
+                .unwrap()
+                .risk_blockers
+                .get(TRADE_PERSISTENCE_RISK_BLOCKER)
+                .is_some_and(|blocker| blocker.reason == reason);
+            if !already_blocked {
+                self.set_risk_blocker(TRADE_PERSISTENCE_RISK_BLOCKER, reason);
+            }
+            return;
+        }
+        let durable = persistence.generation_is_durable(generation);
         if !durable {
             return;
         }
@@ -1321,10 +2109,22 @@ impl SharedAccount {
         }
     }
 
-    fn flush_rollback_persistence(&self) -> Result<(), String> {
-        self.persistence
+    /// Record the newest trade generation without waiting for the WAL writer.
+    /// The user-feed thread calls this immediately after applying an economic
+    /// transition; admission observes writer failure through
+    /// `refresh_trade_persistence_blocker` instead of imposing an fsync barrier
+    /// on every private event.
+    fn track_trade_persistence_generation(&self) {
+        let generation = self
+            .persistence
             .as_ref()
-            .map_or(Ok(()), AccountPersistence::flush_blocking)
+            .map_or(0, AccountPersistence::scheduled_generation);
+        if generation == 0 {
+            return;
+        }
+        self.trade_persistence_pending_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        self.refresh_trade_persistence_blocker();
     }
 
     fn flush_admission_persistence(&self) -> Result<(), ReservationError> {
@@ -2865,9 +3665,6 @@ impl SharedAccount {
                 "coid/oid/token must be present and quantity/price must be positive".into(),
             ));
         }
-        // A previous asynchronous mutation may have failed to persist. Retry
-        // the complete current snapshot before changing any reservation.
-        self.ensure_admission_persistence()?;
         let mut state = self.state.lock().unwrap();
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
@@ -2880,12 +3677,14 @@ impl SharedAccount {
                 && existing.instance_id == instance_id
             {
                 let ownership = existing.clone();
-                // Retry the latest durable snapshot if a prior async write
-                // failed; never send the idempotent network order until its
-                // ownership and reservation are fsynced.
-                self.schedule_persist(&state);
-                drop(state);
-                self.flush_admission_persistence()?;
+                // Nudge the single WAL writer even for an idempotent retry,
+                // but never hold network order admission behind disk I/O.
+                self.schedule_order_persist(
+                    &state,
+                    instance_id,
+                    client_order_id,
+                    order_id,
+                );
                 return Ok(ownership);
             }
             return Err(ReservationError::DuplicateClientOrderId(
@@ -2993,42 +3792,12 @@ impl SharedAccount {
         state
             .orders
             .insert(client_order_id.into(), ownership.clone());
-        self.schedule_persist(&state);
-        drop(state);
-        // The local EIP-712 order id is known before POST. Make its instance
-        // ownership/reservation crash-durable before the network can observe
-        // the order; this closes the restart window that produced unowned
-        // fills. The dedicated writer keeps serialization off the hot thread;
-        // this wait is only for the final atomic fsync generation.
-        if let Err(error) = self.flush_admission_persistence() {
-            // Nothing has been sent yet. Roll back the in-memory reservation
-            // so a persistence outage cannot leak one lock per quote retry.
-            let mut state = self.state.lock().unwrap();
-            if let Some(order) = state.orders.remove(client_order_id) {
-                state
-                    .oid_to_coid
-                    .remove(&normalize_order_id(&order.order_id));
-                if let Some(instance) = state.instances.get_mut(&order.instance_id) {
-                    instance.reserved_cash =
-                        (instance.reserved_cash - order.reserved_cash).max(0.0);
-                    if order.reserved_quantity > 0.0 {
-                        let reserved = instance
-                            .reserved_positions
-                            .entry(order.token_id)
-                            .or_insert(0.0);
-                        *reserved = (*reserved - order.reserved_quantity).max(0.0);
-                    }
-                }
-            }
-            self.schedule_persist(&state);
-            drop(state);
-            if let Err(rollback_error) = self.flush_rollback_persistence() {
-                return Err(ReservationError::PersistenceUnavailable(format!(
-                    "{error}; admission rollback also failed: {rollback_error}"
-                )));
-            }
-            return Err(error);
-        }
+        // Deliberately asynchronous: startup exchange reconciliation is the
+        // recovery authority for the crash window between POST acceptance and
+        // this WAL generation reaching disk. In-process reservations remain
+        // atomic across strategies, while order submission never waits for
+        // serialization, append, or fsync.
+        self.schedule_order_persist(&state, instance_id, client_order_id, order_id);
         Ok(ownership)
     }
 
@@ -4451,26 +5220,7 @@ impl SharedAccount {
             return TradeTransitionResult::Rejected;
         };
         if persistence_required {
-            if let Err(error) = self.flush_persistence(Duration::from_secs(2)) {
-                let generation = self
-                    .persistence
-                    .as_ref()
-                    .map_or(0, AccountPersistence::scheduled_generation);
-                self.trade_persistence_pending_generation
-                    .fetch_max(generation, Ordering::AcqRel);
-                self.set_risk_blocker(
-                    TRADE_PERSISTENCE_RISK_BLOCKER,
-                    format!(
-                        "trade `{trade_key}` applied but generation {generation} is not durable: {error}"
-                    ),
-                );
-                return if owned_noop {
-                    TradeTransitionResult::OwnedNoopButPersistencePending(ownership)
-                } else {
-                    TradeTransitionResult::AppliedButPersistencePending(ownership)
-                };
-            }
-            self.refresh_trade_persistence_blocker();
+            self.track_trade_persistence_generation();
         }
         if owned_noop {
             TradeTransitionResult::OwnedNoop(ownership)
@@ -4524,7 +5274,7 @@ impl SharedAccount {
                     "authenticated historical trade `{trade_key}` is not a valid terminal edge"
                 ),
             );
-            self.schedule_persist(&state);
+            self.schedule_trade_persist(&state, trade_key, "", order_id, token_id);
             return TradeTransitionResult::Rejected;
         }
         if state.trades.contains_key(trade_key)
@@ -4538,7 +5288,7 @@ impl SharedAccount {
                     "authenticated historical trade `{trade_key}` conflicts with an existing durable trade proof"
                 ),
             );
-            self.schedule_persist(&state);
+            self.schedule_trade_persist(&state, trade_key, "", order_id, token_id);
             return TradeTransitionResult::Rejected;
         }
         if !state.settled_token_values.contains_key(token_id) {
@@ -4548,7 +5298,7 @@ impl SharedAccount {
                     "authenticated historical trade `{trade_key}` token `{token_id}` has no durable settlement proof"
                 ),
             );
-            self.schedule_persist(&state);
+            self.schedule_trade_persist(&state, trade_key, "", order_id, token_id);
             return TradeTransitionResult::Rejected;
         }
 
@@ -4583,7 +5333,7 @@ impl SharedAccount {
                     candidate_owners.len(),
                 ),
             );
-            self.schedule_persist(&state);
+            self.schedule_trade_persist(&state, trade_key, "", order_id, token_id);
             return TradeTransitionResult::Rejected;
         }
 
@@ -4627,25 +5377,11 @@ impl SharedAccount {
             is_maker,
             reopened,
         );
+        // This rare historical path also prunes expired ownership tombstones;
+        // retain the cold full-state fallback so those removals are durable.
         self.schedule_persist(&state);
         drop(state);
-
-        if let Err(error) = self.flush_persistence(Duration::from_secs(2)) {
-            let generation = self
-                .persistence
-                .as_ref()
-                .map_or(0, AccountPersistence::scheduled_generation);
-            self.trade_persistence_pending_generation
-                .fetch_max(generation, Ordering::AcqRel);
-            self.set_risk_blocker(
-                TRADE_PERSISTENCE_RISK_BLOCKER,
-                format!(
-                    "authenticated historical trade `{trade_key}` no-op generation {generation} is not durable: {error}"
-                ),
-            );
-            return TradeTransitionResult::OwnedNoopButPersistencePending(ownership);
-        }
-        self.refresh_trade_persistence_blocker();
+        self.track_trade_persistence_generation();
         TradeTransitionResult::OwnedNoop(ownership)
     }
 
@@ -4679,6 +5415,9 @@ impl SharedAccount {
             _ => return None,
         };
         let mut state = self.state.lock().unwrap();
+        let schedule_trade_persist = |state: &SharedAccountState| {
+            self.schedule_trade_persist(state, trade_key, client_order_id, order_id, token_id);
+        };
         let anomaly_key = if trade_key.is_empty() {
             format!("trade:<missing>:{order_id}")
         } else {
@@ -4698,7 +5437,7 @@ impl SharedAccount {
                     "invalid trade `{trade_key}` numeric payload quantity={quantity} price={price}"
                 ),
             );
-            self.schedule_persist(&state);
+            schedule_trade_persist(&state);
             return None;
         }
         let normalized_order_id = normalize_order_id(order_id);
@@ -4728,7 +5467,7 @@ impl SharedAccount {
                     price,
                 ) {
                     set_ownership_anomaly(&mut state, anomaly_key.clone(), reason);
-                    self.schedule_persist(&state);
+                    schedule_trade_persist(&state);
                     return None;
                 }
                 let was_uncertain = state.uncertain;
@@ -4779,7 +5518,7 @@ impl SharedAccount {
                             was_uncertain && !state.uncertain,
                         );
                     }
-                    self.schedule_persist(&state);
+                    schedule_trade_persist(&state);
                     *persistence_required = true;
                 }
                 *owned_noop = true;
@@ -4813,7 +5552,7 @@ impl SharedAccount {
                 });
                 if let Err(reason) = validation {
                     set_ownership_anomaly(&mut state, anomaly_key.clone(), reason);
-                    self.schedule_persist(&state);
+                    schedule_trade_persist(&state);
                     return None;
                 }
                 let was_uncertain = state.uncertain;
@@ -4828,7 +5567,7 @@ impl SharedAccount {
                         self.account_id, trade_key,
                         tombstone.ownership.client_order_id, reopened,
                     );
-                    self.schedule_persist(&state);
+                    schedule_trade_persist(&state);
                     *persistence_required = true;
                 }
                 *owned_noop = true;
@@ -4850,7 +5589,7 @@ impl SharedAccount {
                     durable_coid.as_deref().unwrap_or_default(),
                 ),
             );
-            self.schedule_persist(&state);
+            schedule_trade_persist(&state);
             return None;
         }
         let resolved_coid = durable_coid
@@ -4862,7 +5601,7 @@ impl SharedAccount {
                 anomaly_key.clone(),
                 format!("unowned trade `{trade_key}` coid=`{resolved_coid}` oid=`{order_id}`"),
             );
-            self.schedule_persist(&state);
+            schedule_trade_persist(&state);
             return None;
         };
         let stored_order_id = normalize_order_id(&order.order_id);
@@ -4879,7 +5618,7 @@ impl SharedAccount {
                     order.order_id, order.token_id, order.side,
                 ),
             );
-            self.schedule_persist(&state);
+            schedule_trade_persist(&state);
             return None;
         }
         let instance_id = order.instance_id;
@@ -4899,7 +5638,7 @@ impl SharedAccount {
                         prior.client_order_id, prior.order_id, prior.token_id, prior.side,
                     ),
                 );
-                self.schedule_persist(&state);
+                schedule_trade_persist(&state);
                 return None;
             }
             let quantity_tolerance = 1e-8_f64.max(prior.quantity.abs() * 1e-8);
@@ -4915,7 +5654,7 @@ impl SharedAccount {
                         prior.quantity, prior.price,
                     ),
                 );
-                self.schedule_persist(&state);
+                schedule_trade_persist(&state);
                 return None;
             }
         }
@@ -4932,7 +5671,7 @@ impl SharedAccount {
                     order.filled_quantity, order.quantity, order.price,
                 ),
             );
-            self.schedule_persist(&state);
+            schedule_trade_persist(&state);
             return None;
         }
         state.ownership_anomalies.remove(&anomaly_key);
@@ -4972,7 +5711,7 @@ impl SharedAccount {
                         &mut state, trade_key, fee_status, is_maker,
                     );
                 }
-                self.schedule_persist(&state);
+                schedule_trade_persist(&state);
                 *persistence_required = true;
                 return Some(ownership);
             }
@@ -5198,7 +5937,7 @@ impl SharedAccount {
             advance_trade_ledger_generation(&mut state, trade_key);
         }
         recompute_reconciliation(&mut state, "trade lifecycle transition");
-        self.schedule_persist(&state);
+        schedule_trade_persist(&state);
         *persistence_required = true;
         Some(ownership)
     }
@@ -11177,6 +11916,248 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn persistence_wal_replays_and_compacts_on_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-shared-account-wal-replay-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let wal_path = persistence_wal_path(&path);
+        {
+            let account = SharedAccount::new_persistent("wal-replay", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account
+                .reserve_order(
+                    "a",
+                    "a-wal",
+                    "oid-wal",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+
+            let snapshot: PersistedAccount =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(snapshot.state.orders.is_empty());
+            assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        }
+
+        {
+            let restored = SharedAccount::new_persistent("wal-replay", &path).unwrap();
+            assert_eq!(
+                restored.order_owner_by_oid("oid-wal").as_deref(),
+                Some("a")
+            );
+            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+            let compacted: PersistedAccount =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(compacted.persistence_generation > 0);
+            assert!(compacted.state.orders.contains_key("a-wal"));
+        }
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn typed_trade_wal_replays_virtual_and_physical_economics() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-shared-account-typed-trade-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("typed-trade", &path).unwrap();
+            account.register_instance("maker", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account
+                .reserve_order(
+                    "maker",
+                    "maker-order",
+                    "maker-oid",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            // Drain every cold setup job so both lifecycle edges below must use
+            // the typed-delta path rather than coalescing into a full fallback.
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                account.apply_trade_transition_with_context(
+                    "maker-trade",
+                    "MATCHED",
+                    "maker-order",
+                    "maker-oid",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    true,
+                    1,
+                ),
+                TradeTransitionResult::Applied(_)
+            ));
+            assert!(matches!(
+                account.apply_trade_transition_with_context(
+                    "maker-trade",
+                    "MINED",
+                    "maker-order",
+                    "maker-oid",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    true,
+                    1,
+                ),
+                TradeTransitionResult::Applied(_)
+            ));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("typed-trade", &path).unwrap();
+        let snapshot = restored.monitoring_snapshot();
+        assert_eq!(snapshot.physical_cash, 95.0);
+        assert_eq!(snapshot.physical_positions.get("UP").copied(), Some(10.0));
+        let maker = restored.instance_snapshot("maker").unwrap();
+        assert_eq!(maker.cash, 95.0);
+        assert_eq!(maker.positions.get("UP").copied(), Some(10.0));
+        assert!(!snapshot.uncertain);
+        assert_eq!(
+            restored.trade_ownership("maker-trade").unwrap().status,
+            "MINED",
+        );
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn persistence_wal_ignores_only_a_torn_final_frame() {
+        use std::io::Write as _;
+
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-shared-account-wal-torn-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let wal_path = persistence_wal_path(&path);
+        {
+            let account = SharedAccount::new_persistent("wal-torn", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap()
+            .write_all(b"17 deadbeef partial")
+            .unwrap();
+
+        let restored = SharedAccount::new_persistent("wal-torn", &path).unwrap();
+        assert!(restored.instance_snapshot("a").is_some());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn persistence_wal_rejects_a_corrupt_complete_frame() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-shared-account-wal-corrupt-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let wal_path = persistence_wal_path(&path);
+        {
+            let account = SharedAccount::new_persistent("wal-corrupt", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let mut wal = std::fs::read(&wal_path).unwrap();
+        let first_space = wal.iter().position(|byte| *byte == b' ').unwrap();
+        let second_space = first_space
+            + 1
+            + wal[first_space + 1..]
+                .iter()
+                .position(|byte| *byte == b' ')
+                .unwrap();
+        wal[second_space + 1] ^= 1;
+        std::fs::write(&wal_path, wal).unwrap();
+
+        let error = SharedAccount::new_persistent("wal-corrupt", &path).unwrap_err();
+        assert!(error.contains("checksum mismatch"), "{error}");
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn persistence_wal_writes_a_small_delta_for_a_large_ledger() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-shared-account-wal-delta-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let wal_path = persistence_wal_path(&path);
+        {
+            let account = SharedAccount::new_persistent("wal-delta", &path).unwrap();
+            let mut state = account.state.lock().unwrap();
+            for index in 0..5_000 {
+                state
+                    .settled_token_values
+                    .insert(format!("token-{index:05}"), 1.0);
+            }
+            state.settled_token_values_generation = 1;
+            account.schedule_persist(&state);
+            drop(state);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        {
+            let account = SharedAccount::new_persistent("wal-delta", &path).unwrap();
+            let snapshot_len = std::fs::metadata(&path).unwrap().len();
+            let mut state = account.state.lock().unwrap();
+            state
+                .settled_token_values
+                .insert("token-00000".to_string(), 0.0);
+            state.settled_token_values_generation += 1;
+            account.schedule_persist(&state);
+            drop(state);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                wal_len * 10 < snapshot_len,
+                "incremental WAL {wal_len} should be far smaller than snapshot {snapshot_len}"
+            );
+        }
+        remove_persistence_test_files(&path);
+    }
+
+    fn remove_persistence_test_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(persistence_wal_path(path));
+        let mut tmp_path = path.as_os_str().to_os_string();
+        tmp_path.push(".tmp");
+        let _ = std::fs::remove_file(PathBuf::from(tmp_path));
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
     fn sidecar_checkpoint_is_monotonic_and_durable() {
         let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
@@ -11279,6 +12260,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: "invalid".to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11364,6 +12346,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: account_id.to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11492,6 +12475,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: account_id.to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11597,6 +12581,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: account_id.to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11649,6 +12634,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: "unowned".to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11703,6 +12689,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: "recoverable".to_string(),
+                persistence_generation: 0,
                 state,
             },
         )
@@ -11919,6 +12906,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &PersistedAccount {
                 version: PERSISTENCE_VERSION,
                 account_id: "acct".to_string(),
+                persistence_generation: 0,
                 state: state.clone(),
             },
         )
@@ -12260,6 +13248,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .unwrap();
             account.flush_persistence(Duration::from_secs(2)).unwrap();
         }
+        // Runtime mutations are WAL-backed; reopening folds them into the
+        // snapshot before this test deliberately tampers with that snapshot.
+        drop(SharedAccount::new_persistent("economic-replay", &path).unwrap());
 
         let mut persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -12300,6 +13291,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .unwrap();
             account.flush_persistence(Duration::from_secs(2)).unwrap();
         }
+        // Materialize the WAL-backed seed before simulating a legacy snapshot
+        // that predates the immutable baseline field.
+        drop(SharedAccount::new_persistent("legacy-seed", &path).unwrap());
         let mut persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         persisted["state"]
@@ -12390,7 +13384,61 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
-    fn applied_trade_survives_persistence_failure_and_blocks_admission() {
+    fn order_admission_does_not_wait_for_a_failed_wal_writer() {
+        let _persistence_guard = persistence_test_guard();
+        let root = std::env::temp_dir().join(format!(
+            "hexagent-order-async-persistence-{}-{}",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let moved = root.with_extension("moved");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("account.json");
+        let account = SharedAccount::new_persistent("order-async", &path).unwrap();
+        account.register_instance("a", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+
+        // Keep the ledger lock alive while making every new WAL open fail.
+        // Order admission must still update the in-memory shared reservation
+        // and return without invoking a persistence flush.
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::write(&root, b"not-a-directory").unwrap();
+        account
+            .register_token_interest("a", "condition", "UP", "DOWN")
+            .unwrap();
+        account
+            .flush_persistence(Duration::from_secs(2))
+            .unwrap_err();
+        let flushes_before = account.monitoring_snapshot().persistence_flushes;
+
+        let ownership = account
+            .reserve_order(
+                "a",
+                "a-order",
+                "oid-order",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert_eq!(ownership.client_order_id, "a-order");
+        let after = account.monitoring_snapshot();
+        assert_eq!(after.persistence_flushes, flushes_before);
+        assert!(after.persistence_error.is_some());
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+
+        drop(account);
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    #[test]
+    fn applied_trade_does_not_wait_for_persistence_failure_and_blocks_next_admission() {
         let _persistence_guard = persistence_test_guard();
         let root = std::env::temp_dir().join(format!(
             "hexagent-trade-persistence-failure-{}-{}",
@@ -12433,19 +13481,26 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             false,
             123,
         );
-        assert!(matches!(
-            result,
-            TradeTransitionResult::AppliedButPersistencePending(_)
-        ));
+        assert!(matches!(result, TradeTransitionResult::Applied(_)));
         let snapshot = account.instance_snapshot("a").unwrap();
         assert_eq!(snapshot.positions.get("UP").copied(), Some(10.0));
         assert_eq!(snapshot.cash, 95.0);
-        assert!(account.is_uncertain());
+        // The private-event caller returns immediately. Wait only in the test
+        // for the background writer to expose its deterministic failure, then
+        // prove the next admission observes it without an fsync barrier.
+        for _ in 0..200 {
+            if account.monitoring_snapshot().persistence_error.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(account.monitoring_snapshot().persistence_error.is_some());
         assert!(matches!(
             account.reserve_order("a", "blocked", "oid-blocked", "UP", Side::Buy, 1.0, 0.5, 0,),
             Err(ReservationError::PersistenceUnavailable(_))
                 | Err(ReservationError::AccountUncertain)
         ));
+        assert!(account.is_uncertain());
 
         drop(account);
         let _ = std::fs::remove_file(&root);
