@@ -29,6 +29,10 @@ const GAMMA_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const ROTATION_GAMMA_ATTEMPTS: u32 = 2;
 const ROTATION_REFRESH_TIMEOUT_NS: u64 = 15_000_000_000;
 const ENGINE_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+/// Absorb short CLOB frame bursts without closing the TCP receive window while
+/// the single-threaded parser processes the preceding frame. Linux doubles
+/// the requested value for bookkeeping, so metrics normally report 16 MiB.
+const CLOB_SOCKET_RCVBUF_BYTES: libc::c_int = 8 * 1024 * 1024;
 
 /// The synchronous Polymarket feed's externally visible phase.  This lives in
 /// atomics shared with the engine supervisor, so it remains observable even if
@@ -2356,6 +2360,52 @@ fn clob_socket_fd(
     None
 }
 
+#[cfg(unix)]
+fn configure_clob_socket_receive_buffer(
+    fd: Option<i32>,
+    requested_bytes: libc::c_int,
+) -> std::result::Result<libc::c_int, String> {
+    let fd = fd.ok_or_else(|| "CLOB socket file descriptor unavailable".to_string())?;
+    if requested_bytes <= 0 {
+        return Err(format!(
+            "invalid CLOB socket receive buffer request: {requested_bytes}"
+        ));
+    }
+    unsafe {
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&requested_bytes as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut actual: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut actual as *mut libc::c_int).cast(),
+            &mut len,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(actual)
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_clob_socket_receive_buffer(
+    _fd: Option<i32>,
+    _requested_bytes: libc::c_int,
+) -> std::result::Result<libc::c_int, String> {
+    Err("CLOB socket receive-buffer tuning is unsupported on this platform".to_string())
+}
+
 fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
     let Some(fd) = fd else {
         return TcpSocketMetrics::default();
@@ -2764,6 +2814,16 @@ async fn clob_ws_task(
         };
         backoff.reset();
         let tcp_fd = clob_socket_fd(&stream);
+        match configure_clob_socket_receive_buffer(tcp_fd, CLOB_SOCKET_RCVBUF_BYTES) {
+            Ok(actual_bytes) => info!(
+                "[clob_socket_config] requested_rcvbuf={} actual_rcvbuf={}",
+                CLOB_SOCKET_RCVBUF_BYTES, actual_bytes,
+            ),
+            Err(error) => warn!(
+                "[clob_socket_config] failed to raise receive buffer requested_rcvbuf={}: {}",
+                CLOB_SOCKET_RCVBUF_BYTES, error,
+            ),
+        }
         let (mut write, mut read) = stream.split();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
@@ -5722,6 +5782,15 @@ impl ExchangeMarket for PolymarketMarket {
 #[cfg(test)]
 mod pick_current_event_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn clob_receive_buffer_is_configurable_and_observable() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let actual = configure_clob_socket_receive_buffer(Some(socket.as_raw_fd()), 64 * 1024)
+            .expect("configure receive buffer");
+        assert!(actual >= 64 * 1024, "actual receive buffer={actual}");
+    }
 
     #[test]
     fn external_liveness_keeps_three_heartbeats_independent() {
