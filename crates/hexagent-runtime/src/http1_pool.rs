@@ -19,8 +19,8 @@
 //! * Two fixed process-global fallback pools: **fallback-order** (4 slots)
 //!   and **query** (4 slots).
 //! * One pool group per Polymarket account. If N strategy instances share an
-//!   account, that group owns **4·N order** slots (`Fast`+`Cancel`), **2·N
-//!   reconcile** slots, and **2 gap-replay** slots. Instance IDs are mapped to
+//!   account, that group owns **4·N placement** slots, **4·N cancellation**
+//!   slots, **2·N reconcile** slots, and **2 gap-replay** slots. Instance IDs are mapped to
 //!   their account before admission, so shared-wallet instances borrow the
 //!   same warm capacity without duplicating physical pools.
 //! * Round-robin dispatch spreads a burst (e.g. a two-leg replace: two
@@ -28,10 +28,9 @@
 //!   connections → no head-of-line queueing.
 //! * Pool isolation still guarantees a slow query/replay can never
 //!   occupy a connection an order op needs — on h1.1 this is *the*
-//!   isolation mechanism, stream credits don't exist. Within the order
-//!   pool, place vs cancel isolation was traded for burst capacity
-//!   (2026-07-31: live busy-rejections came from one side's 3-slot
-//!   partition filling while the other side idled).
+//!   isolation mechanism, stream credits don't exist. Placement and cancel
+//!   therefore also have independent physical pools: slow cancel finality can
+//!   never consume a warm connection reserved for a fresh quote.
 //!
 //! ## Sizing
 //!
@@ -69,7 +68,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 // ── Per-pool client-level timeout ceilings ────────────────────────
-// ORDER (Fast+Cancel merged) is a ceiling only: the per-request deadline
+// ORDER (Fast and Cancel use separate account pools) is a ceiling only: the per-request deadline
 // is chosen by `async_rt::current_fast_timeout()` /
 // `current_cancel_timeout()` and is always ≤ this value. QUERY and the
 // account reconcile pools use the larger 5 s client ceiling; reconcile's
@@ -103,8 +102,8 @@ fn keep_warm_tick(full_sweep: Duration, n_slots: usize) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
-/// Request roles. Fast+Cancel share the account's order pool; Reconcile and
-/// GapReplay each have their own account pool. Query is process-global.
+/// Request roles. Fast, Cancel, Reconcile, and GapReplay have physically
+/// isolated account pools. Query is process-global.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// POST /order, /orders — hot-path placements.
@@ -276,7 +275,12 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
     // actual place/cancel/reconcile/replay connections, not just fallbacks.
     if let Some(registry) = ACCOUNT_POOLS.get() {
         for account in registry.by_account.values() {
-            for rp in [&account.order, &account.reconcile, &account.gap_replay] {
+            for rp in [
+                &account.fast,
+                &account.cancel,
+                &account.reconcile,
+                &account.gap_replay,
+            ] {
                 all.extend(rp.slots.iter().map(|s| s.client.read().unwrap().clone()));
             }
         }
@@ -293,7 +297,12 @@ pub fn pooled_clients_all() -> Vec<PooledClient> {
     all.extend(p.query.pooled_clients());
     if let Some(registry) = ACCOUNT_POOLS.get() {
         for account in registry.by_account.values() {
-            for rp in [&account.order, &account.reconcile, &account.gap_replay] {
+            for rp in [
+                &account.fast,
+                &account.cancel,
+                &account.reconcile,
+                &account.gap_replay,
+            ] {
                 all.extend(rp.pooled_clients());
             }
         }
@@ -516,7 +525,12 @@ fn keep_warm_targets() -> Vec<KeepWarmTarget> {
         ids.sort();
         for id in ids {
             let account = &registry.by_account[id];
-            for pool in [&account.order, &account.reconcile, &account.gap_replay] {
+            for pool in [
+                &account.fast,
+                &account.cancel,
+                &account.reconcile,
+                &account.gap_replay,
+            ] {
                 targets.extend((0..pool.slots.len()).map(|slot| KeepWarmTarget { pool, slot }));
             }
         }
@@ -1197,7 +1211,11 @@ impl RolePool {
     }
 }
 
-pub const ACCOUNT_ORDER_SLOTS_PER_INSTANCE: usize = 4;
+pub const ACCOUNT_FAST_SLOTS_PER_INSTANCE: usize = 4;
+pub const ACCOUNT_CANCEL_SLOTS_PER_INSTANCE: usize = 4;
+/// Backward-compatible name for placement capacity. Account cancellation now
+/// has a separate pool of the same size.
+pub const ACCOUNT_ORDER_SLOTS_PER_INSTANCE: usize = ACCOUNT_FAST_SLOTS_PER_INSTANCE;
 pub const ACCOUNT_RECONCILE_SLOTS_PER_INSTANCE: usize = 2;
 pub const ACCOUNT_GAP_REPLAY_SLOTS: usize = 2;
 
@@ -1205,7 +1223,8 @@ pub const ACCOUNT_GAP_REPLAY_SLOTS: usize = 2;
 /// Polymarket account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountPoolSizes {
-    pub order: usize,
+    pub fast: usize,
+    pub cancel: usize,
     pub reconcile: usize,
     pub gap_replay: usize,
 }
@@ -1213,17 +1232,20 @@ pub struct AccountPoolSizes {
 impl AccountPoolSizes {
     pub fn for_instances(instance_count: usize) -> Self {
         Self {
-            order: ACCOUNT_ORDER_SLOTS_PER_INSTANCE * instance_count,
+            fast: ACCOUNT_FAST_SLOTS_PER_INSTANCE * instance_count,
+            cancel: ACCOUNT_CANCEL_SLOTS_PER_INSTANCE * instance_count,
             reconcile: ACCOUNT_RECONCILE_SLOTS_PER_INSTANCE * instance_count,
             gap_replay: ACCOUNT_GAP_REPLAY_SLOTS,
         }
     }
 }
 
-/// Physical pools for one account. Fast+Cancel share `order`; reconciliation
-/// and gap replay are isolated from both orders and process-global queries.
+/// Physical pools for one account. Placement cannot be starved by retained
+/// cancellations (or vice versa); reconciliation and gap replay remain
+/// isolated from both hot lanes and process-global queries.
 struct AccountPools {
-    order: RolePool,
+    fast: RolePool,
+    cancel: RolePool,
     reconcile: RolePool,
     gap_replay: RolePool,
 }
@@ -1231,7 +1253,8 @@ struct AccountPools {
 impl AccountPools {
     fn role(&self, role: Role) -> Option<&RolePool> {
         match role {
-            Role::Fast | Role::Cancel => Some(&self.order),
+            Role::Fast => Some(&self.fast),
+            Role::Cancel => Some(&self.cancel),
             Role::Reconcile => Some(&self.reconcile),
             Role::GapReplay => Some(&self.gap_replay),
             Role::Query => None,
@@ -1248,8 +1271,8 @@ static ACCOUNT_POOLS: OnceLock<AccountPoolRegistry> = OnceLock::new();
 
 /// Build account-level admission pools and the instance→account routing map.
 /// `accounts[account_id]` is the complete set of enabled instance IDs sharing
-/// that wallet. The fixed sizing policy is 4·N order, 2·N reconcile and 2 gap
-/// replay slots per account.
+/// that wallet. The fixed sizing policy is 4·N placement, 4·N cancel, 2·N
+/// reconcile and 2 gap replay slots per account.
 pub fn init_account_pools(accounts: &HashMap<String, Vec<String>>) -> Result<()> {
     let registry = build_account_pool_registry(accounts)?;
     let account_count = registry.by_account.len();
@@ -1299,16 +1322,18 @@ fn build_account_pool_registry(
         by_account.insert(
             account_id.clone(),
             AccountPools {
-                order: RolePool::new(sizes.order, ORDER_TIMEOUT_CEILING, Role::Fast)?,
+                fast: RolePool::new(sizes.fast, ORDER_TIMEOUT_CEILING, Role::Fast)?,
+                cancel: RolePool::new(sizes.cancel, ORDER_TIMEOUT_CEILING, Role::Cancel)?,
                 reconcile: RolePool::new(sizes.reconcile, QUERY_TIMEOUT_CEILING, Role::Reconcile)?,
                 gap_replay: RolePool::new(sizes.gap_replay, GAP_REPLAY_TIMEOUT, Role::GapReplay)?,
             },
         );
         log::info!(
-            "[http1_pool] account={} instances={} order={} reconcile={} gap_replay={}",
+            "[http1_pool] account={} instances={} fast={} cancel={} reconcile={} gap_replay={}",
             account_id,
             instances.len(),
-            sizes.order,
+            sizes.fast,
+            sizes.cancel,
             sizes.reconcile,
             sizes.gap_replay,
         );
@@ -1457,8 +1482,8 @@ pub fn all_gap_replay_stats() -> Vec<(String, u64, u64, usize, Vec<(usize, u64, 
         .collect()
 }
 
-/// Sum of all account order slots. The completion executor uses this to avoid
-/// queueing an already-fired request while its permit remains held.
+/// Sum of all account placement and cancel slots. Completion drainers cover
+/// both kinds of already-fired requests while their permit remains held.
 pub fn total_account_order_capacity() -> usize {
     ACCOUNT_POOLS
         .get()
@@ -1466,7 +1491,22 @@ pub fn total_account_order_capacity() -> usize {
             registry
                 .by_account
                 .values()
-                .map(|account| account.order.slots.len())
+                .map(|account| account.fast.slots.len() + account.cancel.slots.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Sum of physically isolated cancel slots. The retained-cancel worker count
+/// should track this lane, not placement capacity.
+pub fn total_account_cancel_capacity() -> usize {
+    ACCOUNT_POOLS
+        .get()
+        .map(|registry| {
+            registry
+                .by_account
+                .values()
+                .map(|account| account.cancel.slots.len())
                 .sum()
         })
         .unwrap_or(0)
@@ -1479,11 +1519,20 @@ mod tests {
     #[test]
     fn account_sizes_scale_with_instances() {
         let s1 = AccountPoolSizes::for_instances(1);
-        assert_eq!((s1.order, s1.reconcile, s1.gap_replay), (4, 2, 2));
+        assert_eq!(
+            (s1.fast, s1.cancel, s1.reconcile, s1.gap_replay),
+            (4, 4, 2, 2)
+        );
         let s3 = AccountPoolSizes::for_instances(3);
-        assert_eq!((s3.order, s3.reconcile, s3.gap_replay), (12, 6, 2));
+        assert_eq!(
+            (s3.fast, s3.cancel, s3.reconcile, s3.gap_replay),
+            (12, 12, 6, 2)
+        );
         let s20 = AccountPoolSizes::for_instances(20);
-        assert_eq!((s20.order, s20.reconcile, s20.gap_replay), (80, 40, 2));
+        assert_eq!(
+            (s20.fast, s20.cancel, s20.reconcile, s20.gap_replay),
+            (80, 80, 40, 2)
+        );
     }
 
     #[test]
@@ -1511,11 +1560,13 @@ mod tests {
         assert_eq!(registry.instance_to_account["eth-1"], "wallet-b");
 
         let wallet_a = &registry.by_account["wallet-a"];
-        assert_eq!(wallet_a.order.slots.len(), 8);
+        assert_eq!(wallet_a.fast.slots.len(), 8);
+        assert_eq!(wallet_a.cancel.slots.len(), 8);
         assert_eq!(wallet_a.reconcile.slots.len(), 4);
         assert_eq!(wallet_a.gap_replay.slots.len(), 2);
         let wallet_b = &registry.by_account["wallet-b"];
-        assert_eq!(wallet_b.order.slots.len(), 4);
+        assert_eq!(wallet_b.fast.slots.len(), 4);
+        assert_eq!(wallet_b.cancel.slots.len(), 4);
         assert_eq!(wallet_b.reconcile.slots.len(), 2);
         assert_eq!(wallet_b.gap_replay.slots.len(), 2);
     }
@@ -1636,8 +1687,9 @@ mod tests {
 
     fn account(n: usize) -> AccountPools {
         AccountPools {
-            order: pool(n),
-            reconcile: pool(n),
+            fast: pool(n),
+            cancel: RolePool::new(n, Duration::from_millis(500), Role::Cancel).unwrap(),
+            reconcile: RolePool::new(n, Duration::from_millis(500), Role::Reconcile).unwrap(),
             gap_replay: RolePool::new(
                 ACCOUNT_GAP_REPLAY_SLOTS,
                 Duration::from_secs(5),
@@ -1798,7 +1850,7 @@ mod tests {
         assert!(held.is_some());
         assert!(
             a.role(Role::Fast).unwrap().try_acquire().is_none(),
-            "account A's order pool is exhausted"
+            "account A's placement pool is exhausted"
         );
         assert!(
             b.role(Role::Fast).unwrap().try_acquire().is_some(),
@@ -1807,20 +1859,19 @@ mod tests {
     }
 
     #[test]
-    fn admission_merged_pool_semantics() {
+    fn admission_fast_and_cancel_are_physically_isolated() {
         let i = account(1);
-        // Fast and Cancel SHARE the order pool: exhausting it via a
-        // place blocks a cancel too — the merge trades strict role
-        // isolation for burst capacity. Reconcile is independent; Query is
-        // global and therefore intentionally absent from an account pool.
+        // A retained cancel must never consume the last placement slot, and a
+        // placement wave must never delay cancellation admission.
         let _fast = i.role(Role::Fast).unwrap().try_acquire().unwrap();
         assert!(
             i.role(Role::Fast).unwrap().try_acquire().is_none(),
-            "order pool exhausted"
+            "placement pool exhausted"
         );
+        let _cancel = i.role(Role::Cancel).unwrap().try_acquire().unwrap();
         assert!(
             i.role(Role::Cancel).unwrap().try_acquire().is_none(),
-            "Cancel shares the order pool's slots"
+            "cancel pool exhausted independently"
         );
         let _rec = i.role(Role::Reconcile).unwrap().try_acquire().unwrap();
         assert!(i.role(Role::Query).is_none());
@@ -1828,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_pool_keeps_per_role_counters() {
+    fn role_pool_keeps_per_logical_role_counters() {
         let p = pool(2);
         let held = p.try_acquire_as(0).unwrap(); // e.g. a place
         let _cxl = p.try_acquire_as(1).unwrap(); // e.g. a cancel
