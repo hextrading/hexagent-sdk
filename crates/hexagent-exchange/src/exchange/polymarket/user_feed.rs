@@ -5,7 +5,7 @@
 //! but under the hood the WS read loop runs as a tokio task on the shared
 //! async runtime.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +33,7 @@ const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 const FAILED_TRADE_DIAGNOSTIC_CAPACITY: usize = 4096;
+const TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY: usize = 32_768;
 const PERIODIC_GAP_RETRY_MAX_MS: u64 = 30_000;
 const PRIVATE_APPLY_QUEUE_CAPACITY: usize = 1024;
 const GAP_APPLY_BATCH_SIZE: usize = 16;
@@ -94,6 +95,30 @@ fn admit_failed_trade_diagnostic(venue_trade_id: &str) -> bool {
         .admit(venue_trade_id)
 }
 
+fn terminal_gap_replay_cache() -> &'static Mutex<HashMap<String, FailedTradeDiagnosticDedupe>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, FailedTradeDiagnosticDedupe>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn terminal_gap_replay_seen(account_id: &str, key: &str) -> bool {
+    terminal_gap_replay_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(account_id)
+        .is_some_and(|cache| cache.seen.contains(key))
+}
+
+fn remember_terminal_gap_replay(account_id: &str, key: &str) {
+    terminal_gap_replay_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(account_id.to_string())
+        .or_insert_with(|| {
+            FailedTradeDiagnosticDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY)
+        })
+        .admit(key);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapReplayOutcome {
     Complete { records: usize },
@@ -110,6 +135,7 @@ struct GapReplayCheckpoint {
     records: usize,
     pages: usize,
     cursor_resets: usize,
+    terminal_fast_skips: usize,
 }
 
 impl GapReplayCheckpoint {
@@ -121,6 +147,7 @@ impl GapReplayCheckpoint {
             records: 0,
             pages: 0,
             cursor_resets: 0,
+            terminal_fast_skips: 0,
         }
     }
 }
@@ -682,12 +709,6 @@ fn parse_order_event(
         debug!("[PolyUserFeed] probe order lifecycle push muted: oid={order_id}");
         return Ok(Vec::new());
     }
-    let coid = shared.lookup_coid(order_id).ok_or_else(|| {
-        format!("unowned private order lifecycle event for order_id `{order_id}`")
-    })?;
-    let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
-        format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
-    })?;
     let asset_id = required_string(data, &["asset_id", "token_id"], "asset_id")?;
     let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
     let price = strict_number(data.get("price"), "price")?;
@@ -707,6 +728,25 @@ fn parse_order_event(
             "invalid order lifecycle economics order_id={order_id}"
         ));
     }
+    if shared
+        .account_state
+        .retired_order_audit_covers(order_id, original_size, size_matched)
+    {
+        shared.account_state.resolve_private_event_anomaly(&format!(
+            "order:{}",
+            normalize_order_id(order_id)
+        ));
+        debug!(
+            "[PolyUserFeed] retired zero-fill order lifecycle replay ignored: oid={order_id}"
+        );
+        return Ok(Vec::new());
+    }
+    let coid = shared.lookup_coid(order_id).ok_or_else(|| {
+        format!("unowned private order lifecycle event for order_id `{order_id}`")
+    })?;
+    let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+        format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
+    })?;
     if normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
         || ownership.token_id != asset_id
         || ownership.side != side
@@ -931,6 +971,7 @@ fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMa
 
 fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, error: &str) {
     let key = invalid_payload_key(data);
+    let reason = format!("invalid Polymarket private event `{key}`: {error}");
     let event_type = data
         .get("event_type")
         .or_else(|| data.get("type"))
@@ -951,17 +992,23 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
             .map(str::trim)
             .filter(|order_id| !order_id.is_empty())
         {
-            if let Some(coid) = shared.lookup_coid(order_id) {
+            let coid = shared.lookup_coid(order_id);
+            if let Some(coid) = coid.as_deref() {
                 shared
                     .account_state
-                    .begin_order_recovery(std::iter::once(coid.as_str()));
+                    .begin_order_recovery(std::iter::once(coid));
             }
+            shared.account_state.mark_private_order_event_anomaly(
+                order_id,
+                coid.as_deref(),
+                reason,
+            );
+            shared.user_feed_health.set_inventory_uncertain(true);
+            warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
+            return;
         }
     }
-    shared.account_state.mark_private_event_anomaly(
-        &key,
-        format!("invalid Polymarket private event `{key}`: {error}"),
-    );
+    shared.account_state.mark_private_event_anomaly(&key, reason);
     shared.user_feed_health.set_inventory_uncertain(true);
     warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
 }
@@ -1050,6 +1097,64 @@ impl PrivateEventDelta {
             .unwrap_or_default();
         format!("{id}|{status}|{lifecycle}|{timestamp}")
     }
+
+    fn terminal_trade_key(&self) -> Option<String> {
+        let Self::Trade(payload) = self else {
+            return None;
+        };
+        let status = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)?
+            .trim_start_matches("TRADE_STATUS_");
+        let status = match status {
+            "CONFIRMED" | "FAILED" => status,
+            _ => return None,
+        };
+        let trade_id = payload
+            .get("id")
+            .or_else(|| payload.get("trade_id"))
+            .and_then(serde_json::Value::as_str)?
+            .trim();
+        (!trade_id.is_empty()).then(|| format!("{trade_id}|{status}"))
+    }
+}
+
+fn terminal_trade_is_durably_resolved(payload: &serde_json::Value, shared: &SharedState) -> bool {
+    let trade_id = payload
+        .get("id")
+        .or_else(|| payload.get("trade_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|trade_id| !trade_id.is_empty());
+    let Some(trade_id) = trade_id else {
+        return false;
+    };
+    let owned_maker_order_ids: Vec<&str> = payload
+        .get("maker_orders")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|order| {
+            order
+                .get("maker_address")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.eq_ignore_ascii_case(&shared.order_maker_address))
+        })
+        .filter_map(|order| {
+            order
+                .get("order_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|order_id| !order_id.is_empty())
+        })
+        .collect();
+    if !owned_maker_order_ids.is_empty() {
+        return owned_maker_order_ids.iter().all(|order_id| {
+            let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
+            shared.account_state.trade_ownership(&key).is_some()
+        });
+    }
+    shared.account_state.trade_ownership(trade_id).is_some()
 }
 
 enum PrivateApplyCommand {
@@ -1190,6 +1295,11 @@ fn apply_private_batch(
                 .rejection_reason
                 .unwrap_or_else(|| "invalid private business event".to_string()));
         }
+        if let Some(key) = event.terminal_trade_key() {
+            if terminal_trade_is_durably_resolved(event.payload(), shared) {
+                remember_terminal_gap_replay(shared.account_state.account_id(), &key);
+            }
+        }
         for update in parsed.updates {
             dispatch_private_update(shared, update_tx, recovery_generation, update)?;
         }
@@ -1215,7 +1325,10 @@ fn spawn_private_apply_worker(
     let worker = std::thread::Builder::new()
         .name(format!("poly-private-{}", account_id))
         .spawn(move || {
-            crate::os_tune::pin_background("polymarket-private-account-apply");
+            crate::os_tune::pin_private_account_apply(
+                "polymarket-private-account-apply",
+                &account_id,
+            );
             while !shutdown.load(Ordering::Relaxed) {
                 let command = match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(command) => command,
@@ -2031,6 +2144,13 @@ async fn replay_missed_trades_inner(
             let Some(delta) = PrivateEventDelta::classify(rec) else {
                 continue;
             };
+            if delta.terminal_trade_key().is_some_and(|key| {
+                terminal_gap_replay_seen(shared.account_state.account_id(), &key)
+            }) {
+                checkpoint.terminal_fast_skips =
+                    checkpoint.terminal_fast_skips.saturating_add(1);
+                continue;
+            }
             if dedupe.insert(delta.dedupe_key()) {
                 deltas.push(delta);
             }
@@ -2336,13 +2456,14 @@ async fn user_feed_loop(
             Some(recovery_generation),
         )
         .await;
+        let terminal_fast_skips = checkpoint.terminal_fast_skips;
         match replay_result {
             Ok(outcome) => {
                 match outcome {
                     GapReplayOutcome::Complete { records } => {
                         info!(
-                            "[PolyUserFeed] Gap recovery after={} replayed={} trades (complete)",
-                            after_secs, records,
+                            "[PolyUserFeed] Gap recovery after={} replayed={} trades terminal_fast_skips={} (complete)",
+                            after_secs, records, terminal_fast_skips,
                         );
                     }
                 }
@@ -3993,5 +4114,27 @@ mod tests {
             shared.account_state.earliest_unresolved_trade_match_time(),
             None
         );
+    }
+
+    #[test]
+    fn terminal_gap_replay_dedupe_survives_page_and_sweep_boundaries() {
+        let account = format!("terminal-gap-test-{}", std::process::id());
+        let terminal = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "trade",
+            "id": "trade-terminal-dedupe",
+            "status": "CONFIRMED"
+        }))
+        .unwrap();
+        let key = terminal.terminal_trade_key().unwrap();
+        assert!(!terminal_gap_replay_seen(&account, &key));
+        remember_terminal_gap_replay(&account, &key);
+        assert!(terminal_gap_replay_seen(&account, &key));
+        let advancing = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "trade",
+            "id": "trade-terminal-dedupe",
+            "status": "FAILED"
+        }))
+        .unwrap();
+        assert_ne!(advancing.terminal_trade_key().unwrap(), key);
     }
 }

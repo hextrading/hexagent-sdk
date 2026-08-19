@@ -1602,6 +1602,61 @@ struct QueuedOrderUpdate {
     enqueued_at: std::time::Instant,
 }
 
+#[derive(Debug, Default)]
+struct StrategyCallbackLatencyBucket {
+    queue_samples: u64,
+    queue_total_us: u128,
+    queue_max_us: u64,
+    callback_samples: u64,
+    callback_total_us: u128,
+    callback_max_us: u64,
+}
+
+impl StrategyCallbackLatencyBucket {
+    fn record_queue(&mut self, elapsed_us: u64) {
+        self.queue_samples = self.queue_samples.saturating_add(1);
+        self.queue_total_us = self.queue_total_us.saturating_add(elapsed_us as u128);
+        self.queue_max_us = self.queue_max_us.max(elapsed_us);
+    }
+
+    fn record_callback(&mut self, elapsed: std::time::Duration) {
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.callback_samples = self.callback_samples.saturating_add(1);
+        self.callback_total_us = self.callback_total_us.saturating_add(elapsed_us as u128);
+        self.callback_max_us = self.callback_max_us.max(elapsed_us);
+    }
+}
+
+fn market_event_metric_kind(event: &MarketEvent) -> &'static str {
+    match event {
+        MarketEvent::OrderBook(book) => match book.exchange {
+            Exchange::Binance => "orderbook_binance",
+            Exchange::Polymarket => "orderbook_polymarket",
+            _ => "orderbook_other",
+        },
+        MarketEvent::Trade(trade) => match trade.exchange {
+            Exchange::Binance => "trade_binance",
+            Exchange::Polymarket => "trade_polymarket",
+            _ => "trade_other",
+        },
+        MarketEvent::Quote(quote) => match quote.exchange {
+            Exchange::Binance => "quote_binance",
+            Exchange::Polymarket => "quote_polymarket",
+            _ => "quote_other",
+        },
+        MarketEvent::Bar(_) => "bar",
+        MarketEvent::SpotPrice(_) => "spot_price",
+        MarketEvent::AssetCtx(_) => "asset_ctx",
+        MarketEvent::Instrument(_) => "instrument",
+        MarketEvent::Connected { .. } => "connected",
+        MarketEvent::Disconnected { .. } => "disconnected",
+        MarketEvent::MarketDataHealth(_) => "market_health",
+        MarketEvent::TickSizeChange(_) => "tick_size",
+        MarketEvent::EventStart { .. } => "event_start",
+        MarketEvent::Exit => "exit",
+    }
+}
+
 fn quarantine_strategy_worker(
     idx: usize,
     reason: &str,
@@ -6232,6 +6287,7 @@ impl Engine {
         let mut queue_samples = 0u64;
         let mut queue_total_us = 0u128;
         let mut queue_max_us = 0u64;
+        let mut callback_metrics = HashMap::<&'static str, StrategyCallbackLatencyBucket>::new();
         let mut update_queue_window_started = std::time::Instant::now();
         let mut update_queue_samples = 0u64;
         let mut update_queue_total_us = 0u128;
@@ -6288,12 +6344,17 @@ impl Engine {
                             update_queue_total_us = 0;
                             update_queue_max_us = 0;
                         }
+                        let callback_started = std::time::Instant::now();
                         let signals = strategy.on_order_update(&queued.update);
                         if !shutdown_started {
                             for sig in signals {
                                 if !emit(sig) { return; }
                             }
                         }
+                        callback_metrics
+                            .entry("private_order_update")
+                            .or_default()
+                            .record_callback(callback_started.elapsed());
                     }
                     Err(_) => break,
                 },
@@ -6301,9 +6362,14 @@ impl Engine {
                     if quarantined.load(Ordering::Acquire) { return; }
                     heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                     if shutdown_started { continue; }
+                    let callback_started = std::time::Instant::now();
                     for sig in strategy.on_watchdog(crate::types::now_ns()) {
                         if !emit(sig) { return; }
                     }
+                    callback_metrics
+                        .entry("watchdog")
+                        .or_default()
+                        .record_callback(callback_started.elapsed());
                 },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) => {
@@ -6324,31 +6390,16 @@ impl Engine {
                         if shutdown_started { continue; }
                         let queue_last_us = queued.enqueued_at.elapsed().as_micros()
                             .min(u64::MAX as u128) as u64;
+                        let event_kind = market_event_metric_kind(queued.event.as_ref());
                         queue_samples = queue_samples.saturating_add(1);
                         queue_total_us = queue_total_us.saturating_add(queue_last_us as u128);
                         queue_max_us = queue_max_us.max(queue_last_us);
-                        if queue_window_started.elapsed() >= std::time::Duration::from_secs(30) {
-                            let avg_us = if queue_samples == 0 {
-                                0.0
-                            } else {
-                                queue_total_us as f64 / queue_samples as f64
-                            };
-                            info!(
-                                "[market_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} latest_replaced={}",
-                                instance_id,
-                                queue_samples,
-                                queue_last_us,
-                                avg_us,
-                                queue_max_us,
-                                market_rx.len(),
-                                latest_market.replacements.swap(0, Ordering::Relaxed),
-                            );
-                            queue_window_started = std::time::Instant::now();
-                            queue_samples = 0;
-                            queue_total_us = 0;
-                            queue_max_us = 0;
-                        }
+                        callback_metrics
+                            .entry(event_kind)
+                            .or_default()
+                            .record_queue(queue_last_us);
                         let event = queued.event;
+                        let callback_started = std::time::Instant::now();
                         let signals = match event.as_ref() {
                             MarketEvent::OrderBook(ob) => { strategy.on_orderbook(ob); Vec::new() }
                             MarketEvent::Trade(t) => { strategy.on_trade_tick(t); Vec::new() }
@@ -6414,6 +6465,54 @@ impl Engine {
                         }
                         for sig in signals {
                             if !emit(sig) { return; }
+                        }
+                        callback_metrics
+                            .entry(event_kind)
+                            .or_default()
+                            .record_callback(callback_started.elapsed());
+                        if queue_window_started.elapsed() >= std::time::Duration::from_secs(30) {
+                            let avg_us = if queue_samples == 0 {
+                                0.0
+                            } else {
+                                queue_total_us as f64 / queue_samples as f64
+                            };
+                            info!(
+                                "[market_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} latest_replaced={}",
+                                instance_id,
+                                queue_samples,
+                                queue_last_us,
+                                avg_us,
+                                queue_max_us,
+                                market_rx.len(),
+                                latest_market.replacements.swap(0, Ordering::Relaxed),
+                            );
+                            let mut kinds = callback_metrics.keys().copied().collect::<Vec<_>>();
+                            kinds.sort_unstable();
+                            for kind in kinds {
+                                let Some(metric) = callback_metrics.get(kind) else {
+                                    continue;
+                                };
+                                let queue_avg_us = metric.queue_total_us as f64
+                                    / metric.queue_samples.max(1) as f64;
+                                let callback_avg_us = metric.callback_total_us as f64
+                                    / metric.callback_samples.max(1) as f64;
+                                info!(
+                                    "[strategy_event_metric] instance={} kind={} queue_samples={} queue_avg_us={:.1} queue_max_us={} callback_samples={} callback_avg_us={:.1} callback_max_us={}",
+                                    instance_id,
+                                    kind,
+                                    metric.queue_samples,
+                                    queue_avg_us,
+                                    metric.queue_max_us,
+                                    metric.callback_samples,
+                                    callback_avg_us,
+                                    metric.callback_max_us,
+                                );
+                            }
+                            callback_metrics.clear();
+                            queue_window_started = std::time::Instant::now();
+                            queue_samples = 0;
+                            queue_total_us = 0;
+                            queue_max_us = 0;
                         }
                     }
                     Err(_) => break,
@@ -7766,6 +7865,18 @@ impl Engine {
             shared
                 .account_state
                 .reconcile_configured_instances(&configured_instances);
+            let orphan_repair = PolymarketTrade::from_shared(shared.clone(), "", "")
+                .reconcile_persisted_orphan_order_anomalies();
+            if orphan_repair.examined > 0 {
+                info!(
+                    "[Engine] Polymarket account={} startup orphan ownership audit examined={} rebuilt={} tombstoned={} unresolved={}",
+                    account_id,
+                    orphan_repair.examined,
+                    orphan_repair.rebuilt,
+                    orphan_repair.tombstoned,
+                    orphan_repair.unresolved,
+                );
+            }
             let startup_query_repairs = shared
                 .account_state
                 .startup_query_repair_pending_order_ids();
@@ -7960,7 +8071,43 @@ impl Engine {
                     let mut delivered_audit_fingerprints = HashMap::<String, String>::new();
                     let mut completed_recoveries = 0u64;
                     let mut completion_log_started = std::time::Instant::now();
+                    let mut orphan_audit_started = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(30))
+                        .unwrap_or_else(std::time::Instant::now);
                     while !recovery_shutdown.load(Ordering::Relaxed) {
+                        if orphan_audit_started.elapsed()
+                            >= std::time::Duration::from_secs(30)
+                        {
+                            let orphan_count = recovery_shared
+                                .account_state
+                                .persisted_orphan_order_anomalies()
+                                .len();
+                            if orphan_count > 0 {
+                                let recovery = PolymarketTrade::from_shared(
+                                    recovery_shared.clone(),
+                                    "",
+                                    "",
+                                );
+                                let repaired =
+                                    recovery.reconcile_persisted_orphan_order_anomalies();
+                                if repaired.rebuilt > 0 || repaired.tombstoned > 0 {
+                                    info!(
+                                        "[Engine] Polymarket account={} background orphan ownership audit rebuilt={} tombstoned={} unresolved={}",
+                                        recovery_account_id,
+                                        repaired.rebuilt,
+                                        repaired.tombstoned,
+                                        repaired.unresolved,
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "[Engine] Polymarket account={} background orphan ownership audit unchanged={} ",
+                                        recovery_account_id,
+                                        repaired.unresolved,
+                                    );
+                                }
+                            }
+                            orphan_audit_started = std::time::Instant::now();
+                        }
                         let before = recovery_shared.account_state.monitoring_snapshot();
                         let pending = before
                             .recovery_pending_orders
