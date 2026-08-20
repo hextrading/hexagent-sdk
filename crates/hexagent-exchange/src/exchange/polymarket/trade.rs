@@ -2081,6 +2081,19 @@ impl SharedState {
     }
 
     pub(crate) fn request_settled_gc(&self) {
+        if !self.account_state.has_settled_gc_candidates() {
+            return;
+        }
+        let _ = self.settled_gc_tx.try_send(());
+    }
+
+    pub(crate) fn request_settled_gc_for_token(&self, token_id: &str) {
+        if !self
+            .account_state
+            .has_settled_gc_candidate_for_token(token_id)
+        {
+            return;
+        }
         let _ = self.settled_gc_tx.try_send(());
     }
 
@@ -2350,6 +2363,30 @@ impl SharedState {
             }
             _ => {}
         }
+        let slow_threshold_ns = if matches!(stage, "http_response" | "cancel_response") {
+            250_000_000
+        } else {
+            5_000_000
+        };
+        let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
+        let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
+        let normal_info = !warning
+            && !slow
+            && matches!(stage, "http_response" | "cancel_response");
+        let enabled = if warning || slow {
+            log::log_enabled!(log::Level::Warn)
+        } else if normal_info {
+            log::log_enabled!(log::Level::Info)
+        } else {
+            log::log_enabled!(log::Level::Debug)
+        };
+        if !enabled {
+            // The timestamp/segment metric above is the hot-path contract.
+            // Avoid cloning every string in the trace merely to discover that
+            // the ordinary signed/reserved lifecycle line is debug-disabled.
+            drop(traces);
+            return;
+        }
         let trace = traces.get(client_order_id).cloned();
         drop(traces);
         let (
@@ -2383,26 +2420,6 @@ impl SharedState {
                 0,
             ),
         };
-        let slow_threshold_ns = if matches!(stage, "http_response" | "cancel_response") {
-            250_000_000
-        } else {
-            5_000_000
-        };
-        let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
-        let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
-        let normal_info = !warning
-            && !slow
-            && matches!(stage, "http_response" | "cancel_response");
-        let enabled = if warning || slow {
-            log::log_enabled!(log::Level::Warn)
-        } else if normal_info {
-            log::log_enabled!(log::Level::Info)
-        } else {
-            log::log_enabled!(log::Level::Debug)
-        };
-        if !enabled {
-            return;
-        }
         let message = format!(
             "[order_lifecycle] stage={} coid={} oid={} trade_id={} status={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} segment={} segment_ms={:.3} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3} reason_code={} reason={}",
             stage,
@@ -2696,6 +2713,10 @@ impl SharedState {
     /// release a residual reservation: FAK/partially matched orders can be
     /// terminal with `size_matched < original quantity`.
     fn remove_order_resolved_as(&self, client_order_id: &str, status: OrderStatus) {
+        let terminal_token = self
+            .account_state
+            .order(client_order_id)
+            .map(|order| order.token_id);
         self.open_orders.lock().unwrap().remove(client_order_id);
         self.account_state.release_order(client_order_id, status);
         self.account_state.finish_order_recovery(client_order_id);
@@ -2725,8 +2746,12 @@ impl SharedState {
                 u8::from(active_count > 0), active_count, client_order_id,
             );
         }
-        // Never scan account-wide history on this HTTP/reconcile completion.
-        self.request_settled_gc();
+        // Never scan account-wide history on this HTTP/reconcile completion,
+        // and do not wake an old event's blocked GC for an unrelated active
+        // market cancel.
+        if let Some(token_id) = terminal_token {
+            self.request_settled_gc_for_token(&token_id);
+        }
     }
 
     pub(crate) fn complete_filled_order_audit(&self, client_order_id: &str) {
@@ -3737,6 +3762,9 @@ impl PolymarketTrade {
                 filled_cleanup_tx,
             });
         SharedState::spawn_settled_gc_worker(&shared, settled_gc_rx);
+        // Resume a durable zero-reference cleanup request without waiting for
+        // an unrelated private trade to provide the first wake after restart.
+        shared.request_settled_gc();
         SharedState::spawn_filled_cleanup_worker(&shared, filled_cleanup_rx);
         Ok(Self {
             shared,

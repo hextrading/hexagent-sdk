@@ -7,12 +7,17 @@
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
 use log::debug;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::types::{now_ns, OrderUpdate, Side};
 use hexagent_account::account::shared_account::RestoredTrade;
+
+/// Startup replay can precede strategy construction (prediction/APV2 warmup
+/// is deliberately synchronous). Keep that race bounded without reconnecting
+/// a healthy private socket merely because no strategy consumer exists yet.
+const STARTUP_RECOVERY_BUFFER_CAPACITY: usize = 4_096;
 
 // ════════════════════════════════════════════════════════════════
 // User-feed health (narrow cross-thread handle)
@@ -49,6 +54,8 @@ pub struct UserFeedHealth {
     gap_replay_degraded: AtomicBool,
     last_transport_activity_ns: AtomicU64,
     last_valid_business_event_ns: AtomicU64,
+    strategy_consumer_ready_fast: AtomicBool,
+    strategy_consumer_ready_notify: tokio::sync::Notify,
     recovery_delivery: Mutex<RecoveryDeliveryState>,
 }
 
@@ -84,6 +91,7 @@ struct RecoveryDeliveryState {
     generation: u64,
     enrolling: bool,
     pending: HashMap<RecoveryUpdateKey, usize>,
+    startup_buffer: VecDeque<(u64, OrderUpdate)>,
 }
 
 /// Completion token held across one strategy `on_order_update` call. It only
@@ -117,6 +125,8 @@ impl UserFeedHealth {
             gap_replay_degraded: AtomicBool::new(false),
             last_transport_activity_ns: AtomicU64::new(0),
             last_valid_business_event_ns: AtomicU64::new(0),
+            strategy_consumer_ready_fast: AtomicBool::new(false),
+            strategy_consumer_ready_notify: tokio::sync::Notify::new(),
             recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
         }
     }
@@ -182,6 +192,7 @@ impl UserFeedHealth {
         delivery.generation = delivery.generation.wrapping_add(1).max(1);
         delivery.enrolling = true;
         delivery.pending.clear();
+        delivery.startup_buffer.clear();
         delivery.generation
     }
 
@@ -190,7 +201,7 @@ impl UserFeedHealth {
         generation: u64,
         instance_id: &str,
         update: &OrderUpdate,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if instance_id.trim().is_empty() {
             return Err(format!(
                 "recovery update coid={} has no owning instance",
@@ -204,11 +215,67 @@ impl UserFeedHealth {
                 generation,
             ));
         }
+        // `mark_strategy_consumer_ready` publishes while holding this same
+        // mutex, so an update is either wholly buffered before the edge or
+        // wholly sent after it; the startup drain cannot miss the race.
+        let buffer_update = !self.strategy_consumer_ready_fast.load(Ordering::Acquire);
+        if buffer_update && delivery.startup_buffer.len() >= STARTUP_RECOVERY_BUFFER_CAPACITY {
+            return Err(format!(
+                "startup recovery buffer is full ({STARTUP_RECOVERY_BUFFER_CAPACITY} updates)",
+            ));
+        }
         *delivery
             .pending
             .entry(RecoveryUpdateKey::new(instance_id, update))
             .or_insert(0) += 1;
-        Ok(())
+        if buffer_update {
+            delivery
+                .startup_buffer
+                .push_back((generation, update.clone()));
+        }
+        Ok(buffer_update)
+    }
+
+    /// Publish the engine's order-update consumer after strategy construction.
+    /// Buffered updates are drained by the user-feed recovery task, preserving
+    /// its single enrollment/delivery ordering.
+    pub fn mark_strategy_consumer_ready(&self) {
+        let _delivery = self.recovery_delivery.lock().unwrap();
+        self.strategy_consumer_ready_fast
+            .store(true, Ordering::Release);
+        self.strategy_consumer_ready_notify.notify_one();
+    }
+
+    pub fn strategy_consumer_ready(&self) -> bool {
+        self.strategy_consumer_ready_fast.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_strategy_consumer_ready(&self) {
+        while !self.strategy_consumer_ready() {
+            self.strategy_consumer_ready_notify.notified().await;
+        }
+    }
+
+    pub fn take_startup_recovery_updates(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<OrderUpdate>, String> {
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        if delivery.generation != generation {
+            return Err(format!(
+                "recovery delivery generation {generation} was superseded",
+            ));
+        }
+        if !self.strategy_consumer_ready_fast.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        let mut updates = Vec::with_capacity(delivery.startup_buffer.len());
+        while let Some((buffered_generation, update)) = delivery.startup_buffer.pop_front() {
+            if buffered_generation == generation {
+                updates.push(update);
+            }
+        }
+        Ok(updates)
     }
 
     pub fn finish_recovery_delivery_enrollment(&self, generation: u64) -> bool {
@@ -644,6 +711,32 @@ mod user_feed_health_tests {
         assert_eq!(h.recovery_delivery_progress(generation), Some((true, 1)));
         assert!(h.acknowledge_recovery_update("btc01", &update));
         assert_eq!(h.recovery_delivery_progress(generation), Some((true, 0)));
+    }
+
+    #[test]
+    fn startup_recovery_is_buffered_until_strategy_consumer_is_ready() {
+        let h = UserFeedHealth::new();
+        let generation = h.begin_recovery_delivery();
+        let update = recovery_update("btc01-buffered");
+        assert!(h
+            .register_recovery_update(generation, "btc01", &update)
+            .unwrap());
+        assert!(h
+            .take_startup_recovery_updates(generation)
+            .unwrap()
+            .is_empty());
+        h.mark_strategy_consumer_ready();
+        assert!(h.strategy_consumer_ready());
+        assert_eq!(
+            h.take_startup_recovery_updates(generation)
+                .unwrap()
+                .len(),
+            1,
+        );
+        assert!(h
+            .take_startup_recovery_updates(generation)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

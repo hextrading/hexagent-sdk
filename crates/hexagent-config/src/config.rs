@@ -1193,10 +1193,11 @@ pub struct ExchangeConfig {
     /// timeouts didn't justify the configuration surface area.
     #[serde(default = "default_http_timeout_ms")]
     pub http_timeout_ms: u64,
-    /// Polymarket-only — user-feed periodic gap-replay cadence (ms). Every
-    /// interval the feed re-fetches recent `/trades` for the active market to
-    /// recover any WS-dropped fills. Sub-second values are honoured. Default
-    /// 2000 ms. See `exchange::polymarket::user_feed`.
+    /// Polymarket-only — fast/recovery gap-replay cadence (ms). The healthy
+    /// feed adapts this to at least 10 s after recent private activity and
+    /// 30 s while idle; reconnect recovery still runs immediately and failed
+    /// periodic sweeps retry from this configured base. Default 2000 ms. See
+    /// `exchange::polymarket::user_feed`.
     #[serde(default = "default_gap_replay_interval_ms")]
     pub gap_replay_interval_ms: u64,
     /// Polymarket-only — how far back (ms) the *periodic* gap-replay rewinds
