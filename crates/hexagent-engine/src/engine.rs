@@ -7869,12 +7869,13 @@ impl Engine {
                 .reconcile_persisted_orphan_order_anomalies();
             if orphan_repair.examined > 0 {
                 info!(
-                    "[Engine] Polymarket account={} startup orphan ownership audit examined={} rebuilt={} tombstoned={} unresolved={}",
+                    "[Engine] Polymarket account={} startup orphan ownership audit examined={} rebuilt={} tombstoned={} unresolved={} failures={:?}",
                     account_id,
                     orphan_repair.examined,
                     orphan_repair.rebuilt,
                     orphan_repair.tombstoned,
                     orphan_repair.unresolved,
+                    orphan_repair.failures,
                 );
             }
             let startup_query_repairs = shared
@@ -8092,17 +8093,19 @@ impl Engine {
                                     recovery.reconcile_persisted_orphan_order_anomalies();
                                 if repaired.rebuilt > 0 || repaired.tombstoned > 0 {
                                     info!(
-                                        "[Engine] Polymarket account={} background orphan ownership audit rebuilt={} tombstoned={} unresolved={}",
+                                        "[Engine] Polymarket account={} background orphan ownership audit rebuilt={} tombstoned={} unresolved={} failures={:?}",
                                         recovery_account_id,
                                         repaired.rebuilt,
                                         repaired.tombstoned,
                                         repaired.unresolved,
+                                        repaired.failures,
                                     );
                                 } else {
                                     log::debug!(
-                                        "[Engine] Polymarket account={} background orphan ownership audit unchanged={} ",
+                                        "[Engine] Polymarket account={} background orphan ownership audit unchanged={} failures={:?}",
                                         recovery_account_id,
                                         repaired.unresolved,
+                                        repaired.failures,
                                     );
                                 }
                             }

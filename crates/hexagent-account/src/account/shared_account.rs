@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -385,6 +385,10 @@ pub struct PersistedOrphanOrderAnomaly {
     pub anomaly_key: String,
     pub order_id: String,
     pub client_order_id: Option<String>,
+    /// Asset identity retained from the rejected authenticated lifecycle row.
+    /// This allows startup repair to use the durable event-settlement audit
+    /// even after the original order/route rows have disappeared.
+    pub token_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1015,6 +1019,13 @@ struct RetiredOrderAuditTombstone {
     client_order_id: Option<String>,
     status: OrderStatus,
     original_size: f64,
+    /// Historical order lookups can return authoritative not-found after the
+    /// exchange has compacted the row.  When a complete authenticated trade
+    /// sweep plus event-settlement proof shows that the oid never filled, the
+    /// original size is no longer recoverable. Such a tombstone covers any
+    /// later zero-fill lifecycle size, but never a matched lifecycle.
+    #[serde(default)]
+    covers_any_zero_fill_size: bool,
     size_matched: f64,
     #[serde(default)]
     associate_trades: Vec<String>,
@@ -1029,6 +1040,8 @@ struct OrphanOrderAnomalyHint {
     order_id: String,
     #[serde(default)]
     client_order_id: Option<String>,
+    #[serde(default)]
+    token_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -2163,6 +2176,10 @@ pub struct SharedAccount {
     admission_fast: AtomicBool,
     passive_admission_fast: AtomicBool,
     ledger_generation_fast: AtomicU64,
+    /// Cached after startup and every settled-history GC transaction. Reading
+    /// monitoring data must not walk tens of thousands of tombstones while
+    /// holding the account-wide control/state lock.
+    retired_trade_tombstone_count_fast: AtomicUsize,
     persistence: Option<AccountPersistence>,
     /// Highest account-persistence generation containing a trade mutation.
     /// Trade ingestion never waits for this generation: subsequent admission
@@ -2268,6 +2285,7 @@ impl SharedAccount {
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
             ledger_generation_fast: AtomicU64::new(0),
+            retired_trade_tombstone_count_fast: AtomicUsize::new(0),
             persistence: None,
             trade_persistence_pending_generation: AtomicU64::new(0),
             trade_persistence_blocker_active: AtomicBool::new(false),
@@ -2517,6 +2535,11 @@ impl SharedAccount {
             }
             (SharedAccountState::default(), 0)
         };
+        let initial_retired_trade_tombstones = state
+            .retired_trade_ownership_tombstones
+            .values()
+            .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
+            .count();
         let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
@@ -2541,6 +2564,9 @@ impl SharedAccount {
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
             ledger_generation_fast: AtomicU64::new(0),
+            retired_trade_tombstone_count_fast: AtomicUsize::new(
+                initial_retired_trade_tombstones,
+            ),
             persistence: Some(persistence),
             trade_persistence_pending_generation: AtomicU64::new(0),
             trade_persistence_blocker_active: AtomicBool::new(false),
@@ -4520,6 +4546,10 @@ impl SharedAccount {
             retired_conditions.push(condition_id);
             retired.push(tokens);
         }
+        self.retired_trade_tombstone_count_fast.store(
+            state.retired_trade_ownership_tombstones.len(),
+            Ordering::Relaxed,
+        );
         self.schedule_settled_prune_persist(&state, &outcomes, &retired_conditions);
         retired
     }
@@ -5386,11 +5416,9 @@ impl SharedAccount {
                 .count(),
             recovery_pending_orders: state.recovery_pending_orders.len(),
             routine_cancel_audits: state.routine_cancel_audits.len(),
-            retired_trade_ownership_tombstones: state
-                .retired_trade_ownership_tombstones
-                .values()
-                .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
-                .count(),
+            retired_trade_ownership_tombstones: self
+                .retired_trade_tombstone_count_fast
+                .load(Ordering::Relaxed),
             verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
             persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
             persistence_error,
@@ -5906,6 +5934,24 @@ impl SharedAccount {
         client_order_id: Option<&str>,
         reason: impl Into<String>,
     ) {
+        self.mark_private_order_event_anomaly_with_token(
+            order_id,
+            client_order_id,
+            None,
+            reason,
+        );
+    }
+
+    /// Structured variant used by the private feed. Keeping the authenticated
+    /// asset id makes event settlement an order-independent startup-repair
+    /// authority if the CLOB later compacts the oid lookup row.
+    pub fn mark_private_order_event_anomaly_with_token(
+        &self,
+        order_id: &str,
+        client_order_id: Option<&str>,
+        token_id: Option<&str>,
+        reason: impl Into<String>,
+    ) {
         let normalized = normalize_order_id(order_id);
         if normalized.is_empty() {
             return;
@@ -5925,6 +5971,10 @@ impl SharedAccount {
                 client_order_id: client_order_id
                     .map(str::trim)
                     .filter(|coid| !coid.is_empty())
+                    .map(str::to_string),
+                token_id: token_id
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
                     .map(str::to_string),
             },
         );
@@ -5963,6 +6013,7 @@ impl SharedAccount {
                     .map(|hint| hint.order_id.clone())
                     .unwrap_or_else(|| order_id.trim().to_string()),
                 client_order_id,
+                token_id: hint.and_then(|hint| hint.token_id.clone()),
             });
         }
         anomalies.sort_by(|left, right| {
@@ -6017,6 +6068,7 @@ impl SharedAccount {
                     .map(str::to_string),
                 status,
                 original_size,
+                covers_any_zero_fill_size: false,
                 size_matched,
                 associate_trades: Vec::new(),
                 evidence: evidence.to_string(),
@@ -6029,6 +6081,61 @@ impl SharedAccount {
         });
         state.orphan_order_anomaly_hints.remove(&normalized);
         recompute_reconciliation(&mut state, "authenticated terminal orphan order audit");
+        self.schedule_persist(&state);
+        true
+    }
+
+    /// Retire a compacted historical oid after callers have independently
+    /// proved both sides of the absence: the authenticated order lookup is
+    /// not-found and a complete account trade/event-settlement audit contains
+    /// no fill for this oid. Unlike the ordinary tombstone, original quantity
+    /// is intentionally unknown; the replay guard therefore covers only
+    /// zero-fill lifecycle rows.
+    pub fn record_authoritative_absent_orphan_order_audit(
+        &self,
+        order_id: &str,
+        client_order_id: Option<&str>,
+        evidence: &str,
+    ) -> bool {
+        let normalized = normalize_order_id(order_id);
+        if normalized.is_empty() || evidence.trim().is_empty() {
+            return false;
+        }
+        let _transition = self.private_anomaly_transition.lock().unwrap();
+        let mut state = self.lock_state();
+        if state
+            .orders
+            .values()
+            .any(|order| normalize_order_id(&order.order_id) == normalized)
+        {
+            return false;
+        }
+        state.retired_order_audit_tombstones.insert(
+            normalized.clone(),
+            RetiredOrderAuditTombstone {
+                order_id: normalized.clone(),
+                client_order_id: client_order_id
+                    .map(str::trim)
+                    .filter(|coid| !coid.is_empty())
+                    .map(str::to_string),
+                status: OrderStatus::Cancelled,
+                original_size: 0.0,
+                covers_any_zero_fill_size: true,
+                size_matched: 0.0,
+                associate_trades: Vec::new(),
+                evidence: evidence.to_string(),
+                audited_at_ms: wall_clock_ms(),
+            },
+        );
+        state.ownership_anomalies.retain(|key, _| {
+            key.strip_prefix("private_event:order:")
+                .is_none_or(|order_id| normalize_order_id(order_id) != normalized)
+        });
+        state.orphan_order_anomaly_hints.remove(&normalized);
+        recompute_reconciliation(
+            &mut state,
+            "authenticated absent historical orphan order audit",
+        );
         self.schedule_persist(&state);
         true
     }
@@ -6048,8 +6155,9 @@ impl SharedAccount {
             .retired_order_audit_tombstones
             .get(&normalized)
             .is_some_and(|audit| {
-                (audit.original_size - original_size).abs()
-                    <= 1e-9_f64.max(audit.original_size.abs().max(original_size.abs()) * 1e-8)
+                (audit.covers_any_zero_fill_size
+                    || (audit.original_size - original_size).abs()
+                        <= 1e-9_f64.max(audit.original_size.abs().max(original_size.abs()) * 1e-8))
                     && size_matched.abs() <= 1e-9
                     && audit.size_matched.abs() <= 1e-9
             })
@@ -7700,6 +7808,10 @@ impl SharedAccount {
             },
         );
         prune_retired_trade_ownership_tombstones(&mut state, retired_at_ms);
+        self.retired_trade_tombstone_count_fast.store(
+            state.retired_trade_ownership_tombstones.len(),
+            Ordering::Relaxed,
+        );
         let was_uncertain = state.uncertain;
         state.ownership_anomalies.remove(&anomaly_key);
         state.unresolved_trade_match_times.remove(trade_key);
@@ -9117,6 +9229,10 @@ impl SharedAccount {
         }
         let mut state = self.lock_state();
         let outcome = prune_terminal_history_locked(&mut state, instance_id, tokens);
+        self.retired_trade_tombstone_count_fast.store(
+            state.retired_trade_ownership_tombstones.len(),
+            Ordering::Relaxed,
+        );
         let pruned_orders = outcome.orders.len();
         let pruned_trades = outcome.trades.len();
         if !outcome.is_empty() {
@@ -11338,6 +11454,10 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 .client_order_id
                 .as_deref()
                 .is_some_and(|coid| coid.trim().is_empty())
+            || hint
+                .token_id
+                .as_deref()
+                .is_some_and(|token| token.trim().is_empty())
             || !state.ownership_anomalies.keys().any(|key| {
                 key.strip_prefix("private_event:order:")
                     .is_some_and(|candidate| normalize_order_id(candidate) == *order_id)
@@ -11353,7 +11473,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || normalize_order_id(&audit.order_id) != *order_id
             || !matches!(audit.status, OrderStatus::Cancelled | OrderStatus::Rejected)
             || !audit.original_size.is_finite()
-            || audit.original_size <= 0.0
+            || (!audit.covers_any_zero_fill_size && audit.original_size <= 0.0)
+            || (audit.covers_any_zero_fill_size && audit.original_size.abs() > EPS)
             || !audit.size_matched.is_finite()
             || audit.size_matched.abs() > EPS
             || !audit.associate_trades.is_empty()
@@ -16744,6 +16865,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 anomaly_key: "private_event:order:ABCDEF".to_string(),
                 order_id: "ABCDEF".to_string(),
                 client_order_id: Some("a-123".to_string()),
+                token_id: None,
             }],
         );
         assert!(account.record_terminal_orphan_order_audit(
@@ -16788,6 +16910,29 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn authoritative_absent_orphan_tombstone_covers_only_zero_fill_replay() {
+        let account = seeded_account();
+        account.mark_private_order_event_anomaly_with_token(
+            "0xCOMPACTED",
+            Some("a-1700000000000"),
+            Some("TOKEN"),
+            "historical route without ledger row",
+        );
+        assert_eq!(
+            account.persisted_orphan_order_anomalies()[0].token_id.as_deref(),
+            Some("TOKEN"),
+        );
+        assert!(account.record_authoritative_absent_orphan_order_audit(
+            "compacted",
+            Some("a-1700000000000"),
+            "authenticated order not-found; complete trades audit; event settled",
+        ));
+        assert!(account.retired_order_audit_covers("0xCOMPACTED", 37.5, 0.0));
+        assert!(!account.retired_order_audit_covers("0xCOMPACTED", 37.5, 0.1));
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
     fn orphan_order_hint_and_terminal_audit_survive_restart() {
         let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
@@ -16812,6 +16957,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                     anomaly_key: "private_event:order:durable".to_string(),
                     order_id: "0xDURABLE".to_string(),
                     client_order_id: Some("maker-42".to_string()),
+                    token_id: None,
                 }],
             );
             assert!(account.record_terminal_orphan_order_audit(

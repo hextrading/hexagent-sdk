@@ -3,7 +3,7 @@
 //! Implements `ExchangeTrade` for submitting and canceling orders via the
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -156,12 +156,106 @@ pub struct MarketCancelFinality {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OrphanOrderRepairFailure {
+    LookupTimeout,
+    LookupTransport,
+    LookupHttp,
+    LookupInvalidResponse,
+    MissingClientOrderId,
+    MissingHistoricalTimestamp,
+    TradeAuditUnavailable,
+    TradeAuditIncomplete,
+    TradeAuditFoundFill,
+    EventNotSettled,
+    MissingRebuildIdentity,
+    MakerMismatch,
+    UnknownInstance,
+    InvalidOriginalSize,
+    OwnershipBackfillRejected,
+    NonTerminalOrder,
+    TerminalOrderHasFills,
+    TombstoneRejected,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrphanOrderStartupRepair {
     pub examined: usize,
     pub rebuilt: usize,
     pub tombstoned: usize,
     pub unresolved: usize,
+    pub failures: BTreeMap<OrphanOrderRepairFailure, usize>,
+}
+
+impl OrphanOrderStartupRepair {
+    fn unresolved(&mut self, failure: OrphanOrderRepairFailure) {
+        self.unresolved = self.unresolved.saturating_add(1);
+        *self.failures.entry(failure).or_default() += 1;
+    }
+}
+
+const ORPHAN_TRADE_AUDIT_MAX_PAGES: usize = 64;
+const ORPHAN_TRADE_AUDIT_REWIND_SECS: u64 = 300;
+const LEGACY_ORPHAN_COMPACTION_FINALITY_MS: u64 = 6 * 60 * 60 * 1_000;
+
+#[derive(Debug)]
+enum HistoricalOrderTradeAudit {
+    CompleteNoFill { pages: usize, after_secs: u64 },
+    FoundFill { records: usize },
+    Incomplete { pages: usize },
+    Unavailable(String),
+}
+
+fn coid_wall_clock_ms(coid: &str) -> Option<u64> {
+    let value = coid.rsplit('-').next()?.parse::<u64>().ok()?;
+    // Millisecond ids have been used since the first durable ledger format.
+    // Bounds reject sequence suffixes and corrupt/future timestamps.
+    let now_ms = now_ns() / 1_000_000;
+    (value >= 1_500_000_000_000 && value <= now_ms.saturating_add(60_000)).then_some(value)
+}
+
+fn trade_record_references_order(record: &serde_json::Value, order_id: &str) -> bool {
+    let expected = normalize_order_id(order_id);
+    let same = |candidate: &str| normalize_order_id(candidate) == expected;
+    record
+        .get("taker_order_id")
+        .or_else(|| record.get("order_id"))
+        .or_else(|| record.get("orderID"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(same)
+        || record
+            .get("maker_orders")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|orders| {
+                orders.iter().any(|order| {
+                    order
+                        .get("order_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(same)
+                })
+            })
+}
+
+fn authenticated_trade_page(
+    json: serde_json::Value,
+) -> Result<(Vec<serde_json::Value>, String), String> {
+    if let Some(records) = json.as_array() {
+        return Ok((records.clone(), String::new()));
+    }
+    let Some(object) = json.as_object() else {
+        return Err("response is neither an array nor an object".to_string());
+    };
+    let records = object
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| "response object has no array `data`".to_string())?;
+    let next = match object.get("next_cursor") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(next)) => next.clone(),
+        Some(_) => return Err("response has a non-string `next_cursor`".to_string()),
+    };
+    Ok((records, next))
 }
 
 /// Result of an orphan order lookup. Keep an explicit server not-found result
@@ -3684,6 +3778,67 @@ impl PolymarketTrade {
     /// The bounded retry window covers the common pending/delayed write-index
     /// race without turning startup into an unbounded wait. Anything still
     /// ambiguous is deliberately left reserved and operator-visible.
+    fn audit_historical_order_trades(
+        &self,
+        order_id: &str,
+        submitted_at_ms: u64,
+    ) -> HistoricalOrderTradeAudit {
+        let after_secs = (submitted_at_ms / 1_000).saturating_sub(ORPHAN_TRADE_AUDIT_REWIND_SECS);
+        let mut cursor = String::new();
+        let mut seen_cursors = HashSet::new();
+        let mut matching_records = 0usize;
+        for page in 1..=ORPHAN_TRADE_AUDIT_MAX_PAGES {
+            let path = if cursor.is_empty() {
+                format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}")
+            } else {
+                format!(
+                    "{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}"
+                )
+            };
+            let json = match self.shared.http_call_sync("GET", &path, "") {
+                Ok(json) => json,
+                Err(error) => {
+                    return HistoricalOrderTradeAudit::Unavailable(format!(
+                        "page={page} error={error}"
+                    ));
+                }
+            };
+            let (records, next) = match authenticated_trade_page(json) {
+                Ok(page) => page,
+                Err(error) => {
+                    return HistoricalOrderTradeAudit::Unavailable(format!(
+                        "page={page} schema={error}"
+                    ));
+                }
+            };
+            matching_records = matching_records.saturating_add(
+                records
+                    .iter()
+                    .filter(|record| trade_record_references_order(record, order_id))
+                    .count(),
+            );
+            if next.is_empty() || next == "LTE=" {
+                return if matching_records == 0 {
+                    HistoricalOrderTradeAudit::CompleteNoFill {
+                        pages: page,
+                        after_secs,
+                    }
+                } else {
+                    HistoricalOrderTradeAudit::FoundFill {
+                        records: matching_records,
+                    }
+                };
+            }
+            if !seen_cursors.insert(next.clone()) {
+                return HistoricalOrderTradeAudit::Incomplete { pages: page };
+            }
+            cursor = next;
+        }
+        HistoricalOrderTradeAudit::Incomplete {
+            pages: ORPHAN_TRADE_AUDIT_MAX_PAGES,
+        }
+    }
+
     pub fn reconcile_persisted_orphan_order_anomalies(&self) -> OrphanOrderStartupRepair {
         const REBUILD_FEE_RESERVE_BPS: u32 = 10_000;
         let anomalies = self
@@ -3697,10 +3852,105 @@ impl PolymarketTrade {
         for anomaly in anomalies {
             let coid = anomaly.client_order_id.as_deref().unwrap_or("");
             let fetched = self.fetch_order_by_id(coid, &anomaly.order_id, None);
-            let FetchOrderResult::Found(fetched) = fetched else {
-                summary.unresolved = summary.unresolved.saturating_add(1);
-                continue;
+            let (fetched, absent_evidence) = match fetched {
+                FetchOrderResult::Found(fetched) => (Some(fetched), None),
+                FetchOrderResult::NotFound(evidence) => (None, Some(evidence)),
+                FetchOrderResult::Unavailable(kind) if kind.is_json_null() => (
+                    None,
+                    Some("authenticated /data/order returned literal null".to_string()),
+                ),
+                FetchOrderResult::Unavailable(kind) => {
+                    let failure = match kind {
+                        FetchUnavailable::Timeout => OrphanOrderRepairFailure::LookupTimeout,
+                        FetchUnavailable::Transport => OrphanOrderRepairFailure::LookupTransport,
+                        FetchUnavailable::Http(_) => OrphanOrderRepairFailure::LookupHttp,
+                        FetchUnavailable::InvalidResponse(_) => {
+                            OrphanOrderRepairFailure::LookupInvalidResponse
+                        }
+                    };
+                    summary.unresolved(failure);
+                    continue;
+                }
             };
+            if let Some(absence) = absent_evidence {
+                if coid.is_empty() {
+                    summary.unresolved(OrphanOrderRepairFailure::MissingClientOrderId);
+                    continue;
+                }
+                let Some(submitted_at_ms) = coid_wall_clock_ms(coid) else {
+                    summary.unresolved(OrphanOrderRepairFailure::MissingHistoricalTimestamp);
+                    continue;
+                };
+                // Do not redownload historical trade pages every 30 seconds
+                // while an event is still live. Settlement/legacy-finality is
+                // monotonic; wait for that cheap durable gate first, then run
+                // one complete authenticated absence sweep.
+                let now_ms = now_ns() / 1_000_000;
+                let settlement = anomaly.token_id.as_deref().map_or_else(
+                    || {
+                        now_ms.saturating_sub(submitted_at_ms)
+                            >= LEGACY_ORPHAN_COMPACTION_FINALITY_MS
+                    },
+                    |token| self.shared.account_state.token_event_has_ended(token),
+                );
+                if !settlement {
+                    summary.unresolved(OrphanOrderRepairFailure::EventNotSettled);
+                    continue;
+                }
+                let settlement_evidence = anomaly.token_id.as_deref().map_or_else(
+                    || {
+                        format!(
+                            "legacy_coid_age_ms={} >= compaction_finality_ms={}",
+                            now_ms.saturating_sub(submitted_at_ms),
+                            LEGACY_ORPHAN_COMPACTION_FINALITY_MS,
+                        )
+                    },
+                    |token| format!("durable event settlement token={token}"),
+                );
+                match self.audit_historical_order_trades(&anomaly.order_id, submitted_at_ms) {
+                    HistoricalOrderTradeAudit::CompleteNoFill { pages, after_secs } => {
+                        let evidence = format!(
+                            "{absence}; authenticated /data/trades complete pages={pages} after={after_secs} oid_matches=0; {settlement_evidence}"
+                        );
+                        if self.shared.account_state.record_authoritative_absent_orphan_order_audit(
+                            &anomaly.order_id,
+                            anomaly.client_order_id.as_deref(),
+                            &evidence,
+                        ) {
+                            summary.tombstoned = summary.tombstoned.saturating_add(1);
+                            info!(
+                                "[PolymarketTrade] startup orphan ownership retired by authoritative absence oid={} coid={} evidence={}",
+                                anomaly.order_id, coid, evidence,
+                            );
+                        } else {
+                            summary.unresolved(OrphanOrderRepairFailure::TombstoneRejected);
+                        }
+                    }
+                    HistoricalOrderTradeAudit::FoundFill { records } => {
+                        debug!(
+                            "[PolymarketTrade] startup orphan oid={} coid={} trade fallback found {} matching record(s); ownership rebuild remains required",
+                            anomaly.order_id, coid, records,
+                        );
+                        summary.unresolved(OrphanOrderRepairFailure::TradeAuditFoundFill);
+                    }
+                    HistoricalOrderTradeAudit::Incomplete { pages } => {
+                        debug!(
+                            "[PolymarketTrade] startup orphan oid={} coid={} trade fallback incomplete pages={}",
+                            anomaly.order_id, coid, pages,
+                        );
+                        summary.unresolved(OrphanOrderRepairFailure::TradeAuditIncomplete);
+                    }
+                    HistoricalOrderTradeAudit::Unavailable(error) => {
+                        debug!(
+                            "[PolymarketTrade] startup orphan oid={} coid={} trade fallback unavailable={}",
+                            anomaly.order_id, coid, error,
+                        );
+                        summary.unresolved(OrphanOrderRepairFailure::TradeAuditUnavailable);
+                    }
+                }
+                continue;
+            }
+            let fetched = fetched.expect("found lookup must retain its parsed order");
             let original_size = fetched
                 .audit
                 .original_size
@@ -3855,7 +4105,38 @@ impl PolymarketTrade {
                     continue;
                 }
             }
-            summary.unresolved = summary.unresolved.saturating_add(1);
+            let failure = if terminal_status.is_some()
+                && (size_matched.is_some_and(|matched| matched.abs() > 1e-9)
+                    || !fetched.audit.associate_trades.is_empty())
+            {
+                OrphanOrderRepairFailure::TerminalOrderHasFills
+            } else if anomaly.client_order_id.is_none() {
+                OrphanOrderRepairFailure::MissingClientOrderId
+            } else if original_size.is_none() {
+                OrphanOrderRepairFailure::InvalidOriginalSize
+            } else if fetched.rebuild_identity.is_none() {
+                OrphanOrderRepairFailure::MissingRebuildIdentity
+            } else if fetched.rebuild_identity.as_ref().is_some_and(|identity| {
+                !identity
+                    .maker_address
+                    .eq_ignore_ascii_case(&self.shared.order_maker_address)
+            }) {
+                OrphanOrderRepairFailure::MakerMismatch
+            } else if anomaly.client_order_id.as_deref().is_some_and(|client_order_id| {
+                self.shared
+                    .account_state
+                    .instance_id_for_historical_coid(client_order_id)
+                    .is_none()
+            }) {
+                OrphanOrderRepairFailure::UnknownInstance
+            } else if terminal_status.is_none() {
+                OrphanOrderRepairFailure::NonTerminalOrder
+            } else if zero_fill_terminal.is_some() {
+                OrphanOrderRepairFailure::TombstoneRejected
+            } else {
+                OrphanOrderRepairFailure::OwnershipBackfillRejected
+            };
+            summary.unresolved(failure);
         }
         summary
     }
@@ -9025,6 +9306,49 @@ mod tests {
             canonical_l2_auth_path("/data/order/oid-123"),
             "/data/order/oid-123"
         );
+    }
+
+    #[test]
+    fn historical_trade_audit_matches_taker_and_maker_order_ids() {
+        let taker = serde_json::json!({"taker_order_id": "0xABC", "maker_orders": []});
+        let maker = serde_json::json!({
+            "taker_order_id": "other",
+            "maker_orders": [{"order_id": "abc"}],
+        });
+        let unrelated = serde_json::json!({
+            "taker_order_id": "other",
+            "maker_orders": [{"order_id": "different"}],
+        });
+        assert!(trade_record_references_order(&taker, "abc"));
+        assert!(trade_record_references_order(&maker, "0xABC"));
+        assert!(!trade_record_references_order(&unrelated, "abc"));
+    }
+
+    #[test]
+    fn historical_trade_page_requires_complete_pagination_schema() {
+        let (records, next) = authenticated_trade_page(serde_json::json!({
+            "data": [{"id": "trade-1"}],
+            "next_cursor": "cursor-2",
+        }))
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(next, "cursor-2");
+        assert!(authenticated_trade_page(serde_json::json!({"data": {}})).is_err());
+        assert!(authenticated_trade_page(serde_json::json!(null)).is_err());
+    }
+
+    #[test]
+    fn orphan_failure_summary_counts_each_class() {
+        let mut summary = OrphanOrderStartupRepair::default();
+        summary.unresolved(OrphanOrderRepairFailure::TradeAuditUnavailable);
+        summary.unresolved(OrphanOrderRepairFailure::TradeAuditUnavailable);
+        summary.unresolved(OrphanOrderRepairFailure::EventNotSettled);
+        assert_eq!(summary.unresolved, 3);
+        assert_eq!(
+            summary.failures[&OrphanOrderRepairFailure::TradeAuditUnavailable],
+            2,
+        );
+        assert_eq!(summary.failures[&OrphanOrderRepairFailure::EventNotSettled], 1);
     }
 
     #[test]

@@ -998,9 +998,14 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
                     .account_state
                     .begin_order_recovery(std::iter::once(coid));
             }
-            shared.account_state.mark_private_order_event_anomaly(
+            let token_id = data
+                .get("asset_id")
+                .or_else(|| data.get("token_id"))
+                .and_then(serde_json::Value::as_str);
+            shared.account_state.mark_private_order_event_anomaly_with_token(
                 order_id,
                 coid.as_deref(),
+                token_id,
                 reason,
             );
             shared.user_feed_health.set_inventory_uncertain(true);
