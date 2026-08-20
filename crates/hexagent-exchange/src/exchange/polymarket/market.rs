@@ -2106,6 +2106,10 @@ struct ClobWindowMetrics {
     event_send_max_us: u64,
     event_send_over_1ms: u64,
     event_send_full: u64,
+    loop_scheduler_max_us: u64,
+    runtime_scheduler_max_us: u64,
+    read_handler_max_us: u64,
+    parse_apply_max_us: u64,
 }
 
 impl ClobWindowMetrics {
@@ -2141,6 +2145,10 @@ impl ClobWindowMetrics {
             event_send_max_us: 0,
             event_send_over_1ms: 0,
             event_send_full: 0,
+            loop_scheduler_max_us: 0,
+            runtime_scheduler_max_us: 0,
+            read_handler_max_us: 0,
+            parse_apply_max_us: 0,
         }
     }
 
@@ -2228,9 +2236,27 @@ impl ClobWindowMetrics {
         self.forward_max_us = self.forward_max_us.max(elapsed_us);
     }
 
+    fn record_loop_scheduler(&mut self, elapsed: Duration) {
+        self.loop_scheduler_max_us = self.loop_scheduler_max_us.max(
+            elapsed.as_micros().min(u64::MAX as u128) as u64,
+        );
+    }
+
+    fn record_read_handler(&mut self, elapsed: Duration) {
+        self.read_handler_max_us = self.read_handler_max_us.max(
+            elapsed.as_micros().min(u64::MAX as u128) as u64,
+        );
+    }
+
+    fn record_parse_apply(&mut self, elapsed: Duration) {
+        self.parse_apply_max_us = self.parse_apply_max_us.max(
+            elapsed.as_micros().min(u64::MAX as u128) as u64,
+        );
+    }
+
     fn close_summary(&self, now: Instant, queue_depth_now: usize) -> String {
         format!(
-            "clob_window_ms={} frames={} frame_bytes={} max_frame_bytes={} events={} forward_calls={} forward_events={} forward_avg_us={:.1} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} event_queue_depth={} event_queue_high_water={} health_healthy={} health_settling={} health_repairing={} health_degraded={} bbo_settle_max_us={} parse_errors={} ws_send_max_us={}",
+            "clob_window_ms={} frames={} frame_bytes={} max_frame_bytes={} events={} forward_calls={} forward_events={} forward_avg_us={:.1} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} event_queue_depth={} event_queue_high_water={} health_healthy={} health_settling={} health_repairing={} health_degraded={} bbo_settle_max_us={} parse_errors={} ws_send_max_us={} loop_scheduler_max_us={} runtime_scheduler_max_us={} read_handler_max_us={} parse_apply_max_us={}",
             now.saturating_duration_since(self.window_started_at).as_millis(),
             self.data_frames,
             self.frame_bytes,
@@ -2256,6 +2282,10 @@ impl ClobWindowMetrics {
             self.wire.bbo_settle_max_us,
             self.wire.parse_errors,
             self.ws_send_max_us,
+            self.loop_scheduler_max_us,
+            self.runtime_scheduler_max_us,
+            self.read_handler_max_us,
+            self.parse_apply_max_us,
         )
     }
 
@@ -2264,7 +2294,7 @@ impl ClobWindowMetrics {
             .saturating_duration_since(self.window_started_at)
             .as_secs_f64();
         info!(
-            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} health_healthy={} health_settling={} health_repairing={} health_degraded={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} forward_calls={} forward_events={} forward_total_us={} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} bbo_recovery_same_ts={} bbo_recovery_newer_ts={} bbo_recovery_book={} bbo_recovery_rest={} bbo_repair_superseded_by_ws={} bbo_settle_samples={} bbo_settle_total_us={} bbo_settle_max_us={} bbo_recovery_samples={} bbo_recovery_total_us={} bbo_recovery_max_us={} bbo_tick_distance_samples={} bbo_tick_distance_total={} bbo_tick_distance_max={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
+            "[clob_metric] window_secs={:.1} data_frames={} frame_bytes={} events={} books={} quotes={} trades={} tick_size_changes={} other_events={} health_healthy={} health_settling={} health_repairing={} health_degraded={} max_frame_bytes={} max_events_per_frame={} event_queue_depth={} event_queue_high_water={} forward_calls={} forward_events={} forward_total_us={} forward_max_us={} event_send_max_us={} event_send_over_1ms={} event_send_full={} loop_scheduler_max_us={} runtime_scheduler_max_us={} read_handler_max_us={} parse_apply_max_us={} bbo_change_snapshots={} coalesced_snapshots={} wire_book={} wire_price_change={} wire_best_bid_ask={} wire_trade={} wire_last_trade_price={} wire_tick_size_change={} wire_inline_rtds={} price_change_entries={} level_upserts={} level_deletes={} bbo_transient_recoveries={} bbo_mismatches={} bbo_repair_requests={} bbo_recovery_same_ts={} bbo_recovery_newer_ts={} bbo_recovery_book={} bbo_recovery_rest={} bbo_repair_superseded_by_ws={} bbo_settle_samples={} bbo_settle_total_us={} bbo_settle_max_us={} bbo_recovery_samples={} bbo_recovery_total_us={} bbo_recovery_max_us={} bbo_tick_distance_samples={} bbo_tick_distance_total={} bbo_tick_distance_max={} unseeded_deltas={} ignored={} unknown={} parse_errors={} ws_sends={} ws_send_errors={} ws_send_max_us={}",
             window_secs,
             self.data_frames,
             self.frame_bytes,
@@ -2289,6 +2319,10 @@ impl ClobWindowMetrics {
             self.event_send_max_us,
             self.event_send_over_1ms,
             self.event_send_full,
+            self.loop_scheduler_max_us,
+            self.runtime_scheduler_max_us,
+            self.read_handler_max_us,
+            self.parse_apply_max_us,
             self.bbo_change_snapshots,
             self.coalesced_snapshots,
             self.wire.books,
@@ -2824,6 +2858,34 @@ async fn clob_ws_task(
     subscribed_once: Arc<AtomicBool>,
     liveness: Arc<PolymarketLiveness>,
 ) {
+    // A sibling task on the same runtime distinguishes runtime-wide timer
+    // starvation from delay inside this socket loop's biased select. If only
+    // `clob_loop_scheduler_lag` rises, a ready higher-priority branch is
+    // starving the inline timer; if both rise, the runtime/core itself was not
+    // scheduled. Subtracting 1 ms exposes actionable lag above Tokio/Linux
+    // timer-wheel granularity while retaining the raw series for comparison.
+    let runtime_scheduler_max_us = Arc::new(AtomicU64::new(0));
+    let runtime_probe_max = runtime_scheduler_max_us.clone();
+    let runtime_probe_shutdown = shutdown.clone();
+    let runtime_probe = tokio::spawn(async move {
+        let mut probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        probe.tick().await;
+        while !runtime_probe_shutdown.load(Ordering::Relaxed) {
+            let scheduled_at = probe.tick().await;
+            let lag = scheduled_at.elapsed();
+            let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
+            crate::latency::record_ns("polymarket.ws.clob_runtime_scheduler_lag", lag_ns);
+            crate::latency::record_ns(
+                "polymarket.ws.clob_runtime_scheduler_over_1ms",
+                lag_ns.saturating_sub(1_000_000),
+            );
+            runtime_probe_max.fetch_max(
+                lag.as_micros().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    });
     let mut subscription = initial_subscription;
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
@@ -2996,7 +3058,12 @@ async fn clob_ws_task(
                 tokio::time::sleep_until(tokio::time::Instant::from_std(deferred_deadline));
             tokio::pin!(deferred_sleep);
             tokio::select! {
-                biased;
+                // Fair polling is intentional. With `biased`, bursts of due
+                // repair/deferred/timer branches ahead of `read.next()` could
+                // repeatedly postpone socket draining and trigger the venue's
+                // slow-consumer close even though the engine queue was empty.
+                // Control shutdown remains prompt because every branch is
+                // bounded and the dedicated runtime has no unrelated work.
 
                 ctrl = ctrl_rx.recv() => {
                     match ctrl {
@@ -3202,9 +3269,23 @@ async fn clob_ws_task(
                 }
 
                 scheduled_at = scheduler_probe.tick() => {
+                    let lag = scheduled_at.elapsed();
+                    diagnostics.record_loop_scheduler(lag);
+                    diagnostics.runtime_scheduler_max_us = diagnostics.runtime_scheduler_max_us.max(
+                        runtime_scheduler_max_us.load(Ordering::Relaxed),
+                    );
+                    let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
                     crate::latency::record_ns(
                         "polymarket.ws.clob_scheduler_lag",
-                        scheduled_at.elapsed().as_nanos() as u64,
+                        lag_ns,
+                    );
+                    crate::latency::record_ns(
+                        "polymarket.ws.clob_loop_scheduler_lag",
+                        lag_ns,
+                    );
+                    crate::latency::record_ns(
+                        "polymarket.ws.clob_loop_scheduler_over_1ms",
+                        lag_ns.saturating_sub(1_000_000),
                     );
                 }
 
@@ -3401,6 +3482,12 @@ async fn clob_ws_task(
                                 received_at,
                                 now_ns(),
                             );
+                            let parse_apply_elapsed = t_parse.elapsed();
+                            diagnostics.record_parse_apply(parse_apply_elapsed);
+                            crate::latency::record_ns(
+                                "polymarket.ws.clob_parse_apply",
+                                parse_apply_elapsed.as_nanos().min(u64::MAX as u128) as u64,
+                            );
                             burst_metrics.record_frame(text.len());
                             diagnostics.record_frame(received_at, text.len(), &batch);
                             if batch.recognized_topic {
@@ -3434,6 +3521,7 @@ async fn clob_ws_task(
                             // CLOB WS frame (simd-json + typed deser +
                             // all contained items + crossbeam sends).
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
+                            diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Ping(payload) => {
                             health.record_raw_frame(received_at);
@@ -3444,26 +3532,42 @@ async fn clob_ws_task(
                                 "polymarket.ws.clob_send.frame_pong",
                                 &mut diagnostics,
                             ).await;
+                            diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Pong(_) => {
                             health.record_raw_frame(received_at);
                             health.record_pong(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
+                            diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Close(reason) => {
+                            diagnostics.runtime_scheduler_max_us = diagnostics
+                                .runtime_scheduler_max_us
+                                .max(runtime_scheduler_max_us.load(Ordering::Relaxed));
                             announce_clob_not_ready(
                                 &event_tx,
                                 &mut lifecycle,
                                 "Server closed WS",
                             );
                             match reason.as_ref() {
-                                Some(frame) => warn!(
-                                    "[clob_close_metric] code={:?} reason={:?} {} {}",
-                                    frame.code,
-                                    frame.reason,
-                                    health.clob_summary(received_at),
-                                    diagnostics.close_summary(received_at, event_tx.len()),
-                                ),
+                                Some(frame) => {
+                                    let server_slow_consumer = frame
+                                        .reason
+                                        .to_ascii_lowercase()
+                                        .contains("slow consumer");
+                                    let tcp = sample_tcp_socket(tcp_fd);
+                                    warn!(
+                                        "[clob_close_metric] code={:?} reason={:?} server_slow_consumer={} tcp_rcv_space={} tcp_rcv_wnd={} so_rcvbuf={} {} {}",
+                                        frame.code,
+                                        frame.reason,
+                                        server_slow_consumer,
+                                        tcp.rcv_space.map(i64::from).unwrap_or(-1),
+                                        tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+                                        tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
+                                        health.clob_summary(received_at),
+                                        diagnostics.close_summary(received_at, event_tx.len()),
+                                    );
+                                }
                                 None => warn!(
                                     "[clob_close_metric] code=none reason=none {} {}",
                                     health.clob_summary(received_at),
@@ -3480,6 +3584,7 @@ async fn clob_ws_task(
                         _ => {
                             health.record_raw_frame(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
+                            diagnostics.record_read_handler(received_at.elapsed());
                         }
                     }
                 }
@@ -3494,6 +3599,7 @@ async fn clob_ws_task(
         tokio::time::sleep(delay).await;
     }
 
+    runtime_probe.abort();
     info!("[Polymarket] CLOB WS task exiting");
 }
 

@@ -170,6 +170,11 @@ pub struct OrderManager {
     /// map were a `HashMap`. Same memory profile, O(log N) lookups
     /// (N is at most a handful of resting orders per OM).
     orders: std::collections::BTreeMap<String, LocalOrder>,
+    /// Compact live-state indices. Terminal lifecycle rows intentionally stay
+    /// in `orders` for race handling, but watchdog/count/cancel paths must not
+    /// rescan that history. These sets are updated on every local transition.
+    cancelable_order_ids: std::collections::BTreeSet<String>,
+    live_order_ids: std::collections::BTreeSet<String>,
     /// Cancel requests for placements still awaiting their first authoritative
     /// exchange update. Sending DELETE while the POST is still being processed
     /// produces the `pending/delayed` cancel-before-ack race; instead we park
@@ -215,6 +220,8 @@ impl OrderManager {
             min_marketable_notional: 0.0,
             requote_min_ticks: 0.0,
             orders: std::collections::BTreeMap::new(),
+            cancelable_order_ids: std::collections::BTreeSet::new(),
+            live_order_ids: std::collections::BTreeSet::new(),
             cancel_intents: std::collections::BTreeSet::new(),
             cancel_before_ack_count: 0,
         }
@@ -254,7 +261,7 @@ impl OrderManager {
     /// Inject an existing open order from the exchange (for startup sync).
     pub fn inject_open_order(&mut self, client_order_id: String, side: Side, price: f64, quantity: f64) {
         self.orders.insert(client_order_id.clone(), LocalOrder {
-            client_order_id,
+            client_order_id: client_order_id.clone(),
             symbol: self.symbol.clone(),
             side,
             price,
@@ -263,6 +270,7 @@ impl OrderManager {
             created_ns: crate::types::now_ns(),
             filled_by_trade: HashMap::new(),
         });
+        self.reindex_order(&client_order_id);
     }
 
     pub fn set_tick_size(&mut self, tick_size: f64) {
@@ -298,6 +306,23 @@ impl OrderManager {
         }
     }
 
+    fn reindex_order(&mut self, client_order_id: &str) {
+        self.cancelable_order_ids.remove(client_order_id);
+        self.live_order_ids.remove(client_order_id);
+        let Some(order) = self.orders.get(client_order_id) else {
+            return;
+        };
+        if matches!(order.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active) {
+            self.cancelable_order_ids.insert(client_order_id.to_string());
+        }
+        if matches!(
+            order.status,
+            LocalOrderStatus::Submitted | LocalOrderStatus::Active | LocalOrderStatus::Cancelling
+        ) {
+            self.live_order_ids.insert(client_order_id.to_string());
+        }
+    }
+
     /// Request cancellation without racing a placement that is still awaiting
     /// its first exchange result. Active orders emit immediately; Submitted
     /// orders retain a cancel intent until an authoritative placement update.
@@ -319,6 +344,7 @@ impl OrderManager {
                 if let Some(order) = self.orders.get_mut(client_order_id) {
                     order.status = LocalOrderStatus::Cancelling;
                 }
+                self.reindex_order(client_order_id);
                 Some(self.cancel_signal(client_order_id, timestamp_ns))
             }
             LocalOrderStatus::Cancelling
@@ -347,6 +373,7 @@ impl OrderManager {
             return None;
         };
         order.status = LocalOrderStatus::Cancelling;
+        self.reindex_order(&update.client_order_id);
         log::info!(
             "[OrderManager] {} cancel-intent released coid={} after {:?}",
             self.symbol, update.client_order_id, update.status,
@@ -526,7 +553,10 @@ impl OrderManager {
                 self.symbol, update.client_order_id,
             );
         }
-        self.flush_cancel_intent(update)
+        self.reindex_order(&update.client_order_id);
+        let signal = self.flush_cancel_intent(update);
+        self.reindex_order(&update.client_order_id);
+        signal
     }
 
     /// Reconcile local state after the executor DROPPED a signal for `coid`
@@ -552,7 +582,7 @@ impl OrderManager {
     /// pending-order / lock ledger in lockstep. Any other status (or an
     /// unknown coid) is a no-op returning `NotTracked`.
     pub fn on_signal_dropped(&mut self, coid: &str) -> DroppedSignalOutcome {
-        match self.orders.get_mut(coid) {
+        let outcome = match self.orders.get_mut(coid) {
             Some(o) if o.status == LocalOrderStatus::Submitted => {
                 self.orders.remove(coid);
                 self.cancel_intents.remove(coid);
@@ -563,14 +593,17 @@ impl OrderManager {
                 DroppedSignalOutcome::CancelReverted
             }
             _ => DroppedSignalOutcome::NotTracked,
-        }
+        };
+        self.reindex_order(coid);
+        outcome
     }
 
     /// Find the active (Submitted or Active) order on a given side.
     pub fn active_order(&self, side: Side) -> Option<&LocalOrder> {
-        self.orders.values().find(|o| {
-            o.side == side && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active)
-        })
+        self.cancelable_order_ids
+            .iter()
+            .filter_map(|coid| self.orders.get(coid))
+            .find(|order| order.side == side)
     }
 
     pub fn active_bid(&self) -> Option<&LocalOrder> {
@@ -583,9 +616,10 @@ impl OrderManager {
 
     /// All active (non-Cancelling) orders.
     pub fn active_orders(&self) -> Vec<&LocalOrder> {
-        self.orders.values().filter(|o| {
-            matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active)
-        }).collect()
+        self.cancelable_order_ids
+            .iter()
+            .filter_map(|coid| self.orders.get(coid))
+            .collect()
     }
 
     /// All client_order_ids currently tracked, in any state. Used by
@@ -600,10 +634,10 @@ impl OrderManager {
     /// orders park a cancel intent until their first exchange result, avoiding
     /// DELETE overtaking POST. Used by the hard-position-cap enforcer.
     pub fn cancel_orders_by_side(&mut self, side: Side, ts_event: u64) -> Vec<Signal> {
-        let coids: Vec<String> = self.orders.values()
-            .filter(|o| o.side == side
-                && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
-            .map(|o| o.client_order_id.clone())
+        let coids: Vec<String> = self.cancelable_order_ids
+            .iter()
+            .filter(|coid| self.orders.get(*coid).is_some_and(|order| order.side == side))
+            .cloned()
             .collect();
         let mut signals = Vec::with_capacity(coids.len());
         for coid in coids {
@@ -656,9 +690,7 @@ impl OrderManager {
     /// Rejected / Cancelling / Cancelled entries sitting in the map are
     /// NOT counted here.
     pub fn active_count(&self) -> usize {
-        self.orders.values()
-            .filter(|o| matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
-            .count()
+        self.cancelable_order_ids.len()
     }
 
     /// Number of IN-FLIGHT orders on `side` — `Submitted` (placing), `Active`
@@ -672,10 +704,10 @@ impl OrderManager {
     /// is what builds up the orphan / not-enough-balance pile-up. Terminal
     /// `Rejected` is excluded (already off the book).
     pub fn live_count(&self, side: Side) -> usize {
-        self.orders.values()
-            .filter(|o| o.side == side
-                && matches!(o.status,
-                    LocalOrderStatus::Submitted | LocalOrderStatus::Active | LocalOrderStatus::Cancelling))
+        self.live_order_ids
+            .iter()
+            .filter_map(|coid| self.orders.get(coid))
+            .filter(|order| order.side == side)
             .count()
     }
 
@@ -709,9 +741,10 @@ impl OrderManager {
     /// Active (Submitted | Active) orders on one side — the snapshot the
     /// reconcile primitive diffs against desired levels.
     pub fn active_by_side(&self, side: Side) -> Vec<LocalOrder> {
-        self.orders.values()
-            .filter(|o| o.side == side
-                && matches!(o.status, LocalOrderStatus::Submitted | LocalOrderStatus::Active))
+        self.cancelable_order_ids
+            .iter()
+            .filter_map(|coid| self.orders.get(coid))
+            .filter(|order| order.side == side)
             .cloned()
             .collect()
     }
@@ -763,6 +796,7 @@ impl OrderManager {
                         created_ns: crate::types::now_ns(),
                         filled_by_trade: HashMap::new(),
                     });
+                    self.reindex_order(&client_order_id);
                     signals.push(Signal::NewOrder(OrderRequest {
                         client_order_id,
                         exchange: self.exchange,
