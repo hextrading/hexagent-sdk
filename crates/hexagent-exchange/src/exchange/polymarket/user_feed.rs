@@ -119,6 +119,69 @@ fn remember_terminal_gap_replay(account_id: &str, key: &str) {
         .admit(key);
 }
 
+#[derive(Debug)]
+struct GapReplayLifecycleDedupe {
+    capacity: usize,
+    ranks: HashMap<String, u8>,
+    order: VecDeque<(String, u8)>,
+}
+
+impl GapReplayLifecycleDedupe {
+    fn new(capacity: usize) -> Self {
+        Self { capacity: capacity.max(1), ranks: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn seen(&self, trade_id: &str, rank: u8) -> bool {
+        self.ranks.get(trade_id).is_some_and(|existing| *existing >= rank)
+    }
+
+    fn remember(&mut self, trade_id: &str, rank: u8) {
+        if trade_id.is_empty() || self.seen(trade_id, rank) { return; }
+        self.ranks.insert(trade_id.to_string(), rank);
+        self.order.push_back((trade_id.to_string(), rank));
+        while self.order.len() > self.capacity {
+            if let Some((expired, expired_rank)) = self.order.pop_front() {
+                if self.ranks.get(&expired) == Some(&expired_rank) { self.ranks.remove(&expired); }
+            }
+        }
+    }
+}
+
+fn replay_lifecycle_cache() -> &'static Mutex<HashMap<String, GapReplayLifecycleDedupe>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, GapReplayLifecycleDedupe>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn trade_lifecycle_identity(payload: &serde_json::Value) -> Option<(&str, u8)> {
+    let trade_id = payload.get("id").or_else(|| payload.get("trade_id"))
+        .and_then(serde_json::Value::as_str)?.trim();
+    if trade_id.is_empty() { return None; }
+    let status = payload.get("status").and_then(serde_json::Value::as_str)?
+        .trim_start_matches("TRADE_STATUS_");
+    let rank = match status {
+        "MATCHED" | "MATCHED_NOT_BROADCASTED" => 1,
+        "MINED" => 2,
+        "CONFIRMED" => 3,
+        "FAILED" => 4,
+        _ => return None,
+    };
+    Some((trade_id, rank))
+}
+
+fn replay_lifecycle_seen(account_id: &str, payload: &serde_json::Value) -> bool {
+    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else { return false };
+    replay_lifecycle_cache().lock().unwrap_or_else(|p| p.into_inner())
+        .get(account_id).is_some_and(|cache| cache.seen(trade_id, rank))
+}
+
+fn remember_replay_lifecycle(account_id: &str, payload: &serde_json::Value) {
+    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else { return };
+    replay_lifecycle_cache().lock().unwrap_or_else(|p| p.into_inner())
+        .entry(account_id.to_string())
+        .or_insert_with(|| GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY))
+        .remember(trade_id, rank);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GapReplayOutcome {
     Complete { records: usize },
@@ -1032,13 +1095,6 @@ fn parse_user_event_checked(
         "trade" => {
             validate_trade_event(data, shared)?;
             let updates = parse_user_event_validated(data, shared);
-            let retired = shared.finalize_ready_settled_audit_retirements();
-            if retired > 0 {
-                info!(
-                    "[PolyUserFeed] retired {} terminal feed trade tombstone(s) after settled FIFO convergence",
-                    retired,
-                );
-            }
             Ok(updates)
         }
         _ => Ok(Vec::new()),
@@ -1173,7 +1229,8 @@ enum PrivateApplyCommand {
 
 #[derive(Clone)]
 struct PrivateApplyLane {
-    tx: crossbeam_channel::Sender<PrivateApplyCommand>,
+    live_tx: crossbeam_channel::Sender<PrivateApplyCommand>,
+    replay_tx: crossbeam_channel::Sender<PrivateApplyCommand>,
     reconnect_generation: Arc<AtomicU64>,
     reconnect_notify: Arc<tokio::sync::Notify>,
 }
@@ -1183,7 +1240,7 @@ impl PrivateApplyLane {
         if events.is_empty() {
             return Ok(());
         }
-        self.tx
+        self.live_tx
             .try_send(PrivateApplyCommand::Live(events))
             .map_err(|error| format!("private account-apply queue unavailable: {error}"))
     }
@@ -1203,7 +1260,7 @@ impl PrivateApplyLane {
             completion,
         };
         loop {
-            match self.tx.try_send(command) {
+            match self.replay_tx.try_send(command) {
                 Ok(()) => break,
                 Err(crossbeam_channel::TrySendError::Full(returned)) => {
                     command = returned;
@@ -1286,6 +1343,7 @@ fn apply_private_batch(
     for event in events {
         let account_apply_started = crate::latency::Instant::now();
         let payload = event.payload();
+        let is_trade = matches!(&event, PrivateEventDelta::Trade(_));
         let parsed = parse_user_event_with_health(payload, shared);
         crate::latency::record("polymarket.user.account_apply", account_apply_started);
         let health_apply_started = crate::latency::Instant::now();
@@ -1300,15 +1358,29 @@ fn apply_private_batch(
                 .rejection_reason
                 .unwrap_or_else(|| "invalid private business event".to_string()));
         }
-        if let Some(key) = event.terminal_trade_key() {
-            if terminal_trade_is_durably_resolved(event.payload(), shared) {
-                remember_terminal_gap_replay(shared.account_state.account_id(), &key);
-            }
-        }
+        let terminal_to_remember = event.terminal_trade_key().filter(|_| {
+            terminal_trade_is_durably_resolved(event.payload(), shared)
+        });
         for update in parsed.updates {
             dispatch_private_update(shared, update_tx, recovery_generation, update)?;
         }
+        if is_trade {
+            // Advance the cross-round replay cache only after every derived
+            // strategy update was delivered. A delivery failure must remain
+            // replayable even though the account ledger is idempotent.
+            remember_replay_lifecycle(shared.account_state.account_id(), event.payload());
+            shared.request_settled_gc();
+        }
+        if let Some(key) = terminal_to_remember {
+            remember_terminal_gap_replay(shared.account_state.account_id(), &key);
+        }
         applied = applied.saturating_add(1);
+        if recovery_generation.is_some() {
+            // Let the independent live worker acquire an instance shard
+            // between replay records instead of allowing a REST page to win
+            // the lifecycle mutex repeatedly.
+            std::thread::yield_now();
+        }
     }
     Ok(applied)
 }
@@ -1317,60 +1389,81 @@ fn spawn_private_apply_worker(
     shared: Arc<SharedState>,
     update_tx: Sender<OrderUpdate>,
     shutdown: Arc<AtomicBool>,
-) -> Result<(PrivateApplyLane, std::thread::JoinHandle<()>)> {
-    let (tx, rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
+) -> Result<(PrivateApplyLane, Vec<std::thread::JoinHandle<()>>)> {
+    let (live_tx, live_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
+    let (replay_tx, replay_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
     let reconnect_generation = Arc::new(AtomicU64::new(0));
     let reconnect_notify = Arc::new(tokio::sync::Notify::new());
     let lane = PrivateApplyLane {
-        tx,
+        live_tx,
+        replay_tx,
         reconnect_generation: Arc::clone(&reconnect_generation),
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
     let account_id = shared.account_state.account_id().to_string();
-    let worker = std::thread::Builder::new()
-        .name(format!("poly-private-{}", account_id))
+    let live_shared = Arc::clone(&shared);
+    let live_update_tx = update_tx.clone();
+    let live_shutdown = Arc::clone(&shutdown);
+    let live_generation = Arc::clone(&reconnect_generation);
+    let live_notify = Arc::clone(&reconnect_notify);
+    let live_account_id = account_id.clone();
+    let live_worker = std::thread::Builder::new()
+        .name(format!("poly-private-live-{}", live_account_id))
         .spawn(move || {
             crate::os_tune::pin_private_account_apply(
-                "polymarket-private-account-apply",
-                &account_id,
+                "polymarket-private-live-apply",
+                &live_account_id,
             );
-            while !shutdown.load(Ordering::Relaxed) {
-                let command = match rx.recv_timeout(Duration::from_millis(100)) {
+            while !live_shutdown.load(Ordering::Relaxed) {
+                let command = match live_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(command) => command,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 };
                 match command {
                     PrivateApplyCommand::Live(events) => {
-                        if let Err(error) = apply_private_batch(&shared, &update_tx, events, None) {
-                            shared.user_feed_health.set_recovering(true);
+                        if let Err(error) = apply_private_batch(&live_shared, &live_update_tx, events, None) {
+                            live_shared.user_feed_health.set_recovering(true);
                             warn!(
                                 "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
                                 error,
                             );
-                            reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                            live_generation.fetch_add(1, Ordering::AcqRel);
                             // There is exactly one socket reader. `notify_one`
                             // retains a permit if the worker wins the race with
                             // the reader's next `select!` registration.
-                            reconnect_notify.notify_one();
+                            live_notify.notify_one();
                         }
                     }
-                    PrivateApplyCommand::Replay {
-                        events,
-                        recovery_generation,
-                        completion,
-                    } => {
-                        let _ = completion.send(apply_private_batch(
-                            &shared,
-                            &update_tx,
-                            events,
-                            recovery_generation,
-                        ));
+                    PrivateApplyCommand::Replay { completion, .. } => {
+                        let _ = completion.send(Err("replay command reached private live lane".to_string()));
                     }
                 }
             }
         })?;
-    Ok((lane, worker))
+    let replay_worker = std::thread::Builder::new()
+        .name(format!("poly-private-replay-{}", account_id))
+        .spawn(move || {
+            crate::os_tune::pin_background("polymarket-private-replay-apply");
+            while !shutdown.load(Ordering::Relaxed) {
+                let command = match replay_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(command) => command,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                match command {
+                    PrivateApplyCommand::Replay { events, recovery_generation, completion } => {
+                        let _ = completion.send(apply_private_batch(
+                            &shared, &update_tx, events, recovery_generation,
+                        ));
+                    }
+                    PrivateApplyCommand::Live(_) => {
+                        warn!("[PolyUserFeed] live command reached replay lane");
+                    }
+                }
+            }
+        })?;
+    Ok((lane, vec![live_worker, replay_worker]))
 }
 
 fn parse_user_event_with_health(
@@ -1755,7 +1848,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         continue;
                     }
                     if status != OrderStatus::Failed {
-                        shared.finish_filled_order_if_audited(&coid);
+                        shared.request_filled_order_cleanup(&coid);
                     }
 
                     let update = OrderUpdate {
@@ -1877,7 +1970,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     return Vec::new();
                 }
                 if status != OrderStatus::Failed {
-                    shared.finish_filled_order_if_audited(&coid);
+                    shared.request_filled_order_cleanup(&coid);
                 }
 
                 let update = OrderUpdate {
@@ -2149,6 +2242,12 @@ async fn replay_missed_trades_inner(
             let Some(delta) = PrivateEventDelta::classify(rec) else {
                 continue;
             };
+            if matches!(&delta, PrivateEventDelta::Trade(_))
+                && replay_lifecycle_seen(shared.account_state.account_id(), delta.payload())
+            {
+                checkpoint.terminal_fast_skips = checkpoint.terminal_fast_skips.saturating_add(1);
+                continue;
+            }
             if delta.terminal_trade_key().is_some_and(|key| {
                 terminal_gap_replay_seen(shared.account_state.account_id(), &key)
             }) {
@@ -2776,7 +2875,7 @@ pub fn spawn_user_feed(
     // await).
     use tracing::Instrument as _;
     let acct = shared.instance_id.clone();
-    let (apply_lane, apply_worker) = spawn_private_apply_worker(
+    let (apply_lane, apply_workers) = spawn_private_apply_worker(
         Arc::clone(&shared),
         update_tx.clone(),
         Arc::clone(&shutdown),
@@ -2795,7 +2894,9 @@ pub fn spawn_user_feed(
             async_rt::block_on_runtime(async move {
                 let _ = task_handle.await;
             });
-            let _ = apply_worker.join();
+            for worker in apply_workers {
+                let _ = worker.join();
+            }
         })?;
 
     Ok(handle)
@@ -2805,6 +2906,20 @@ pub fn spawn_user_feed(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn replay_lifecycle_dedupe_advances_rank_and_keeps_failed_correction() {
+        let mut dedupe = GapReplayLifecycleDedupe::new(8);
+        assert!(!dedupe.seen("trade-1", 1));
+        dedupe.remember("trade-1", 1);
+        assert!(dedupe.seen("trade-1", 1));
+        assert!(!dedupe.seen("trade-1", 2));
+        dedupe.remember("trade-1", 3);
+        assert!(dedupe.seen("trade-1", 2));
+        assert!(!dedupe.seen("trade-1", 4));
+        dedupe.remember("trade-1", 4);
+        assert!(dedupe.seen("trade-1", 4));
+    }
 
     #[test]
     fn private_delta_classification_preserves_lifecycle_edges_for_dedupe() {

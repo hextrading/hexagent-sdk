@@ -2391,7 +2391,7 @@ impl ClobBurstMetrics {
 
     fn log_and_reset(&mut self, now: Instant, tcp: TcpSocketMetrics) {
         debug!(
-            "[clob_1s_metric] window_ms={} frames={} frame_bytes={} max_frame_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} so_rcvbuf={}",
+            "[clob_1s_metric] window_ms={} frames={} frame_bytes={} max_frame_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
             now.saturating_duration_since(self.window_started_at).as_millis(),
             self.frames,
             self.bytes,
@@ -2400,6 +2400,7 @@ impl ClobBurstMetrics {
             tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
             tcp.rcv_ssthresh.map(i64::from).unwrap_or(-1),
             tcp.rcv_wscale.map(i64::from).unwrap_or(-1),
+            tcp.total_retrans.map(i64::from).unwrap_or(-1),
             tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
         );
         *self = Self::new(now);
@@ -2412,6 +2413,7 @@ struct TcpSocketMetrics {
     rcv_wnd: Option<u32>,
     rcv_ssthresh: Option<u32>,
     rcv_wscale: Option<u8>,
+    total_retrans: Option<u32>,
     so_rcvbuf: Option<i32>,
 }
 
@@ -2429,6 +2431,8 @@ const LINUX_TCP_INFO_RCV_WSCALE_OFFSET: usize = 6;
 const LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET: usize = 64;
 #[cfg(any(target_os = "linux", test))]
 const LINUX_TCP_INFO_RCV_SPACE_OFFSET: usize = 96;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCP_INFO_TOTAL_RETRANS_OFFSET: usize = 100;
 #[cfg(any(target_os = "linux", test))]
 const LINUX_TCP_INFO_RCV_WND_OFFSET: usize = 232;
 
@@ -2549,6 +2553,8 @@ fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
                 linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_RCV_WND_OFFSET);
             metrics.rcv_ssthresh =
                 linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET);
+            metrics.total_retrans =
+                linux_tcp_info_u32(&info, returned_len, LINUX_TCP_INFO_TOTAL_RETRANS_OFFSET);
             metrics.rcv_wscale = info
                 .get(LINUX_TCP_INFO_RCV_WSCALE_OFFSET)
                 .filter(|_| returned_len > LINUX_TCP_INFO_RCV_WSCALE_OFFSET)
@@ -3557,12 +3563,13 @@ async fn clob_ws_task(
                                         .contains("slow consumer");
                                     let tcp = sample_tcp_socket(tcp_fd);
                                     warn!(
-                                        "[clob_close_metric] code={:?} reason={:?} server_slow_consumer={} tcp_rcv_space={} tcp_rcv_wnd={} so_rcvbuf={} {} {}",
+                                        "[clob_close_metric] code={:?} reason={:?} server_slow_consumer={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {}",
                                         frame.code,
                                         frame.reason,
                                         server_slow_consumer,
                                         tcp.rcv_space.map(i64::from).unwrap_or(-1),
                                         tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+                                        tcp.total_retrans.map(i64::from).unwrap_or(-1),
                                         tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
                                         health.clob_summary(received_at),
                                         diagnostics.close_summary(received_at, event_tx.len()),
@@ -6152,6 +6159,7 @@ mod pick_current_event_tests {
         let rcv_space = 256_000_u32;
         let rcv_wnd = 128_000_u32;
         let rcv_ssthresh = 512_000_u32;
+        let total_retrans = 17_u32;
         info[LINUX_TCP_INFO_RCV_WSCALE_OFFSET] = 7 << 4;
         info[LINUX_TCP_INFO_RCV_SPACE_OFFSET..LINUX_TCP_INFO_RCV_SPACE_OFFSET + 4]
             .copy_from_slice(&rcv_space.to_ne_bytes());
@@ -6159,8 +6167,18 @@ mod pick_current_event_tests {
             .copy_from_slice(&rcv_wnd.to_ne_bytes());
         info[LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET..LINUX_TCP_INFO_RCV_SSTHRESH_OFFSET + 4]
             .copy_from_slice(&rcv_ssthresh.to_ne_bytes());
+        info[LINUX_TCP_INFO_TOTAL_RETRANS_OFFSET..LINUX_TCP_INFO_TOTAL_RETRANS_OFFSET + 4]
+            .copy_from_slice(&total_retrans.to_ne_bytes());
 
         assert_eq!((info[LINUX_TCP_INFO_RCV_WSCALE_OFFSET] >> 4) & 0x0f, 7);
+        assert_eq!(
+            linux_tcp_info_u32(
+                &info,
+                LINUX_TCP_INFO_PREFIX_LEN,
+                LINUX_TCP_INFO_TOTAL_RETRANS_OFFSET,
+            ),
+            Some(total_retrans)
+        );
         assert_eq!(
             linux_tcp_info_u32(
                 &info,

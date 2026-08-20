@@ -6,7 +6,7 @@
 //! - `confirmed_position()`: only CONFIRMED trades (for sell inventory checks)
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
-use log::info;
+use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -513,23 +513,25 @@ impl LivePositionManager {
             },
         );
 
-        let reason_part = match reason {
-            Some(s) if !s.is_empty() => format!(" reason=\"{}\"", s),
-            _ => String::new(),
-        };
         if !log_transition {
             // Restored rows are summarized by the account startup log. Per-row
             // lifecycle output here used to dominate cold-start logs.
-        } else if is_new {
-            info!(
+        } else if log::log_enabled!(log::Level::Debug) {
+            let reason_part = match reason {
+                Some(s) if !s.is_empty() => format!(" reason=\"{}\"", s),
+                _ => String::new(),
+            };
+            if is_new {
+                debug!(
                 "[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
                 trade_id, side, asset_id, size, price, status, is_maker, reason_part
-            );
-        } else {
-            info!(
-                "[LivePosition] Trade {} status → {:?}{}",
-                trade_id, status, reason_part
-            );
+                );
+            } else {
+                debug!(
+                    "[LivePosition] Trade {} status → {:?}{}",
+                    trade_id, status, reason_part
+                );
+            }
         }
 
         true
