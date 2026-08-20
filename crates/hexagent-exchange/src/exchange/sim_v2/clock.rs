@@ -88,6 +88,7 @@ mod tests {
             remaining_quantity: 0.0,
             avg_fill_price: 0.0,
             timestamp_ns: 0,
+            exchange_event_timestamp_ns: None,
             trade_id: None,
             order_audit: None,
             error: None,

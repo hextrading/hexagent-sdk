@@ -1437,6 +1437,7 @@ impl Simulator {
             remaining_quantity: remaining,
             avg_fill_price: 0.0,
             timestamp_ns: ts,
+            exchange_event_timestamp_ns: None,
             trade_id: None,
             order_audit: None,
             error: None,

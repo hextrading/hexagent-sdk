@@ -267,6 +267,11 @@ pub struct OrderUpdate {
     pub remaining_quantity: f64,
     pub avg_fill_price: f64,
     pub timestamp_ns: u64,
+    /// Venue-supplied wall-clock timestamp for the originating private event.
+    /// `timestamp_ns` remains the local producer clock used for internal queue
+    /// latency; this optional field measures exchange-event-to-owner apply.
+    #[serde(default)]
+    pub exchange_event_timestamp_ns: Option<u64>,
     /// Stable identifier for a single fill. Populated on trade-push events
     /// (Polymarket WebSocket "trade"); None on order-lifecycle updates
     /// (placement/update/cancel). The `PositionManager` uses it as the

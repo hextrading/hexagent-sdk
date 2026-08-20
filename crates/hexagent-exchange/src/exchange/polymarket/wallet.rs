@@ -3721,10 +3721,50 @@ fn recover_pending_maintenance_operations(
     wallet: &WalletInfo,
     account: &hexagent_account::account::shared_account::SharedAccount,
 ) -> std::result::Result<(), String> {
-    use hexagent_account::account::shared_account::MaintenanceOperationStatus;
+    use hexagent_account::account::shared_account::{
+        MaintenanceOperationKind, MaintenanceOperationStatus,
+    };
 
     for operation in account.pending_maintenance_operations() {
-        let Some(tx_id) = operation.tx_id.as_deref() else {
+        let tx_id = if let Some(tx_id) = operation.tx_id.clone() {
+            tx_id
+        } else if operation.kind == MaintenanceOperationKind::Split {
+            let Some(deposit_wallet) = wallet.deposit_wallet_active() else {
+                let reason = format!(
+                    "operation {} was durably reserved without a tx id and is not a DW split",
+                    operation.operation_id,
+                );
+                account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+                return Err(reason);
+            };
+            let total: f64 = operation.allocations.values().copied().sum();
+            let amount_wei = (total * 1_000_000.0).round().max(0.0) as u128;
+            let recovered = super::deposit_wallet::recover_dw_split_job_id(
+                &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
+                &operation.condition_id, amount_wei,
+            ).map_err(|error| format!(
+                "query DW split job for operation {}: {error}", operation.operation_id,
+            ))?;
+            let Some(tx_id) = recovered else {
+                let reason = format!(
+                    "operation {} has no persisted tx id and no exact DW split job matched signer/wallet/calldata",
+                    operation.operation_id,
+                );
+                account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+                return Err(reason);
+            };
+            account.mark_maintenance_operation_submitted(&operation.operation_id, &tx_id)
+                .and_then(|_| account.flush_persistence(std::time::Duration::from_secs(2)))
+                .map_err(|error| format!(
+                    "persist recovered DW job {} for operation {}: {error}",
+                    tx_id, operation.operation_id,
+                ))?;
+            log::warn!(
+                "[Maintenance] recovered missing DW job id operation={} tx={} by exact calldata",
+                operation.operation_id, tx_id,
+            );
+            tx_id
+        } else {
             let reason = format!(
                 "operation {} was durably reserved but has no tx id; submit finality requires operator audit",
                 operation.operation_id,
@@ -3732,9 +3772,25 @@ fn recover_pending_maintenance_operations(
             account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
             return Err(reason);
         };
-        let (state, _) = poll_transaction(&wallet.builder_auth, tx_id)
-            .map_err(|error| format!("poll recovered operation {}: {error}", operation.operation_id))?;
-        if state.contains("CONFIRMED") || state.contains("MINED") {
+        let (state, _) = match poll_transaction(&wallet.builder_auth, &tx_id) {
+            Ok(finality) => finality,
+            Err(error) if error.to_string().contains("Transaction failed") => {
+                account.fail_maintenance_operation(
+                    &operation.operation_id,
+                    format!("recovered finality failure: {error}"),
+                );
+                account.flush_persistence(std::time::Duration::from_secs(2))?;
+                log::warn!(
+                    "[Maintenance] recovered {} {:?} tx={} as FAILED: {}",
+                    operation.operation_id, operation.kind, tx_id, error,
+                );
+                continue;
+            }
+            Err(error) => return Err(format!(
+                "poll recovered operation {}: {error}", operation.operation_id,
+            )),
+        };
+        if state.contains("CONFIRMED") {
             account
                 .confirm_maintenance_operation(&operation.operation_id)
                 .map_err(|error| {
@@ -3752,7 +3808,7 @@ fn recover_pending_maintenance_operations(
             );
             continue;
         }
-        if state.contains("FAILED") {
+        if state.contains("FAILED") || state.contains("INVALID") {
             account.fail_maintenance_operation(
                 &operation.operation_id,
                 format!("recovered final_state={state}"),
@@ -3825,13 +3881,40 @@ fn run_split_one(
             "[Maintenance] DW split: cid={} amount_usdc={:.4} (pUSD={:.4}) via WALLET batch",
             cid_short, amount_usdc, balance,
         );
-        return match super::deposit_wallet::dw_split(
+        let mut accepted_tx_id = None;
+        let result = super::deposit_wallet::dw_split(
             &wallet.signing_key, &wallet.signer_address, dw,
             &wallet.builder_auth, condition_id, amount_wei,
-        ) {
+            |tx_id| {
+                accepted_tx_id = Some(tx_id.to_string());
+                let Some((account, operation_id)) = journal else {
+                    return Ok(());
+                };
+                account.mark_maintenance_operation_submitted(operation_id, tx_id)
+                    .map_err(anyhow::Error::msg)?;
+                account.flush_persistence(std::time::Duration::from_secs(2))
+                    .map_err(anyhow::Error::msg)
+            },
+        );
+        return match result {
             Ok(tx) => {
                 log::info!("[Maintenance] DW split confirmed cid={} tx={}", cid_short, tx);
                 SplitOutcome::Confirmed
+            }
+            Err(error) if accepted_tx_id.is_some() => {
+                let tx_id = accepted_tx_id.unwrap_or_default();
+                if let Some((account, operation_id)) = journal {
+                    account.mark_maintenance_operation_uncertain(
+                        operation_id,
+                        format!("DW split tx={tx_id} requires finality recovery: {error}"),
+                    );
+                    let _ = account.flush_persistence(std::time::Duration::from_secs(2));
+                }
+                log::warn!(
+                    "[Maintenance] DW split accepted but not committed cid={} tx={}: {}",
+                    cid_short, tx_id, error,
+                );
+                SplitOutcome::PendingTimeout { reason: error.to_string(), tx_id }
             }
             Err(e) => {
                 log::warn!("[Maintenance] DW split failed cid={}: {}", cid_short, e);
