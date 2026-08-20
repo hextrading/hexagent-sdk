@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use log;
 
-use crate::types::{Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side, Signal};
+use crate::types::{
+    Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, QuoteTriggerSource, Side, Signal,
+};
 
 /// Global auto-increment counter for client_order_id (unique across all OrderManagers).
 /// Initialized from millisecond timestamp to avoid collisions across restarts.
@@ -412,7 +414,14 @@ impl OrderManager {
                         self.symbol, update.client_order_id, order.side, order.price, order.quantity,
                     );
                 }
-                order.status = LocalOrderStatus::Active;
+                // An Accepted can arrive from both the HTTP placement reply
+                // and the private user stream. Once a DELETE was emitted, a
+                // duplicate/late Accepted only proves the order existed; it
+                // must not reopen the cancel gate and trigger a second DELETE.
+                // Cancelled remains the deliberate resurrection exception.
+                if order.status != LocalOrderStatus::Cancelling {
+                    order.status = LocalOrderStatus::Active;
+                }
             }
             status
                 if status == OrderStatus::PartiallyFilled
@@ -808,7 +817,7 @@ impl OrderManager {
                         quote_trigger_exchange_timestamp_ns: 0,
                         quote_trigger_local_timestamp_ns: ts_event,
                         quote_event_id: String::new(),
-                        quote_trigger_source: "strategy_callback".to_string(),
+                        quote_trigger_source: QuoteTriggerSource::StrategyCallback,
                         timestamp_ns: ts_event,
                         instance_id: self.instance_id.clone(),
                         fee_rate_bps: self.fee_rate_bps,
@@ -936,6 +945,19 @@ mod tests {
         let _ = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Cancelled));
         assert_eq!(m.live_count(Side::Buy), 0, "authoritative cancel releases slot");
         assert_eq!(m.locked_buy_cost(), 0.0, "authoritative cancel releases lock");
+    }
+
+    #[test]
+    fn duplicate_accepted_does_not_reopen_cancelling_order() {
+        let mut m = om();
+        m.inject_open_order("x".into(), Side::Buy, 0.40, 5.0);
+        cancel(&mut m, "x");
+        assert_eq!(m.orders["x"].status, LocalOrderStatus::Cancelling);
+
+        let signal = m.on_order_update(&upd("x", Side::Buy, OrderStatus::Accepted));
+        assert!(signal.is_none());
+        assert_eq!(m.orders["x"].status, LocalOrderStatus::Cancelling);
+        assert!(m.active_bid().is_none(), "Cancelling cannot be cancelled twice");
     }
 
     // Cancelled is KEPT in the map (not removed) and excluded from live/active

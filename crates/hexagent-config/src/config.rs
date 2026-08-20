@@ -92,6 +92,16 @@ pub struct OsTuneConfig {
     /// `execution_core` (legacy behaviour). Example: `[4, 15]`.
     #[serde(default)]
     pub poly_exec_cores: Vec<usize>,
+    /// Round-robin pool for must-complete Polymarket cancel dispatch workers.
+    /// Empty inherits `poly_exec_cores` for backwards compatibility.
+    #[serde(default)]
+    pub poly_cancel_cores: Vec<usize>,
+    /// Round-robin pool for Polymarket response completion/accounting workers.
+    /// Empty inherits `poly_exec_cores`. Production should keep this disjoint
+    /// from dispatch cores so slow account application cannot preempt signing;
+    /// strict isolation requires an explicit disjoint pool.
+    #[serde(default)]
+    pub poly_completion_cores: Vec<usize>,
     /// Round-robin pool for non-critical background threads. Empty =
     /// single core 0 (legacy default).
     #[serde(default)]
@@ -124,6 +134,8 @@ impl Default for OsTuneConfig {
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
             poly_exec_cores: Vec::new(),
+            poly_cancel_cores: Vec::new(),
+            poly_completion_cores: Vec::new(),
             background_cores: Vec::new(),
             fifo_async_rt: None,
             fifo_strategy: None,

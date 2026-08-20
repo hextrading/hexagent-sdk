@@ -1324,12 +1324,11 @@ fn claim_lifecycle_slow_log(
 /// The strategy only receives the local timestamp, so this engine boundary is
 /// the last place where both exchange and local clocks are still available.
 fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_lifecycle: bool) {
-    let source = format!("orderbook:{}:{}", trigger.exchange, trigger.symbol);
     let stage_ns = now_ns();
     let stamp = |order: &mut OrderRequest| {
         order.quote_trigger_exchange_timestamp_ns = trigger.exchange_timestamp_ns;
         order.quote_trigger_local_timestamp_ns = trigger.local_timestamp_ns;
-        order.quote_trigger_source.clone_from(&source);
+        order.quote_trigger_source = QuoteTriggerSource::OrderBook(trigger.exchange);
         if log_lifecycle {
             let trigger_to_stage_ns = if order.quote_trigger_local_timestamp_ns == 0 {
                 0
@@ -1816,6 +1815,18 @@ struct QueuedOrderUpdate {
     enqueued_at: std::time::Instant,
 }
 
+struct HistoricalLoadJob {
+    epoch: u64,
+    ts_event: u64,
+    requests: Vec<HistDataRequest>,
+}
+
+struct HistoricalLoadResult {
+    epoch: u64,
+    ts_event: u64,
+    loaded: Vec<(HistDataRequest, Arc<[BarData]>)>,
+}
+
 /// Numeric ownership crosses the strategy/execution boundary with the signal;
 /// strategy workers never publish bare process-global commands.
 #[derive(Debug)]
@@ -1825,11 +1836,14 @@ pub struct RoutedSignal {
 }
 
 const SYSTEM_SIGNAL_OWNER: u16 = u16::MAX;
+const INSTANCE_SIGNAL_LANE_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 struct SignalSender {
     owner: u16,
     tx: Sender<RoutedSignal>,
+    owner_lanes: Option<Arc<Vec<Sender<RoutedSignal>>>>,
+    arbiter_control_tx: Option<Sender<RoutedSignal>>,
 }
 
 impl SignalSender {
@@ -1837,18 +1851,48 @@ impl SignalSender {
         Self {
             owner: SYSTEM_SIGNAL_OWNER,
             tx,
+            owner_lanes: None,
+            arbiter_control_tx: None,
+        }
+    }
+
+    fn system_with_owner_lanes(
+        tx: Sender<RoutedSignal>,
+        owner_lanes: Vec<Sender<RoutedSignal>>,
+        arbiter_control_tx: Sender<RoutedSignal>,
+    ) -> Self {
+        Self {
+            owner: SYSTEM_SIGNAL_OWNER,
+            tx,
+            owner_lanes: Some(Arc::new(owner_lanes)),
+            arbiter_control_tx: Some(arbiter_control_tx),
         }
     }
 
     fn with_owner(&self, owner: usize) -> Self {
+        let tx = self
+            .owner_lanes
+            .as_ref()
+            .and_then(|lanes| lanes.get(owner))
+            .cloned()
+            .unwrap_or_else(|| self.tx.clone());
         Self {
             owner: u16::try_from(owner).expect("strategy owner index exceeds u16"),
-            tx: self.tx.clone(),
+            tx,
+            owner_lanes: None,
+            arbiter_control_tx: None,
         }
     }
 
     fn send(&self, signal: Signal) -> Result<(), crossbeam_channel::SendError<RoutedSignal>> {
-        self.tx.send(RoutedSignal {
+        let barrier = self.owner == SYSTEM_SIGNAL_OWNER
+            && matches!(signal, Signal::BeginShutdown | Signal::Exit);
+        let tx = if barrier {
+            self.arbiter_control_tx.as_ref().unwrap_or(&self.tx)
+        } else {
+            &self.tx
+        };
+        tx.send(RoutedSignal {
             owner: self.owner,
             signal,
         })
@@ -1859,7 +1903,14 @@ impl SignalSender {
         signal: Signal,
         timeout: std::time::Duration,
     ) -> Result<(), crossbeam_channel::SendTimeoutError<RoutedSignal>> {
-        self.tx.send_timeout(
+        let barrier = self.owner == SYSTEM_SIGNAL_OWNER
+            && matches!(signal, Signal::BeginShutdown | Signal::Exit);
+        let tx = if barrier {
+            self.arbiter_control_tx.as_ref().unwrap_or(&self.tx)
+        } else {
+            &self.tx
+        };
+        tx.send_timeout(
             RoutedSignal {
                 owner: self.owner,
                 signal,
@@ -1867,6 +1918,68 @@ impl SignalSender {
             timeout,
         )
     }
+}
+
+/// Merge bounded per-instance strategy lanes into the executor ingress. Every
+/// lane is lossless and ordered. Quote signals are intentionally not coalesced
+/// yet: replacing a signal that already owns a reservation needs an explicit
+/// rollback envelope before it can be safe.
+fn spawn_strategy_signal_arbiter(
+    root_tx: Sender<RoutedSignal>,
+    owner_rxs: Vec<Receiver<RoutedSignal>>,
+    control_rx: Receiver<RoutedSignal>,
+) -> Option<thread::JoinHandle<()>> {
+    if owner_rxs.is_empty() {
+        return None;
+    }
+    Some(
+        thread::Builder::new()
+            .name("strategy-signal-arbiter".into())
+            .spawn(move || {
+                crate::os_tune::pin_execution("strategy-signal-arbiter");
+                // The system sender owns every producer for the arbiter's
+                // lifetime, so channels cannot disappear before Exit. Build
+                // the selector once at startup: no per-signal registration or
+                // temporary Vec allocation on this critical lane.
+                let mut select = crossbeam_channel::Select::new();
+                for rx in &owner_rxs {
+                    select.recv(rx);
+                }
+                let control_index = select.recv(&control_rx);
+                loop {
+                    let selected = select.select();
+                    if selected.index() == control_index {
+                        let Ok(barrier) = selected.recv(&control_rx) else {
+                            break;
+                        };
+                        // Strategy workers stop before shutdown barriers are
+                        // emitted, so drain all owner lanes first.
+                        for rx in &owner_rxs {
+                            while let Ok(routed) = rx.try_recv() {
+                                if root_tx.send(routed).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        let terminal = matches!(barrier.signal, Signal::Exit);
+                        if root_tx.send(barrier).is_err() || terminal {
+                            break;
+                        }
+                        continue;
+                    }
+                    let owner = selected.index();
+                    match selected.recv(&owner_rxs[owner]) {
+                        Ok(routed) => {
+                            if root_tx.send(routed).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .expect("spawn strategy signal arbiter"),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -2834,7 +2947,25 @@ impl Engine {
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
         let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
-        let signal_tx = SignalSender::system(signal_tx_raw);
+        let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
+        let (owner_signal_txs, owner_signal_rxs): (Vec<_>, Vec<_>) = (0..strategy_count)
+            .map(|_| bounded::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY))
+            .unzip();
+        let (signal_control_tx, signal_control_rx) = bounded::<RoutedSignal>(8);
+        let signal_arbiter_handle = spawn_strategy_signal_arbiter(
+            signal_tx_raw.clone(),
+            owner_signal_rxs,
+            signal_control_rx,
+        );
+        let signal_tx = if strategy_count == 0 {
+            SignalSender::system(signal_tx_raw)
+        } else {
+            SignalSender::system_with_owner_lanes(
+                signal_tx_raw,
+                owner_signal_txs,
+                signal_control_tx,
+            )
+        };
         let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
@@ -3075,6 +3206,9 @@ impl Engine {
         for h in poly_feed_handles {
             let _ = h.join();
         }
+        if let Some(handle) = signal_arbiter_handle {
+            let _ = handle.join();
+        }
         for h in heartbeat_handles {
             let _ = h.join();
         }
@@ -3137,7 +3271,25 @@ impl Engine {
         let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
-        let signal_tx = SignalSender::system(signal_tx_raw);
+        let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
+        let (owner_signal_txs, owner_signal_rxs): (Vec<_>, Vec<_>) = (0..strategy_count)
+            .map(|_| bounded::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY))
+            .unzip();
+        let (signal_control_tx, signal_control_rx) = bounded::<RoutedSignal>(8);
+        let signal_arbiter_handle = spawn_strategy_signal_arbiter(
+            signal_tx_raw.clone(),
+            owner_signal_rxs,
+            signal_control_rx,
+        );
+        let signal_tx = if strategy_count == 0 {
+            SignalSender::system(signal_tx_raw)
+        } else {
+            SignalSender::system_with_owner_lanes(
+                signal_tx_raw,
+                owner_signal_txs,
+                signal_control_tx,
+            )
+        };
         let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
@@ -3184,6 +3336,9 @@ impl Engine {
 
         let _ = strategy_handle.join();
         let _ = exec_handle.join();
+        if let Some(handle) = signal_arbiter_handle {
+            let _ = handle.join();
+        }
         for h in feed_handles {
             let _ = h.join();
         }
@@ -6330,6 +6485,18 @@ impl Engine {
         instance_ids: &[String],
         signal_tx: &SignalSender,
     ) {
+        // Polymarket execution completions and private owner-fast routing stamp
+        // OrderUpdate with a local wall-clock timestamp. Reject stale/exchange
+        // timestamps so this boundary metric cannot poison its histogram.
+        if update.exchange == Exchange::Polymarket && update.timestamp_ns > 0 {
+            let producer_to_root_ns = now_ns().saturating_sub(update.timestamp_ns);
+            if producer_to_root_ns <= 5_000_000_000 {
+                hexagent_runtime::latency::record_ns(
+                    "polymarket.update.producer_to_root_router",
+                    producer_to_root_ns,
+                );
+            }
+        }
         let is_market_cancel_finality = update.error.as_deref().is_some_and(|error| {
             error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED)
                 || error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_PENDING)
@@ -6533,6 +6700,43 @@ impl Engine {
         shutdown_ack_tx: Sender<usize>,
         clock_origin: Arc<std::time::Instant>,
     ) {
+        // File/REST-backed history loading never runs on the strategy owner.
+        // A bounded SPSC worker prepares owned immutable snapshots, then this
+        // strategy thread alone replays them into mutable strategy state.
+        let (hist_job_tx, hist_job_rx) = bounded::<HistoricalLoadJob>(8);
+        let (hist_result_tx, hist_result_rx) = bounded::<HistoricalLoadResult>(8);
+        let hist_loader_name = format!("strategy-hist-prefetch-{instance_id}");
+        let hist_loader = thread::Builder::new()
+            .name(hist_loader_name.clone())
+            .spawn(move || {
+                crate::os_tune::pin_background(&hist_loader_name);
+                while let Ok(job) = hist_job_rx.recv() {
+                    let mut loaded = Vec::with_capacity(job.requests.len());
+                    for request in job.requests {
+                        let mut bars = Vec::new();
+                        for dir in &data_dirs {
+                            if let Ok(candidate) = crate::recorder::load_hist_bars(dir, &request) {
+                                if !candidate.is_empty() {
+                                    bars = candidate;
+                                    break;
+                                }
+                            }
+                        }
+                        loaded.push((request, Arc::from(bars.into_boxed_slice())));
+                    }
+                    if hist_result_tx
+                        .send(HistoricalLoadResult {
+                            epoch: job.epoch,
+                            ts_event: job.ts_event,
+                            loaded,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn strategy history prefetch worker");
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         // The sender is permanently tagged with this worker's numeric owner.
         let emit = |sig: Signal| -> bool {
@@ -6553,6 +6757,7 @@ impl Engine {
         let mut update_queue_total_us = 0u128;
         let mut update_queue_max_us = 0u64;
         let mut private_update_burst = 0usize;
+        let mut historical_epoch = 0u64;
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         let never_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
@@ -6584,6 +6789,13 @@ impl Engine {
             crossbeam_channel::select_biased! {
                 recv(selectable_update_rx) -> msg => match msg {
                     Ok(queued) => {
+                        if queued.update.exchange == Exchange::Polymarket {
+                            hexagent_runtime::latency::record_ns(
+                                "polymarket.update.root_router_to_instance_worker",
+                                queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128)
+                                    as u64,
+                            );
+                        }
                         private_update_burst = private_update_burst.saturating_add(1);
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
@@ -6624,6 +6836,28 @@ impl Engine {
                             .entry("private_order_update")
                             .or_default()
                             .record_callback(callback_started.elapsed());
+                    }
+                    Err(_) => break,
+                },
+                recv(hist_result_rx) -> msg => match msg {
+                    Ok(result) => {
+                        if result.epoch != historical_epoch || shutdown_started {
+                            continue;
+                        }
+                        for (request, bars) in result.loaded {
+                            if bars.is_empty() {
+                                warn!(
+                                    "[Strategy] Failed to load hist bars for {}/{}",
+                                    request.exchange,
+                                    request.symbol,
+                                );
+                                continue;
+                            }
+                            for bar in bars.iter() {
+                                strategy.on_hist_bar(bar);
+                            }
+                        }
+                        strategy.on_hist_data_loaded(result.ts_event);
                     }
                     Err(_) => break,
                 },
@@ -6682,23 +6916,21 @@ impl Engine {
                                 strategy.on_instrument(inst);
                                 let ts_event = event.timestamp_ns();
                                 let hist_reqs = strategy.load_hist_data(ts_event);
-                                for req in &hist_reqs {
-                                    let mut loaded = false;
-                                    for dir in &data_dirs {
-                                        if let Ok(bars) = crate::recorder::load_hist_bars(dir, req) {
-                                            if !bars.is_empty() {
-                                                for bar in &bars { strategy.on_hist_bar(bar); }
-                                                loaded = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if !loaded {
-                                        warn!("[Strategy] Failed to load hist bars for {}/{}", req.exchange, req.symbol);
-                                    }
-                                }
                                 if !hist_reqs.is_empty() {
-                                    strategy.on_hist_data_loaded(ts_event);
+                                    historical_epoch = historical_epoch.wrapping_add(1).max(1);
+                                    let job = HistoricalLoadJob {
+                                        epoch: historical_epoch,
+                                        ts_event,
+                                        requests: hist_reqs,
+                                    };
+                                    if hist_job_tx.try_send(job).is_err() {
+                                        error!(
+                                            "[Strategy] historical prefetch queue overflow instance={}; quarantining fail-closed",
+                                            instance_id,
+                                        );
+                                        quarantined.store(true, Ordering::Release);
+                                        return;
+                                    }
                                 }
                                 Vec::new()
                             }
@@ -6791,6 +7023,9 @@ impl Engine {
                 },
             }
         }
+        drop(hist_job_tx);
+        drop(hist_result_rx);
+        let _ = hist_loader.join();
         if !shutdown_started {
             strategy.on_exit();
         }
@@ -8776,12 +9011,12 @@ impl Engine {
                             "[Executor] account admission pools are unavailable; hot-path requests will be shed",
                         );
                     }
-                    // One drainer per possible in-flight fired request
-                    // (Σ account placement+cancel slots) + slack, so a fired request
-                    // never waits for a drainer while holding its permit. Derived
-                    // from the actual registry rather than duplicating sizing.
+                    // One completion worker per possible in-flight fired
+                    // place/cancel attempt. This is derived from the real
+                    // account pool (Fast=4, Cancel=4 per account), without the
+                    // old fixed +4 oversubscription.
                     let n_drainers =
-                        hexagent_runtime::http1_pool::total_account_order_capacity() + 4;
+                        hexagent_runtime::http1_pool::total_account_order_capacity().max(1);
                     for i in 0..n_drainers {
                         let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_done_rx.clone();
@@ -11671,6 +11906,58 @@ mod market_router_tests {
     }
 
     #[test]
+    #[ignore = "manual strategy-signal lane benchmark; run with --release --ignored"]
+    fn instance_signal_arbiter_latency_benchmark() {
+        const EVENTS: usize = 100_000;
+
+        fn percentiles(mut samples_ns: Vec<u64>) -> (u64, u64, u64, u64) {
+            samples_ns.sort_unstable();
+            let at = |numerator: usize, denominator: usize| {
+                samples_ns[(samples_ns.len() - 1) * numerator / denominator]
+            };
+            (at(1, 2), at(99, 100), at(999, 1_000), at(1, 1))
+        }
+
+        let (root_tx, root_rx) = bounded(8);
+        let (owner_tx, owner_rx) = bounded(INSTANCE_SIGNAL_LANE_CAPACITY);
+        let depth_tx = owner_tx.clone();
+        let (control_tx, control_rx) = bounded(2);
+        let arbiter = spawn_strategy_signal_arbiter(root_tx.clone(), vec![owner_rx], control_rx)
+            .expect("arbiter");
+        let system = SignalSender::system_with_owner_lanes(root_tx, vec![owner_tx], control_tx);
+        let owner = system.with_owner(0);
+        let template = Signal::CancelAll {
+            exchange: Exchange::Polymarket,
+            symbol: String::new(),
+            instance_id: String::new(),
+            timestamp_ns: 0,
+        };
+        let mut samples = Vec::with_capacity(EVENTS);
+        let mut peak_depth = 0usize;
+        for _ in 0..EVENTS {
+            let signal = template.clone();
+            let started = std::time::Instant::now();
+            owner.send(signal).unwrap();
+            peak_depth = peak_depth.max(depth_tx.len());
+            std::hint::black_box(root_rx.recv().unwrap());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        system.send(Signal::Exit).unwrap();
+        std::hint::black_box(root_rx.recv().unwrap());
+        arbiter.join().unwrap();
+
+        let measured = percentiles(samples);
+        println!(
+            "instance_signal_arbiter events={EVENTS} boundary=owner_lane_send_to_root_dequeue unit=ns p50={} p99={} p999={} max={} owner_peak_depth={} owner_overflow=0 root_peak_depth=1 root_overflow=0",
+            measured.0,
+            measured.1,
+            measured.2,
+            measured.3,
+            peak_depth,
+        );
+    }
+
+    #[test]
     fn spot_and_binance_ob_route_to_owning_instance_only() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
@@ -11920,7 +12207,7 @@ mod market_router_tests {
             quote_trigger_exchange_timestamp_ns: 0,
             quote_trigger_local_timestamp_ns: 1,
             quote_event_id: "event".into(),
-            quote_trigger_source: "strategy_callback".into(),
+            quote_trigger_source: QuoteTriggerSource::StrategyCallback,
             timestamp_ns: 1,
             instance_id: instance_id.into(),
             fee_rate_bps: 0,
@@ -11970,7 +12257,10 @@ mod market_router_tests {
         for order in orders {
             assert_eq!(order.quote_trigger_exchange_timestamp_ns, 11);
             assert_eq!(order.quote_trigger_local_timestamp_ns, 22);
-            assert_eq!(order.quote_trigger_source, "orderbook:binance:BTCUSDT");
+            assert_eq!(
+                order.quote_trigger_source,
+                QuoteTriggerSource::OrderBook(Exchange::Binance),
+            );
         }
     }
 
@@ -11982,6 +12272,29 @@ mod market_router_tests {
         let routed = rx.recv().unwrap();
         assert_eq!(routed.owner, 7);
         assert!(matches!(routed.signal, Signal::NewOrder(_)));
+    }
+
+    #[test]
+    fn instance_signal_lane_preserves_owner_order_before_shutdown_barrier() {
+        let (root_tx, root_rx) = bounded(8);
+        let (owner_tx, owner_rx) = bounded(8);
+        let (control_tx, control_rx) = bounded(2);
+        let arbiter = spawn_strategy_signal_arbiter(root_tx.clone(), vec![owner_rx], control_rx)
+            .expect("arbiter");
+        let system = SignalSender::system_with_owner_lanes(root_tx, vec![owner_tx], control_tx);
+        let owner = system.with_owner(0);
+
+        owner.send(Signal::NewOrder(order_req("c1", "btc"))).unwrap();
+        owner.send(Signal::NewOrder(order_req("c2", "btc"))).unwrap();
+        system.send(Signal::BeginShutdown).unwrap();
+        system.send(Signal::Exit).unwrap();
+
+        let routed = (0..4).map(|_| root_rx.recv().unwrap()).collect::<Vec<_>>();
+        assert!(matches!(&routed[0].signal, Signal::NewOrder(order) if order.client_order_id == "c1"));
+        assert!(matches!(&routed[1].signal, Signal::NewOrder(order) if order.client_order_id == "c2"));
+        assert!(matches!(routed[2].signal, Signal::BeginShutdown));
+        assert!(matches!(routed[3].signal, Signal::Exit));
+        arbiter.join().unwrap();
     }
 
     #[test]

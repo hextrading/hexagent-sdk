@@ -111,6 +111,10 @@ pub struct CorePlan {
     /// Round-robin pool for Polymarket dispatch workers (`poly-exec-<i>`).
     /// Empty = fall back to `execution`.
     pub poly_exec_cores: Vec<usize>,
+    /// Must-complete cancel dispatch workers. Empty config inherits exec.
+    pub poly_cancel_cores: Vec<usize>,
+    /// Response completion/accounting workers. Empty config inherits exec.
+    pub poly_completion_cores: Vec<usize>,
     pub background_cores: Vec<usize>,
     pub fifo_async_rt: u8,
     pub fifo_strategy: u8,
@@ -136,6 +140,8 @@ impl CorePlan {
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
             poly_exec_cores: Vec::new(),
+            poly_cancel_cores: Vec::new(),
+            poly_completion_cores: Vec::new(),
             background_cores: vec![DEFAULT_BACKGROUND_CORE],
             fifo_async_rt: DEFAULT_PRIO_ASYNC_RT,
             fifo_strategy: DEFAULT_PRIO_STRATEGY,
@@ -150,6 +156,16 @@ impl CorePlan {
             vec![DEFAULT_BACKGROUND_CORE]
         } else {
             cfg.background_cores.clone()
+        };
+        let poly_cancel_cores = if cfg.poly_cancel_cores.is_empty() {
+            cfg.poly_exec_cores.clone()
+        } else {
+            cfg.poly_cancel_cores.clone()
+        };
+        let poly_completion_cores = if cfg.poly_completion_cores.is_empty() {
+            cfg.poly_exec_cores.clone()
+        } else {
+            cfg.poly_completion_cores.clone()
         };
         Self {
             enable_pin: cfg.enable_pin,
@@ -166,6 +182,8 @@ impl CorePlan {
             feed_cores: cfg.feed_cores.clone(),
             hex_worker_cores: cfg.hex_worker_cores.clone(),
             poly_exec_cores: cfg.poly_exec_cores.clone(),
+            poly_cancel_cores,
+            poly_completion_cores,
             background_cores: bg,
             fifo_async_rt: cfg.fifo_async_rt.unwrap_or(DEFAULT_PRIO_ASYNC_RT),
             fifo_strategy: cfg.fifo_strategy.unwrap_or(DEFAULT_PRIO_STRATEGY),
@@ -183,7 +201,9 @@ impl CorePlan {
 
     /// Route an execution-tier thread to its core based on name:
     ///   - `feed-<exchange>`           → `feed_cores[<exchange>]` else execution
-    ///   - `poly-exec-<i>`/`poly-done-<i>` → round-robin `poly_exec_cores` else execution
+    ///   - `poly-exec-<i>`   → `poly_exec_cores`
+    ///   - `poly-cancel-<i>` → `poly_cancel_cores`
+    ///   - `poly-done-<i>`   → `poly_completion_cores`
     ///   - `<inst_id>-worker-<i>`      → round-robin `hex_worker_cores` else execution
     ///   - anything else               → execution
     fn route_execution(&self, thread_name: &str) -> usize {
@@ -192,11 +212,18 @@ impl CorePlan {
                 return core;
             }
         }
-        if (thread_name.starts_with("poly-exec-") || thread_name.starts_with("poly-done-"))
-            && !self.poly_exec_cores.is_empty()
-        {
+        if thread_name.starts_with("poly-exec-") && !self.poly_exec_cores.is_empty() {
             let i = POLY_EXEC_RR.fetch_add(1, Ordering::Relaxed) % self.poly_exec_cores.len();
             return self.poly_exec_cores[i];
+        }
+        if thread_name.starts_with("poly-cancel-") && !self.poly_cancel_cores.is_empty() {
+            let i = POLY_CANCEL_RR.fetch_add(1, Ordering::Relaxed) % self.poly_cancel_cores.len();
+            return self.poly_cancel_cores[i];
+        }
+        if thread_name.starts_with("poly-done-") && !self.poly_completion_cores.is_empty() {
+            let i = POLY_COMPLETION_RR.fetch_add(1, Ordering::Relaxed)
+                % self.poly_completion_cores.len();
+            return self.poly_completion_cores[i];
         }
         if thread_name.contains("-worker-") && !self.hex_worker_cores.is_empty() {
             let i = HEX_WORKER_RR.fetch_add(1, Ordering::Relaxed) % self.hex_worker_cores.len();
@@ -223,9 +250,32 @@ impl CorePlan {
         if self.async_ord.is_none() {
             return Err("strict_core_isolation requires async_ord_core".into());
         }
-        if self.poly_exec_cores.len() < 2 {
+        let distinct_poly_cores: HashSet<_> = self
+            .poly_exec_cores
+            .iter()
+            .chain(&self.poly_cancel_cores)
+            .chain(&self.poly_completion_cores)
+            .copied()
+            .collect();
+        if distinct_poly_cores.len() < 2 {
             return Err(
-                "strict_core_isolation requires at least two distinct poly_exec_cores".into(),
+                "strict_core_isolation requires at least two distinct Polymarket dispatch/completion cores".into(),
+            );
+        }
+        let dispatch_cores: HashSet<_> = self
+            .poly_exec_cores
+            .iter()
+            .chain(&self.poly_cancel_cores)
+            .copied()
+            .collect();
+        if self
+            .poly_completion_cores
+            .iter()
+            .any(|core| dispatch_cores.contains(core))
+        {
+            return Err(
+                "strict_core_isolation requires poly_completion_cores to be disjoint from place/cancel dispatch cores"
+                    .into(),
             );
         }
 
@@ -296,9 +346,33 @@ impl CorePlan {
         }
 
         let mut poly_cores = HashSet::new();
-        for &core in &self.poly_exec_cores {
+        for (&core, pool_name) in self
+            .poly_exec_cores
+            .iter()
+            .map(|core| (core, "poly_exec_cores"))
+            .chain(
+                self.poly_cancel_cores
+                    .iter()
+                    .map(|core| (core, "poly_cancel_cores")),
+            )
+            .chain(
+                self.poly_completion_cores
+                    .iter()
+                    .map(|core| (core, "poly_completion_cores")),
+            )
+        {
+            // Sharing between dispatch roles is explicit and supported; only
+            // duplicate entries inside one list are configuration mistakes.
+            let list = match pool_name {
+                "poly_exec_cores" => &self.poly_exec_cores,
+                "poly_cancel_cores" => &self.poly_cancel_cores,
+                _ => &self.poly_completion_cores,
+            };
+            if list.iter().filter(|&&candidate| candidate == core).count() > 1 {
+                return Err(format!("{} contains duplicate core {}", pool_name, core));
+            }
             if !poly_cores.insert(core) {
-                return Err(format!("poly_exec_cores contains duplicate core {}", core));
+                continue;
             }
             if let Some(role) = exclusive.get(&core) {
                 return Err(format!("poly-exec/done core {} overlaps {}", core, role));
@@ -358,6 +432,8 @@ impl CorePlan {
 static CORE_PLAN: OnceLock<CorePlan> = OnceLock::new();
 static HEX_WORKER_RR: AtomicUsize = AtomicUsize::new(0);
 static POLY_EXEC_RR: AtomicUsize = AtomicUsize::new(0);
+static POLY_CANCEL_RR: AtomicUsize = AtomicUsize::new(0);
+static POLY_COMPLETION_RR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_RR: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the CorePlan resolved from the TOML `[os_tune]` block. Must be
@@ -369,9 +445,11 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} hex_workers={:?} poly_exec_done={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
-        plan.feed_cores, plan.private_apply_cores, plan.hex_worker_cores, plan.poly_exec_cores, plan.background_cores,
+        plan.feed_cores, plan.private_apply_cores, plan.hex_worker_cores,
+        plan.poly_exec_cores, plan.poly_cancel_cores, plan.poly_completion_cores,
+        plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
         plan.fifo_polymarket_feed, plan.fifo_completion,
         plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
@@ -470,6 +548,8 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
         || p.feed_cores.values().any(|&c| c == core_id)
         || p.hex_worker_cores.iter().any(|&c| c == core_id)
         || p.poly_exec_cores.iter().any(|&c| c == core_id)
+        || p.poly_cancel_cores.iter().any(|&c| c == core_id)
+        || p.poly_completion_cores.iter().any(|&c| c == core_id)
     {
         "HEXBOT_NO_PIN_EXECUTION"
     } else if p.background_cores.iter().any(|&c| c == core_id) {
@@ -634,11 +714,20 @@ pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
     }
 }
 
+/// Shared-ledger/audit/persistence half of the private feed. It is explicitly
+/// demoted to the background pool; only the owner-fast route receives the
+/// account-specific FIFO core.
+pub fn pin_private_account_cold(thread_name: &str) {
+    pin_background(thread_name);
+}
+
 /// Pin a critical execution-path thread (`execution` dispatcher,
 /// `feed-*`, per-instance hex worker pool) with `PRIO_EXECUTION`.
 /// Routing:
 ///   - `feed-<exchange>`              → `feed_cores[<exchange>]` else execution
-///   - `poly-exec-*` / `poly-done-*`  → round-robin `poly_exec_cores` else execution
+///   - `poly-exec-*`   → round-robin `poly_exec_cores`
+///   - `poly-cancel-*` → round-robin `poly_cancel_cores`
+///   - `poly-done-*`   → round-robin `poly_completion_cores`
 ///   - `<inst_id>-worker-<i>`         → round-robin `hex_worker_cores` else execution
 ///   - anything else          → `execution_core`
 pub fn pin_execution(thread_name: &str) {
@@ -793,7 +882,9 @@ mod tests {
             ("btc04".into(), 12),
             ("btc05".into(), 13),
         ]);
-        cfg.poly_exec_cores = vec![14, 15];
+        cfg.poly_exec_cores = vec![14];
+        cfg.poly_cancel_cores = vec![14];
+        cfg.poly_completion_cores = vec![15];
         cfg.background_cores = vec![0, 1];
         cfg
     }
@@ -892,13 +983,28 @@ mod tests {
     }
 
     #[test]
-    fn completion_threads_use_polymarket_worker_pool() {
+    fn polymarket_dispatch_and_completion_use_separate_pools() {
         let plan = CorePlan::from_config(&five_instance_config());
         assert!(plan
             .poly_exec_cores
             .contains(&plan.route_execution("poly-exec-0")));
         assert!(plan
-            .poly_exec_cores
+            .poly_cancel_cores
+            .contains(&plan.route_execution("poly-cancel-0")));
+        assert!(plan
+            .poly_completion_cores
             .contains(&plan.route_execution("poly-done-0")));
+        assert_ne!(
+            plan.route_execution("poly-exec-1"),
+            plan.route_execution("poly-done-1"),
+        );
+
+        let mut overlap = five_instance_config();
+        overlap.poly_exec_cores = vec![14, 15];
+        overlap.poly_completion_cores = vec![15];
+        let err = CorePlan::from_config(&overlap)
+            .validate_strategy_isolation(&five_instances())
+            .unwrap_err();
+        assert!(err.contains("poly_completion_cores") && err.contains("disjoint"));
     }
 }
