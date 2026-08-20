@@ -1598,6 +1598,17 @@ fn route_private_event_fast(
             if rank == 0 || status_name == "RETRYING" {
                 return Ok(Vec::new());
             }
+            // A terminal replay can outlive its parent order row after
+            // history compaction. Its durable trade ownership/tombstone is
+            // already the authoritative high-water mark, so there is no
+            // advancing strategy update to route. The cold single-writer
+            // still receives this event and validates the immutable trade
+            // economics before acknowledging replay completion.
+            if matches!(status_name, "CONFIRMED" | "FAILED")
+                && terminal_trade_is_durably_resolved(data, shared)
+            {
+                return Ok(Vec::new());
+            }
             let trade_id = required_string(data, &["id", "trade_id"], "trade_id")?;
             let exchange_timestamp_ns = exchange_event_timestamp_ns(data);
             let failure_reason = private_failure_reason(data);
@@ -4895,6 +4906,53 @@ mod tests {
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
         assert_eq!(after.retired_trade_ownership_tombstones, 1);
+    }
+
+    #[test]
+    fn fast_route_accepts_retired_terminal_maker_trade_without_parent_order() {
+        let shared = owned_taker_shared(0.5);
+        let event = serde_json::json!({
+            "event_type": "trade",
+            "id": "retired-maker-trade",
+            "status": "CONFIRMED",
+            "asset_id": "COUNTERPARTY",
+            "side": "SELL",
+            "size": "10",
+            "price": "0.5",
+            "match_time": "123",
+            "taker_order_id": "counterparty-order",
+            "maker_orders": [{
+                "maker_address": shared.order_maker_address.clone(),
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "matched_amount": "10",
+                "price": "0.5",
+                "order_id": "oid-1"
+            }]
+        });
+        let first = parse_user_event_diagnosed(&event, &shared);
+        assert!(first.valid_business_event);
+        assert_eq!(first.updates.len(), 1);
+        assert_eq!(
+            shared
+                .account_state
+                .prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
+            (1, 1),
+        );
+        shared.coid_to_oid.lock().unwrap().clear();
+        shared.oid_to_coid.lock().unwrap().clear();
+        shared.coid_to_token.lock().unwrap().clear();
+
+        let event = PrivateEventDelta::classify(event).unwrap();
+        let routed = route_private_event_fast(&event, &shared).unwrap();
+        assert!(routed.is_empty());
+
+        // The cold path remains the durable validator and treats the replay
+        // as an owned no-op rather than reopening or reapplying the fill.
+        let cold = parse_user_event_with_health(event.payload(), &shared);
+        assert!(cold.valid_business_event);
+        assert!(!cold.invalid_business_event);
+        assert!(cold.updates.is_empty());
     }
 
     #[test]

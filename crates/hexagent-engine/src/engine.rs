@@ -8223,6 +8223,22 @@ impl Engine {
                             .account_state
                             .register_market_scope(&instance_id, scope);
                     }
+                    if maintenance_enabled {
+                        match crate::exchange::polymarket::wallet::recover_registered_account_maintenance_operations(
+                            &account_id,
+                            &shared.account_state,
+                        ) {
+                            Ok(0) => {}
+                            Ok(recovered) => info!(
+                                "[Engine] account={} startup maintenance finality recovery completed for {} operation(s)",
+                                account_id, recovered,
+                            ),
+                            Err(error) => warn!(
+                                "[Engine] account={} startup maintenance finality recovery remains unresolved: {}; account admission stays fail-closed",
+                                account_id, error,
+                            ),
+                        }
+                    }
                     info!(
                         "[Engine] Built Polymarket SharedState for account_id={} \
                          (first instance_id={} sig_type={} builder_code={})",

@@ -3836,6 +3836,26 @@ fn recover_pending_maintenance_operations(
     Ok(())
 }
 
+/// Run durable maintenance finality recovery during live-engine startup,
+/// before feeds and strategy workers are admitted. Returning the number of
+/// pending rows observed lets the engine distinguish a no-op preflight from
+/// a completed recovery transaction.
+pub fn recover_registered_account_maintenance_operations(
+    account_id: &str,
+    account: &hexagent_account::account::shared_account::SharedAccount,
+) -> Result<usize> {
+    if account_id.trim().is_empty() {
+        return Err(anyhow!("maintenance recovery requires account_id"));
+    }
+    let pending = account.pending_maintenance_operations().len();
+    if pending == 0 {
+        return Ok(0);
+    }
+    let wallet = load_wallet_for_account(account_id)?;
+    recover_pending_maintenance_operations(&wallet, account).map_err(anyhow::Error::msg)?;
+    Ok(pending)
+}
+
 /// Run one splitPosition for `condition_id` with `amount_usdc` USDC → equal
 /// shares of Up + Down tokens on that event. Only proceeds if the wallet's
 /// USDC balance is ≥ the requested amount.
