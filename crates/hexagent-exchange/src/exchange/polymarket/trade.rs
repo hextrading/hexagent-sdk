@@ -3,9 +3,12 @@
 //! Implements `ExchangeTrade` for submitting and canceling orders via the
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -61,6 +64,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
 const REQUEST_BUFFER_SLOTS: usize = 64;
 const REQUEST_BUFFER_BYTES: usize = 2_048;
+const RUNTIME_OWNERSHIP_SHARDS: usize = 64;
 
 fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
     let pool = Arc::new(ArrayQueue::new(REQUEST_BUFFER_SLOTS));
@@ -68,6 +72,78 @@ fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
         let _ = pool.push(BytesMut::with_capacity(REQUEST_BUFFER_BYTES));
     }
     pool
+}
+
+/// Read-mostly OID ownership publication used by the private owner actor.
+/// New-order workers touch one shard, while a private event performs one
+/// bounded read and never enters the aggregate account lifecycle lock.
+#[derive(Debug)]
+struct RuntimeOwnershipIndex {
+    shards: Box<[RwLock<HashMap<String, OrderOwnership>>]>,
+}
+
+impl RuntimeOwnershipIndex {
+    fn new() -> Self {
+        Self {
+            shards: (0..RUNTIME_OWNERSHIP_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn shard_index(order_id: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        order_id.hash(&mut hasher);
+        hasher.finish() as usize % RUNTIME_OWNERSHIP_SHARDS
+    }
+
+    fn lookup_key(order_id: &str) -> Cow<'_, str> {
+        let trimmed = order_id.trim();
+        let unprefixed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        if unprefixed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(unprefixed.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(unprefixed)
+        }
+    }
+
+    fn insert(&self, order_id: &str, ownership: OrderOwnership) {
+        let normalized = normalize_order_id(order_id);
+        self.shards[Self::shard_index(&normalized)]
+            .write()
+            .unwrap()
+            .insert(normalized, ownership);
+    }
+
+    fn get(&self, order_id: &str) -> Option<OrderOwnership> {
+        let normalized = Self::lookup_key(order_id);
+        self.shards[Self::shard_index(normalized.as_ref())]
+            .read()
+            .unwrap()
+            .get(normalized.as_ref())
+            .cloned()
+    }
+
+    fn remove(&self, order_id: &str) {
+        let normalized = Self::lookup_key(order_id);
+        self.shards[Self::shard_index(normalized.as_ref())]
+            .write()
+            .unwrap()
+            .remove(normalized.as_ref());
+    }
+
+    fn remove_client_orders(&self, client_order_ids: &HashSet<String>) {
+        for shard in &self.shards {
+            shard
+                .write()
+                .unwrap()
+                .retain(|_, ownership| !client_order_ids.contains(&ownership.client_order_id));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1754,7 +1830,7 @@ pub struct SharedState {
     /// runtime OID maps. It is a conservative repair root for the rare case
     /// where a cold snapshot replaces an instance lifecycle row before its
     /// asynchronous typed WAL delta is folded into the aggregate state.
-    runtime_order_ownership: Mutex<HashMap<String, OrderOwnership>>,
+    runtime_order_ownership: RuntimeOwnershipIndex,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -2223,9 +2299,7 @@ impl SharedState {
     ) {
         if let Some(ownership) = ownership {
             self.runtime_order_ownership
-                .lock()
-                .unwrap()
-                .insert(client_order_id.to_string(), ownership.clone());
+                .insert(exchange_order_id, ownership.clone());
         }
         let previous = self
             .coid_to_oid
@@ -2276,9 +2350,7 @@ impl SharedState {
             // publication and fail the submit closed instead of blocking the
             // execution actor or allowing an unpersistable live order.
             self.runtime_order_ownership
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
+                .remove(exchange_order_id);
             self.coid_to_oid.lock().unwrap().remove(client_order_id);
             self.oid_to_coid
                 .lock()
@@ -2664,21 +2736,13 @@ impl SharedState {
     }
 
     pub(crate) fn lookup_order_ownership(&self, exchange_order_id: &str) -> Option<OrderOwnership> {
-        let coid = self.lookup_coid(exchange_order_id)?;
         // Runtime routing is published before asynchronous durable ownership.
         // Private messages therefore never wait for the shared ledger writer.
-        if let Some(mirrored) = self
-            .runtime_order_ownership
-            .lock()
-            .unwrap()
-            .get(&coid)
-            .cloned()
-        {
-            return (normalize_order_id(&mirrored.order_id)
-                == normalize_order_id(exchange_order_id))
-            .then_some(mirrored);
+        if let Some(mirrored) = self.runtime_order_ownership.get(exchange_order_id) {
+            return Some(mirrored);
         }
         // Restart/cold-recovery fallback only.
+        let coid = self.lookup_coid(exchange_order_id)?;
         self.account_state
             .reconcile_order_route(&coid, exchange_order_id)
     }
@@ -3873,7 +3937,7 @@ impl PolymarketTrade {
         let mut recovered_coid_to_oid = HashMap::new();
         let mut recovered_oid_to_coid = HashMap::new();
         let mut recovered_coid_to_token = HashMap::new();
-        let mut recovered_runtime_ownership = HashMap::new();
+        let recovered_runtime_ownership = RuntimeOwnershipIndex::new();
         for order in &recovered_orders {
             // Restore terminal mappings too: a late private trade lifecycle
             // must still resolve to the placing instance after restart.
@@ -3888,8 +3952,8 @@ impl PolymarketTrade {
                 recovered_coid_to_token
                     .insert(order.client_order_id.clone(), order.token_id.clone());
             }
-            if !order.client_order_id.is_empty() {
-                recovered_runtime_ownership.insert(order.client_order_id.clone(), order.clone());
+            if !order.client_order_id.is_empty() && !order.order_id.is_empty() {
+                recovered_runtime_ownership.insert(&order.order_id, order.clone());
             }
             if matches!(
                 order.status,
@@ -3931,7 +3995,7 @@ impl PolymarketTrade {
                 open_orders: Mutex::new(recovered_open),
                 coid_to_oid: Mutex::new(recovered_coid_to_oid),
                 oid_to_coid: Mutex::new(recovered_oid_to_coid),
-                runtime_order_ownership: Mutex::new(recovered_runtime_ownership),
+                runtime_order_ownership: recovered_runtime_ownership,
                 coid_to_token: Mutex::new(recovered_coid_to_token),
                 order_lifecycle_traces: Mutex::new(HashMap::new()),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
@@ -5766,12 +5830,9 @@ impl PolymarketTrade {
                     traces.remove(coid);
                 }
             }
-            {
-                let mut ownership = shared.runtime_order_ownership.lock().unwrap();
-                for coid in &owned_coids {
-                    ownership.remove(coid);
-                }
-            }
+            shared
+                .runtime_order_ownership
+                .remove_client_orders(&owned_coids);
             let (ledger_orders, ledger_trades) = shared
                 .account_state
                 .prune_terminal_history_for_instance(&instance_id, &retired_tokens);

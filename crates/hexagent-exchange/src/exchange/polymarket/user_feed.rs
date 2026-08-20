@@ -737,13 +737,18 @@ fn classify_private_trade_role(
         .filter(|value| !value.is_empty());
     let has_owned_taker_order = top_level_maker_matches_account(data, shared)
         || taker_id.is_some_and(|order_id| {
-            shared.lookup_coid(order_id).is_some()
-                || shared.account_state.order_owner_by_oid(order_id).is_some()
-                || trade_id
-                    .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
-                    .is_some_and(|ownership| {
-                        normalize_order_id(&ownership.order_id) == normalize_order_id(order_id)
-                    })
+            // The live owner route uses the OID ownership publication only.
+            // A durable trade lookup takes an instance lifecycle lock and is
+            // needed solely for a compacted historical taker replay. In
+            // particular, never perform that cold lookup for a maker event.
+            shared.lookup_order_ownership(order_id).is_some()
+                || (!has_owned_maker_leg
+                    && trade_id
+                        .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
+                        .is_some_and(|ownership| {
+                            normalize_order_id(&ownership.order_id)
+                                == normalize_order_id(order_id)
+                        }))
         });
     match (has_owned_maker_leg, has_owned_taker_order) {
         (true, false) => Ok(PrivateTradeRole::Maker),
@@ -764,7 +769,7 @@ fn classify_private_trade_role(
 fn validate_trade_event(
     data: &serde_json::Value,
     shared: &SharedState,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<PrivateTradeRole, String> {
     required_string(data, &["id", "trade_id"], "id")?;
     let status = required_string(data, &["status"], "status")?;
     let status = status.strip_prefix("TRADE_STATUS_").unwrap_or(status);
@@ -776,7 +781,8 @@ fn validate_trade_event(
             "trade field `status` has unsupported value `{status}`"
         ));
     }
-    match classify_private_trade_role(data, shared)? {
+    let role = classify_private_trade_role(data, shared)?;
+    match role {
         PrivateTradeRole::Taker => {
             strict_side(required_string(data, &["side"], "side")?, "side")?;
             required_string(data, &["asset_id", "token_id"], "asset_id")?;
@@ -834,7 +840,7 @@ fn validate_trade_event(
             }
         }
     }
-    Ok(())
+    Ok(role)
 }
 
 fn close_enough(left: f64, right: f64) -> bool {
@@ -1593,7 +1599,7 @@ fn route_private_event_fast(
             }])
         }
         PrivateEventDelta::Trade(_) => {
-            validate_trade_event(data, shared)?;
+            let role = validate_trade_event(data, shared)?;
             let (status_name, status, rank) = private_status(data);
             if rank == 0 || status_name == "RETRYING" {
                 return Ok(Vec::new());
@@ -1613,7 +1619,7 @@ fn route_private_event_fast(
             let exchange_timestamp_ns = exchange_event_timestamp_ns(data);
             let failure_reason = private_failure_reason(data);
             let mut routed = Vec::new();
-            match classify_private_trade_role(data, shared)? {
+            match role {
                 PrivateTradeRole::Maker => {
                     for maker in data
                         .get("maker_orders")
