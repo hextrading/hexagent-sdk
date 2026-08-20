@@ -4815,11 +4815,76 @@ impl SharedAccount {
             });
             pruned |= instance.token_interests.len() != before;
         }
-        let interests = state
+        let mut interests: Vec<TokenInterest> = state
             .instances
             .values()
             .flat_map(|instance| instance.token_interests.values().cloned())
             .collect();
+        let mut known: HashSet<(String, String, String, String)> = interests
+            .iter()
+            .map(|interest| {
+                (
+                    interest.instance_id.clone(),
+                    interest.condition_id.clone(),
+                    interest.up_token_id.clone(),
+                    interest.down_token_id.clone(),
+                )
+            })
+            .collect();
+        // A recovered split can predate the strategy's durable event-interest
+        // registry. Keep its confirmed operation root as a read-only wallet
+        // query scope until both physical and virtual legs are observed at
+        // zero. This lets a later platform auto-redeem close historical
+        // inventory without resurrecting the event in strategy runtime state.
+        for operation in state
+            .maintenance_ops
+            .values()
+            .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+        {
+            let physical_outstanding = [&operation.up_token_id, &operation.down_token_id]
+                .into_iter()
+                .any(|token| {
+                    state
+                        .physical_positions
+                        .get(token)
+                        .is_some_and(|quantity| *quantity > EPS)
+                });
+            for instance_id in operation.allocations.keys() {
+                let Some(instance) = state.instances.get(instance_id) else {
+                    continue;
+                };
+                let virtual_outstanding = [&operation.up_token_id, &operation.down_token_id]
+                    .into_iter()
+                    .any(|token| {
+                        instance
+                            .positions
+                            .get(token)
+                            .is_some_and(|quantity| *quantity > EPS)
+                    });
+                let identity = (
+                    instance_id.clone(),
+                    operation.condition_id.clone(),
+                    operation.up_token_id.clone(),
+                    operation.down_token_id.clone(),
+                );
+                if (physical_outstanding || virtual_outstanding) && known.insert(identity) {
+                    interests.push(TokenInterest {
+                        instance_id: instance_id.clone(),
+                        condition_id: operation.condition_id.clone(),
+                        up_token_id: operation.up_token_id.clone(),
+                        down_token_id: operation.down_token_id.clone(),
+                        scope_key: instance
+                            .market_scopes
+                            .iter()
+                            .next()
+                            .filter(|_| instance.market_scopes.len() == 1)
+                            .cloned()
+                            .unwrap_or_default(),
+                        retire_after_ms: Some(0),
+                    });
+                }
+            }
+        }
         if pruned {
             self.schedule_persist(&state);
         }
@@ -12668,29 +12733,53 @@ fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: St
 /// restart snapshot.
 fn proven_binary_token_value(state: &SharedAccountState, token_id: &str) -> Option<(String, f64)> {
     let mut proof = None;
-    for interest in state
+    let mut mappings: Vec<(&str, &str, &str)> = state
         .instances
         .values()
         .flat_map(|instance| instance.token_interests.values())
         .filter(|interest| interest.up_token_id == token_id || interest.down_token_id == token_id)
-    {
+        .map(|interest| {
+            (
+                interest.condition_id.as_str(),
+                interest.up_token_id.as_str(),
+                interest.down_token_id.as_str(),
+            )
+        })
+        .collect();
+    mappings.extend(
+        state
+            .maintenance_ops
+            .values()
+            .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+            .filter(|operation| {
+                operation.up_token_id == token_id || operation.down_token_id == token_id
+            })
+            .map(|operation| {
+                (
+                    operation.condition_id.as_str(),
+                    operation.up_token_id.as_str(),
+                    operation.down_token_id.as_str(),
+                )
+            }),
+    );
+    for (condition_id, up_token_id, down_token_id) in mappings {
         let up = state
             .settled_token_values
-            .get(&interest.up_token_id)
+            .get(up_token_id)
             .copied()?;
         let down = state
             .settled_token_values
-            .get(&interest.down_token_id)
+            .get(down_token_id)
             .copied()?;
         if !((up == 1.0 && down == 0.0) || (up == 0.0 && down == 1.0)) {
             continue;
         }
-        let value = if interest.up_token_id == token_id {
+        let value = if up_token_id == token_id {
             up
         } else {
             down
         };
-        let candidate = (interest.condition_id.clone(), value);
+        let candidate = (condition_id.to_string(), value);
         if proof
             .as_ref()
             .is_some_and(|existing| existing != &candidate)
@@ -15353,7 +15442,15 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .unwrap();
         let before_confirmation = account.lock_state().clone();
         account.confirm_maintenance_operation(operation_id).unwrap();
-        let after_confirmation = account.lock_state().clone();
+        let mut after_confirmation = account.lock_state().clone();
+        // The original live incident was recovered after the strategy had
+        // already pruned this historical event from its interest registry.
+        after_confirmation
+            .instances
+            .get_mut("btc")
+            .unwrap()
+            .token_interests
+            .clear();
 
         write_persisted_account(
             &path,
@@ -15388,6 +15485,14 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let restored = SharedAccount::new_persistent(account_id, &path).unwrap();
         assert_eq!(restored.instance_snapshot("btc").unwrap().cash, 75.0);
         assert_eq!(restored.instance_snapshot("btc").unwrap().positions["WIN"], 25.0);
+        let recovered_scope = restored
+            .token_interests()
+            .into_iter()
+            .find(|interest| interest.condition_id == "historical-event")
+            .unwrap();
+        assert_eq!(recovered_scope.up_token_id, "WIN");
+        assert_eq!(recovered_scope.down_token_id, "LOSE");
+        assert_eq!(recovered_scope.retire_after_ms, Some(0));
         restored.record_settled_token_values(&HashMap::from([
             ("WIN".into(), 1.0),
             ("LOSE".into(), 0.0),
