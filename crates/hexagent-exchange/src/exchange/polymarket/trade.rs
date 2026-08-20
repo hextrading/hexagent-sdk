@@ -428,8 +428,6 @@ fn preflight_rejection_reason_code(reason: &str) -> &'static str {
         "balance_backoff"
     } else if reason == "invalid token backoff" {
         "invalid_token_backoff"
-    } else if reason.starts_with("shared-account admission:") {
-        "account_admission"
     } else if reason.starts_with("body serialize:") {
         "serialization"
     } else if reason.contains("sign") || reason.contains("signature") {
@@ -1259,6 +1257,12 @@ struct FilledCleanupJob {
     enqueued_ns: u64,
 }
 
+#[derive(Debug)]
+enum AccountMaintenanceJob {
+    PersistOwnership(OrderOwnership),
+    FilledCleanup(FilledCleanupJob),
+}
+
 async fn send_and_drain(
     request: reqwest::RequestBuilder,
 ) -> std::result::Result<u16, reqwest::Error> {
@@ -1494,23 +1498,27 @@ fn http_reply_enqueue_stage(role: crate::http1_pool::Role) -> &'static str {
 /// per-request latency CSV (`latency_record`). Returns `None` for
 /// everything else (heartbeat, reconcile GET, …) so the record stays
 /// focused on order placement + cancellation latency.
-fn latency_record_kind(method: &str, path: &str) -> Option<&'static str> {
+fn latency_record_kind(method: &str, path: &str) -> Option<crate::latency_record::RequestKind> {
+    use crate::latency_record::RequestKind;
     match (method, path) {
-        ("POST", "/order") | ("POST", "/orders") => Some("place"),
-        ("DELETE", "/order") | ("DELETE", "/orders") | ("DELETE", "/cancel-all") => Some("cancel"),
+        ("POST", "/order") | ("POST", "/orders") => Some(RequestKind::Place),
+        ("DELETE", "/order") | ("DELETE", "/orders") | ("DELETE", "/cancel-all") => {
+            Some(RequestKind::Cancel)
+        }
         _ => None,
     }
 }
 
 /// Map an HTTP reply to the `status` column of the latency CSV.
-fn latency_record_status(reply: &HttpReply) -> String {
+fn latency_record_status(reply: &HttpReply) -> crate::latency_record::RequestStatus {
+    use crate::latency_record::RequestStatus;
     match reply {
-        Ok(_) => "ok".to_string(),
-        Err(HttpErr::Timeout) => "timeout".to_string(),
-        Err(HttpErr::Status(code, _)) => format!("http_{}", code),
-        Err(HttpErr::Transport(_)) => "transport_error".to_string(),
-        Err(HttpErr::InvalidResponse(_)) => "invalid_response".to_string(),
-        Err(HttpErr::Other(_)) => "error".to_string(),
+        Ok(_) => RequestStatus::Ok,
+        Err(HttpErr::Timeout) => RequestStatus::Timeout,
+        Err(HttpErr::Status(code, _)) => RequestStatus::Http(*code),
+        Err(HttpErr::Transport(_)) => RequestStatus::TransportError,
+        Err(HttpErr::InvalidResponse(_)) => RequestStatus::InvalidResponse,
+        Err(HttpErr::Other(_)) => RequestStatus::Error,
     }
 }
 
@@ -1913,7 +1921,7 @@ pub struct SharedState {
     /// Terminal executor bookkeeping can acquire several audit/runtime locks.
     /// Private account-apply only enqueues the coid; a background worker owns
     /// the readiness check and final teardown.
-    filled_cleanup_tx: crossbeam_channel::Sender<FilledCleanupJob>,
+    account_maintenance_tx: crossbeam_channel::Sender<AccountMaintenanceJob>,
 }
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
@@ -2097,22 +2105,56 @@ impl SharedState {
         let _ = self.settled_gc_tx.try_send(());
     }
 
-    fn spawn_filled_cleanup_worker(
+    fn spawn_account_maintenance_worker(
         shared: &Arc<Self>,
-        rx: crossbeam_channel::Receiver<FilledCleanupJob>,
+        rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
     ) {
         let weak = Arc::downgrade(shared);
         let _ = std::thread::Builder::new()
-            .name(format!("poly-filled-cleanup-{}", shared.instance_id))
+            .name(format!("poly-account-maint-{}", shared.instance_id))
             .spawn(move || {
-                crate::os_tune::pin_background("polymarket-filled-cleanup");
+                crate::os_tune::pin_background("polymarket-account-maintenance");
                 while let Ok(job) = rx.recv() {
                     let Some(shared) = weak.upgrade() else { break };
-                    crate::latency::record_ns(
-                        "polymarket.user.filled_cleanup_queue",
-                        now_ns().saturating_sub(job.enqueued_ns),
-                    );
-                    shared.finish_filled_order_if_audited(&job.client_order_id);
+                    match job {
+                        AccountMaintenanceJob::FilledCleanup(job) => {
+                            crate::latency::record_ns(
+                                "polymarket.user.filled_cleanup_queue",
+                                now_ns().saturating_sub(job.enqueued_ns),
+                            );
+                            shared.finish_filled_order_if_audited(&job.client_order_id);
+                        }
+                        AccountMaintenanceJob::PersistOwnership(ownership) => {
+                            let mut batch = Vec::with_capacity(64);
+                            batch.push(ownership);
+                            while batch.len() < 256 {
+                                match rx.try_recv() {
+                                    Ok(AccountMaintenanceJob::PersistOwnership(ownership)) => {
+                                        batch.push(ownership);
+                                    }
+                                    Ok(AccountMaintenanceJob::FilledCleanup(job)) => {
+                                        shared.finish_filled_order_if_audited(
+                                            &job.client_order_id,
+                                        );
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            for ownership in batch {
+                                if shared
+                                    .account_state
+                                    .backfill_order_ownership(&ownership)
+                                    .is_none()
+                                {
+                                    shared.user_feed_health.set_inventory_uncertain(true);
+                                    log::error!(
+                                        "[PolymarketTrade] async ownership persistence conflict coid={} oid={}",
+                                        ownership.client_order_id, ownership.order_id,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             });
     }
@@ -2125,7 +2167,10 @@ impl SharedState {
             client_order_id: client_order_id.to_string(),
             enqueued_ns: now_ns(),
         };
-        if let Err(error) = self.filled_cleanup_tx.try_send(job) {
+        if let Err(error) = self
+            .account_maintenance_tx
+            .try_send(AccountMaintenanceJob::FilledCleanup(job))
+        {
             warn!(
                 "[PolymarketTrade] filled cleanup queue unavailable; reconcile will retain coid safely: {}",
                 error,
@@ -2169,16 +2214,44 @@ impl SharedState {
     }
 
     /// Install the deterministic local signing hash in runtime lookup maps.
-    /// `reserve_order` has already persisted this exact OID, so re-entering
-    /// account rebind here would only repeat lifecycle locking before POST.
+    /// The ownership recorder has already persisted this exact OID, so
+    /// re-entering account rebind here would repeat lifecycle locking.
     fn register_local_order_id(
         &self,
         client_order_id: &str,
         exchange_order_id: &str,
         token: &str,
-        ownership: Option<&OrderOwnership>,
-    ) {
-        self.install_runtime_order_id(client_order_id, exchange_order_id, token, ownership);
+        ownership: Option<OrderOwnership>,
+    ) -> Result<(), String> {
+        self.install_runtime_order_id(
+            client_order_id,
+            exchange_order_id,
+            token,
+            ownership.as_ref(),
+        );
+        let Some(ownership) = ownership else {
+            return Ok(());
+        };
+        if let Err(error) = self
+            .account_maintenance_tx
+            .try_send(AccountMaintenanceJob::PersistOwnership(ownership))
+        {
+            // No HTTP request has been dispatched yet. Roll back the local
+            // publication and fail the submit closed instead of blocking the
+            // execution actor or allowing an unpersistable live order.
+            self.runtime_order_ownership
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+            self.coid_to_oid.lock().unwrap().remove(client_order_id);
+            self.oid_to_coid
+                .lock()
+                .unwrap()
+                .remove(&normalize_order_id(exchange_order_id));
+            self.coid_to_token.lock().unwrap().remove(client_order_id);
+            return Err(format!("ownership persistence queue unavailable: {error}"));
+        }
+        Ok(())
     }
 
     pub(crate) fn register_order_lifecycle(&self, order: &OrderRequest) {
@@ -2295,12 +2368,12 @@ impl SharedState {
                     segment_name = "submit_prep_to_signed";
                     trace.submit_prep_ns
                 }
-                "account_reserved" => {
-                    segment_name = "signed_to_account_reserved";
+                "account_recorded" => {
+                    segment_name = "signed_to_account_recorded";
                     trace.signed_ns
                 }
                 "http_dispatched" => {
-                    segment_name = "account_reserved_to_http_dispatch";
+                    segment_name = "account_recorded_to_http_dispatch";
                     trace.account_reserved_ns
                 }
                 "http_response" => {
@@ -2327,7 +2400,7 @@ impl SharedState {
             match stage {
                 "submit_prep" => trace.submit_prep_ns = stage_ns,
                 "signed" => trace.signed_ns = stage_ns,
-                "account_reserved" => trace.account_reserved_ns = stage_ns,
+                "account_recorded" => trace.account_reserved_ns = stage_ns,
                 "http_dispatched" => trace.http_dispatched_ns = stage_ns,
                 "cancel_prep" => trace.cancel_prep_ns = stage_ns,
                 "cancel_dispatched" => trace.cancel_dispatched_ns = stage_ns,
@@ -2341,10 +2414,10 @@ impl SharedState {
             "submit_prep_to_signed" => {
                 crate::latency::record_ns("polymarket.order.prep_to_signed", segment_ns)
             }
-            "signed_to_account_reserved" => {
+            "signed_to_account_recorded" => {
                 crate::latency::record_ns("polymarket.order.signed_to_reserve", segment_ns)
             }
-            "account_reserved_to_http_dispatch" => {
+            "account_recorded_to_http_dispatch" => {
                 crate::latency::record_ns("polymarket.order.reserve_to_http_dispatch", segment_ns)
             }
             "http_dispatch_to_response" => {
@@ -2510,22 +2583,22 @@ impl SharedState {
 
     pub(crate) fn lookup_order_ownership(&self, exchange_order_id: &str) -> Option<OrderOwnership> {
         let coid = self.lookup_coid(exchange_order_id)?;
-        if let Some(order) = self
-            .account_state
-            .reconcile_order_route(&coid, exchange_order_id)
-        {
-            return Some(order);
-        }
-        let mirrored = self
+        // Runtime routing is published before asynchronous durable ownership.
+        // Private messages therefore never wait for the shared ledger writer.
+        if let Some(mirrored) = self
             .runtime_order_ownership
             .lock()
             .unwrap()
             .get(&coid)
-            .cloned()?;
-        if normalize_order_id(&mirrored.order_id) != normalize_order_id(exchange_order_id) {
-            return None;
+            .cloned()
+        {
+            return (normalize_order_id(&mirrored.order_id)
+                == normalize_order_id(exchange_order_id))
+            .then_some(mirrored);
         }
-        self.account_state.backfill_order_ownership(&mirrored)
+        // Restart/cold-recovery fallback only.
+        self.account_state
+            .reconcile_order_route(&coid, exchange_order_id)
     }
 
     /// Complete account-global settled-audit cleanup only after the durable
@@ -3161,7 +3234,7 @@ impl SharedState {
         method: &str,
         path: &str,
         body: &str,
-        rec_kind_override: Option<&'static str>,
+        rec_kind_override: Option<crate::latency_record::RequestKind>,
     ) -> crossbeam_channel::Receiver<HttpReply> {
         let method = match method {
             "POST" => reqwest::Method::POST,
@@ -3380,7 +3453,7 @@ impl SharedState {
         method: &str,
         path: &str,
         body: &str,
-        rec_kind_override: Option<&'static str>,
+        rec_kind_override: Option<crate::latency_record::RequestKind>,
     ) -> HttpReply {
         self.http_call_async_rec(method, path, body, rec_kind_override)
             .recv()
@@ -3710,7 +3783,8 @@ impl PolymarketTrade {
         }
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
-        let (filled_cleanup_tx, filled_cleanup_rx) = crossbeam_channel::bounded(16_384);
+        let (account_maintenance_tx, account_maintenance_rx) =
+            crossbeam_channel::bounded(16_384);
         let shared = Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
                 account_state,
@@ -3759,13 +3833,13 @@ impl PolymarketTrade {
                 cancel_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
                 settled_gc_tx,
-                filled_cleanup_tx,
+                account_maintenance_tx,
             });
         SharedState::spawn_settled_gc_worker(&shared, settled_gc_rx);
         // Resume a durable zero-reference cleanup request without waiting for
         // an unrelated private trade to provide the first wake after restart.
         shared.request_settled_gc();
-        SharedState::spawn_filled_cleanup_worker(&shared, filled_cleanup_rx);
+        SharedState::spawn_account_maintenance_worker(&shared, account_maintenance_rx);
         Ok(Self {
             shared,
             owner: api_key.to_string(),
@@ -5521,9 +5595,7 @@ impl PolymarketTrade {
         let instance_id = self.instance_id.clone();
         let owned_condition_id = condition_id.to_string();
         let asset_ids = asset_ids.to_vec();
-        let thread_name = format!("settled-gc-{}", instance_id);
-        if let Err(error) = std::thread::Builder::new().name(thread_name).spawn(move || {
-            hexagent_runtime::os_tune::pin_background("polymarket-settled-gc");
+        if let Err(error) = hexagent_runtime::background_jobs::try_submit(move || {
             let owned_coids: HashSet<String> = shared
                 .account_state
                 .orders()
@@ -5581,7 +5653,7 @@ impl PolymarketTrade {
             );
         }) {
             warn!(
-                "[PolymarketTrade] cannot spawn settled GC instance={} condition={}: {}",
+                "[PolymarketTrade] cannot enqueue settled GC instance={} condition={}: {}",
                 self.instance_id, condition_id, error,
             );
         }
@@ -7069,30 +7141,25 @@ impl PolymarketTrade {
         update
     }
 
-    /// Synchronous prep for a place: rate/balance gate, sign, register the
+    /// Synchronous prep for a place: rate/backoff gate, sign, register the
     /// orderID + `open_orders` entry, and return `(local_oid, body_json)`.
     /// Split out of `submit_kickoff` so the kickoff path can prep then
     /// dispatch separately. Returns the synthetic `OrderUpdate` on a
     /// pre-flight reject (rate-limit / backoff / sign).
-    fn reserve_account_order(
+    fn record_account_order(
         &self,
         order: &OrderRequest,
         local_oid: &str,
     ) -> std::result::Result<Option<OrderOwnership>, OrderUpdate> {
-        // CLI/legacy one-off routes have no strategy instance and therefore
-        // no virtual allocation. Engine-built routes are always registered
-        // in the shared account before strategy startup.
+        // CLI/legacy one-off routes have no strategy instance. Engine-built
+        // routes record durable ownership for private-feed routing/recovery,
+        // but balance and inventory admission belong to StrategyAccount.
         if self.instance_id.is_empty() {
             return Ok(None);
         }
-        let reserve = if order.post_only
-            && !matches!(
-                order.order_type,
-                crate::types::OrderType::Market
-                    | crate::types::OrderType::Fak
-                    | crate::types::OrderType::Fok
-            ) {
-            self.shared.account_state.reserve_passive_order(
+        self.shared
+            .account_state
+            .prepare_order_ownership(
                 &self.instance_id,
                 &order.client_order_id,
                 local_oid,
@@ -7102,21 +7169,10 @@ impl PolymarketTrade {
                 order.price.unwrap_or(0.0),
                 order.fee_rate_bps,
             )
-        } else {
-        self.shared.account_state.reserve_order(
-            &self.instance_id,
-            &order.client_order_id,
-            local_oid,
-            &order.symbol,
-            order.side,
-            order.quantity,
-            order.price.unwrap_or(0.0),
-            order.fee_rate_bps,
-            )
-        };
-        reserve.map(Some).map_err(|error| {
-            Self::make_rejected(order, &format!("shared-account admission: {error}"))
-        })
+            .map(Some)
+            .map_err(|error| {
+                Self::make_rejected(order, &format!("order ownership registration: {error}"))
+            })
     }
 
     pub(crate) fn submit_prep(
@@ -7164,20 +7220,22 @@ impl PolymarketTrade {
                 ))
             }
         };
-        let ownership = self.reserve_account_order(order, &local_oid)?;
+        let ownership = self.record_account_order(order, &local_oid)?;
         self.shared.log_order_lifecycle(
             &order.client_order_id,
-            "account_reserved",
+            "account_recorded",
             Some(&local_oid),
             Some(OrderStatus::Pending),
             None,
         );
-        self.shared.register_local_order_id(
+        if let Err(error) = self.shared.register_local_order_id(
             &order.client_order_id,
             &local_oid,
             &order.symbol,
-            ownership.as_ref(),
-        );
+            ownership,
+        ) {
+            return Err(Self::make_rejected(order, &error));
+        }
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
         // point on the order may already be live on the server (a
         // POST landing but its reply timing out leaves an orphan-place
@@ -7971,7 +8029,7 @@ impl ExchangeTrade for PolymarketTrade {
                             None,
                         );
                         let b = serde_json::to_value(&b).unwrap_or_default();
-                        let ownership = match self.reserve_account_order(o, &order_hash) {
+                        let ownership = match self.record_account_order(o, &order_hash) {
                             Ok(ownership) => ownership,
                             Err(rejected) => {
                             self.shared.log_preflight_rejected(
@@ -7986,7 +8044,7 @@ impl ExchangeTrade for PolymarketTrade {
                         };
                         self.shared.log_order_lifecycle(
                             &o.client_order_id,
-                            "account_reserved",
+                            "account_recorded",
                             Some(&order_hash),
                             Some(OrderStatus::Pending),
                             None,
@@ -7996,12 +8054,22 @@ impl ExchangeTrade for PolymarketTrade {
                         // open_orders insert as `submit_kickoff` —
                         // makes the map the single source of truth
                         // for "may be live on the server".
-                        self.shared.register_local_order_id(
+                        if let Err(error) = self.shared.register_local_order_id(
                             &o.client_order_id,
                             &order_hash,
                             &o.symbol,
-                            ownership.as_ref(),
-                        );
+                            ownership,
+                        ) {
+                            let rejected = Self::make_rejected(o, &error);
+                            self.shared.log_preflight_rejected(
+                                &o.client_order_id,
+                                Some(&order_hash),
+                                &rejected,
+                            );
+                            self.shared.forget_order_lifecycle(&o.client_order_id);
+                            all_updates.push(rejected);
+                            continue;
+                        }
                         self.shared.open_orders.lock().unwrap().insert(
                             o.client_order_id.clone(),
                             TrackedOrder {
@@ -8774,7 +8842,7 @@ impl ExchangeTrade for PolymarketTrade {
                         None,
                     );
                     let b = serde_json::to_value(&b).unwrap_or_default();
-                    let ownership = match self.reserve_account_order(o, &order_hash) {
+                    let ownership = match self.record_account_order(o, &order_hash) {
                         Ok(ownership) => ownership,
                         Err(rejected) => {
                         self.shared.log_preflight_rejected(
@@ -8789,17 +8857,27 @@ impl ExchangeTrade for PolymarketTrade {
                     };
                     self.shared.log_order_lifecycle(
                         &o.client_order_id,
-                        "account_reserved",
+                        "account_recorded",
                         Some(&order_hash),
                         Some(OrderStatus::Pending),
                         None,
                     );
-                    self.shared.register_local_order_id(
+                    if let Err(error) = self.shared.register_local_order_id(
                         &o.client_order_id,
                         &order_hash,
                         &o.symbol,
-                        ownership.as_ref(),
-                    );
+                        ownership,
+                    ) {
+                        let rejected = Self::make_rejected(o, &error);
+                        self.shared.log_preflight_rejected(
+                            &o.client_order_id,
+                            Some(&order_hash),
+                            &rejected,
+                        );
+                        self.shared.forget_order_lifecycle(&o.client_order_id);
+                        place_sign_failures.push(rejected);
+                        continue;
+                    }
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share
                     // the "open_orders = may be on server" invariant.
@@ -9925,10 +10003,6 @@ mod tests {
         assert_eq!(
             preflight_rejection_reason_code("rate limited"),
             "rate_limit"
-        );
-        assert_eq!(
-            preflight_rejection_reason_code("shared-account admission: cash exhausted"),
-            "account_admission"
         );
         assert_eq!(
             preflight_rejection_reason_code("invalid token backoff"),

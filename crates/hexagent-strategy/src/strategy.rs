@@ -33,6 +33,13 @@ pub trait Strategy: Send {
     fn on_trade_tick(&mut self, _trade: &TradeTick) {}
     fn on_quote_tick(&mut self, _quote: &QuoteTick) {}
     fn on_quote(&mut self, _ts_event: u64) -> Vec<Signal> { Vec::new() }
+    /// Allocation-aware quote callback. Engines keep `out` capacity across
+    /// ticks; latency-sensitive strategies should override this method and
+    /// append directly. The default preserves source compatibility while
+    /// older implementations migrate away from returning a fresh `Vec`.
+    fn on_quote_into(&mut self, ts_event: u64, out: &mut Vec<Signal>) {
+        out.extend(self.on_quote(ts_event));
+    }
     fn quote_interval_ms(&self) -> u64 { 0 }
     /// When true, only Binance OrderBook events drive the quote cadence;
     /// other venues' OrderBooks update internal state but don't trigger

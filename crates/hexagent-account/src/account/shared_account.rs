@@ -5865,8 +5865,104 @@ impl SharedAccount {
         })
     }
 
+    /// Record order ownership without performing account admission.
+    ///
+    /// The strategy instance owns its balance/inventory admission and pending
+    /// reservations. The execution layer retains this durable mirror only so
+    /// authenticated order/trade messages can be routed and replayed after a
+    /// restart. Nominal reservations are recorded for recovery, but they are
+    /// never compared with shared cash or inventory here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_order_ownership(
+        &self,
+        instance_id: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        fee_rate_bps: u32,
+    ) -> Result<OrderOwnership, ReservationError> {
+        if instance_id.is_empty()
+            || client_order_id.is_empty()
+            || order_id.is_empty()
+            || token_id.is_empty()
+            || !quantity.is_finite()
+            || quantity <= 0.0
+            || !price.is_finite()
+            || price <= 0.0
+        {
+            return Err(ReservationError::InvalidOrder(
+                "instance/coid/oid/token must be present and quantity/price must be positive"
+                    .into(),
+            ));
+        }
+        let reserved_cash = if side == Side::Buy {
+            quantity * price * (1.0 + fee_rate_bps as f64 / 10_000.0)
+        } else {
+            0.0
+        };
+        if !reserved_cash.is_finite() {
+            return Err(ReservationError::InvalidOrder(
+                "order reservation is not finite".into(),
+            ));
+        }
+        let reserved_quantity = if side == Side::Sell { quantity } else { 0.0 };
+        let ownership = OrderOwnership {
+            account_id: self.account_id.clone(),
+            instance_id: instance_id.to_string(),
+            client_order_id: client_order_id.to_string(),
+            order_id: order_id.to_string(),
+            token_id: token_id.to_string(),
+            side,
+            quantity,
+            filled_quantity: 0.0,
+            terminal_matched_quantity: None,
+            terminal_trade_ids: Vec::new(),
+            terminal_trade_ids_authoritative: false,
+            price,
+            fee_rate_bps,
+            reserved_cash,
+            reserved_quantity,
+            status: OrderStatus::Pending,
+        };
+        Ok(ownership)
+    }
+
+    /// Compatibility entry point for cold/legacy callers. Live execution uses
+    /// [`Self::prepare_order_ownership`] and publishes the returned typed row
+    /// to its single-writer persistence actor after installing local routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_order_without_admission(
+        &self,
+        instance_id: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        fee_rate_bps: u32,
+    ) -> Result<OrderOwnership, ReservationError> {
+        let ownership = self.prepare_order_ownership(
+            instance_id,
+            client_order_id,
+            order_id,
+            token_id,
+            side,
+            quantity,
+            price,
+            fee_rate_bps,
+        )?;
+        self.backfill_order_ownership(&ownership).ok_or_else(|| {
+            ReservationError::DuplicateClientOrderId(client_order_id.to_string())
+        })
+    }
+
     /// Reserve an order and bind both locally-known identifiers before the
-    /// network POST. This is the account-wide admission-control gate.
+    /// network POST. This legacy account-wide admission API remains available
+    /// to callers that explicitly need shared-wallet arbitration.
     pub fn reserve_order(
         &self,
         instance_id: &str,
@@ -12400,6 +12496,26 @@ mod tests {
             1_490.390_728,
         );
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn ownership_recording_bypasses_shared_cash_limit() {
+        let account = seeded_account();
+        let ownership = account
+            .record_order_without_admission(
+                "a",
+                "a-local",
+                "oid-local",
+                "UP",
+                Side::Buy,
+                1_000.0,
+                1.0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(ownership.reserved_cash, 1_000.0);
+        assert_eq!(account.order_owner_by_oid("oid-local").as_deref(), Some("a"));
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 1_000.0);
     }
 
     #[test]

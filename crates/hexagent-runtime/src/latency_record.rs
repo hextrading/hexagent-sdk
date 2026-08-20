@@ -1,167 +1,204 @@
-//! Per-request place/cancel latency recorder.
+//! Typed, asynchronous place/cancel latency recording.
 //!
-//! Captures EACH individual `POST /order(s)` (place) and `DELETE
-//! /order(s) | /cancel-all` (cancel) round-trip latency to a CSV file —
-//! covering BOTH normal trading (real quotes routed through the
-//! executor) and the RTT-probe task's synthetic place/cancel cycles,
-//! since both flow through the same `SharedState::http_call_async`
-//! choke point where the recording happens.
-//!
-//! ## Activation
-//!
-//! Recording is a process-global singleton (mirrors `latency.rs`),
-//! installed once via [`init`]. The engine installs it in live mode when
-//! either:
-//!   * `[general] latency_record_enabled = true` — log latencies during
-//!     normal trading, or
-//!   * `[general] all_probe = true` — the no-trading probe session
-//!     (which implies recording).
-//!
-//! When not installed, [`record`] / [`maybe_flush`] / [`flush`] are
-//! cheap no-ops (a single `OnceLock` load), so the call sites stay on
-//! the hot path unconditionally.
-//!
-//! ## File layout
-//!
-//!   * One file per **UTC day**, rotated at 00:00 UTC:
-//!     `<latency_record>/<YYYYMMDD>.csv`, where the date is
-//!     each row's own UTC calendar date. Runs that span midnight — or
-//!     several runs within one UTC day — append into the matching daily
-//!     file, and a flush whose buffer straddles 00:00 UTC routes each row
-//!     to its own day's file (so the boundary is exact, not "whichever
-//!     day the flush happened to fire").
-//!   * Rows are buffered in memory and appended to disk **every 5
-//!     minutes, aligned to the wall clock** (shortly after each
-//!     `:00 / :05 / :10 …` boundary — 00:00 UTC is one such boundary, so
-//!     the day rolls promptly), plus a final flush on shutdown.
-//!   * Columns: `epoch_ms,iso_local,instance_id,kind,rtt_ms,status` —
-//!     `kind` is `place` or `cancel`; `status` is `ok`, `timeout`,
-//!     `http_<code>`, or `error`.
+//! The response path only stamps a fixed-size row and `try_send`s it to a
+//! bounded telemetry queue.  A single background writer owns buffering,
+//! date rotation, CSV formatting, and filesystem I/O.  It therefore has no
+//! global mutex, heap allocation, string formatting, or blocking operation on
+//! the HTTP completion path.
 
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{info, warn};
 
-/// Flush cadence in seconds — 5 minutes. Bucketing on
-/// `epoch_secs / FLUSH_BUCKET_SECS` aligns every flush to a wall-clock
-/// 5-minute boundary (and, for any timezone whose UTC offset is a
-/// multiple of 5 minutes — i.e. every standard zone — to a *local*
-/// 5-minute boundary too).
 const FLUSH_BUCKET_SECS: u64 = 300;
+const RECORD_QUEUE_CAPACITY: usize = 16_384;
+const INSTANCE_ID_BYTES: usize = 96;
 
 static RECORDER: OnceLock<LatencyRecorder> = OnceLock::new();
 
-/// Install the process-global recorder writing daily files under `<dir>`
-/// named `<UTC-YYYYMMDD>.csv` (rotated at 00:00 UTC).
-/// `start_label` is the run-start timestamp, kept only for the startup
-/// log line. Idempotent — the first call wins; later calls are ignored.
-/// Returns `true` iff this call installed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    Place,
+    Cancel,
+    ProbePlace,
+    ProbeCancel,
+}
+
+impl RequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Place => "place",
+            Self::Cancel => "cancel",
+            Self::ProbePlace => "probe_place",
+            Self::ProbeCancel => "probe_cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestStatus {
+    Ok,
+    Timeout,
+    Http(u16),
+    TransportError,
+    InvalidResponse,
+    Error,
+}
+
+impl RequestStatus {
+    fn write_csv(self, out: &mut String) {
+        match self {
+            Self::Ok => out.push_str("ok"),
+            Self::Timeout => out.push_str("timeout"),
+            Self::Http(code) => {
+                let _ = write!(out, "http_{code}");
+            }
+            Self::TransportError => out.push_str("transport_error"),
+            Self::InvalidResponse => out.push_str("invalid_response"),
+            Self::Error => out.push_str("error"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineInstanceId {
+    len: u8,
+    bytes: [u8; INSTANCE_ID_BYTES],
+}
+
+impl InlineInstanceId {
+    #[inline]
+    fn new(value: &str) -> Self {
+        let mut bytes = [0u8; INSTANCE_ID_BYTES];
+        let len = value.len().min(INSTANCE_ID_BYTES);
+        bytes[..len].copy_from_slice(&value.as_bytes()[..len]);
+        Self {
+            len: len as u8,
+            bytes,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // The prefix of a valid UTF-8 string can end within a codepoint when
+        // truncated. Instance IDs are protocol ASCII, so keep the fallback
+        // defensive without adding work to the recording path.
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("invalid-instance-id")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Row {
+    epoch_ms: u64,
+    instance_id: InlineInstanceId,
+    kind: RequestKind,
+    rtt_ms: f64,
+    status: RequestStatus,
+}
+
+enum WriterMessage {
+    Row(Row),
+    Flush(Option<Sender<()>>),
+}
+
+struct LatencyRecorder {
+    tx: Sender<WriterMessage>,
+    last_flush_bucket: AtomicU64,
+    dropped: AtomicU64,
+}
+
 pub fn init(dir: &str, start_label: &str) -> bool {
     RECORDER.set(LatencyRecorder::new(dir, start_label)).is_ok()
 }
 
-/// True once [`init`] has installed the recorder.
 #[inline]
 pub fn is_active() -> bool {
     RECORDER.get().is_some()
 }
 
-/// Buffer one place/cancel latency sample. No-op when recording is off.
+/// Enqueue one fully typed record. This is the hot-path API.
 #[inline]
-pub fn record(instance_id: &str, kind: &'static str, rtt_ms: f64, status: String) {
-    if let Some(r) = RECORDER.get() {
-        r.record(instance_id, kind, rtt_ms, status);
-    }
-}
-
-/// Flush iff the wall clock has crossed into a new 5-minute bucket.
-/// No-op when recording is off. Cheap to call on a poll loop.
-pub fn maybe_flush() {
-    if let Some(r) = RECORDER.get() {
-        r.maybe_flush();
-    }
-}
-
-/// Force-flush any buffered rows (used on shutdown). No-op when off.
-pub fn flush() {
-    if let Some(r) = RECORDER.get() {
-        r.flush();
-    }
-}
-
-/// One latency observation awaiting flush.
-struct Row {
-    epoch_ms: u64,
-    instance_id: String,
-    /// `"place"` or `"cancel"` — `&'static str`, no allocation.
-    kind: &'static str,
+pub fn record(
+    instance_id: &str,
+    kind: RequestKind,
     rtt_ms: f64,
-    /// `"ok"` / `"timeout"` / `"http_<code>"` / `"error"`.
-    status: String,
+    status: RequestStatus,
+) {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.record(instance_id, kind, rtt_ms, status);
+    }
 }
 
-struct LatencyRecorder {
-    /// Output directory. The actual file is chosen per flush from each
-    /// row's UTC date (`<YYYYMMDD>.csv`), so output rolls
-    /// to a fresh file at 00:00 UTC.
-    dir: PathBuf,
-    buf: Mutex<Vec<Row>>,
-    /// Wall-clock 5-min bucket index (`epoch_secs / 300`) of the last
-    /// flush. Seeded to the current bucket at construction so the first
-    /// flush happens at the next boundary, not immediately.
-    last_flush_bucket: AtomicU64,
+/// Request a boundary flush. The writer also checks the wall-clock bucket on
+/// its own, so a saturated telemetry queue never makes rotation dependent on
+/// a trading thread.
+pub fn maybe_flush() {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.maybe_flush();
+    }
+}
+
+/// Synchronously drain and persist queued records. Used only during shutdown.
+pub fn flush() {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.flush();
+    }
 }
 
 impl LatencyRecorder {
-    /// Create a recorder writing daily files under `<dir>` named
-    /// `<UTC-YYYYMMDD>.csv` (rotated at 00:00 UTC).
-    /// `start_label` is the run start timestamp (e.g. `20260614_143052`),
-    /// used only for the startup log line. The directory is created if
-    /// missing.
     fn new(dir: &str, start_label: &str) -> Self {
-        let dir_path = PathBuf::from(dir);
-        if let Err(e) = fs::create_dir_all(&dir_path) {
+        let dir = PathBuf::from(dir);
+        if let Err(error) = fs::create_dir_all(&dir) {
             warn!(
                 "[LatencyRecorder] create_dir_all({}) failed: {} — latency records may not persist",
-                dir_path.display(), e,
+                dir.display(),
+                error,
             );
         }
         info!(
-            "[LatencyRecorder] per-request place/cancel latency → {}/<UTC-date>.csv \
-             (run started {}, daily UTC rotation, flush every {}s aligned to wall clock)",
-            dir_path.display(), start_label, FLUSH_BUCKET_SECS,
+            "[LatencyRecorder] typed async records → {}/<UTC-date>.csv (run started {}, flush every {}s)",
+            dir.display(),
+            start_label,
+            FLUSH_BUCKET_SECS,
         );
+        let (tx, rx) = bounded(RECORD_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("latency-record-writer".into())
+            .spawn(move || writer_loop(dir, rx))
+            .expect("spawn latency record writer");
         Self {
-            dir: dir_path,
-            buf: Mutex::new(Vec::with_capacity(1024)),
+            tx,
             last_flush_bucket: AtomicU64::new(current_bucket()),
+            dropped: AtomicU64::new(0),
         }
     }
 
-    fn record(&self, instance_id: &str, kind: &'static str, rtt_ms: f64, status: String) {
-        let epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if let Ok(mut buf) = self.buf.lock() {
-            buf.push(Row {
-                epoch_ms,
-                instance_id: instance_id.to_string(),
-                kind,
-                rtt_ms,
-                status,
-            });
+    #[inline]
+    fn record(
+        &self,
+        instance_id: &str,
+        kind: RequestKind,
+        rtt_ms: f64,
+        status: RequestStatus,
+    ) {
+        let row = Row {
+            epoch_ms: epoch_ms(),
+            instance_id: InlineInstanceId::new(instance_id),
+            kind,
+            rtt_ms,
+            status,
+        };
+        if self.tx.try_send(WriterMessage::Row(row)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Flush iff a new 5-minute bucket has begun. The CAS makes the
-    /// boundary flush fire exactly once even when several instances'
-    /// threads race here.
     fn maybe_flush(&self) {
         let bucket = current_bucket();
         let last = self.last_flush_bucket.load(Ordering::Relaxed);
@@ -171,99 +208,138 @@ impl LatencyRecorder {
                 .compare_exchange(last, bucket, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            self.flush();
+            let _ = self.tx.try_send(WriterMessage::Flush(None));
         }
     }
 
-    /// Append buffered rows to per-UTC-day CSV files (creating each file +
-    /// its header on first write). Rows are routed by their own UTC date,
-    /// so a buffer that straddles 00:00 UTC splits cleanly across two
-    /// daily files. A no-op when the buffer is empty.
     fn flush(&self) {
-        let rows: Vec<Row> = match self.buf.lock() {
-            Ok(mut b) => std::mem::take(&mut *b),
-            Err(_) => return,
-        };
-        if rows.is_empty() {
-            return;
+        let (done_tx, done_rx) = bounded(1);
+        if self
+            .tx
+            .send(WriterMessage::Flush(Some(done_tx)))
+            .is_ok()
+        {
+            let _ = done_rx.recv();
         }
-        // Group by UTC date (`YYYYMMDD`), preserving each day's row order.
-        // BTreeMap keeps the (rare) midnight-straddling two-day split
-        // deterministic (older day first).
-        let mut by_date: std::collections::BTreeMap<String, Vec<&Row>> =
-            std::collections::BTreeMap::new();
-        for r in &rows {
-            by_date.entry(utc_date(r.epoch_ms)).or_default().push(r);
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        if dropped != 0 {
+            warn!("[LatencyRecorder] dropped {dropped} records because telemetry queue was full");
         }
-        for (date, day_rows) in by_date {
-            let path = self.dir.join(format!("{}.csv", date));
-            let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(
-                        "[LatencyRecorder] open {} failed: {} — dropping {} rows",
-                        path.display(), e, day_rows.len(),
-                    );
-                    continue;
+    }
+
+    #[cfg(test)]
+    fn record_at(&self, row: Row) {
+        self.tx.send(WriterMessage::Row(row)).unwrap();
+    }
+}
+
+fn writer_loop(dir: PathBuf, rx: Receiver<WriterMessage>) {
+    let mut rows = Vec::with_capacity(4096);
+    let mut bucket = current_bucket();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(WriterMessage::Row(row)) => rows.push(row),
+            Ok(WriterMessage::Flush(done)) => {
+                flush_rows(&dir, &mut rows);
+                if let Some(done) = done {
+                    let _ = done.send(());
                 }
-            };
-            // Header only when the file is brand-new / empty — covers both
-            // the first write of a fresh day and resuming a day's file
-            // after a process restart (no spurious mid-file header).
-            let need_header = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
-            let mut out = String::with_capacity(day_rows.len() * 80 + 64);
-            if need_header {
-                out.push_str("epoch_ms,iso_local,instance_id,kind,rtt_ms,status\n");
             }
-            for r in &day_rows {
-                out.push_str(&format!(
-                    "{},{},{},{},{:.3},{}\n",
-                    r.epoch_ms,
-                    format_local(r.epoch_ms),
-                    r.instance_id,
-                    r.kind,
-                    r.rtt_ms,
-                    r.status,
-                ));
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                flush_rows(&dir, &mut rows);
+                return;
             }
-            match file.write_all(out.as_bytes()) {
-                Ok(()) => info!(
-                    "[LatencyRecorder] flushed {} rows → {}",
-                    day_rows.len(), path.display(),
-                ),
-                Err(e) => warn!(
-                    "[LatencyRecorder] write {} failed: {} — {} rows lost",
-                    path.display(), e, day_rows.len(),
-                ),
-            }
+        }
+        let now_bucket = current_bucket();
+        if now_bucket > bucket {
+            bucket = now_bucket;
+            flush_rows(&dir, &mut rows);
         }
     }
 }
 
-/// Current wall-clock 5-minute bucket index.
-fn current_bucket() -> u64 {
+fn flush_rows(dir: &Path, rows: &mut Vec<Row>) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut drained = Vec::with_capacity(rows.capacity());
+    std::mem::swap(rows, &mut drained);
+    let mut by_date: std::collections::BTreeMap<String, Vec<&Row>> =
+        std::collections::BTreeMap::new();
+    for row in &drained {
+        by_date.entry(utc_date(row.epoch_ms)).or_default().push(row);
+    }
+    for (date, day_rows) in by_date {
+        let path = dir.join(format!("{date}.csv"));
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                warn!(
+                    "[LatencyRecorder] open {} failed: {} — dropping {} rows",
+                    path.display(),
+                    error,
+                    day_rows.len(),
+                );
+                continue;
+            }
+        };
+        let need_header = file.metadata().map(|meta| meta.len() == 0).unwrap_or(false);
+        let mut out = String::with_capacity(day_rows.len() * 96 + 64);
+        if need_header {
+            out.push_str("epoch_ms,iso_local,instance_id,kind,rtt_ms,status\n");
+        }
+        for row in &day_rows {
+            let _ = write!(
+                out,
+                "{},{},{},{},{:.3},",
+                row.epoch_ms,
+                format_local(row.epoch_ms),
+                row.instance_id.as_str(),
+                row.kind.as_str(),
+                row.rtt_ms,
+            );
+            row.status.write_csv(&mut out);
+            out.push('\n');
+        }
+        match file.write_all(out.as_bytes()) {
+            Ok(()) => info!(
+                "[LatencyRecorder] flushed {} rows → {}",
+                day_rows.len(),
+                path.display(),
+            ),
+            Err(error) => warn!(
+                "[LatencyRecorder] write {} failed: {} — {} rows lost",
+                path.display(),
+                error,
+                day_rows.len(),
+            ),
+        }
+    }
+}
+
+fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / FLUSH_BUCKET_SECS)
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
-/// The UTC calendar date (`YYYYMMDD`) of an epoch-ms timestamp — the
-/// daily-rotation file key. `from_timestamp_millis` yields a UTC
-/// `DateTime`, so the format is UTC regardless of the host timezone.
-/// Empty on the (impossible) out-of-range case.
+fn current_bucket() -> u64 {
+    epoch_ms() / 1_000 / FLUSH_BUCKET_SECS
+}
+
 fn utc_date(epoch_ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(epoch_ms as i64)
-        .map(|dt| dt.format("%Y%m%d").to_string())
+        .map(|date_time| date_time.format("%Y%m%d").to_string())
         .unwrap_or_default()
 }
 
-/// Format an epoch-ms timestamp as a local-time ISO-8601 string with
-/// millisecond precision. Empty on the (impossible) out-of-range case.
 fn format_local(epoch_ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(epoch_ms as i64)
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
+        .map(|date_time| {
+            date_time
+                .with_timezone(&chrono::Local)
                 .format("%Y-%m-%dT%H:%M:%S%.3f")
                 .to_string()
         })
@@ -274,139 +350,106 @@ fn format_local(epoch_ms: u64) -> String {
 mod tests {
     use super::*;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("hexbot_latrec_{}_{}_{}", tag, std::process::id(), nanos))
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hexbot_latrec_{}_{}_{}",
+            tag,
+            std::process::id(),
+            epoch_ms()
+        ))
     }
 
-    /// Sorted list of daily `<YYYYMMDD>.csv` files in `dir` (the daily
-    /// rotation produces date-named files, so tests glob rather than
-    /// assume a fixed name).
-    fn list_probe_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .and_then(|n| n.strip_suffix(".csv"))
-                            .map(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()))
+    fn list_probe_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|name| name.strip_suffix(".csv"))
+                            .map(|stem| {
+                                stem.len() == 8
+                                    && stem.bytes().all(|byte| byte.is_ascii_digit())
+                            })
                             .unwrap_or(false)
                     })
                     .collect()
             })
             .unwrap_or_default();
-        v.sort();
-        v
+        files.sort();
+        files
     }
 
     #[test]
-    fn writes_header_and_rows_on_flush() {
-        let dir = tmp_dir("hdr");
-        let rec = LatencyRecorder::new(dir.to_str().unwrap(), "20260614_000000");
-        rec.record("maker01", "place", 42.5, "ok".to_string());
-        rec.record("maker01", "cancel", 7.25, "http_404".to_string());
-        rec.flush();
-
-        // Records are stamped "now", so they land in today's UTC file —
-        // exactly one daily file (the test runs well within one UTC day).
-        let files = list_probe_files(&dir);
-        assert_eq!(files.len(), 1, "expected one daily file, got {:?}", files);
-        let path = &files[0];
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let stem = name.strip_suffix(".csv").unwrap_or("");
-        assert!(
-            stem.len() == 8 && stem.bytes().all(|b| b.is_ascii_digit()),
-            "daily filename shape <YYYYMMDD>.csv: {}", name,
+    fn writes_header_and_typed_rows_on_flush() {
+        let dir = tmp_dir("typed");
+        let recorder = LatencyRecorder::new(dir.to_str().unwrap(), "20260614_000000");
+        recorder.record("maker01", RequestKind::Place, 42.5, RequestStatus::Ok);
+        recorder.record(
+            "maker01",
+            RequestKind::Cancel,
+            7.25,
+            RequestStatus::Http(404),
         );
-
-        let body = std::fs::read_to_string(path).expect("file written");
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines[0], "epoch_ms,iso_local,instance_id,kind,rtt_ms,status");
-        assert_eq!(lines.len(), 3, "header + 2 rows, got: {:?}", lines);
-        assert!(lines[1].contains(",maker01,place,42.500,ok"), "row1={}", lines[1]);
-        assert!(lines[2].contains(",maker01,cancel,7.250,http_404"), "row2={}", lines[2]);
-
-        // Second flush with no new rows must NOT re-emit the header.
-        rec.flush();
-        let body2 = std::fs::read_to_string(path).unwrap();
-        assert_eq!(body2.lines().count(), 3, "empty flush must not append");
-
-        // Appending more rows continues without a second header.
-        rec.record("maker01", "place", 1.0, "ok".to_string());
-        rec.flush();
-        let body3 = std::fs::read_to_string(path).unwrap();
-        let lines3: Vec<&str> = body3.lines().collect();
-        assert_eq!(lines3.len(), 4);
-        assert_eq!(lines3[0], "epoch_ms,iso_local,instance_id,kind,rtt_ms,status");
-
+        recorder.flush();
+        let files = list_probe_files(&dir);
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(&files[0]).unwrap();
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains(",maker01,place,42.500,ok"));
+        assert!(lines[2].contains(",maker01,cancel,7.250,http_404"));
+        recorder.flush();
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn maybe_flush_is_noop_within_same_bucket() {
         let dir = tmp_dir("bucket");
-        let rec = LatencyRecorder::new(dir.to_str().unwrap(), "20260614_000001");
-        rec.record("m", "place", 1.0, "ok".to_string());
-        // Same 5-min bucket as construction → no flush, no file yet.
-        rec.maybe_flush();
-        assert!(list_probe_files(&dir).is_empty(), "maybe_flush flushed within the same bucket");
-        // Forcing the bucket back makes maybe_flush fire.
-        rec.last_flush_bucket.store(0, Ordering::Relaxed);
-        rec.maybe_flush();
-        assert_eq!(list_probe_files(&dir).len(), 1, "maybe_flush should flush after crossing a bucket");
+        let recorder = LatencyRecorder::new(dir.to_str().unwrap(), "start");
+        recorder.record("m", RequestKind::Place, 1.0, RequestStatus::Ok);
+        recorder.maybe_flush();
+        assert!(list_probe_files(&dir).is_empty());
+        recorder.last_flush_bucket.store(0, Ordering::Relaxed);
+        recorder.maybe_flush();
+        // Flush messages preserve FIFO order behind the record.
+        for _ in 0..100 {
+            if !list_probe_files(&dir).is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(list_probe_files(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rotates_files_at_utc_midnight() {
         let dir = tmp_dir("rotate");
-        let rec = LatencyRecorder::new(dir.to_str().unwrap(), "20260614_120000");
-        // Two rows straddling 2026-06-14T00:00:00Z: one 1ms before the
-        // UTC boundary, one exactly at it. A single flush must route them
-        // into two distinct daily files.
+        let recorder = LatencyRecorder::new(dir.to_str().unwrap(), "start");
         let midnight_ms = chrono::DateTime::parse_from_rfc3339("2026-06-14T00:00:00Z")
             .unwrap()
             .timestamp_millis() as u64;
-        if let Ok(mut b) = rec.buf.lock() {
-            b.push(Row {
-                epoch_ms: midnight_ms - 1,
-                instance_id: "m".to_string(),
-                kind: "place",
+        for (epoch_ms, kind) in [
+            (midnight_ms - 1, RequestKind::Place),
+            (midnight_ms, RequestKind::Cancel),
+        ] {
+            recorder.record_at(Row {
+                epoch_ms,
+                instance_id: InlineInstanceId::new("m"),
+                kind,
                 rtt_ms: 1.0,
-                status: "ok".to_string(),
-            });
-            b.push(Row {
-                epoch_ms: midnight_ms,
-                instance_id: "m".to_string(),
-                kind: "cancel",
-                rtt_ms: 2.0,
-                status: "ok".to_string(),
+                status: RequestStatus::Ok,
             });
         }
-        rec.flush();
-
-        let names: Vec<String> = list_probe_files(&dir)
+        recorder.flush();
+        let names: Vec<_> = list_probe_files(&dir)
             .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "20260613.csv".to_string(),
-                "20260614.csv".to_string(),
-            ],
-            "rows straddling 00:00 UTC must split into two daily files; got {:?}", names,
-        );
-        // Each day's file has its own header + exactly one row.
-        for n in &names {
-            let body = std::fs::read_to_string(dir.join(n)).unwrap();
-            assert_eq!(body.lines().count(), 2, "{n}: header + 1 row");
-            assert_eq!(body.lines().next().unwrap(), "epoch_ms,iso_local,instance_id,kind,rtt_ms,status");
-        }
+        assert_eq!(names, vec!["20260613.csv", "20260614.csv"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

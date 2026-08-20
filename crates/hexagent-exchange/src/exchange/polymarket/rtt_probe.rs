@@ -411,7 +411,12 @@ fn fire_full_probe(
     // the dedicated `probe_place` kind (not `place`) so offline analysis
     // can separate synthetic probe traffic from real strategy orders.
     let t0 = Instant::now();
-    let res = shared.http_call_sync_rec("POST", "/order", &body, Some("probe_place"));
+    let res = shared.http_call_sync_rec(
+        "POST",
+        "/order",
+        &body,
+        Some(crate::latency_record::RequestKind::ProbePlace),
+    );
     let place_rtt = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve the resting order's id for the cancel leg. The server's
@@ -464,7 +469,12 @@ fn fire_full_probe(
     // is recorded at the http layer; we just fire it and log.
     if let Some(oid) = order_id {
         let cbody = serde_json::json!({ "orderID": oid }).to_string();
-        let cres = shared.http_call_sync_rec("DELETE", "/order", &cbody, Some("probe_cancel"));
+        let cres = shared.http_call_sync_rec(
+            "DELETE",
+            "/order",
+            &cbody,
+            Some(crate::latency_record::RequestKind::ProbeCancel),
+        );
         if cres.is_ok() && account_reserved {
             shared
                 .account_state

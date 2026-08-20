@@ -188,8 +188,8 @@ pub fn fetch_clob_market_info(
         .map_err(|e| anyhow!("{}: url={}  body={}", e, url, &raw[..raw.len().min(200)]))
 }
 
-/// Spawn a fetch on a dedicated short-lived thread; return a channel
-/// the strategy can `try_recv` on each tick. Never blocks the caller.
+/// Enqueue a fetch on the bounded runtime job executor; return a channel the
+/// strategy can `try_recv` on each tick. Never blocks the caller.
 pub fn spawn_market_info_v2_fetch(
     api_url_prefix: String,
     condition_id: String,
@@ -201,20 +201,18 @@ pub fn spawn_market_info_v2_fetch(
         return rx;
     }
     let worker_key = key.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("clob-v2-market-info".into())
-        .spawn(move || {
-            const ATTEMPTS: u32 = 4;
-            let mut backoff = std::time::Duration::from_millis(200);
-            let mut result = None;
-            for attempt in 1..=ATTEMPTS {
-                match fetch_clob_market_info(
-                    &worker_key.api_url_prefix,
-                    &worker_key.condition_id,
-                    &worker_key.path_template,
-                ) {
-                    Ok(market_info) => {
-                        info!(
+    let submit_result = hexagent_runtime::background_jobs::try_submit(move || {
+        const ATTEMPTS: u32 = 4;
+        let mut backoff = std::time::Duration::from_millis(200);
+        let mut result = None;
+        for attempt in 1..=ATTEMPTS {
+            match fetch_clob_market_info(
+                &worker_key.api_url_prefix,
+                &worker_key.condition_id,
+                &worker_key.path_template,
+            ) {
+                Ok(market_info) => {
+                    info!(
                             "[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={} attempt={}",
                             &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
                             market_info.fee_rate,
@@ -223,28 +221,28 @@ pub fn spawn_market_info_v2_fetch(
                             market_info.taker_only,
                             attempt,
                         );
-                        result = Some(market_info);
-                        break;
-                    }
-                    Err(error) => {
-                        warn!(
-                            "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
-                            attempt,
-                            ATTEMPTS,
-                            &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
-                            error,
-                        );
-                        if attempt < ATTEMPTS {
-                            std::thread::sleep(backoff);
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
-                        }
+                    result = Some(market_info);
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
+                        attempt,
+                        ATTEMPTS,
+                        &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
+                        error,
+                    );
+                    if attempt < ATTEMPTS {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                     }
                 }
             }
-            finish_market_info_fetch(&worker_key, result);
-        });
-    if let Err(error) = spawn_result {
-        warn!("[market_info_v2] failed to spawn fetch worker: {}", error);
+        }
+        finish_market_info_fetch(&worker_key, result);
+    });
+    if let Err(error) = submit_result {
+        warn!("[market_info_v2] failed to enqueue fetch job: {}", error);
         finish_market_info_fetch(&key, None);
     }
     rx

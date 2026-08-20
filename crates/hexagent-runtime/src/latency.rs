@@ -1,164 +1,186 @@
-//! Latency instrumentation: per-stage HDR histograms + periodic dump.
+//! Low-overhead latency instrumentation with thread-owned preallocated bins.
 //!
-//! Design goals:
-//!   1. Cheap to call at event boundaries (~100 ns per record, incl. lock).
-//!      Safe to leave on in production.
-//!   2. Thread-safe — callers are the async runtime thread, strategy
-//!      engine thread, heartbeat, joiners, user-feed etc.
-//!   3. Named stages are `&'static str` (no allocation on the hot path).
-//!   4. Percentile queries on demand; a background thread periodically
-//!      dumps a compact summary line per stage to the log.
-//!
-//! Usage from a hot path:
-//!
-//! ```ignore
-//! use crate::latency;
-//!
-//! let t0 = latency::Instant::now();
-//! // ... work ...
-//! latency::record("polymarket.ws.parse", t0);
-//! ```
-//!
-//! Or for spans that cross function boundaries, stash the start `Instant`
-//! in whatever struct owns the work (e.g. `OrderRequest`, `HttpTask`)
-//! and call `latency::record(stage, t0)` at the end.
-//!
-//! Clock source is `quanta::Instant` (TSC-based on x86_64, ~5 ns per
-//! reading vs ~25 ns for `std::time::Instant`). We don't expose
-//! `quanta::Instant` directly — instead we re-export it as
-//! `latency::Instant` so callers don't care about the backend.
+//! The recording path never takes a process-global lock after a thread has
+//! observed a stage for the first time. Each calling thread owns one fixed
+//! telemetry slab. A background dumper reads and resets those atomic bins and
+//! performs all percentile calculation and formatting off critical threads.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, RwLock};
-
-use hdrhistogram::Histogram;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use quanta::Instant;
 
-/// Default highest request/processing latency (1 minute). Long-lived state
-/// ages use a stage-specific bound; the default previously hid a live
-/// 106.8-minute orphan as 60 seconds.
-const HISTOGRAM_MAX_NS: u64 = 60_000_000_000;
-const ORPHAN_AGE_HISTOGRAM_MAX_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
-/// Three significant digits is the standard recommendation — gives ~0.1%
-/// bucket accuracy across the full range with ~few KB per histogram.
-const HISTOGRAM_SIGFIG: u8 = 3;
+const MAX_STAGES: usize = 128;
+const SUB_BUCKETS: usize = 8;
+const BUCKETS: usize = 64 * SUB_BUCKETS;
 
-fn histogram_max_ns(stage: &str) -> u64 {
-    match stage {
-        "polymarket.orphan.age" => ORPHAN_AGE_HISTOGRAM_MAX_NS,
-        _ => HISTOGRAM_MAX_NS,
-    }
+/// One process-wide mapping from static stage names to dense numeric IDs.
+/// It is touched only on the first observation of a stage by each thread.
+struct StageRegistry {
+    state: Mutex<StageRegistryState>,
 }
 
-struct Registry {
-    /// Maps stage name → its histogram. Read-mostly (first record for a
-    /// new stage takes the write lock; steady state is all reads).
-    stages: RwLock<HashMap<&'static str, Mutex<Histogram<u64>>>>,
+struct StageRegistryState {
+    by_name: HashMap<&'static str, usize>,
+    names: Vec<&'static str>,
 }
 
-impl Registry {
+impl StageRegistry {
     fn new() -> Self {
-        Self { stages: RwLock::new(HashMap::new()) }
-    }
-
-    fn record(&self, stage: &'static str, ns: u64) {
-        let max_ns = histogram_max_ns(stage);
-        let v = ns.min(max_ns);
-        // Fast path: read lock, find entry, take inner mutex briefly.
-        {
-            let guard = self.stages.read().expect("stages RwLock poisoned");
-            if let Some(h) = guard.get(stage) {
-                if let Ok(mut h) = h.lock() {
-                    h.record(v).ok();
-                }
-                return;
-            }
-        }
-        // Slow path: first sample for this stage — install it, then
-        // drop the outer write guard before touching the inner mutex
-        // so subsequent record() calls on other stages don't block.
-        {
-            let mut guard = self.stages.write().expect("stages RwLock poisoned");
-            guard.entry(stage).or_insert_with(|| {
-                Mutex::new(
-                    Histogram::<u64>::new_with_bounds(1, max_ns, HISTOGRAM_SIGFIG)
-                        .expect("histogram bounds are valid"),
-                )
-            });
-        }
-        let guard = self.stages.read().expect("stages RwLock poisoned");
-        if let Some(h) = guard.get(stage) {
-            if let Ok(mut h) = h.lock() {
-                h.record(v).ok();
-            }
+        Self {
+            state: Mutex::new(StageRegistryState {
+                by_name: HashMap::with_capacity(MAX_STAGES),
+                names: Vec::with_capacity(MAX_STAGES),
+            }),
         }
     }
 
-    /// Take a snapshot of every stage and reset them in place. Returns
-    /// `(stage_name, histogram_snapshot)` pairs sorted by stage name.
-    /// Resetting gives us per-interval (not cumulative) dumps, which
-    /// are easier to read for spotting recent regressions.
-    fn snapshot_and_reset(&self) -> Vec<(&'static str, Histogram<u64>)> {
-        let guard = self.stages.read().expect("stages RwLock poisoned");
-        let mut out: Vec<(&'static str, Histogram<u64>)> = Vec::with_capacity(guard.len());
-        for (name, mu) in guard.iter() {
-            let mut h = match mu.lock() {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if h.len() == 0 {
-                continue; // skip stages with no new samples this interval
-            }
-            let snap = h.clone();
-            h.reset();
-            out.push((*name, snap));
+    fn id(&self, stage: &'static str) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(id) = state.by_name.get(stage) {
+            return *id;
         }
-        out.sort_by_key(|(n, _)| *n);
-        out
+        let id = state.names.len();
+        assert!(
+            id < MAX_STAGES,
+            "latency stage capacity exhausted ({MAX_STAGES}); increase MAX_STAGES"
+        );
+        state.names.push(stage);
+        state.by_name.insert(stage, id);
+        id
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .names
+            .clone()
     }
 }
 
-static REGISTRY: OnceLock<Registry> = OnceLock::new();
+static STAGES: OnceLock<StageRegistry> = OnceLock::new();
 
-fn registry() -> &'static Registry {
-    REGISTRY.get_or_init(Registry::new)
+fn stages() -> &'static StageRegistry {
+    STAGES.get_or_init(StageRegistry::new)
 }
 
-/// Record the elapsed time from `start` to now under `stage`.
-///
-/// `stage` MUST be a `&'static str` — it's used as the registry key
-/// without allocation.
+/// A fixed-size slab written by exactly one business thread. Atomic cells let
+/// the background dumper snapshot/reset without pausing that owner.
+struct ThreadTelemetry {
+    bins: Box<[AtomicU64]>,
+    maxima: Box<[AtomicU64]>,
+}
+
+impl ThreadTelemetry {
+    fn new() -> Self {
+        let bins = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(MAX_STAGES * BUCKETS)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let maxima = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(MAX_STAGES)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { bins, maxima }
+    }
+
+    #[inline]
+    fn record(&self, stage_id: usize, ns: u64) {
+        let bucket = latency_bucket(ns);
+        self.bins[stage_id * BUCKETS + bucket].fetch_add(1, Ordering::Relaxed);
+        self.maxima[stage_id].fetch_max(ns, Ordering::Relaxed);
+    }
+}
+
+struct ThreadRecorder {
+    telemetry: Arc<ThreadTelemetry>,
+    /// Thread-local cache: no global stage-registry access after first use.
+    stage_ids: HashMap<&'static str, usize>,
+}
+
+impl ThreadRecorder {
+    fn new() -> Self {
+        let telemetry = Arc::new(ThreadTelemetry::new());
+        recorders()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::downgrade(&telemetry));
+        Self {
+            telemetry,
+            stage_ids: HashMap::with_capacity(32),
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, stage: &'static str, ns: u64) {
+        let stage_id = match self.stage_ids.get(stage) {
+            Some(id) => *id,
+            None => {
+                let id = stages().id(stage);
+                self.stage_ids.insert(stage, id);
+                id
+            }
+        };
+        self.telemetry.record(stage_id, ns);
+    }
+}
+
+thread_local! {
+    static THREAD_RECORDER: RefCell<Option<ThreadRecorder>> = const { RefCell::new(None) };
+}
+
+static RECORDERS: OnceLock<Mutex<Vec<Weak<ThreadTelemetry>>>> = OnceLock::new();
+
+fn recorders() -> &'static Mutex<Vec<Weak<ThreadTelemetry>>> {
+    RECORDERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Eight logarithmic sub-buckets per power of two. The mapping is branch-light,
+/// allocation-free, monotonic, and covers the complete u64 nanosecond range.
+#[inline]
+fn latency_bucket(ns: u64) -> usize {
+    if ns <= 1 {
+        return 0;
+    }
+    let exponent = 63usize.saturating_sub(ns.leading_zeros() as usize);
+    let base = 1u64 << exponent;
+    let fraction = (((ns - base) as u128 * SUB_BUCKETS as u128) / base as u128) as usize;
+    (exponent * SUB_BUCKETS + fraction.min(SUB_BUCKETS - 1)).min(BUCKETS - 1)
+}
+
+#[inline]
+fn bucket_upper_ns(bucket: usize) -> u64 {
+    let exponent = bucket / SUB_BUCKETS;
+    let fraction = bucket % SUB_BUCKETS;
+    let base = 1u64 << exponent.min(63);
+    let increment = ((base as u128 * (fraction + 1) as u128) / SUB_BUCKETS as u128)
+        .min(u64::MAX as u128) as u64;
+    base.saturating_add(increment).max(1)
+}
+
+/// Record elapsed time under a static stage name.
 #[inline]
 pub fn record(stage: &'static str, start: Instant) {
-    let elapsed_ns = start.elapsed().as_nanos() as u64;
-    registry().record(stage, elapsed_ns);
+    record_ns(stage, start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
 }
 
-/// Record a raw nanosecond duration (when you've computed it elsewhere
-/// and don't have an `Instant`).
+/// Record a raw nanosecond duration.
 #[inline]
-#[allow(dead_code)]
 pub fn record_ns(stage: &'static str, ns: u64) {
-    registry().record(stage, ns);
+    THREAD_RECORDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let recorder = slot.get_or_insert_with(ThreadRecorder::new);
+        recorder.record(stage, ns);
+    });
 }
 
-/// RAII guard: captures `Instant::now()` on construction and calls
-/// `record(stage, start)` on drop. Handy for instrumenting functions
-/// with many early-return paths without peppering the body with
-/// `latency::record` calls at every exit.
-///
-/// ```ignore
-/// fn quote_event(...) -> Vec<Signal> {
-///     let _t = latency::TimedStage::new("polymarket.strategy.quote");
-///     if some_gate_fails { return vec![]; }        // _t drops → recorded
-///     // ... real work ...
-///     signals                                      // _t drops → recorded
-/// }
-/// ```
-///
-/// Overhead is one `quanta::Instant::now()` plus one registry lookup +
-/// HDR bucket update on drop — ~100 ns combined.
+/// RAII timing guard for functions with multiple exits.
 pub struct TimedStage {
     stage: &'static str,
     start: Instant,
@@ -167,7 +189,10 @@ pub struct TimedStage {
 impl TimedStage {
     #[inline]
     pub fn new(stage: &'static str) -> Self {
-        Self { stage, start: Instant::now() }
+        Self {
+            stage,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -178,51 +203,103 @@ impl Drop for TimedStage {
     }
 }
 
-/// Format a single histogram as a compact summary line.
-fn format_line(stage: &str, h: &Histogram<u64>) -> String {
-    let fmt = |ns: u64| -> String {
-        if ns >= 1_000_000_000 {
-            format!("{:.2}s", ns as f64 / 1_000_000_000.0)
-        } else if ns >= 1_000_000 {
-            format!("{:.2}ms", ns as f64 / 1_000_000.0)
-        } else if ns >= 1_000 {
-            format!("{:.1}us", ns as f64 / 1_000.0)
-        } else {
-            format!("{}ns", ns)
-        }
+#[derive(Default)]
+struct StageSnapshot {
+    bins: Vec<u64>,
+    count: u64,
+    max: u64,
+}
+
+fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
+    let names = stages().names();
+    let telemetry = {
+        let mut registered = recorders()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut live = Vec::with_capacity(registered.len());
+        registered.retain(|weak| {
+            if let Some(recorder) = weak.upgrade() {
+                live.push(recorder);
+                true
+            } else {
+                false
+            }
+        });
+        live
     };
-    // p85 is the most diagnostic body-of-distribution percentile for
-    // Polymarket HTTP RTT: it sits past the fast-network mode (p50)
-    // and before the cap-driven tail (p95+). Live14.log analysis
-    // showed p85/p50 ≈ 5–10× — a signal that regime-switches into
-    // server-stress show up at p85 about 30–60 minutes before they
-    // become visible at p50. Emitting p85 lets operators monitor and
-    // calibrators (`calibrate_from_log → SidedParams.p85_ms`) anchor
-    // the body shape directly instead of interpolating between p50
-    // and p95 in the 5-anchor CDF.
+    let mut snapshots = names
+        .iter()
+        .map(|_| StageSnapshot {
+            bins: vec![0; BUCKETS],
+            count: 0,
+            max: 0,
+        })
+        .collect::<Vec<_>>();
+    for recorder in telemetry {
+        for stage_id in 0..names.len() {
+            let snapshot = &mut snapshots[stage_id];
+            let offset = stage_id * BUCKETS;
+            for bucket in 0..BUCKETS {
+                let value = recorder.bins[offset + bucket].swap(0, Ordering::AcqRel);
+                snapshot.bins[bucket] = snapshot.bins[bucket].saturating_add(value);
+                snapshot.count = snapshot.count.saturating_add(value);
+            }
+            snapshot.max = snapshot.max.max(recorder.maxima[stage_id].swap(0, Ordering::AcqRel));
+        }
+    }
+    names
+        .into_iter()
+        .zip(snapshots)
+        .filter(|(_, snapshot)| snapshot.count > 0)
+        .collect()
+}
+
+fn value_at_quantile(snapshot: &StageSnapshot, quantile: f64) -> u64 {
+    if snapshot.count == 0 {
+        return 0;
+    }
+    let rank = ((snapshot.count as f64 * quantile.clamp(0.0, 1.0)).ceil() as u64).max(1);
+    let mut seen = 0u64;
+    for (bucket, count) in snapshot.bins.iter().enumerate() {
+        seen = seen.saturating_add(*count);
+        if seen >= rank {
+            return bucket_upper_ns(bucket).min(snapshot.max.max(1));
+        }
+    }
+    snapshot.max
+}
+
+fn format_duration(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{}ns", ns)
+    }
+}
+
+fn format_line(stage: &str, snapshot: &StageSnapshot) -> String {
     format!(
         "[latency] {:<40} n={:<7} p50={} p85={} p95={} p99={} p99.9={} max={}",
         stage,
-        h.len(),
-        fmt(h.value_at_quantile(0.50)),
-        fmt(h.value_at_quantile(0.85)),
-        fmt(h.value_at_quantile(0.95)),
-        fmt(h.value_at_quantile(0.99)),
-        fmt(h.value_at_quantile(0.999)),
-        fmt(h.max()),
+        snapshot.count,
+        format_duration(value_at_quantile(snapshot, 0.50)),
+        format_duration(value_at_quantile(snapshot, 0.85)),
+        format_duration(value_at_quantile(snapshot, 0.95)),
+        format_duration(value_at_quantile(snapshot, 0.99)),
+        format_duration(value_at_quantile(snapshot, 0.999)),
+        format_duration(snapshot.max),
     )
 }
 
-/// Spawn a background thread that periodically snapshots every stage
-/// and logs a one-line summary. Idempotent — safe to call from main.
-///
-/// `interval` of 30-60s is a reasonable default. Each call resets the
-/// histograms so each dump reflects the last interval's samples, not
-/// cumulative since process start.
+/// Periodically aggregates thread-owned slabs and logs percentile summaries.
 pub fn spawn_periodic_dump(interval: std::time::Duration) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
-        return; // already started
+        return;
     }
     std::thread::Builder::new()
         .name("latency-dump".into())
@@ -230,12 +307,8 @@ pub fn spawn_periodic_dump(interval: std::time::Duration) {
             crate::os_tune::pin_background("latency-dump");
             loop {
                 std::thread::sleep(interval);
-                let snap = registry().snapshot_and_reset();
-                if snap.is_empty() {
-                    continue;
-                }
-                for (stage, h) in &snap {
-                    log::info!("{}", format_line(stage, h));
+                for (stage, snapshot) in snapshot_and_reset() {
+                    log::info!("{}", format_line(stage, &snapshot));
                 }
             }
         })
@@ -247,15 +320,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn orphan_age_histogram_covers_multi_hour_incidents() {
-        assert_eq!(histogram_max_ns("ordinary.stage"), 60_000_000_000);
-        assert!(histogram_max_ns("polymarket.orphan.age") >= 2 * 60 * 60 * 1_000_000_000);
+    fn logarithmic_buckets_are_monotonic_and_cover_u64() {
+        let values = [0, 1, 2, 3, 10, 999, 1_000, 1_000_000, 60_000_000_000, u64::MAX];
+        let mut previous = 0;
+        for value in values {
+            let bucket = latency_bucket(value);
+            assert!(bucket >= previous);
+            assert!(bucket < BUCKETS);
+            previous = bucket;
+        }
+    }
 
-        let max = histogram_max_ns("polymarket.orphan.age");
-        let mut histogram =
-            Histogram::<u64>::new_with_bounds(1, max, HISTOGRAM_SIGFIG).unwrap();
-        let observed = 106 * 60 * 1_000_000_000;
-        histogram.record(observed).unwrap();
-        assert!(histogram.max() >= observed);
+    #[test]
+    fn thread_local_recording_produces_tail_percentiles() {
+        let stage = "latency.test.thread_local";
+        for value in 1..=1_000u64 {
+            record_ns(stage, value);
+        }
+        let snapshots = snapshot_and_reset();
+        let snapshot = snapshots
+            .iter()
+            .find(|(name, _)| *name == stage)
+            .map(|(_, snapshot)| snapshot)
+            .expect("test stage snapshot");
+        assert_eq!(snapshot.count, 1_000);
+        assert!(value_at_quantile(snapshot, 0.50) >= 500);
+        assert!(value_at_quantile(snapshot, 0.999) >= 900);
+        assert_eq!(snapshot.max, 1_000);
     }
 }
