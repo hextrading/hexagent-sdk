@@ -2115,6 +2115,182 @@ fn append_persistence_wal(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct IncompleteMaintenanceCashWalEvidence {
+    generation: u64,
+    operation_id: String,
+    cash_corrections: BTreeMap<String, f64>,
+}
+
+fn incomplete_maintenance_cash_wal_evidence(
+    record: &PersistenceWalRecord,
+    state: &serde_json::Value,
+) -> Result<Vec<IncompleteMaintenanceCashWalEvidence>, String> {
+    let confirmed_operations: BTreeSet<String> = record
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            PersistenceWalChange::Set { path, value }
+                if path.len() == 3
+                    && path[0] == "maintenance_ops"
+                    && path[2] == "status"
+                    && value == "Confirmed" =>
+            {
+                Some(path[1].clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if confirmed_operations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changed = |expected: &[&str]| {
+        record.changes.iter().any(|change| match change {
+            PersistenceWalChange::Set { path, .. } | PersistenceWalChange::Remove { path } => {
+                path.iter().map(String::as_str).eq(expected.iter().copied())
+            }
+            PersistenceWalChange::SetInsert { .. }
+            | PersistenceWalChange::SetRemove { .. } => false,
+        })
+    };
+    let mut evidence = Vec::new();
+    for operation_id in confirmed_operations {
+        let operation_value = state
+            .get("maintenance_ops")
+            .and_then(|operations| operations.get(&operation_id))
+            .ok_or_else(|| {
+                format!(
+                    "maintenance confirmation WAL generation {} has no operation `{operation_id}`",
+                    record.generation,
+                )
+            })?;
+        let operation: MaintenanceOperation = serde_json::from_value(operation_value.clone())
+            .map_err(|error| {
+                format!(
+                    "decode maintenance operation `{operation_id}` after WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?;
+        let physical_complete = changed(&["physical_cash"])
+            && changed(&["physical_positions", &operation.up_token_id])
+            && changed(&["physical_positions", &operation.down_token_id]);
+        if !physical_complete {
+            continue;
+        }
+        let direction = match operation.kind {
+            MaintenanceOperationKind::Split => -1.0,
+            MaintenanceOperationKind::Merge => 1.0,
+        };
+        let mut cash_corrections = BTreeMap::new();
+        for (instance_id, amount) in &operation.allocations {
+            let positions_complete = changed(&[
+                "instances",
+                instance_id,
+                "positions",
+                &operation.up_token_id,
+            ]) && changed(&[
+                "instances",
+                instance_id,
+                "positions",
+                &operation.down_token_id,
+            ]);
+            let reservation_complete = match operation.kind {
+                MaintenanceOperationKind::Split => changed(&[
+                    "instances",
+                    instance_id,
+                    "maintenance_reserved_cash",
+                ]),
+                MaintenanceOperationKind::Merge => changed(&[
+                    "instances",
+                    instance_id,
+                    "maintenance_reserved_positions",
+                    &operation.up_token_id,
+                ]) && changed(&[
+                    "instances",
+                    instance_id,
+                    "maintenance_reserved_positions",
+                    &operation.down_token_id,
+                ]),
+            };
+            if positions_complete
+                && reservation_complete
+                && !changed(&["instances", instance_id, "cash"])
+            {
+                cash_corrections.insert(instance_id.clone(), direction * *amount);
+            }
+        }
+        if !cash_corrections.is_empty() {
+            evidence.push(IncompleteMaintenanceCashWalEvidence {
+                generation: record.generation,
+                operation_id,
+                cash_corrections,
+            });
+        }
+    }
+    Ok(evidence)
+}
+
+fn repair_incomplete_maintenance_cash_from_wal(
+    account_id: &str,
+    state: &mut SharedAccountState,
+    evidence: &[IncompleteMaintenanceCashWalEvidence],
+) -> bool {
+    if evidence.is_empty() || !state.seeded {
+        return false;
+    }
+    let Ok(replayed) = replay_account_economics(state) else {
+        return false;
+    };
+    let current = current_account_economics(state);
+    let mut corrections = BTreeMap::<String, f64>::new();
+    for item in evidence {
+        for (instance_id, correction) in &item.cash_corrections {
+            *corrections.entry(instance_id.clone()).or_insert(0.0) += *correction;
+        }
+    }
+    let mut instance_ids: BTreeSet<String> = current.instances.keys().cloned().collect();
+    instance_ids.extend(replayed.instances.keys().cloned());
+    instance_ids.extend(corrections.keys().cloned());
+    for instance_id in &instance_ids {
+        let current_balance = current.instances.get(instance_id);
+        let replayed_balance = replayed.instances.get(instance_id);
+        let empty = HashMap::new();
+        if compare_economic_positions(
+            &format!("instance `{instance_id}` positions during maintenance WAL recovery"),
+            current_balance.map_or(&empty, |balance| &balance.positions),
+            replayed_balance.map_or(&empty, |balance| &balance.positions),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let stored_cash = current_balance.map_or(0.0, |balance| balance.cash);
+        let expected_cash = replayed_balance.map_or(0.0, |balance| balance.cash);
+        let correction = corrections.get(instance_id).copied().unwrap_or(0.0);
+        if (stored_cash + correction - expected_cash).abs()
+            > reconciliation_tolerance(stored_cash + correction, expected_cash)
+        {
+            return false;
+        }
+    }
+    for (instance_id, correction) in corrections {
+        let Some(instance) = state.instances.get_mut(&instance_id) else {
+            return false;
+        };
+        instance.cash += correction;
+    }
+    let recovered: Vec<String> = evidence
+        .iter()
+        .map(|item| format!("{}@{}", item.operation_id, item.generation))
+        .collect();
+    log::warn!(
+        "[shared_account] account={} repaired incomplete maintenance WAL cash publication operations={:?}",
+        account_id,
+        recovered,
+    );
+    true
+}
+
 fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Result<(), String> {
     use std::io::BufRead as _;
 
@@ -2137,6 +2313,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
     })?;
     let snapshot_generation = persisted.persistence_generation;
     let mut applied_generation = snapshot_generation;
+    let mut incomplete_maintenance_cash = Vec::new();
     let mut reader = std::io::BufReader::new(wal);
     let mut line_number = 0usize;
     loop {
@@ -2252,7 +2429,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
                 line_number
             ));
         }
-        for change in record.changes {
+        for change in record.changes.iter().cloned() {
             apply_persistence_wal_change(&mut state, change).map_err(|error| {
                 format!(
                     "apply account ledger WAL frame {}:{}: {error}",
@@ -2261,6 +2438,9 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
                 )
             })?;
         }
+        incomplete_maintenance_cash.extend(incomplete_maintenance_cash_wal_evidence(
+            &record, &state,
+        )?);
         applied_generation = record.generation;
     }
     if applied_generation > snapshot_generation {
@@ -2272,6 +2452,11 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         })?;
         persisted.persistence_generation = applied_generation;
     }
+    repair_incomplete_maintenance_cash_from_wal(
+        &persisted.account_id,
+        &mut persisted.state,
+        &incomplete_maintenance_cash,
+    );
     Ok(())
 }
 
@@ -3232,13 +3417,38 @@ impl SharedAccount {
             )
         };
 
+        let mut concurrent_economics = AccountEconomicState::default();
+        for trade_key in &trade_keys {
+            if let Some(trade) = state.trades.get(trade_key) {
+                add_economic_state(
+                    &mut concurrent_economics,
+                    &trade_economic_effect(trade),
+                    -1.0,
+                );
+            }
+            if let Some(trade) = lifecycle.trades.get(trade_key) {
+                add_economic_state(
+                    &mut concurrent_economics,
+                    &trade_economic_effect(trade),
+                    1.0,
+                );
+            }
+        }
         if let Some(instance) = state.instances.get_mut(&account.instance_id) {
-            instance.cash = account.cash.load();
+            let economic_delta = concurrent_economics.instances.get(&account.instance_id);
+            // Compose the concurrent owner-shard trade root with the cold
+            // transaction instead of replacing absolute cash/positions. An
+            // absolute overwrite loses a simultaneous split/merge debit even
+            // though the operation status and token legs persist.
+            instance.cash += economic_delta.map_or(0.0, |delta| delta.cash);
             instance.reserved_cash = account.reserved_cash.load();
             let positions = account.positions.read().unwrap();
             for token in &tokens {
                 if let Some(position) = positions.get(token) {
-                    instance.positions.insert(token.clone(), position.balance.load());
+                    *instance.positions.entry(token.clone()).or_insert(0.0) += economic_delta
+                        .and_then(|delta| delta.positions.get(token))
+                        .copied()
+                        .unwrap_or(0.0);
                     instance
                         .reserved_positions
                         .insert(token.clone(), position.reserved.load());
@@ -15032,6 +15242,189 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         // Recovery may observe the same terminal chain state more than once.
         account.confirm_maintenance_operation("split-op-1").unwrap();
         assert_eq!(account.monitoring_snapshot().physical_cash, 360.0);
+    }
+
+    #[test]
+    fn concurrent_owner_trade_delta_does_not_overwrite_cold_economics() {
+        let mut baseline_ledger = InstanceLedger::new(1.0);
+        baseline_ledger.cash = 100.0;
+        baseline_ledger.positions.insert("HOT".into(), 20.0);
+        let account = VirtualAccount::new("a".into(), &baseline_ledger);
+        let mut lifecycle = VirtualLifecycle::default();
+        let mut state = SharedAccountState::default();
+        let mut cold_ledger = baseline_ledger;
+        cold_ledger.cash -= 10.0;
+        cold_ledger.positions.insert("COLD-UP".into(), 10.0);
+        cold_ledger.positions.insert("COLD-DOWN".into(), 10.0);
+        state.instances.insert("a".into(), cold_ledger);
+
+        // Reproduce a maker fill that commits on the owner shard while a
+        // split confirmation is holding the cold control transaction.
+        account.cash.add(5.0);
+        account
+            .positions
+            .read()
+            .unwrap()
+            .get("HOT")
+            .unwrap()
+            .balance
+            .add(-10.0);
+        lifecycle.trades.insert(
+            "trade".into(),
+            AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: "acct".into(),
+                    instance_id: "a".into(),
+                    trade_key: "trade".into(),
+                    client_order_id: "coid".into(),
+                    order_id: "oid".into(),
+                    token_id: "HOT".into(),
+                    side: Side::Sell,
+                    quantity: 10.0,
+                    price: 0.5,
+                    status: "MATCHED".into(),
+                },
+                booked: true,
+                physical_booked: false,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: true,
+                physical_fee_booked: false,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: 1,
+            },
+        );
+        account.trade_epoch.store(1, Ordering::Release);
+        lifecycle
+            .recent_trade_mutations
+            .push_back(VirtualTradeMutationHint {
+                epoch: 1,
+                trade_key: "trade".into(),
+                client_order_id: "coid".into(),
+                token_id: "HOT".into(),
+            });
+
+        assert!(SharedAccount::merge_concurrent_trade_mutations(
+            &mut state,
+            &account,
+            &mut lifecycle,
+            Some(0),
+        ));
+        let merged = state.instances.get("a").unwrap();
+        assert_eq!(merged.cash, 95.0);
+        assert_eq!(merged.positions["HOT"], 10.0);
+        assert_eq!(merged.positions["COLD-UP"], 10.0);
+        assert_eq!(merged.positions["COLD-DOWN"], 10.0);
+    }
+
+    #[test]
+    fn restart_repairs_incomplete_split_cash_then_auto_redeems_historical_event_once() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-maintenance-recovery-redeem-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "maintenance-recovery-redeem";
+        let operation_id = "split-recovery";
+        let account = SharedAccount::new(account_id);
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "historical-event", "WIN", "LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .reserve_maintenance_operation(
+                operation_id,
+                MaintenanceOperationKind::Split,
+                "historical-event",
+                "WIN",
+                "LOSE",
+                &HashMap::from([("btc".into(), 25.0)]),
+            )
+            .unwrap();
+        account
+            .mark_maintenance_operation_submitted(operation_id, "0xtx")
+            .unwrap();
+        let before_confirmation = account.lock_state().clone();
+        account.confirm_maintenance_operation(operation_id).unwrap();
+        let after_confirmation = account.lock_state().clone();
+
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.into(),
+                persistence_generation: 0,
+                state: before_confirmation.clone(),
+            },
+        )
+        .unwrap();
+        reset_persistence_wal(&path).unwrap();
+        let mut changes = persistence_json_diff(
+            &serde_json::to_value(before_confirmation).unwrap(),
+            &serde_json::to_value(after_confirmation).unwrap(),
+        );
+        changes.retain(|change| {
+            !matches!(change,
+                PersistenceWalChange::Set { path, .. }
+                    if path == &vec!["instances".to_string(), "btc".to_string(), "cash".to_string()]
+            )
+        });
+        let record = PersistenceWalRecord {
+            version: PERSISTENCE_WAL_VERSION,
+            account_id: account_id.into(),
+            generation: 1,
+            changes,
+        };
+        let mut wal_len = 0;
+        append_persistence_wal(&path, &record, &mut wal_len).unwrap();
+
+        let restored = SharedAccount::new_persistent(account_id, &path).unwrap();
+        assert_eq!(restored.instance_snapshot("btc").unwrap().cash, 75.0);
+        assert_eq!(restored.instance_snapshot("btc").unwrap().positions["WIN"], 25.0);
+        restored.record_settled_token_values(&HashMap::from([
+            ("WIN".into(), 1.0),
+            ("LOSE".into(), 0.0),
+        ]));
+        assert!(restored.observe_platform_binary_redeem(
+            100.0,
+            &HashMap::new(),
+            &HashSet::from(["WIN".into(), "LOSE".into()]),
+        ));
+        let after_redeem = restored.instance_snapshot("btc").unwrap();
+        assert_eq!(after_redeem.cash, 100.0);
+        assert!(after_redeem
+            .positions
+            .values()
+            .all(|quantity| quantity.abs() <= EPS));
+        restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(restored);
+
+        let reloaded = SharedAccount::new_persistent(account_id, &path).unwrap();
+        assert_eq!(reloaded.instance_snapshot("btc").unwrap().cash, 100.0);
+        assert!(reloaded
+            .instance_snapshot("btc")
+            .unwrap()
+            .positions
+            .values()
+            .all(|quantity| quantity.abs() <= EPS));
+        assert!(!reloaded.observe_platform_binary_redeem(
+            100.0,
+            &HashMap::new(),
+            &HashSet::from(["WIN".into(), "LOSE".into()]),
+        ));
+        drop(reloaded);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(persistence_wal_path(&path));
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]
