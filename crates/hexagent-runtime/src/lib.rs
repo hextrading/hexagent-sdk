@@ -10,8 +10,9 @@
 
 pub use hexagent_config::config;
 
-pub mod os_tune;
 pub mod async_rt;
+pub mod background_jobs;
 pub mod http1_pool;
 pub mod latency;
 pub mod latency_record;
+pub mod os_tune;

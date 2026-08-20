@@ -1160,6 +1160,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "core_affinity",
+ "crossbeam-channel",
  "futures-util",
  "hdrhistogram",
  "hexagent-config",

@@ -1501,27 +1501,215 @@ fn register_polymarket_wallet_identity(
 #[derive(Debug, Clone)]
 struct QueuedMarketPayload {
     event: Arc<MarketEvent>,
-    enqueued_at: std::time::Instant,
+    enqueued_ns: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SymbolId(u64, u64);
+
+impl SymbolId {
+    /// Allocation-free, ASCII-case-insensitive stable symbol identity. Feed
+    /// schemas use ASCII venue symbols/token IDs; two independent accumulators
+    /// make accidental cross-symbol aliasing vanishingly unlikely while the
+    /// startup/dynamic registration path still checks duplicate ownership.
+    #[inline]
+    fn of(symbol: &str) -> Self {
+        let mut fnv = 0xcbf29ce484222325u64;
+        let mut mixed = 0x9e3779b97f4a7c15u64;
+        for byte in symbol.bytes() {
+            let byte = byte.to_ascii_lowercase() as u64;
+            fnv ^= byte;
+            fnv = fnv.wrapping_mul(0x100000001b3);
+            mixed ^= byte.wrapping_add(0x9e3779b97f4a7c15);
+            mixed = mixed.rotate_left(27).wrapping_mul(0x94d049bb133111eb);
+        }
+        Self(fnv, mixed)
+    }
+}
+
+type RouteMask = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LatestMarketKey {
-    epoch: u64,
     kind: u8,
     exchange: Exchange,
-    symbol: String,
+    symbol: SymbolId,
 }
 
 #[derive(Debug, Clone)]
 enum QueuedMarketEvent {
     Direct(QueuedMarketPayload),
-    Latest(LatestMarketKey),
+    Latest(u16),
 }
 
-#[derive(Debug, Default)]
+const MAX_LATEST_MARKET_KEYS: usize = 128;
+const LATEST_EPOCH_SLOTS: usize = 4;
+const LATEST_SLOT_COUNT: usize = MAX_LATEST_MARKET_KEYS * LATEST_EPOCH_SLOTS;
+const LATEST_IDLE: u8 = 0;
+const LATEST_WRITING: u8 = 1;
+const LATEST_PENDING: u8 = 2;
+const LATEST_CONSUMING: u8 = 3;
+
+#[derive(Debug)]
+struct LatestMarketSlot {
+    state: std::sync::atomic::AtomicU8,
+    epoch: AtomicU64,
+    enqueued_ns: AtomicU64,
+    event: std::sync::atomic::AtomicPtr<MarketEvent>,
+}
+
+impl Default for LatestMarketSlot {
+    fn default() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(LATEST_IDLE),
+            epoch: AtomicU64::new(0),
+            enqueued_ns: AtomicU64::new(0),
+            event: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+enum LatestPublish {
+    MarkerRequired,
+    Replaced,
+    Direct(Arc<MarketEvent>),
+}
+
+impl LatestMarketSlot {
+    fn publish(&self, event: Arc<MarketEvent>, epoch: u64, enqueued_ns: u64) -> LatestPublish {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            match state {
+                LATEST_IDLE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            LATEST_IDLE,
+                            LATEST_WRITING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    self.epoch.store(epoch, Ordering::Relaxed);
+                    self.enqueued_ns.store(enqueued_ns, Ordering::Relaxed);
+                    let raw = Arc::into_raw(event).cast_mut();
+                    debug_assert!(self.event.swap(raw, Ordering::AcqRel).is_null());
+                    self.state.store(LATEST_PENDING, Ordering::Release);
+                    return LatestPublish::MarkerRequired;
+                }
+                LATEST_PENDING => {
+                    if self.epoch.load(Ordering::Acquire) != epoch {
+                        return LatestPublish::Direct(event);
+                    }
+                    if self
+                        .state
+                        .compare_exchange(
+                            LATEST_PENDING,
+                            LATEST_WRITING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let raw = Arc::into_raw(event).cast_mut();
+                    let previous = self.event.swap(raw, Ordering::AcqRel);
+                    self.enqueued_ns.store(enqueued_ns, Ordering::Relaxed);
+                    self.state.store(LATEST_PENDING, Ordering::Release);
+                    if !previous.is_null() {
+                        // SAFETY: the slot owned exactly one strong reference.
+                        unsafe { drop(Arc::from_raw(previous)) };
+                    }
+                    return LatestPublish::Replaced;
+                }
+                // A producer never waits behind its consumer. Direct enqueue
+                // preserves ordering and keeps the router's latency bounded.
+                LATEST_WRITING | LATEST_CONSUMING => return LatestPublish::Direct(event),
+                _ => unreachable!("invalid latest-market slot state"),
+            }
+        }
+    }
+
+    fn take(&self) -> Option<QueuedMarketPayload> {
+        loop {
+            match self.state.compare_exchange(
+                LATEST_PENDING,
+                LATEST_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(LATEST_WRITING) => std::hint::spin_loop(),
+                Err(_) => return None,
+            }
+        }
+        let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let enqueued_ns = self.enqueued_ns.load(Ordering::Relaxed);
+        self.state.store(LATEST_IDLE, Ordering::Release);
+        if event.is_null() {
+            return None;
+        }
+        // SAFETY: publish transferred one Arc strong reference into the slot;
+        // this consumer atomically removed that exact pointer.
+        Some(QueuedMarketPayload {
+            event: unsafe { Arc::from_raw(event) },
+            enqueued_ns,
+        })
+    }
+
+    fn discard_if_pending(&self) {
+        if self
+            .state
+            .compare_exchange(
+                LATEST_PENDING,
+                LATEST_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        self.state.store(LATEST_IDLE, Ordering::Release);
+        if !event.is_null() {
+            // SAFETY: same ownership transfer as `take`, discarded on failed
+            // marker admission.
+            unsafe { drop(Arc::from_raw(event)) };
+        }
+    }
+}
+
+impl Drop for LatestMarketSlot {
+    fn drop(&mut self) {
+        let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !event.is_null() {
+            // SAFETY: shutdown owns the slot exclusively.
+            unsafe { drop(Arc::from_raw(event)) };
+        }
+    }
+}
+
+#[derive(Debug)]
 struct LatestMarketStore {
-    events: std::sync::Mutex<HashMap<LatestMarketKey, QueuedMarketPayload>>,
+    slots: Box<[LatestMarketSlot]>,
     replacements: AtomicU64,
+}
+
+impl Default for LatestMarketStore {
+    fn default() -> Self {
+        Self {
+            slots: std::iter::repeat_with(LatestMarketSlot::default)
+                .take(LATEST_SLOT_COUNT)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            replacements: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1533,56 +1721,70 @@ struct MarketEventLane {
     barrier_epoch: Arc<AtomicU64>,
 }
 
-fn latest_market_key(event: &MarketEvent, epoch: u64) -> Option<LatestMarketKey> {
+fn latest_market_key(event: &MarketEvent) -> Option<LatestMarketKey> {
     match event {
         MarketEvent::OrderBook(book) => Some(LatestMarketKey {
-            epoch,
             kind: 0,
             exchange: book.exchange,
-            symbol: book.symbol.to_ascii_lowercase(),
+            symbol: SymbolId::of(&book.symbol),
         }),
         MarketEvent::Quote(quote) => Some(LatestMarketKey {
-            epoch,
             kind: 1,
             exchange: quote.exchange,
-            symbol: quote.symbol.to_ascii_lowercase(),
+            symbol: SymbolId::of(&quote.symbol),
         }),
         _ => None,
     }
 }
 
-fn enqueue_market_event(lane: &MarketEventLane, event: Arc<MarketEvent>) -> bool {
-    let payload = QueuedMarketPayload {
-        event: Arc::clone(&event),
-        enqueued_at: std::time::Instant::now(),
-    };
+fn enqueue_market_event(
+    lane: &MarketEventLane,
+    event: Arc<MarketEvent>,
+    latest_key_id: Option<u16>,
+) -> bool {
+    let enqueued_ns = crate::types::now_ns();
     let epoch = lane.barrier_epoch.load(Ordering::Relaxed);
-    let Some(key) = latest_market_key(event.as_ref(), epoch) else {
+    let Some(key_id) = latest_key_id else {
         lane.barrier_epoch.fetch_add(1, Ordering::Relaxed);
-        return lane.tx.try_send(QueuedMarketEvent::Direct(payload)).is_ok();
+        return lane
+            .tx
+            .try_send(QueuedMarketEvent::Direct(QueuedMarketPayload {
+                event,
+                enqueued_ns,
+            }))
+            .is_ok();
     };
-    let marker_needed = {
-        let mut latest = lane.latest.events.lock().unwrap();
-        let replaced = latest.insert(key.clone(), payload).is_some();
-        if replaced {
+    let slot_id = key_id as usize * LATEST_EPOCH_SLOTS
+        + (epoch as usize % LATEST_EPOCH_SLOTS);
+    let Some(slot) = lane.latest.slots.get(slot_id) else {
+        return lane
+            .tx
+            .try_send(QueuedMarketEvent::Direct(QueuedMarketPayload {
+                event,
+                enqueued_ns,
+            }))
+            .is_ok();
+    };
+    match slot.publish(event, epoch, enqueued_ns) {
+        LatestPublish::Replaced => {
             lane.latest.replacements.fetch_add(1, Ordering::Relaxed);
+            true
         }
-        !replaced
-    };
-    if !marker_needed {
-        return true;
-    }
-    if lane
-        .tx
-        .try_send(QueuedMarketEvent::Latest(key.clone()))
-        .is_ok()
-    {
-        true
-    } else {
-        // No marker exists for a newly inserted key, so retaining it would
-        // create an update that can never be observed.
-        lane.latest.events.lock().unwrap().remove(&key);
-        false
+        LatestPublish::MarkerRequired => {
+            if lane.tx.try_send(QueuedMarketEvent::Latest(slot_id as u16)).is_ok() {
+                true
+            } else {
+                slot.discard_if_pending();
+                false
+            }
+        }
+        LatestPublish::Direct(event) => lane
+            .tx
+            .try_send(QueuedMarketEvent::Direct(QueuedMarketPayload {
+                event,
+                enqueued_ns,
+            }))
+            .is_ok(),
     }
 }
 
@@ -1592,7 +1794,7 @@ fn resolve_market_event(
 ) -> Option<QueuedMarketPayload> {
     match queued {
         QueuedMarketEvent::Direct(payload) => Some(payload),
-        QueuedMarketEvent::Latest(key) => latest.events.lock().unwrap().remove(&key),
+        QueuedMarketEvent::Latest(slot_id) => latest.slots.get(slot_id as usize)?.take(),
     }
 }
 
@@ -1604,6 +1806,59 @@ fn private_update_lane_enabled(private_burst: usize, market_waiting: bool) -> bo
 struct QueuedOrderUpdate {
     update: OrderUpdate,
     enqueued_at: std::time::Instant,
+}
+
+/// Numeric ownership crosses the strategy/execution boundary with the signal;
+/// strategy workers never publish bare process-global commands.
+#[derive(Debug)]
+pub struct RoutedSignal {
+    pub owner: u16,
+    pub signal: Signal,
+}
+
+const SYSTEM_SIGNAL_OWNER: u16 = u16::MAX;
+
+#[derive(Clone)]
+struct SignalSender {
+    owner: u16,
+    tx: Sender<RoutedSignal>,
+}
+
+impl SignalSender {
+    fn system(tx: Sender<RoutedSignal>) -> Self {
+        Self {
+            owner: SYSTEM_SIGNAL_OWNER,
+            tx,
+        }
+    }
+
+    fn with_owner(&self, owner: usize) -> Self {
+        Self {
+            owner: u16::try_from(owner).expect("strategy owner index exceeds u16"),
+            tx: self.tx.clone(),
+        }
+    }
+
+    fn send(&self, signal: Signal) -> Result<(), crossbeam_channel::SendError<RoutedSignal>> {
+        self.tx.send(RoutedSignal {
+            owner: self.owner,
+            signal,
+        })
+    }
+
+    fn send_timeout(
+        &self,
+        signal: Signal,
+        timeout: std::time::Duration,
+    ) -> Result<(), crossbeam_channel::SendTimeoutError<RoutedSignal>> {
+        self.tx.send_timeout(
+            RoutedSignal {
+                owner: self.owner,
+                signal,
+            },
+            timeout,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1666,7 +1921,7 @@ fn quarantine_strategy_worker(
     reason: &str,
     instance_ids: &[String],
     quarantined: &[Arc<AtomicBool>],
-    signal_tx: &Sender<Signal>,
+    signal_tx: &SignalSender,
 ) -> bool {
     let Some(flag) = quarantined.get(idx) else {
         return false;
@@ -1687,7 +1942,7 @@ fn enqueue_emergency_instance_cancel(
     idx: usize,
     instance_id: &str,
     reason: &str,
-    signal_tx: &Sender<Signal>,
+    signal_tx: &SignalSender,
 ) -> bool {
     let cancel = Signal::PolymarketCancelAllOrders {
         reason: format!("strategy instance `{instance_id}` quarantined: {reason}"),
@@ -1695,7 +1950,10 @@ fn enqueue_emergency_instance_cancel(
         asset_ids: Vec::new(),
         instance_id: instance_id.to_string(),
     };
-    if let Err(error) = signal_tx.send_timeout(cancel, std::time::Duration::from_millis(500)) {
+    if let Err(error) = signal_tx
+        .with_owner(idx)
+        .send_timeout(cancel, std::time::Duration::from_millis(500))
+    {
         error!("[strategy_supervisor] failed to enqueue emergency instance cancel for worker index={idx}: {error}");
         return false;
     }
@@ -2567,8 +2825,9 @@ impl Engine {
         // Strategy↔executor control traffic must not stall quote processing or
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
-        let (signal_tx, signal_rx) = unbounded::<Signal>();
-        let (update_tx, update_rx) = unbounded::<OrderUpdate>();
+        let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
+        let signal_tx = SignalSender::system(signal_tx_raw);
+        let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2869,8 +3128,9 @@ impl Engine {
 
         let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
-        let (signal_tx, signal_rx) = unbounded::<Signal>();
-        let (update_tx, update_rx) = unbounded::<OrderUpdate>();
+        let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
+        let signal_tx = SignalSender::system(signal_tx_raw);
+        let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3799,6 +4059,7 @@ impl Engine {
         }
 
         let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
+        let mut quote_signal_batch = Vec::with_capacity(32);
 
         // Per-instance USDC + per-event split shares (carried over from the removed v1 sim's wallet
         // seeding). split_amount_usdc → shares of each token credited at event.
@@ -4459,9 +4720,10 @@ impl Engine {
                             };
                             if fire {
                                 last_quote_ns[i] = ts;
-                                let mut quote_signals = strategy.on_quote(ts);
-                                stamp_quote_trigger(&mut quote_signals, ob, false);
-                                for sig in quote_signals {
+                                quote_signal_batch.clear();
+                                strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                stamp_quote_trigger(&mut quote_signal_batch, ob, false);
+                                for sig in quote_signal_batch.drain(..) {
                                     sim.submit(&sig, strat_clock_ns);
                                 }
                             }
@@ -4738,7 +5000,7 @@ impl Engine {
     /// book live); the queue/taker/book-through/fold knobs are mirrored from the
     /// backtest config so paper fills track the calibrated backtest behaviour.
     fn spawn_paper_execution_thread(
-        signal_rx: Receiver<Signal>,
+        signal_rx: Receiver<RoutedSignal>,
         sim_feed_rx: Receiver<MarketEvent>,
         update_tx: Sender<OrderUpdate>,
         sim_latency_ms: u64,
@@ -4821,6 +5083,7 @@ impl Engine {
                             }
                         }
                         recv(signal_rx) -> msg => {
+                            let msg = msg.map(|routed| routed.signal);
                             // Simulate network latency: signal → exchange
                             if latency.as_millis() > 0 {
                                 std::thread::sleep(latency);
@@ -5056,7 +5319,7 @@ impl Engine {
     fn spawn_strategy_thread(
         &self,
         market_rx: Receiver<MarketEvent>,
-        signal_tx: Sender<Signal>,
+        signal_tx: SignalSender,
         update_rx: Receiver<OrderUpdate>,
         backtest: bool,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
@@ -5551,6 +5814,7 @@ impl Engine {
                 crate::os_tune::pin_strategy("strategy");
 
                 let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
+                let mut quote_signal_batch = Vec::with_capacity(32);
 
                 loop {
                     crossbeam_channel::select! {
@@ -5684,9 +5948,10 @@ impl Engine {
                                                 };
                                                 if fire {
                                                     last_quote_ns[i] = ts;
-                                                    let mut ob_signals = strategy.on_quote(ts);
-                                                    stamp_quote_trigger(&mut ob_signals, ob, true);
-                                                    for sig in ob_signals {
+                                                    quote_signal_batch.clear();
+                                                    strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true);
+                                                    for sig in quote_signal_batch.drain(..) {
                                                         if signal_tx.send(sig).is_err() { return; }
                                                     }
                                                 }
@@ -5734,9 +5999,9 @@ impl Engine {
     /// each market event only to the instances subscribing its symbol
     /// (spot symbols matched statically from `subscribed_symbols`,
     /// Polymarket token_ids learned dynamically from `Instrument`
-    /// events). Order-update fan-out is broadcast for now (each strategy
-    /// filters by its own `client_order_id`, exactly as the single-
-    /// thread loop did); P3 refines this to coid→instance routing.
+    /// events). Order updates are routed directly by the numeric owner encoded
+    /// in each instance's client-order-id namespace; unknown or quarantined
+    /// owners are fail-closed and never broadcast to sibling strategies.
     ///
     /// Returns the router/supervisor thread's handle (it joins the
     /// workers internally), so the caller's single `.join()` still works.
@@ -5744,7 +6009,7 @@ impl Engine {
         &self,
         strategies: Vec<Box<dyn Strategy>>,
         market_rx: Receiver<MarketEvent>,
-        signal_tx: Sender<Signal>,
+        signal_tx: SignalSender,
         update_rx: Receiver<OrderUpdate>,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
@@ -5754,29 +6019,19 @@ impl Engine {
         // symbol shared by several instances (e.g. two BTC timeframes on
         // BTCUSDT) maps to all of them — that's the shared-subscription
         // fan-out the design calls for.
-        let mut sym_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
+        assert!(
+            strategies.len() <= RouteMask::BITS as usize,
+            "numeric strategy route mask supports at most {} instances",
+            RouteMask::BITS,
+        );
+        let mut sym_to_instances: HashMap<SymbolId, RouteMask> = HashMap::new();
         let mut instance_ids: Vec<String> = Vec::with_capacity(strategies.len());
         for (i, s) in strategies.iter().enumerate() {
             instance_ids.push(s.instance_id().to_string());
             for sym in s.subscribed_symbols() {
-                let key = sym.to_ascii_lowercase();
-                let e = sym_to_instances.entry(key).or_default();
-                if !e.contains(&i) {
-                    e.push(i);
-                }
+                *sym_to_instances.entry(SymbolId::of(&sym)).or_default() |= 1u64 << i;
             }
         }
-
-        // P3: client_order_id → owning instance index registry. Each
-        // worker registers the coids of every order it places (keyed to
-        // its own index) as it emits the signal; the router consults it
-        // to deliver each OrderUpdate ONLY to the owning instance (a
-        // BTC fill never wakes the ETH worker). Entries are removed on
-        // terminal status. A coid the router can't resolve (e.g. a
-        // straggler after removal, or a reconcile-sourced update)
-        // falls back to broadcast — still correct, each worker filters.
-        let coid_owner: Arc<std::sync::Mutex<HashMap<String, usize>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Per-instance channels + move each strategy into a worker spec.
         // Market events are immutable after parsing. Fan out one allocation
@@ -5825,10 +6080,9 @@ impl Engine {
                 let (worker_status_tx, worker_status_rx) = unbounded::<(usize, bool)>();
                 let (shutdown_ack_tx, shutdown_ack_rx) = unbounded::<usize>();
                 for (idx, (strategy, mrx, latest, urx)) in specs.into_iter().enumerate() {
-                    let stx = signal_tx.clone();
+                    let stx = signal_tx.with_owner(idx);
                     let dd = data_dirs.clone();
                     let iid = instance_ids[idx].clone();
-                    let reg = coid_owner.clone();
                     let heartbeat = Arc::clone(&worker_heartbeats[idx]);
                     let quarantined = Arc::clone(&worker_quarantined[idx]);
                     let shutdown_requested = Arc::clone(&worker_shutdown_requested[idx]);
@@ -5840,7 +6094,7 @@ impl Engine {
                         .spawn(move || {
                             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 Self::run_strategy_worker(
-                                    strategy, mrx, latest, urx, stx, dd, &iid, idx, reg,
+                                    strategy, mrx, latest, urx, stx, dd, &iid, idx,
                                     heartbeat, quarantined, shutdown_requested,
                                     ack_tx, clock_origin,
                                 );
@@ -5862,14 +6116,15 @@ impl Engine {
                 );
 
                 // Learned Polymarket token_id → instances (from Instrument).
-                let mut token_to_instances: HashMap<String, Vec<usize>> = HashMap::new();
+                let mut token_to_instances: HashMap<SymbolId, RouteMask> =
+                    HashMap::with_capacity(64);
+                let mut latest_key_ids: HashMap<LatestMarketKey, u16> =
+                    HashMap::with_capacity(MAX_LATEST_MARKET_KEYS);
                 let mut market_overflow_drops = vec![0u64; instance_ids.len()];
                 let mut market_overflow_log_at = std::time::Instant::now();
                 let mut last_emergency_cancel_attempt_ns = vec![0u64; instance_ids.len()];
                 let supervisor_tick = crossbeam_channel::tick(std::time::Duration::from_millis(100));
-                // instance_id → worker index, for recovering the owner of a
-                // coid that's no longer in `coid_owner` (late update after its
-                // registry entry was freed). Coids are minted as
+                // instance_id → numeric worker owner. Coids are minted as
                 // "{instance_id}-{counter}" in live/paper, so the prefix names
                 // the placing instance.
                 let iid_to_idx: HashMap<String, usize> = instance_ids
@@ -5923,12 +6178,16 @@ impl Engine {
                             Ok(event) => {
                                 if shutdown_in_progress { continue; }
                                 let event = Arc::new(event);
-                                for idx in Self::route_market_event(
+                                let mut dropped_mask = Self::route_market_event(
                                     Arc::clone(&event),
                                     &sym_to_instances,
                                     &mut token_to_instances,
+                                    &mut latest_key_ids,
                                     &market_lanes,
-                                ) {
+                                );
+                                while dropped_mask != 0 {
+                                    let idx = dropped_mask.trailing_zeros() as usize;
+                                    dropped_mask &= dropped_mask - 1;
                                     if let Some(drops) = market_overflow_drops.get_mut(idx) {
                                         *drops = drops.saturating_add(1);
                                     }
@@ -5963,12 +6222,12 @@ impl Engine {
                             Err(_) => break,
                         },
                         recv(update_rx) -> msg => match msg {
-                            // P3: route by coid → owning instance. Unknown
-                            // coid → broadcast fallback (worker filters).
+                            // Route by coid → numeric owner. Missing ownership
+                            // is unowned and dropped rather than contaminating
+                            // sibling StrategyAccounts.
                             Ok(u) => {
                                 Self::route_private_update(
                                     u,
-                                    &coid_owner,
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
@@ -5987,7 +6246,6 @@ impl Engine {
                                 while let Ok(u) = update_rx.try_recv() {
                                     Self::route_private_update(
                                         u,
-                                        &coid_owner,
                                         &iid_to_idx,
                                         &update_txs,
                                         &worker_quarantined,
@@ -6061,12 +6319,11 @@ impl Engine {
 
     fn route_private_update(
         update: OrderUpdate,
-        coid_owner: &std::sync::Mutex<HashMap<String, usize>>,
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         instance_ids: &[String],
-        signal_tx: &Sender<Signal>,
+        signal_tx: &SignalSender,
     ) {
         let is_market_cancel_finality = update.error.as_deref().is_some_and(|error| {
             error.starts_with(POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED)
@@ -6075,20 +6332,8 @@ impl Engine {
         let owner = if is_market_cancel_finality {
             iid_to_idx.get(&update.client_order_id).copied()
         } else {
-            coid_owner
-                .lock()
-                .unwrap()
-                .get(&update.client_order_id)
-                .copied()
-                .or_else(|| owner_from_coid(&update.client_order_id, iid_to_idx))
+            owner_from_coid(&update.client_order_id, iid_to_idx)
         };
-        let terminal = !is_market_cancel_finality
-            && (matches!(
-                update.status,
-                OrderStatus::Cancelled | OrderStatus::Rejected
-            ) || (matches!(update.status, OrderStatus::Filled | OrderStatus::Failed)
-                && update.trade_id.as_deref().is_none_or(str::is_empty)));
-        let terminal_coid = terminal.then(|| update.client_order_id.clone());
 
         match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
             PrivateUpdateRoute::Owner(i) => {
@@ -6116,30 +6361,12 @@ impl Engine {
                     i, update.client_order_id
                 );
             }
-            PrivateUpdateRoute::Broadcast => {
-                let enqueued_at = std::time::Instant::now();
-                for (idx, tx) in update_txs.iter().enumerate() {
-                    if worker_quarantined[idx].load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let sent = tx.try_send(QueuedOrderUpdate {
-                        update: update.clone(),
-                        enqueued_at,
-                    });
-                    if sent.is_err() {
-                        quarantine_strategy_worker(
-                            idx,
-                            "private update broadcast queue overflow/disconnect (event loss)",
-                            instance_ids,
-                            worker_quarantined,
-                            signal_tx,
-                        );
-                    }
-                }
+            PrivateUpdateRoute::Unowned => {
+                error!(
+                    "[strategy_router] dropping private update without numeric owner coid={} status={:?}",
+                    update.client_order_id, update.status,
+                );
             }
-        }
-        if let Some(coid) = terminal_coid {
-            coid_owner.lock().unwrap().remove(&coid);
         }
     }
 
@@ -6151,25 +6378,19 @@ impl Engine {
     /// token_id → instance from `Instrument(BinaryOption)`.
     fn route_market_event(
         event: Arc<MarketEvent>,
-        sym_to_instances: &HashMap<String, Vec<usize>>,
-        token_to_instances: &mut HashMap<String, Vec<usize>>,
+        sym_to_instances: &HashMap<SymbolId, RouteMask>,
+        token_to_instances: &mut HashMap<SymbolId, RouteMask>,
+        latest_key_ids: &mut HashMap<LatestMarketKey, u16>,
         market_lanes: &[MarketEventLane],
-    ) -> Vec<usize> {
-        let broadcast = |lanes: &[MarketEventLane]| {
-            let mut dropped = Vec::new();
-            for (idx, lane) in lanes.iter().enumerate() {
-                if !enqueue_market_event(lane, Arc::clone(&event)) {
-                    dropped.push(idx);
-                }
-            }
-            dropped
-        };
-        let send_to = |idxs: &[usize], lanes: &[MarketEventLane]| {
-            let mut dropped = Vec::new();
-            for &i in idxs {
-                if let Some(lane) = lanes.get(i) {
-                    if !enqueue_market_event(lane, Arc::clone(&event)) {
-                        dropped.push(i);
+    ) -> RouteMask {
+        let send_to = |mut mask: RouteMask, latest_key_id: Option<u16>| {
+            let mut dropped = 0u64;
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if let Some(lane) = market_lanes.get(i) {
+                    if !enqueue_market_event(lane, Arc::clone(&event), latest_key_id) {
+                        dropped |= 1u64 << i;
                     }
                 }
             }
@@ -6179,26 +6400,27 @@ impl Engine {
         // Instrument(BinaryOption) → attribute its token_ids to the owner
         // instance(s) of its slug, then deliver to those owners.
         if let MarketEvent::Instrument(Instrument::BinaryOption(bo)) = event.as_ref() {
-            let route_key = if bo.series_slug.trim().is_empty() {
-                bo.slug.to_ascii_lowercase()
+            let route_symbol = if bo.series_slug.trim().is_empty() {
+                bo.slug.as_str()
             } else {
-                bo.series_slug.to_ascii_lowercase()
+                bo.series_slug.as_str()
             };
-            if let Some(owners) = sym_to_instances.get(&route_key).cloned() {
+            let route_key = SymbolId::of(route_symbol);
+            if let Some(&owners) = sym_to_instances.get(&route_key) {
                 for tok in &bo.clob_token_ids {
-                    token_to_instances.insert(tok.to_ascii_lowercase(), owners.clone());
+                    token_to_instances.insert(SymbolId::of(tok), owners);
                 }
-                return send_to(&owners, market_lanes);
+                return send_to(owners, None);
             } else {
                 warn!(
                     "[strategy_router] dropping unroutable Polymarket instrument series={} event_slug={}",
-                    route_key, bo.slug,
+                    route_symbol, bo.slug,
                 );
-                return Vec::new();
+                return 0;
             }
         }
 
-        let targets: Option<Vec<usize>> = match event.as_ref() {
+        let targets: Option<RouteMask> = match event.as_ref() {
             // Lifecycle / spot-instrument → all instances.
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
@@ -6206,88 +6428,82 @@ impl Engine {
             // Polymarket market data keyed by dynamic token_id.
             MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => Some(
                 token_to_instances
-                    .get(&ob.symbol.to_ascii_lowercase())
-                    .cloned()
+                    .get(&SymbolId::of(&ob.symbol))
+                    .copied()
                     .unwrap_or_default(),
             ),
             MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => Some(
                 token_to_instances
-                    .get(&t.symbol.to_ascii_lowercase())
-                    .cloned()
+                    .get(&SymbolId::of(&t.symbol))
+                    .copied()
                     .unwrap_or_default(),
             ),
             MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => Some(
                 token_to_instances
-                    .get(&q.symbol.to_ascii_lowercase())
-                    .cloned()
+                    .get(&SymbolId::of(&q.symbol))
+                    .copied()
                     .unwrap_or_default(),
             ),
             MarketEvent::TickSizeChange(tsc) => Some(
                 token_to_instances
-                    .get(&tsc.symbol.to_ascii_lowercase())
-                    .cloned()
+                    .get(&SymbolId::of(&tsc.symbol))
+                    .copied()
                     .unwrap_or_default(),
             ),
             // Spot venues keyed by stable symbol.
             MarketEvent::OrderBook(ob) => sym_to_instances
-                .get(&ob.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&ob.symbol))
+                .copied(),
             MarketEvent::Trade(t) => sym_to_instances
-                .get(&t.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&t.symbol))
+                .copied(),
             MarketEvent::Quote(q) => sym_to_instances
-                .get(&q.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&q.symbol))
+                .copied(),
             MarketEvent::Bar(b) => sym_to_instances
-                .get(&b.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&b.symbol))
+                .copied(),
             MarketEvent::SpotPrice(sp) => sym_to_instances
-                .get(&sp.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&sp.symbol))
+                .copied(),
             MarketEvent::AssetCtx(ac) => sym_to_instances
-                .get(&ac.symbol.to_ascii_lowercase())
-                .cloned(),
+                .get(&SymbolId::of(&ac.symbol))
+                .copied(),
             MarketEvent::MarketDataHealth(health) => Some(
                 token_to_instances
-                    .get(&health.symbol.to_ascii_lowercase())
-                    .cloned()
+                    .get(&SymbolId::of(&health.symbol))
+                    .copied()
                     .unwrap_or_default(),
             ),
             MarketEvent::EventStart { symbol, .. } => {
-                sym_to_instances.get(&symbol.to_ascii_lowercase()).cloned()
+                sym_to_instances.get(&SymbolId::of(symbol)).copied()
             }
-            MarketEvent::Exit => Some(Vec::new()),
+            MarketEvent::Exit => Some(0),
         };
-        match targets {
-            Some(idxs) if !idxs.is_empty() => send_to(&idxs, market_lanes),
-            Some(_) => Vec::new(), // Exit handled by caller; empty = drop
-            None => broadcast(market_lanes),
-        }
-    }
-
-    /// Register the client_order_ids of every order a signal PLACES,
-    /// keyed to the emitting instance's index, so the router can route
-    /// that order's later fills/acks/cancels back to it (P3). Cancel-only
-    /// signals carry no places and are a no-op here.
-    fn register_place_coids(
-        signal: &Signal,
-        idx: usize,
-        coid_owner: &std::sync::Mutex<HashMap<String, usize>>,
-    ) {
-        let places: &[OrderRequest] = match signal {
-            Signal::NewOrder(o) => std::slice::from_ref(o),
-            Signal::BatchNewOrders { orders, .. } => orders,
-            Signal::BatchUpdateOrders { place_orders, .. }
-            | Signal::ReplaceOrder { place_orders, .. } => place_orders,
-            _ => return,
+        let targets = match targets {
+            Some(0) => return 0, // Exit handled by caller; empty = drop
+            Some(mask) => mask,
+            None => match market_lanes.len() {
+                64 => u64::MAX,
+                len => (1u64 << len) - 1,
+            },
         };
-        if places.is_empty() {
-            return;
-        }
-        let mut map = coid_owner.lock().unwrap();
-        for o in places {
-            map.insert(o.client_order_id.clone(), idx);
-        }
+        // Register coverable keys only after routing resolved at least one
+        // owner. Unknown dynamic token traffic must not consume fixed slots.
+        let latest_key_id = latest_market_key(event.as_ref()).map(|key| {
+            if let Some(id) = latest_key_ids.get(&key) {
+                return *id;
+            }
+            let id = latest_key_ids.len();
+            assert!(
+                id < MAX_LATEST_MARKET_KEYS,
+                "latest-market key capacity exhausted ({MAX_LATEST_MARKET_KEYS})"
+            );
+            let id = id as u16;
+            latest_key_ids.insert(key, id);
+            id
+        });
+        send_to(targets, latest_key_id)
     }
 
     /// Per-instance worker loop (live/paper multi-instance). Runs ONE
@@ -6295,18 +6511,17 @@ impl Engine {
     /// of the single-thread loop (market dispatch + quote-cadence
     /// trigger + order-update reaction), minus the recorder/sim-clock
     /// (the router owns recording; sim-clock is backtest-only). Registers
-    /// the coids of every order it places into `coid_owner` so the router
-    /// routes the resulting fills back to THIS instance (P3).
+    /// numeric ownership in the signal envelope lets the router return fills
+    /// to this instance without a shared client-order-id registry.
     fn run_strategy_worker(
         mut strategy: Box<dyn Strategy>,
         market_rx: Receiver<QueuedMarketEvent>,
         latest_market: Arc<LatestMarketStore>,
         update_rx: Receiver<QueuedOrderUpdate>,
-        signal_tx: Sender<Signal>,
+        signal_tx: SignalSender,
         data_dirs: Vec<PathBuf>,
         instance_id: &str,
         idx: usize,
-        coid_owner: Arc<std::sync::Mutex<HashMap<String, usize>>>,
         heartbeat: Arc<AtomicU64>,
         quarantined: Arc<AtomicBool>,
         shutdown_requested: Arc<AtomicBool>,
@@ -6314,16 +6529,15 @@ impl Engine {
         clock_origin: Arc<std::time::Instant>,
     ) {
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
-        // Emit a signal: register its placed coids to this instance, then
-        // forward. Returns false if the executor channel is gone.
+        // The sender is permanently tagged with this worker's numeric owner.
         let emit = |sig: Signal| -> bool {
             if quarantined.load(Ordering::Acquire) {
                 return false;
             }
-            Self::register_place_coids(&sig, idx, &coid_owner);
             signal_tx.send(sig).is_ok()
         };
         let mut last_quote_ns: u64 = 0;
+        let mut quote_signal_batch = Vec::with_capacity(32);
         let mut queue_window_started = std::time::Instant::now();
         let mut queue_samples = 0u64;
         let mut queue_total_us = 0u128;
@@ -6439,8 +6653,9 @@ impl Engine {
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if shutdown_started { continue; }
-                        let queue_last_us = queued.enqueued_at.elapsed().as_micros()
-                            .min(u64::MAX as u128) as u64;
+                        let queue_last_us = crate::types::now_ns()
+                            .saturating_sub(queued.enqueued_ns)
+                            / 1_000;
                         let event_kind = market_event_metric_kind(queued.event.as_ref());
                         queue_samples = queue_samples.saturating_add(1);
                         queue_total_us = queue_total_us.saturating_add(queue_last_us as u128);
@@ -6506,9 +6721,10 @@ impl Engine {
                                 };
                                 if fire {
                                     last_quote_ns = ts;
-                                    let mut quote_signals = strategy.on_quote(ts);
-                                    stamp_quote_trigger(&mut quote_signals, ob, true);
-                                    for sig in quote_signals {
+                                    quote_signal_batch.clear();
+                                    strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true);
+                                    for sig in quote_signal_batch.drain(..) {
                                         if !emit(sig) { return; }
                                     }
                                 }
@@ -8367,7 +8583,7 @@ impl Engine {
     /// Spawn the execution thread that processes Signal → OrderUpdate.
     pub fn spawn_execution_thread(
         &self,
-        signal_rx: Receiver<Signal>,
+        signal_rx: Receiver<RoutedSignal>,
         update_tx: Sender<OrderUpdate>,
     ) -> thread::JoinHandle<()> {
         // Standalone caller (no live polymaker wiring) — pass an empty
@@ -8381,7 +8597,7 @@ impl Engine {
     /// HTTP agent / connection pool with the heartbeat and user_feed.
     pub fn spawn_execution_thread_with_poly(
         &self,
-        signal_rx: Receiver<Signal>,
+        signal_rx: Receiver<RoutedSignal>,
         update_tx: Sender<OrderUpdate>,
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
@@ -8398,7 +8614,7 @@ impl Engine {
 
     fn spawn_execution_thread_with_poly_shutdown(
         &self,
-        signal_rx: Receiver<Signal>,
+        signal_rx: Receiver<RoutedSignal>,
         update_tx: Sender<OrderUpdate>,
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
@@ -8511,11 +8727,11 @@ impl Engine {
                     .map(|e| e.executor_workers).unwrap_or(8).max(1);
                 let (poly_pool_tx, poly_pool_rx) =
                     bounded::<(Signal, u64, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
-                // Must-complete cancel work owns a lossless lane. Its workers
-                // are allowed to wait for a Cancel permit without consuming a
-                // place worker and aging unrelated quote signals.
+                // Must-complete cancel work owns a bounded lossless lane. A
+                // full lane backpressures only the execution actor; it cannot
+                // grow process memory without limit or block a strategy owner.
                 let (poly_cancel_tx, poly_cancel_rx) =
-                    unbounded::<(Signal, u64, Sender<OrderUpdate>)>();
+                    bounded::<(Signal, u64, Sender<OrderUpdate>)>(CHANNEL_CAPACITY);
                 // Reconcile performs synchronous multi-request HTTP. Keep it
                 // off both the place and cancel lanes; bounded admission lets
                 // the strategy receive explicit deferred feedback instead of
@@ -8527,11 +8743,15 @@ impl Engine {
                 // "await reply + book it" closure here; a pool of drainers runs
                 // them so no worker `block_on`s the RTT. The permit is captured
                 // by the closure and released when it completes.
-                // Fired completions are already bounded by held HTTP permits,
-                // so an unbounded channel removes a redundant blocking send
-                // without removing effective admission control.
+                // Fired completions are bounded by held HTTP permits. Mirror
+                // that physical ceiling in the queue as an explicit invariant
+                // rather than relying on an unbounded container.
+                let completion_capacity =
+                    hexagent_runtime::http1_pool::total_account_order_capacity()
+                        .saturating_add(4)
+                        .max(4);
                 let (poly_done_tx, poly_done_rx) =
-                    unbounded::<QueuedPolyCompletion>();
+                    bounded::<QueuedPolyCompletion>(completion_capacity);
                 let mut poly_worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 let mut poly_cancel_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 let mut poly_reconcile_handles: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -8633,7 +8853,11 @@ impl Engine {
                             .unwrap();
                         poly_cancel_handles.push(h);
                     }
-                    let reconcile_worker_n = poly_states.len().saturating_mul(2).max(1);
+                    // One owner task per account route is sufficient: each
+                    // request already owns a separate Reconcile connection
+                    // permit, and duplicate OS workers only increase lock/map
+                    // contention in cold lifecycle bookkeeping.
+                    let reconcile_worker_n = poly_states.len().max(1);
                     for i in 0..reconcile_worker_n {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_reconcile_rx.clone();
@@ -8896,7 +9120,9 @@ impl Engine {
                 let mut round_robins: HashMap<String, usize> = HashMap::new();
                 let mut shutdown_finalized = false;
 
-                while let Ok(signal) = signal_rx.recv() {
+                while let Ok(routed) = signal_rx.recv() {
+                    let _owner = routed.owner;
+                    let signal = routed.signal;
                     if shutdown_finalized
                         && !matches!(&signal, Signal::BeginShutdown | Signal::Exit)
                     {
@@ -9063,8 +9289,8 @@ impl Engine {
                                     _ => {
                                         // Lifecycle/audit control messages are
                                         // low-volume and lossless. Reuse the
-                                        // unbounded must-complete lane so place
-                                        // pressure cannot delay the dispatcher.
+                                        // bounded must-complete lane so place
+                                        // pressure cannot grow process memory.
                                         if let Some(tx) = poly_cancel_tx.as_ref() {
                                             let _ = tx.send(work);
                                         }
@@ -9105,7 +9331,7 @@ impl Engine {
 /// never contains '-', so `rsplit_once('-')` cleanly splits off the
 /// instance_id prefix even when the instance_id itself contains dashes.
 /// Returns `None` for legacy un-prefixed (all-numeric) coids or an unknown
-/// instance — caller then broadcasts, preserving the prior behaviour.
+/// instance. Multi-instance private routing treats that as unowned/fail-closed.
 fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<usize> {
     let (iid, _counter) = coid.rsplit_once('-')?;
     iid_to_idx.get(iid).copied()
@@ -9114,7 +9340,7 @@ fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<us
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateUpdateRoute {
     Owner(usize),
-    Broadcast,
+    Unowned,
     DropQuarantined(usize),
     DropInvalid(usize),
 }
@@ -9130,7 +9356,7 @@ fn classify_private_update_route(
         }
         Some(i) if quarantined[i].load(Ordering::Acquire) => PrivateUpdateRoute::DropQuarantined(i),
         Some(i) => PrivateUpdateRoute::Owner(i),
-        None => PrivateUpdateRoute::Broadcast,
+        None => PrivateUpdateRoute::Unowned,
     }
 }
 
@@ -11194,9 +11420,9 @@ mod market_router_tests {
         assert!(rx.try_recv().is_err(), "exit event must be enqueued once");
     }
 
-    fn two_instance_map() -> HashMap<String, Vec<usize>> {
+    fn two_instance_map() -> HashMap<SymbolId, RouteMask> {
         // Instance 0 = BTC, instance 1 = ETH.
-        let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut m: HashMap<SymbolId, RouteMask> = HashMap::new();
         for s in [
             "btcusdt",
             "btc-usd",
@@ -11204,7 +11430,7 @@ mod market_router_tests {
             "series:btc-up-or-down-5m",
             "btc-up-or-down-5m",
         ] {
-            m.entry(s.to_string()).or_default().push(0);
+            *m.entry(SymbolId::of(s)).or_default() |= 1;
         }
         for s in [
             "ethusdt",
@@ -11213,7 +11439,7 @@ mod market_router_tests {
             "series:eth-up-or-down-5m",
             "eth-up-or-down-5m",
         ] {
-            m.entry(s.to_string()).or_default().push(1);
+            *m.entry(SymbolId::of(s)).or_default() |= 1 << 1;
         }
         m
     }
@@ -11235,8 +11461,8 @@ mod market_router_tests {
         let (lane, rx) = test_market_lane(8);
         let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
         let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
-        assert!(enqueue_market_event(&lane, first));
-        assert!(enqueue_market_event(&lane, Arc::clone(&second)));
+        assert!(enqueue_market_event(&lane, first, Some(0)));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second), Some(0)));
         assert_eq!(rx.len(), 1, "one latest-only marker per venue/symbol/kind");
         let payload = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&payload.event, &second));
@@ -11248,14 +11474,15 @@ mod market_router_tests {
         let (lane, rx) = test_market_lane(8);
         let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
         let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
-        assert!(enqueue_market_event(&lane, Arc::clone(&first)));
+        assert!(enqueue_market_event(&lane, Arc::clone(&first), Some(0)));
         assert!(enqueue_market_event(
             &lane,
             Arc::new(MarketEvent::Connected {
                 exchange: Exchange::Binance,
             }),
+            None,
         ));
-        assert!(enqueue_market_event(&lane, Arc::clone(&second)));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second), Some(0)));
         assert_eq!(rx.len(), 3);
 
         let before_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
@@ -11290,7 +11517,8 @@ mod market_router_tests {
     #[test]
     fn spot_and_binance_ob_route_to_owning_instance_only() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -11300,15 +11528,23 @@ mod market_router_tests {
             Arc::new(ob(Exchange::Binance, "BTCUSDT")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         // BTC chainlink spot (lowercase "btc/usd") → only instance 0.
-        Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(spot("btc/usd")),
+            &sym,
+            &mut tok,
+            &mut latest,
+            &txs,
+        );
         // ETH Coinbase OB → only instance 1.
         Engine::route_market_event(
             Arc::new(ob(Exchange::Coinbase, "ETH-USD")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
 
@@ -11319,31 +11555,39 @@ mod market_router_tests {
     #[test]
     fn full_market_queue_drops_only_that_instance_without_blocking_router() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, _rx0) = test_market_lane(1);
         let (lane1, rx1) = test_market_lane(1);
         let txs = [lane0, lane1];
 
         assert_eq!(
-            Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs,),
-            Vec::<usize>::new()
+            Engine::route_market_event(
+                Arc::new(spot("btc/usd")), &sym, &mut tok, &mut latest, &txs,
+            ),
+            0
         );
         // BTC queue is now full. Routing ETH must remain independent.
         assert_eq!(
-            Engine::route_market_event(Arc::new(spot("eth/usd")), &sym, &mut tok, &txs,),
-            Vec::<usize>::new()
+            Engine::route_market_event(
+                Arc::new(spot("eth/usd")), &sym, &mut tok, &mut latest, &txs,
+            ),
+            0
         );
         assert_eq!(drain(&rx1), 1);
         assert_eq!(
-            Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &txs,),
-            vec![0]
+            Engine::route_market_event(
+                Arc::new(spot("btc/usd")), &sym, &mut tok, &mut latest, &txs,
+            ),
+            1
         );
     }
 
     #[test]
     fn polymarket_token_learned_from_instrument_then_routed() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -11359,6 +11603,7 @@ mod market_router_tests {
             Arc::new(MarketEvent::Instrument(rotating)),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         assert_eq!(drain(&rx0), 1, "instrument delivered to owner");
@@ -11369,6 +11614,7 @@ mod market_router_tests {
             Arc::new(ob(Exchange::Polymarket, "TOKxyz")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         assert_eq!(drain(&rx0), 1, "poly OB routed to learned owner");
@@ -11387,6 +11633,7 @@ mod market_router_tests {
             })),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         assert_eq!(drain(&rx0), 1, "condition health routed to learned owner");
@@ -11396,7 +11643,8 @@ mod market_router_tests {
     #[test]
     fn unknown_polymarket_series_is_never_broadcast() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -11407,17 +11655,19 @@ mod market_router_tests {
             ))),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         assert_eq!(drain(&rx0), 0);
         assert_eq!(drain(&rx1), 0);
-        assert!(!tok.contains_key("sol-token"));
+        assert!(!tok.contains_key(&SymbolId::of("sol-token")));
     }
 
     #[test]
     fn unknown_polymarket_market_data_is_never_broadcast() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -11426,21 +11676,30 @@ mod market_router_tests {
             Arc::new(ob(Exchange::Polymarket, "UNMAPPED-TOKEN")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         Engine::route_market_event(
             Arc::new(trade(Exchange::Polymarket, "UNMAPPED-TOKEN")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         Engine::route_market_event(
             Arc::new(quote(Exchange::Polymarket, "UNMAPPED-TOKEN")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
-        Engine::route_market_event(Arc::new(tick_size("UNMAPPED-TOKEN")), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(tick_size("UNMAPPED-TOKEN")),
+            &sym,
+            &mut tok,
+            &mut latest,
+            &txs,
+        );
         Engine::route_market_event(
             Arc::new(MarketEvent::MarketDataHealth(MarketDataHealth {
                 exchange: Exchange::Polymarket,
@@ -11454,6 +11713,7 @@ mod market_router_tests {
             })),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         assert_eq!(drain(&rx0), 0);
@@ -11463,7 +11723,8 @@ mod market_router_tests {
     #[test]
     fn lifecycle_and_unknown_spot_symbols_broadcast() {
         let sym = two_instance_map();
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -11475,10 +11736,17 @@ mod market_router_tests {
             }),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         // Unknown spot symbol → broadcast (never dropped).
-        Engine::route_market_event(Arc::new(spot("dogeusdt")), &sym, &mut tok, &txs);
+        Engine::route_market_event(
+            Arc::new(spot("dogeusdt")),
+            &sym,
+            &mut tok,
+            &mut latest,
+            &txs,
+        );
 
         assert_eq!(drain(&rx0), 2);
         assert_eq!(drain(&rx1), 2);
@@ -11551,40 +11819,13 @@ mod market_router_tests {
     }
 
     #[test]
-    fn register_place_coids_maps_each_placed_order_to_its_instance() {
-        let reg = std::sync::Mutex::new(HashMap::<String, usize>::new());
-        // NewOrder → single coid.
-        Engine::register_place_coids(&Signal::NewOrder(order_req("c1", "btc")), 0, &reg);
-        // BatchUpdateOrders (reprice) places two new coids for instance 1.
-        Engine::register_place_coids(
-            &Signal::BatchUpdateOrders {
-                exchange: Exchange::Polymarket,
-                market_id: "m".into(),
-                cancel_client_order_ids: vec!["old".into()],
-                place_orders: vec![order_req("c2", "eth"), order_req("c3", "eth")],
-                timestamp_ns: 1,
-                instance_id: "eth".into(),
-            },
-            1,
-            &reg,
-        );
-        // Cancel-only signal registers nothing.
-        Engine::register_place_coids(
-            &Signal::BatchCancelOrders {
-                exchange: Exchange::Polymarket,
-                market_id: "m".into(),
-                client_order_ids: vec!["c1".into()],
-                instance_id: "btc".into(),
-                timestamp_ns: 1,
-            },
-            0,
-            &reg,
-        );
-        let map = reg.lock().unwrap();
-        assert_eq!(map.get("c1"), Some(&0));
-        assert_eq!(map.get("c2"), Some(&1));
-        assert_eq!(map.get("c3"), Some(&1));
-        assert_eq!(map.len(), 3, "cancel-only signal added no entries");
+    fn signal_sender_tags_numeric_owner_without_registry() {
+        let (raw_tx, rx) = bounded(1);
+        let sender = SignalSender::system(raw_tx).with_owner(7);
+        sender.send(Signal::NewOrder(order_req("c1", "btc"))).unwrap();
+        let routed = rx.recv().unwrap();
+        assert_eq!(routed.owner, 7);
+        assert!(matches!(routed.signal, Signal::NewOrder(_)));
     }
 
     #[test]
@@ -11598,9 +11839,9 @@ mod market_router_tests {
         assert_eq!(owner_from_coid("btc02-9", &m), Some(1));
         // rsplit_once('-') keeps the dash-bearing instance_id intact.
         assert_eq!(owner_from_coid("zhu-03-42", &m), Some(2));
-        // Legacy bare-numeric coid (backtest/single-instance) → broadcast.
+        // Legacy bare-numeric coid has no multi-instance owner.
         assert_eq!(owner_from_coid("1782840607342", &m), None);
-        // Unknown instance → broadcast.
+        // Unknown instance is unowned.
         assert_eq!(owner_from_coid("eth09-7", &m), None);
     }
 
@@ -11684,7 +11925,8 @@ mod market_router_tests {
 
     #[test]
     fn worker_quarantine_is_idempotent_and_enqueues_instance_cancel() {
-        let (signal_tx, signal_rx) = bounded::<Signal>(4);
+        let (raw_tx, signal_rx) = bounded::<RoutedSignal>(4);
+        let signal_tx = SignalSender::system(raw_tx);
         let flags = vec![Arc::new(AtomicBool::new(false))];
         let instances = vec!["btc01".to_string()];
         assert!(quarantine_strategy_worker(
@@ -11695,7 +11937,9 @@ mod market_router_tests {
             &signal_tx,
         ));
         assert!(flags[0].load(Ordering::Acquire));
-        match signal_rx.try_recv().unwrap() {
+        let routed = signal_rx.try_recv().unwrap();
+        assert_eq!(routed.owner, 0);
+        match routed.signal {
             Signal::PolymarketCancelAllOrders {
                 instance_id,
                 market,
@@ -11720,7 +11964,8 @@ mod market_router_tests {
 
     #[test]
     fn emergency_instance_cancel_can_retry_after_queue_saturation() {
-        let (signal_tx, signal_rx) = bounded::<Signal>(1);
+        let (raw_tx, signal_rx) = bounded::<RoutedSignal>(1);
+        let signal_tx = SignalSender::system(raw_tx);
         signal_tx.send(Signal::Exit).unwrap();
         assert!(!enqueue_emergency_instance_cancel(
             0,
@@ -11728,7 +11973,7 @@ mod market_router_tests {
             "first attempt",
             &signal_tx,
         ));
-        assert!(matches!(signal_rx.recv().unwrap(), Signal::Exit));
+        assert!(matches!(signal_rx.recv().unwrap().signal, Signal::Exit));
         assert!(enqueue_emergency_instance_cancel(
             0,
             "btc01",
@@ -11736,7 +11981,7 @@ mod market_router_tests {
             &signal_tx,
         ));
         assert!(matches!(
-            signal_rx.recv().unwrap(),
+            signal_rx.recv().unwrap().signal,
             Signal::PolymarketCancelAllOrders { instance_id, .. } if instance_id == "btc01"
         ));
     }
@@ -11757,7 +12002,7 @@ mod market_router_tests {
         );
         assert_eq!(
             classify_private_update_route(None, 2, &flags),
-            PrivateUpdateRoute::Broadcast,
+            PrivateUpdateRoute::Unowned,
         );
         assert_eq!(
             classify_private_update_route(Some(9), 2, &flags),
@@ -11846,15 +12091,17 @@ mod market_router_tests {
     fn shared_symbol_fans_out_one_allocation_to_five_subscribers() {
         // Five BTC instances all subscribe BTCUSDT, but the router must not
         // allocate five copies of the order-book payload.
-        let mut sym: HashMap<String, Vec<usize>> = HashMap::new();
-        sym.insert("btcusdt".into(), vec![0, 1, 2, 3, 4]);
-        let mut tok: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut sym: HashMap<SymbolId, RouteMask> = HashMap::new();
+        sym.insert(SymbolId::of("btcusdt"), 0b1_1111);
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = HashMap::new();
         let (txs, rxs): (Vec<_>, Vec<_>) = (0..5).map(|_| test_market_lane(64)).unzip();
 
         Engine::route_market_event(
             Arc::new(ob(Exchange::Binance, "BTCUSDT")),
             &sym,
             &mut tok,
+            &mut latest,
             &txs,
         );
         let first =

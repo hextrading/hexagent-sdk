@@ -868,9 +868,15 @@ fn parse_order_event(
     let coid = shared.lookup_coid(order_id).ok_or_else(|| {
         format!("unowned private order lifecycle event for order_id `{order_id}`")
     })?;
-    let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
-        format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
-    })?;
+    // Cold account application needs the ledger's advancing lifecycle status;
+    // the fast owner route intentionally uses the immutable runtime mirror.
+    let ownership = shared
+        .account_state
+        .reconcile_order_route(&coid, order_id)
+        .or_else(|| shared.lookup_order_ownership(order_id))
+        .ok_or_else(|| {
+            format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
+        })?;
     if normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
         || ownership.token_id != asset_id
         || ownership.side != side
@@ -1296,6 +1302,315 @@ struct PrivateApplyLane {
     reconnect_notify: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Debug)]
+enum PrivateRouteIdentity {
+    TradeLifecycle { key: String, rank: u8 },
+}
+
+#[derive(Debug)]
+struct FastPrivateUpdate {
+    update: OrderUpdate,
+    identity: PrivateRouteIdentity,
+}
+
+#[derive(Debug)]
+struct PrivateRouteDedupe {
+    trades: GapReplayLifecycleDedupe,
+}
+
+impl PrivateRouteDedupe {
+    fn new() -> Self {
+        Self {
+            trades: GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+        }
+    }
+
+    fn seen(&self, identity: &PrivateRouteIdentity) -> bool {
+        match identity {
+            PrivateRouteIdentity::TradeLifecycle { key, rank } => {
+                self.trades.seen(key, *rank)
+            }
+        }
+    }
+
+    fn remember(&mut self, identity: PrivateRouteIdentity) {
+        match identity {
+            PrivateRouteIdentity::TradeLifecycle { key, rank } => {
+                self.trades.remember(&key, rank);
+            }
+        }
+    }
+}
+
+fn private_status(data: &serde_json::Value) -> (&str, OrderStatus, u8) {
+    let raw = data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("MATCHED")
+        .trim_start_matches("TRADE_STATUS_");
+    let normalized = if raw == "MATCHED_NOT_BROADCASTED" {
+        "MATCHED"
+    } else {
+        raw
+    };
+    match normalized {
+        "MATCHED" => (normalized, OrderStatus::PartiallyFilled, 1),
+        "MINED" => (normalized, OrderStatus::PartiallyFilled, 2),
+        "CONFIRMED" => (normalized, OrderStatus::Filled, 3),
+        "FAILED" => (normalized, OrderStatus::Failed, 4),
+        _ => (normalized, OrderStatus::PartiallyFilled, 0),
+    }
+}
+
+fn private_failure_reason(data: &serde_json::Value) -> Option<String> {
+    [
+        "error",
+        "reason",
+        "failure_reason",
+        "revert_reason",
+        "last_status_reason",
+        "last_update_reason",
+        "status_reason",
+        "error_message",
+        "errorMsg",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Validate and attribute a private event using the route-local ownership
+/// mirror only. No shared account transition, audit, logging, or persistence
+/// occurs here; the account actor can deliver these updates to StrategyAccount
+/// before beginning cold bookkeeping.
+fn route_private_event_fast(
+    event: &PrivateEventDelta,
+    shared: &SharedState,
+) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
+    let data = event.payload();
+    match event {
+        PrivateEventDelta::Order(_) => {
+            let order_id = required_string(data, &["order_id", "orderID", "id"], "order_id")?;
+            let asset_id = required_string(data, &["asset_id", "token_id"], "asset_id")?;
+            let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
+            let price = strict_number(data.get("price"), "price")?;
+            let original_size = strict_number(
+                data.get("original_size").or_else(|| data.get("size")),
+                "original_size",
+            )?;
+            let size_matched = strict_number(data.get("size_matched"), "size_matched")?;
+            let tolerance = 1e-9_f64.max(original_size.abs() * 1e-8);
+            if original_size <= 0.0
+                || size_matched < 0.0
+                || size_matched > original_size + tolerance
+                || price <= 0.0
+                || price > 1.0 + 1e-8
+            {
+                return Err(format!("invalid order lifecycle economics order_id={order_id}"));
+            }
+            let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+                format!("unowned private order lifecycle event for order_id `{order_id}`")
+            })?;
+            if ownership.token_id != asset_id
+                || ownership.side != side
+                || !close_enough(ownership.quantity, original_size)
+                || !close_enough(ownership.price, price)
+            {
+                return Err(format!(
+                    "order lifecycle invariant mismatch coid={} order_id={order_id}",
+                    ownership.client_order_id,
+                ));
+            }
+            let lifecycle = required_string(data, &["type"], "type")?.to_ascii_uppercase();
+            let status = match lifecycle.as_str() {
+                "PLACEMENT" => OrderStatus::Accepted,
+                "UPDATE" if size_matched + tolerance >= original_size => OrderStatus::Filled,
+                "UPDATE" if size_matched > tolerance => OrderStatus::PartiallyFilled,
+                "UPDATE" => OrderStatus::Accepted,
+                "CANCELLATION" | "CANCELLED" | "CANCELED" => OrderStatus::Cancelled,
+                _ => return Err(format!("unsupported order lifecycle type `{lifecycle}`")),
+            };
+            let associate_trades = match data.get("associate_trades") {
+                None => Vec::new(),
+                Some(value) => {
+                    let mut seen = HashSet::new();
+                    value
+                        .as_array()
+                        .ok_or_else(|| {
+                            "order lifecycle associate_trades is not an array".to_string()
+                        })?
+                        .iter()
+                        .map(|value| {
+                            let trade_id = value
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .ok_or_else(|| {
+                                    "order lifecycle associate_trades contains invalid id"
+                                        .to_string()
+                                })?;
+                            if !seen.insert(trade_id) {
+                                return Err(format!(
+                                    "order lifecycle associate_trades contains duplicate id `{trade_id}`"
+                                ));
+                            }
+                            Ok(trade_id.to_string())
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                }
+            };
+            if size_matched > tolerance && associate_trades.is_empty() {
+                return Err(format!(
+                    "matched order lifecycle is missing associate_trades order_id={order_id}"
+                ));
+            }
+            let rank = match status {
+                OrderStatus::Accepted => 1,
+                OrderStatus::PartiallyFilled => 2,
+                OrderStatus::Filled | OrderStatus::Cancelled => 3,
+                _ => 0,
+            };
+            let identity = PrivateRouteIdentity::TradeLifecycle {
+                key: format!("order:{}", normalize_order_id(order_id)),
+                rank,
+            };
+            Ok(vec![FastPrivateUpdate {
+                update: OrderUpdate {
+                    client_order_id: ownership.client_order_id,
+                    exchange: Exchange::Polymarket,
+                    symbol: asset_id.to_string(),
+                    side,
+                    exchange_order_id: Some(order_id.to_string()),
+                    status,
+                    liquidity: None,
+                    filled_quantity: 0.0,
+                    remaining_quantity: (original_size - size_matched).max(0.0),
+                    avg_fill_price: price,
+                    timestamp_ns: now_ns(),
+                    trade_id: None,
+                    order_audit: Some(AuthoritativeOrderAudit {
+                        original_size: Some(original_size.to_string()),
+                        size_matched: Some(size_matched.to_string()),
+                        associate_trades,
+                    }),
+                    error: None,
+                },
+                identity,
+            }])
+        }
+        PrivateEventDelta::Trade(_) => {
+            validate_trade_event(data, shared)?;
+            let (status_name, status, rank) = private_status(data);
+            if rank == 0 || status_name == "RETRYING" {
+                return Ok(Vec::new());
+            }
+            let trade_id = required_string(data, &["id", "trade_id"], "trade_id")?;
+            let failure_reason = private_failure_reason(data);
+            let mut routed = Vec::new();
+            match classify_private_trade_role(data, shared)? {
+                PrivateTradeRole::Maker => {
+                    for maker in data
+                        .get("maker_orders")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|maker| {
+                            maker
+                                .get("maker_address")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|address| {
+                                    address.eq_ignore_ascii_case(&shared.order_maker_address)
+                                })
+                        })
+                    {
+                        let order_id = required_string(maker, &["order_id"], "maker order_id")?;
+                        let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+                            format!("unowned maker trade `{trade_id}` order_id `{order_id}`")
+                        })?;
+                        let symbol = required_string(maker, &["asset_id"], "maker asset_id")?;
+                        let side = strict_side(
+                            required_string(maker, &["side"], "maker side")?,
+                            "maker side",
+                        )?;
+                        let quantity = strict_number(maker.get("matched_amount"), "matched_amount")?;
+                        let price = strict_number(maker.get("price"), "price")?;
+                        if ownership.token_id != symbol || ownership.side != side {
+                            return Err(format!(
+                                "maker trade ownership mismatch trade={trade_id} order_id={order_id}"
+                            ));
+                        }
+                        let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
+                        routed.push(FastPrivateUpdate {
+                            update: OrderUpdate {
+                                client_order_id: ownership.client_order_id,
+                                exchange: Exchange::Polymarket,
+                                symbol: symbol.to_string(),
+                                side,
+                                exchange_order_id: Some(order_id.to_string()),
+                                status,
+                                liquidity: Some(Liquidity::Maker),
+                                filled_quantity: quantity,
+                                remaining_quantity: 0.0,
+                                avg_fill_price: price,
+                                timestamp_ns: now_ns(),
+                                trade_id: Some(key.clone()),
+                                order_audit: None,
+                                error: failure_reason.clone(),
+                            },
+                            identity: PrivateRouteIdentity::TradeLifecycle { key, rank },
+                        });
+                    }
+                }
+                PrivateTradeRole::Taker => {
+                    let order_id = taker_order_id(data).unwrap_or("");
+                    let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+                        format!("unowned taker trade `{trade_id}` order_id `{order_id}`")
+                    })?;
+                    let symbol = required_string(data, &["asset_id", "token_id"], "asset_id")?;
+                    let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
+                    let quantity = strict_number(
+                        data.get("size").or_else(|| data.get("matched_amount")),
+                        "size",
+                    )?;
+                    let price = strict_number(data.get("price"), "price")?;
+                    if ownership.token_id != symbol || ownership.side != side {
+                        return Err(format!(
+                            "taker trade ownership mismatch trade={trade_id} order_id={order_id}"
+                        ));
+                    }
+                    routed.push(FastPrivateUpdate {
+                        update: OrderUpdate {
+                            client_order_id: ownership.client_order_id,
+                            exchange: Exchange::Polymarket,
+                            symbol: symbol.to_string(),
+                            side,
+                            exchange_order_id: Some(order_id.to_string()),
+                            status,
+                            liquidity: Some(Liquidity::Taker),
+                            filled_quantity: quantity,
+                            remaining_quantity: 0.0,
+                            avg_fill_price: price,
+                            timestamp_ns: now_ns(),
+                            trade_id: Some(trade_id.to_string()),
+                            order_audit: None,
+                            error: failure_reason,
+                        },
+                        identity: PrivateRouteIdentity::TradeLifecycle {
+                            key: trade_id.to_string(),
+                            rank,
+                        },
+                    });
+                }
+            }
+            Ok(routed)
+        }
+    }
+}
+
 impl PrivateApplyLane {
     fn dispatch_live(&self, events: Vec<PrivateEventDelta>) -> std::result::Result<(), String> {
         if events.is_empty() {
@@ -1399,12 +1714,39 @@ fn apply_private_batch(
     update_tx: &Sender<OrderUpdate>,
     events: Vec<PrivateEventDelta>,
     recovery_generation: Option<u64>,
+    route_dedupe: &mut PrivateRouteDedupe,
 ) -> std::result::Result<usize, String> {
     let mut applied = 0usize;
     for event in events {
-        let account_apply_started = crate::latency::Instant::now();
         let payload = event.payload();
         let is_trade = matches!(&event, PrivateEventDelta::Trade(_));
+        let route_started = crate::latency::Instant::now();
+        let routed = match route_private_event_fast(&event, shared) {
+            Ok(routed) => routed,
+            Err(error) => {
+                flag_invalid_private_event(payload, shared, &error);
+                return Err(error);
+            }
+        };
+        for routed in routed {
+            if route_dedupe.seen(&routed.identity) {
+                continue;
+            }
+            dispatch_private_update(
+                shared,
+                update_tx,
+                recovery_generation,
+                routed.update,
+            )?;
+            // Delivery is the commit edge for actor-local replay suppression.
+            route_dedupe.remember(routed.identity);
+        }
+        crate::latency::record("polymarket.user.validate_route_dispatch", route_started);
+
+        // Shared account transitions, audits, statistics and persistence are
+        // deliberately cold: StrategyAccount has already received the owned,
+        // deduplicated private message above.
+        let account_apply_started = crate::latency::Instant::now();
         let parsed = parse_user_event_with_health(payload, shared);
         crate::latency::record("polymarket.user.account_apply", account_apply_started);
         let health_apply_started = crate::latency::Instant::now();
@@ -1433,9 +1775,8 @@ fn apply_private_batch(
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        for update in parsed.updates {
-            dispatch_private_update(shared, update_tx, recovery_generation, update)?;
-        }
+        // `parsed.updates` are the cold ledger's view of the same transitions;
+        // the owner-directed delivery was already committed above.
         if is_trade {
             // Advance the cross-round replay cache only after every derived
             // strategy update was delivered. A delivery failure must remain
@@ -1479,69 +1820,66 @@ fn spawn_private_apply_worker(
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
     let account_id = shared.account_state.account_id().to_string();
-    let live_shared = Arc::clone(&shared);
-    let live_update_tx = update_tx.clone();
-    let live_shutdown = Arc::clone(&shutdown);
-    let live_generation = Arc::clone(&reconnect_generation);
-    let live_notify = Arc::clone(&reconnect_notify);
-    let live_account_id = account_id.clone();
-    let live_worker = std::thread::Builder::new()
-        .name(format!("poly-private-live-{}", live_account_id))
+    let worker = std::thread::Builder::new()
+        .name(format!("poly-private-owner-{}", account_id))
         .spawn(move || {
             crate::os_tune::pin_private_account_apply(
-                "polymarket-private-live-apply",
-                &live_account_id,
+                "polymarket-private-owner",
+                &account_id,
             );
-            while !live_shutdown.load(Ordering::Relaxed) {
-                let command = match live_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(command) => command,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                };
-                match command {
-                    PrivateApplyCommand::Live(events) => {
-                        if let Err(error) = apply_private_batch(&live_shared, &live_update_tx, events, None) {
-                            live_shared.user_feed_health.set_recovering(true);
-                            warn!(
-                                "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
-                                error,
-                            );
-                            live_generation.fetch_add(1, Ordering::AcqRel);
-                            // There is exactly one socket reader. `notify_one`
-                            // retains a permit if the worker wins the race with
-                            // the reader's next `select!` registration.
-                            live_notify.notify_one();
-                        }
-                    }
-                    PrivateApplyCommand::Replay { completion, .. } => {
-                        let _ = completion.send(Err("replay command reached private live lane".to_string()));
-                    }
-                }
-            }
-        })?;
-    let replay_worker = std::thread::Builder::new()
-        .name(format!("poly-private-replay-{}", account_id))
-        .spawn(move || {
-            crate::os_tune::pin_background("polymarket-private-replay-apply");
+            let mut route_dedupe = PrivateRouteDedupe::new();
             while !shutdown.load(Ordering::Relaxed) {
-                let command = match replay_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(command) => command,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                };
-                match command {
-                    PrivateApplyCommand::Replay { events, recovery_generation, completion } => {
-                        let _ = completion.send(apply_private_batch(
-                            &shared, &update_tx, events, recovery_generation,
-                        ));
-                    }
-                    PrivateApplyCommand::Live(_) => {
-                        warn!("[PolyUserFeed] live command reached replay lane");
-                    }
+                crossbeam_channel::select_biased! {
+                    recv(live_rx) -> command => match command {
+                        Ok(PrivateApplyCommand::Live(events)) => {
+                            if let Err(error) = apply_private_batch(
+                                &shared,
+                                &update_tx,
+                                events,
+                                None,
+                                &mut route_dedupe,
+                            ) {
+                                shared.user_feed_health.set_recovering(true);
+                                warn!(
+                                    "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
+                                    error,
+                                );
+                                reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                                reconnect_notify.notify_one();
+                            }
+                        }
+                        Ok(PrivateApplyCommand::Replay { completion, .. }) => {
+                            let _ = completion.send(Err(
+                                "replay command reached private live lane".to_string()
+                            ));
+                        }
+                        Err(_) => break,
+                    },
+                    recv(replay_rx) -> command => match command {
+                        Ok(PrivateApplyCommand::Replay {
+                            events,
+                            recovery_generation,
+                            completion,
+                        }) => {
+                            let result = apply_private_batch(
+                                &shared,
+                                &update_tx,
+                                events,
+                                recovery_generation,
+                                &mut route_dedupe,
+                            );
+                            let _ = completion.send(result);
+                        }
+                        Ok(PrivateApplyCommand::Live(_)) => {
+                            warn!("[PolyUserFeed] live command reached replay lane");
+                        }
+                        Err(_) => break,
+                    },
+                    default(Duration::from_millis(100)) => {}
                 }
             }
         })?;
-    Ok((lane, vec![live_worker, replay_worker]))
+    Ok((lane, vec![worker]))
 }
 
 fn parse_user_event_with_health(
@@ -3117,6 +3455,71 @@ mod tests {
         )
         .unwrap()
         .shared_state()
+    }
+
+    #[test]
+    fn private_actor_routes_owned_trade_before_cold_account_apply() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner-1", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner-1",
+                "owner-1-1",
+                "0xabc1",
+                "TOKEN",
+                Side::Buy,
+                5.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        shared.register_order_id("owner-1-1", "0xabc1", "TOKEN");
+        let event = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "trade",
+            "id": "fast-route-trade",
+            "status": "MATCHED",
+            "asset_id": "TOKEN",
+            "side": "BUY",
+            "size": "2",
+            "price": "0.5",
+            "taker_order_id": "0xabc1",
+            "maker_orders": []
+        }))
+        .unwrap();
+
+        let before = shared.account_state.order("owner-1-1").unwrap();
+        let routed = route_private_event_fast(&event, &shared).unwrap();
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].update.client_order_id, "owner-1-1");
+        assert_eq!(
+            shared
+                .account_state
+                .order("owner-1-1")
+                .unwrap()
+                .filled_quantity,
+            before.filled_quantity,
+            "fast validation/routing must not synchronously mutate the shared ledger",
+        );
+
+        let cold = parse_user_event_with_health(event.payload(), &shared);
+        assert!(cold.valid_business_event);
+        assert!(
+            shared
+                .account_state
+                .order("owner-1-1")
+                .unwrap()
+                .filled_quantity
+                > before.filled_quantity
+        );
     }
 
     fn record(manager: &Mutex<LivePositionManager>, status: &str) -> bool {
