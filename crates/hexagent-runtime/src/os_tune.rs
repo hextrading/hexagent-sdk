@@ -98,11 +98,10 @@ pub struct CorePlan {
     /// would starve one of the two).
     pub async_ord: Option<usize>,
     pub strategy: usize,
-    /// Per-instance strategy-worker cores (live/paper multi-instance):
-    /// `instance_id → core`. A polymaker instance whose `instance_id`
-    /// is a key here gets its own dedicated core (so co-hosted BTC/ETH
-    /// instances run on separate cores and never preempt each other).
-    /// Instances absent from this map fall back to `strategy`.
+    /// Per-instance strategy-worker cores (live/paper): `instance_id →
+    /// core`. Every strategy runs in its own worker thread; entries here also
+    /// place those workers on dedicated cores. Instances absent from this map
+    /// fall back to `strategy`.
     pub strategy_cores: HashMap<String, usize>,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
@@ -393,7 +392,7 @@ pub fn init_disabled() {
     let _ = CORE_PLAN.set(plan);
 }
 
-/// Fail-fast validation for production live/paper multi-instance topology.
+/// Fail-fast validation for production live/paper per-instance topology.
 /// No-op unless `[os_tune].strict_core_isolation = true`.
 /// Call after [`init_from_config`] and before spawning runtime/feed threads.
 pub fn validate_strategy_isolation(instance_ids: &[String]) -> Result<(), String> {
@@ -607,10 +606,9 @@ pub fn pin_strategy(thread_name: &str) {
     set_fifo(p.fifo_strategy, thread_name);
 }
 
-/// Pin a per-instance strategy worker thread (live/paper
-/// multi-instance fan-out). Resolves `strategy_cores[instance_id]` for
-/// a dedicated core, else falls back to the shared `strategy` core.
-/// Same `PRIO_STRATEGY` FIFO priority as the single-thread path.
+/// Pin a per-instance strategy worker thread (live/paper). Resolves
+/// `strategy_cores[instance_id]` for a dedicated core, else falls back to the
+/// shared `strategy` core. Uses `PRIO_STRATEGY` FIFO priority.
 pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
     let p = plan();
     let core = p
