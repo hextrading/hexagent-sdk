@@ -635,6 +635,7 @@ mod user_feed_health_tests {
             remaining_quantity: 3.0,
             avg_fill_price: 0.4,
             timestamp_ns: 1,
+            exchange_event_timestamp_ns: None,
             trade_id: Some("trade-1".to_string()),
             order_audit: None,
             error: None,

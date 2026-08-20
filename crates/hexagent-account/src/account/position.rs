@@ -1051,6 +1051,7 @@ mod tests {
             remaining_quantity: qty,
             avg_fill_price: price,
             timestamp_ns: 0,
+            exchange_event_timestamp_ns: None,
             trade_id: None,
             order_audit: None,
             error: None,

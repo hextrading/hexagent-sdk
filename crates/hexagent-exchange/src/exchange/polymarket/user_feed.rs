@@ -995,6 +995,7 @@ fn parse_order_event(
         remaining_quantity: (original_size - size_matched).max(0.0),
         avg_fill_price: price,
         timestamp_ns: now_ns(),
+        exchange_event_timestamp_ns: None,
         trade_id: None,
         order_audit: Some(order_audit),
         error: None,
@@ -1117,6 +1118,24 @@ fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMa
         business_secs,
         replay_watermark_secs: business_secs.min(now),
     }
+}
+
+fn exchange_event_timestamp_ns(data: &serde_json::Value) -> Option<u64> {
+    let raw = ["timestamp", "last_update", "match_time"]
+        .into_iter()
+        .find_map(|key| data.get(key).and_then(|value| {
+            value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        }))?;
+    let timestamp_ns = match raw {
+        100_000_000_000_000_000.. => raw,
+        100_000_000_000_000.. => raw.saturating_mul(1_000),
+        100_000_000_000.. => raw.saturating_mul(1_000_000),
+        1_000_000_000.. => raw.saturating_mul(1_000_000_000),
+        _ => return None,
+    };
+    let receipt_ns = now_ns();
+    let maximum_future_skew_ns = Duration::from_secs(300).as_nanos() as u64;
+    (timestamp_ns <= receipt_ns.saturating_add(maximum_future_skew_ns)).then_some(timestamp_ns)
 }
 
 fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, error: &str) {
@@ -1310,7 +1329,10 @@ fn terminal_trade_is_durably_resolved(payload: &serde_json::Value, shared: &Shar
 }
 
 enum PrivateApplyCommand {
-    Live(Vec<PrivateEventDelta>),
+    Live {
+        events: Vec<PrivateEventDelta>,
+        enqueued_at: crate::latency::Instant,
+    },
     Replay {
         events: Vec<PrivateEventDelta>,
         recovery_generation: Option<u64>,
@@ -1340,7 +1362,7 @@ struct PrivateApplyLane {
 
 #[derive(Debug)]
 enum PrivateRouteIdentity {
-    TradeLifecycle { key: String, rank: u8 },
+    TradeLifecycle { fingerprint: u128, rank: u8 },
 }
 
 #[derive(Debug)]
@@ -1351,29 +1373,61 @@ struct FastPrivateUpdate {
 
 #[derive(Debug)]
 struct PrivateRouteDedupe {
-    trades: GapReplayLifecycleDedupe,
+    capacity: usize,
+    ranks: HashMap<u128, u8>,
+    order: VecDeque<(u128, u8)>,
 }
 
 impl PrivateRouteDedupe {
     fn new() -> Self {
         Self {
-            trades: GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+            capacity: TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY,
+            ranks: HashMap::with_capacity(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+            order: VecDeque::with_capacity(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
         }
     }
 
     fn seen(&self, identity: &PrivateRouteIdentity) -> bool {
         match identity {
-            PrivateRouteIdentity::TradeLifecycle { key, rank } => self.trades.seen(key, *rank),
+            PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => self
+                .ranks.get(fingerprint).is_some_and(|existing| *existing >= *rank),
         }
     }
 
     fn remember(&mut self, identity: PrivateRouteIdentity) {
         match identity {
-            PrivateRouteIdentity::TradeLifecycle { key, rank } => {
-                self.trades.remember(&key, rank);
+            PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => {
+                if self.ranks.get(&fingerprint).is_some_and(|existing| *existing >= rank) {
+                    return;
+                }
+                self.ranks.insert(fingerprint, rank);
+                self.order.push_back((fingerprint, rank));
+                while self.order.len() > self.capacity {
+                    if let Some((expired, expired_rank)) = self.order.pop_front() {
+                        if self.ranks.get(&expired) == Some(&expired_rank) {
+                            self.ranks.remove(&expired);
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+fn private_route_fingerprint(kind: u8, parts: &[&str]) -> u128 {
+    let mut left = 0xcbf29ce484222325_u64 ^ u64::from(kind);
+    let mut right = 0x9e3779b97f4a7c15_u64 ^ u64::from(kind);
+    for part in parts {
+        for byte in part.bytes().map(|byte| byte.to_ascii_lowercase()) {
+            left ^= u64::from(byte);
+            left = left.wrapping_mul(0x100000001b3);
+            right ^= u64::from(byte).wrapping_add(0x9d);
+            right = right.rotate_left(7).wrapping_mul(0x9e3779b185ebca87);
+        }
+        left ^= 0xff;
+        right ^= 0xa5;
+    }
+    (u128::from(left) << 64) | u128::from(right)
 }
 
 fn private_status(data: &serde_json::Value) -> (&str, OrderStatus, u8) {
@@ -1461,42 +1515,41 @@ fn route_private_event_fast(
                     ownership.client_order_id,
                 ));
             }
-            let lifecycle = required_string(data, &["type"], "type")?.to_ascii_uppercase();
-            let status = match lifecycle.as_str() {
-                "PLACEMENT" => OrderStatus::Accepted,
-                "UPDATE" if size_matched + tolerance >= original_size => OrderStatus::Filled,
-                "UPDATE" if size_matched > tolerance => OrderStatus::PartiallyFilled,
-                "UPDATE" => OrderStatus::Accepted,
-                "CANCELLATION" | "CANCELLED" | "CANCELED" => OrderStatus::Cancelled,
-                _ => return Err(format!("unsupported order lifecycle type `{lifecycle}`")),
+            let lifecycle = required_string(data, &["type"], "type")?;
+            let status = if lifecycle.eq_ignore_ascii_case("PLACEMENT") {
+                OrderStatus::Accepted
+            } else if lifecycle.eq_ignore_ascii_case("UPDATE") {
+                if size_matched + tolerance >= original_size { OrderStatus::Filled }
+                else if size_matched > tolerance { OrderStatus::PartiallyFilled }
+                else { OrderStatus::Accepted }
+            } else if lifecycle.eq_ignore_ascii_case("CANCELLATION")
+                || lifecycle.eq_ignore_ascii_case("CANCELLED")
+                || lifecycle.eq_ignore_ascii_case("CANCELED")
+            {
+                OrderStatus::Cancelled
+            } else {
+                return Err(format!("unsupported order lifecycle type `{lifecycle}`"));
             };
             let associate_trades = match data.get("associate_trades") {
                 None => Vec::new(),
                 Some(value) => {
-                    let mut seen = HashSet::new();
-                    value
-                        .as_array()
+                    let values = value.as_array()
                         .ok_or_else(|| {
                             "order lifecycle associate_trades is not an array".to_string()
-                        })?
-                        .iter()
-                        .map(|value| {
-                            let trade_id = value
-                                .as_str()
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .ok_or_else(|| {
-                                    "order lifecycle associate_trades contains invalid id"
-                                        .to_string()
-                                })?;
-                            if !seen.insert(trade_id) {
-                                return Err(format!(
-                                    "order lifecycle associate_trades contains duplicate id `{trade_id}`"
-                                ));
-                            }
-                            Ok(trade_id.to_string())
-                        })
-                        .collect::<std::result::Result<Vec<_>, _>>()?
+                        })?;
+                    let mut trades = Vec::with_capacity(values.len());
+                    for value in values {
+                        let trade_id = value.as_str().map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| "order lifecycle associate_trades contains invalid id".to_string())?;
+                        if trades.iter().any(|existing| existing == trade_id) {
+                            return Err(format!(
+                                "order lifecycle associate_trades contains duplicate id `{trade_id}`"
+                            ));
+                        }
+                        trades.push(trade_id.to_string());
+                    }
+                    trades
                 }
             };
             if size_matched > tolerance && associate_trades.is_empty() {
@@ -1511,7 +1564,7 @@ fn route_private_event_fast(
                 _ => 0,
             };
             let identity = PrivateRouteIdentity::TradeLifecycle {
-                key: format!("order:{}", normalize_order_id(order_id)),
+                fingerprint: private_route_fingerprint(b'o', &[order_id]),
                 rank,
             };
             Ok(vec![FastPrivateUpdate {
@@ -1527,6 +1580,7 @@ fn route_private_event_fast(
                     remaining_quantity: (original_size - size_matched).max(0.0),
                     avg_fill_price: price,
                     timestamp_ns: now_ns(),
+                    exchange_event_timestamp_ns: None,
                     trade_id: None,
                     order_audit: Some(AuthoritativeOrderAudit {
                         original_size: Some(original_size.to_string()),
@@ -1545,6 +1599,7 @@ fn route_private_event_fast(
                 return Ok(Vec::new());
             }
             let trade_id = required_string(data, &["id", "trade_id"], "trade_id")?;
+            let exchange_timestamp_ns = exchange_event_timestamp_ns(data);
             let failure_reason = private_failure_reason(data);
             let mut routed = Vec::new();
             match classify_private_trade_role(data, shared)? {
@@ -1595,11 +1650,15 @@ fn route_private_event_fast(
                                 remaining_quantity: 0.0,
                                 avg_fill_price: price,
                                 timestamp_ns: now_ns(),
+                                exchange_event_timestamp_ns: exchange_timestamp_ns,
                                 trade_id: Some(key.clone()),
                                 order_audit: None,
                                 error: failure_reason.clone(),
                             },
-                            identity: PrivateRouteIdentity::TradeLifecycle { key, rank },
+                            identity: PrivateRouteIdentity::TradeLifecycle {
+                                fingerprint: private_route_fingerprint(b'm', &[trade_id, order_id]),
+                                rank,
+                            },
                         });
                     }
                 }
@@ -1633,12 +1692,13 @@ fn route_private_event_fast(
                             remaining_quantity: 0.0,
                             avg_fill_price: price,
                             timestamp_ns: now_ns(),
+                            exchange_event_timestamp_ns: exchange_timestamp_ns,
                             trade_id: Some(trade_id.to_string()),
                             order_audit: None,
                             error: failure_reason,
                         },
                         identity: PrivateRouteIdentity::TradeLifecycle {
-                            key: trade_id.to_string(),
+                            fingerprint: private_route_fingerprint(b't', &[trade_id]),
                             rank,
                         },
                     });
@@ -1655,7 +1715,10 @@ impl PrivateApplyLane {
             return Ok(());
         }
         self.live_tx
-            .try_send(PrivateApplyCommand::Live(events))
+            .try_send(PrivateApplyCommand::Live {
+                events,
+                enqueued_at: crate::latency::Instant::now(),
+            })
             .map_err(|error| format!("private account-apply queue unavailable: {error}"))
     }
 
@@ -1715,33 +1778,36 @@ fn dispatch_private_update(
             }
         }
     }
-    let coid = if update.client_order_id.is_empty() {
-        match update.exchange_order_id.as_deref() {
-            Some(oid) if !oid.is_empty() => {
-                format!("<unmapped:orderID={}..>", &oid[..oid.len().min(10)])
+    if log::log_enabled!(log::Level::Debug) {
+        let coid = if update.client_order_id.is_empty() {
+            match update.exchange_order_id.as_deref() {
+                Some(oid) if !oid.is_empty() => {
+                    format!("<unmapped:orderID={}..>", &oid[..oid.len().min(10)])
+                }
+                _ => "<unmapped>".to_string(),
             }
-            _ => "<unmapped>".to_string(),
-        }
-    } else {
-        update.client_order_id.clone()
-    };
-    debug!(
-        "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
-        update.symbol,
-        coid,
-        update.side,
-        update.status,
-        update.filled_quantity,
-        update.avg_fill_price,
-    );
+        } else {
+            update.client_order_id.clone()
+        };
+        debug!(
+            "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
+            update.symbol, coid, update.side, update.status,
+            update.filled_quantity, update.avg_fill_price,
+        );
+    }
     let dispatch_started = crate::latency::Instant::now();
     let result = if let Some(generation) = recovery_generation {
         enqueue_recovery_update(shared, update_tx, generation, update)
             .map_err(|error| error.to_string())
     } else {
         update_tx
-            .send(update)
-            .map_err(|_| "order update channel closed".to_string())
+            .try_send(update)
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) =>
+                    "root order-update queue saturated; private event remains replayable".to_string(),
+                crossbeam_channel::TrySendError::Disconnected(_) =>
+                    "order update channel closed".to_string(),
+            })
     };
     crate::latency::record("polymarket.user.dispatch", dispatch_started);
     result
@@ -1757,6 +1823,7 @@ fn route_private_batch(
     for event in events {
         let payload = event.payload();
         let route_started = crate::latency::Instant::now();
+        let validate_started = crate::latency::Instant::now();
         let routed = match route_private_event_fast(event, shared) {
             Ok(routed) => routed,
             Err(error) => {
@@ -1764,6 +1831,7 @@ fn route_private_batch(
                 return Err(error);
             }
         };
+        crate::latency::record("polymarket.user.validate_route", validate_started);
         for routed in routed {
             if route_dedupe.seen(&routed.identity) {
                 continue;
@@ -1917,7 +1985,11 @@ fn spawn_private_apply_worker(
             while !shutdown.load(Ordering::Relaxed) {
                 crossbeam_channel::select_biased! {
                     recv(live_rx) -> command => match command {
-                        Ok(PrivateApplyCommand::Live(events)) => {
+                        Ok(PrivateApplyCommand::Live { events, enqueued_at }) => {
+                            crate::latency::record(
+                                "polymarket.user.ws_enqueue_to_owner_dequeue",
+                                enqueued_at,
+                            );
                             if let Err(error) = route_private_batch(
                                 &shared,
                                 &update_tx,
@@ -1994,7 +2066,7 @@ fn spawn_private_apply_worker(
                                 }
                             }
                         }
-                        Ok(PrivateApplyCommand::Live(_)) => {
+                        Ok(PrivateApplyCommand::Live { .. }) => {
                             warn!("[PolyUserFeed] live command reached replay lane");
                         }
                         Err(_) => break,
@@ -2407,6 +2479,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         remaining_quantity: 0.0,
                         avg_fill_price: mo_price,
                         timestamp_ns: now_ns(),
+                        exchange_event_timestamp_ns: None,
                         trade_id: if leg_id.is_empty() {
                             None
                         } else {
@@ -2529,6 +2602,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     remaining_quantity: 0.0,
                     avg_fill_price: price,
                     timestamp_ns: now_ns(),
+                    exchange_event_timestamp_ns: None,
                     trade_id: if trade_id.is_empty() {
                         None
                     } else {
@@ -3452,6 +3526,34 @@ pub fn spawn_user_feed(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn exchange_event_timestamp_normalizes_seconds_millis_micros_and_nanos() {
+        let seconds = receipt_time_secs().saturating_sub(1);
+        assert_eq!(
+            exchange_event_timestamp_ns(&serde_json::json!({"match_time": seconds})),
+            Some(seconds * 1_000_000_000),
+        );
+        assert_eq!(
+            exchange_event_timestamp_ns(&serde_json::json!({"timestamp": seconds * 1_000})),
+            Some(seconds * 1_000_000_000),
+        );
+        assert_eq!(
+            exchange_event_timestamp_ns(&serde_json::json!({"timestamp": seconds * 1_000_000})),
+            Some(seconds * 1_000_000_000),
+        );
+        assert_eq!(
+            exchange_event_timestamp_ns(&serde_json::json!({"timestamp": seconds * 1_000_000_000})),
+            Some(seconds * 1_000_000_000),
+        );
+    }
+
+    #[test]
+    fn private_route_fingerprint_is_case_stable_and_role_scoped() {
+        let maker = private_route_fingerprint(b'm', &["Trade-1", "0xAbCd"]);
+        assert_eq!(maker, private_route_fingerprint(b'm', &["trade-1", "0xabcd"]));
+        assert_ne!(maker, private_route_fingerprint(b't', &["trade-1", "0xabcd"]));
+    }
 
     #[test]
     fn replay_lifecycle_dedupe_advances_rank_and_keeps_failed_correction() {

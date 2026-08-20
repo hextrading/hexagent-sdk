@@ -603,8 +603,19 @@ struct InstanceLedger {
     weight: f64,
     cash: f64,
     positions: HashMap<String, f64>,
+    /// Reservations owned by order lifecycle rows only. Maintenance coverage
+    /// lives in the operation-scoped fields below and cannot be released by an
+    /// order terminal transition.
     reserved_cash: f64,
     reserved_positions: HashMap<String, f64>,
+    #[serde(default)]
+    maintenance_reserved_cash: f64,
+    #[serde(default)]
+    maintenance_reserved_positions: HashMap<String, f64>,
+    /// Zero identifies a pre operation-scoped ledger whose `reserved_*`
+    /// aggregates included both orders and maintenance operations.
+    #[serde(default)]
+    reservation_scope_version: u8,
     #[serde(default)]
     token_interests: BTreeMap<String, TokenInterest>,
     #[serde(default)]
@@ -648,9 +659,29 @@ impl InstanceLedger {
             positions: HashMap::new(),
             reserved_cash: 0.0,
             reserved_positions: HashMap::new(),
+            maintenance_reserved_cash: 0.0,
+            maintenance_reserved_positions: HashMap::new(),
+            reservation_scope_version: 1,
             token_interests: BTreeMap::new(),
             market_scopes: HashSet::new(),
         }
+    }
+
+    fn total_reserved_cash(&self) -> f64 {
+        self.reserved_cash + self.maintenance_reserved_cash
+    }
+
+    fn total_reserved_position(&self, token: &str) -> f64 {
+        self.reserved_positions.get(token).copied().unwrap_or(0.0)
+            + self.maintenance_reserved_positions.get(token).copied().unwrap_or(0.0)
+    }
+
+    fn total_reserved_positions(&self) -> HashMap<String, f64> {
+        let mut total = self.reserved_positions.clone();
+        for (token, quantity) in &self.maintenance_reserved_positions {
+            *total.entry(token.clone()).or_insert(0.0) += *quantity;
+        }
+        total
     }
 }
 
@@ -784,7 +815,9 @@ struct VirtualAccount {
     weight: AtomicF64,
     cash: AtomicF64,
     reserved_cash: AtomicF64,
+    maintenance_reserved_cash: AtomicF64,
     positions: RwLock<HashMap<String, Arc<VirtualPositionQuota>>>,
+    maintenance_reserved_positions: RwLock<HashMap<String, f64>>,
     token_interests: Mutex<BTreeMap<String, TokenInterest>>,
     market_scopes: Mutex<HashSet<String>>,
     lifecycle: Mutex<VirtualLifecycle>,
@@ -832,7 +865,11 @@ impl VirtualAccount {
             weight: AtomicF64::new(ledger.weight),
             cash: AtomicF64::new(ledger.cash),
             reserved_cash: AtomicF64::new(ledger.reserved_cash),
+            maintenance_reserved_cash: AtomicF64::new(ledger.maintenance_reserved_cash),
             positions: RwLock::new(positions),
+            maintenance_reserved_positions: RwLock::new(
+                ledger.maintenance_reserved_positions.clone(),
+            ),
             token_interests: Mutex::new(ledger.token_interests.clone()),
             market_scopes: Mutex::new(ledger.market_scopes.clone()),
             lifecycle: Mutex::new(VirtualLifecycle::default()),
@@ -873,6 +910,9 @@ impl VirtualAccount {
             positions: balances,
             reserved_cash: self.reserved_cash.load(),
             reserved_positions,
+            maintenance_reserved_cash: self.maintenance_reserved_cash.load(),
+            maintenance_reserved_positions: self.maintenance_reserved_positions.read().unwrap().clone(),
+            reservation_scope_version: 1,
             token_interests: self.token_interests.lock().unwrap().clone(),
             market_scopes: self.market_scopes.lock().unwrap().clone(),
         }
@@ -882,6 +922,7 @@ impl VirtualAccount {
         self.weight.store(ledger.weight);
         self.cash.store(ledger.cash);
         self.reserved_cash.store(ledger.reserved_cash);
+        self.maintenance_reserved_cash.store(ledger.maintenance_reserved_cash);
         let mut positions = self.positions.write().unwrap();
         positions.clear();
         for token in ledger
@@ -896,6 +937,8 @@ impl VirtualAccount {
                 ))
             });
         }
+        *self.maintenance_reserved_positions.write().unwrap() =
+            ledger.maintenance_reserved_positions.clone();
         *self.token_interests.lock().unwrap() = ledger.token_interests.clone();
         *self.market_scopes.lock().unwrap() = ledger.market_scopes.clone();
     }
@@ -4399,8 +4442,8 @@ impl SharedAccount {
             ));
         }
         let has_reservations = state.instances.values().any(|instance| {
-            instance.reserved_cash > EPS
-                || instance.reserved_positions.values().any(|qty| *qty > EPS)
+            instance.total_reserved_cash() > EPS
+                || instance.total_reserved_positions().values().any(|qty| *qty > EPS)
         });
         let has_live_orders = state.orders.values().any(|order| {
             !matches!(
@@ -4826,7 +4869,7 @@ impl SharedAccount {
             if configured.contains(instance_id) {
                 continue;
             }
-            let owned_cash = instance.cash.abs() > EPS || instance.reserved_cash > EPS;
+            let owned_cash = instance.cash.abs() > EPS || instance.total_reserved_cash() > EPS;
             let owned_positions = instance.positions.values().any(|qty| qty.abs() > EPS)
                 || instance
                     .reserved_positions
@@ -5702,14 +5745,17 @@ impl SharedAccount {
             for (token, qty) in &instance.reserved_positions {
                 *reserved_positions.entry(token.clone()).or_insert(0.0) += *qty;
             }
+            for (token, qty) in &instance.maintenance_reserved_positions {
+                *reserved_positions.entry(token.clone()).or_insert(0.0) += *qty;
+            }
             instances.push(InstanceAccountSnapshot {
                 instance_id: instance_id.clone(),
                 weight: instance.weight,
                 ledger_generation: state.ledger_generation,
                 cash: instance.cash,
                 positions: instance.positions.clone(),
-                reserved_cash: instance.reserved_cash,
-                reserved_positions: instance.reserved_positions.clone(),
+                reserved_cash: instance.total_reserved_cash(),
+                reserved_positions: instance.total_reserved_positions(),
             });
         }
         AccountMonitoringSnapshot {
@@ -5725,7 +5771,7 @@ impl SharedAccount {
             reserved_cash: state
                 .instances
                 .values()
-                .map(|instance| instance.reserved_cash)
+                .map(InstanceLedger::total_reserved_cash)
                 .sum(),
             reserved_positions,
             uncertain: state.uncertain || persistence_error.is_some(),
@@ -5805,8 +5851,14 @@ impl SharedAccount {
             ledger_generation: self.ledger_generation_fast.load(Ordering::Acquire),
             cash: instance.cash,
             positions: instance.positions,
-            reserved_cash: instance.reserved_cash,
-            reserved_positions: instance.reserved_positions,
+            reserved_cash: instance.reserved_cash + instance.maintenance_reserved_cash,
+            reserved_positions: {
+                let mut total = instance.reserved_positions;
+                for (token, quantity) in instance.maintenance_reserved_positions {
+                    *total.entry(token).or_insert(0.0) += quantity;
+                }
+                total
+            },
         })
     }
 
@@ -5863,9 +5915,20 @@ impl SharedAccount {
         // instance quotas at seed/migration time. Ordinary quotes therefore
         // need only this instance's atomic counters; no cross-instance sum or
         // account-wide lock participates in availability.
-        let virtual_cash = (account.cash.load() - account.reserved_cash.load()).max(0.0);
+        let virtual_cash = (account.cash.load()
+            - account.reserved_cash.load()
+            - account.maintenance_reserved_cash.load())
+        .max(0.0);
         let position = account.position(token);
-        let virtual_position = (position.balance.load() - position.reserved.load()).max(0.0);
+        let maintenance_reserved = account
+            .maintenance_reserved_positions
+            .read()
+            .unwrap()
+            .get(token)
+            .copied()
+            .unwrap_or(0.0);
+        let virtual_position =
+            (position.balance.load() - position.reserved.load() - maintenance_reserved).max(0.0);
         Some(AccountAvailability {
             virtual_cash,
             physical_cash: virtual_cash,
@@ -7306,7 +7369,11 @@ impl SharedAccount {
         }
         reject_allocation_audit_blockers(&state, allocations)?;
         let total: f64 = allocations.values().copied().sum();
-        let total_reserved_cash: f64 = state.instances.values().map(|i| i.reserved_cash).sum();
+        let total_reserved_cash: f64 = state
+            .instances
+            .values()
+            .map(InstanceLedger::total_reserved_cash)
+            .sum();
         let physical_available = (state.physical_cash - total_reserved_cash).max(0.0);
         if total > physical_available + EPS {
             return Err(ReservationError::InsufficientPhysicalCash {
@@ -7318,7 +7385,7 @@ impl SharedAccount {
             let Some(instance) = state.instances.get(instance_id) else {
                 return Err(ReservationError::UnknownInstance(instance_id.clone()));
             };
-            let available = (instance.cash - instance.reserved_cash).max(0.0);
+            let available = (instance.cash - instance.total_reserved_cash()).max(0.0);
             if *amount > available + EPS {
                 return Err(ReservationError::InsufficientVirtualCash {
                     required: *amount,
@@ -7731,7 +7798,7 @@ impl SharedAccount {
                 let total_reserved_cash: f64 = state
                     .instances
                     .values()
-                    .map(|instance| instance.reserved_cash)
+                    .map(InstanceLedger::total_reserved_cash)
                     .sum();
                 let physical_available = (state.physical_cash - total_reserved_cash).max(0.0);
                 if total > physical_available + EPS {
@@ -7744,7 +7811,7 @@ impl SharedAccount {
                     let Some(instance) = state.instances.get(instance_id) else {
                         return Err(ReservationError::UnknownInstance(instance_id.clone()));
                     };
-                    let available = (instance.cash - instance.reserved_cash).max(0.0);
+                    let available = (instance.cash - instance.total_reserved_cash()).max(0.0);
                     if *amount > available + EPS {
                         return Err(ReservationError::InsufficientVirtualCash {
                             required: *amount,
@@ -7757,7 +7824,7 @@ impl SharedAccount {
                         .instances
                         .get_mut(instance_id)
                         .expect("validated")
-                        .reserved_cash += *amount;
+                        .maintenance_reserved_cash += *amount;
                 }
             }
             MaintenanceOperationKind::Merge => {
@@ -7766,11 +7833,7 @@ impl SharedAccount {
                         .instances
                         .values()
                         .map(|instance| {
-                            instance
-                                .reserved_positions
-                                .get(token)
-                                .copied()
-                                .unwrap_or(0.0)
+                            instance.total_reserved_position(token)
                         })
                         .sum();
                     let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
@@ -7787,11 +7850,7 @@ impl SharedAccount {
                             return Err(ReservationError::UnknownInstance(instance_id.clone()));
                         };
                         let available = (instance.positions.get(token).copied().unwrap_or(0.0)
-                            - instance
-                                .reserved_positions
-                                .get(token)
-                                .copied()
-                                .unwrap_or(0.0))
+                            - instance.total_reserved_position(token))
                         .max(0.0);
                         if *amount > available + EPS {
                             return Err(ReservationError::InsufficientVirtualPosition {
@@ -7806,7 +7865,7 @@ impl SharedAccount {
                     let instance = state.instances.get_mut(instance_id).expect("validated");
                     for token in [up_token_id, down_token_id] {
                         *instance
-                            .reserved_positions
+                            .maintenance_reserved_positions
                             .entry(token.to_string())
                             .or_insert(0.0) += *amount;
                     }
@@ -7937,12 +7996,13 @@ impl SharedAccount {
             if let Some(instance) = state.instances.get_mut(instance_id) {
                 match existing.kind {
                     MaintenanceOperationKind::Split => {
-                        instance.reserved_cash = (instance.reserved_cash - *amount).max(0.0);
+                        instance.maintenance_reserved_cash =
+                            (instance.maintenance_reserved_cash - *amount).max(0.0);
                     }
                     MaintenanceOperationKind::Merge => {
                         for token in [&existing.up_token_id, &existing.down_token_id] {
                             let reserved = instance
-                                .reserved_positions
+                                .maintenance_reserved_positions
                                 .entry(token.clone())
                                 .or_insert(0.0);
                             *reserved = (*reserved - *amount).max(0.0);
@@ -7978,6 +8038,11 @@ impl SharedAccount {
                 "maintenance operation `{operation_id}` already failed"
             )));
         }
+        if existing.tx_id.as_deref().is_none_or(str::is_empty) {
+            return Err(ReservationError::InvalidOrder(format!(
+                "maintenance operation `{operation_id}` has no persisted tx id"
+            )));
+        }
         let total: f64 = existing.allocations.values().copied().sum();
         match existing.kind {
             MaintenanceOperationKind::Split => {
@@ -7991,10 +8056,10 @@ impl SharedAccount {
                     let Some(instance) = state.instances.get(instance_id) else {
                         return Err(ReservationError::UnknownInstance(instance_id.clone()));
                     };
-                    if *amount > instance.cash.min(instance.reserved_cash) + EPS {
+                    if *amount > instance.cash.min(instance.maintenance_reserved_cash) + EPS {
                         return Err(ReservationError::InsufficientVirtualCash {
                             required: *amount,
-                            available: instance.cash.min(instance.reserved_cash),
+                            available: instance.cash.min(instance.maintenance_reserved_cash),
                         });
                     }
                 }
@@ -8009,7 +8074,8 @@ impl SharedAccount {
                     .or_insert(0.0) += total;
                 for (instance_id, amount) in &existing.allocations {
                     let instance = state.instances.get_mut(instance_id).expect("validated");
-                    instance.reserved_cash = (instance.reserved_cash - *amount).max(0.0);
+                    instance.maintenance_reserved_cash =
+                        (instance.maintenance_reserved_cash - *amount).max(0.0);
                     instance.cash -= *amount;
                     *instance
                         .positions
@@ -8039,7 +8105,7 @@ impl SharedAccount {
                     for token in [&existing.up_token_id, &existing.down_token_id] {
                         let owned = instance.positions.get(token).copied().unwrap_or(0.0);
                         let reserved = instance
-                            .reserved_positions
+                            .maintenance_reserved_positions
                             .get(token)
                             .copied()
                             .unwrap_or(0.0);
@@ -8067,7 +8133,7 @@ impl SharedAccount {
                     for token in [&existing.up_token_id, &existing.down_token_id] {
                         *instance.positions.entry(token.clone()).or_insert(0.0) -= *amount;
                         let reserved = instance
-                            .reserved_positions
+                            .maintenance_reserved_positions
                             .entry(token.clone())
                             .or_insert(0.0);
                         *reserved = (*reserved - *amount).max(0.0);
@@ -10509,8 +10575,10 @@ struct StartupReservationAggregateRepair {
 
 #[derive(Default)]
 struct DerivedReservationAggregates {
-    cash_by_instance: HashMap<String, f64>,
-    positions_by_instance: HashMap<String, HashMap<String, f64>>,
+    order_cash_by_instance: HashMap<String, f64>,
+    order_positions_by_instance: HashMap<String, HashMap<String, f64>>,
+    maintenance_cash_by_instance: HashMap<String, f64>,
+    maintenance_positions_by_instance: HashMap<String, HashMap<String, f64>>,
 }
 
 fn derive_reservation_aggregates(
@@ -10580,12 +10648,12 @@ fn derive_reservation_aggregates(
             ));
         }
         *derived
-            .cash_by_instance
+            .order_cash_by_instance
             .entry(order.instance_id.clone())
             .or_insert(0.0) += expected_cash;
         if expected_quantity > 0.0 {
             *derived
-                .positions_by_instance
+                .order_positions_by_instance
                 .entry(order.instance_id.clone())
                 .or_default()
                 .entry(order.token_id.clone())
@@ -10605,13 +10673,13 @@ fn derive_reservation_aggregates(
             match operation.kind {
                 MaintenanceOperationKind::Split => {
                     *derived
-                        .cash_by_instance
+                        .maintenance_cash_by_instance
                         .entry(instance_id.clone())
                         .or_insert(0.0) += *amount;
                 }
                 MaintenanceOperationKind::Merge => {
                     let expected = derived
-                        .positions_by_instance
+                        .maintenance_positions_by_instance
                         .entry(instance_id.clone())
                         .or_default();
                     for token in [&operation.up_token_id, &operation.down_token_id] {
@@ -10625,10 +10693,10 @@ fn derive_reservation_aggregates(
     Ok(derived)
 }
 
-/// Restore only conservative aggregate reservation deficits before live
-/// admission. The durable order/trade/maintenance roots remain authoritative:
-/// this may raise an instance aggregate to their proven lower bound, but never
-/// lowers a persisted reservation or repairs an invalid/non-finite value.
+/// Upgrade legacy combined aggregates and restore conservative reservation
+/// deficits before live admission. Version-zero ledgers stored maintenance
+/// coverage in the same counters mutated by order lifecycle; their durable
+/// order and maintenance roots are split exactly once during startup.
 fn repair_under_reserved_instance_aggregates(
     state: &mut SharedAccountState,
 ) -> Result<Vec<StartupReservationAggregateRepair>, String> {
@@ -10636,22 +10704,35 @@ fn repair_under_reserved_instance_aggregates(
     let mut repairs = Vec::new();
     for (instance_id, instance) in &mut state.instances {
         let expected_cash = derived
-            .cash_by_instance
+            .order_cash_by_instance
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0.0);
+        let expected_maintenance_cash = derived
+            .maintenance_cash_by_instance
             .get(instance_id)
             .copied()
             .unwrap_or(0.0);
         let cash_before = instance.reserved_cash;
-        let repair_cash = cash_before.is_finite()
+        let legacy_scope = instance.reservation_scope_version == 0;
+        let repair_cash = legacy_scope
+            || (cash_before.is_finite()
             && cash_before >= -EPS
             && expected_cash.is_finite()
             && expected_cash >= 0.0
-            && expected_cash - cash_before > reconciliation_tolerance(expected_cash, cash_before);
+            && expected_cash - cash_before > reconciliation_tolerance(expected_cash, cash_before));
         if repair_cash {
             instance.reserved_cash = expected_cash;
         }
+        if legacy_scope
+            || expected_maintenance_cash - instance.maintenance_reserved_cash
+                > reconciliation_tolerance(expected_maintenance_cash, instance.maintenance_reserved_cash)
+        {
+            instance.maintenance_reserved_cash = expected_maintenance_cash;
+        }
 
         let mut position_repairs = Vec::new();
-        if let Some(expected_positions) = derived.positions_by_instance.get(instance_id) {
+        if let Some(expected_positions) = derived.order_positions_by_instance.get(instance_id) {
             let mut tokens: Vec<&String> = expected_positions.keys().collect();
             tokens.sort();
             for token in tokens {
@@ -10661,19 +10742,49 @@ fn repair_under_reserved_instance_aggregates(
                     .get(token)
                     .copied()
                     .unwrap_or(0.0);
-                if stored.is_finite()
+                if legacy_scope
+                    || (stored.is_finite()
                     && stored >= -EPS
                     && expected.is_finite()
                     && expected >= 0.0
-                    && expected - stored > reconciliation_tolerance(expected, stored)
+                    && expected - stored > reconciliation_tolerance(expected, stored))
                 {
                     instance.reserved_positions.insert(token.clone(), expected);
                     position_repairs.push((token.clone(), stored, expected));
                 }
             }
         }
+        if legacy_scope {
+            instance.reserved_positions.retain(|token, _| {
+                derived
+                    .order_positions_by_instance
+                    .get(instance_id)
+                    .is_some_and(|positions| positions.contains_key(token))
+            });
+        }
+        let expected_maintenance_positions = derived
+            .maintenance_positions_by_instance
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_default();
+        if legacy_scope {
+            instance.maintenance_reserved_positions = expected_maintenance_positions;
+            instance.reservation_scope_version = 1;
+        } else {
+            for (token, expected) in expected_maintenance_positions {
+                let stored = instance
+                    .maintenance_reserved_positions
+                    .get(&token)
+                    .copied()
+                    .unwrap_or(0.0);
+                if expected - stored > reconciliation_tolerance(expected, stored) {
+                    instance.maintenance_reserved_positions.insert(token.clone(), expected);
+                    position_repairs.push((token, stored, expected));
+                }
+            }
+        }
 
-        if repair_cash || !position_repairs.is_empty() {
+        if repair_cash || legacy_scope || !position_repairs.is_empty() {
             repairs.push(StartupReservationAggregateRepair {
                 instance_id: instance_id.clone(),
                 cash_before,
@@ -11583,6 +11694,9 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || instance.cash < -EPS
             || !instance.reserved_cash.is_finite()
             || instance.reserved_cash < -EPS
+            || !instance.maintenance_reserved_cash.is_finite()
+            || instance.maintenance_reserved_cash < -EPS
+            || instance.reservation_scope_version != 1
         {
             return Err(format!(
                 "instance `{instance_id}` has invalid weight/cash/reservation"
@@ -11598,17 +11712,28 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             &instance.reserved_positions,
             true,
         )?;
-        if instance.reserved_cash
-            > instance.cash + reconciliation_tolerance(instance.cash, instance.reserved_cash)
+        validate_named_values(
+            &format!("instance `{instance_id}` maintenance_reserved_positions"),
+            &instance.maintenance_reserved_positions,
+            true,
+        )?;
+        let total_reserved_cash = instance.total_reserved_cash();
+        if total_reserved_cash
+            > instance.cash + reconciliation_tolerance(instance.cash, total_reserved_cash)
             && !reservation_deficit_has_recovery_root(state, instance_id, None)
         {
             return Err(format!(
                 "instance `{instance_id}` reserves more cash than it owns"
             ));
         }
-        for (token, reserved) in &instance.reserved_positions {
+        for token in instance
+            .reserved_positions
+            .keys()
+            .chain(instance.maintenance_reserved_positions.keys())
+        {
+            let reserved = instance.total_reserved_position(token);
             let owned = instance.positions.get(token).copied().unwrap_or(0.0);
-            if *reserved > owned + reconciliation_tolerance(owned, *reserved)
+            if reserved > owned + reconciliation_tolerance(owned, reserved)
                 && !reservation_deficit_has_recovery_root(state, instance_id, Some(token.as_str()))
             {
                 return Err(format!(
@@ -11934,7 +12059,7 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
 
     for (instance_id, instance) in &state.instances {
         let expected_cash = derived_reservations
-            .cash_by_instance
+            .order_cash_by_instance
             .get(instance_id)
             .copied()
             .unwrap_or(0.0);
@@ -11946,8 +12071,21 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 instance.reserved_cash,
             ));
         }
+        let expected_maintenance_cash = derived_reservations
+            .maintenance_cash_by_instance
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0.0);
+        if (expected_maintenance_cash - instance.maintenance_reserved_cash).abs()
+            > reconciliation_tolerance(expected_maintenance_cash, instance.maintenance_reserved_cash)
+        {
+            return Err(format!(
+                "instance `{instance_id}` maintenance_reserved_cash={} disagrees with operation aggregate={expected_maintenance_cash}",
+                instance.maintenance_reserved_cash,
+            ));
+        }
         let expected_positions = derived_reservations
-            .positions_by_instance
+            .order_positions_by_instance
             .get(instance_id);
         let mut reservation_tokens: HashSet<String> =
             instance.reserved_positions.keys().cloned().collect();
@@ -11967,6 +12105,33 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             if (stored - expected).abs() > reconciliation_tolerance(stored, expected) {
                 return Err(format!(
                     "instance `{instance_id}` reserved position `{token}`={stored} disagrees with derived aggregate={expected}",
+                ));
+            }
+        }
+        let expected_maintenance_positions = derived_reservations
+            .maintenance_positions_by_instance
+            .get(instance_id);
+        let mut maintenance_tokens: HashSet<String> = instance
+            .maintenance_reserved_positions
+            .keys()
+            .cloned()
+            .collect();
+        if let Some(expected) = expected_maintenance_positions {
+            maintenance_tokens.extend(expected.keys().cloned());
+        }
+        for token in maintenance_tokens {
+            let stored = instance
+                .maintenance_reserved_positions
+                .get(&token)
+                .copied()
+                .unwrap_or(0.0);
+            let expected = expected_maintenance_positions
+                .and_then(|positions| positions.get(&token))
+                .copied()
+                .unwrap_or(0.0);
+            if (stored - expected).abs() > reconciliation_tolerance(stored, expected) {
+                return Err(format!(
+                    "instance `{instance_id}` maintenance reserved position `{token}`={stored} disagrees with operation aggregate={expected}",
                 ));
             }
         }
@@ -14755,6 +14920,17 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             1
         );
         account
+            .reserve_order(
+                "a", "a-maintenance-isolation", "oid-maintenance-isolation", "UP",
+                Side::Buy, 2.0, 0.5, 0,
+            )
+            .unwrap();
+        assert_eq!(account.monitoring_snapshot().reserved_cash, 41.0);
+        account.release_order("a-maintenance-isolation", OrderStatus::Cancelled);
+        // Order lifecycle releases only its own one-dollar reservation. The
+        // operation-scoped split coverage remains intact.
+        assert_eq!(account.monitoring_snapshot().reserved_cash, 40.0);
+        account
             .mark_maintenance_operation_submitted("split-op-1", "tx-1")
             .unwrap();
         assert_eq!(
@@ -14783,6 +14959,31 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         // Recovery may observe the same terminal chain state more than once.
         account.confirm_maintenance_operation("split-op-1").unwrap();
         assert_eq!(account.monitoring_snapshot().physical_cash, 360.0);
+    }
+
+    #[test]
+    fn legacy_combined_maintenance_reservation_migrates_from_operation_root() {
+        let account = seeded_account();
+        account
+            .reserve_maintenance_operation(
+                "legacy-split", MaintenanceOperationKind::Split, "condition", "UP", "DOWN",
+                &HashMap::from([("a".into(), 10.0)]),
+            )
+            .unwrap();
+        let mut state = account.lock_state();
+        let instance = state.instances.get_mut("a").unwrap();
+        instance.reservation_scope_version = 0;
+        instance.maintenance_reserved_cash = 0.0;
+        // Reproduce the old bug: an order terminal transition consumed part
+        // of the aggregate maintenance coverage before a restart.
+        instance.reserved_cash = 7.5;
+        let repairs = repair_under_reserved_instance_aggregates(&mut state).unwrap();
+        let instance = state.instances.get("a").unwrap();
+        assert_eq!(instance.reserved_cash, 0.0);
+        assert_eq!(instance.maintenance_reserved_cash, 10.0);
+        assert_eq!(instance.reservation_scope_version, 1);
+        assert_eq!(repairs.len(), 1);
+        assert!(validate_persisted_state("acct", &state).is_ok());
     }
 
     #[test]

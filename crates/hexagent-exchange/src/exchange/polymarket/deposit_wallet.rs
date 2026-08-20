@@ -407,6 +407,63 @@ fn find_wallet_action_by_signer_nonce(
     Ok(best)
 }
 
+fn action_matches_dw_split(
+    action: &serde_json::Value,
+    signer: &str,
+    deposit_wallet: &str,
+    expected_calldata: &str,
+) -> bool {
+    if !is_wallet_action(action) {
+        return false;
+    }
+    let from = action.get("from").or_else(|| action.get("owner"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    if !from.eq_ignore_ascii_case(signer) {
+        return false;
+    }
+    let Some(params) = action.get("depositWalletParams") else {
+        return false;
+    };
+    if !params.get("depositWallet").and_then(serde_json::Value::as_str)
+        .is_some_and(|wallet| wallet.eq_ignore_ascii_case(deposit_wallet))
+    {
+        return false;
+    }
+    params.get("calls").and_then(serde_json::Value::as_array)
+        .into_iter().flatten().any(|call| {
+            call.get("target").and_then(serde_json::Value::as_str)
+                .is_some_and(|target| target.eq_ignore_ascii_case(CTF_COLLATERAL_ADAPTER))
+                && call.get("data").and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| data.eq_ignore_ascii_case(expected_calldata))
+        })
+}
+
+/// Recover the relayer job id for a pre-journal DW split. Exact signer,
+/// deposit-wallet, adapter target and calldata form the operation identity.
+pub(crate) fn recover_dw_split_job_id(
+    builder_auth: &PolyAuth,
+    signer: &str,
+    deposit_wallet: &str,
+    condition_id: &str,
+    amount_wei: u128,
+) -> Result<Option<String>> {
+    let expected_calldata = split_position_calldata(PUSD_TOKEN, condition_id, amount_wei);
+    let path = "/transactions";
+    let headers = builder_auth.sign_request("GET", path, "");
+    let json = relayer_get(format!("{}{}", RELAYER_URL, path), headers)?;
+    let actions = json.as_array()
+        .ok_or_else(|| anyhow!("relayer /transactions returned non-array: {}", json))?;
+    Ok(actions.iter()
+        .filter(|action| {
+            action_matches_dw_split(action, signer, deposit_wallet, &expected_calldata)
+                && action.get("transactionID").and_then(serde_json::Value::as_str).is_some()
+        })
+        .max_by_key(|action| wallet_action_recovery_rank(action))
+        .and_then(|action| action.get("transactionID"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
 /// Execute an ambiguous WALLET submission safely.
 ///
 /// A transport error, transient HTTP response, or malformed 2xx body does not
@@ -651,7 +708,7 @@ fn wallet_busy_error(
 }
 
 /// Sign + submit a relayer `type:"WALLET"` batch. Returns the tx id.
-fn submit_wallet_batch(
+fn submit_wallet_batch_with_hook<F>(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
@@ -659,7 +716,11 @@ fn submit_wallet_batch(
     calls: &[Call],
     gate_maintenance_until_started: bool,
     dry_run: bool,
-) -> Result<String> {
+    mut on_submitted: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     // Serialize only this signer. Different accounts remain concurrent, while
     // two strategies sharing one signer cannot race on the same fresh nonce.
     let submit_lock = wallet_submit_lock(eoa)?;
@@ -763,6 +824,11 @@ fn submit_wallet_batch(
             e
         );
     }
+    // Persist the stable recovery key before any confirmation poll begins.
+    on_submitted(&tx_id).map_err(|error| anyhow!(
+        "WALLET batch accepted txID={} but durable submission journal failed: {}",
+        tx_id, error,
+    ))?;
     println!("   WALLET batch submitted (txID={}) — polling …", tx_id);
     if global_submit_guard.is_some() {
         wait_wallet_action_leaves_new(builder_auth, &tx_id);
@@ -774,6 +840,15 @@ fn submit_wallet_batch(
     }
     println!("   confirmed (tx=0x{})", tx_hash.trim_start_matches("0x"));
     Ok(tx_id)
+}
+
+fn submit_wallet_batch(
+    key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
+    calls: &[Call], gate_maintenance_until_started: bool, dry_run: bool,
+) -> Result<String> {
+    submit_wallet_batch_with_hook(
+        key, eoa, dw, builder_auth, calls, gate_maintenance_until_started, dry_run, |_| Ok(()),
+    )
 }
 
 fn approve_calldata(spender: &str) -> String {
@@ -871,14 +946,18 @@ fn redeem_calldata(collateral: &str, condition_id: &str) -> String {
 /// Split `amount_wei` pUSD → Up+Down shares FROM the deposit wallet, via a
 /// `splitPosition` on the CTF in a relayer WALLET batch. Blocks until the
 /// tx confirms; returns the tx id (Err on submit/confirm failure).
-pub(crate) fn dw_split(
+pub(crate) fn dw_split<F>(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
     builder_auth: &PolyAuth,
     condition_id: &str,
     amount_wei: u128,
-) -> Result<String> {
+    on_submitted: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     // Split VIA the CtfCollateralAdapter (not the CTF directly): the adapter
     // pulls pUSD, unwraps to USDC.e, and mints USDC.e-space outcome tokens — the
     // ones the CLOB actually trades (clob_token_id). Splitting pUSD directly on
@@ -888,7 +967,7 @@ pub(crate) fn dw_split(
         target: CTF_COLLATERAL_ADAPTER.to_string(),
         data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
     }];
-    submit_wallet_batch(
+    submit_wallet_batch_with_hook(
         key,
         eoa,
         dw,
@@ -896,6 +975,7 @@ pub(crate) fn dw_split(
         &calls,
         /*gate_maintenance_until_started=*/ true,
         /*dry_run=*/ false,
+        on_submitted,
     )
 }
 
@@ -1746,6 +1826,36 @@ mod derive_tests {
         });
         assert!(action_matches_signer_nonce(&different_type, signer, 1873));
         assert!(!is_wallet_action(&different_type));
+    }
+
+    #[test]
+    fn legacy_dw_split_recovery_requires_exact_operation_calldata() {
+        let signer = "0x111111111111111111111111111111111111AaAa";
+        let wallet = "0x222222222222222222222222222222222222BbBb";
+        let condition = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let calldata = split_position_calldata(PUSD_TOKEN, condition, 80_000_000);
+        let action = serde_json::json!({
+            "from": signer.to_ascii_lowercase(),
+            "type": "WALLET",
+            "transactionID": "01a02005-bd41-7792-9de1-9293ab25a65a",
+            "state": "STATE_CONFIRMED",
+            "depositWalletParams": {
+                "depositWallet": wallet.to_ascii_lowercase(),
+                "calls": [{
+                    "target": CTF_COLLATERAL_ADAPTER.to_ascii_lowercase(),
+                    "value": "0",
+                    "data": calldata,
+                }],
+            },
+        });
+        assert!(action_matches_dw_split(
+            &action, signer, wallet,
+            &split_position_calldata(PUSD_TOKEN, condition, 80_000_000),
+        ));
+        assert!(!action_matches_dw_split(
+            &action, signer, wallet,
+            &split_position_calldata(PUSD_TOKEN, condition, 79_000_000),
+        ));
     }
 
     #[test]
