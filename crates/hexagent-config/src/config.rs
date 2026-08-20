@@ -60,12 +60,11 @@ pub struct OsTuneConfig {
     /// pin it and (with `enable_fifo`) raise it to `fifo_async_rt`.
     pub async_ord_core: Option<usize>,
     pub strategy_core: Option<usize>,
-    /// Per-instance strategy-worker cores for live/paper multi-instance
-    /// runs: `instance_id → core`. A polymaker instance listed here gets
-    /// its own dedicated core (co-hosted BTC/ETH never preempt each
-    /// other). Instances not listed fall back to `strategy_core`.
-    /// Example: `{ btc = 10, eth = 11 }`. Single-instance runs can omit
-    /// this entirely (the lone instance uses `strategy_core`).
+    /// Per-instance strategy-worker cores for live/paper runs:
+    /// `instance_id → core`. Every strategy runs in its own worker thread;
+    /// assigning entries here also gives those workers dedicated cores so
+    /// co-hosted instances never preempt each other. Instances not listed
+    /// fall back to `strategy_core`. Example: `{ btc = 10, eth = 11 }`.
     #[serde(default)]
     pub strategy_cores: HashMap<String, usize>,
     /// Shared-account id -> dedicated private event application core.  These

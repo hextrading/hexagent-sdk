@@ -1596,7 +1596,11 @@ impl LatestMarketSlot {
                     self.epoch.store(epoch, Ordering::Relaxed);
                     self.enqueued_ns.store(enqueued_ns, Ordering::Relaxed);
                     let raw = Arc::into_raw(event).cast_mut();
-                    debug_assert!(self.event.swap(raw, Ordering::AcqRel).is_null());
+                    // The pointer publication is a production side effect; do
+                    // not place it inside `debug_assert!`, which is removed in
+                    // optimized builds.
+                    let previous = self.event.swap(raw, Ordering::AcqRel);
+                    debug_assert!(previous.is_null());
                     self.state.store(LATEST_PENDING, Ordering::Release);
                     return LatestPublish::MarkerRequired;
                 }
@@ -1800,6 +1804,10 @@ fn resolve_market_event(
 
 fn private_update_lane_enabled(private_burst: usize, market_waiting: bool) -> bool {
     private_burst < PRIVATE_UPDATE_BURST_BUDGET || !market_waiting
+}
+
+fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: usize) -> bool {
+    !backtest && strategy_count > 0
 }
 
 #[derive(Debug)]
@@ -5779,19 +5787,16 @@ impl Engine {
             s.on_init();
         }
 
-        // ── LIVE/PAPER multi-instance fan-out (P1+P2) ──
-        // With more than one strategy instance, run each on its OWN
-        // thread (pinned to its own core via `strategy_cores`), fed by a
-        // market router that delivers each event only to the instances
-        // that subscribe its symbol. This isolates co-hosted instances
-        // (e.g. BTC + ETH) so they never preempt each other and a BTC
-        // Binance OB drives only the BTC instance's quote cadence.
+        // ── LIVE/PAPER per-instance workers (P1+P2) ──
+        // Every live/paper strategy instance runs on its OWN watchdog-enabled
+        // thread (pinned via `strategy_cores`), including a deployment with a
+        // single enabled instance. The market router delivers each event only
+        // to instances subscribing to its symbol. This preserves instance
+        // ownership and ensures wall-clock safety/initialization work runs even
+        // while every market-data source is silent.
         //
-        // Backtest (determinism) and the single-instance case keep the
-        // original single-thread loop below — byte-identical, so
-        // existing single-instance live/paper and all backtests are
-        // unaffected.
-        if !backtest && strategies.len() > 1 {
+        // Backtest keeps the deterministic single-thread loop below.
+        if should_spawn_per_instance_strategy_workers(backtest, strategies.len()) {
             return self.spawn_per_instance_strategy_threads(
                 strategies,
                 market_rx,
@@ -5993,7 +5998,7 @@ impl Engine {
             .unwrap()
     }
 
-    /// LIVE/PAPER multi-instance fan-out (P1+P2). Spawns one worker
+    /// LIVE/PAPER per-instance routing (P1+P2). Spawns one worker
     /// thread per strategy instance — each pinned to its own core via
     /// `strategy_cores[instance_id]` — and a router thread that fans
     /// each market event only to the instances subscribing its symbol
@@ -6106,12 +6111,12 @@ impl Engine {
                 }
 
                 // Router runs on the fallback strategy core. Production
-                // multi-instance layouts dedicate that core to the router;
-                // every configured instance uses `strategy_cores` instead.
+                // live/paper layouts dedicate that core to the router; every
+                // configured instance uses `strategy_cores` instead.
                 // Fan-out below clones only Arc pointers, never event payloads.
                 crate::os_tune::pin_strategy("strategy-router");
                 info!(
-                    "[Strategy] Multi-instance fan-out active: {} instances {:?}, {} routed symbols",
+                    "[Strategy] Per-instance routing active: {} instances {:?}, {} routed symbols",
                     instance_ids.len(), instance_ids, sym_to_instances.len(),
                 );
 
@@ -6506,7 +6511,7 @@ impl Engine {
         send_to(targets, latest_key_id)
     }
 
-    /// Per-instance worker loop (live/paper multi-instance). Runs ONE
+    /// Per-instance worker loop (live/paper). Runs ONE
     /// strategy, pinned to its own core. Mirrors the per-strategy body
     /// of the single-thread loop (market dispatch + quote-cadence
     /// trigger + order-update reaction), minus the recorder/sim-clock
@@ -11087,6 +11092,25 @@ mod market_router_tests {
     use super::*;
     use crossbeam_channel::Receiver;
 
+    struct WatchdogTestStrategy {
+        watchdog_tx: Sender<u64>,
+    }
+
+    impl Strategy for WatchdogTestStrategy {
+        fn name(&self) -> &str {
+            "watchdog-test"
+        }
+
+        fn instance_id(&self) -> &str {
+            "single"
+        }
+
+        fn on_watchdog(&mut self, now_ns: u64) -> Vec<Signal> {
+            let _ = self.watchdog_tx.try_send(now_ns);
+            Vec::new()
+        }
+    }
+
     #[derive(Default)]
     struct HistConsumerState {
         load_anchors: Vec<u64>,
@@ -11512,6 +11536,138 @@ mod market_router_tests {
             PRIVATE_UPDATE_BURST_BUDGET,
             false,
         ));
+    }
+
+    #[test]
+    fn live_and_paper_select_instance_workers_even_for_one_strategy() {
+        assert!(should_spawn_per_instance_strategy_workers(false, 1));
+        assert!(should_spawn_per_instance_strategy_workers(false, 5));
+        assert!(!should_spawn_per_instance_strategy_workers(false, 0));
+        assert!(!should_spawn_per_instance_strategy_workers(true, 1));
+        assert!(!should_spawn_per_instance_strategy_workers(true, 5));
+    }
+
+    #[test]
+    fn single_instance_worker_runs_watchdog_without_market_events() {
+        let (market_tx, market_rx) = bounded(1);
+        let (_update_tx, update_rx) = bounded(1);
+        let (routed_signal_tx, _routed_signal_rx) = bounded(1);
+        let (shutdown_ack_tx, _shutdown_ack_rx) = bounded(1);
+        let (watchdog_tx, watchdog_rx) = bounded(1);
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let quarantined = Arc::new(AtomicBool::new(false));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let clock_origin = Arc::new(std::time::Instant::now());
+
+        let worker = thread::Builder::new()
+            .name("strategy-single-test".into())
+            .spawn(move || {
+                Engine::run_strategy_worker(
+                    Box::new(WatchdogTestStrategy { watchdog_tx }),
+                    market_rx,
+                    Arc::new(LatestMarketStore::default()),
+                    update_rx,
+                    SignalSender::system(routed_signal_tx).with_owner(0),
+                    Vec::new(),
+                    "single",
+                    0,
+                    heartbeat,
+                    quarantined,
+                    shutdown_requested,
+                    shutdown_ack_tx,
+                    clock_origin,
+                );
+            })
+            .unwrap();
+
+        let watchdog_result = watchdog_rx.recv_timeout(std::time::Duration::from_secs(2));
+        market_tx
+            .send(QueuedMarketEvent::Direct(QueuedMarketPayload {
+                event: Arc::new(MarketEvent::Exit),
+                enqueued_ns: crate::types::now_ns(),
+            }))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert!(
+            watchdog_result.is_ok(),
+            "single-instance worker did not run its watchdog while market data was silent"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual dispatch-latency benchmark; run with --release --ignored"]
+    fn single_instance_router_dispatch_latency_benchmark() {
+        const EVENTS: usize = 100_000;
+
+        fn percentiles(mut samples_ns: Vec<u64>) -> (u64, u64, u64, u64) {
+            samples_ns.sort_unstable();
+            let at = |numerator: usize, denominator: usize| {
+                samples_ns[(samples_ns.len() - 1) * numerator / denominator]
+            };
+            (at(1, 2), at(99, 100), at(999, 1_000), at(1, 1))
+        }
+
+        let event = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
+
+        // Legacy comparison boundary: direct dispatch enqueue through dequeue.
+        let (direct_tx, direct_rx) = bounded::<Arc<MarketEvent>>(CHANNEL_CAPACITY);
+        let mut direct_samples = Vec::with_capacity(EVENTS);
+        let mut direct_peak_depth = 0usize;
+        let mut direct_overflow = 0u64;
+        for _ in 0..EVENTS {
+            let started = std::time::Instant::now();
+            if direct_tx.try_send(Arc::clone(&event)).is_err() {
+                direct_overflow += 1;
+                continue;
+            }
+            direct_peak_depth = direct_peak_depth.max(direct_tx.len());
+            std::hint::black_box(direct_rx.try_recv().unwrap());
+            direct_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+
+        // New boundary: single-instance router entry through lane resolution.
+        // The same-thread dequeue deliberately excludes OS scheduling noise.
+        let (lane, routed_rx) = test_market_lane(CHANNEL_CAPACITY);
+        let sym_to_instances = HashMap::from([(SymbolId::of("BTCUSDT"), 1)]);
+        let mut token_to_instances = HashMap::new();
+        let mut latest_key_ids = HashMap::new();
+        let mut routed_samples = Vec::with_capacity(EVENTS);
+        let mut routed_peak_depth = 0usize;
+        let mut routed_overflow = 0u64;
+        for _ in 0..EVENTS {
+            let started = std::time::Instant::now();
+            routed_overflow += Engine::route_market_event(
+                Arc::clone(&event),
+                &sym_to_instances,
+                &mut token_to_instances,
+                &mut latest_key_ids,
+                std::slice::from_ref(&lane),
+            )
+            .count_ones() as u64;
+            routed_peak_depth = routed_peak_depth.max(routed_rx.len());
+            let queued = routed_rx.try_recv().unwrap();
+            std::hint::black_box(resolve_market_event(queued, &lane.latest).unwrap());
+            routed_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+
+        let direct = percentiles(direct_samples);
+        let routed = percentiles(routed_samples);
+        println!(
+            "single_instance_dispatch events={EVENTS} boundary=dispatch_entry_to_lane_dequeue unit=ns legacy_direct_p50={} legacy_direct_p99={} legacy_direct_p999={} legacy_direct_max={} legacy_direct_peak_depth={} legacy_direct_overflow={} routed_p50={} routed_p99={} routed_p999={} routed_max={} routed_peak_depth={} routed_overflow={}",
+            direct.0,
+            direct.1,
+            direct.2,
+            direct.3,
+            direct_peak_depth,
+            direct_overflow,
+            routed.0,
+            routed.1,
+            routed.2,
+            routed.3,
+            routed_peak_depth,
+            routed_overflow,
+        );
     }
 
     #[test]
