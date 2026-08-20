@@ -1783,7 +1783,7 @@ mod tests {
             quote_trigger_exchange_timestamp_ns: 0,
             quote_trigger_local_timestamp_ns: 0,
             quote_event_id: String::new(),
-            quote_trigger_source: String::new(),
+            quote_trigger_source: crate::types::QuoteTriggerSource::Unknown,
             timestamp_ns: 0,
             instance_id: String::new(),
             fee_rate_bps: 0,

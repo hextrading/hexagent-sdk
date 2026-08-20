@@ -10,6 +10,7 @@ use base64::engine::general_purpose::{STANDARD as B64_STD, URL_SAFE as B64_URL, 
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::Arc;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -25,16 +26,19 @@ pub struct PolyAuth {
     api_secret_b64: String,
     pub passphrase: String,
     pub wallet_address: String,
+    api_key_template: Arc<str>,
+    address_template: Arc<str>,
+    passphrase_template: Arc<str>,
 }
 
 /// Authentication headers for a single request.
 #[derive(Clone)]
 pub struct AuthHeaders {
-    pub api_key: String,
-    pub address: String,
+    pub api_key: Arc<str>,
+    pub address: Arc<str>,
     pub signature: String,
     pub timestamp: String,
-    pub passphrase: String,
+    pub passphrase: Arc<str>,
 }
 
 impl PolyAuth {
@@ -57,6 +61,9 @@ impl PolyAuth {
             api_secret_b64: api_secret_b64.to_string(),
             passphrase: passphrase.to_string(),
             wallet_address: wallet_address.to_string(),
+            api_key_template: Arc::from(api_key),
+            address_template: Arc::from(wallet_address),
+            passphrase_template: Arc::from(passphrase),
         })
     }
 
@@ -84,22 +91,22 @@ impl PolyAuth {
                 .as_secs()
         );
 
-        let mut message = format!("{}{}{}", timestamp, method, path);
-        if !body.is_empty() {
-            message.push_str(body);
-        }
-
         let mut mac = HmacSha256::new_from_slice(&self.secret)
             .expect("HMAC accepts any key size");
-        mac.update(message.as_bytes());
+        mac.update(timestamp.as_bytes());
+        mac.update(method.as_bytes());
+        mac.update(path.as_bytes());
+        if !body.is_empty() {
+            mac.update(body.as_bytes());
+        }
         let signature = B64_URL.encode(mac.finalize().into_bytes());
 
         AuthHeaders {
-            api_key: self.api_key.clone(),
-            address: self.wallet_address.clone(),
+            api_key: Arc::clone(&self.api_key_template),
+            address: Arc::clone(&self.address_template),
             signature,
             timestamp,
-            passphrase: self.passphrase.clone(),
+            passphrase: Arc::clone(&self.passphrase_template),
         }
     }
 }
@@ -109,21 +116,21 @@ impl AuthHeaders {
     /// reqwest requests (async HTTP/2 path).
     pub fn as_pairs(&self) -> [(&'static str, &str); 5] {
         [
-            ("POLY_API_KEY", self.api_key.as_str()),
-            ("POLY_ADDRESS", self.address.as_str()),
+            ("POLY_API_KEY", self.api_key.as_ref()),
+            ("POLY_ADDRESS", self.address.as_ref()),
             ("POLY_SIGNATURE", self.signature.as_str()),
             ("POLY_TIMESTAMP", self.timestamp.as_str()),
-            ("POLY_PASSPHRASE", self.passphrase.as_str()),
+            ("POLY_PASSPHRASE", self.passphrase.as_ref()),
         ]
     }
 
     /// Returns the builder-auth header name→value pairs.
     pub fn as_builder_pairs(&self) -> [(&'static str, &str); 4] {
         [
-            ("POLY_BUILDER_API_KEY", self.api_key.as_str()),
+            ("POLY_BUILDER_API_KEY", self.api_key.as_ref()),
             ("POLY_BUILDER_SIGNATURE", self.signature.as_str()),
             ("POLY_BUILDER_TIMESTAMP", self.timestamp.as_str()),
-            ("POLY_BUILDER_PASSPHRASE", self.passphrase.as_str()),
+            ("POLY_BUILDER_PASSPHRASE", self.passphrase.as_ref()),
         ]
     }
 }
@@ -143,9 +150,9 @@ mod tests {
         ).unwrap();
         let headers = auth.sign_request("GET", "/order/0xabc", "");
         assert!(!headers.signature.is_empty());
-        assert_eq!(headers.api_key, "test-key");
-        assert_eq!(headers.address, "0x1234");
-        assert_eq!(headers.passphrase, "test-pass");
+        assert_eq!(headers.api_key.as_ref(), "test-key");
+        assert_eq!(headers.address.as_ref(), "0x1234");
+        assert_eq!(headers.passphrase.as_ref(), "test-pass");
         assert!(!headers.timestamp.is_empty());
     }
 }

@@ -61,8 +61,7 @@ fn adaptive_healthy_gap_replay_delay(
     last_business_event_ns: u64,
 ) -> Duration {
     let recent_activity = last_business_event_ns > 0
-        && now_ns.saturating_sub(last_business_event_ns)
-            <= HEALTHY_GAP_REPLAY_ACTIVITY_WINDOW_NS;
+        && now_ns.saturating_sub(last_business_event_ns) <= HEALTHY_GAP_REPLAY_ACTIVITY_WINDOW_NS;
     let healthy_floor_ms = if recent_activity {
         HEALTHY_GAP_REPLAY_ACTIVE_MS
     } else {
@@ -132,9 +131,7 @@ fn remember_terminal_gap_replay(account_id: &str, key: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(account_id.to_string())
-        .or_insert_with(|| {
-            FailedTradeDiagnosticDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY)
-        })
+        .or_insert_with(|| FailedTradeDiagnosticDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY))
         .admit(key);
 }
 
@@ -147,20 +144,30 @@ struct GapReplayLifecycleDedupe {
 
 impl GapReplayLifecycleDedupe {
     fn new(capacity: usize) -> Self {
-        Self { capacity: capacity.max(1), ranks: HashMap::new(), order: VecDeque::new() }
+        Self {
+            capacity: capacity.max(1),
+            ranks: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
     fn seen(&self, trade_id: &str, rank: u8) -> bool {
-        self.ranks.get(trade_id).is_some_and(|existing| *existing >= rank)
+        self.ranks
+            .get(trade_id)
+            .is_some_and(|existing| *existing >= rank)
     }
 
     fn remember(&mut self, trade_id: &str, rank: u8) {
-        if trade_id.is_empty() || self.seen(trade_id, rank) { return; }
+        if trade_id.is_empty() || self.seen(trade_id, rank) {
+            return;
+        }
         self.ranks.insert(trade_id.to_string(), rank);
         self.order.push_back((trade_id.to_string(), rank));
         while self.order.len() > self.capacity {
             if let Some((expired, expired_rank)) = self.order.pop_front() {
-                if self.ranks.get(&expired) == Some(&expired_rank) { self.ranks.remove(&expired); }
+                if self.ranks.get(&expired) == Some(&expired_rank) {
+                    self.ranks.remove(&expired);
+                }
             }
         }
     }
@@ -172,10 +179,17 @@ fn replay_lifecycle_cache() -> &'static Mutex<HashMap<String, GapReplayLifecycle
 }
 
 fn trade_lifecycle_identity(payload: &serde_json::Value) -> Option<(&str, u8)> {
-    let trade_id = payload.get("id").or_else(|| payload.get("trade_id"))
-        .and_then(serde_json::Value::as_str)?.trim();
-    if trade_id.is_empty() { return None; }
-    let status = payload.get("status").and_then(serde_json::Value::as_str)?
+    let trade_id = payload
+        .get("id")
+        .or_else(|| payload.get("trade_id"))
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    if trade_id.is_empty() {
+        return None;
+    }
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)?
         .trim_start_matches("TRADE_STATUS_");
     let rank = match status {
         "MATCHED" | "MATCHED_NOT_BROADCASTED" => 1,
@@ -188,14 +202,23 @@ fn trade_lifecycle_identity(payload: &serde_json::Value) -> Option<(&str, u8)> {
 }
 
 fn replay_lifecycle_seen(account_id: &str, payload: &serde_json::Value) -> bool {
-    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else { return false };
-    replay_lifecycle_cache().lock().unwrap_or_else(|p| p.into_inner())
-        .get(account_id).is_some_and(|cache| cache.seen(trade_id, rank))
+    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else {
+        return false;
+    };
+    replay_lifecycle_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(account_id)
+        .is_some_and(|cache| cache.seen(trade_id, rank))
 }
 
 fn remember_replay_lifecycle(account_id: &str, payload: &serde_json::Value) {
-    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else { return };
-    replay_lifecycle_cache().lock().unwrap_or_else(|p| p.into_inner())
+    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else {
+        return;
+    };
+    replay_lifecycle_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
         .entry(account_id.to_string())
         .or_insert_with(|| GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY))
         .remember(trade_id, rank);
@@ -856,13 +879,10 @@ fn parse_order_event(
         .account_state
         .retired_order_audit_covers(order_id, original_size, size_matched)
     {
-        shared.account_state.resolve_private_event_anomaly(&format!(
-            "order:{}",
-            normalize_order_id(order_id)
-        ));
-        debug!(
-            "[PolyUserFeed] retired zero-fill order lifecycle replay ignored: oid={order_id}"
-        );
+        shared
+            .account_state
+            .resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(order_id)));
+        debug!("[PolyUserFeed] retired zero-fill order lifecycle replay ignored: oid={order_id}");
         return Ok(Vec::new());
     }
     let coid = shared.lookup_coid(order_id).ok_or_else(|| {
@@ -1132,7 +1152,9 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
                 .get("asset_id")
                 .or_else(|| data.get("token_id"))
                 .and_then(serde_json::Value::as_str);
-            shared.account_state.mark_private_order_event_anomaly_with_token(
+            shared
+                .account_state
+                .mark_private_order_event_anomaly_with_token(
                 order_id,
                 coid.as_deref(),
                 token_id,
@@ -1143,7 +1165,9 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
             return;
         }
     }
-    shared.account_state.mark_private_event_anomaly(&key, reason);
+    shared
+        .account_state
+        .mark_private_event_anomaly(&key, reason);
     shared.user_feed_health.set_inventory_uncertain(true);
     warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
 }
@@ -1294,6 +1318,18 @@ enum PrivateApplyCommand {
     },
 }
 
+/// Ownership has already been validated and every advancing strategy update
+/// has crossed the high-priority delivery edge before this command is
+/// published.  One cold-account worker is the sole consumer, preserving the
+/// venue order of account/audit/persistence transitions without holding up the
+/// private owner route.
+struct PrivateColdCommand {
+    events: Vec<PrivateEventDelta>,
+    recovery_generation: Option<u64>,
+    completion: Option<tokio::sync::oneshot::Sender<std::result::Result<usize, String>>>,
+    routed_at: crate::latency::Instant,
+}
+
 #[derive(Clone)]
 struct PrivateApplyLane {
     live_tx: crossbeam_channel::Sender<PrivateApplyCommand>,
@@ -1327,9 +1363,7 @@ impl PrivateRouteDedupe {
 
     fn seen(&self, identity: &PrivateRouteIdentity) -> bool {
         match identity {
-            PrivateRouteIdentity::TradeLifecycle { key, rank } => {
-                self.trades.seen(key, *rank)
-            }
+            PrivateRouteIdentity::TradeLifecycle { key, rank } => self.trades.seen(key, *rank),
         }
     }
 
@@ -1410,7 +1444,9 @@ fn route_private_event_fast(
                 || price <= 0.0
                 || price > 1.0 + 1e-8
             {
-                return Err(format!("invalid order lifecycle economics order_id={order_id}"));
+                return Err(format!(
+                    "invalid order lifecycle economics order_id={order_id}"
+                ));
             }
             let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
                 format!("unowned private order lifecycle event for order_id `{order_id}`")
@@ -1528,7 +1564,8 @@ fn route_private_event_fast(
                         })
                     {
                         let order_id = required_string(maker, &["order_id"], "maker order_id")?;
-                        let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+                        let ownership =
+                            shared.lookup_order_ownership(order_id).ok_or_else(|| {
                             format!("unowned maker trade `{trade_id}` order_id `{order_id}`")
                         })?;
                         let symbol = required_string(maker, &["asset_id"], "maker asset_id")?;
@@ -1536,7 +1573,8 @@ fn route_private_event_fast(
                             required_string(maker, &["side"], "maker side")?,
                             "maker side",
                         )?;
-                        let quantity = strict_number(maker.get("matched_amount"), "matched_amount")?;
+                        let quantity =
+                            strict_number(maker.get("matched_amount"), "matched_amount")?;
                         let price = strict_number(maker.get("price"), "price")?;
                         if ownership.token_id != symbol || ownership.side != side {
                             return Err(format!(
@@ -1709,19 +1747,17 @@ fn dispatch_private_update(
     result
 }
 
-fn apply_private_batch(
+fn route_private_batch(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
-    events: Vec<PrivateEventDelta>,
+    events: &[PrivateEventDelta],
     recovery_generation: Option<u64>,
     route_dedupe: &mut PrivateRouteDedupe,
-) -> std::result::Result<usize, String> {
-    let mut applied = 0usize;
+) -> std::result::Result<(), String> {
     for event in events {
         let payload = event.payload();
-        let is_trade = matches!(&event, PrivateEventDelta::Trade(_));
         let route_started = crate::latency::Instant::now();
-        let routed = match route_private_event_fast(&event, shared) {
+        let routed = match route_private_event_fast(event, shared) {
             Ok(routed) => routed,
             Err(error) => {
                 flag_invalid_private_event(payload, shared, &error);
@@ -1732,20 +1768,24 @@ fn apply_private_batch(
             if route_dedupe.seen(&routed.identity) {
                 continue;
             }
-            dispatch_private_update(
-                shared,
-                update_tx,
-                recovery_generation,
-                routed.update,
-            )?;
+            dispatch_private_update(shared, update_tx, recovery_generation, routed.update)?;
             // Delivery is the commit edge for actor-local replay suppression.
             route_dedupe.remember(routed.identity);
         }
         crate::latency::record("polymarket.user.validate_route_dispatch", route_started);
+    }
+    Ok(())
+}
 
-        // Shared account transitions, audits, statistics and persistence are
-        // deliberately cold: StrategyAccount has already received the owned,
-        // deduplicated private message above.
+fn apply_private_cold_batch(
+    shared: &SharedState,
+    events: &[PrivateEventDelta],
+    recovery_generation: Option<u64>,
+) -> std::result::Result<usize, String> {
+    let mut applied = 0usize;
+    for event in events {
+        let payload = event.payload();
+        let is_trade = matches!(event, PrivateEventDelta::Trade(_));
         let account_apply_started = crate::latency::Instant::now();
         let parsed = parse_user_event_with_health(payload, shared);
         crate::latency::record("polymarket.user.account_apply", account_apply_started);
@@ -1761,9 +1801,9 @@ fn apply_private_batch(
                 .rejection_reason
                 .unwrap_or_else(|| "invalid private business event".to_string()));
         }
-        let terminal_to_remember = event.terminal_trade_key().filter(|_| {
-            terminal_trade_is_durably_resolved(event.payload(), shared)
-        });
+        let terminal_to_remember = event
+            .terminal_trade_key()
+            .filter(|_| terminal_trade_is_durably_resolved(event.payload(), shared));
         let terminal_tokens = terminal_to_remember
             .is_some()
             .then(|| {
@@ -1811,6 +1851,14 @@ fn spawn_private_apply_worker(
 ) -> Result<(PrivateApplyLane, Vec<std::thread::JoinHandle<()>>)> {
     let (live_tx, live_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
     let (replay_tx, replay_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
+    // Producer: the single owner-fast worker below. Consumer: one cold ledger
+    // worker. Each batch crosses fast routing and cold accounting in the same
+    // serialized order selected by the owner actor (live intentionally retains
+    // priority over replay). Overflow is fail-closed: live forces
+    // reconnect/replay; replay returns an explicit error to its caller. No
+    // private lifecycle is silently dropped.
+    let (cold_tx, cold_rx) =
+        crossbeam_channel::bounded::<PrivateColdCommand>(PRIVATE_APPLY_QUEUE_CAPACITY);
     let reconnect_generation = Arc::new(AtomicU64::new(0));
     let reconnect_notify = Arc::new(tokio::sync::Notify::new());
     let lane = PrivateApplyLane {
@@ -1820,6 +1868,44 @@ fn spawn_private_apply_worker(
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
     let account_id = shared.account_state.account_id().to_string();
+    let cold_shared = Arc::clone(&shared);
+    let cold_reconnect_generation = Arc::clone(&reconnect_generation);
+    let cold_reconnect_notify = Arc::clone(&reconnect_notify);
+    let cold_account_id = account_id.clone();
+    let cold_worker = std::thread::Builder::new()
+        .name(format!("poly-private-cold-{}", cold_account_id))
+        .spawn(move || {
+            crate::os_tune::pin_private_account_cold("polymarket-private-cold");
+            loop {
+                match cold_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(command) => {
+                        crate::latency::record(
+                            "polymarket.user.fast_route_to_cold_worker",
+                            command.routed_at,
+                        );
+                        let result = apply_private_cold_batch(
+                            &cold_shared,
+                            &command.events,
+                            command.recovery_generation,
+                        );
+                        if let Err(error) = &result {
+                            cold_shared.user_feed_health.set_recovering(true);
+                            warn!(
+                                "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
+                                error,
+                            );
+                            cold_reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                            cold_reconnect_notify.notify_one();
+                        }
+                        if let Some(completion) = command.completion {
+                            let _ = completion.send(result);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })?;
     let worker = std::thread::Builder::new()
         .name(format!("poly-private-owner-{}", account_id))
         .spawn(move || {
@@ -1832,10 +1918,10 @@ fn spawn_private_apply_worker(
                 crossbeam_channel::select_biased! {
                     recv(live_rx) -> command => match command {
                         Ok(PrivateApplyCommand::Live(events)) => {
-                            if let Err(error) = apply_private_batch(
+                            if let Err(error) = route_private_batch(
                                 &shared,
                                 &update_tx,
-                                events,
+                                &events,
                                 None,
                                 &mut route_dedupe,
                             ) {
@@ -1843,6 +1929,21 @@ fn spawn_private_apply_worker(
                                 warn!(
                                     "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
                                     error,
+                                );
+                                reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                                reconnect_notify.notify_one();
+                                continue;
+                            }
+                            let cold = PrivateColdCommand {
+                                events,
+                                recovery_generation: None,
+                                completion: None,
+                                routed_at: crate::latency::Instant::now(),
+                            };
+                            if cold_tx.try_send(cold).is_err() {
+                                shared.user_feed_health.set_recovering(true);
+                                warn!(
+                                    "[PolyUserFeed] cold private-account queue saturated; forcing reconnect/replay"
                                 );
                                 reconnect_generation.fetch_add(1, Ordering::AcqRel);
                                 reconnect_notify.notify_one();
@@ -1861,14 +1962,37 @@ fn spawn_private_apply_worker(
                             recovery_generation,
                             completion,
                         }) => {
-                            let result = apply_private_batch(
+                            let routed = route_private_batch(
                                 &shared,
                                 &update_tx,
-                                events,
+                                &events,
                                 recovery_generation,
                                 &mut route_dedupe,
                             );
-                            let _ = completion.send(result);
+                            match routed {
+                                Err(error) => {
+                                    let _ = completion.send(Err(error));
+                                }
+                                Ok(()) => {
+                                    let cold = PrivateColdCommand {
+                                        events,
+                                        recovery_generation,
+                                        completion: Some(completion),
+                                        routed_at: crate::latency::Instant::now(),
+                                    };
+                                    if let Err(error) = cold_tx.try_send(cold) {
+                                        if let PrivateColdCommand {
+                                            completion: Some(completion),
+                                            ..
+                                        } = error.into_inner()
+                                        {
+                                            let _ = completion.send(Err(
+                                                "cold private-account queue saturated".to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Ok(PrivateApplyCommand::Live(_)) => {
                             warn!("[PolyUserFeed] live command reached replay lane");
@@ -1879,7 +2003,7 @@ fn spawn_private_apply_worker(
                 }
             }
         })?;
-    Ok((lane, vec![worker]))
+    Ok((lane, vec![worker, cold_worker]))
 }
 
 fn parse_user_event_with_health(
@@ -2667,8 +2791,7 @@ async fn replay_missed_trades_inner(
             if delta.terminal_trade_key().is_some_and(|key| {
                 terminal_gap_replay_seen(shared.account_state.account_id(), &key)
             }) {
-                checkpoint.terminal_fast_skips =
-                    checkpoint.terminal_fast_skips.saturating_add(1);
+                checkpoint.terminal_fast_skips = checkpoint.terminal_fast_skips.saturating_add(1);
                 continue;
             }
             if dedupe.insert(delta.dedupe_key()) {
@@ -3055,12 +3178,7 @@ async fn user_feed_loop(
                     continue;
                 }
                 if let Err(error) =
-                    wait_for_recovery_delivery(
-                        &shared,
-                        recovery_generation,
-                        &update_tx,
-                        &shutdown,
-                    )
+                    wait_for_recovery_delivery(&shared, recovery_generation, &update_tx, &shutdown)
                     .await
                 {
                     shared.user_feed_health.set_recovering(true);
@@ -3422,19 +3540,11 @@ mod tests {
     fn healthy_gap_replay_adapts_to_private_activity_without_ignoring_config() {
         let now = 100_000_000_000;
         assert_eq!(
-            adaptive_healthy_gap_replay_delay(
-                Duration::from_secs(2),
-                now,
-                now - 1_000_000_000,
-            ),
+            adaptive_healthy_gap_replay_delay(Duration::from_secs(2), now, now - 1_000_000_000,),
             Duration::from_secs(10),
         );
         assert_eq!(
-            adaptive_healthy_gap_replay_delay(
-                Duration::from_secs(2),
-                now,
-                now - 31_000_000_000,
-            ),
+            adaptive_healthy_gap_replay_delay(Duration::from_secs(2), now, now - 31_000_000_000,),
             Duration::from_secs(30),
         );
         assert_eq!(

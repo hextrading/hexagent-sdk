@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam_queue::ArrayQueue;
 use hexagent_account::account::shared_account::{normalize_order_id, OrderOwnership};
 use log::{debug, info, warn};
 
@@ -57,6 +59,16 @@ impl ClobVersion {
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
+const REQUEST_BUFFER_SLOTS: usize = 64;
+const REQUEST_BUFFER_BYTES: usize = 2_048;
+
+fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
+    let pool = Arc::new(ArrayQueue::new(REQUEST_BUFFER_SLOTS));
+    for _ in 0..REQUEST_BUFFER_SLOTS {
+        let _ = pool.push(BytesMut::with_capacity(REQUEST_BUFFER_BYTES));
+    }
+    pool
+}
 
 #[derive(Debug, Clone)]
 struct FetchedOrder {
@@ -1167,7 +1179,7 @@ pub(crate) struct OrderLifecycleTrace {
     pub event_id: String,
     pub symbol: String,
     pub side: Side,
-    pub trigger_source: String,
+    pub trigger_source: QuoteTriggerSource,
     pub trigger_exchange_ns: u64,
     pub trigger_local_ns: u64,
     pub quote_emit_ns: u64,
@@ -1569,12 +1581,14 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
 /// request runs on its reserved warm connection instead of opening a cold one.
 async fn execute_http_on(
     client: crate::http1_pool::PooledClient,
+    attempt_id: u64,
     method: reqwest::Method,
-    url: String,
+    url: Arc<str>,
     path: String,
     headers: super::auth::AuthHeaders,
-    body: String,
+    body: Bytes,
 ) -> HttpReply {
+    debug_assert_ne!(attempt_id, 0, "every HTTP dispatch requires an attempt ID");
     // Lazily derived — only the error branches need it, and parsing the
     // URL eagerly cost a full `Url::parse` + allocs on every request.
     let prewarm_url = |u: &str| {
@@ -1590,7 +1604,7 @@ async fn execute_http_on(
     let req_timeout = per_request_timeout(&method, &path);
     let mut req = client
         .client()
-        .request(method.clone(), &url)
+        .request(method.clone(), url.as_ref())
         .header("Content-Type", "application/json")
         .body(body);
     // Per-request timeout override (FAST / CANCEL paths only). The pool
@@ -1608,7 +1622,7 @@ async fn execute_http_on(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            client.note_transport_failure(prewarm_url(&url));
+            client.note_transport_failure(prewarm_url(url.as_ref()));
             return Err(map_reqwest_err(e));
         }
     };
@@ -1802,6 +1816,13 @@ pub struct SharedState {
     /// back to `DEFAULT_CLOB_BASE_URL` (= v1 host) when unset. MUST
     /// match `clob_version`: v2-signed orders require `clob-v2.polymarket.com`.
     pub clob_base_url: String,
+    /// Startup-built hot single-order endpoint. Arc cloning is allocation-free
+    /// when a fire worker hands the URL to the async order runtime.
+    order_url: Arc<str>,
+    /// Startup-filled, bounded request-body pool. Hot single-order requests
+    /// take one buffer without blocking and return its allocation after the
+    /// async HTTP future has dropped its body reference.
+    request_buffers: Arc<ArrayQueue<BytesMut>>,
     /// Live position & balance manager (trade-status-based)
     pub live_position: Mutex<LivePositionManager>,
     /// Narrow user-feed health handle shared with the strategy (pause-quoting
@@ -2059,9 +2080,22 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    fn take_request_buffer(&self) -> BytesMut {
+        self.request_buffers.pop().unwrap_or_else(|| {
+            crate::latency::record_ns("polymarket.order.request_buffer_pool_exhausted", 1);
+            BytesMut::with_capacity(REQUEST_BUFFER_BYTES)
+        })
+    }
+
+    fn recycle_request_buffer(&self, mut buffer: BytesMut) {
+        buffer.clear();
+        let _ = self.request_buffers.push(buffer);
+    }
+
     fn spawn_settled_gc_worker(shared: &Arc<Self>, rx: crossbeam_channel::Receiver<()>) {
         let weak = Arc::downgrade(shared);
-        let _ = std::thread::Builder::new()
+        let _ =
+            std::thread::Builder::new()
             .name(format!("poly-settled-gc-{}", shared.instance_id))
             .spawn(move || {
                 crate::os_tune::pin_background("polymarket-settled-gc");
@@ -2083,7 +2117,9 @@ impl SharedState {
                         );
                         std::thread::yield_now();
                     }
-                    if exhausted { shared.request_settled_gc(); }
+                        if exhausted {
+                            shared.request_settled_gc();
+                        }
                 }
             });
     }
@@ -2262,7 +2298,7 @@ impl SharedState {
                 event_id: order.quote_event_id.clone(),
                 symbol: order.symbol.clone(),
                 side: order.side,
-                trigger_source: order.quote_trigger_source.clone(),
+                trigger_source: order.quote_trigger_source,
                 trigger_exchange_ns: order.quote_trigger_exchange_timestamp_ns,
                 trigger_local_ns: order.quote_trigger_local_timestamp_ns,
                 quote_emit_ns: order.timestamp_ns,
@@ -2314,6 +2350,51 @@ impl SharedState {
             trade_id,
             "",
             "",
+        );
+    }
+
+    fn log_admission_attempt(
+        &self,
+        attempt: &crate::http1_pool::AttemptTraceHandle,
+        kind: &'static str,
+        client_order_id: &str,
+        exchange_order_id: Option<&str>,
+        status: OrderStatus,
+    ) {
+        let Some(attempt) = attempt.snapshot() else {
+            log::error!(
+                "[order_attempt] admission trace slot reused before completion kind={} coid={}",
+                kind,
+                client_order_id,
+            );
+            return;
+        };
+        let completed_ns = now_ns();
+        let elapsed_ns = completed_ns.saturating_sub(attempt.dispatched_ns);
+        crate::latency::record_ns(
+            if kind == "cancel" {
+                "polymarket.cancel.attempt_dispatch_to_lifecycle_done"
+            } else {
+                "polymarket.order.attempt_dispatch_to_lifecycle_done"
+            },
+            elapsed_ns,
+        );
+        info!(
+            "[order_attempt] attempt_id={} kind={} role={:?} slot={} coid={} oid={} status={:?} signal_ns={} prep_ns={} signed_ns={} account_recorded_ns={} dispatched_ns={} completed_ns={} dispatch_to_done_ms={:.3}",
+            attempt.attempt_id,
+            kind,
+            attempt.role,
+            attempt.slot,
+            client_order_id,
+            exchange_order_id.unwrap_or(""),
+            status,
+            attempt.signal_ns,
+            attempt.prep_ns,
+            attempt.signed_ns,
+            attempt.account_recorded_ns,
+            attempt.dispatched_ns,
+            completed_ns,
+            elapsed_ns as f64 / 1_000_000.0,
         );
     }
 
@@ -2432,7 +2513,10 @@ impl SharedState {
             "cancel_http_dispatch_to_response" => {
                 // See `polymarket.http.cancel.network` for the actual HTTP
                 // send-through-body/JSON interval.
-                crate::latency::record_ns("polymarket.cancel.dispatch_to_lifecycle_done", segment_ns)
+                crate::latency::record_ns(
+                    "polymarket.cancel.dispatch_to_lifecycle_done",
+                    segment_ns,
+                )
             }
             _ => {}
         }
@@ -2443,9 +2527,7 @@ impl SharedState {
         };
         let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
-        let normal_info = !warning
-            && !slow
-            && matches!(stage, "http_response" | "cancel_response");
+        let normal_info = !warning && !slow && matches!(stage, "http_response" | "cancel_response");
         let enabled = if warning || slow {
             log::log_enabled!(log::Level::Warn)
         } else if normal_info {
@@ -2487,7 +2569,7 @@ impl SharedState {
                     String::new(),
                     String::new(),
                     String::new(),
-                    "recovered_or_untraced".to_string(),
+                QuoteTriggerSource::Unknown,
                     0,
                     0,
                 0,
@@ -3257,7 +3339,7 @@ impl SharedState {
         // (None ⇒ not recorded).
         let rec_kind = rec_kind_override.or_else(|| latency_record_kind(method.as_str(), path));
         let t_start = crate::latency::Instant::now();
-        let url = format!("{}{}", self.clob_base_url, path);
+        let url: Arc<str> = format!("{}{}", self.clob_base_url, path).into();
         // L2 HMAC covers the endpoint path, not the query string. This also
         // matches the existing `/data/trades?after=...` gap-replay request.
         let auth_path = canonical_l2_auth_path(path);
@@ -3279,12 +3361,13 @@ impl SharedState {
             .as_ref()
             .map(crate::http1_pool::Permit::pooled_client)
             .unwrap_or_else(|| crate::http1_pool::pooled_client(role));
+        let attempt_id = request_client.allocate_attempt_id();
 
         // Sign once and dispatch exactly one request.
         {
             let headers = self.auth.sign_request(method.as_str(), auth_path, body);
             let path_owned = path.to_string();
-            let body_owned = body.to_string();
+            let body_owned = Bytes::copy_from_slice(body.as_bytes());
             let url_owned = url.clone();
             let method_owned = method.clone();
             let tx_a = reply_tx;
@@ -3295,6 +3378,7 @@ impl SharedState {
                 let network_started = crate::latency::Instant::now();
                 let reply = execute_http_on(
                     request_client,
+                    attempt_id,
                     method_owned.clone(),
                     url_owned,
                     path_owned.clone(),
@@ -3347,7 +3431,31 @@ impl SharedState {
         method: &str,
         path: &str,
         body: &str,
-    ) -> (crossbeam_channel::Receiver<HttpReply>, Arc<HttpCompletionTiming>) {
+    ) -> (
+        crossbeam_channel::Receiver<HttpReply>,
+        Arc<HttpCompletionTiming>,
+    ) {
+        let attempt_id = client.allocate_attempt_id();
+        self.http_call_async_on_timed_bytes(
+            client,
+            attempt_id,
+            method,
+            path,
+            Bytes::copy_from_slice(body.as_bytes()),
+        )
+    }
+
+    fn http_call_async_on_timed_bytes(
+        &self,
+        client: crate::http1_pool::PooledClient,
+        attempt_id: u64,
+        method: &str,
+        path: &str,
+        body: Bytes,
+    ) -> (
+        crossbeam_channel::Receiver<HttpReply>,
+        Arc<HttpCompletionTiming>,
+    ) {
         let timing = Arc::new(HttpCompletionTiming::default());
         let method = match method {
             "POST" => reqwest::Method::POST,
@@ -3369,26 +3477,40 @@ impl SharedState {
         let reply_enqueue_stage = http_reply_enqueue_stage(role);
         let rec_kind = latency_record_kind(method.as_str(), path);
         let t_start = crate::latency::Instant::now();
-        let url = format!("{}{}", self.clob_base_url, path);
+        let url = if path == "/order" {
+            Arc::clone(&self.order_url)
+        } else {
+            Arc::<str>::from(format!("{}{}", self.clob_base_url, path))
+        };
         let auth_path = canonical_l2_auth_path(path);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
         // Single request on the reserved connection.
         {
-            let headers = self.auth.sign_request(method.as_str(), auth_path, body);
+            let body_text = std::str::from_utf8(body.as_ref())
+                .expect("Polymarket request serialization must produce UTF-8 JSON");
+            let headers = self
+                .auth
+                .sign_request(method.as_str(), auth_path, body_text);
             let method_a = method.clone();
             let path_a = path.to_string();
-            let body_a = body.to_string();
+            let body_a = body;
             let url_a = url.clone();
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
+            let request_buffers = Arc::clone(&self.request_buffers);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
             async_rt::order_handle().spawn(async move {
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
+                // Keep one cheap Bytes handle so the unique allocation can be
+                // recovered and returned to the startup-filled pool after
+                // reqwest drops its request body.
+                let recyclable = body_a.clone();
                 let reply = execute_http_on(
                     client,
+                    attempt_id,
                     method_a.clone(),
                     url_a,
                     path_a.clone(),
@@ -3396,14 +3518,22 @@ impl SharedState {
                     body_a,
                 )
                         .await;
+                if let Ok(mut buffer) = recyclable.try_into_mut() {
+                    buffer.clear();
+                    let _ = request_buffers.push(buffer);
+                }
                 crate::latency::record(network_stage, network_started);
-                timing_a.response_ready_ns.store(now_ns(), Ordering::Release);
+                timing_a
+                    .response_ready_ns
+                    .store(now_ns(), Ordering::Release);
                 let rec = rec_kind
                     .filter(|_| crate::latency_record::is_active())
                     .map(|k| (k, latency_record_status(&reply)));
                 let reply_enqueue_started = crate::latency::Instant::now();
                 if tx_a.try_send(reply).is_ok() {
-                    timing_a.reply_enqueued_ns.store(now_ns(), Ordering::Release);
+                    timing_a
+                        .reply_enqueued_ns
+                        .store(now_ns(), Ordering::Release);
                     crate::latency::record(reply_enqueue_stage, reply_enqueue_started);
                     crate::latency::record(stage, t_start);
                     if let Some((k, status)) = rec {
@@ -3473,6 +3603,7 @@ pub struct PendingSubmit {
     local_oid: String,
     rx: crossbeam_channel::Receiver<HttpReply>,
     timing: Arc<HttpCompletionTiming>,
+    attempt: crate::http1_pool::AttemptTraceHandle,
 }
 
 /// Opaque in-flight cancel: the reply-handling context + the reply
@@ -3483,6 +3614,15 @@ pub struct PendingCancel {
     ctx: CancelCtx,
     rx: Option<crossbeam_channel::Receiver<HttpReply>>,
     timing: Option<Arc<HttpCompletionTiming>>,
+    attempt: Option<crate::http1_pool::AttemptTraceHandle>,
+}
+
+struct PreparedSubmit {
+    local_oid: String,
+    body: Bytes,
+    prep_ns: u64,
+    signed_ns: u64,
+    account_recorded_ns: u64,
 }
 
 /// Polymarket CLOB live order executor.
@@ -3654,6 +3794,7 @@ impl PolymarketTrade {
         } else {
             api_url_prefix.trim_end_matches('/').to_string()
         };
+        let order_url: Arc<str> = format!("{clob_base_url}/order").into();
 
         info!("[PolymarketTrade] Initialized: maker={} signer={} sig_type={:?} exchange={} clob={} host={} builder={} batch={}",
             signer.maker_address, signer.signer_address, signer.signature_type,
@@ -3783,8 +3924,7 @@ impl PolymarketTrade {
         }
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
-        let (account_maintenance_tx, account_maintenance_rx) =
-            crossbeam_channel::bounded(16_384);
+        let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let shared = Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
                 account_state,
@@ -3802,6 +3942,8 @@ impl PolymarketTrade {
                 clob_version,
                 use_batch_orders,
                 clob_base_url,
+            order_url,
+            request_buffers: new_request_buffer_pool(),
                 live_position: Mutex::new(LivePositionManager::from_restored(recovered_trades)),
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
                 gap_replay,
@@ -3814,18 +3956,15 @@ impl PolymarketTrade {
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
                 startup_recovery_lookup_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
-                get_live_delete_uncertain_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(
-                    0,
-                ),
+            get_live_delete_uncertain_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 get_live_delete_uncertain_suppressed: std::sync::atomic::AtomicU64::new(0),
                 terminal_trade_backfill_missing_total: std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_missing_warn_silent_until_ns:
-                    std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_missing_suppressed: std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_noop_total: std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_noop_log_silent_until_ns: std::sync::atomic::AtomicU64::new(
+            terminal_trade_backfill_missing_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(
                     0,
                 ),
+            terminal_trade_backfill_missing_suppressed: std::sync::atomic::AtomicU64::new(0),
+            terminal_trade_backfill_noop_total: std::sync::atomic::AtomicU64::new(0),
+            terminal_trade_backfill_noop_log_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 terminal_trade_backfill_noop_suppressed: std::sync::atomic::AtomicU64::new(0),
                 reconcile_cancel_not_found_counts: Mutex::new(HashMap::new()),
                 reconcile_attempts: ReconcileAttemptCounters::default(),
@@ -4033,9 +4172,7 @@ impl PolymarketTrade {
             let path = if cursor.is_empty() {
                 format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}")
             } else {
-                format!(
-                    "{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}"
-                )
+                format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}")
             };
             let json = match self.shared.http_call_sync("GET", &path, "") {
                 Ok(json) => json,
@@ -4083,10 +4220,7 @@ impl PolymarketTrade {
 
     pub fn reconcile_persisted_orphan_order_anomalies(&self) -> OrphanOrderStartupRepair {
         const REBUILD_FEE_RESERVE_BPS: u32 = 10_000;
-        let anomalies = self
-            .shared
-            .account_state
-            .persisted_orphan_order_anomalies();
+        let anomalies = self.shared.account_state.persisted_orphan_order_anomalies();
         let mut summary = OrphanOrderStartupRepair {
             examined: anomalies.len(),
             ..OrphanOrderStartupRepair::default()
@@ -4154,11 +4288,15 @@ impl PolymarketTrade {
                         let evidence = format!(
                             "{absence}; authenticated /data/trades complete pages={pages} after={after_secs} oid_matches=0; {settlement_evidence}"
                         );
-                        if self.shared.account_state.record_authoritative_absent_orphan_order_audit(
+                        if self
+                            .shared
+                            .account_state
+                            .record_authoritative_absent_orphan_order_audit(
                             &anomaly.order_id,
                             anomaly.client_order_id.as_deref(),
                             &evidence,
-                        ) {
+                            )
+                        {
                             summary.tombstoned = summary.tombstoned.saturating_add(1);
                             info!(
                                 "[PolymarketTrade] startup orphan ownership retired by authoritative absence oid={} coid={} evidence={}",
@@ -4228,13 +4366,9 @@ impl PolymarketTrade {
                         .account_state
                         .instance_id_for_historical_coid(client_order_id)?;
                     let quantity = original_size?;
-                    let fee_rate_bps = identity
-                        .fee_rate_bps
-                        .unwrap_or(REBUILD_FEE_RESERVE_BPS);
+                    let fee_rate_bps = identity.fee_rate_bps.unwrap_or(REBUILD_FEE_RESERVE_BPS);
                     let reserve_cash = if identity.side == Side::Buy {
-                        quantity
-                            * identity.price
-                            * (1.0 + f64::from(fee_rate_bps) / 10_000.0)
+                        quantity * identity.price * (1.0 + f64::from(fee_rate_bps) / 10_000.0)
                     } else {
                         0.0
                     };
@@ -4282,18 +4416,15 @@ impl PolymarketTrade {
                         &fetched.audit,
                     );
                     if !fetched.audit.associate_trades.is_empty() {
-                        let _ = self.reconcile_orphans(
-                            &[],
-                            &[],
-                            &fetched.audit.associate_trades,
-                        );
+                        let _ = self.reconcile_orphans(&[], &[], &fetched.audit.associate_trades);
                     }
                     if self
                         .shared
                         .account_state
                         .terminal_order_audit_complete(&client_order_id)
                     {
-                        self.shared.remove_order_resolved_as(&client_order_id, status);
+                        self.shared
+                            .remove_order_resolved_as(&client_order_id, status);
                     }
                 } else {
                     self.shared.open_orders.lock().unwrap().insert(
@@ -4316,20 +4447,22 @@ impl PolymarketTrade {
                 continue;
             }
 
-            let zero_fill_terminal = terminal_status
-                .zip(original_size)
-                .zip(size_matched)
-                .filter(|((status, _), matched)| {
+            let zero_fill_terminal = terminal_status.zip(original_size).zip(size_matched).filter(
+                |((status, _), matched)| {
                     matches!(status, OrderStatus::Cancelled | OrderStatus::Rejected)
                         && matched.abs() <= 1e-9
                         && fetched.audit.associate_trades.is_empty()
-                });
+                },
+            );
             if let Some(((status, quantity), matched)) = zero_fill_terminal {
                 let evidence = format!(
                     "authenticated /data/order terminal status={} size_matched=0 associate_trades=[]",
                     fetched.status,
                 );
-                if self.shared.account_state.record_terminal_orphan_order_audit(
+                if self
+                    .shared
+                    .account_state
+                    .record_terminal_orphan_order_audit(
                     &anomaly.order_id,
                     anomaly.client_order_id.as_deref(),
                     status,
@@ -4337,7 +4470,8 @@ impl PolymarketTrade {
                     matched,
                     &fetched.audit.associate_trades,
                     &evidence,
-                ) {
+                    )
+                {
                     summary.tombstoned = summary.tombstoned.saturating_add(1);
                     info!(
                         "[PolymarketTrade] startup orphan ownership retired by zero-fill audit oid={} coid={}",
@@ -4364,12 +4498,16 @@ impl PolymarketTrade {
                     .eq_ignore_ascii_case(&self.shared.order_maker_address)
             }) {
                 OrphanOrderRepairFailure::MakerMismatch
-            } else if anomaly.client_order_id.as_deref().is_some_and(|client_order_id| {
+            } else if anomaly
+                .client_order_id
+                .as_deref()
+                .is_some_and(|client_order_id| {
                 self.shared
                     .account_state
                     .instance_id_for_historical_coid(client_order_id)
                     .is_none()
-            }) {
+                })
+            {
                 OrphanOrderRepairFailure::UnknownInstance
             } else if terminal_status.is_none() {
                 OrphanOrderRepairFailure::NonTerminalOrder
@@ -5601,8 +5739,7 @@ impl PolymarketTrade {
                 .orders()
                 .into_iter()
                 .filter(|order| {
-                    order.instance_id == instance_id
-                        && retired_tokens.contains(&order.token_id)
+                    order.instance_id == instance_id && retired_tokens.contains(&order.token_id)
                 })
                 .map(|order| order.client_order_id)
                 .collect();
@@ -6993,7 +7130,11 @@ impl PolymarketTrade {
         &mut self,
         order: &OrderRequest,
     ) -> std::result::Result<(String, crossbeam_channel::Receiver<HttpReply>), OrderUpdate> {
-        let (local_oid, body_str) = match self.submit_prep(order) {
+        let PreparedSubmit {
+            local_oid,
+            body: body_str,
+            ..
+        } = match self.submit_prep(order, true) {
             Ok(prepared) => prepared,
             Err(update) => {
                 self.shared.log_preflight_rejected(
@@ -7005,7 +7146,12 @@ impl PolymarketTrade {
                 return Err(update);
             }
         };
-        let rx = self.shared.http_call_async("POST", "/order", &body_str);
+        let body_text = std::str::from_utf8(body_str.as_ref())
+            .expect("Polymarket request serialization must produce UTF-8 JSON");
+        let rx = self.shared.http_call_async("POST", "/order", body_text);
+        if let Ok(buffer) = body_str.try_into_mut() {
+            self.shared.recycle_request_buffer(buffer);
+        }
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "http_dispatched",
@@ -7032,7 +7178,7 @@ impl PolymarketTrade {
         order: &OrderRequest,
         client: crate::http1_pool::PooledClient,
     ) -> std::result::Result<PendingSubmit, OrderUpdate> {
-        let (local_oid, body_str) = match self.submit_prep(order) {
+        let prepared = match self.submit_prep(order, false) {
             Ok(prepared) => prepared,
             Err(update) => {
                 self.shared.log_preflight_rejected(
@@ -7040,44 +7186,95 @@ impl PolymarketTrade {
                     update.exchange_order_id.as_deref(),
                     &update,
                 );
-                self.shared.forget_order_lifecycle(&order.client_order_id);
                 return Err(update);
             }
         };
-        let (rx, timing) = self
-            .shared
-            .http_call_async_on_timed(client, "POST", "/order", &body_str);
-        self.shared.log_order_lifecycle(
-            &order.client_order_id,
-            "http_dispatched",
-            Some(&local_oid),
-            None,
-            None,
+        let attempt = client.begin_attempt(
+            order.timestamp_ns,
+            prepared.prep_ns,
+            prepared.signed_ns,
+            prepared.account_recorded_ns,
         );
-        Ok(PendingSubmit { local_oid, rx, timing })
+        let (rx, timing) = self.shared.http_call_async_on_timed_bytes(
+            client,
+            attempt.attempt_id(),
+            "POST",
+            "/order",
+            prepared.body,
+        );
+        let dispatched_ns = now_ns();
+        attempt.mark_dispatched(dispatched_ns);
+        let trace = attempt
+            .snapshot()
+            .expect("admission permit must retain its trace slot");
+        crate::latency::record_ns(
+            "polymarket.order.attempt_quote_to_prep",
+            trace.prep_ns.saturating_sub(trace.signal_ns),
+        );
+        crate::latency::record_ns(
+            "polymarket.order.attempt_prep_to_signed",
+            trace.signed_ns.saturating_sub(trace.prep_ns),
+        );
+        crate::latency::record_ns(
+            "polymarket.order.attempt_signed_to_reserve",
+            trace.account_recorded_ns.saturating_sub(trace.signed_ns),
+        );
+        crate::latency::record_ns(
+            "polymarket.order.attempt_reserve_to_http_dispatch",
+            trace
+                .dispatched_ns
+                .saturating_sub(trace.account_recorded_ns),
+        );
+        Ok(PendingSubmit {
+            local_oid: prepared.local_oid,
+            rx,
+            timing,
+            attempt,
+        })
     }
 
     /// Complete a fired place: block on its reply, then run the normal reply
     /// handler (open_orders / coid bookkeeping, balance-error trigger).
     pub fn complete_submit(&mut self, order: &OrderRequest, pending: PendingSubmit) -> OrderUpdate {
-        let PendingSubmit { local_oid, rx, timing } = pending;
+        let PendingSubmit {
+            local_oid,
+            rx,
+            timing,
+            attempt,
+        } = pending;
         let completion_started_ns = now_ns();
         let reply = rx
             .recv()
             .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
         let response_received_ns = now_ns();
-        crate::latency::record_ns("polymarket.order.completion_wait_response", response_received_ns.saturating_sub(completion_started_ns));
+        crate::latency::record_ns(
+            "polymarket.order.completion_wait_response",
+            response_received_ns.saturating_sub(completion_started_ns),
+        );
         let response_ready_ns = timing.response_ready_ns.load(Ordering::Acquire);
         if response_ready_ns > 0 {
-            crate::latency::record_ns("polymarket.order.response_ready_to_handler", response_received_ns.saturating_sub(response_ready_ns));
+            crate::latency::record_ns(
+                "polymarket.order.response_ready_to_handler",
+                response_received_ns.saturating_sub(response_ready_ns),
+            );
         }
         let reply_enqueued_ns = timing.reply_enqueued_ns.load(Ordering::Acquire);
         if reply_enqueued_ns > 0 {
-            crate::latency::record_ns("polymarket.order.reply_enqueued_to_handler", response_received_ns.saturating_sub(reply_enqueued_ns));
+            crate::latency::record_ns(
+                "polymarket.order.reply_enqueued_to_handler",
+                response_received_ns.saturating_sub(reply_enqueued_ns),
+            );
         }
         let handler_started = crate::latency::Instant::now();
-        let update = self.handle_submit_reply(order, &local_oid, reply);
+        let update = self.handle_submit_reply_inner(order, &local_oid, reply, false);
         crate::latency::record("polymarket.order.response_handler", handler_started);
+        self.shared.log_admission_attempt(
+            &attempt,
+            "place",
+            &order.client_order_id,
+            Some(&local_oid),
+            update.status,
+        );
         update
     }
 
@@ -7089,22 +7286,43 @@ impl PolymarketTrade {
         client_order_id: &str,
         client: crate::http1_pool::PooledClient,
     ) -> PendingCancel {
-        let (ctx, body) = self.cancel_prep(client_order_id);
-        let (rx, timing) = body
-            .map(|body_str| self.shared.http_call_async_on_timed(client, "DELETE", "/order", &body_str))
-            .map_or((None, None), |(rx, timing)| (Some(rx), Some(timing)));
-        self.shared.log_order_lifecycle(
-            client_order_id,
-            if rx.is_some() {
-                "cancel_dispatched"
-            } else {
-                "cancel_not_dispatched"
-            },
-            ctx.local_oid.as_deref(),
-            None,
-            None,
+        let signal_ns = self.gen_ns_hint;
+        let prep_ns = now_ns();
+        let (ctx, body) = self.cancel_prep(client_order_id, false);
+        let (rx, timing, attempt) = match body {
+            Some(body_bytes) => {
+                let attempt = client.begin_attempt(signal_ns, prep_ns, 0, 0);
+                let (rx, timing) = self.shared.http_call_async_on_timed_bytes(
+                    client,
+                    attempt.attempt_id(),
+                    "DELETE",
+                    "/order",
+                    body_bytes,
         );
-        PendingCancel { ctx, rx, timing }
+                (Some(rx), Some(timing), Some(attempt))
+            }
+            None => (None, None, None),
+        };
+        let dispatched_ns = rx.as_ref().map(|_| now_ns()).unwrap_or(0);
+        if let Some(attempt) = &attempt {
+            attempt.mark_dispatched(dispatched_ns);
+        }
+        if dispatched_ns > 0 {
+            crate::latency::record_ns(
+                "polymarket.cancel.attempt_signal_to_prep",
+                prep_ns.saturating_sub(signal_ns),
+            );
+            crate::latency::record_ns(
+                "polymarket.cancel.attempt_prep_to_http_dispatch",
+                dispatched_ns.saturating_sub(prep_ns),
+            );
+        }
+        PendingCancel {
+            ctx,
+            rx,
+            timing,
+            attempt,
+        }
     }
 
     /// Complete a fired cancel: block on its reply (if any), then run the
@@ -7115,7 +7333,12 @@ impl PolymarketTrade {
         client_order_id: &str,
         pending: PendingCancel,
     ) -> OrderUpdate {
-        let PendingCancel { ctx, rx, timing } = pending;
+        let PendingCancel {
+            ctx,
+            rx,
+            timing,
+            attempt,
+        } = pending;
         let completion_started_ns = now_ns();
         let reply = rx.map(|rx| {
             rx.recv()
@@ -7123,21 +7346,39 @@ impl PolymarketTrade {
         });
         let response_received_ns = now_ns();
         if reply.is_some() {
-            crate::latency::record_ns("polymarket.cancel.completion_wait_response", response_received_ns.saturating_sub(completion_started_ns));
+            crate::latency::record_ns(
+                "polymarket.cancel.completion_wait_response",
+                response_received_ns.saturating_sub(completion_started_ns),
+            );
         }
         if let Some(timing) = timing {
             let response_ready_ns = timing.response_ready_ns.load(Ordering::Acquire);
             if response_ready_ns > 0 {
-                crate::latency::record_ns("polymarket.cancel.response_ready_to_handler", response_received_ns.saturating_sub(response_ready_ns));
+                crate::latency::record_ns(
+                    "polymarket.cancel.response_ready_to_handler",
+                    response_received_ns.saturating_sub(response_ready_ns),
+                );
             }
             let reply_enqueued_ns = timing.reply_enqueued_ns.load(Ordering::Acquire);
             if reply_enqueued_ns > 0 {
-                crate::latency::record_ns("polymarket.cancel.reply_enqueued_to_handler", response_received_ns.saturating_sub(reply_enqueued_ns));
+                crate::latency::record_ns(
+                    "polymarket.cancel.reply_enqueued_to_handler",
+                    response_received_ns.saturating_sub(reply_enqueued_ns),
+                );
             }
         }
         let handler_started = crate::latency::Instant::now();
-        let update = self.handle_cancel_reply(exchange, client_order_id, ctx, reply);
+        let update = self.handle_cancel_reply_inner(exchange, client_order_id, ctx, reply, false);
         crate::latency::record("polymarket.cancel.response_handler", handler_started);
+        if let Some(attempt) = &attempt {
+            self.shared.log_admission_attempt(
+                attempt,
+                "cancel",
+                client_order_id,
+                update.exchange_order_id.as_deref(),
+                update.status,
+            );
+        }
         update
     }
 
@@ -7175,10 +7416,13 @@ impl PolymarketTrade {
             })
     }
 
-    pub(crate) fn submit_prep(
+    fn submit_prep(
         &mut self,
         order: &OrderRequest,
-    ) -> std::result::Result<(String, String), OrderUpdate> {
+        legacy_trace: bool,
+    ) -> std::result::Result<PreparedSubmit, OrderUpdate> {
+        let prep_ns = now_ns();
+        if legacy_trace {
         self.shared.register_order_lifecycle(order);
         self.shared.log_order_lifecycle(
             &order.client_order_id,
@@ -7187,6 +7431,7 @@ impl PolymarketTrade {
             Some(OrderStatus::Pending),
             None,
         );
+        }
         if !self.shared.check_rate_limit() {
             return Err(Self::make_rejected(order, "rate limited"));
         }
@@ -7204,6 +7449,8 @@ impl PolymarketTrade {
             Err(e) => return Err(Self::make_rejected(order, &e.to_string())),
         };
         let local_oid = order_hash;
+        let signed_ns = now_ns();
+        if legacy_trace {
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "signed",
@@ -7211,16 +7458,25 @@ impl PolymarketTrade {
             None,
             None,
         );
-        let body_json = match serde_json::to_string(&body) {
-            Ok(body) => body,
-            Err(e) => {
+        }
+        let mut body_json = self.shared.take_request_buffer();
+        body_json.clear();
+        if let Err(e) = serde_json::to_writer((&mut body_json).writer(), &body) {
+            self.shared.recycle_request_buffer(body_json);
                 return Err(Self::make_rejected(
                     order,
                     &format!("body serialize: {}", e),
-                ))
+            ));
+        }
+        let ownership = match self.record_account_order(order, &local_oid) {
+            Ok(ownership) => ownership,
+            Err(update) => {
+                self.shared.recycle_request_buffer(body_json);
+                return Err(update);
             }
         };
-        let ownership = self.record_account_order(order, &local_oid)?;
+        let account_recorded_ns = now_ns();
+        if legacy_trace {
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "account_recorded",
@@ -7228,12 +7484,14 @@ impl PolymarketTrade {
             Some(OrderStatus::Pending),
             None,
         );
+        }
         if let Err(error) = self.shared.register_local_order_id(
             &order.client_order_id,
             &local_oid,
             &order.symbol,
             ownership,
         ) {
+            self.shared.recycle_request_buffer(body_json);
             return Err(Self::make_rejected(order, &error));
         }
         // Track in `open_orders` BEFORE the HTTP call resolves: from this
@@ -7280,7 +7538,13 @@ impl PolymarketTrade {
             serde_json::to_string_pretty(&body).unwrap_or_default()
         );
 
-        Ok((local_oid, body_json))
+        Ok(PreparedSubmit {
+            local_oid,
+            body: body_json.freeze(),
+            prep_ns,
+            signed_ns,
+            account_recorded_ns,
+        })
     }
 
     /// Parse the `POST /order` reply and produce an `OrderUpdate`.
@@ -7291,6 +7555,16 @@ impl PolymarketTrade {
         order: &OrderRequest,
         local_oid: &str,
         reply: HttpReply,
+    ) -> OrderUpdate {
+        self.handle_submit_reply_inner(order, local_oid, reply, true)
+    }
+
+    fn handle_submit_reply_inner(
+        &mut self,
+        order: &OrderRequest,
+        local_oid: &str,
+        reply: HttpReply,
+        legacy_trace: bool,
     ) -> OrderUpdate {
         let update = (|| {
         let resp = match reply {
@@ -7389,7 +7663,10 @@ impl PolymarketTrade {
             &self.instance_id,
             OrderStatus::Accepted,
         );
-        crate::latency::record("polymarket.order.response_account_apply", account_apply_started);
+            crate::latency::record(
+                "polymarket.order.response_account_apply",
+                account_apply_started,
+            );
 
         if !order_id.is_empty() && !Self::oid_eq(&order_id, local_oid) {
             warn!(
@@ -7494,6 +7771,7 @@ impl PolymarketTrade {
             error: None,
         }
         })();
+        if legacy_trace {
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "http_response",
@@ -7501,6 +7779,7 @@ impl PolymarketTrade {
             Some(update.status),
             None,
         );
+        }
         update
     }
 
@@ -7512,10 +7791,15 @@ impl PolymarketTrade {
         &mut self,
         client_order_id: &str,
     ) -> (CancelCtx, Option<crossbeam_channel::Receiver<HttpReply>>) {
-        let (ctx, body) = self.cancel_prep(client_order_id);
+        let (ctx, body) = self.cancel_prep(client_order_id, true);
         match body {
-            Some(body_str) => {
-                let rx = self.shared.http_call_async("DELETE", "/order", &body_str);
+            Some(body_bytes) => {
+                let body_text = std::str::from_utf8(body_bytes.as_ref())
+                    .expect("Polymarket cancel serialization must produce UTF-8 JSON");
+                let rx = self.shared.http_call_async("DELETE", "/order", body_text);
+                if let Ok(buffer) = body_bytes.try_into_mut() {
+                    self.shared.recycle_request_buffer(buffer);
+                }
                 self.shared.log_order_lifecycle(
                     client_order_id,
                     "cancel_dispatched",
@@ -7543,7 +7827,11 @@ impl PolymarketTrade {
     /// (or `None` when the coid has no local orderID → nothing to send).
     /// Prep half of `cancel_kickoff`: resolve the server orderID + tracked
     /// symbol/side and build the DELETE body (None = nothing to send).
-    pub(crate) fn cancel_prep(&mut self, client_order_id: &str) -> (CancelCtx, Option<String>) {
+    pub(crate) fn cancel_prep(
+        &mut self,
+        client_order_id: &str,
+        legacy_trace: bool,
+    ) -> (CancelCtx, Option<Bytes>) {
         let prep_ns = now_ns();
         if self.gen_ns_hint > 0 {
             crate::latency::record_ns(
@@ -7551,10 +7839,12 @@ impl PolymarketTrade {
                 prep_ns.saturating_sub(self.gen_ns_hint),
             );
         }
+        if legacy_trace {
         self.shared
             .record_cancel_signal(client_order_id, self.gen_ns_hint);
         self.shared
             .log_order_lifecycle(client_order_id, "cancel_prep", None, None, None);
+        }
         let order_id = self
             .shared
             .coid_to_oid
@@ -7589,9 +7879,22 @@ impl PolymarketTrade {
                     "[PolymarketTrade] Cancel request orderID={}... coid={} gen_ns={}",
                     oid_short, client_order_id, self.gen_ns_hint
                 );
-                let body_str = serde_json::to_string(&CancelBody { order_id: &oid })
-                    .unwrap_or_else(|_| format!("{{\"orderID\":\"{}\"}}", oid));
-                (ctx, Some(body_str))
+                let mut body = self.shared.take_request_buffer();
+                body.clear();
+                if let Err(error) =
+                    serde_json::to_writer((&mut body).writer(), &CancelBody { order_id: oid })
+                {
+                    self.shared.recycle_request_buffer(body);
+                    warn!(
+                        "[PolymarketTrade] pooled cancel serialization failed coid={}; retrying allocated buffer: {}",
+                        client_order_id,
+                        error,
+                    );
+                    let fallback = serde_json::to_vec(&CancelBody { order_id: oid })
+                        .expect("CancelBody serialization is infallible");
+                    return (ctx, Some(Bytes::from(fallback)));
+                }
+                (ctx, Some(body.freeze()))
             }
             None => {
                 info!(
@@ -7611,6 +7914,17 @@ impl PolymarketTrade {
         client_order_id: &str,
         ctx: CancelCtx,
         reply: Option<HttpReply>,
+    ) -> OrderUpdate {
+        self.handle_cancel_reply_inner(exchange, client_order_id, ctx, reply, true)
+    }
+
+    fn handle_cancel_reply_inner(
+        &mut self,
+        exchange: Exchange,
+        client_order_id: &str,
+        ctx: CancelCtx,
+        reply: Option<HttpReply>,
+        legacy_trace: bool,
     ) -> OrderUpdate {
         let update = (|| {
             let CancelCtx {
@@ -7729,13 +8043,8 @@ impl PolymarketTrade {
             let effective = self
                 .shared
                 .effective_cancel_attempt_status(client_order_id, status);
-            let update = Self::make_orphan_cancel(
-                client_order_id,
-                &symbol,
-                side,
-                local_oid,
-                effective,
-            );
+                let update =
+                    Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, effective);
             crate::latency::record(
                 "polymarket.cancel.response_account_apply",
                 account_apply_started,
@@ -7777,6 +8086,7 @@ impl PolymarketTrade {
         );
         update
         })();
+        if legacy_trace {
         self.shared.log_order_lifecycle(
             client_order_id,
             "cancel_response",
@@ -7784,6 +8094,7 @@ impl PolymarketTrade {
             Some(update.status),
             None,
         );
+        }
         update
     }
 }
@@ -9471,6 +9782,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_body_pool_reuses_the_same_backing_allocation() {
+        let pool = new_request_buffer_pool();
+        assert_eq!(pool.len(), REQUEST_BUFFER_SLOTS);
+        let mut buffer = pool.pop().unwrap();
+        let original_ptr = buffer.as_ptr();
+        buffer.extend_from_slice(br#"{"orderID":"oid"}"#);
+        let body = buffer.freeze();
+        let retained = body.clone();
+        drop(body);
+        let mut recovered = retained
+            .try_into_mut()
+            .expect("unique Bytes owner recovers BytesMut without copying");
+        recovered.clear();
+        assert_eq!(recovered.as_ptr(), original_ptr);
+        pool.push(recovered).unwrap();
+        assert_eq!(pool.len(), REQUEST_BUFFER_SLOTS);
+    }
+
+    #[test]
     fn routine_cancel_audits_keep_the_bounded_recovery_pass_running() {
         assert!(startup_recovery_audits_complete(0, 0));
         assert!(!startup_recovery_audits_complete(1, 0));
@@ -9641,7 +9971,10 @@ mod tests {
             summary.failures[&OrphanOrderRepairFailure::TradeAuditUnavailable],
             2,
         );
-        assert_eq!(summary.failures[&OrphanOrderRepairFailure::EventNotSettled], 1);
+        assert_eq!(
+            summary.failures[&OrphanOrderRepairFailure::EventNotSettled],
+            1
+        );
     }
 
     #[test]

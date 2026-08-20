@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use super::market::{Exchange, Side};
 
@@ -137,6 +138,49 @@ pub enum OrderStatus {
     CancelUncertain,
 }
 
+/// Allocation-free quote origin carried across strategy → executor → exchange.
+/// Symbol/event identity already lives in `OrderRequest`, so the hot path only
+/// needs this compact discriminator instead of formatting a descriptive String.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteTriggerSource {
+    #[default]
+    Unknown,
+    StrategyCallback,
+    OrderBook(Exchange),
+    OrderUpdateRequote,
+    CancelAckLegRequote,
+    ClobHealthRecovery,
+}
+
+impl QuoteTriggerSource {
+    pub fn from_callback_reason(reason: &str) -> Self {
+        match reason {
+            "order_update_requote" => Self::OrderUpdateRequote,
+            "cancel_ack_leg_requote" => Self::CancelAckLegRequote,
+            "clob_health_recovery" => Self::ClobHealthRecovery,
+            _ => Self::StrategyCallback,
+        }
+    }
+
+    pub fn is_unknown(self) -> bool {
+        self == Self::Unknown
+    }
+}
+
+impl fmt::Display for QuoteTriggerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("unknown"),
+            Self::StrategyCallback => f.write_str("strategy_callback"),
+            Self::OrderBook(exchange) => write!(f, "orderbook:{exchange}"),
+            Self::OrderUpdateRequote => f.write_str("order_update_requote"),
+            Self::CancelAckLegRequote => f.write_str("cancel_ack_leg_requote"),
+            Self::ClobHealthRecovery => f.write_str("clob_health_recovery"),
+        }
+    }
+}
+
 /// Request to place a new order
 #[derive(
     Debug, Clone, Serialize, Deserialize,
@@ -163,10 +207,10 @@ pub struct OrderRequest {
     /// Polymarket condition id). Logging-only; never used for order routing.
     #[serde(default)]
     pub quote_event_id: String,
-    /// Human-readable origin such as `orderbook:binance:BTCUSDT` or
-    /// `strategy_callback` for an immediate requote without a market event.
+    /// Compact allocation-free origin. The order symbol/event fields provide
+    /// the remaining human-readable correlation.
     #[serde(default)]
-    pub quote_trigger_source: String,
+    pub quote_trigger_source: QuoteTriggerSource,
     pub timestamp_ns: u64,
     /// Strategy instance ID for routing to the correct executor/wallet.
     #[serde(default)]
@@ -277,7 +321,7 @@ impl OrderRequest {
             quote_trigger_exchange_timestamp_ns: 0,
             quote_trigger_local_timestamp_ns: 0,
             quote_event_id: String::new(),
-            quote_trigger_source: String::new(),
+            quote_trigger_source: QuoteTriggerSource::Unknown,
             timestamp_ns: crate::types::now_ns(),
             instance_id: String::new(),
             fee_rate_bps: 0,
@@ -304,7 +348,7 @@ impl OrderRequest {
             quote_trigger_exchange_timestamp_ns: 0,
             quote_trigger_local_timestamp_ns: 0,
             quote_event_id: String::new(),
-            quote_trigger_source: String::new(),
+            quote_trigger_source: QuoteTriggerSource::Unknown,
             timestamp_ns: crate::types::now_ns(),
             instance_id: String::new(),
             fee_rate_bps: 0,
@@ -339,6 +383,6 @@ mod tests {
         assert_eq!(restored.quote_trigger_exchange_timestamp_ns, 0);
         assert_eq!(restored.quote_trigger_local_timestamp_ns, 0);
         assert!(restored.quote_event_id.is_empty());
-        assert!(restored.quote_trigger_source.is_empty());
+        assert!(restored.quote_trigger_source.is_unknown());
     }
 }

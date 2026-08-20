@@ -736,6 +736,10 @@ struct Slot {
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
+    /// Fixed storage reused by consecutive requests admitted on this slot.
+    /// The slot permit guarantees a single writer and prevents reuse until
+    /// completion has consumed the trace.
+    attempt_trace: Arc<AttemptTraceSlot>,
     timeout: Duration,
 }
 
@@ -873,11 +877,140 @@ impl ConnectionHealth {
 pub struct PooledClient {
     client: Arc<reqwest::Client>,
     health: ConnectionHealth,
+    attempt_trace: Arc<AttemptTraceSlot>,
+    exclusive_admission: bool,
+}
+
+static NEXT_HTTP_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct AttemptTraceSlot {
+    role: Role,
+    slot: usize,
+    attempt_id: AtomicU64,
+    signal_ns: AtomicU64,
+    prep_ns: AtomicU64,
+    signed_ns: AtomicU64,
+    account_recorded_ns: AtomicU64,
+    dispatched_ns: AtomicU64,
+}
+
+impl AttemptTraceSlot {
+    fn new(role: Role, slot: usize) -> Self {
+        Self {
+            role,
+            slot,
+            attempt_id: AtomicU64::new(0),
+            signal_ns: AtomicU64::new(0),
+            prep_ns: AtomicU64::new(0),
+            signed_ns: AtomicU64::new(0),
+            account_recorded_ns: AtomicU64::new(0),
+            dispatched_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Allocation-free handle to the trace record preallocated for one admission
+/// slot. A handle remains valid until its owning permit is released.
+#[derive(Clone)]
+pub struct AttemptTraceHandle {
+    attempt_id: u64,
+    slot: Arc<AttemptTraceSlot>,
+}
+
+/// Stable copy of one HTTP attempt's timestamps. The snapshot is keyed by the
+/// monotonic attempt ID, never by a client order ID.
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptTraceSnapshot {
+    pub attempt_id: u64,
+    pub role: Role,
+    pub slot: usize,
+    pub signal_ns: u64,
+    pub prep_ns: u64,
+    pub signed_ns: u64,
+    pub account_recorded_ns: u64,
+    pub dispatched_ns: u64,
+}
+
+impl AttemptTraceHandle {
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt_id
+    }
+
+    /// Mark the instant at which the prepared request entered the async HTTP
+    /// runtime. This is the last write before the completion owner reads it.
+    pub fn mark_dispatched(&self, timestamp_ns: u64) {
+        debug_assert_eq!(
+            self.slot.attempt_id.load(Ordering::Acquire),
+            self.attempt_id,
+            "attempt slot reused before permit release"
+        );
+        self.slot
+            .dispatched_ns
+            .store(timestamp_ns, Ordering::Release);
+    }
+
+    pub fn snapshot(&self) -> Option<AttemptTraceSnapshot> {
+        if self.slot.attempt_id.load(Ordering::Acquire) != self.attempt_id {
+            return None;
+        }
+        Some(AttemptTraceSnapshot {
+            attempt_id: self.attempt_id,
+            role: self.slot.role,
+            slot: self.slot.slot,
+            signal_ns: self.slot.signal_ns.load(Ordering::Relaxed),
+            prep_ns: self.slot.prep_ns.load(Ordering::Relaxed),
+            signed_ns: self.slot.signed_ns.load(Ordering::Relaxed),
+            account_recorded_ns: self.slot.account_recorded_ns.load(Ordering::Relaxed),
+            dispatched_ns: self.slot.dispatched_ns.load(Ordering::Acquire),
+        })
+    }
 }
 
 impl PooledClient {
     pub fn client(&self) -> &Arc<reqwest::Client> {
         &self.client
+    }
+
+    /// Allocate the process-monotonic identity used by non-admission HTTP
+    /// paths. Admission-owned order attempts should call [`Self::begin_attempt`]
+    /// so the same ID is also published in the slot trace.
+    pub fn allocate_attempt_id(&self) -> u64 {
+        NEXT_HTTP_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Start a trace in this admission slot's preallocated storage. This is
+    /// valid only for a client obtained from an exclusive [`Permit`].
+    pub fn begin_attempt(
+        &self,
+        signal_ns: u64,
+        prep_ns: u64,
+        signed_ns: u64,
+        account_recorded_ns: u64,
+    ) -> AttemptTraceHandle {
+        debug_assert!(
+            self.exclusive_admission,
+            "attempt trace requires an admission-owned client"
+        );
+        let attempt_id = self.allocate_attempt_id();
+        self.attempt_trace.attempt_id.store(0, Ordering::Relaxed);
+        self.attempt_trace
+            .signal_ns
+            .store(signal_ns, Ordering::Relaxed);
+        self.attempt_trace.prep_ns.store(prep_ns, Ordering::Relaxed);
+        self.attempt_trace
+            .signed_ns
+            .store(signed_ns, Ordering::Relaxed);
+        self.attempt_trace
+            .account_recorded_ns
+            .store(account_recorded_ns, Ordering::Relaxed);
+        self.attempt_trace.dispatched_ns.store(0, Ordering::Relaxed);
+        self.attempt_trace
+            .attempt_id
+            .store(attempt_id, Ordering::Release);
+        AttemptTraceHandle {
+            attempt_id,
+            slot: Arc::clone(&self.attempt_trace),
+        }
     }
 
     pub fn note_transport_success(&self) {
@@ -915,6 +1048,7 @@ pub struct Permit {
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
     last_rebuild: Arc<Mutex<Option<Instant>>>,
+    attempt_trace: Arc<AttemptTraceSlot>,
     availability: Arc<(Mutex<()>, Condvar)>,
     timeout: Duration,
 }
@@ -954,6 +1088,8 @@ impl Permit {
         PooledClient {
             client: self.client.clone(),
             health: self.health(self.acquired_generation),
+            attempt_trace: Arc::clone(&self.attempt_trace),
+            exclusive_admission: true,
         }
     }
 
@@ -968,6 +1104,8 @@ impl Permit {
         PooledClient {
             client: self.current_client(),
             health: self.health(generation),
+            attempt_trace: Arc::clone(&self.attempt_trace),
+            exclusive_admission: true,
         }
     }
 }
@@ -1011,7 +1149,7 @@ impl RolePool {
     fn new(n: usize, timeout: Duration, role: Role) -> Result<Self> {
         let n = n.max(1);
         let mut slots = Vec::with_capacity(n);
-        for _ in 0..n {
+        for slot in 0..n {
             slots.push(Slot {
                 client: Arc::new(RwLock::new(Arc::new(build_h1_client(timeout)?))),
                 busy: Arc::new(AtomicBool::new(false)),
@@ -1020,6 +1158,7 @@ impl RolePool {
                 transport_failures: Arc::new(AtomicUsize::new(0)),
                 generation: Arc::new(AtomicU64::new(0)),
                 last_rebuild: Arc::new(Mutex::new(None)),
+                attempt_trace: Arc::new(AttemptTraceSlot::new(role, slot)),
                 timeout,
             });
         }
@@ -1123,6 +1262,7 @@ impl RolePool {
             transport_failures: s.transport_failures.clone(),
             generation: s.generation.clone(),
             last_rebuild: s.last_rebuild.clone(),
+            attempt_trace: Arc::clone(&s.attempt_trace),
             availability: self.availability.clone(),
             timeout: s.timeout,
         })
@@ -1152,6 +1292,8 @@ impl RolePool {
                 availability: self.availability.clone(),
                 timeout: state.timeout,
             },
+            attempt_trace: Arc::clone(&state.attempt_trace),
+            exclusive_admission: false,
         }
     }
 
@@ -1735,6 +1877,40 @@ mod tests {
             assert!(p.try_acquire().is_none(), "never exceed N in-flight");
         }
         assert_eq!(p.stats().3, 3, "exactly N busy");
+    }
+
+    #[test]
+    fn admission_attempt_trace_is_slot_owned_and_attempt_keyed() {
+        let p = pool(1);
+        let first_permit = p.try_acquire().unwrap();
+        let first = first_permit.pooled_client().begin_attempt(10, 20, 30, 40);
+        first.mark_dispatched(50);
+        let snapshot = first.snapshot().unwrap();
+        assert_eq!(snapshot.role, Role::Fast);
+        assert_eq!(snapshot.slot, 0);
+        assert_eq!(
+            (
+                snapshot.signal_ns,
+                snapshot.prep_ns,
+                snapshot.signed_ns,
+                snapshot.account_recorded_ns,
+                snapshot.dispatched_ns,
+            ),
+            (10, 20, 30, 40, 50),
+        );
+
+        drop(first_permit);
+        let second_permit = p.try_acquire().unwrap();
+        let second = second_permit.pooled_client().begin_attempt(60, 70, 80, 90);
+        second.mark_dispatched(100);
+        assert_ne!(
+            first.attempt_id, second.attempt_id,
+            "attempt IDs must be process-monotonic"
+        );
+        assert!(
+            first.snapshot().is_none(),
+            "an old handle detects admission-slot reuse instead of reading another attempt"
+        );
     }
 
     #[test]
