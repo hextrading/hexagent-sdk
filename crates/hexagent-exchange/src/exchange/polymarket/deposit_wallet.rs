@@ -71,6 +71,18 @@ const FACTORY_BEACON_SELECTOR: &str = "0x49493a4d";
 const WALLET_DEPLOYED_TOPIC0_PREIMAGE: &[u8] =
     b"WalletDeployed(address,address,bytes32,address)";
 
+/// `PositionSplit(address indexed stakeholder, bytes32 indexed conditionId,
+/// uint256 amount)`. The v2 collateral adapter emits this after its complete
+/// pUSD -> USDC.e -> CTF split succeeds. Unlike the relayer's short-lived
+/// `/transactions` index, this is a durable operation fingerprint.
+const POSITION_SPLIT_TOPIC0: &str =
+    "0xbbed930dbfb7907ae2d60ddf78345610214f26419a0128df39b6cc3d9e5df9b0";
+/// A deposit-wallet batch signature expires after 290 seconds. Keep a wider
+/// deterministic window for timestamp skew and relayer inclusion, while still
+/// making a repeated identical operator action surface as ambiguous.
+const LEGACY_SPLIT_SCAN_BEFORE_SECS: u64 = 30;
+const LEGACY_SPLIT_SCAN_AFTER_SECS: u64 = 10 * 60;
+
 
 // ════════════════════════════════════════════════════════════════
 // #70 test order — one unfunded type-3 order, observe the verdict
@@ -438,30 +450,225 @@ fn action_matches_dw_split(
         })
 }
 
+fn parse_rpc_hex_u64(value: &serde_json::Value, context: &str) -> Result<u64> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{context}: expected hex string, got {value}"))?;
+    u64::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16)
+        .map_err(|error| anyhow!("{context}: invalid hex value {raw}: {error}"))
+}
+
+fn polygon_tip_block() -> Result<u64> {
+    let response = super::onchain_tx::rpc_call("eth_blockNumber", serde_json::json!([]))?;
+    parse_rpc_hex_u64(
+        response
+            .get("result")
+            .ok_or_else(|| anyhow!("eth_blockNumber response has no result: {response}"))?,
+        "eth_blockNumber",
+    )
+}
+
+fn polygon_block_timestamp(block: u64) -> Result<u64> {
+    let response = super::onchain_tx::rpc_call(
+        "eth_getBlockByNumber",
+        serde_json::json!([format!("0x{block:x}"), false]),
+    )?;
+    let timestamp = response
+        .get("result")
+        .and_then(|result| result.get("timestamp"))
+        .ok_or_else(|| anyhow!("block {block} response has no timestamp: {response}"))?;
+    parse_rpc_hex_u64(timestamp, "eth_getBlockByNumber.timestamp")
+}
+
+/// Return the first canonical block whose timestamp is at least `target`.
+/// This is startup-only legacy recovery traffic; logarithmic header reads are
+/// deliberately preferred over a third-party timestamp indexer.
+fn first_polygon_block_at_or_after(target: u64, tip: u64) -> Result<u64> {
+    let mut low = 0u64;
+    let mut high = tip.saturating_add(1);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if mid > tip || polygon_block_timestamp(mid)? >= target {
+            high = mid;
+        } else {
+            low = mid.saturating_add(1);
+        }
+    }
+    Ok(low)
+}
+
+fn exact_dw_split_log_transaction(
+    logs: &[serde_json::Value],
+    deposit_wallet: &str,
+    condition_id: &str,
+    amount_wei: u128,
+) -> Result<Option<String>> {
+    let wallet_topic = format!("0x{}", hex::encode(address_to_bytes32(deposit_wallet)));
+    let condition_bytes = hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id))
+        .map_err(|error| anyhow!("invalid split condition id {condition_id}: {error}"))?;
+    if condition_bytes.len() != 32 {
+        return Err(anyhow!(
+            "invalid split condition id length {} (expected 32 bytes)",
+            condition_bytes.len(),
+        ));
+    }
+    let condition_topic = format!("0x{}", hex::encode(condition_bytes));
+    let amount_data = format!("0x{}", hex::encode(u256_bytes(amount_wei)));
+    let mut transaction_hashes = Vec::new();
+    for log in logs {
+        if log.get("removed").and_then(serde_json::Value::as_bool) == Some(true)
+            || !log
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.eq_ignore_ascii_case(CTF_COLLATERAL_ADAPTER))
+        {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3
+            || !topics[0]
+                .as_str()
+                .is_some_and(|topic| topic.eq_ignore_ascii_case(POSITION_SPLIT_TOPIC0))
+            || !topics[1]
+                .as_str()
+                .is_some_and(|topic| topic.eq_ignore_ascii_case(&wallet_topic))
+            || !topics[2]
+                .as_str()
+                .is_some_and(|topic| topic.eq_ignore_ascii_case(&condition_topic))
+            || !log
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|data| data.eq_ignore_ascii_case(&amount_data))
+        {
+            continue;
+        }
+        let Some(transaction_hash) = log
+            .get("transactionHash")
+            .and_then(serde_json::Value::as_str)
+            .filter(|hash| hash.starts_with("0x") && hash.len() == 66)
+        else {
+            continue;
+        };
+        transaction_hashes.push(transaction_hash.to_ascii_lowercase());
+    }
+    transaction_hashes.sort_unstable();
+    transaction_hashes.dedup();
+    match transaction_hashes.as_slice() {
+        [] => Ok(None),
+        [transaction_hash] => Ok(Some(transaction_hash.clone())),
+        _ => Err(anyhow!(
+            "ambiguous legacy DW split recovery: {} exact on-chain PositionSplit transactions matched",
+            transaction_hashes.len(),
+        )),
+    }
+}
+
+fn recover_dw_split_onchain_hash(
+    deposit_wallet: &str,
+    condition_id: &str,
+    amount_wei: u128,
+    operation_id: &str,
+) -> Result<Option<String>> {
+    let created_ns = operation_id
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| anyhow!("maintenance operation id has no timestamp: {operation_id}"))?
+        .parse::<u128>()
+        .map_err(|error| anyhow!("invalid maintenance operation timestamp in {operation_id}: {error}"))?;
+    let created_secs = u64::try_from(created_ns / 1_000_000_000)
+        .map_err(|_| anyhow!("maintenance operation timestamp is out of range: {operation_id}"))?;
+    let tip = polygon_tip_block()?;
+    let from_block = first_polygon_block_at_or_after(
+        created_secs.saturating_sub(LEGACY_SPLIT_SCAN_BEFORE_SECS),
+        tip,
+    )?;
+    if from_block > tip {
+        return Ok(None);
+    }
+    let after_window = created_secs.saturating_add(LEGACY_SPLIT_SCAN_AFTER_SECS);
+    let to_block = first_polygon_block_at_or_after(after_window, tip)?
+        .saturating_sub(1)
+        .min(tip);
+    if to_block < from_block {
+        return Ok(None);
+    }
+    let wallet_topic = format!("0x{}", hex::encode(address_to_bytes32(deposit_wallet)));
+    let condition_bytes = hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id))
+        .map_err(|error| anyhow!("invalid split condition id {condition_id}: {error}"))?;
+    if condition_bytes.len() != 32 {
+        return Err(anyhow!(
+            "invalid split condition id length {} (expected 32 bytes)",
+            condition_bytes.len(),
+        ));
+    }
+    let response = super::onchain_tx::rpc_call(
+        "eth_getLogs",
+        serde_json::json!([{
+            "address": CTF_COLLATERAL_ADAPTER,
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": [
+                POSITION_SPLIT_TOPIC0,
+                wallet_topic,
+                format!("0x{}", hex::encode(condition_bytes)),
+            ],
+        }]),
+    )?;
+    let logs = response
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("eth_getLogs response has no log array: {response}"))?;
+    exact_dw_split_log_transaction(logs, deposit_wallet, condition_id, amount_wei)
+}
+
 /// Recover the relayer job id for a pre-journal DW split. Exact signer,
-/// deposit-wallet, adapter target and calldata form the operation identity.
+/// deposit-wallet, adapter target and calldata form the operation identity
+/// while the relayer still exposes the original request. Its list is
+/// short-lived and current responses contain only flattened transaction data,
+/// so legacy recovery falls back to the adapter's durable PositionSplit event
+/// in the operation's bounded signature window. A unique event returns its
+/// Polygon transaction hash, which the normal finality poller also accepts.
 pub(crate) fn recover_dw_split_job_id(
     builder_auth: &PolyAuth,
     signer: &str,
     deposit_wallet: &str,
     condition_id: &str,
     amount_wei: u128,
+    operation_id: &str,
 ) -> Result<Option<String>> {
     let expected_calldata = split_position_calldata(PUSD_TOKEN, condition_id, amount_wei);
     let path = "/transactions";
     let headers = builder_auth.sign_request("GET", path, "");
-    let json = relayer_get(format!("{}{}", RELAYER_URL, path), headers)?;
-    let actions = json.as_array()
-        .ok_or_else(|| anyhow!("relayer /transactions returned non-array: {}", json))?;
-    Ok(actions.iter()
-        .filter(|action| {
-            action_matches_dw_split(action, signer, deposit_wallet, &expected_calldata)
-                && action.get("transactionID").and_then(serde_json::Value::as_str).is_some()
-        })
-        .max_by_key(|action| wallet_action_recovery_rank(action))
-        .and_then(|action| action.get("transactionID"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+    let relayer_job_id = match relayer_get(format!("{}{}", RELAYER_URL, path), headers) {
+        Ok(json) => json
+            .as_array()
+            .ok_or_else(|| anyhow!("relayer /transactions returned non-array: {}", json))?
+            .iter()
+            .filter(|action| {
+                action_matches_dw_split(action, signer, deposit_wallet, &expected_calldata)
+                    && action
+                        .get("transactionID")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            })
+            .max_by_key(|action| wallet_action_recovery_rank(action))
+            .and_then(|action| action.get("transactionID"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Err(error) => {
+            log::warn!(
+                "[Maintenance] relayer legacy split index unavailable; falling back to Polygon event proof: {}",
+                error,
+            );
+            None
+        }
+    };
+    if relayer_job_id.is_some() {
+        return Ok(relayer_job_id);
+    }
+    recover_dw_split_onchain_hash(deposit_wallet, condition_id, amount_wei, operation_id)
 }
 
 /// Execute an ambiguous WALLET submission safely.
@@ -1856,6 +2063,76 @@ mod derive_tests {
             &action, signer, wallet,
             &split_position_calldata(PUSD_TOKEN, condition, 79_000_000),
         ));
+    }
+
+    #[test]
+    fn legacy_dw_split_chain_recovery_requires_one_exact_adapter_event() {
+        let wallet = "0x222222222222222222222222222222222222BbBb";
+        let condition =
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let transaction_hash = format!("0x{}", "12".repeat(32));
+        let exact = serde_json::json!({
+            "address": CTF_COLLATERAL_ADAPTER.to_ascii_lowercase(),
+            "topics": [
+                POSITION_SPLIT_TOPIC0,
+                format!("0x{}", hex::encode(address_to_bytes32(wallet))),
+                condition,
+            ],
+            "data": format!("0x{}", hex::encode(u256_bytes(80_000_000))),
+            "transactionHash": transaction_hash,
+            "removed": false,
+        });
+        assert_eq!(
+            exact_dw_split_log_transaction(
+                std::slice::from_ref(&exact),
+                wallet,
+                condition,
+                80_000_000,
+            )
+            .unwrap(),
+            Some(transaction_hash.clone()),
+        );
+
+        let mut wrong_amount = exact.clone();
+        wrong_amount["data"] = serde_json::Value::String(format!(
+            "0x{}",
+            hex::encode(u256_bytes(79_000_000)),
+        ));
+        assert_eq!(
+            exact_dw_split_log_transaction(
+                &[wrong_amount],
+                wallet,
+                condition,
+                80_000_000,
+            )
+            .unwrap(),
+            None,
+        );
+
+        // Duplicate provider rows for one canonical log are harmless, but two
+        // distinct exact transactions must stay fail-closed.
+        assert_eq!(
+            exact_dw_split_log_transaction(
+                &[exact.clone(), exact.clone()],
+                wallet,
+                condition,
+                80_000_000,
+            )
+            .unwrap(),
+            Some(transaction_hash),
+        );
+        let mut second = exact.clone();
+        second["transactionHash"] =
+            serde_json::Value::String(format!("0x{}", "34".repeat(32)));
+        assert!(exact_dw_split_log_transaction(
+            &[exact, second],
+            wallet,
+            condition,
+            80_000_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous"));
     }
 
     #[test]

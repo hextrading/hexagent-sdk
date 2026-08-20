@@ -3741,13 +3741,13 @@ fn recover_pending_maintenance_operations(
             let amount_wei = (total * 1_000_000.0).round().max(0.0) as u128;
             let recovered = super::deposit_wallet::recover_dw_split_job_id(
                 &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
-                &operation.condition_id, amount_wei,
+                &operation.condition_id, amount_wei, &operation.operation_id,
             ).map_err(|error| format!(
                 "query DW split job for operation {}: {error}", operation.operation_id,
             ))?;
             let Some(tx_id) = recovered else {
                 let reason = format!(
-                    "operation {} has no persisted tx id and no exact DW split job matched signer/wallet/calldata",
+                    "operation {} has no persisted tx id and no exact relayer job or on-chain DW split event matched",
                     operation.operation_id,
                 );
                 account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
@@ -3760,7 +3760,7 @@ fn recover_pending_maintenance_operations(
                     tx_id, operation.operation_id,
                 ))?;
             log::warn!(
-                "[Maintenance] recovered missing DW job id operation={} tx={} by exact calldata",
+                "[Maintenance] recovered missing DW finality id operation={} tx={} by exact operation fingerprint",
                 operation.operation_id, tx_id,
             );
             tx_id
