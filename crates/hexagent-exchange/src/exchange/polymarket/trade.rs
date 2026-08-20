@@ -2741,10 +2741,23 @@ impl SharedState {
         if let Some(mirrored) = self.runtime_order_ownership.get(exchange_order_id) {
             return Some(mirrored);
         }
-        // Restart/cold-recovery fallback only.
-        let coid = self.lookup_coid(exchange_order_id)?;
-        self.account_state
-            .reconcile_order_route(&coid, exchange_order_id)
+        // Restart/cold-recovery fallback only. Settled-event GC may have
+        // retired the compact runtime route before a delayed private replay;
+        // recover the retained durable terminal ownership by OID in that rare
+        // case and republish the immutable owner index.
+        let ownership = if let Some(coid) = self.lookup_coid(exchange_order_id) {
+            self.account_state
+                .reconcile_order_route(&coid, exchange_order_id)?
+        } else {
+            self.account_state.order_by_oid(exchange_order_id)?
+        };
+        self.install_runtime_order_id(
+            &ownership.client_order_id,
+            exchange_order_id,
+            &ownership.token_id,
+            Some(&ownership),
+        );
+        Some(ownership)
     }
 
     /// Complete account-global settled-audit cleanup only after the durable
@@ -4290,6 +4303,37 @@ impl PolymarketTrade {
             ..OrphanOrderStartupRepair::default()
         };
         for anomaly in anomalies {
+            // A late lifecycle replay can race settled-event GC: the compact
+            // runtime OID map is gone while the durable terminal ownership
+            // row is still intentionally retained. Prefer that exact local
+            // authority before asking the CLOB, whose historical response no
+            // longer carries our client id. Token mismatch remains fail-closed.
+            if let Some(ownership) = self.shared.lookup_order_ownership(&anomaly.order_id) {
+                let token_matches = anomaly
+                    .token_id
+                    .as_deref()
+                    .is_none_or(|token| token == ownership.token_id);
+                if token_matches
+                    && self
+                        .shared
+                        .account_state
+                        .reconcile_order_route(&ownership.client_order_id, &anomaly.order_id)
+                        .is_some()
+                {
+                    self.shared.install_runtime_order_id(
+                        &ownership.client_order_id,
+                        &anomaly.order_id,
+                        &ownership.token_id,
+                        Some(&ownership),
+                    );
+                    summary.rebuilt = summary.rebuilt.saturating_add(1);
+                    info!(
+                        "[PolymarketTrade] startup orphan ownership restored from durable row oid={} coid={}",
+                        anomaly.order_id, ownership.client_order_id,
+                    );
+                    continue;
+                }
+            }
             let coid = anomaly.client_order_id.as_deref().unwrap_or("");
             let fetched = self.fetch_order_by_id(coid, &anomaly.order_id, None);
             let (fetched, absent_evidence) = match fetched {

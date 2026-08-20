@@ -7093,6 +7093,48 @@ impl SharedAccount {
         None
     }
 
+    /// Recover an ownership row by exchange order id when a retired runtime
+    /// route receives a late private lifecycle replay. This is a cold-path
+    /// fallback: the normal private owner route uses its immutable OID index.
+    /// Merely finding the row does not clear an anomaly; callers must first
+    /// validate the event's token/economics, then use
+    /// [`Self::reconcile_order_route`] to acknowledge the exact evidence.
+    pub fn order_by_oid(&self, order_id: &str) -> Option<OrderOwnership> {
+        let normalized = normalize_order_id(order_id);
+        if normalized.is_empty() {
+            return None;
+        }
+        let accounts: Vec<Arc<VirtualAccount>> = self
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let mut recovered: Option<(String, OrderOwnership)> = None;
+        for account in accounts {
+            let lifecycle = account.lifecycle.lock().unwrap();
+            for order in lifecycle
+                .orders
+                .values()
+                .filter(|order| normalize_order_id(&order.order_id) == normalized)
+            {
+                if recovered.as_ref().is_some_and(|(_, existing)| {
+                    existing.client_order_id != order.client_order_id
+                        || existing.instance_id != order.instance_id
+                }) {
+                    return None;
+                }
+                recovered = Some((account.instance_id.clone(), order.clone()));
+            }
+        }
+        let (instance_id, order) = recovered?;
+        self.coid_routes
+            .insert(order.client_order_id.clone(), instance_id.clone());
+        self.oid_routes.insert(normalized, instance_id);
+        Some(order)
+    }
+
     /// Cheap instance-shard predicate used by the asynchronous executor
     /// cleanup worker after a private fill. It intentionally does not enter
     /// `control_gate`: the order row, exact terminal ids, applied trades and
@@ -18519,6 +18561,48 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             Some("a"),
         );
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn order_oid_lookup_recovers_retired_route_before_clearing_validated_anomaly() {
+        let account = seeded_account();
+        let ownership = account
+            .reserve_order(
+                "a",
+                "probe:a:oid-late-probe",
+                "oid-late-probe",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.01,
+                0,
+            )
+            .unwrap();
+        account.release_order(&ownership.client_order_id, OrderStatus::Cancelled);
+        let ownership = account.order(&ownership.client_order_id).unwrap();
+        account.coid_routes.remove(&ownership.client_order_id);
+        account
+            .oid_routes
+            .remove(&normalize_order_id(&ownership.order_id));
+        account.mark_private_order_event_anomaly_with_token(
+            &ownership.order_id,
+            None,
+            Some(&ownership.token_id),
+            "late lifecycle after runtime route retirement",
+        );
+
+        assert_eq!(account.order_by_oid(&ownership.order_id), Some(ownership.clone()));
+        assert_eq!(
+            account.order_owner_by_oid(&ownership.order_id).as_deref(),
+            Some("a"),
+        );
+        assert!(account.is_uncertain(), "lookup alone is not event validation");
+        assert_eq!(
+            account.reconcile_order_route(&ownership.client_order_id, &ownership.order_id),
+            Some(ownership),
+        );
+        assert!(!account.is_uncertain());
+        assert!(account.ownership_anomalies().is_empty());
     }
 
     #[test]
