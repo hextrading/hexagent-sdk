@@ -2553,7 +2553,7 @@ impl SharedAccount {
         path: PathBuf,
         allow_query_repair: bool,
     ) -> Result<Self, String> {
-        let (state, initial_generation) = if path.exists() {
+        let (state, initial_generation, startup_aggregate_repairs) = if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("read account ledger {}: {error}", path.display()))?;
             let mut persisted: PersistedAccount = serde_json::from_slice(&bytes)
@@ -2740,9 +2740,13 @@ impl SharedAccount {
             // reconciliation leaves on the fill thread. Rebuild those derived
             // leaves after WAL replay, before validating and exposing state.
             recompute_reconciliation(&mut state, "startup typed-delta reconciliation");
+            let startup_aggregate_repairs =
+                repair_under_reserved_instance_aggregates(&mut state).map_err(|error| {
+                    format!("invalid account ledger {}: {error}", path.display())
+                })?;
             validate_persisted_state(&account_id, &state)
                 .map_err(|error| format!("invalid account ledger {}: {error}", path.display()))?;
-            (state, initial_generation)
+            (state, initial_generation, startup_aggregate_repairs)
         } else {
             let wal_path = persistence_wal_path(&path);
             if wal_path.exists() {
@@ -2752,7 +2756,7 @@ impl SharedAccount {
                     wal_path.display()
                 ));
             }
-            (SharedAccountState::default(), 0)
+            (SharedAccountState::default(), 0, Vec::new())
         };
         let initial_retired_trade_tombstones = state
             .retired_trade_ownership_tombstones
@@ -2785,6 +2789,13 @@ impl SharedAccount {
             Arc::clone(&state),
             initial_generation,
         )?;
+        if !startup_aggregate_repairs.is_empty() {
+            log::warn!(
+                "[shared_account] account={} startup repaired under-reserved instance aggregate(s) from durable roots before admission: {:?}",
+                account_id,
+                startup_aggregate_repairs,
+            );
+        }
         let account = Self {
             account_id,
             state,
@@ -10488,6 +10499,192 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct StartupReservationAggregateRepair {
+    instance_id: String,
+    cash_before: f64,
+    cash_after: f64,
+    positions: Vec<(String, f64, f64)>,
+}
+
+#[derive(Default)]
+struct DerivedReservationAggregates {
+    cash_by_instance: HashMap<String, f64>,
+    positions_by_instance: HashMap<String, HashMap<String, f64>>,
+}
+
+fn derive_reservation_aggregates(
+    state: &SharedAccountState,
+) -> Result<DerivedReservationAggregates, String> {
+    let mut booked_quantity_by_order = HashMap::<String, f64>::new();
+    for trade in state
+        .trades
+        .values()
+        .filter(|trade| trade.booked && !trade.failed)
+    {
+        *booked_quantity_by_order
+            .entry(trade.ownership.client_order_id.clone())
+            .or_insert(0.0) += trade.ownership.quantity;
+    }
+    // Terminal pruning folds a confirmed trade's economics into
+    // `compacted_economic_effects` and retains only this exact ownership
+    // proof. A parent order may intentionally survive that pruning while it
+    // remains under startup recovery or terminal audit. Count only durable,
+    // economically-booked tombstones that still match every immutable order
+    // root; authenticated historical no-ops were never booked by this ledger
+    // and must not contribute.
+    for tombstone in state.retired_trade_ownership_tombstones.values() {
+        let ownership = &tombstone.ownership;
+        if tombstone.authenticated_terminal_noop || ownership.status != "CONFIRMED" {
+            continue;
+        }
+        let Some(order) = state.orders.get(&ownership.client_order_id) else {
+            continue;
+        };
+        if trade_ownership_matches_order_root(ownership, order) {
+            *booked_quantity_by_order
+                .entry(ownership.client_order_id.clone())
+                .or_insert(0.0) += ownership.quantity;
+        }
+    }
+
+    let mut derived = DerivedReservationAggregates::default();
+    for (coid, order) in &state.orders {
+        let booked = booked_quantity_by_order.get(coid).copied().unwrap_or(0.0);
+        let tolerance = reconciliation_tolerance(booked, order.filled_quantity)
+            .max(order.quantity.abs().max(1.0) * 1e-8);
+        if (booked - order.filled_quantity).abs() > tolerance {
+            return Err(format!(
+                "order `{coid}` filled_quantity={} disagrees with durable trades={booked}",
+                order.filled_quantity,
+            ));
+        }
+        let terminal_and_released = matches!(
+            order.status,
+            OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
+        ) && !state.recovery_pending_orders.contains(coid)
+            && !state.routine_cancel_audits.contains(coid);
+        let (expected_cash, expected_quantity) = if terminal_and_released {
+            (0.0, 0.0)
+        } else {
+            desired_order_reservation(order)
+        };
+        if (expected_cash - order.reserved_cash).abs()
+            > reconciliation_tolerance(expected_cash, order.reserved_cash)
+            || (expected_quantity - order.reserved_quantity).abs()
+                > reconciliation_tolerance(expected_quantity, order.reserved_quantity)
+        {
+            return Err(format!(
+                "order `{coid}` reservation disagrees with effective remaining quantity: stored_cash={} expected_cash={expected_cash} stored_quantity={} expected_quantity={expected_quantity}",
+                order.reserved_cash, order.reserved_quantity,
+            ));
+        }
+        *derived
+            .cash_by_instance
+            .entry(order.instance_id.clone())
+            .or_insert(0.0) += expected_cash;
+        if expected_quantity > 0.0 {
+            *derived
+                .positions_by_instance
+                .entry(order.instance_id.clone())
+                .or_default()
+                .entry(order.token_id.clone())
+                .or_insert(0.0) += expected_quantity;
+        }
+    }
+
+    for operation in state.maintenance_ops.values().filter(|operation| {
+        matches!(
+            operation.status,
+            MaintenanceOperationStatus::Reserved
+                | MaintenanceOperationStatus::Submitted
+                | MaintenanceOperationStatus::Uncertain
+        )
+    }) {
+        for (instance_id, amount) in &operation.allocations {
+            match operation.kind {
+                MaintenanceOperationKind::Split => {
+                    *derived
+                        .cash_by_instance
+                        .entry(instance_id.clone())
+                        .or_insert(0.0) += *amount;
+                }
+                MaintenanceOperationKind::Merge => {
+                    let expected = derived
+                        .positions_by_instance
+                        .entry(instance_id.clone())
+                        .or_default();
+                    for token in [&operation.up_token_id, &operation.down_token_id] {
+                        *expected.entry(token.clone()).or_insert(0.0) += *amount;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(derived)
+}
+
+/// Restore only conservative aggregate reservation deficits before live
+/// admission. The durable order/trade/maintenance roots remain authoritative:
+/// this may raise an instance aggregate to their proven lower bound, but never
+/// lowers a persisted reservation or repairs an invalid/non-finite value.
+fn repair_under_reserved_instance_aggregates(
+    state: &mut SharedAccountState,
+) -> Result<Vec<StartupReservationAggregateRepair>, String> {
+    let derived = derive_reservation_aggregates(state)?;
+    let mut repairs = Vec::new();
+    for (instance_id, instance) in &mut state.instances {
+        let expected_cash = derived
+            .cash_by_instance
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0.0);
+        let cash_before = instance.reserved_cash;
+        let repair_cash = cash_before.is_finite()
+            && cash_before >= -EPS
+            && expected_cash.is_finite()
+            && expected_cash >= 0.0
+            && expected_cash - cash_before > reconciliation_tolerance(expected_cash, cash_before);
+        if repair_cash {
+            instance.reserved_cash = expected_cash;
+        }
+
+        let mut position_repairs = Vec::new();
+        if let Some(expected_positions) = derived.positions_by_instance.get(instance_id) {
+            let mut tokens: Vec<&String> = expected_positions.keys().collect();
+            tokens.sort();
+            for token in tokens {
+                let expected = expected_positions.get(token).copied().unwrap_or(0.0);
+                let stored = instance
+                    .reserved_positions
+                    .get(token)
+                    .copied()
+                    .unwrap_or(0.0);
+                if stored.is_finite()
+                    && stored >= -EPS
+                    && expected.is_finite()
+                    && expected >= 0.0
+                    && expected - stored > reconciliation_tolerance(expected, stored)
+                {
+                    instance.reserved_positions.insert(token.clone(), expected);
+                    position_repairs.push((token.clone(), stored, expected));
+                }
+            }
+        }
+
+        if repair_cash || !position_repairs.is_empty() {
+            repairs.push(StartupReservationAggregateRepair {
+                instance_id: instance_id.clone(),
+                cash_before,
+                cash_after: instance.reserved_cash,
+                positions: position_repairs,
+            });
+        }
+    }
+    Ok(repairs)
+}
+
 fn trade_ownership_matches_order_root(ownership: &TradeOwnership, order: &OrderOwnership) -> bool {
     ownership.account_id == order.account_id
         && ownership.instance_id == order.instance_id
@@ -11733,110 +11930,11 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
     // one side of those relationships. Rebuild the expected values solely
     // from the durable order/trade/maintenance roots and compare every leaf
     // and aggregate before the persistence worker can expose the account.
-    let mut booked_quantity_by_order = HashMap::<String, f64>::new();
-    for trade in state
-        .trades
-        .values()
-        .filter(|trade| trade.booked && !trade.failed)
-    {
-        *booked_quantity_by_order
-            .entry(trade.ownership.client_order_id.clone())
-            .or_insert(0.0) += trade.ownership.quantity;
-    }
-    // Terminal pruning folds a confirmed trade's economics into
-    // `compacted_economic_effects` and retains only this exact ownership
-    // proof. A parent order may intentionally survive that pruning while it
-    // remains under startup recovery or terminal audit. Count only durable,
-    // economically-booked tombstones that still match every immutable order
-    // root; authenticated historical no-ops were never booked by this ledger
-    // and must not contribute.
-    for tombstone in state.retired_trade_ownership_tombstones.values() {
-        let ownership = &tombstone.ownership;
-        if tombstone.authenticated_terminal_noop || ownership.status != "CONFIRMED" {
-            continue;
-        }
-        let Some(order) = state.orders.get(&ownership.client_order_id) else {
-            continue;
-        };
-        if trade_ownership_matches_order_root(ownership, order) {
-            *booked_quantity_by_order
-                .entry(ownership.client_order_id.clone())
-                .or_insert(0.0) += ownership.quantity;
-        }
-    }
-    let mut expected_cash_by_instance = HashMap::<String, f64>::new();
-    let mut expected_positions_by_instance = HashMap::<String, HashMap<String, f64>>::new();
-    for (coid, order) in &state.orders {
-        let booked = booked_quantity_by_order.get(coid).copied().unwrap_or(0.0);
-        let tolerance = reconciliation_tolerance(booked, order.filled_quantity)
-            .max(order.quantity.abs().max(1.0) * 1e-8);
-        if (booked - order.filled_quantity).abs() > tolerance {
-            return Err(format!(
-                "order `{coid}` filled_quantity={} disagrees with durable trades={booked}",
-                order.filled_quantity,
-            ));
-        }
-        let terminal_and_released = matches!(
-            order.status,
-            OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
-        ) && !state.recovery_pending_orders.contains(coid)
-            && !state.routine_cancel_audits.contains(coid);
-        let (expected_cash, expected_quantity) = if terminal_and_released {
-            (0.0, 0.0)
-        } else {
-            desired_order_reservation(order)
-        };
-        if (expected_cash - order.reserved_cash).abs()
-            > reconciliation_tolerance(expected_cash, order.reserved_cash)
-            || (expected_quantity - order.reserved_quantity).abs()
-                > reconciliation_tolerance(expected_quantity, order.reserved_quantity)
-        {
-            return Err(format!(
-                "order `{coid}` reservation disagrees with effective remaining quantity: stored_cash={} expected_cash={expected_cash} stored_quantity={} expected_quantity={expected_quantity}",
-                order.reserved_cash, order.reserved_quantity,
-            ));
-        }
-        *expected_cash_by_instance
-            .entry(order.instance_id.clone())
-            .or_insert(0.0) += expected_cash;
-        if expected_quantity > 0.0 {
-            *expected_positions_by_instance
-                .entry(order.instance_id.clone())
-                .or_default()
-                .entry(order.token_id.clone())
-                .or_insert(0.0) += expected_quantity;
-        }
-    }
-
-    for operation in state.maintenance_ops.values().filter(|operation| {
-        matches!(
-            operation.status,
-            MaintenanceOperationStatus::Reserved
-                | MaintenanceOperationStatus::Submitted
-                | MaintenanceOperationStatus::Uncertain
-        )
-    }) {
-        for (instance_id, amount) in &operation.allocations {
-            match operation.kind {
-                MaintenanceOperationKind::Split => {
-                    *expected_cash_by_instance
-                        .entry(instance_id.clone())
-                        .or_insert(0.0) += *amount;
-                }
-                MaintenanceOperationKind::Merge => {
-                    let expected = expected_positions_by_instance
-                        .entry(instance_id.clone())
-                        .or_default();
-                    for token in [&operation.up_token_id, &operation.down_token_id] {
-                        *expected.entry(token.clone()).or_insert(0.0) += *amount;
-                    }
-                }
-            }
-        }
-    }
+    let derived_reservations = derive_reservation_aggregates(state)?;
 
     for (instance_id, instance) in &state.instances {
-        let expected_cash = expected_cash_by_instance
+        let expected_cash = derived_reservations
+            .cash_by_instance
             .get(instance_id)
             .copied()
             .unwrap_or(0.0);
@@ -11848,7 +11946,9 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 instance.reserved_cash,
             ));
         }
-        let expected_positions = expected_positions_by_instance.get(instance_id);
+        let expected_positions = derived_reservations
+            .positions_by_instance
+            .get(instance_id);
         let mut reservation_tokens: HashSet<String> =
             instance.reserved_positions.keys().cloned().collect();
         if let Some(expected) = expected_positions {
@@ -12351,6 +12451,45 @@ mod tests {
         account.register_instance("b", 3.0);
         account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
         account
+    }
+
+    fn persisted_buy_reservation_state(
+        account_id: &str,
+        instance_reserved_cash: f64,
+        order_reserved_cash: f64,
+    ) -> SharedAccountState {
+        let mut state = SharedAccountState::default();
+        state.physical_cash = 100.0;
+        let mut instance = InstanceLedger::new(1.0);
+        instance.cash = 100.0;
+        instance.reserved_cash = instance_reserved_cash;
+        state.instances.insert("btc01".to_string(), instance);
+        state.orders.insert(
+            "btc01-residual".to_string(),
+            OrderOwnership {
+                account_id: account_id.to_string(),
+                instance_id: "btc01".to_string(),
+                client_order_id: "btc01-residual".to_string(),
+                order_id: "0xRESIDUAL".to_string(),
+                token_id: "BTC-UP".to_string(),
+                side: Side::Buy,
+                quantity: 1.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                terminal_trade_ids: Vec::new(),
+                terminal_trade_ids_authoritative: false,
+                price: 0.00646972,
+                fee_rate_bps: 0,
+                reserved_cash: order_reserved_cash,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        state.oid_to_coid.insert(
+            "residual".to_string(),
+            "btc01-residual".to_string(),
+        );
+        state
     }
 
     #[test]
@@ -16690,6 +16829,136 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.get_mut("maker-order").unwrap().filled_quantity = 0.5;
         let fill_error = validate_persisted_state("account", &state).unwrap_err();
         assert!(fill_error.contains("durable trades"), "{fill_error}");
+    }
+
+    #[test]
+    fn startup_repairs_only_under_reserved_instance_aggregates() {
+        let mut state = persisted_buy_reservation_state("account", 0.0, 0.00646972);
+        state
+            .physical_positions
+            .insert("BTC-DOWN".to_string(), 2.0);
+        state
+            .instances
+            .get_mut("btc01")
+            .unwrap()
+            .positions
+            .insert("BTC-DOWN".to_string(), 2.0);
+        state.orders.insert(
+            "btc01-sell".to_string(),
+            OrderOwnership {
+                account_id: "account".to_string(),
+                instance_id: "btc01".to_string(),
+                client_order_id: "btc01-sell".to_string(),
+                order_id: "0xSELL".to_string(),
+                token_id: "BTC-DOWN".to_string(),
+                side: Side::Sell,
+                quantity: 2.0,
+                filled_quantity: 0.0,
+                terminal_matched_quantity: None,
+                terminal_trade_ids: Vec::new(),
+                terminal_trade_ids_authoritative: false,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 2.0,
+                status: OrderStatus::Accepted,
+            },
+        );
+        state
+            .oid_to_coid
+            .insert("sell".to_string(), "btc01-sell".to_string());
+
+        let before = validate_persisted_state("account", &state).unwrap_err();
+        assert!(before.contains("reserved_cash"), "{before}");
+        let repairs = repair_under_reserved_instance_aggregates(&mut state).unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].instance_id, "btc01");
+        assert_eq!(repairs[0].cash_before, 0.0);
+        assert_eq!(repairs[0].cash_after, 0.00646972);
+        assert_eq!(
+            repairs[0].positions,
+            vec![("BTC-DOWN".to_string(), 0.0, 2.0)],
+        );
+        assert!(validate_persisted_state("account", &state).is_ok());
+        assert!(repair_under_reserved_instance_aggregates(&mut state)
+            .unwrap()
+            .is_empty());
+
+        let mut over_reserved =
+            persisted_buy_reservation_state("account", 0.01, 0.00646972);
+        assert!(repair_under_reserved_instance_aggregates(&mut over_reserved)
+            .unwrap()
+            .is_empty());
+        let over_error = validate_persisted_state("account", &over_reserved).unwrap_err();
+        assert!(over_error.contains("reserved_cash"), "{over_error}");
+
+        let mut invalid_leaf = persisted_buy_reservation_state("account", 0.0, 0.0);
+        let leaf_error = repair_under_reserved_instance_aggregates(&mut invalid_leaf).unwrap_err();
+        assert!(
+            leaf_error.contains("reservation disagrees with effective remaining quantity"),
+            "{leaf_error}",
+        );
+        assert_eq!(
+            invalid_leaf.instances["btc01"].reserved_cash,
+            0.0,
+            "an invalid order leaf must not be masked by aggregate repair",
+        );
+    }
+
+    #[test]
+    fn persistent_startup_repairs_and_snapshots_reservation_aggregate() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-startup-aggregate-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "aggregate-repair";
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.to_string(),
+                persistence_generation: 0,
+                state: persisted_buy_reservation_state(account_id, 0.0, 0.00646972),
+            },
+        )
+        .unwrap();
+
+        {
+            let restored =
+                SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+            assert_eq!(
+                restored
+                    .instance_snapshot("btc01")
+                    .unwrap()
+                    .reserved_cash,
+                0.00646972,
+            );
+        }
+        let persisted: PersistedAccount =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted.state.instances["btc01"].reserved_cash,
+            0.00646972,
+            "the startup snapshot must durably fold the repair before admission",
+        );
+        {
+            let reopened = SharedAccount::new_persistent(account_id, &path).unwrap();
+            assert_eq!(
+                reopened
+                    .instance_snapshot("btc01")
+                    .unwrap()
+                    .reserved_cash,
+                0.00646972,
+            );
+        }
+
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(persistence_wal_path(&path));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
     #[test]
