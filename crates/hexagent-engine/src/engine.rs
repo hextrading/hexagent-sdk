@@ -32,8 +32,12 @@ use crate::types::*;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
-const PRIVATE_UPDATE_BURST_BUDGET: usize = 32;
+// Four account updates keep fill/cancel feedback responsive while bounding
+// the time an already-enqueued market trigger can sit behind the biased lane.
+// At the private-apply target (<=1 ms p95), 32 permitted a 32 ms quote stall.
+const PRIVATE_UPDATE_BURST_BUDGET: usize = 4;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
+const WATCHDOG_MAX_DEFERRAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ACCOUNT_METRIC_POSITION_EPS: f64 = 1e-9;
 const FEED_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const POLY_SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1896,10 +1900,37 @@ fn is_routine_clob_resubscribe(reason: &str) -> bool {
     reason == "CLOB resubscribe requested"
 }
 
-fn forward_recorder_event(recorder_tx: Option<&Sender<MarketEvent>>, event: &MarketEvent) {
+fn forward_recorder_shared(recorder_tx: Option<&Sender<Arc<MarketEvent>>>, event: Arc<MarketEvent>) {
     if let Some(tx) = recorder_tx {
-        let _ = tx.send(event.clone());
+        if matches!(event.as_ref(), MarketEvent::Exit) {
+            let _ = tx.send(event);
+            return;
+        }
+        let started = std::time::Instant::now();
+        match tx.try_send(event) {
+            Ok(()) => crate::latency::record_ns(
+                "market.recorder.enqueue",
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            ),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                static DROPPED: AtomicU64 = AtomicU64::new(0);
+                static LAST_WARN_NS: AtomicU64 = AtomicU64::new(0);
+                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = now_ns();
+                let last = LAST_WARN_NS.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= 10_000_000_000
+                    && LAST_WARN_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                {
+                    warn!("[Recorder] live queue saturated; dropped_events_total={} action=preserve_strategy_latency", dropped);
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+        }
     }
+}
+
+fn forward_recorder_event(recorder_tx: Option<&Sender<Arc<MarketEvent>>>, event: &MarketEvent) {
+    forward_recorder_shared(recorder_tx, Arc::new(event.clone()));
 }
 
 /// Sleep for a retry delay while keeping shutdown latency bounded. Subscription
@@ -2266,7 +2297,7 @@ impl Engine {
     }
 
     /// Spawn a market data recorder thread. Returns (sender, join handle).
-    fn spawn_recorder_thread(&self) -> Result<(Sender<MarketEvent>, thread::JoinHandle<()>)> {
+    fn spawn_recorder_thread(&self) -> Result<(Sender<Arc<MarketEvent>>, thread::JoinHandle<()>)> {
         // Live uses the same unfiltered recorder semantics as Record mode:
         // external spot/index and Polymarket events share one output root.
         self.spawn_recorder_thread_to(&self.config.recording.output_dir)
@@ -2275,7 +2306,7 @@ impl Engine {
     fn spawn_recorder_thread_to(
         &self,
         dir: &str,
-    ) -> Result<(Sender<MarketEvent>, thread::JoinHandle<()>)> {
+    ) -> Result<(Sender<Arc<MarketEvent>>, thread::JoinHandle<()>)> {
         let output_dir = std::fs::canonicalize(dir)
             .unwrap_or_else(|_| {
                 let p = PathBuf::from(dir);
@@ -2284,7 +2315,7 @@ impl Engine {
             })
             .to_string_lossy()
             .to_string();
-        let (recorder_tx, recorder_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
+        let (recorder_tx, recorder_rx) = bounded::<Arc<MarketEvent>>(CHANNEL_CAPACITY);
         let handle = thread::Builder::new()
             .name("recorder".into())
             .spawn(move || {
@@ -2318,10 +2349,10 @@ impl Engine {
                 loop {
                     match recorder_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(event) => {
-                            if matches!(event, MarketEvent::Exit) {
+                            if matches!(event.as_ref(), MarketEvent::Exit) {
                                 break;
                             }
-                            if let Err(e) = recorder.write_event(&event) {
+                            if let Err(e) = recorder.write_event(event.as_ref()) {
                                 error!("[Recorder] Write error: {}", e);
                             }
                         }
@@ -5019,7 +5050,7 @@ impl Engine {
         signal_tx: Sender<Signal>,
         update_rx: Receiver<OrderUpdate>,
         backtest: bool,
-        recorder_tx: Option<Sender<MarketEvent>>,
+        recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         rtt_probe_install: HashMap<
             String,
             (
@@ -5706,7 +5737,7 @@ impl Engine {
         market_rx: Receiver<MarketEvent>,
         signal_tx: Sender<Signal>,
         update_rx: Receiver<OrderUpdate>,
-        recorder_tx: Option<Sender<MarketEvent>>,
+        recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<Receiver<()>>,
     ) -> thread::JoinHandle<()> {
@@ -5882,9 +5913,9 @@ impl Engine {
                             }
                             Ok(event) => {
                                 if shutdown_in_progress { continue; }
-                                forward_recorder_event(recorder_tx.as_ref(), &event);
+                                let event = Arc::new(event);
                                 for idx in Self::route_market_event(
-                                    Arc::new(event),
+                                    Arc::clone(&event),
                                     &sym_to_instances,
                                     &mut token_to_instances,
                                     &market_lanes,
@@ -5900,6 +5931,7 @@ impl Engine {
                                         &signal_tx,
                                     );
                                 }
+                                forward_recorder_shared(recorder_tx.as_ref(), event);
                                 if market_overflow_drops.iter().any(|drops| *drops > 0)
                                     && market_overflow_log_at.elapsed()
                                         >= std::time::Duration::from_secs(1)
@@ -6296,6 +6328,8 @@ impl Engine {
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         let never_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
+        let never_watchdog_rx = crossbeam_channel::never::<std::time::Instant>();
+        let mut last_watchdog_run = std::time::Instant::now();
         loop {
             if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
                 strategy.on_exit();
@@ -6312,6 +6346,13 @@ impl Engine {
                 } else {
                     &update_rx
                 };
+            let selectable_watchdog_rx = if !market_rx.is_empty()
+                && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL
+            {
+                &never_watchdog_rx
+            } else {
+                &watchdog_rx
+            };
             crossbeam_channel::select_biased! {
                 recv(selectable_update_rx) -> msg => match msg {
                     Ok(queued) => {
@@ -6358,7 +6399,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                recv(watchdog_rx) -> _ => {
+                recv(selectable_watchdog_rx) -> _ => {
                     if quarantined.load(Ordering::Acquire) { return; }
                     heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                     if shutdown_started { continue; }
@@ -6370,6 +6411,7 @@ impl Engine {
                         .entry("watchdog")
                         .or_default()
                         .record_callback(callback_started.elapsed());
+                    last_watchdog_run = std::time::Instant::now();
                 },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) => {
@@ -8480,7 +8522,7 @@ impl Engine {
                 // so an unbounded channel removes a redundant blocking send
                 // without removing effective admission control.
                 let (poly_done_tx, poly_done_rx) =
-                    unbounded::<(PolyCompletionFn, Sender<OrderUpdate>)>();
+                    unbounded::<QueuedPolyCompletion>();
                 let mut poly_worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 let mut poly_cancel_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 let mut poly_reconcile_handles: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -8514,9 +8556,18 @@ impl Engine {
                             .name(dname.clone())
                             .spawn(move || {
                                 crate::os_tune::pin_execution(&dname);
-                                while let Ok((complete, utx)) = rx.recv() {
-                                    for update in complete(&mut router) {
-                                        if utx.send(update).is_err() { break; }
+                                while let Ok(queued) = rx.recv() {
+                                    let queue_stage = if queued.kind == "cancel" {
+                                        "polymarket.cancel.completion_queue"
+                                    } else {
+                                        "polymarket.order.completion_queue"
+                                    };
+                                    crate::latency::record_ns(
+                                        queue_stage,
+                                        queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                    );
+                                    for update in (queued.complete)(&mut router) {
+                                        if queued.update_tx.send(update).is_err() { break; }
                                     }
                                 }
                             })
@@ -9276,6 +9327,13 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
 /// admission permit, so the reserved connection is released when this runs.
 type PolyCompletionFn = Box<dyn FnOnce(&mut LiveRouter) -> Vec<OrderUpdate> + Send>;
 
+struct QueuedPolyCompletion {
+    complete: PolyCompletionFn,
+    update_tx: Sender<OrderUpdate>,
+    kind: &'static str,
+    enqueued_at: std::time::Instant,
+}
+
 /// ExecutorRejected update for a placement we never sent (admission skip /
 /// stale / pre-flight). Free-fn twin of the closure in `execute_fallback_signal`.
 fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
@@ -9498,7 +9556,7 @@ fn fire_or_execute(
     worker: &mut LiveRouter,
     signal: Signal,
     stale_ms: u64,
-    done_tx: &Sender<(PolyCompletionFn, Sender<OrderUpdate>)>,
+    done_tx: &Sender<QueuedPolyCompletion>,
     cancel_tx: &Sender<(Signal, u64, Sender<OrderUpdate>)>,
     utx: &Sender<OrderUpdate>,
 ) {
@@ -9513,7 +9571,22 @@ fn fire_or_execute(
         Signal::NewOrder(order)
             if order.exchange == Exchange::Polymarket && !order.instance_id.is_empty() =>
         {
-            if is_stale(order.timestamp_ns) {
+            if order.timestamp_ns > 0 {
+                crate::latency::record_ns(
+                    if order.post_only { "polymarket.order.post_only.quote_age_at_dispatch" } else { "polymarket.order.quote_age_at_dispatch" },
+                    now_ns().saturating_sub(order.timestamp_ns),
+                );
+            }
+            if order.quote_trigger_local_timestamp_ns > 0 {
+                crate::latency::record_ns(
+                    "polymarket.order.trigger_age_at_dispatch",
+                    now_ns().saturating_sub(order.quote_trigger_local_timestamp_ns),
+                );
+            }
+            // `timestamp_ns` only proves the strategy emitted recently. Also
+            // reject a freshly-emitted order computed from a market trigger
+            // that sat stale in a scheduler/callback queue.
+            if is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns) {
                 let _ = utx.send(exec_rejected_place(&order));
                 return;
             }
@@ -9551,7 +9624,7 @@ fn fire_or_execute(
                                 drop(permit); // release the reserved connection
                                 vec![u]
                             });
-                            let _ = done_tx.send((f, utx.clone()));
+                            let _ = done_tx.send(QueuedPolyCompletion { complete: f, update_tx: utx.clone(), kind: "place", enqueued_at: std::time::Instant::now() });
                         }
                         Err(update) => {
                             drop(permit); // pre-flight reject: nothing sent
@@ -9617,7 +9690,7 @@ fn fire_or_execute(
                         drop(permit);
                         vec![u]
                     });
-                    let _ = done_tx.send((f, utx.clone()));
+                    let _ = done_tx.send(QueuedPolyCompletion { complete: f, update_tx: utx.clone(), kind: "cancel", enqueued_at: std::time::Instant::now() });
                 }
             }
         }
@@ -9634,13 +9707,25 @@ fn fire_or_execute(
         {
             let coid = cancel_client_order_ids.into_iter().next().unwrap();
             let place = place_orders.into_iter().next().unwrap();
+            if place.timestamp_ns > 0 {
+                crate::latency::record_ns(
+                    if place.post_only { "polymarket.order.post_only.quote_age_at_dispatch" } else { "polymarket.order.quote_age_at_dispatch" },
+                    now_ns().saturating_sub(place.timestamp_ns),
+                );
+            }
+            if place.quote_trigger_local_timestamp_ns > 0 {
+                crate::latency::record_ns(
+                    "polymarket.order.trigger_age_at_dispatch",
+                    now_ns().saturating_sub(place.quote_trigger_local_timestamp_ns),
+                );
+            }
             // ReplaceOrder is emitted only for a strictly more-aggressive
             // replacement. Admit/fire the place leg independently BEFORE a
             // potentially saturated retained-cancel wait, so Cancel-pool
             // pressure cannot serialize or stale an otherwise-free Fast leg.
             // Account admission still requires enough physical + virtual funds
             // for both old and new reservations at the same time.
-            if is_stale(timestamp_ns) {
+            if is_stale(timestamp_ns) || is_stale(place.quote_trigger_local_timestamp_ns) {
                 let _ = utx.send(exec_rejected_place(&place));
             } else {
                 match try_acquire(&iid, Role::Fast) {
@@ -9678,7 +9763,7 @@ fn fire_or_execute(
                                     drop(ppermit);
                                     vec![u]
                                 });
-                                let _ = done_tx.send((pf, utx.clone()));
+                                let _ = done_tx.send(QueuedPolyCompletion { complete: pf, update_tx: utx.clone(), kind: "place", enqueued_at: std::time::Instant::now() });
                             }
                             Err(update) => {
                                 drop(ppermit);
@@ -9812,6 +9897,11 @@ fn execute_fallback_signal(
         let now = now_ns();
         now.saturating_sub(ts) / 1_000_000 > stale_threshold_ms
     };
+    let has_stale_trigger = |orders: &[OrderRequest]| {
+        orders
+            .iter()
+            .any(|order| is_stale(order.quote_trigger_local_timestamp_ns))
+    };
 
     // Phase 2e-3: route every polymarket-targeted signal through
     // `poly_route_mut(instance_id)` so each instance hits its own
@@ -9823,7 +9913,7 @@ fn execute_fallback_signal(
 
     match signal {
         Signal::NewOrder(order) => {
-            if is_stale(order.timestamp_ns) {
+            if is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns) {
                 warn!(
                     "[Executor] Signal stale ({}ms > {}ms), dropping NewOrder coid={}",
                     (now_ns().saturating_sub(order.timestamp_ns)) / 1_000_000,
@@ -9908,7 +9998,7 @@ fn execute_fallback_signal(
             ..
         } => {
             let oldest_ts = orders.iter().map(|o| o.timestamp_ns).min().unwrap_or(0);
-            if is_stale(oldest_ts) {
+            if is_stale(oldest_ts) || has_stale_trigger(&orders) {
                 warn!(
                     "[Executor] Signal stale, dropping BatchNewOrders ({} orders)",
                     orders.len()
@@ -9955,7 +10045,7 @@ fn execute_fallback_signal(
             timestamp_ns,
             ..
         } => {
-            if is_stale(timestamp_ns) {
+            if is_stale(timestamp_ns) || has_stale_trigger(&place_orders) {
                 warn!(
                     "[Executor] Signal stale, retaining {} BatchUpdateOrders cancels and dropping {} places",
                     cancel_client_order_ids.len(), place_orders.len(),
@@ -10006,7 +10096,7 @@ fn execute_fallback_signal(
             timestamp_ns,
             ..
         } => {
-            if is_stale(timestamp_ns) {
+            if is_stale(timestamp_ns) || has_stale_trigger(&place_orders) {
                 warn!(
                     "[Executor] Signal stale, retaining {} ReplaceOrder cancels and dropping {} places",
                     cancel_client_order_ids.len(), place_orders.len(),
@@ -11069,11 +11159,11 @@ mod market_router_tests {
 
     #[test]
     fn live_recorder_forwards_polymarket_and_external_sources_once() {
-        let (tx, rx) = bounded::<MarketEvent>(4);
+        let (tx, rx) = bounded::<Arc<MarketEvent>>(4);
         forward_recorder_event(Some(&tx), &ob(Exchange::Polymarket, "up"));
         assert!(matches!(
             rx.try_recv(),
-            Ok(MarketEvent::OrderBook(OrderBookSnapshot {
+            Ok(event) if matches!(event.as_ref(), MarketEvent::OrderBook(OrderBookSnapshot {
                 exchange: Exchange::Polymarket,
                 ..
             }))
@@ -11084,14 +11174,14 @@ mod market_router_tests {
         );
 
         forward_recorder_event(Some(&tx), &spot("btc/usd"));
-        assert!(matches!(rx.try_recv(), Ok(MarketEvent::SpotPrice(_))));
+        assert!(matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::SpotPrice(_))));
         assert!(
             rx.try_recv().is_err(),
             "external event must be enqueued once"
         );
 
         forward_recorder_event(Some(&tx), &MarketEvent::Exit);
-        assert!(matches!(rx.try_recv(), Ok(MarketEvent::Exit)));
+        assert!(matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::Exit)));
         assert!(rx.try_recv().is_err(), "exit event must be enqueued once");
     }
 

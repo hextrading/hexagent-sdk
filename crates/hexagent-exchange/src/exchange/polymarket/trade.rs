@@ -4,6 +4,7 @@
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1246,6 +1247,18 @@ impl RateLimiter {
 
 type HttpReply = std::result::Result<serde_json::Value, HttpErr>;
 
+#[derive(Debug, Default)]
+struct HttpCompletionTiming {
+    response_ready_ns: AtomicU64,
+    reply_enqueued_ns: AtomicU64,
+}
+
+#[derive(Debug)]
+struct FilledCleanupJob {
+    client_order_id: String,
+    enqueued_ns: u64,
+}
+
 async fn send_and_drain(
     request: reqwest::RequestBuilder,
 ) -> std::result::Result<u16, reqwest::Error> {
@@ -1464,6 +1477,16 @@ fn http_network_stage(role: crate::http1_pool::Role) -> &'static str {
         crate::http1_pool::Role::Reconcile => "polymarket.http.reconcile.network",
         crate::http1_pool::Role::GapReplay => "polymarket.http.gap_replay.network",
         crate::http1_pool::Role::Query => "polymarket.http.query.network",
+    }
+}
+
+fn http_reply_enqueue_stage(role: crate::http1_pool::Role) -> &'static str {
+    match role {
+        crate::http1_pool::Role::Fast => "polymarket.http.place.reply_enqueue",
+        crate::http1_pool::Role::Cancel => "polymarket.http.cancel.reply_enqueue",
+        crate::http1_pool::Role::Reconcile => "polymarket.http.reconcile.reply_enqueue",
+        crate::http1_pool::Role::GapReplay => "polymarket.http.gap_replay.reply_enqueue",
+        crate::http1_pool::Role::Query => "polymarket.http.query.reply_enqueue",
     }
 }
 
@@ -1885,6 +1908,12 @@ pub struct SharedState {
     /// not-yet-indexed order. Inserted at the cancel-reply classification sites
     /// and cleared only on conclusive resolution via `remove_order`.
     pub(crate) pending_delayed_orphans: Mutex<HashSet<String>>,
+    /// Coalescing wakeup for account-wide settled-history GC.
+    settled_gc_tx: crossbeam_channel::Sender<()>,
+    /// Terminal executor bookkeeping can acquire several audit/runtime locks.
+    /// Private account-apply only enqueues the coid; a background worker owns
+    /// the readiness check and final teardown.
+    filled_cleanup_tx: crossbeam_channel::Sender<FilledCleanupJob>,
 }
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
@@ -2022,6 +2051,75 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    fn spawn_settled_gc_worker(shared: &Arc<Self>, rx: crossbeam_channel::Receiver<()>) {
+        let weak = Arc::downgrade(shared);
+        let _ = std::thread::Builder::new()
+            .name(format!("poly-settled-gc-{}", shared.instance_id))
+            .spawn(move || {
+                crate::os_tune::pin_background("polymarket-settled-gc");
+                while rx.recv().is_ok() {
+                    let Some(shared) = weak.upgrade() else { break };
+                    let mut exhausted = true;
+                    for _ in 0..8 {
+                        let started = crate::latency::Instant::now();
+                        let (retired_events, retired_live_trades) =
+                            shared.finalize_ready_settled_audit_retirements();
+                        crate::latency::record("polymarket.account.settled_gc", started);
+                        if retired_events == 0 {
+                            exhausted = false;
+                            break;
+                        }
+                        debug!(
+                            "[PolySettledGc] account={} retired_events={} retired_live_trades={}",
+                            shared.account_state.account_id(), retired_events, retired_live_trades,
+                        );
+                        std::thread::yield_now();
+                    }
+                    if exhausted { shared.request_settled_gc(); }
+                }
+            });
+    }
+
+    pub(crate) fn request_settled_gc(&self) {
+        let _ = self.settled_gc_tx.try_send(());
+    }
+
+    fn spawn_filled_cleanup_worker(
+        shared: &Arc<Self>,
+        rx: crossbeam_channel::Receiver<FilledCleanupJob>,
+    ) {
+        let weak = Arc::downgrade(shared);
+        let _ = std::thread::Builder::new()
+            .name(format!("poly-filled-cleanup-{}", shared.instance_id))
+            .spawn(move || {
+                crate::os_tune::pin_background("polymarket-filled-cleanup");
+                while let Ok(job) = rx.recv() {
+                    let Some(shared) = weak.upgrade() else { break };
+                    crate::latency::record_ns(
+                        "polymarket.user.filled_cleanup_queue",
+                        now_ns().saturating_sub(job.enqueued_ns),
+                    );
+                    shared.finish_filled_order_if_audited(&job.client_order_id);
+                }
+            });
+    }
+
+    pub(crate) fn request_filled_order_cleanup(&self, client_order_id: &str) {
+        if client_order_id.is_empty() {
+            return;
+        }
+        let job = FilledCleanupJob {
+            client_order_id: client_order_id.to_string(),
+            enqueued_ns: now_ns(),
+        };
+        if let Err(error) = self.filled_cleanup_tx.try_send(job) {
+            warn!(
+                "[PolymarketTrade] filled cleanup queue unavailable; reconcile will retain coid safely: {}",
+                error,
+            );
+        }
+    }
+
     fn install_runtime_order_id(
         &self,
         client_order_id: &str,
@@ -2161,6 +2259,15 @@ impl SharedState {
         reason_code: &str,
         reason: &str,
     ) {
+        // A private fill has no quote/HTTP segment to update. Avoid the trace
+        // map lock, trace clone and INFO formatting on every normal lifecycle
+        // edge; failures remain WARN and DEBUG retains the full audit line.
+        if stage == "private_trade"
+            && status != Some(OrderStatus::Failed)
+            && !log::log_enabled!(log::Level::Debug)
+        {
+            return;
+        }
         let stage_ns = now_ns();
         let mut traces = self.order_lifecycle_traces.lock().unwrap();
         let mut segment_ns = 0u64;
@@ -2228,13 +2335,18 @@ impl SharedState {
                 crate::latency::record_ns("polymarket.order.reserve_to_http_dispatch", segment_ns)
             }
             "http_dispatch_to_response" => {
-                crate::latency::record_ns("polymarket.order.http_rtt", segment_ns)
+                // This ends after response classification/account mutation;
+                // it is not a network RTT. The true wire/body segment is
+                // `polymarket.http.place.network`.
+                crate::latency::record_ns("polymarket.order.dispatch_to_lifecycle_done", segment_ns)
             }
             "cancel_prep_to_http_dispatch" => {
                 crate::latency::record_ns("polymarket.cancel.prep_to_http_dispatch", segment_ns)
             }
             "cancel_http_dispatch_to_response" => {
-                crate::latency::record_ns("polymarket.cancel.http_rtt", segment_ns)
+                // See `polymarket.http.cancel.network` for the actual HTTP
+                // send-through-body/JSON interval.
+                crate::latency::record_ns("polymarket.cancel.dispatch_to_lifecycle_done", segment_ns)
             }
             _ => {}
         }
@@ -2280,7 +2392,7 @@ impl SharedState {
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
         let normal_info = !warning
             && !slow
-            && matches!(stage, "http_response" | "cancel_response" | "private_trade");
+            && matches!(stage, "http_response" | "cancel_response");
         let enabled = if warning || slow {
             log::log_enabled!(log::Level::Warn)
         } else if normal_info {
@@ -2402,18 +2514,20 @@ impl SharedState {
     /// Complete account-global settled-audit cleanup only after the durable
     /// shared reference ledger proves every instance has evicted the event and
     /// every associated order/trade is terminal.
-    pub(crate) fn finalize_ready_settled_audit_retirements(&self) -> usize {
+    pub(crate) fn finalize_ready_settled_audit_retirements(&self) -> (usize, usize) {
         let ready = self
             .account_state
             .finalize_ready_settled_audit_retirements();
         if ready.is_empty() {
-            return 0;
+            return (0, 0);
         }
+        let retired_events = ready.len();
         let mut live = self.live_position.lock().unwrap();
-        ready
+        let retired_live_trades = ready
             .iter()
             .map(|tokens| live.prune_terminal_history(tokens))
-            .sum()
+            .sum();
+        (retired_events, retired_live_trades)
     }
 
     /// Apply a live order status and restore every runtime structure that a
@@ -2611,10 +2725,8 @@ impl SharedState {
                 u8::from(active_count > 0), active_count, client_order_id,
             );
         }
-        // A zero-reference settled event may have been waiting solely for
-        // this order GET/audit edge. Re-check global retirement here as well
-        // as on private trades so an otherwise quiet market converges.
-        let _ = self.finalize_ready_settled_audit_retirements();
+        // Never scan account-wide history on this HTTP/reconcile completion.
+        self.request_settled_gc();
     }
 
     pub(crate) fn complete_filled_order_audit(&self, client_order_id: &str) {
@@ -2677,18 +2789,20 @@ impl SharedState {
     /// Remove executor-side tracking after the account ledger has consumed all
     /// reserved quantity/cash for a terminal fill.
     pub(crate) fn finish_filled_order_if_audited(&self, client_order_id: &str) {
+        // MATCHED -> MINED -> CONFIRMED can enqueue the same coid three times.
+        // Once the first job has retired executor tracking, later lifecycle
+        // edges are strict background no-ops instead of repeated WAL writes.
+        if !self
+            .open_orders
+            .lock()
+            .unwrap()
+            .contains_key(client_order_id)
+        {
+            return;
+        }
         let audited = self
             .account_state
-            .order(client_order_id)
-            .is_some_and(|order| {
-                order.status == OrderStatus::Filled
-                    && if order.terminal_trade_ids_authoritative {
-                        self.account_state
-                            .terminal_order_audit_complete(client_order_id)
-                    } else {
-                        order.reserved_cash <= 1e-9 && order.reserved_quantity <= 1e-9
-                    }
-            });
+            .filled_order_ready_for_retirement(client_order_id);
         if audited {
             self.complete_filled_order_audit(client_order_id);
         }
@@ -3126,6 +3240,17 @@ impl SharedState {
         path: &str,
         body: &str,
     ) -> crossbeam_channel::Receiver<HttpReply> {
+        self.http_call_async_on_timed(client, method, path, body).0
+    }
+
+    fn http_call_async_on_timed(
+        &self,
+        client: crate::http1_pool::PooledClient,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (crossbeam_channel::Receiver<HttpReply>, Arc<HttpCompletionTiming>) {
+        let timing = Arc::new(HttpCompletionTiming::default());
         let method = match method {
             "POST" => reqwest::Method::POST,
             "DELETE" => reqwest::Method::DELETE,
@@ -3136,13 +3261,14 @@ impl SharedState {
                     "unsupported method: {}",
                     other
                 ))));
-                return rx;
+                return (rx, timing);
             }
         };
         let stage = http_stage(method.as_str(), path);
         let role = request_role(&method, path);
         let runtime_queue_stage = http_runtime_queue_stage(role);
         let network_stage = http_network_stage(role);
+        let reply_enqueue_stage = http_reply_enqueue_stage(role);
         let rec_kind = latency_record_kind(method.as_str(), path);
         let t_start = crate::latency::Instant::now();
         let url = format!("{}{}", self.clob_base_url, path);
@@ -3159,6 +3285,7 @@ impl SharedState {
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             let enqueued_at = crate::latency::Instant::now();
+            let timing_a = Arc::clone(&timing);
             async_rt::order_handle().spawn(async move {
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
@@ -3172,10 +3299,14 @@ impl SharedState {
                 )
                         .await;
                 crate::latency::record(network_stage, network_started);
+                timing_a.response_ready_ns.store(now_ns(), Ordering::Release);
                 let rec = rec_kind
                     .filter(|_| crate::latency_record::is_active())
                     .map(|k| (k, latency_record_status(&reply)));
+                let reply_enqueue_started = crate::latency::Instant::now();
                 if tx_a.try_send(reply).is_ok() {
+                    timing_a.reply_enqueued_ns.store(now_ns(), Ordering::Release);
+                    crate::latency::record(reply_enqueue_stage, reply_enqueue_started);
                     crate::latency::record(stage, t_start);
                     if let Some((k, status)) = rec {
                         crate::latency_record::record(
@@ -3189,7 +3320,7 @@ impl SharedState {
             });
         }
 
-        reply_rx
+        (reply_rx, timing)
     }
 
     /// Synchronous variant — dispatches and blocks on the reply. Used by
@@ -3243,6 +3374,7 @@ impl SharedState {
 pub struct PendingSubmit {
     local_oid: String,
     rx: crossbeam_channel::Receiver<HttpReply>,
+    timing: Arc<HttpCompletionTiming>,
 }
 
 /// Opaque in-flight cancel: the reply-handling context + the reply
@@ -3252,6 +3384,7 @@ pub struct PendingSubmit {
 pub struct PendingCancel {
     ctx: CancelCtx,
     rx: Option<crossbeam_channel::Receiver<HttpReply>>,
+    timing: Option<Arc<HttpCompletionTiming>>,
 }
 
 /// Polymarket CLOB live order executor.
@@ -3551,8 +3684,9 @@ impl PolymarketTrade {
             );
         }
 
-        Ok(Self {
-            shared: Arc::new(SharedState {
+        let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
+        let (filled_cleanup_tx, filled_cleanup_rx) = crossbeam_channel::bounded(16_384);
+        let shared = Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
                 account_state,
                 open_orders: Mutex::new(recovered_open),
@@ -3599,7 +3733,13 @@ impl PolymarketTrade {
                 placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 cancel_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
-            }),
+                settled_gc_tx,
+                filled_cleanup_tx,
+            });
+        SharedState::spawn_settled_gc_worker(&shared, settled_gc_rx);
+        SharedState::spawn_filled_cleanup_worker(&shared, filled_cleanup_rx);
+        Ok(Self {
+            shared,
             owner: api_key.to_string(),
             // CLI / first-build route: per-instance trading routes are
             // rebuilt via `from_shared(.., instance_id)`.
@@ -5403,15 +5543,12 @@ impl PolymarketTrade {
                     instance_id, owned_condition_id, error,
                 );
             }
-            // Account finalisation itself is bounded to a small event batch.
-            // Subsequent private-feed ticks continue draining any backlog.
-            let live_trades = shared.finalize_ready_settled_audit_retirements();
+            shared.request_settled_gc();
             info!(
-                "[PolymarketTrade] settled background GC retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s), {} feed trade(s) for {} token(s)",
+                "[PolymarketTrade] settled background cleanup retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s); account GC queued for {} token(s)",
                 reclaimed,
                 ledger_orders,
                 ledger_trades,
-                live_trades,
                 retired_tokens.len(),
             );
         }) {
@@ -6807,9 +6944,9 @@ impl PolymarketTrade {
                 return Err(update);
             }
         };
-        let rx = self
+        let (rx, timing) = self
             .shared
-            .http_call_async_on(client, "POST", "/order", &body_str);
+            .http_call_async_on_timed(client, "POST", "/order", &body_str);
         self.shared.log_order_lifecycle(
             &order.client_order_id,
             "http_dispatched",
@@ -6817,17 +6954,31 @@ impl PolymarketTrade {
             None,
             None,
         );
-        Ok(PendingSubmit { local_oid, rx })
+        Ok(PendingSubmit { local_oid, rx, timing })
     }
 
     /// Complete a fired place: block on its reply, then run the normal reply
     /// handler (open_orders / coid bookkeeping, balance-error trigger).
     pub fn complete_submit(&mut self, order: &OrderRequest, pending: PendingSubmit) -> OrderUpdate {
-        let PendingSubmit { local_oid, rx } = pending;
+        let PendingSubmit { local_oid, rx, timing } = pending;
+        let completion_started_ns = now_ns();
         let reply = rx
             .recv()
             .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
-        self.handle_submit_reply(order, &local_oid, reply)
+        let response_received_ns = now_ns();
+        crate::latency::record_ns("polymarket.order.completion_wait_response", response_received_ns.saturating_sub(completion_started_ns));
+        let response_ready_ns = timing.response_ready_ns.load(Ordering::Acquire);
+        if response_ready_ns > 0 {
+            crate::latency::record_ns("polymarket.order.response_ready_to_handler", response_received_ns.saturating_sub(response_ready_ns));
+        }
+        let reply_enqueued_ns = timing.reply_enqueued_ns.load(Ordering::Acquire);
+        if reply_enqueued_ns > 0 {
+            crate::latency::record_ns("polymarket.order.reply_enqueued_to_handler", response_received_ns.saturating_sub(reply_enqueued_ns));
+        }
+        let handler_started = crate::latency::Instant::now();
+        let update = self.handle_submit_reply(order, &local_oid, reply);
+        crate::latency::record("polymarket.order.response_handler", handler_started);
+        update
     }
 
     /// Fire-and-track cancel: sync prep + exactly one dispatch on the
@@ -6839,10 +6990,9 @@ impl PolymarketTrade {
         client: crate::http1_pool::PooledClient,
     ) -> PendingCancel {
         let (ctx, body) = self.cancel_prep(client_order_id);
-        let rx = body.map(|body_str| {
-            self.shared
-                .http_call_async_on(client, "DELETE", "/order", &body_str)
-        });
+        let (rx, timing) = body
+            .map(|body_str| self.shared.http_call_async_on_timed(client, "DELETE", "/order", &body_str))
+            .map_or((None, None), |(rx, timing)| (Some(rx), Some(timing)));
         self.shared.log_order_lifecycle(
             client_order_id,
             if rx.is_some() {
@@ -6854,7 +7004,7 @@ impl PolymarketTrade {
             None,
             None,
         );
-        PendingCancel { ctx, rx }
+        PendingCancel { ctx, rx, timing }
     }
 
     /// Complete a fired cancel: block on its reply (if any), then run the
@@ -6865,12 +7015,30 @@ impl PolymarketTrade {
         client_order_id: &str,
         pending: PendingCancel,
     ) -> OrderUpdate {
-        let PendingCancel { ctx, rx } = pending;
+        let PendingCancel { ctx, rx, timing } = pending;
+        let completion_started_ns = now_ns();
         let reply = rx.map(|rx| {
             rx.recv()
                 .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
         });
-        self.handle_cancel_reply(exchange, client_order_id, ctx, reply)
+        let response_received_ns = now_ns();
+        if reply.is_some() {
+            crate::latency::record_ns("polymarket.cancel.completion_wait_response", response_received_ns.saturating_sub(completion_started_ns));
+        }
+        if let Some(timing) = timing {
+            let response_ready_ns = timing.response_ready_ns.load(Ordering::Acquire);
+            if response_ready_ns > 0 {
+                crate::latency::record_ns("polymarket.cancel.response_ready_to_handler", response_received_ns.saturating_sub(response_ready_ns));
+            }
+            let reply_enqueued_ns = timing.reply_enqueued_ns.load(Ordering::Acquire);
+            if reply_enqueued_ns > 0 {
+                crate::latency::record_ns("polymarket.cancel.reply_enqueued_to_handler", response_received_ns.saturating_sub(reply_enqueued_ns));
+            }
+        }
+        let handler_started = crate::latency::Instant::now();
+        let update = self.handle_cancel_reply(exchange, client_order_id, ctx, reply);
+        crate::latency::record("polymarket.cancel.response_handler", handler_started);
+        update
     }
 
     /// Synchronous prep for a place: rate/balance gate, sign, register the
@@ -7084,7 +7252,10 @@ impl PolymarketTrade {
             }
         };
 
-        let parsed = match parse_placement_response(&resp) {
+        let response_parse_started = crate::latency::Instant::now();
+        let parsed_result = parse_placement_response(&resp);
+        crate::latency::record("polymarket.order.response_parse", response_parse_started);
+        let parsed = match parsed_result {
             Ok(parsed) => parsed,
             Err(reason) => {
                     self.shared
@@ -7124,6 +7295,7 @@ impl PolymarketTrade {
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
         self.shared.clear_invalid_token(&order.symbol);
+        let account_apply_started = crate::latency::Instant::now();
         let effective_ack_status = self.shared.mark_order_live(
             &order.client_order_id,
             &order.symbol,
@@ -7131,6 +7303,7 @@ impl PolymarketTrade {
             &self.instance_id,
             OrderStatus::Accepted,
         );
+        crate::latency::record("polymarket.order.response_account_apply", account_apply_started);
 
         if !order_id.is_empty() && !Self::oid_eq(&order_id, local_oid) {
             warn!(
@@ -7359,6 +7532,7 @@ impl PolymarketTrade {
                 symbol,
                 side,
             } = ctx;
+        let classify_started = crate::latency::Instant::now();
         // Worst-case default: the order is still live. Only an explicit
         // terminal response below is allowed to remove tracking.
         let mut should_remove = false;
@@ -7462,19 +7636,27 @@ impl PolymarketTrade {
                 }
             }
         }
+        crate::latency::record("polymarket.cancel.response_classify", classify_started);
 
         if let Some(status) = orphan_status {
+            let account_apply_started = crate::latency::Instant::now();
             let effective = self
                 .shared
                 .effective_cancel_attempt_status(client_order_id, status);
-            return Self::make_orphan_cancel(
+            let update = Self::make_orphan_cancel(
                 client_order_id,
                 &symbol,
                 side,
                 local_oid,
                 effective,
             );
+            crate::latency::record(
+                "polymarket.cancel.response_account_apply",
+                account_apply_started,
+            );
+            return update;
         }
+        let account_apply_started = crate::latency::Instant::now();
         if should_remove {
             self.shared.remove_order_as(client_order_id, ok_status);
         }
@@ -7487,7 +7669,7 @@ impl PolymarketTrade {
             .shared
             .effective_cancel_attempt_status(client_order_id, status);
 
-        OrderUpdate {
+        let update = OrderUpdate {
             client_order_id: client_order_id.to_string(),
             exchange,
             symbol,
@@ -7502,7 +7684,12 @@ impl PolymarketTrade {
             trade_id: None,
             order_audit: None,
             error: None,
-        }
+        };
+        crate::latency::record(
+            "polymarket.cancel.response_account_apply",
+            account_apply_started,
+        );
+        update
         })();
         self.shared.log_order_lifecycle(
             client_order_id,

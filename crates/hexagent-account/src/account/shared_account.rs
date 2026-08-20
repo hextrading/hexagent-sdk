@@ -1252,6 +1252,15 @@ enum PersistenceJobPayload {
     /// Raw reservation data is converted to JSON only on the WAL writer. This
     /// keeps path allocation and serde work off the signed-to-dispatch lane.
     Reservation(ReservationPersistenceDelta),
+    /// Raw order/status/audit lifecycle mutation. HTTP response, cancel and
+    /// background cleanup paths only clone their one owned row under the
+    /// instance lock; WAL paths/serde stay on the writer.
+    VirtualLifecycle(VirtualLifecyclePersistenceDelta),
+    /// Raw virtual-trade data is converted to JSON only on the WAL writer.
+    /// The private-feed worker captures a bounded set of owned values while
+    /// holding the instance lifecycle shard, then releases that shard before
+    /// any path allocation or serde work occurs.
+    VirtualTrade(VirtualTradePersistenceDelta),
 }
 
 #[derive(Debug, Clone)]
@@ -1261,6 +1270,36 @@ struct ReservationPersistenceDelta {
     order: OrderOwnership,
     reserved_cash: f64,
     reserved_position: f64,
+}
+
+#[derive(Debug, Clone)]
+struct VirtualLifecyclePersistenceDelta {
+    instance_id: String,
+    reserved_cash: f64,
+    client_order_id: String,
+    order: Option<OrderOwnership>,
+    reserved_position: Option<(String, f64)>,
+    recovery_pending: bool,
+    startup_query_repair: bool,
+    routine_cancel_audit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct VirtualTradePersistenceDelta {
+    instance_id: String,
+    cash: f64,
+    reserved_cash: f64,
+    token_id: String,
+    position: f64,
+    reserved_position: f64,
+    client_order_id: String,
+    order: Option<OrderOwnership>,
+    trade_key: String,
+    trade: Option<AppliedTrade>,
+    fee_attribution_pending: bool,
+    recovery_pending: bool,
+    routine_cancel_audit: bool,
+    ledger_generation: u64,
 }
 
 #[derive(Debug)]
@@ -1400,10 +1439,14 @@ impl AccountPersistence {
                 let mut durable_wal_len = 0u64;
                 while let Ok(signal) = rx.recv() {
                     loop {
-                        let jobs = thread_pending
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
+                        // Detach the batch so producers append to a fresh Vec
+                        // while JSON and disk work proceeds.
+                        let mut jobs = {
+                            let mut pending = thread_pending
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            std::mem::take(&mut *pending)
+                        };
                         let Some(last) = jobs.last() else {
                             break;
                         };
@@ -1472,22 +1515,33 @@ impl AccountPersistence {
                             }
                             Ok(next_state)
                         })();
-                        if let Ok(next_state) = &result {
-                            durable_state = next_state.clone();
-                            thread_pending
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .retain(|job| job.generation > generation);
-                        }
+                        let error = match result {
+                            Ok(next_state) => {
+                                // Consume directly; avoid cloning the complete
+                                // 10-13 MB durable JSON tree a second time.
+                                durable_state = next_state;
+                                None
+                            }
+                            Err(error) => {
+                                // Failed jobs must stay ahead of work queued
+                                // while this batch was being written.
+                                let mut pending = thread_pending
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                jobs.append(&mut *pending);
+                                *pending = jobs;
+                                Some(error)
+                            }
+                        };
                         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
                         let (lock, cv) = &*thread_progress;
                         let mut progress =
                             lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if result.is_ok() {
+                        if error.is_none() {
                             progress.completed_generation =
                                 progress.completed_generation.max(generation);
                         }
-                        progress.last_error = result.err();
+                        progress.last_error = error;
                         progress.writes = progress.writes.saturating_add(1);
                         progress.write_last_us = elapsed_us;
                         progress.write_max_us = progress.write_max_us.max(elapsed_us);
@@ -1529,6 +1583,14 @@ impl AccountPersistence {
 
     fn schedule_reservation(&self, delta: ReservationPersistenceDelta) {
         self.enqueue(PersistenceJobPayload::Reservation(delta));
+    }
+
+    fn schedule_virtual_lifecycle(&self, delta: VirtualLifecyclePersistenceDelta) {
+        self.enqueue(PersistenceJobPayload::VirtualLifecycle(delta));
+    }
+
+    fn schedule_virtual_trade(&self, delta: VirtualTradePersistenceDelta) {
+        self.enqueue(PersistenceJobPayload::VirtualTrade(delta));
     }
 
     fn scheduled_generation(&self) -> u64 {
@@ -1799,6 +1861,74 @@ fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWa
             ] {
                 persistence_wal_set_membership(&mut changes, set, &delta.client_order_id, false)?;
             }
+            Ok(changes)
+        }
+        PersistenceJobPayload::VirtualLifecycle(delta) => {
+            let mut changes = Vec::with_capacity(8);
+            persistence_wal_set(
+                &mut changes,
+                [
+                    "instances".to_string(),
+                    delta.instance_id.clone(),
+                    "reserved_cash".to_string(),
+                ],
+                &delta.reserved_cash,
+            )?;
+            persistence_wal_map_entry(
+                &mut changes,
+                "orders",
+                &delta.client_order_id,
+                delta.order.as_ref(),
+            )?;
+            if let Some((token_id, reserved_position)) = &delta.reserved_position {
+                persistence_wal_set(
+                    &mut changes,
+                    [
+                        "instances".to_string(),
+                        delta.instance_id.clone(),
+                        "reserved_positions".to_string(),
+                        token_id.clone(),
+                    ],
+                    reserved_position,
+                )?;
+                let normalized = delta
+                    .order
+                    .as_ref()
+                    .map(|order| normalize_order_id(&order.order_id))
+                    .unwrap_or_default();
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "oid_to_coid",
+                    &normalized,
+                    delta.order.as_ref().map(|order| &order.client_order_id),
+                )?;
+            }
+            for (set, present) in [
+                ("recovery_pending_orders", delta.recovery_pending),
+                ("startup_query_repair_orders", delta.startup_query_repair),
+                ("routine_cancel_audits", delta.routine_cancel_audit),
+            ] {
+                persistence_wal_set_membership(
+                    &mut changes,
+                    set,
+                    &delta.client_order_id,
+                    present,
+                )?;
+            }
+            Ok(changes)
+        }
+        PersistenceJobPayload::VirtualTrade(delta) => {
+            let mut changes = Vec::with_capacity(10);
+            persistence_wal_set(&mut changes, ["instances".to_string(), delta.instance_id.clone(), "cash".to_string()], &delta.cash)?;
+            persistence_wal_set(&mut changes, ["instances".to_string(), delta.instance_id.clone(), "reserved_cash".to_string()], &delta.reserved_cash)?;
+            persistence_wal_set(&mut changes, ["instances".to_string(), delta.instance_id.clone(), "positions".to_string(), delta.token_id.clone()], &delta.position)?;
+            persistence_wal_set(&mut changes, ["instances".to_string(), delta.instance_id.clone(), "reserved_positions".to_string(), delta.token_id.clone()], &delta.reserved_position)?;
+            persistence_wal_map_entry(&mut changes, "orders", &delta.client_order_id, delta.order.as_ref())?;
+            persistence_wal_map_entry(&mut changes, "trades", &delta.trade_key, delta.trade.as_ref())?;
+            persistence_wal_set_membership(&mut changes, "fee_attribution_pending", &delta.trade_key, delta.fee_attribution_pending)?;
+            persistence_wal_set_membership(&mut changes, "recovery_pending_orders", &delta.client_order_id, delta.recovery_pending)?;
+            persistence_wal_set_membership(&mut changes, "routine_cancel_audits", &delta.client_order_id, delta.routine_cancel_audit)?;
+            persistence_wal_set(&mut changes, ["ledger_generation".to_string()], &delta.ledger_generation)?;
             Ok(changes)
         }
     }
@@ -2157,7 +2287,7 @@ pub struct SharedAccount {
     /// separate from the physical ledger lock: it prevents one exchange trade
     /// from being booked into two instance shards without serializing unrelated
     /// fills on `SharedAccount::state`.
-    trade_routes: RwLock<HashMap<String, String>>,
+    trade_routes: ShardedRouteMap,
     /// Only anomalous trade ids are present. Exact replays for those ids take
     /// the cold audit path until a verified replay clears the durable anomaly.
     anomalous_trade_keys: RwLock<HashSet<String>>,
@@ -2165,6 +2295,11 @@ pub struct SharedAccount {
     /// Successful ordinary events can skip the account-wide reconciliation
     /// lock unless their own key is known to need repair.
     anomalous_private_event_keys: RwLock<HashSet<String>>,
+    /// Only trade ids whose replay watermark still needs cold-ledger repair
+    /// are present. A normal private fill therefore misses in one route shard
+    /// instead of taking `control_gate` and cloning/publishing the full
+    /// account state merely to discover there is nothing to remove.
+    unresolved_trade_keys: ShardedRouteMap,
     /// Serializes the rare mark/resolve transition so a corrected replay
     /// cannot race between the fast anomaly index and its durable row.
     private_anomaly_transition: Mutex<()>,
@@ -2275,9 +2410,10 @@ impl SharedAccount {
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
             oid_routes: ShardedRouteMap::new(),
-            trade_routes: RwLock::new(HashMap::new()),
+            trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
@@ -2540,6 +2676,8 @@ impl SharedAccount {
             .values()
             .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
             .count();
+        let initial_unresolved_trade_keys: Vec<String> =
+            state.unresolved_trade_match_times.keys().cloned().collect();
         let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
@@ -2554,9 +2692,10 @@ impl SharedAccount {
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
             oid_routes: ShardedRouteMap::new(),
-            trade_routes: RwLock::new(HashMap::new()),
+            trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
@@ -2583,6 +2722,11 @@ impl SharedAccount {
         };
         {
             let _state = account.lock_state();
+        }
+        for trade_key in initial_unresolved_trade_keys {
+            account
+                .unresolved_trade_keys
+                .insert(trade_key, String::new());
         }
         Ok(account)
     }
@@ -3133,15 +3277,15 @@ impl SharedAccount {
                     .map(|order| normalize_order_id(&order.order_id))
                     .collect();
                 let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
-                (instance_id.clone(), coids, oids, trade_keys)
+                let trade_epoch = account.trade_epoch.load(Ordering::Acquire);
+                (instance_id.clone(), coids, oids, trade_keys, trade_epoch)
             })
             .collect();
         let live_owners: HashSet<String> = route_snapshots
             .iter()
-            .map(|(instance_id, _, _, _)| instance_id.clone())
+            .map(|(instance_id, _, _, _, _)| instance_id.clone())
             .collect();
-        let mut trade_routes = self.trade_routes.write().unwrap();
-        for (instance_id, coids, oids, trade_keys) in route_snapshots {
+        for (instance_id, coids, oids, trade_keys, trade_epoch) in route_snapshots {
             for coid in &coids {
                 self.coid_routes.insert(coid.clone(), instance_id.clone());
             }
@@ -3149,18 +3293,28 @@ impl SharedAccount {
                 self.oid_routes.insert(oid.clone(), instance_id.clone());
             }
             for trade_key in &trade_keys {
-                trade_routes.insert(trade_key.clone(), instance_id.clone());
+                self.trade_routes
+                    .insert(trade_key.clone(), instance_id.clone());
             }
             // Publish desired keys first, then prune keys no longer present in
             // this owner's shard. Readers therefore never observe a valid
             // order without a route while settled GC still removes tombstones.
             self.coid_routes.retain_owner_keys(&instance_id, &coids);
             self.oid_routes.retain_owner_keys(&instance_id, &oids);
-            trade_routes.retain(|key, owner| owner != &instance_id || trade_keys.contains(key));
+            if accounts
+                .iter()
+                .find(|(candidate, _)| candidate == &instance_id)
+                .is_some_and(|(_, account)| {
+                    account.trade_epoch.load(Ordering::Acquire) == trade_epoch
+                })
+            {
+                self.trade_routes
+                    .retain_owner_keys(&instance_id, &trade_keys);
+            }
         }
         self.coid_routes.retain_owners(&live_owners);
         self.oid_routes.retain_owners(&live_owners);
-        trade_routes.retain(|_, owner| live_owners.contains(owner));
+        self.trade_routes.retain_owners(&live_owners);
         *self.anomalous_trade_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
@@ -3275,9 +3429,9 @@ impl SharedAccount {
             .map(|order| normalize_order_id(&order.order_id))
             .collect();
         let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
+        let trade_epoch = account.trade_epoch.load(Ordering::Acquire);
         drop(lifecycle);
 
-        let mut trade_routes = self.trade_routes.write().unwrap();
         // Route retirement is explicit and event-scoped. Destructively
         // removing every route for an instance makes lock-free private reads
         // observe a transient hole while this snapshot is republished.
@@ -3290,11 +3444,15 @@ impl SharedAccount {
                 .insert(oid.clone(), instance_id.to_string());
         }
         for trade_key in &trade_keys {
-            trade_routes.insert(trade_key.clone(), instance_id.to_string());
+            self.trade_routes
+                .insert(trade_key.clone(), instance_id.to_string());
         }
         self.coid_routes.retain_owner_keys(instance_id, &coids);
         self.oid_routes.retain_owner_keys(instance_id, &oids);
-        trade_routes.retain(|key, owner| owner != instance_id || trade_keys.contains(key));
+        if account.trade_epoch.load(Ordering::Acquire) == trade_epoch {
+            self.trade_routes
+                .retain_owner_keys(instance_id, &trade_keys);
+        }
         *self.anomalous_trade_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
@@ -3436,76 +3594,32 @@ impl SharedAccount {
         lifecycle: &VirtualLifecycle,
         client_order_id: &str,
     ) {
-        if self.persistence.is_none() {
+        let Some(persistence) = &self.persistence else {
             return;
-        }
-        let instance_id = account.instance_id.as_str();
-        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::with_capacity(10);
-            // Lifecycle edges only change the reservation derivatives of the
-            // instance ledger. Persist those atomic counters directly instead
-            // of cloning/serializing the complete virtual account (positions,
-            // interests and scopes) on the order/event-loop thread.
-            persistence_wal_set(
-                &mut changes,
-                [
-                    "instances".to_string(),
-                    instance_id.to_string(),
-                    "reserved_cash".to_string(),
-                ],
-                &account.reserved_cash.load(),
-            )?;
-            let order = lifecycle.orders.get(client_order_id);
-            persistence_wal_map_entry(&mut changes, "orders", client_order_id, order)?;
-            if let Some(order) = order {
-                let reserved_position = account
-                    .positions
-                    .read()
-                    .unwrap()
-                    .get(&order.token_id)
-                    .map(|position| position.reserved.load())
-                    .unwrap_or(0.0);
-                persistence_wal_set(
-                    &mut changes,
-                    [
-                        "instances".to_string(),
-                        instance_id.to_string(),
-                        "reserved_positions".to_string(),
-                        order.token_id.clone(),
-                    ],
-                    &reserved_position,
-                )?;
-                let normalized = normalize_order_id(&order.order_id);
-                persistence_wal_map_entry(
-                    &mut changes,
-                    "oid_to_coid",
-                    &normalized,
-                    Some(&order.client_order_id),
-                )?;
-            }
-            persistence_wal_set_membership(
-                &mut changes,
-                "recovery_pending_orders",
-                &client_order_id,
-                lifecycle.recovery_pending_orders.contains(client_order_id),
-            )?;
-            persistence_wal_set_membership(
-                &mut changes,
-                "startup_query_repair_orders",
-                &client_order_id,
-                lifecycle
-                    .startup_query_repair_orders
-                    .contains(client_order_id),
-            )?;
-            persistence_wal_set_membership(
-                &mut changes,
-                "routine_cancel_audits",
-                &client_order_id,
-                lifecycle.routine_cancel_audits.contains(client_order_id),
-            )?;
-            Ok(changes)
-        })();
-        self.schedule_virtual_changes(instance_id, changes);
+        };
+        let order = lifecycle.orders.get(client_order_id).cloned();
+        let reserved_position = order.as_ref().map(|order| {
+            let reserved = account
+                .positions
+                .read()
+                .unwrap()
+                .get(&order.token_id)
+                .map(|position| position.reserved.load())
+                .unwrap_or(0.0);
+            (order.token_id.clone(), reserved)
+        });
+        persistence.schedule_virtual_lifecycle(VirtualLifecyclePersistenceDelta {
+            instance_id: account.instance_id.clone(),
+            reserved_cash: account.reserved_cash.load(),
+            client_order_id: client_order_id.to_string(),
+            order,
+            reserved_position,
+            recovery_pending: lifecycle.recovery_pending_orders.contains(client_order_id),
+            startup_query_repair: lifecycle
+                .startup_query_repair_orders
+                .contains(client_order_id),
+            routine_cancel_audit: lifecycle.routine_cancel_audits.contains(client_order_id),
+        });
     }
 
     fn schedule_virtual_sidecar_persist(
@@ -3575,89 +3689,26 @@ impl SharedAccount {
         client_order_id: &str,
         token_id: &str,
     ) {
-        if self.persistence.is_none() {
+        let Some(persistence) = &self.persistence else {
             return;
-        }
-        let instance_id = account.instance_id.as_str();
-        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::with_capacity(14);
-            persistence_wal_set(
-                &mut changes,
-                [
-                    "instances".to_string(),
-                    instance_id.to_string(),
-                    "cash".to_string(),
-                ],
-                &account.cash.load(),
-            )?;
-            persistence_wal_set(
-                &mut changes,
-                [
-                    "instances".to_string(),
-                    instance_id.to_string(),
-                    "reserved_cash".to_string(),
-                ],
-                &account.reserved_cash.load(),
-            )?;
-            let position = account.position(token_id);
-            persistence_wal_set(
-                &mut changes,
-                [
-                    "instances".to_string(),
-                    instance_id.to_string(),
-                    "positions".to_string(),
-                    token_id.to_string(),
-                ],
-                &position.balance.load(),
-            )?;
-            persistence_wal_set(
-                &mut changes,
-                [
-                    "instances".to_string(),
-                    instance_id.to_string(),
-                    "reserved_positions".to_string(),
-                    token_id.to_string(),
-                ],
-                &position.reserved.load(),
-            )?;
-            persistence_wal_map_entry(
-                &mut changes,
-                "orders",
-                client_order_id,
-                lifecycle.orders.get(client_order_id),
-            )?;
-            persistence_wal_map_entry(
-                &mut changes,
-                "trades",
-                trade_key,
-                lifecycle.trades.get(trade_key),
-            )?;
-            persistence_wal_set_membership(
-                &mut changes,
-                "fee_attribution_pending",
-                &trade_key,
-                lifecycle.fee_attribution_pending.contains(trade_key),
-            )?;
-            persistence_wal_set_membership(
-                &mut changes,
-                "recovery_pending_orders",
-                &client_order_id,
-                lifecycle.recovery_pending_orders.contains(client_order_id),
-            )?;
-            persistence_wal_set_membership(
-                &mut changes,
-                "routine_cancel_audits",
-                &client_order_id,
-                lifecycle.routine_cancel_audits.contains(client_order_id),
-            )?;
-            persistence_wal_set(
-                &mut changes,
-                ["ledger_generation".to_string()],
-                &self.ledger_generation_fast.load(Ordering::Acquire),
-            )?;
-            Ok(changes)
-        })();
-        self.schedule_virtual_changes(instance_id, changes);
+        };
+        let position = account.position(token_id);
+        persistence.schedule_virtual_trade(VirtualTradePersistenceDelta {
+            instance_id: account.instance_id.clone(),
+            cash: account.cash.load(),
+            reserved_cash: account.reserved_cash.load(),
+            token_id: token_id.to_string(),
+            position: position.balance.load(),
+            reserved_position: position.reserved.load(),
+            client_order_id: client_order_id.to_string(),
+            order: lifecycle.orders.get(client_order_id).cloned(),
+            trade_key: trade_key.to_string(),
+            trade: lifecycle.trades.get(trade_key).cloned(),
+            fee_attribution_pending: lifecycle.fee_attribution_pending.contains(trade_key),
+            recovery_pending: lifecycle.recovery_pending_orders.contains(client_order_id),
+            routine_cancel_audit: lifecycle.routine_cancel_audits.contains(client_order_id),
+            ledger_generation: self.ledger_generation_fast.load(Ordering::Acquire),
+        });
     }
 
     fn schedule_settled_prune_persist(
@@ -6208,10 +6259,17 @@ impl SharedAccount {
             .unresolved_trade_match_times
             .insert(trade_key.to_string(), match_time_secs);
         self.schedule_persist(&state);
+        self.unresolved_trade_keys
+            .insert(trade_key.to_string(), String::new());
     }
 
     pub fn resolve_unresolved_trade_match_time(&self, trade_key: &str) {
         if trade_key.is_empty() {
+            return;
+        }
+        // Ordinary owned trades have no unresolved anchor. Keep that dominant
+        // path completely out of the account-wide control/state lock.
+        if self.unresolved_trade_keys.remove(trade_key).is_none() {
             return;
         }
         let mut state = self.lock_state();
@@ -6310,6 +6368,26 @@ impl SharedAccount {
             }
         }
         None
+    }
+
+    /// Cheap instance-shard predicate used by the asynchronous executor
+    /// cleanup worker after a private fill. It intentionally does not enter
+    /// `control_gate`: the order row, exact terminal ids, applied trades and
+    /// reservation residuals all live in the same virtual lifecycle shard.
+    pub fn filled_order_ready_for_retirement(&self, client_order_id: &str) -> bool {
+        let Some(account) = self.virtual_account_for_coid(client_order_id) else {
+            return false;
+        };
+        let lifecycle = account.lifecycle.lock().unwrap();
+        let Some(order) = lifecycle.orders.get(client_order_id) else {
+            return false;
+        };
+        order.status == OrderStatus::Filled
+            && if order.terminal_trade_ids_authoritative {
+                terminal_order_audit_complete_virtual(&lifecycle, client_order_id)
+            } else {
+                order.reserved_cash <= EPS && order.reserved_quantity <= EPS
+            }
     }
 
     /// Resolve an order through its durable instance shard and repair any
@@ -6416,7 +6494,6 @@ impl SharedAccount {
         client_order_id: &str,
         status: OrderStatus,
     ) -> Option<OrderStatus> {
-        let control = self.control_gate.read().unwrap();
         let account = self.virtual_account_for_coid(client_order_id)?;
         let mut lifecycle = account.lifecycle.lock().unwrap();
         if let Some(current_status) = lifecycle
@@ -6485,19 +6562,38 @@ impl SharedAccount {
                 lifecycle.recovery_pending_orders.remove(client_order_id);
                 lifecycle.routine_cancel_audits.remove(client_order_id);
                 let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
+                Self::record_virtual_trade_mutation(
+                    &account,
+                    &mut lifecycle,
+                    "",
+                    client_order_id,
+                    &token_id,
+                );
                 self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
                 drop(lifecycle);
-                drop(control);
                 if clear_cancel_anomaly {
                     self.clear_cancel_audit_anomaly(client_order_id);
                 }
                 return Some(status);
             } else {
+                let token_id = lifecycle
+                    .orders
+                    .get_mut(client_order_id)
+                    .expect("order status read above")
+                    .token_id
+                    .clone();
                 lifecycle
                     .orders
                     .get_mut(client_order_id)
                     .expect("order status read above")
                     .status = status;
+                Self::record_virtual_trade_mutation(
+                    &account,
+                    &mut lifecycle,
+                    "",
+                    client_order_id,
+                    &token_id,
+                );
             }
             self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
             return Some(status);
@@ -7815,6 +7911,7 @@ impl SharedAccount {
         let was_uncertain = state.uncertain;
         state.ownership_anomalies.remove(&anomaly_key);
         state.unresolved_trade_match_times.remove(trade_key);
+        self.unresolved_trade_keys.remove(trade_key);
         state.verified_trade_replay_recoveries =
             state.verified_trade_replay_recoveries.saturating_add(1);
         recompute_reconciliation(&mut state, "authenticated terminal historical trade no-op");
@@ -8026,7 +8123,7 @@ impl SharedAccount {
         // has passed and before changing economics. The index has its own tiny
         // critical section and never touches the physical account ledger.
         {
-            let mut routes = self.trade_routes.write().unwrap();
+            let mut routes = self.trade_routes.write_shard(trade_key);
             match routes.get(trade_key) {
                 Some(owner) if owner != instance_id => return VirtualTradeAttempt::Fallback,
                 Some(_) => {}
@@ -8363,7 +8460,7 @@ impl SharedAccount {
         };
         let coid_scope = self.coid_routes.get(client_order_id);
         let oid_scope = self.oid_routes.get(&normalize_order_id(order_id));
-        let trade_scope = self.trade_routes.read().unwrap().get(trade_key).cloned();
+        let trade_scope = self.trade_routes.get(trade_key);
         let anomalous_trade = self
             .anomalous_trade_keys
             .read()
@@ -17185,6 +17282,90 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let trade = account.trade_ownership("trade-no-control").unwrap();
         assert_eq!(trade.client_order_id, "a-trade-no-control");
         assert_eq!(account.order("a-trade-no-control").unwrap().filled_quantity, 1.0);
+    }
+
+    #[test]
+    fn normal_trade_replay_anchor_miss_does_not_wait_for_control_gate() {
+        let account = Arc::new(seeded_account());
+        let control = account.lock_state();
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_account.resolve_unresolved_trade_match_time("ordinary-trade");
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(control);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn filled_retirement_readiness_does_not_wait_for_control_gate() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-filled-ready",
+                "oid-filled-ready",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert!(account
+            .apply_trade_transition_with_context(
+                "trade-filled-ready",
+                "MATCHED",
+                "a-filled-ready",
+                "oid-filled-ready",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                true,
+                123,
+            )
+            .ownership()
+            .is_some());
+        let control = account.lock_state();
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_account.filled_order_ready_for_retirement("a-filled-ready"))
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        drop(control);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn normal_status_update_does_not_wait_for_control_gate_and_survives_publish() {
+        let account = Arc::new(seeded_account());
+        account.reserve_order(
+            "a", "a-status-no-control", "oid-status-no-control", "UP",
+            Side::Buy, 1.0, 0.5, 0,
+        ).unwrap();
+        let control = account.lock_state();
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_account.mark_order_status_effective(
+                "a-status-no-control", OrderStatus::Accepted,
+            )).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(OrderStatus::Accepted),
+        );
+        drop(control);
+        worker.join().unwrap();
+        assert_eq!(
+            account.order("a-status-no-control").unwrap().status,
+            OrderStatus::Accepted,
+        );
     }
 
     #[test]
