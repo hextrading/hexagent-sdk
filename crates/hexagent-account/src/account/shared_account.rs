@@ -27,6 +27,7 @@ const QUOTE_CURRENCY_ATOMIC_UNIT: f64 = 1e-6;
 const RECONCILIATION_UNIT: f64 = 1e-6;
 const INITIAL_TOKEN_BARRIER_TIMEOUT_MS: u64 = 10_000;
 const MANUAL_RISK_BLOCKER: &str = "manual";
+const MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "maintenance_attribution:";
 const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
 const FEE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "fee_attribution:";
 /// Settled-event FIFO eviction may race a pinned gap replay by many hours.
@@ -7960,6 +7961,39 @@ impl SharedAccount {
         self.schedule_persist(&state);
     }
 
+    /// Keep a confirmed-chain/virtual-attribution failure owned by the exact
+    /// maintenance operation. A later proof may clear this source without
+    /// touching an unrelated manual or subsystem blocker.
+    pub fn mark_maintenance_attribution_uncertain(
+        &self,
+        operation_id: &str,
+        detail: impl Into<String>,
+    ) {
+        self.set_risk_blocker(
+            &format!("{MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX}{operation_id}"),
+            detail,
+        );
+    }
+
+    /// Remove only attribution blockers whose durable operation is already
+    /// Confirmed. This also migrates the precise legacy `manual` reason emitted
+    /// by older SDKs before maintenance blockers became operation-scoped.
+    pub fn repair_confirmed_maintenance_risk_blockers(&self) -> usize {
+        let mut state = self.lock_state();
+        let cleared = clear_confirmed_maintenance_risk_blockers(&mut state);
+        if cleared.is_empty() {
+            return 0;
+        }
+        let mut fast_sources = self.risk_blocker_sources_fast.write().unwrap();
+        for source in &cleared {
+            fast_sources.remove(source);
+        }
+        drop(fast_sources);
+        recompute_reconciliation(&mut state, "confirmed maintenance blocker recovery");
+        self.schedule_persist(&state);
+        cleared.len()
+    }
+
     pub fn pending_maintenance_operations(&self) -> Vec<MaintenanceOperation> {
         self.lock_state()
             .maintenance_ops
@@ -8145,6 +8179,13 @@ impl SharedAccount {
             operation.status = MaintenanceOperationStatus::Confirmed;
             operation.updated_at_ms = wall_clock_ms();
             operation.detail = None;
+        }
+        let cleared = clear_confirmed_maintenance_risk_blockers(&mut state);
+        if !cleared.is_empty() {
+            let mut fast_sources = self.risk_blocker_sources_fast.write().unwrap();
+            for source in cleared {
+                fast_sources.remove(&source);
+            }
         }
         recompute_reconciliation(&mut state, "confirmed maintenance operation");
         self.schedule_persist(&state);
@@ -10137,6 +10178,38 @@ fn has_unsettled_maintenance_operation(state: &SharedAccountState) -> bool {
                 | MaintenanceOperationStatus::Uncertain
         )
     })
+}
+
+fn clear_confirmed_maintenance_risk_blockers(state: &mut SharedAccountState) -> Vec<String> {
+    let confirmed: Vec<(&str, &str)> = state
+        .maintenance_ops
+        .values()
+        .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+        .map(|operation| (operation.operation_id.as_str(), operation.condition_id.as_str()))
+        .collect();
+    let mut cleared: Vec<String> = confirmed
+        .iter()
+        .map(|(operation_id, _)| {
+            format!("{MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX}{operation_id}")
+        })
+        .filter(|source| state.risk_blockers.remove(source).is_some())
+        .collect();
+
+    let legacy_manual_is_confirmed = state
+        .risk_blockers
+        .get(MANUAL_RISK_BLOCKER)
+        .is_some_and(|blocker| {
+            confirmed.iter().any(|(_, condition_id)| {
+                blocker.reason.starts_with(&format!(
+                    "confirmed maintenance split attribution failed cid={condition_id}: "
+                ))
+            })
+        });
+    if legacy_manual_is_confirmed {
+        state.risk_blockers.remove(MANUAL_RISK_BLOCKER);
+        cleared.push(MANUAL_RISK_BLOCKER.to_string());
+    }
+    cleared
 }
 
 fn fee_configs_equal(left: &TokenFeeConfig, right: &TokenFeeConfig) -> bool {
@@ -14959,6 +15032,46 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         // Recovery may observe the same terminal chain state more than once.
         account.confirm_maintenance_operation("split-op-1").unwrap();
         assert_eq!(account.monitoring_snapshot().physical_cash, 360.0);
+    }
+
+    #[test]
+    fn confirmed_maintenance_clears_only_its_attribution_blocker() {
+        let account = seeded_account();
+        account
+            .reserve_maintenance_operation(
+                "split-scoped",
+                MaintenanceOperationKind::Split,
+                "condition-scoped",
+                "UP-SCOPED",
+                "DOWN-SCOPED",
+                &HashMap::from([("a".into(), 10.0)]),
+            )
+            .unwrap();
+        account
+            .mark_maintenance_operation_submitted("split-scoped", "tx-scoped")
+            .unwrap();
+        account.mark_maintenance_attribution_uncertain(
+            "split-scoped",
+            "confirmed maintenance split attribution failed cid=condition-scoped: fixture",
+        );
+        assert!(account.is_uncertain());
+        account
+            .confirm_maintenance_operation("split-scoped")
+            .unwrap();
+        assert!(!account.is_uncertain());
+
+        // Reproduce the persisted blocker emitted by the old generic/manual
+        // call after the operation had already been confirmed.
+        account.mark_uncertain_with_reason(
+            "confirmed maintenance split attribution failed cid=condition-scoped: fixture",
+        );
+        assert!(account.is_uncertain());
+        assert_eq!(account.repair_confirmed_maintenance_risk_blockers(), 1);
+        assert!(!account.is_uncertain());
+
+        account.mark_uncertain_with_reason("independent operator risk hold");
+        assert_eq!(account.repair_confirmed_maintenance_risk_blockers(), 0);
+        assert!(account.is_uncertain());
     }
 
     #[test]
