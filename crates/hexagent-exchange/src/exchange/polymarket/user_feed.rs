@@ -35,6 +35,9 @@ const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 const FAILED_TRADE_DIAGNOSTIC_CAPACITY: usize = 4096;
 const TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY: usize = 32_768;
 const PERIODIC_GAP_RETRY_MAX_MS: u64 = 30_000;
+const HEALTHY_GAP_REPLAY_ACTIVE_MS: u64 = 10_000;
+const HEALTHY_GAP_REPLAY_IDLE_MS: u64 = 30_000;
+const HEALTHY_GAP_REPLAY_ACTIVITY_WINDOW_NS: u64 = 30_000_000_000;
 const PRIVATE_APPLY_QUEUE_CAPACITY: usize = 1024;
 const GAP_APPLY_BATCH_SIZE: usize = 16;
 
@@ -50,6 +53,22 @@ fn periodic_gap_retry_delay(base: Duration, failures: u32) -> Duration {
 
 fn periodic_gap_failure_reminder(attempt: u32) -> bool {
     attempt >= 4 && attempt.is_power_of_two()
+}
+
+fn adaptive_healthy_gap_replay_delay(
+    configured_fast: Duration,
+    now_ns: u64,
+    last_business_event_ns: u64,
+) -> Duration {
+    let recent_activity = last_business_event_ns > 0
+        && now_ns.saturating_sub(last_business_event_ns)
+            <= HEALTHY_GAP_REPLAY_ACTIVITY_WINDOW_NS;
+    let healthy_floor_ms = if recent_activity {
+        HEALTHY_GAP_REPLAY_ACTIVE_MS
+    } else {
+        HEALTHY_GAP_REPLAY_IDLE_MS
+    };
+    configured_fast.max(Duration::from_millis(healthy_floor_ms))
 }
 
 #[derive(Debug)]
@@ -249,26 +268,57 @@ fn enqueue_recovery_update(
                 update.client_order_id,
             )
         })?;
-    shared
+    let buffered = shared
         .user_feed_health
         .register_recovery_update(generation, &owner, &update)
         .map_err(|error| anyhow!(error))?;
-    update_tx
-        .send(update)
-        .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
+    if buffered {
+        Ok(())
+    } else {
+        update_tx
+            .send(update)
+            .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
+    }
 }
 
 async fn wait_for_recovery_delivery(
     shared: &SharedState,
     generation: u64,
+    update_tx: &Sender<OrderUpdate>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
-    let started = Instant::now();
+    let mut ready_started = None;
+    let mut startup_buffer_drained = false;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Err(anyhow!(
                 "shutdown while waiting for reconnect updates to drain"
             ));
+        }
+        let consumer_ready = shared.user_feed_health.strategy_consumer_ready();
+        if consumer_ready {
+            if ready_started.is_none() {
+                ready_started = Some(Instant::now());
+            }
+            if !startup_buffer_drained {
+                let buffered = shared
+                    .user_feed_health
+                    .take_startup_recovery_updates(generation)
+                    .map_err(|error| anyhow!(error))?;
+                let buffered_count = buffered.len();
+                for update in buffered {
+                    update_tx.send(update).map_err(|_| {
+                        anyhow!("order update channel closed while draining startup recovery")
+                    })?;
+                }
+                if buffered_count > 0 {
+                    info!(
+                        "[PolyUserFeed] released {} bounded startup replay update(s) to strategy consumer",
+                        buffered_count,
+                    );
+                }
+                startup_buffer_drained = true;
+            }
         }
         let Some((enrollment_finished, pending)) = shared
             .user_feed_health
@@ -278,16 +328,27 @@ async fn wait_for_recovery_delivery(
                 "reconnect delivery generation {generation} was superseded",
             ));
         };
-        if enrollment_finished && pending == 0 {
+        if consumer_ready && enrollment_finished && pending == 0 {
             return Ok(());
         }
-        if started.elapsed() >= RECOVERY_DELIVERY_TIMEOUT {
+        if ready_started.is_some_and(|started| started.elapsed() >= RECOVERY_DELIVERY_TIMEOUT) {
             return Err(anyhow!(
                 "timed out after {}ms waiting for {pending} replay update(s) to be processed",
                 RECOVERY_DELIVERY_TIMEOUT.as_millis(),
             ));
         }
-        sleep(Duration::from_millis(1)).await;
+        if consumer_ready {
+            sleep(Duration::from_millis(1)).await;
+        } else {
+            // Predictor/APV2 construction can take tens of seconds. Sleep on
+            // the one-shot publication edge instead of waking the private
+            // runtime every millisecond throughout startup; retain a bounded
+            // timeout only so shutdown is still observed promptly.
+            tokio::select! {
+                _ = shared.user_feed_health.wait_for_strategy_consumer_ready() => {}
+                _ = sleep(Duration::from_millis(100)) => {}
+            }
+        }
     }
 }
 
@@ -1361,6 +1422,17 @@ fn apply_private_batch(
         let terminal_to_remember = event.terminal_trade_key().filter(|_| {
             terminal_trade_is_durably_resolved(event.payload(), shared)
         });
+        let terminal_tokens = terminal_to_remember
+            .is_some()
+            .then(|| {
+                parsed
+                    .updates
+                    .iter()
+                    .filter(|update| !update.symbol.is_empty())
+                    .map(|update| update.symbol.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         for update in parsed.updates {
             dispatch_private_update(shared, update_tx, recovery_generation, update)?;
         }
@@ -1369,9 +1441,15 @@ fn apply_private_batch(
             // strategy update was delivered. A delivery failure must remain
             // replayable even though the account ledger is idempotent.
             remember_replay_lifecycle(shared.account_state.account_id(), event.payload());
-            shared.request_settled_gc();
         }
         if let Some(key) = terminal_to_remember {
+            // Only a newly durable terminal edge can make a zero-reference
+            // settled event collectible. MATCHED/MINED pushes and replayed
+            // no-ops used to wake the cold account GC for every raw trade,
+            // creating the 30-100ms account-apply/Cancel tail seen in live.
+            for token in terminal_tokens {
+                shared.request_settled_gc_for_token(&token);
+            }
             remember_terminal_gap_replay(shared.account_state.account_id(), &key);
         }
         applied = applied.saturating_add(1);
@@ -2445,7 +2523,13 @@ async fn user_feed_loop(
                             );
                             }
                             consecutive_failures = 0;
-                            next_delay = interval;
+                            let (_, last_business_event_ns) =
+                                shared.user_feed_health.activity_timestamps_ns();
+                            next_delay = adaptive_healthy_gap_replay_delay(
+                                interval,
+                                now_ns(),
+                                last_business_event_ns,
+                            );
                             periodic_checkpoint = None;
                             shared.user_feed_health.set_gap_replay_degraded(false);
                         }
@@ -2633,7 +2717,13 @@ async fn user_feed_loop(
                     continue;
                 }
                 if let Err(error) =
-                    wait_for_recovery_delivery(&shared, recovery_generation, &shutdown).await
+                    wait_for_recovery_delivery(
+                        &shared,
+                        recovery_generation,
+                        &update_tx,
+                        &shutdown,
+                    )
+                    .await
                 {
                     shared.user_feed_health.set_recovering(true);
                     let delay = backoff.next_delay();
@@ -2988,6 +3078,31 @@ mod tests {
             .filter(|attempt| periodic_gap_failure_reminder(*attempt))
             .collect();
         assert_eq!(reminders, vec![4, 8, 16]);
+    }
+
+    #[test]
+    fn healthy_gap_replay_adapts_to_private_activity_without_ignoring_config() {
+        let now = 100_000_000_000;
+        assert_eq!(
+            adaptive_healthy_gap_replay_delay(
+                Duration::from_secs(2),
+                now,
+                now - 1_000_000_000,
+            ),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            adaptive_healthy_gap_replay_delay(
+                Duration::from_secs(2),
+                now,
+                now - 31_000_000_000,
+            ),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            adaptive_healthy_gap_replay_delay(Duration::from_secs(45), now, now),
+            Duration::from_secs(45),
+        );
     }
 
     fn test_shared() -> Arc<SharedState> {
@@ -3498,6 +3613,12 @@ mod tests {
             &shared,
         );
         assert_eq!(updates.len(), 1);
+        let cleanup_deadline = Instant::now() + Duration::from_millis(100);
+        while shared.open_orders.lock().unwrap().contains_key("owner-1")
+            && Instant::now() < cleanup_deadline
+        {
+            std::thread::yield_now();
+        }
         assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
         assert_eq!(
             shared

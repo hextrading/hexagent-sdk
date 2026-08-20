@@ -2306,6 +2306,11 @@ pub struct SharedAccount {
     /// Successful ordinary events can skip the account-wide reconciliation
     /// lock unless their own key is known to need repair.
     anomalous_private_event_keys: RwLock<HashSet<String>>,
+    /// Read-mostly membership mirror for sticky risk blockers.  Normal
+    /// private fills clear a trade-scoped blocker defensively even though one
+    /// was almost never installed.  Missing in this set is authoritative, so
+    /// that common no-op never materialises/clones the aggregate account.
+    risk_blocker_sources_fast: RwLock<HashSet<String>>,
     /// Only trade ids whose replay watermark still needs cold-ledger repair
     /// are present. A normal private fill therefore misses in one route shard
     /// instead of taking `control_gate` and cloning/publishing the full
@@ -2333,6 +2338,16 @@ pub struct SharedAccount {
     /// monitoring data must not walk tens of thousands of tombstones while
     /// holding the account-wide control/state lock.
     retired_trade_tombstone_count_fast: AtomicUsize,
+    /// Empty settled-audit references that may be ready for terminal-history
+    /// retirement.  Keeping this worklist separate from the durable map means
+    /// a GC wakeup never scans every historical event merely to discover that
+    /// no cleanup is pending.
+    settled_gc_candidates: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    settled_gc_candidate_count_fast: AtomicUsize,
+    /// Lock-free token membership snapshot for the terminal private-event
+    /// path. Candidate publication is rare and runs outside account apply;
+    /// terminal trade messages only load this immutable set.
+    settled_gc_candidate_tokens_fast: ArcSwap<HashSet<String>>,
     persistence: Option<AccountPersistence>,
     /// Highest account-persistence generation containing a trade mutation.
     /// Trade ingestion never waits for this generation: subsequent admission
@@ -2471,6 +2486,7 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            risk_blocker_sources_fast: RwLock::new(HashSet::new()),
             unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
@@ -2486,6 +2502,9 @@ impl SharedAccount {
             uncertain_reason_fast: ArcSwapOption::empty(),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(0),
+            settled_gc_candidates: Mutex::new(BTreeMap::new()),
+            settled_gc_candidate_count_fast: AtomicUsize::new(0),
+            settled_gc_candidate_tokens_fast: ArcSwap::from_pointee(HashSet::new()),
             persistence: None,
             trade_persistence_pending_generation: AtomicU64::new(0),
             trade_persistence_blocker_active: AtomicBool::new(false),
@@ -2742,6 +2761,20 @@ impl SharedAccount {
             .count();
         let initial_unresolved_trade_keys: Vec<String> =
             state.unresolved_trade_match_times.keys().cloned().collect();
+        let initial_risk_blocker_sources = state.risk_blockers.keys().cloned().collect();
+        let initial_settled_gc_candidates: BTreeMap<String, BTreeSet<String>> = state
+            .settled_audit_references
+            .iter()
+            .filter(|(_, reference)| reference.instances.is_empty())
+            .map(|(condition_id, reference)| {
+                (condition_id.clone(), reference.asset_ids.clone())
+            })
+            .collect();
+        let initial_settled_gc_candidate_count = initial_settled_gc_candidates.len();
+        let initial_settled_gc_candidate_tokens = initial_settled_gc_candidates
+            .values()
+            .flat_map(|tokens| tokens.iter().cloned())
+            .collect();
         let initial_settled_generation =
             Self::effective_settled_token_values_generation(&state);
         let initial_settled_values = state.settled_token_values.clone();
@@ -2762,6 +2795,7 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
@@ -2779,6 +2813,13 @@ impl SharedAccount {
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(
                 initial_retired_trade_tombstones,
+            ),
+            settled_gc_candidates: Mutex::new(initial_settled_gc_candidates),
+            settled_gc_candidate_count_fast: AtomicUsize::new(
+                initial_settled_gc_candidate_count,
+            ),
+            settled_gc_candidate_tokens_fast: ArcSwap::from_pointee(
+                initial_settled_gc_candidate_tokens,
             ),
             persistence: Some(persistence),
             trade_persistence_pending_generation: AtomicU64::new(0),
@@ -4567,41 +4608,46 @@ impl SharedAccount {
         asset_ids: &[String],
     ) -> Result<(), ReservationError> {
         let normalized = validate_settled_audit_identity(instance_id, condition_id, asset_ids)?;
-        let mut state = self.lock_state();
-        if !state.instances.contains_key(instance_id) {
-            return Err(ReservationError::UnknownInstance(instance_id.to_string()));
-        }
-        match state.settled_audit_references.get_mut(condition_id) {
-            Some(reference) => {
-                if reference.asset_ids != normalized {
-                    return Err(ReservationError::InvalidOrder(format!(
-                        "settled audit token identity changed for condition `{condition_id}`",
-                    )));
+        {
+            let mut state = self.lock_state();
+            if !state.instances.contains_key(instance_id) {
+                return Err(ReservationError::UnknownInstance(instance_id.to_string()));
+            }
+            match state.settled_audit_references.get_mut(condition_id) {
+                Some(reference) => {
+                    if reference.asset_ids != normalized {
+                        return Err(ReservationError::InvalidOrder(format!(
+                            "settled audit token identity changed for condition `{condition_id}`",
+                        )));
+                    }
+                    reference.instances.insert(instance_id.to_string());
                 }
-                reference.instances.insert(instance_id.to_string());
+                None => {
+                    state.settled_audit_references.insert(
+                        condition_id.to_string(),
+                        SettledAuditReference {
+                            condition_id: condition_id.to_string(),
+                            asset_ids: normalized,
+                            instances: BTreeSet::from([instance_id.to_string()]),
+                        },
+                    );
+                }
             }
-            None => {
-                state.settled_audit_references.insert(
-                    condition_id.to_string(),
-                    SettledAuditReference {
-                        condition_id: condition_id.to_string(),
-                        asset_ids: normalized,
-                        instances: BTreeSet::from([instance_id.to_string()]),
-                    },
-                );
-            }
+            let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+                let mut changes = Vec::with_capacity(1);
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "settled_audit_references",
+                    condition_id,
+                    state.settled_audit_references.get(condition_id),
+                )?;
+                Ok(changes)
+            })();
+            self.schedule_typed_persist(&state, changes);
         }
-        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::with_capacity(1);
-            persistence_wal_map_entry(
-                &mut changes,
-                "settled_audit_references",
-                condition_id,
-                state.settled_audit_references.get(condition_id),
-            )?;
-            Ok(changes)
-        })();
-        self.schedule_typed_persist(&state, changes);
+        let mut candidates = self.settled_gc_candidates.lock().unwrap();
+        candidates.remove(condition_id);
+        self.publish_settled_gc_candidates(&candidates);
         Ok(())
     }
 
@@ -4614,30 +4660,42 @@ impl SharedAccount {
         asset_ids: &[String],
     ) -> Result<(), ReservationError> {
         let normalized = validate_settled_audit_identity(instance_id, condition_id, asset_ids)?;
-        let mut state = self.lock_state();
-        let Some(reference) = state.settled_audit_references.get_mut(condition_id) else {
-            // A failed-event eviction never entered the settled FIFO. Keep this
-            // idempotent and conservative: instance-scoped rows are still pruned
-            // by the caller, but no account-global history is destroyed.
-            return Ok(());
+        let candidate_tokens = {
+            let mut state = self.lock_state();
+            let Some(reference) = state.settled_audit_references.get_mut(condition_id) else {
+                // A failed-event eviction never entered the settled FIFO. Keep this
+                // idempotent and conservative: instance-scoped rows are still pruned
+                // by the caller, but no account-global history is destroyed.
+                return Ok(());
+            };
+            if reference.asset_ids != normalized {
+                return Err(ReservationError::InvalidOrder(format!(
+                    "settled audit retirement token mismatch for condition `{condition_id}`",
+                )));
+            }
+            reference.instances.remove(instance_id);
+            let candidate_tokens = reference
+                .instances
+                .is_empty()
+                .then(|| reference.asset_ids.clone());
+            let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+                let mut changes = Vec::with_capacity(1);
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "settled_audit_references",
+                    condition_id,
+                    state.settled_audit_references.get(condition_id),
+                )?;
+                Ok(changes)
+            })();
+            self.schedule_typed_persist(&state, changes);
+            candidate_tokens
         };
-        if reference.asset_ids != normalized {
-            return Err(ReservationError::InvalidOrder(format!(
-                "settled audit retirement token mismatch for condition `{condition_id}`",
-            )));
+        if let Some(candidate_tokens) = candidate_tokens {
+            let mut candidates = self.settled_gc_candidates.lock().unwrap();
+            candidates.insert(condition_id.to_string(), candidate_tokens);
+            self.publish_settled_gc_candidates(&candidates);
         }
-        reference.instances.remove(instance_id);
-        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::with_capacity(1);
-            persistence_wal_map_entry(
-                &mut changes,
-                "settled_audit_references",
-                condition_id,
-                state.settled_audit_references.get(condition_id),
-            )?;
-            Ok(changes)
-        })();
-        self.schedule_typed_persist(&state, changes);
         Ok(())
     }
 
@@ -4647,19 +4705,50 @@ impl SharedAccount {
     /// account control lock.
     pub fn finalize_ready_settled_audit_retirements(&self) -> Vec<HashSet<String>> {
         const SETTLED_GC_EVENTS_PER_BATCH: usize = 4;
+        // Keep candidates published while the cold check runs. A terminal
+        // trade racing this transaction can then still enqueue a follow-up
+        // wake; removing a claimed key up front created a missed-wakeup gap.
+        let claimed: Vec<String> = self
+            .settled_gc_candidates
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        if claimed.is_empty() {
+            return Vec::new();
+        }
         let mut state = self.lock_state();
-        let ready: Vec<(String, HashSet<String>)> = state
-            .settled_audit_references
-            .iter()
-            .filter(|(_, reference)| reference.instances.is_empty())
-            .filter_map(|(condition_id, reference)| {
+        let mut inactive = Vec::new();
+        let ready: Vec<(String, HashSet<String>)> = claimed
+            .into_iter()
+            .filter_map(|condition_id| {
+                let Some(reference) = state.settled_audit_references.get(&condition_id) else {
+                    inactive.push(condition_id);
+                    return None;
+                };
+                if !reference.instances.is_empty() {
+                    inactive.push(condition_id);
+                    return None;
+                }
                 let tokens: HashSet<String> = reference.asset_ids.iter().cloned().collect();
-                (!settled_audit_has_revisable_rows(&state, &tokens))
-                    .then(|| (condition_id.clone(), tokens))
+                if settled_audit_has_revisable_rows(&state, &tokens) {
+                    None
+                } else {
+                    Some((condition_id, tokens))
+                }
             })
             .take(SETTLED_GC_EVENTS_PER_BATCH)
             .collect();
         if ready.is_empty() {
+            drop(state);
+            if !inactive.is_empty() {
+                let mut candidates = self.settled_gc_candidates.lock().unwrap();
+                for condition_id in inactive {
+                    candidates.remove(&condition_id);
+                }
+                self.publish_settled_gc_candidates(&candidates);
+            }
             return Vec::new();
         }
         let mut retired = Vec::with_capacity(ready.len());
@@ -4668,7 +4757,8 @@ impl SharedAccount {
         for (condition_id, tokens) in ready {
             outcomes.push(prune_terminal_history_locked(&mut state, None, &tokens));
             state.settled_audit_references.remove(&condition_id);
-            retired_conditions.push(condition_id);
+            retired_conditions.push(condition_id.clone());
+            inactive.push(condition_id);
             retired.push(tokens);
         }
         self.retired_trade_tombstone_count_fast.store(
@@ -4676,7 +4766,42 @@ impl SharedAccount {
             Ordering::Relaxed,
         );
         self.schedule_settled_prune_persist(&state, &outcomes, &retired_conditions);
+        drop(state);
+        if !inactive.is_empty() {
+            let mut candidates = self.settled_gc_candidates.lock().unwrap();
+            for condition_id in inactive {
+                candidates.remove(&condition_id);
+            }
+            self.publish_settled_gc_candidates(&candidates);
+        }
         retired
+    }
+
+    /// Cheap edge used by the exchange worker before sending a coalesced GC
+    /// wakeup. An acquire load replaces the previous account-wide scan on
+    /// every private trade lifecycle message.
+    pub fn has_settled_gc_candidates(&self) -> bool {
+        self.settled_gc_candidate_count_fast.load(Ordering::Acquire) > 0
+    }
+
+    pub fn has_settled_gc_candidate_for_token(&self, token_id: &str) -> bool {
+        !token_id.is_empty()
+            && self.has_settled_gc_candidates()
+            && self.settled_gc_candidate_tokens_fast.load().contains(token_id)
+    }
+
+    fn publish_settled_gc_candidates(
+        &self,
+        candidates: &BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let tokens = candidates
+            .values()
+            .flat_map(|candidate_tokens| candidate_tokens.iter().cloned())
+            .collect();
+        self.settled_gc_candidate_tokens_fast
+            .store(Arc::new(tokens));
+        self.settled_gc_candidate_count_fast
+            .store(candidates.len(), Ordering::Release);
     }
 
     /// Validate the final configured membership after every instance sharing
@@ -5305,6 +5430,10 @@ impl SharedAccount {
                 since_ms,
             },
         );
+        self.risk_blocker_sources_fast
+            .write()
+            .unwrap()
+            .insert(source.to_string());
         set_uncertain(&mut state, format!("{source}: {reason}"));
         self.schedule_persist(&state);
     }
@@ -5313,10 +5442,28 @@ impl SharedAccount {
     /// derived account invariant. Callers cannot accidentally reopen admission
     /// for a different source.
     pub fn clear_risk_blocker(&self, source: &str) -> bool {
-        let mut state = self.lock_state();
-        if state.risk_blockers.remove(source.trim()).is_none() {
+        let source = source.trim();
+        if source.is_empty()
+            || !self
+                .risk_blocker_sources_fast
+                .read()
+                .unwrap()
+                .contains(source)
+        {
             return false;
         }
+        let mut state = self.lock_state();
+        if state.risk_blockers.remove(source).is_none() {
+            self.risk_blocker_sources_fast
+                .write()
+                .unwrap()
+                .remove(source);
+            return false;
+        }
+        self.risk_blocker_sources_fast
+            .write()
+            .unwrap()
+            .remove(source);
         recompute_reconciliation(&mut state, "risk blocker cleared");
         self.schedule_persist(&state);
         true
@@ -9385,6 +9532,24 @@ impl SharedAccount {
         if trade_key.is_empty() {
             return None;
         }
+        if let Some(instance_id) = self.trade_routes.get(trade_key) {
+            if let Some(account) = self.virtual_account(&instance_id) {
+                if let Some(ownership) = account
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .trades
+                    .get(trade_key)
+                    .map(|trade| trade.ownership.clone())
+                {
+                    return Some(ownership);
+                }
+            }
+        }
+        // Compacted terminal rows intentionally no longer live in an
+        // instance shard. Only that historical tombstone fallback pays for a
+        // cold aggregate transaction; ordinary terminal private updates are
+        // served by the route + one lifecycle shard above.
         let state = self.lock_state();
         state
             .trades
@@ -12989,6 +13154,18 @@ mod tests {
             before,
             "owned fills must remain entirely on the instance shard",
         );
+        assert_eq!(
+            account
+                .trade_ownership("trade-sharded-fill")
+                .unwrap()
+                .instance_id,
+            "a",
+        );
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            before,
+            "active trade ownership lookups must remain on the routed shard",
+        );
         let restored = account.restored_trades_for_instance_tokens(
             "a",
             &HashSet::from(["UP".to_string()]),
@@ -14006,6 +14183,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         account
             .release_settled_event_audit("a", "condition", &["UP".to_string()])
             .unwrap();
+        assert!(!account.has_settled_gc_candidates());
         assert!(account
             .finalize_ready_settled_audit_retirements()
             .is_empty());
@@ -14019,10 +14197,14 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         account
             .release_settled_event_audit("b", "condition", &["UP".to_string()])
             .unwrap();
+        assert!(account.has_settled_gc_candidates());
+        assert!(account.has_settled_gc_candidate_for_token("UP"));
+        assert!(!account.has_settled_gc_candidate_for_token("DOWN"));
         assert_eq!(
             account.finalize_ready_settled_audit_retirements(),
             vec![HashSet::from(["UP".to_string()])],
         );
+        assert!(!account.has_settled_gc_candidates());
         let state = account.lock_state();
         assert!(!state.token_fee_configs.contains_key("UP"));
         assert!(!state.settled_audit_references.contains_key("condition"));
@@ -15242,6 +15424,13 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     #[test]
     fn subsystem_risk_blocker_survives_unrelated_reconciliation() {
         let account = seeded_account();
+        let before_noop = account.account_lock_acquisitions.load(Ordering::Relaxed);
+        assert!(!account.clear_risk_blocker("fee_attribution:absent"));
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            before_noop,
+            "ordinary trade-scoped blocker clears must stay off the cold account lock",
+        );
         account.set_risk_blocker("sidecar_persistence:maker", "sidecar fsync failed");
         assert!(account.is_uncertain());
         account

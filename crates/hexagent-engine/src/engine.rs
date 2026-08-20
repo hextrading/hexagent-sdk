@@ -2779,6 +2779,15 @@ impl Engine {
             Some(shutdown_done_rx),
         );
 
+        // Strategy construction may spend seconds warming predictors while
+        // the authenticated private feed is already replaying. Release each
+        // account's bounded startup buffer only after the update router and
+        // strategy workers exist; recovery timeout accounting starts at this
+        // edge rather than at socket authentication.
+        for (_, shared) in Self::dedup_states_by_account(&poly_states) {
+            shared.user_feed_health.mark_strategy_consumer_ready();
+        }
+
         // Strategy construction performs prediction/APV2 warm-up
         // synchronously. Subscribe only after it returns: otherwise the
         // bounded market queue can fill while no consumer exists, block CLOB
