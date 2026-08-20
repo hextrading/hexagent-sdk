@@ -5,6 +5,7 @@
 //! wallet: physical funds/positions are the hard ceiling, while each
 //! instance's weighted virtual balance/inventory is its private ceiling.
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -222,6 +223,16 @@ pub struct InstanceAccountSnapshot {
     pub positions: HashMap<String, f64>,
     pub reserved_cash: f64,
     pub reserved_positions: HashMap<String, f64>,
+}
+
+/// Immutable, lock-free view of account-wide authoritative binary outcomes.
+/// Writers publish a new `Arc` only when the generation advances; quote and
+/// watchdog callbacks therefore never enter the aggregate account lock merely
+/// to compare settlement generations.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SettledTokenValuesSnapshot {
+    pub generation: u64,
+    pub values: HashMap<String, f64>,
 }
 
 /// Durable checkpoint for a strategy-owned sidecar whose file is committed
@@ -2310,6 +2321,13 @@ pub struct SharedAccount {
     uncertain_fast: AtomicBool,
     admission_fast: AtomicBool,
     passive_admission_fast: AtomicBool,
+    /// Monotonic for one process: once the startup wallet snapshot is applied,
+    /// hot readiness checks remain a single acquire load until restart.
+    startup_snapshot_applied_fast: AtomicBool,
+    /// Account-wide outcome map published by the cold control plane.
+    settled_token_values_fast: ArcSwap<SettledTokenValuesSnapshot>,
+    settled_token_values_generation_fast: AtomicU64,
+    uncertain_reason_fast: ArcSwapOption<String>,
     ledger_generation_fast: AtomicU64,
     /// Cached after startup and every settled-history GC transaction. Reading
     /// monitoring data must not walk tens of thousands of tombstones while
@@ -2388,10 +2406,50 @@ impl Drop for AccountStateGuard<'_> {
         self.account
             .account_lock_hold_max_us
             .fetch_max(hold_us, Ordering::Relaxed);
+        self.account.publish_control_snapshots(&self.state);
     }
 }
 
 impl SharedAccount {
+    fn effective_settled_token_values_generation(state: &SharedAccountState) -> u64 {
+        if state.settled_token_values.is_empty() {
+            state.settled_token_values_generation
+        } else {
+            // Ledgers written before this field existed load it as zero.
+            state.settled_token_values_generation.max(1)
+        }
+    }
+
+    /// Publish read-mostly control state after a cold transaction. This runs
+    /// while the transaction still owns the state guard, so readers observing
+    /// a new generation also observe the matching immutable values map.
+    fn publish_control_snapshots(&self, state: &SharedAccountState) {
+        self.startup_snapshot_applied_fast.store(
+            state.startup_snapshot_applied_this_process,
+            Ordering::Release,
+        );
+        let current_reason = self.uncertain_reason_fast.load_full();
+        if current_reason.as_deref().map(String::as_str) != state.uncertain_reason.as_deref() {
+            self.uncertain_reason_fast
+                .store(state.uncertain_reason.clone().map(Arc::new));
+        }
+        let generation = Self::effective_settled_token_values_generation(state);
+        if self
+            .settled_token_values_generation_fast
+            .load(Ordering::Acquire)
+            != generation
+        {
+            self.settled_token_values_fast.store(Arc::new(
+                SettledTokenValuesSnapshot {
+                    generation,
+                    values: state.settled_token_values.clone(),
+                },
+            ));
+            self.settled_token_values_generation_fast
+                .store(generation, Ordering::Release);
+        }
+    }
+
     #[inline]
     fn mark_virtual_fee_pending(&self) {
         self.uncertain_fast.store(true, Ordering::Release);
@@ -2420,6 +2478,12 @@ impl SharedAccount {
             uncertain_fast: AtomicBool::new(false),
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
+            startup_snapshot_applied_fast: AtomicBool::new(false),
+            settled_token_values_fast: ArcSwap::from_pointee(
+                SettledTokenValuesSnapshot::default(),
+            ),
+            settled_token_values_generation_fast: AtomicU64::new(0),
+            uncertain_reason_fast: ArcSwapOption::empty(),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(0),
             persistence: None,
@@ -2678,6 +2742,9 @@ impl SharedAccount {
             .count();
         let initial_unresolved_trade_keys: Vec<String> =
             state.unresolved_trade_match_times.keys().cloned().collect();
+        let initial_settled_generation =
+            Self::effective_settled_token_values_generation(&state);
+        let initial_settled_values = state.settled_token_values.clone();
         let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
@@ -2702,6 +2769,13 @@ impl SharedAccount {
             uncertain_fast: AtomicBool::new(false),
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
+            startup_snapshot_applied_fast: AtomicBool::new(false),
+            settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot {
+                generation: initial_settled_generation,
+                values: initial_settled_values,
+            }),
+            settled_token_values_generation_fast: AtomicU64::new(initial_settled_generation),
+            uncertain_reason_fast: ArcSwapOption::empty(),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(
                 initial_retired_trade_tombstones,
@@ -4676,18 +4750,66 @@ impl SharedAccount {
         }
     }
 
+    /// Apply one event's authoritative outcomes and retire its token-interest
+    /// scope in a single ordered control-plane transaction. Strategy callbacks
+    /// enqueue this operation; the account worker owns aggregate mutation,
+    /// reconciliation and persistence.
+    pub fn record_settlement_and_retire(
+        &self,
+        instance_id: &str,
+        condition_id: &str,
+        values: &HashMap<String, f64>,
+    ) -> Result<(), ReservationError> {
+        if instance_id.trim().is_empty() || condition_id.trim().is_empty() {
+            return Err(ReservationError::InvalidOrder(
+                "settlement mutation requires instance and condition identifiers".into(),
+            ));
+        }
+        let mut state = self.lock_state();
+        if !state.instances.contains_key(instance_id) {
+            return Err(ReservationError::UnknownInstance(instance_id.to_string()));
+        }
+        let effective_generation = Self::effective_settled_token_values_generation(&state);
+        let mut changed = false;
+        for (token, value) in values {
+            if !token.is_empty()
+                && value.is_finite()
+                && (*value == 0.0 || *value == 1.0)
+                && state.settled_token_values.get(token) != Some(value)
+            {
+                state.settled_token_values.insert(token.clone(), *value);
+                changed = true;
+            }
+        }
+        if changed {
+            state.settled_token_values_generation = effective_generation.saturating_add(1).max(1);
+            try_attribute_binary_redeem(&mut state);
+        }
+        if let Some(interest) = state
+            .instances
+            .get_mut(instance_id)
+            .and_then(|instance| instance.token_interests.get_mut(condition_id))
+        {
+            interest.retire_after_ms = Some(wall_clock_ms().saturating_add(10 * 60 * 1000));
+            changed = true;
+        }
+        if changed {
+            self.schedule_persist(&state);
+        }
+        Ok(())
+    }
+
     /// Account-wide authoritative outcome snapshot. Strategies compare the
-    /// generation before cloning the map, then revise active and retained
-    /// settled event baselines.
+    /// generation before revising active and retained settled-event baselines.
+    /// Kept for compatibility; latency-sensitive callers should retain the
+    /// `Arc` returned by [`Self::settled_token_values_snapshot_arc`].
     pub fn settled_token_values_snapshot(&self) -> (u64, HashMap<String, f64>) {
-        let state = self.lock_state();
-        let generation = if state.settled_token_values.is_empty() {
-            state.settled_token_values_generation
-        } else {
-            // Ledgers written before this field existed load it as zero.
-            state.settled_token_values_generation.max(1)
-        };
-        (generation, state.settled_token_values.clone())
+        let snapshot = self.settled_token_values_snapshot_arc();
+        (snapshot.generation, snapshot.values.clone())
+    }
+
+    pub fn settled_token_values_snapshot_arc(&self) -> Arc<SettledTokenValuesSnapshot> {
+        self.settled_token_values_fast.load_full()
     }
 
     /// Persist the exchange fee curve for every outcome token in one event.
@@ -4966,7 +5088,7 @@ impl SharedAccount {
         self.seeded_fast.load(Ordering::Acquire)
     }
     pub fn startup_snapshot_applied(&self) -> bool {
-        self.lock_state().startup_snapshot_applied_this_process
+        self.startup_snapshot_applied_fast.load(Ordering::Acquire)
     }
 
     /// Attribute only a proven 1:1 platform redemption. This deliberately
@@ -5107,6 +5229,14 @@ impl SharedAccount {
             .and_then(AccountPersistence::last_error)
             .is_some()
             || self.uncertain_fast.load(Ordering::Acquire)
+    }
+
+    /// Lock-free diagnostic reason paired with the most recently published
+    /// control transaction. Admission decisions use dedicated atomics; this
+    /// view is for logging/monitoring and must never force quote callbacks to
+    /// materialize the aggregate ledger.
+    pub fn uncertain_reason_snapshot(&self) -> Option<Arc<String>> {
+        self.uncertain_reason_fast.load_full()
     }
 
     /// True when every current admission failure is limited to delayed fee
@@ -9294,6 +9424,63 @@ impl SharedAccount {
             .collect()
     }
 
+    /// Return only one instance's trades for a bounded token scope. Seed and
+    /// fee-rebuild workers use this instead of cloning/scanning the aggregate
+    /// account ledger; the lookup takes only the instance lifecycle shard.
+    pub fn restored_trades_for_instance_tokens(
+        &self,
+        instance_id: &str,
+        token_ids: &HashSet<String>,
+    ) -> Vec<RestoredTrade> {
+        if instance_id.trim().is_empty() || token_ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(account) = self.virtual_account(instance_id) else {
+            return Vec::new();
+        };
+        let lifecycle = account.lifecycle.lock().unwrap();
+        lifecycle
+            .trades
+            .values()
+            .filter(|trade| token_ids.contains(&trade.ownership.token_id))
+            .filter_map(|trade| {
+                Some(RestoredTrade {
+                    ownership: trade.ownership.clone(),
+                    booked: trade.booked,
+                    usdc_fee: if trade.virtual_fee_booked {
+                        trade.usdc_fee
+                    } else {
+                        0.0
+                    },
+                    shares_fee: if trade.virtual_fee_booked {
+                        trade.shares_fee
+                    } else {
+                        0.0
+                    },
+                    virtual_fee_booked: trade.virtual_fee_booked,
+                    is_maker: trade.is_maker?,
+                    match_time_secs: trade.match_time_secs,
+                    ledger_generation: trade.ledger_generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Exact, instance-sharded generation lookup for one private trade.
+    /// Unlike `restored_trades`, this never materializes the aggregate account
+    /// or clones unrelated trade rows.
+    pub fn trade_ledger_generation(&self, instance_id: &str, trade_key: &str) -> Option<u64> {
+        if instance_id.trim().is_empty() || trade_key.trim().is_empty() {
+            return None;
+        }
+        let account = self.virtual_account(instance_id)?;
+        let lifecycle = account.lifecycle.lock().unwrap();
+        lifecycle
+            .trades
+            .get(trade_key)
+            .map(|trade| trade.ledger_generation)
+    }
+
     /// Bound the durable per-event ownership history after the executor's
     /// late-fill mapping grace has elapsed. Potentially-live/FAILED orders and
     /// nonterminal trades are retained; only fully terminal rows for the
@@ -12802,6 +12989,17 @@ mod tests {
             before,
             "owned fills must remain entirely on the instance shard",
         );
+        let restored = account.restored_trades_for_instance_tokens(
+            "a",
+            &HashSet::from(["UP".to_string()]),
+        );
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].ownership.trade_key, "trade-sharded-fill");
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            before,
+            "scoped trade restore must not fall back to the aggregate ledger",
+        );
     }
 
     #[test]
@@ -15444,6 +15642,34 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             );
         }
         remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn read_mostly_control_snapshots_do_not_take_the_account_lock() {
+        let account = SharedAccount::new("lock-free-control-snapshots");
+        {
+            let mut state = account.lock_state();
+            state.startup_snapshot_applied_this_process = true;
+            state.uncertain_reason = Some("test blocker".to_string());
+            state
+                .settled_token_values
+                .insert("winner-token".to_string(), 1.0);
+            state.settled_token_values_generation = 7;
+        }
+        let acquisitions = account.account_lock_acquisitions.load(Ordering::Acquire);
+
+        assert!(account.startup_snapshot_applied());
+        assert_eq!(
+            account.uncertain_reason_snapshot().as_deref().map(String::as_str),
+            Some("test blocker"),
+        );
+        let outcomes = account.settled_token_values_snapshot_arc();
+        assert_eq!(outcomes.generation, 7);
+        assert_eq!(outcomes.values.get("winner-token"), Some(&1.0));
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Acquire),
+            acquisitions,
+        );
     }
 
     fn remove_persistence_test_files(path: &Path) {
