@@ -3847,13 +3847,24 @@ pub fn recover_registered_account_maintenance_operations(
     if account_id.trim().is_empty() {
         return Err(anyhow!("maintenance recovery requires account_id"));
     }
+    let repaired_blockers = account.repair_confirmed_maintenance_risk_blockers();
+    if repaired_blockers > 0 {
+        account
+            .flush_persistence(std::time::Duration::from_secs(2))
+            .map_err(anyhow::Error::msg)?;
+        log::info!(
+            "[Maintenance] cleared {} attribution blocker(s) backed by confirmed operations account={}",
+            repaired_blockers,
+            account_id,
+        );
+    }
     let pending = account.pending_maintenance_operations().len();
     if pending == 0 {
-        return Ok(0);
+        return Ok(repaired_blockers);
     }
     let wallet = load_wallet_for_account(account_id)?;
     recover_pending_maintenance_operations(&wallet, account).map_err(anyhow::Error::msg)?;
-    Ok(pending)
+    Ok(pending.saturating_add(repaired_blockers))
 }
 
 /// Run one splitPosition for `condition_id` with `amount_usdc` USDC → equal
@@ -5266,9 +5277,12 @@ fn run_maintenance_job(
                                     "[Maintenance] On-chain split confirmed but virtual allocation failed account={} cid={}: {}",
                                     account_id, cid, error,
                                 );
-                                account.mark_uncertain_with_reason(format!(
-                                    "confirmed maintenance split attribution failed cid={cid}: {error}"
-                                ));
+                                account.mark_maintenance_attribution_uncertain(
+                                    &operation_id,
+                                    format!(
+                                        "confirmed maintenance split attribution failed cid={cid}: {error}"
+                                    ),
+                                );
                                 account.mark_maintenance_operation_uncertain(
                                     &operation_id,
                                     format!("on-chain confirmed; virtual allocation uncertain: {error}"),
