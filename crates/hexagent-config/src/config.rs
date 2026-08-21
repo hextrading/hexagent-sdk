@@ -47,6 +47,18 @@ pub struct OsTuneConfig {
     /// other latency-critical role.
     #[serde(default)]
     pub allow_background_on_execution_core: bool,
+    /// Allow the short FIFO strategy-router thread to share
+    /// `execution_core`. Per-instance strategy workers remain independently
+    /// pinned by `strategy_cores`; this opt-in only consolidates the router
+    /// and signal dispatcher on core-constrained production hosts.
+    #[serde(default)]
+    pub allow_strategy_router_on_execution_core: bool,
+    /// Allow a FIFO private-account owner to share only a configured
+    /// Polymarket completion core. Both roles use `fifo_completion`, perform
+    /// bounded nonblocking work, and remain separate from the SCHED_OTHER
+    /// private cold-account core.
+    #[serde(default)]
+    pub allow_private_apply_on_completion_core: bool,
     pub async_rt_core: Option<usize>,
     /// Core for the dedicated public Polymarket CLOB socket runtime. Unset
     /// keeps the backwards-compatible feed-core placement; production can
@@ -131,6 +143,8 @@ impl Default for OsTuneConfig {
             enable_fifo: true,
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
+            allow_strategy_router_on_execution_core: false,
+            allow_private_apply_on_completion_core: false,
             async_rt_core: None,
             async_clob_core: None,
             async_ord_core: None,
@@ -163,6 +177,8 @@ mod os_tune_config_tests {
         let cfg: OsTuneConfig = toml::from_str(
             "strict_core_isolation = true\n\
              allow_background_on_execution_core = true\n\
+             allow_strategy_router_on_execution_core = true\n\
+             allow_private_apply_on_completion_core = true\n\
              async_clob_core = 11\n\
              private_apply_cores = { zhu02 = 12, zhu03 = 13 }\n\
              private_cold_cores = { zhu02 = 14, zhu03 = 15 }\n\
@@ -174,6 +190,8 @@ mod os_tune_config_tests {
         )
         .unwrap();
         assert!(cfg.allow_background_on_execution_core);
+        assert!(cfg.allow_strategy_router_on_execution_core);
+        assert!(cfg.allow_private_apply_on_completion_core);
         assert_eq!(cfg.async_clob_core, Some(11));
         assert_eq!(cfg.private_apply_cores.get("zhu02"), Some(&12));
         assert_eq!(cfg.private_cold_cores.get("zhu02"), Some(&14));

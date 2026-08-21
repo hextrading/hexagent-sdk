@@ -88,6 +88,8 @@ pub struct CorePlan {
     pub enable_fifo: bool,
     pub strict_core_isolation: bool,
     pub allow_background_on_execution_core: bool,
+    pub allow_strategy_router_on_execution_core: bool,
+    pub allow_private_apply_on_completion_core: bool,
     pub async_rt: usize,
     /// Dedicated public-CLOB socket runtime core. `None` preserves the legacy
     /// placement beside `feed-polymarket`.
@@ -133,6 +135,8 @@ impl CorePlan {
             enable_fifo: true,
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
+            allow_strategy_router_on_execution_core: false,
+            allow_private_apply_on_completion_core: false,
             async_rt: DEFAULT_ASYNC_RT_CORE,
             async_clob: None,
             async_ord: None,
@@ -176,6 +180,10 @@ impl CorePlan {
             enable_fifo: cfg.enable_fifo,
             strict_core_isolation: cfg.strict_core_isolation,
             allow_background_on_execution_core: cfg.allow_background_on_execution_core,
+            allow_strategy_router_on_execution_core: cfg
+                .allow_strategy_router_on_execution_core,
+            allow_private_apply_on_completion_core: cfg
+                .allow_private_apply_on_completion_core,
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
             async_clob: cfg.async_clob_core,
             async_ord: cfg.async_ord_core,
@@ -303,12 +311,21 @@ impl CorePlan {
             claim(core, "async_clob".into(), &mut exclusive)?;
         }
         claim(self.async_ord.unwrap(), "async_ord".into(), &mut exclusive)?;
-        claim(
-            self.strategy,
-            "strategy_router_or_fallback".into(),
-            &mut exclusive,
-        )?;
         claim(self.execution, "execution".into(), &mut exclusive)?;
+        if self.strategy == self.execution {
+            if !self.allow_strategy_router_on_execution_core {
+                return Err(
+                    "strategy router overlaps execution_core without allow_strategy_router_on_execution_core=true"
+                        .into(),
+                );
+            }
+        } else {
+            claim(
+                self.strategy,
+                "strategy_router_or_fallback".into(),
+                &mut exclusive,
+            )?;
+        }
 
         let mut seen_ids = HashSet::new();
         for instance_id in instance_ids {
@@ -397,7 +414,12 @@ impl CorePlan {
                 continue;
             }
             if let Some(role) = exclusive.get(&core) {
-                return Err(format!("poly-exec/done core {} overlaps {}", core, role));
+                let allowed_private_completion = pool_name == "poly_completion_cores"
+                    && self.allow_private_apply_on_completion_core
+                    && role.starts_with("private_account_apply:");
+                if !allowed_private_completion {
+                    return Err(format!("poly-exec/done core {} overlaps {}", core, role));
+                }
             }
             if feed_cores.contains(&core) {
                 return Err(format!("poly-exec/done core {} overlaps a feed core", core));
@@ -467,7 +489,7 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={} allow_strategy_router_on_execution={} allow_private_apply_on_completion={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.private_apply_cores, plan.private_cold_cores,
         plan.hex_worker_cores,
@@ -477,6 +499,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
         plan.fifo_polymarket_feed, plan.fifo_completion,
         plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
         plan.allow_background_on_execution_core,
+        plan.allow_strategy_router_on_execution_core,
+        plan.allow_private_apply_on_completion_core,
     );
     let _ = CORE_PLAN.set(plan);
 }
@@ -998,6 +1022,51 @@ mod tests {
             CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled),
             Ok(())
         );
+    }
+
+    #[test]
+    fn strict_plan_allows_only_opted_in_router_execution_overlap() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.strategy_core = cfg.execution_core;
+        let instances = five_instances();
+
+        let err = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&instances)
+            .unwrap_err();
+        assert!(err.contains("allow_strategy_router_on_execution_core"));
+
+        cfg.allow_strategy_router_on_execution_core = true;
+        assert_eq!(
+            CorePlan::from_config(&cfg).validate_strategy_isolation(&instances),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn strict_plan_allows_private_apply_only_on_opted_in_completion_core() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.private_apply_cores = HashMap::from([("zhu02".into(), 15)]);
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17)]);
+        let instances = five_instances();
+
+        let err = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&instances)
+            .unwrap_err();
+        assert!(err.contains("poly-exec/done core 15"));
+
+        cfg.allow_private_apply_on_completion_core = true;
+        assert_eq!(
+            CorePlan::from_config(&cfg).validate_strategy_isolation(&instances),
+            Ok(())
+        );
+
+        cfg.private_apply_cores = HashMap::from([("zhu02".into(), 14)]);
+        let dispatch_overlap = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&instances)
+            .unwrap_err();
+        assert!(dispatch_overlap.contains("poly-exec/done core 14"));
     }
 
     #[test]
