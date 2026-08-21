@@ -1332,6 +1332,13 @@ enum PersistenceJobPayload {
     /// holding the instance lifecycle shard, then releases that shard before
     /// any path allocation or serde work occurs.
     VirtualTrade(VirtualTradePersistenceDelta),
+    /// Durable gap-replay rewind anchor. The private cold worker updates the
+    /// read-mostly in-memory map and leaves WAL path allocation/serde to the
+    /// account writer instead of materializing the aggregate account.
+    UnresolvedTradeMatchTime {
+        trade_key: String,
+        match_time_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1662,6 +1669,17 @@ impl AccountPersistence {
 
     fn schedule_virtual_trade(&self, delta: VirtualTradePersistenceDelta) {
         self.enqueue(PersistenceJobPayload::VirtualTrade(delta));
+    }
+
+    fn schedule_unresolved_trade_match_time(
+        &self,
+        trade_key: String,
+        match_time_secs: Option<u64>,
+    ) {
+        self.enqueue(PersistenceJobPayload::UnresolvedTradeMatchTime {
+            trade_key,
+            match_time_secs,
+        });
     }
 
     fn scheduled_generation(&self) -> u64 {
@@ -2057,6 +2075,19 @@ fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWa
                 &mut changes,
                 ["ledger_generation".to_string()],
                 &delta.ledger_generation,
+            )?;
+            Ok(changes)
+        }
+        PersistenceJobPayload::UnresolvedTradeMatchTime {
+            trade_key,
+            match_time_secs,
+        } => {
+            let mut changes = Vec::with_capacity(1);
+            persistence_wal_map_entry(
+                &mut changes,
+                "unresolved_trade_match_times",
+                trade_key,
+                match_time_secs.as_ref(),
             )?;
             Ok(changes)
         }
@@ -2918,6 +2949,10 @@ pub struct SharedAccount {
     /// instead of taking `control_gate` and cloning/publishing the full
     /// account state merely to discover there is nothing to remove.
     unresolved_trade_keys: ShardedRouteMap,
+    /// Authoritative live rewind anchors. MATCHED trade edges update this
+    /// small map under the shared control gate and enqueue one typed WAL row;
+    /// they never clone or reconcile the aggregate account.
+    unresolved_trade_match_times_fast: RwLock<BTreeMap<String, u64>>,
     /// Serializes the rare mark/resolve transition so a corrected replay
     /// cannot race between the fast anomaly index and its durable row.
     private_anomaly_transition: Mutex<()>,
@@ -2935,6 +2970,11 @@ pub struct SharedAccount {
     /// maintenance lifecycle can still advance physical economics. Strategy
     /// workers read this without entering the aggregate account transaction.
     startup_snapshot_deferred_fast: AtomicBool,
+    /// Maintenance half of the deferred-snapshot gate. Trade replay anchors
+    /// update independently on the private cold lane; keeping this bit
+    /// separate lets a terminal trade clear the combined gate without an
+    /// aggregate account transaction.
+    unsettled_maintenance_fast: AtomicBool,
     /// Account-wide outcome map published by the cold control plane.
     settled_token_values_fast: ArcSwap<SettledTokenValuesSnapshot>,
     settled_token_values_generation_fast: AtomicU64,
@@ -3049,8 +3089,11 @@ impl SharedAccount {
             state.startup_snapshot_applied_this_process,
             Ordering::Release,
         );
+        let unsettled_maintenance = has_unsettled_maintenance_operation(state);
+        self.unsettled_maintenance_fast
+            .store(unsettled_maintenance, Ordering::Release);
         self.startup_snapshot_deferred_fast.store(
-            has_unsettled_trade_lifecycle(state) || has_unsettled_maintenance_operation(state),
+            has_unsettled_trade_lifecycle(state) || unsettled_maintenance,
             Ordering::Release,
         );
         let current_reason = self.uncertain_reason_fast.load_full();
@@ -3074,6 +3117,8 @@ impl SharedAccount {
         }
         self.retired_order_audit_tombstones_fast
             .store(Arc::new(state.retired_order_audit_tombstones.clone()));
+        *self.unresolved_trade_match_times_fast.write().unwrap() =
+            state.unresolved_trade_match_times.clone();
     }
 
     #[inline]
@@ -3100,6 +3145,7 @@ impl SharedAccount {
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
             risk_blocker_sources_fast: RwLock::new(HashSet::new()),
             unresolved_trade_keys: ShardedRouteMap::new(),
+            unresolved_trade_match_times_fast: RwLock::new(BTreeMap::new()),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
@@ -3108,6 +3154,7 @@ impl SharedAccount {
             passive_admission_fast: AtomicBool::new(false),
             startup_snapshot_applied_fast: AtomicBool::new(false),
             startup_snapshot_deferred_fast: AtomicBool::new(false),
+            unsettled_maintenance_fast: AtomicBool::new(false),
             settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot::default()),
             settled_token_values_generation_fast: AtomicU64::new(0),
             uncertain_reason_fast: ArcSwapOption::empty(),
@@ -3410,8 +3457,9 @@ impl SharedAccount {
             .values()
             .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
             .count();
+        let initial_unresolved_trade_match_times = state.unresolved_trade_match_times.clone();
         let initial_unresolved_trade_keys: Vec<String> =
-            state.unresolved_trade_match_times.keys().cloned().collect();
+            initial_unresolved_trade_match_times.keys().cloned().collect();
         let initial_risk_blocker_sources = state.risk_blockers.keys().cloned().collect();
         let initial_settled_gc_candidates: BTreeMap<String, BTreeSet<String>> = state
             .settled_audit_references
@@ -3453,6 +3501,9 @@ impl SharedAccount {
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
             risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
+            unresolved_trade_match_times_fast: RwLock::new(
+                initial_unresolved_trade_match_times,
+            ),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
@@ -3461,6 +3512,7 @@ impl SharedAccount {
             passive_admission_fast: AtomicBool::new(false),
             startup_snapshot_applied_fast: AtomicBool::new(false),
             startup_snapshot_deferred_fast: AtomicBool::new(false),
+            unsettled_maintenance_fast: AtomicBool::new(false),
             settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot {
                 generation: initial_settled_generation,
                 values: initial_settled_values,
@@ -3503,6 +3555,11 @@ impl SharedAccount {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
         let mut state = self.state.lock().unwrap();
+        state.unresolved_trade_match_times = self
+            .unresolved_trade_match_times_fast
+            .read()
+            .unwrap()
+            .clone();
         let acquired_at = Instant::now();
         let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account_lock_wait_last_us
@@ -3556,6 +3613,11 @@ impl SharedAccount {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
         let mut state = self.state.lock().unwrap();
+        state.unresolved_trade_match_times = self
+            .unresolved_trade_match_times_fast
+            .read()
+            .unwrap()
+            .clone();
         let acquired_at = Instant::now();
         let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account_lock_wait_last_us
@@ -7387,20 +7449,30 @@ impl SharedAccount {
         if trade_key.is_empty() || match_time_secs == 0 {
             return;
         }
-        let mut state = self.lock_state();
-        if state
-            .unresolved_trade_match_times
+        // Serialize against cold state publication without entering the
+        // aggregate state mutex. The typed writer makes this exact map entry
+        // durable, while the virtual trade WAL independently persists the
+        // lifecycle/economics that require the rewind anchor.
+        let _control = self.control_gate.read().unwrap();
+        let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
+        if anchors
             .get(trade_key)
             .is_some_and(|existing| *existing == match_time_secs)
         {
             return;
         }
-        state
-            .unresolved_trade_match_times
-            .insert(trade_key.to_string(), match_time_secs);
-        self.schedule_persist(&state);
+        anchors.insert(trade_key.to_string(), match_time_secs);
+        drop(anchors);
+        self.startup_snapshot_deferred_fast
+            .store(true, Ordering::Release);
         self.unresolved_trade_keys
             .insert(trade_key.to_string(), String::new());
+        if let Some(persistence) = &self.persistence {
+            persistence.schedule_unresolved_trade_match_time(
+                trade_key.to_string(),
+                Some(match_time_secs),
+            );
+        }
     }
 
     pub fn resolve_unresolved_trade_match_time(&self, trade_key: &str) {
@@ -7412,19 +7484,28 @@ impl SharedAccount {
         if self.unresolved_trade_keys.remove(trade_key).is_none() {
             return;
         }
-        let mut state = self.lock_state();
-        if state
-            .unresolved_trade_match_times
-            .remove(trade_key)
-            .is_some()
-        {
-            self.schedule_persist(&state);
+        let _control = self.control_gate.read().unwrap();
+        let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
+        if anchors.remove(trade_key).is_some() {
+            let all_trades_resolved = anchors.is_empty();
+            drop(anchors);
+            if all_trades_resolved
+                && !self.unsettled_maintenance_fast.load(Ordering::Acquire)
+            {
+                self.startup_snapshot_deferred_fast
+                    .store(false, Ordering::Release);
+            }
+            if let Some(persistence) = &self.persistence {
+                persistence
+                    .schedule_unresolved_trade_match_time(trade_key.to_string(), None);
+            }
         }
     }
 
     pub fn earliest_unresolved_trade_match_time(&self) -> Option<u64> {
-        self.lock_state()
-            .unresolved_trade_match_times
+        self.unresolved_trade_match_times_fast
+            .read()
+            .unwrap()
             .values()
             .copied()
             .min()
@@ -19855,6 +19936,46 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         drop(control);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn normal_trade_replay_anchor_mark_and_resolve_skip_aggregate_account() {
+        let account = seeded_account();
+        let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
+        account.mark_unresolved_trade_match_time("ordinary-trade", 123);
+        assert_eq!(account.earliest_unresolved_trade_match_time(), Some(123));
+        account.resolve_unresolved_trade_match_time("ordinary-trade");
+        assert_eq!(account.earliest_unresolved_trade_match_time(), None);
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            aggregate_acquisitions,
+            "replay-anchor updates must not materialize the aggregate account",
+        );
+    }
+
+    #[test]
+    fn typed_replay_anchor_wal_persists_insert_and_remove() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-replay-anchor-wal-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("replay-anchor", &path).unwrap();
+            account.mark_unresolved_trade_match_time("trade-anchor", 456);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        {
+            let account = SharedAccount::new_persistent("replay-anchor", &path).unwrap();
+            assert_eq!(account.earliest_unresolved_trade_match_time(), Some(456));
+            account.resolve_unresolved_trade_match_time("trade-anchor");
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("replay-anchor", &path).unwrap();
+        assert_eq!(restored.earliest_unresolved_trade_match_time(), None);
+        drop(restored);
+        remove_persistence_test_files(&path);
     }
 
     #[test]
