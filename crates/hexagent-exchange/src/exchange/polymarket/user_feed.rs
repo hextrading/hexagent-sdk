@@ -911,10 +911,15 @@ fn parse_order_event(
             "invalid order lifecycle economics order_id={order_id}"
         ));
     }
-    if shared
+    let retired_audit_started = crate::latency::Instant::now();
+    let retired_audit_covers = shared
         .account_state
-        .retired_order_audit_covers(order_id, original_size, size_matched)
-    {
+        .retired_order_audit_covers(order_id, original_size, size_matched);
+    crate::latency::record(
+        "polymarket.user.retired_order_audit_lookup",
+        retired_audit_started,
+    );
+    if retired_audit_covers {
         shared
             .account_state
             .resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(order_id)));
