@@ -1031,6 +1031,14 @@ fn parse_order_event(
         _ => shared.account_state.mark_order_status(&coid, status),
     }
     crate::latency::record(
+        if matches!(status, OrderStatus::Filled | OrderStatus::Cancelled) {
+            "polymarket.user.account_order_lifecycle_commit.terminal"
+        } else {
+            "polymarket.user.account_order_lifecycle_commit.live"
+        },
+        lifecycle_started,
+    );
+    crate::latency::record(
         "polymarket.user.account_order_lifecycle_commit",
         lifecycle_started,
     );

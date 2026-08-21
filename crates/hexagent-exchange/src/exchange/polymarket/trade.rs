@@ -3144,13 +3144,44 @@ impl SharedState {
     /// release a residual reservation: FAK/partially matched orders can be
     /// terminal with `size_matched < original quantity`.
     fn remove_order_resolved_as(&self, client_order_id: &str, status: OrderStatus) {
-        let terminal_token = self
-            .account_state
-            .order(client_order_id)
-            .map(|order| order.token_id);
+        self.remove_order_resolved_as_inner(client_order_id, status, false);
+    }
+
+    /// Runtime teardown after `apply_authoritative_order_audit` has already
+    /// committed status, exact trade IDs, reservation release and recovery-set
+    /// cleanup in one account transaction. Re-entering `release_order` and
+    /// `finish_order_recovery` here used to take the account control/lifecycle
+    /// locks twice more for every terminal private order push.
+    fn remove_order_after_authoritative_commit(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+    ) {
+        self.remove_order_resolved_as_inner(client_order_id, status, true);
+    }
+
+    fn remove_order_resolved_as_inner(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+        account_already_committed: bool,
+    ) {
+        let terminal_token = if account_already_committed {
+            self.coid_to_token
+                .lock()
+                .unwrap()
+                .get(client_order_id)
+                .cloned()
+        } else {
+            self.account_state
+                .order(client_order_id)
+                .map(|order| order.token_id)
+        };
         self.open_orders.lock().unwrap().remove(client_order_id);
-        self.account_state.release_order(client_order_id, status);
-        self.account_state.finish_order_recovery(client_order_id);
+        if !account_already_committed {
+            self.account_state.release_order(client_order_id, status);
+            self.account_state.finish_order_recovery(client_order_id);
+        }
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
         self.pending_delayed_orphans
@@ -3198,37 +3229,41 @@ impl SharedState {
         status: OrderStatus,
         audit: &AuthoritativeOrderAudit,
     ) -> bool {
-        let transition =
-            match self
-                .account_state
-                .apply_authoritative_order_audit(client_order_id, status, audit)
-            {
-                Ok(transition) => transition,
-                Err(error) => {
-                    warn!(
+        let audit_started = crate::latency::Instant::now();
+        let transition_result = self
+            .account_state
+            .apply_authoritative_order_audit(client_order_id, status, audit);
+        crate::latency::record(
+            "polymarket.account.terminal_audit_commit",
+            audit_started,
+        );
+        let transition = match transition_result {
+            Ok(transition) => transition,
+            Err(error) => {
+                warn!(
                     "[PolymarketTrade] authoritative order audit rejected coid={} status={:?}: {}",
                     client_order_id, status, error,
                 );
-                    self.account_state
-                        .mark_order_status(client_order_id, status);
-                    self.account_state.begin_order_recovery([client_order_id]);
-                    return true;
-                }
-            };
-        self.open_orders.lock().unwrap().remove(client_order_id);
-        self.pending_delayed_orphans
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
-        self.reconcile_cancel_not_found_counts
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
-        self.cancel_reconcile_next_retry_ns
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+                self.account_state
+                    .mark_order_status(client_order_id, status);
+                self.account_state.begin_order_recovery([client_order_id]);
+                return true;
+            }
+        };
         if transition.pending() {
+            self.open_orders.lock().unwrap().remove(client_order_id);
+            self.pending_delayed_orphans
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+            self.reconcile_cancel_not_found_counts
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
+            self.cancel_reconcile_next_retry_ns
+                .lock()
+                .unwrap()
+                .remove(client_order_id);
             debug!(
                 "[PolymarketTrade] authoritative terminal audit committed coid={} status={:?} trade_ids={} pending=true",
                 client_order_id,
@@ -3237,7 +3272,12 @@ impl SharedState {
             );
             true
         } else {
-            self.remove_order_resolved_as(client_order_id, status);
+            let teardown_started = crate::latency::Instant::now();
+            self.remove_order_after_authoritative_commit(client_order_id, status);
+            crate::latency::record(
+                "polymarket.account.terminal_runtime_teardown",
+                teardown_started,
+            );
             false
         }
     }
