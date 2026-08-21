@@ -8146,6 +8146,9 @@ impl SharedAccount {
         if complete {
             release_virtual_order_reservation(&account, &mut lifecycle, client_order_id);
             lifecycle.recovery_pending_orders.remove(client_order_id);
+            lifecycle
+                .startup_query_repair_orders
+                .remove(client_order_id);
         } else {
             lifecycle
                 .recovery_pending_orders
