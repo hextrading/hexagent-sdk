@@ -9117,12 +9117,26 @@ impl SharedAccount {
             return Err("authoritative audit contains duplicate trade ids".to_string());
         }
 
-        let control = self.control_gate.read().unwrap();
+        let route_started = crate::latency::Instant::now();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return Ok(FillAuditPendingTransition::NotTracked);
         };
+        crate::latency::record(
+            "polymarket.account.terminal_audit_route",
+            route_started,
+        );
+        let lifecycle_wait_started = crate::latency::Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        crate::latency::record(
+            "polymarket.account.terminal_audit_lifecycle_wait",
+            lifecycle_wait_started,
+        );
+        let critical_started = crate::latency::Instant::now();
         let Some(existing) = lifecycle.orders.get(client_order_id).cloned() else {
+            crate::latency::record(
+                "polymarket.account.terminal_audit_critical",
+                critical_started,
+            );
             return Ok(FillAuditPendingTransition::NotTracked);
         };
         let tolerance = existing.quantity.abs().max(1.0) * 1e-8;
@@ -9134,6 +9148,10 @@ impl SharedAccount {
             || matched + tolerance < existing.filled_quantity
             || (matched > tolerance && trade_ids.is_empty())
         {
+            crate::latency::record(
+                "polymarket.account.terminal_audit_critical",
+                critical_started,
+            );
             return Err(format!(
                 "authoritative audit disagrees with owned order coid={client_order_id} original={original} matched={matched} owned_quantity={} filled={}",
                 existing.quantity, existing.filled_quantity,
@@ -9179,6 +9197,17 @@ impl SharedAccount {
                 .insert(client_order_id.to_string());
         }
         let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
+        // Terminal private events are owner-local mutations. Advance the same
+        // touched-key epoch as a fill/status edge so a concurrent cold account
+        // transaction merges this audit instead of blocking the private lane
+        // on the account-wide control gate.
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            "",
+            client_order_id,
+            &token_id,
+        );
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
 
         let transition = if complete {
@@ -9191,8 +9220,11 @@ impl SharedAccount {
         if transition.newly_pending() {
             self.notify_order_audit_worker();
         }
+        crate::latency::record(
+            "polymarket.account.terminal_audit_critical",
+            critical_started,
+        );
         drop(lifecycle);
-        drop(control);
         if clear_cancel_anomaly {
             self.clear_cancel_audit_anomaly(client_order_id);
         }
@@ -22307,6 +22339,52 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             account.order("a-status-no-control").unwrap().status,
             OrderStatus::Accepted,
         );
+    }
+
+    #[test]
+    fn authoritative_terminal_audit_does_not_wait_for_control_gate_and_survives_publish() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-terminal-audit-no-control",
+                "oid-terminal-audit-no-control",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let control = account.lock_state();
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let transition = worker_account.apply_authoritative_order_audit(
+                "a-terminal-audit-no-control",
+                OrderStatus::Cancelled,
+                &AuthoritativeOrderAudit {
+                    original_size: Some("1".to_string()),
+                    size_matched: Some("0".to_string()),
+                    associate_trades: Vec::new(),
+                },
+            );
+            tx.send(transition).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+            FillAuditPendingTransition::Resolved,
+        );
+        drop(control);
+        worker.join().unwrap();
+
+        let order = account.order("a-terminal-audit-no-control").unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.terminal_matched_quantity, Some(0.0));
+        assert!(order.terminal_trade_ids_authoritative);
+        assert_eq!(order.reserved_cash, 0.0);
+        assert_eq!(order.reserved_quantity, 0.0);
+        assert!(account.recovery_pending_order_ids().is_empty());
     }
 
     #[test]
