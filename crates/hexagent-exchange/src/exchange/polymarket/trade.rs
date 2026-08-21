@@ -4,14 +4,15 @@
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use hexagent_account::account::shared_account::{normalize_order_id, OrderOwnership};
@@ -79,14 +80,31 @@ fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
 /// bounded read and never enters the aggregate account lifecycle lock.
 #[derive(Debug)]
 struct RuntimeOwnershipIndex {
-    shards: Box<[RwLock<HashMap<String, OrderOwnership>>]>,
+    shards: Box<[RuntimeOwnershipShard]>,
+}
+
+/// Execution workers serialize only with other writers. The private owner
+/// actor reads an immutable RCU snapshot and can never inherit a lower
+/// priority execution worker's scheduling delay while it holds a map lock.
+#[derive(Debug)]
+struct RuntimeOwnershipShard {
+    published: ArcSwap<HashMap<Arc<str>, Arc<RuntimeOwnershipEntry>>>,
+    writer: Mutex<()>,
+}
+
+#[derive(Debug)]
+struct RuntimeOwnershipEntry {
+    ownership: OrderOwnership,
 }
 
 impl RuntimeOwnershipIndex {
     fn new() -> Self {
         Self {
             shards: (0..RUNTIME_OWNERSHIP_SHARDS)
-                .map(|_| RwLock::new(HashMap::new()))
+                .map(|_| RuntimeOwnershipShard {
+                    published: ArcSwap::from_pointee(HashMap::new()),
+                    writer: Mutex::new(()),
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
@@ -113,35 +131,52 @@ impl RuntimeOwnershipIndex {
 
     fn insert(&self, order_id: &str, ownership: OrderOwnership) {
         let normalized = normalize_order_id(order_id);
-        self.shards[Self::shard_index(&normalized)]
-            .write()
-            .unwrap()
-            .insert(normalized, ownership);
+        let shard = &self.shards[Self::shard_index(&normalized)];
+        let _writer = shard.writer.lock().unwrap();
+        let current = shard.published.load_full();
+        let mut next = (*current).clone();
+        next.insert(
+            Arc::<str>::from(normalized),
+            Arc::new(RuntimeOwnershipEntry { ownership }),
+        );
+        shard.published.store(Arc::new(next));
     }
 
     fn get(&self, order_id: &str) -> Option<OrderOwnership> {
         let normalized = Self::lookup_key(order_id);
         self.shards[Self::shard_index(normalized.as_ref())]
-            .read()
-            .unwrap()
+            .published
+            .load()
             .get(normalized.as_ref())
-            .cloned()
+            .map(|entry| entry.ownership.clone())
     }
 
     fn remove(&self, order_id: &str) {
         let normalized = Self::lookup_key(order_id);
-        self.shards[Self::shard_index(normalized.as_ref())]
-            .write()
-            .unwrap()
-            .remove(normalized.as_ref());
+        let shard = &self.shards[Self::shard_index(normalized.as_ref())];
+        let _writer = shard.writer.lock().unwrap();
+        let current = shard.published.load_full();
+        if current.contains_key(normalized.as_ref()) {
+            let mut next = (*current).clone();
+            next.remove(normalized.as_ref());
+            shard.published.store(Arc::new(next));
+        }
     }
 
     fn remove_client_orders(&self, client_order_ids: &HashSet<String>) {
         for shard in &self.shards {
-            shard
-                .write()
-                .unwrap()
-                .retain(|_, ownership| !client_order_ids.contains(&ownership.client_order_id));
+            let _writer = shard.writer.lock().unwrap();
+            let current = shard.published.load_full();
+            if current
+                .values()
+                .any(|entry| client_order_ids.contains(&entry.ownership.client_order_id))
+            {
+                let mut next = (*current).clone();
+                next.retain(|_, entry| {
+                    !client_order_ids.contains(&entry.ownership.client_order_id)
+                });
+                shard.published.store(Arc::new(next));
+            }
         }
     }
 }
@@ -1346,9 +1381,30 @@ struct FilledCleanupJob {
 }
 
 #[derive(Debug)]
+struct DeferredLifecycleJob {
+    client_order_id: String,
+    status: OrderStatus,
+    enqueued_ns: u64,
+}
+
+#[derive(Debug)]
+struct AttemptAuditJob {
+    attempt: crate::http1_pool::AttemptTraceSnapshot,
+    kind: &'static str,
+    client_order_id: String,
+    exchange_order_id: Option<String>,
+    status: OrderStatus,
+    error: Option<String>,
+    completed_ns: u64,
+    enqueued_ns: u64,
+}
+
+#[derive(Debug)]
 enum AccountMaintenanceJob {
     PersistOwnership(OrderOwnership),
     FilledCleanup(FilledCleanupJob),
+    DeferredLifecycle(DeferredLifecycleJob),
+    AttemptAudit(AttemptAuditJob),
 }
 
 async fn send_and_drain(
@@ -2222,10 +2278,14 @@ impl SharedState {
         rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
     ) {
         let weak = Arc::downgrade(shared);
+        let account_id = shared.account_state.account_id().to_string();
         let _ = std::thread::Builder::new()
             .name(format!("poly-account-maint-{}", shared.instance_id))
             .spawn(move || {
-                crate::os_tune::pin_background("polymarket-account-maintenance");
+                crate::os_tune::pin_private_account_cold(
+                    "polymarket-account-maintenance",
+                    &account_id,
+                );
                 while let Ok(job) = rx.recv() {
                     let Some(shared) = weak.upgrade() else { break };
                     match job {
@@ -2235,6 +2295,12 @@ impl SharedState {
                                 now_ns().saturating_sub(job.enqueued_ns),
                             );
                             shared.finish_filled_order_if_audited(&job.client_order_id);
+                        }
+                        AccountMaintenanceJob::DeferredLifecycle(job) => {
+                            shared.apply_deferred_lifecycle(job);
+                        }
+                        AccountMaintenanceJob::AttemptAudit(job) => {
+                            shared.write_attempt_audit(job);
                         }
                         AccountMaintenanceJob::PersistOwnership(ownership) => {
                             let mut batch = Vec::with_capacity(64);
@@ -2248,6 +2314,12 @@ impl SharedState {
                                         shared.finish_filled_order_if_audited(
                                             &job.client_order_id,
                                         );
+                                    }
+                                    Ok(AccountMaintenanceJob::DeferredLifecycle(job)) => {
+                                        shared.apply_deferred_lifecycle(job);
+                                    }
+                                    Ok(AccountMaintenanceJob::AttemptAudit(job)) => {
+                                        shared.write_attempt_audit(job);
                                     }
                                     Err(_) => break,
                                 }
@@ -2269,6 +2341,54 @@ impl SharedState {
                     }
                 }
             });
+    }
+
+    fn apply_deferred_lifecycle(&self, job: DeferredLifecycleJob) {
+        crate::latency::record_ns(
+            "polymarket.account.lifecycle_queue",
+            now_ns().saturating_sub(job.enqueued_ns),
+        );
+        let apply_started = crate::latency::Instant::now();
+        match job.status {
+            OrderStatus::Cancelled => {
+                self.account_state
+                    .mark_cancelled_pending_audit(&job.client_order_id);
+            }
+            OrderStatus::Rejected => {
+                // StrategyAccount receives the authoritative rejection first.
+                // Shared monitoring cleanup may persist and take lifecycle
+                // locks, so it belongs exclusively on this cold writer.
+                self.remove_order_resolved_as(&job.client_order_id, OrderStatus::Rejected);
+            }
+            status => {
+                self.account_state
+                    .mark_order_status_effective(&job.client_order_id, status);
+            }
+        }
+        crate::latency::record("polymarket.account.lifecycle_apply", apply_started);
+    }
+
+    fn defer_lifecycle_account_apply(&self, client_order_id: &str, status: OrderStatus) {
+        let job = DeferredLifecycleJob {
+            client_order_id: client_order_id.to_string(),
+            status,
+            enqueued_ns: now_ns(),
+        };
+        if let Err(error) = self
+            .account_maintenance_tx
+            .try_send(AccountMaintenanceJob::DeferredLifecycle(job))
+        {
+            // StrategyAccount still receives the authoritative lifecycle
+            // update. Fail the shared monitoring account closed and require
+            // reconnect/reconcile rather than blocking the completion lane.
+            self.user_feed_health.set_inventory_uncertain(true);
+            log::error!(
+                "[PolymarketTrade] deferred lifecycle queue unavailable coid={} status={:?}: {}; shared account forced uncertain",
+                client_order_id,
+                status,
+                error,
+            );
+        }
     }
 
     pub(crate) fn request_filled_order_cleanup(&self, client_order_id: &str) {
@@ -2349,8 +2469,7 @@ impl SharedState {
             // No HTTP request has been dispatched yet. Roll back the local
             // publication and fail the submit closed instead of blocking the
             // execution actor or allowing an unpersistable live order.
-            self.runtime_order_ownership
-                .remove(exchange_order_id);
+            self.runtime_order_ownership.remove(exchange_order_id);
             self.coid_to_oid.lock().unwrap().remove(client_order_id);
             self.oid_to_coid
                 .lock()
@@ -2432,6 +2551,7 @@ impl SharedState {
         client_order_id: &str,
         exchange_order_id: Option<&str>,
         status: OrderStatus,
+        error: Option<&str>,
     ) {
         let Some(attempt) = attempt.snapshot() else {
             log::error!(
@@ -2451,23 +2571,64 @@ impl SharedState {
             },
             elapsed_ns,
         );
+        let job = AttemptAuditJob {
+            attempt,
+            kind,
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: exchange_order_id.map(str::to_string),
+            status,
+            error: error.map(str::to_string),
+            completed_ns,
+            enqueued_ns: now_ns(),
+        };
+        if let Err(error) = self
+            .account_maintenance_tx
+            .try_send(AccountMaintenanceJob::AttemptAudit(job))
+        {
+            // This is an audit/measurement loss, not an account mutation.
+            // Keep the order completion lane non-blocking and make the loss
+            // operationally loud instead of delaying StrategyAccount apply.
+            log::error!(
+                "[order_attempt] audit queue unavailable kind={} coid={}: {}",
+                kind,
+                client_order_id,
+                error,
+            );
+        }
+    }
+
+    fn write_attempt_audit(&self, job: AttemptAuditJob) {
+        crate::latency::record_ns(
+            "polymarket.account.attempt_audit_queue",
+            now_ns().saturating_sub(job.enqueued_ns),
+        );
+        let attempt = job.attempt;
+        let elapsed_ns = job.completed_ns.saturating_sub(attempt.dispatched_ns);
         info!(
             "[order_attempt] attempt_id={} kind={} role={:?} slot={} coid={} oid={} status={:?} signal_ns={} prep_ns={} signed_ns={} account_recorded_ns={} dispatched_ns={} completed_ns={} dispatch_to_done_ms={:.3}",
             attempt.attempt_id,
-            kind,
+            job.kind,
             attempt.role,
             attempt.slot,
-            client_order_id,
-            exchange_order_id.unwrap_or(""),
-            status,
+            job.client_order_id,
+            job.exchange_order_id.as_deref().unwrap_or(""),
+            job.status,
             attempt.signal_ns,
             attempt.prep_ns,
             attempt.signed_ns,
             attempt.account_recorded_ns,
             attempt.dispatched_ns,
-            completed_ns,
+            job.completed_ns,
             elapsed_ns as f64 / 1_000_000.0,
         );
+        if job.status == OrderStatus::Rejected {
+            warn!(
+                "[PolymarketTrade] {} rejected off completion lane: {} coid={}",
+                job.kind,
+                job.error.as_deref().unwrap_or("unspecified rejection"),
+                job.client_order_id,
+            );
+        }
     }
 
     pub(crate) fn log_preflight_rejected(
@@ -2745,12 +2906,18 @@ impl SharedState {
         // retired the compact runtime route before a delayed private replay;
         // recover the retained durable terminal ownership by OID in that rare
         // case and republish the immutable owner index.
+        let fallback_started = crate::latency::Instant::now();
         let ownership = if let Some(coid) = self.lookup_coid(exchange_order_id) {
             self.account_state
-                .reconcile_order_route(&coid, exchange_order_id)?
+                .reconcile_order_route(&coid, exchange_order_id)
         } else {
-            self.account_state.order_by_oid(exchange_order_id)?
+            self.account_state.order_by_oid(exchange_order_id)
         };
+        crate::latency::record(
+            "polymarket.user.order_ownership_durable_fallback",
+            fallback_started,
+        );
+        let ownership = ownership?;
         self.install_runtime_order_id(
             &ownership.client_order_id,
             exchange_order_id,
@@ -2758,6 +2925,17 @@ impl SharedState {
             Some(&ownership),
         );
         Some(ownership)
+    }
+
+    /// Lock-free ownership probe for ambiguity checks on the private owner
+    /// lane. A maker trade's top-level taker order normally belongs to another
+    /// account; consulting the durable ledger for that negative lookup would
+    /// scan every StrategyAccount lifecycle and dominate P99.
+    pub(crate) fn lookup_runtime_order_ownership(
+        &self,
+        exchange_order_id: &str,
+    ) -> Option<OrderOwnership> {
+        self.runtime_order_ownership.get(exchange_order_id)
     }
 
     /// Complete account-global settled-audit cleanup only after the durable
@@ -2887,6 +3065,22 @@ impl SharedState {
         self.remove_order_as(client_order_id, OrderStatus::Cancelled);
     }
 
+    fn remove_cancelled_order_runtime(&self, client_order_id: &str) {
+        self.open_orders.lock().unwrap().remove(client_order_id);
+        self.pending_delayed_orphans
+            .lock()
+            .unwrap()
+            .remove(client_order_id);
+        self.reconcile_cancel_not_found_counts
+            .lock()
+            .unwrap()
+            .remove(client_order_id);
+        self.cancel_reconcile_next_retry_ns
+            .lock()
+            .unwrap()
+            .remove(client_order_id);
+    }
+
     pub fn remove_order_as(&self, client_order_id: &str, status: OrderStatus) {
         // `MATCHED`/`FILLED` from an order lookup or DELETE response proves the
         // order is terminal, but it does not prove that every associated trade
@@ -2913,7 +3107,7 @@ impl SharedState {
         }
         }
         if status == OrderStatus::Cancelled {
-            self.open_orders.lock().unwrap().remove(client_order_id);
+            self.remove_cancelled_order_runtime(client_order_id);
             if self
                 .account_state
                 .mark_cancelled_pending_audit(client_order_id)
@@ -2923,18 +3117,6 @@ impl SharedState {
                     client_order_id,
                 );
             }
-            self.pending_delayed_orphans
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
-            self.reconcile_cancel_not_found_counts
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
-            self.cancel_reconcile_next_retry_ns
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
             return;
         }
         self.remove_order_resolved_as(client_order_id, status);
@@ -7393,6 +7575,7 @@ impl PolymarketTrade {
             &order.client_order_id,
             Some(&local_oid),
             update.status,
+            update.error.as_deref(),
         );
         update
     }
@@ -7496,6 +7679,7 @@ impl PolymarketTrade {
                 client_order_id,
                 update.exchange_order_id.as_deref(),
                 update.status,
+                update.error.as_deref(),
             );
         }
         update
@@ -7642,7 +7826,7 @@ impl PolymarketTrade {
         // `gen_ns` = strategy on_quote emission time (ns) carried on the
         // OrderRequest. Pairs this place with its quote for offline
         // on_quote→dispatch latency analysis (dispatch wall-clock − gen_ns).
-        info!(
+        debug!(
             "[PolymarketTrade] Submit {} {}... @ {:.3} qty={} coid={} oid={} gen_ns={}",
             order.side,
             sym_short,
@@ -7696,9 +7880,16 @@ impl PolymarketTrade {
                     warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
                         e, order.client_order_id, &local_oid[..18.min(local_oid.len())]);
                 }
-                self.shared
-                    .account_state
-                    .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
+                if legacy_trace {
+                    self.shared
+                        .account_state
+                        .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
+                } else {
+                    self.shared.defer_lifecycle_account_apply(
+                        &order.client_order_id,
+                        OrderStatus::NewOrderTimeout,
+                    );
+                }
                 return Self::make_timeout_place(order, Some(local_oid));
             }
             Err(e) => {
@@ -7714,14 +7905,21 @@ impl PolymarketTrade {
                 } else if SharedState::is_invalid_token_error(&err_s) {
                     self.handle_invalid_token(&order.symbol);
                 }
+                if legacy_trace {
                     self.shared
                         .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-                if e.is_definitive_submit_rejection() {
+                } else {
+                    self.shared.defer_lifecycle_account_apply(
+                        &order.client_order_id,
+                        OrderStatus::Rejected,
+                    );
+                }
+                if legacy_trace && e.is_definitive_submit_rejection() {
                         warn!(
                             "[PolymarketTrade] Order server-rejected: {} coid={} → Rejected",
                             e, order.client_order_id
                         );
-                } else {
+                } else if legacy_trace {
                         warn!(
                             "[PolymarketTrade] Local order failure: {} coid={}",
                             e, order.client_order_id
@@ -7737,16 +7935,23 @@ impl PolymarketTrade {
         let parsed = match parsed_result {
             Ok(parsed) => parsed,
             Err(reason) => {
+                if legacy_trace {
                     self.shared
                         .account_state
                         .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
-                warn!(
-                    "[PolymarketTrade] ambiguous HTTP 2xx placement response coid={} local={} reason={} body={} → NewOrderTimeout",
-                    order.client_order_id,
-                    local_oid,
-                    reason,
-                    resp,
-                );
+                    warn!(
+                        "[PolymarketTrade] ambiguous HTTP 2xx placement response coid={} local={} reason={} body={} → NewOrderTimeout",
+                        order.client_order_id,
+                        local_oid,
+                        reason,
+                        resp,
+                    );
+                } else {
+                    self.shared.defer_lifecycle_account_apply(
+                        &order.client_order_id,
+                        OrderStatus::NewOrderTimeout,
+                    );
+                }
                 return Self::make_timeout_place(order, Some(local_oid));
             }
         };
@@ -7756,8 +7961,15 @@ impl PolymarketTrade {
         let error_msg = parsed.error_msg;
 
         if !success {
+            if legacy_trace {
                 self.shared
                     .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
+            } else {
+                self.shared.defer_lifecycle_account_apply(
+                    &order.client_order_id,
+                    OrderStatus::Rejected,
+                );
+            }
             if SharedState::is_trading_disabled_error(&error_msg) {
                 self.handle_trading_disabled(&error_msg);
             } else if SharedState::is_balance_error(&error_msg) {
@@ -7765,23 +7977,34 @@ impl PolymarketTrade {
             } else if SharedState::is_invalid_token_error(&error_msg) {
                 self.handle_invalid_token(&order.symbol);
             }
+            if legacy_trace {
                 warn!(
                     "[PolymarketTrade] Order rejected by server: {} coid={} → Rejected",
                     error_msg, order.client_order_id
                 );
+            }
             return Self::make_rejected(order, &error_msg);
         }
         // Accepted by the server → token is registered/tradeable; clear any
         // invalid-token strikes/backoff for it.
         self.shared.clear_invalid_token(&order.symbol);
         let account_apply_started = crate::latency::Instant::now();
-        let effective_ack_status = self.shared.mark_order_live(
+            let effective_ack_status = if legacy_trace {
+                self.shared.mark_order_live(
             &order.client_order_id,
             &order.symbol,
             order.side,
             &self.instance_id,
             OrderStatus::Accepted,
-        );
+                )
+            } else {
+                // Runtime ownership/open-order publication happened before HTTP
+                // dispatch. StrategyAccount is the lifecycle authority; durable
+                // shared monitoring follows on its cold single-writer lane.
+                self.shared
+                    .defer_lifecycle_account_apply(&order.client_order_id, OrderStatus::Accepted);
+                Some(OrderStatus::Accepted)
+            };
             crate::latency::record(
                 "polymarket.order.response_account_apply",
                 account_apply_started,
@@ -7827,7 +8050,7 @@ impl PolymarketTrade {
                     .and_then(|v| v.as_array())
                     .map(|ids| ids.len())
                     .unwrap_or(0);
-                    info!(
+                    debug!(
                         "[PolymarketTrade] Matched immediately: orderID={} trades={} \
                        (emitting placeholder Filled for immediate order REST audit; \
                        ledger updated via authoritative trade updates)",
@@ -7835,24 +8058,32 @@ impl PolymarketTrade {
                     );
             }
             "delayed" => {
-                info!("[PolymarketTrade] Deferred execution: orderID={}", order_id);
+                debug!("[PolymarketTrade] Deferred execution: orderID={}", order_id);
             }
             _ => {}
         }
         let status = placement_response_status(true, &status_str, effective_ack_status);
-        let effective_remaining = self
-            .shared
-            .account_state
-            .order(&order.client_order_id)
-            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
-            .unwrap_or(order.quantity);
+        // The admission-bound path returns this update to the sole-writer
+        // StrategyAccount, which already owns the current lifecycle state.
+        // Reading the cold shared account here can block behind private-trade
+        // persistence for tens of milliseconds. Legacy synchronous callers
+        // still need their effective shared-state quantity.
+        let effective_remaining = if legacy_trace {
+            self.shared
+                .account_state
+                .order(&order.client_order_id)
+                .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
+                .unwrap_or(order.quantity)
+        } else {
+            order.quantity
+        };
         let (filled_quantity, remaining_quantity) = if status == OrderStatus::Filled {
             (0.0, 0.0)
         } else {
             (0.0, effective_remaining)
         };
 
-            info!(
+            debug!(
                 "[PolymarketTrade] Order accepted: orderID={} status={} coid={}",
                 order_id, status_str, order.client_order_id
             );
@@ -8160,9 +8391,14 @@ impl PolymarketTrade {
 
         if let Some(status) = orphan_status {
             let account_apply_started = crate::latency::Instant::now();
-            let effective = self
-                .shared
-                .effective_cancel_attempt_status(client_order_id, status);
+                let effective = if legacy_trace {
+                    self.shared
+                        .effective_cancel_attempt_status(client_order_id, status)
+                } else {
+                    self.shared
+                        .defer_lifecycle_account_apply(client_order_id, status);
+                    status
+                };
                 let update =
                     Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, effective);
             crate::latency::record(
@@ -8173,16 +8409,25 @@ impl PolymarketTrade {
         }
         let account_apply_started = crate::latency::Instant::now();
         if should_remove {
+                if !legacy_trace && ok_status == OrderStatus::Cancelled {
+                    self.shared.remove_cancelled_order_runtime(client_order_id);
+                    self.shared
+                        .defer_lifecycle_account_apply(client_order_id, ok_status);
+                } else {
             self.shared.remove_order_as(client_order_id, ok_status);
         }
+            }
             let status = if should_remove {
                 ok_status
             } else {
                 OrderStatus::Accepted
             };
-        let status = self
-            .shared
-            .effective_cancel_attempt_status(client_order_id, status);
+            let status = if legacy_trace || (should_remove && ok_status != OrderStatus::Cancelled) {
+                self.shared
+                    .effective_cancel_attempt_status(client_order_id, status)
+            } else {
+                status
+            };
 
         let update = OrderUpdate {
             client_order_id: client_order_id.to_string(),
@@ -9907,6 +10152,55 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
+        OrderOwnership {
+            account_id: "acct".into(),
+            instance_id: "maker".into(),
+            client_order_id: client_order_id.into(),
+            order_id: order_id.into(),
+            token_id: "UP".into(),
+            side: Side::Buy,
+            quantity: 10.0,
+            filled_quantity: 0.0,
+            terminal_matched_quantity: None,
+            terminal_trade_ids: Vec::new(),
+            terminal_trade_ids_authoritative: false,
+            price: 0.5,
+            fee_rate_bps: 0,
+            reserved_cash: 5.0,
+            reserved_quantity: 0.0,
+            status: OrderStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn runtime_ownership_reader_never_waits_for_writer_serialization() {
+        let index = RuntimeOwnershipIndex::new();
+        let ownership = runtime_ownership("0xABC", "maker-1");
+        index.insert(&ownership.order_id, ownership.clone());
+
+        let normalized = normalize_order_id(&ownership.order_id);
+        let shard = &index.shards[RuntimeOwnershipIndex::shard_index(&normalized)];
+        let _writer = shard.writer.lock().unwrap();
+        assert_eq!(
+            index
+                .get(&ownership.order_id)
+                .map(|value| value.client_order_id),
+            Some("maker-1".to_string()),
+            "an RCU reader must remain available while a lower-priority writer is serialized",
+        );
+    }
+
+    #[test]
+    fn runtime_ownership_snapshot_publishes_insert_and_remove() {
+        let index = RuntimeOwnershipIndex::new();
+        let ownership = runtime_ownership("0xDEF", "maker-2");
+        index.insert(&ownership.order_id, ownership.clone());
+        assert!(index.get("def").is_some());
+        index.remove("0xdef");
+        assert!(index.get("DEF").is_none());
+    }
 
     #[test]
     fn request_body_pool_reuses_the_same_backing_allocation() {

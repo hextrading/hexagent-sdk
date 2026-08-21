@@ -400,6 +400,26 @@ fn replay_match_time_anchor(shared: &SharedState, committed_secs: u64) -> u64 {
     }
 }
 
+fn update_trade_finality_replay_anchor(
+    shared: &SharedState,
+    trade_key: &str,
+    status: &str,
+    match_time_secs: u64,
+) {
+    let normalized = status
+        .trim_start_matches("TRADE_STATUS_")
+        .to_ascii_uppercase();
+    if matches!(normalized.as_str(), "MATCHED" | "MATCHED_NOT_BROADCASTED") {
+        shared
+            .account_state
+            .mark_unresolved_trade_match_time(trade_key, match_time_secs);
+    } else {
+        shared
+            .account_state
+            .resolve_unresolved_trade_match_time(trade_key);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GapSendFailure {
     slot: usize,
@@ -740,14 +760,27 @@ fn classify_private_trade_role(
             // The live owner route uses the OID ownership publication only.
             // A durable trade lookup takes an instance lifecycle lock and is
             // needed solely for a compacted historical taker replay. In
-            // particular, never perform that cold lookup for a maker event.
-            shared.lookup_order_ownership(order_id).is_some()
+            // particular, never perform that cold lookup for a maker event:
+            // its top-level taker order normally belongs to another account.
+            let owned_order = if has_owned_maker_leg {
+                shared.lookup_runtime_order_ownership(order_id)
+            } else {
+                shared.lookup_order_ownership(order_id)
+            };
+            owned_order.is_some()
                 || (!has_owned_maker_leg
                     && trade_id
-                        .and_then(|trade_key| shared.account_state.trade_ownership(trade_key))
+                        .and_then(|trade_key| {
+                            let started = crate::latency::Instant::now();
+                            let ownership = shared.account_state.trade_ownership(trade_key);
+                            crate::latency::record(
+                                "polymarket.user.owner_durable_fallback",
+                                started,
+                            );
+                            ownership
+                        })
                         .is_some_and(|ownership| {
-                            normalize_order_id(&ownership.order_id)
-                                == normalize_order_id(order_id)
+                            normalize_order_id(&ownership.order_id) == normalize_order_id(order_id)
                         }))
         });
     match (has_owned_maker_leg, has_owned_taker_order) {
@@ -796,7 +829,7 @@ fn validate_trade_event(
                 .ok_or_else(|| "trade field `order_id` is missing or empty".to_string())?;
         }
         PrivateTradeRole::Maker => {
-            let maker_legs: Vec<&serde_json::Value> = data
+            for (index, order) in data
                 .get("maker_orders")
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
@@ -809,34 +842,31 @@ fn validate_trade_event(
                             address.eq_ignore_ascii_case(&shared.order_maker_address)
                         })
                 })
-                .collect();
-            for (index, order) in maker_legs.iter().enumerate() {
-                required_string(
-                    order,
-                    &["order_id"],
-                    &format!("maker_orders[{index}].order_id"),
-                )?;
-                required_string(
-                    order,
-                    &["asset_id"],
-                    &format!("maker_orders[{index}].asset_id"),
-                )?;
-                strict_side(
-                    required_string(order, &["side"], &format!("maker_orders[{index}].side"))?,
-                    &format!("maker_orders[{index}].side"),
-                )?;
-                let quantity = strict_number(
-                    order.get("matched_amount"),
-                    &format!("maker_orders[{index}].matched_amount"),
-                )?;
-                let price =
-                    strict_number(order.get("price"), &format!("maker_orders[{index}].price"))?;
-                validate_quantity_price(
-                    quantity,
-                    price,
-                    &format!("maker_orders[{index}].matched_amount"),
-                    &format!("maker_orders[{index}].price"),
-                )?;
+                .enumerate()
+            {
+                // Keep success-path validation allocation-free. The leg index
+                // is added only when malformed input needs an error string.
+                let validate = || -> std::result::Result<(), String> {
+                    required_string(order, &["order_id"], "maker order_id")?;
+                    required_string(order, &["asset_id"], "maker asset_id")?;
+                    strict_side(
+                        required_string(order, &["side"], "maker side")?,
+                        "maker side",
+                    )?;
+                    let quantity = strict_number(
+                        order.get("matched_amount"),
+                        "maker matched_amount",
+                    )?;
+                    let price = strict_number(order.get("price"), "maker price")?;
+                    validate_quantity_price(
+                        quantity,
+                        price,
+                        "maker matched_amount",
+                        "maker price",
+                    )?;
+                    Ok(())
+                };
+                validate().map_err(|error| format!("maker_orders[{index}]: {error}"))?;
             }
         }
     }
@@ -1129,9 +1159,13 @@ fn effective_match_time(data: &serde_json::Value, trade_id: &str) -> EffectiveMa
 fn exchange_event_timestamp_ns(data: &serde_json::Value) -> Option<u64> {
     let raw = ["timestamp", "last_update", "match_time"]
         .into_iter()
-        .find_map(|key| data.get(key).and_then(|value| {
-            value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-        }))?;
+        .find_map(|key| {
+            data.get(key).and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            })
+        })?;
     let timestamp_ns = match raw {
         100_000_000_000_000_000.. => raw,
         100_000_000_000_000.. => raw.saturating_mul(1_000),
@@ -1253,6 +1287,29 @@ impl PrivateEventDelta {
         }
     }
 
+    /// Synthetic RTT order pushes are operational measurements, not strategy
+    /// lifecycle events.  Remove them on the websocket parser thread before
+    /// they consume either the lossless owner lane or the cold account lane.
+    fn is_registered_probe_order(&self, shared: &SharedState) -> bool {
+        let Self::Order(payload) = self else {
+            return false;
+        };
+        let Some(order_id) = payload
+            .get("order_id")
+            .or_else(|| payload.get("orderID"))
+            .or_else(|| payload.get("id"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        shared
+            .probe_order_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|probe| normalize_order_id(probe) == normalize_order_id(order_id))
+    }
+
     fn dedupe_key(&self) -> String {
         // REST pages can repeat exact rows at cursor boundaries. Include the
         // lifecycle status/type in addition to the venue id so MATCHED →
@@ -1297,6 +1354,14 @@ impl PrivateEventDelta {
 }
 
 fn terminal_trade_is_durably_resolved(payload: &serde_json::Value, shared: &SharedState) -> bool {
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches("TRADE_STATUS_");
+    if !matches!(status, "CONFIRMED" | "FAILED") {
+        return false;
+    }
     let trade_id = payload
         .get("id")
         .or_else(|| payload.get("trade_id"))
@@ -1328,10 +1393,14 @@ fn terminal_trade_is_durably_resolved(payload: &serde_json::Value, shared: &Shar
     if !owned_maker_order_ids.is_empty() {
         return owned_maker_order_ids.iter().all(|order_id| {
             let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
-            shared.account_state.trade_ownership(&key).is_some()
+            shared
+                .account_state
+                .trade_status_matches_nonblocking(&key, status)
         });
     }
-    shared.account_state.trade_ownership(trade_id).is_some()
+    shared
+        .account_state
+        .trade_status_matches_nonblocking(trade_id, status)
 }
 
 enum PrivateApplyCommand {
@@ -1396,14 +1465,20 @@ impl PrivateRouteDedupe {
     fn seen(&self, identity: &PrivateRouteIdentity) -> bool {
         match identity {
             PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => self
-                .ranks.get(fingerprint).is_some_and(|existing| *existing >= *rank),
+                .ranks
+                .get(fingerprint)
+                .is_some_and(|existing| *existing >= *rank),
         }
     }
 
     fn remember(&mut self, identity: PrivateRouteIdentity) {
         match identity {
             PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => {
-                if self.ranks.get(&fingerprint).is_some_and(|existing| *existing >= rank) {
+                if self
+                    .ranks
+                    .get(&fingerprint)
+                    .is_some_and(|existing| *existing >= rank)
+                {
                     return;
                 }
                 self.ranks.insert(fingerprint, rank);
@@ -1525,9 +1600,13 @@ fn route_private_event_fast(
             let status = if lifecycle.eq_ignore_ascii_case("PLACEMENT") {
                 OrderStatus::Accepted
             } else if lifecycle.eq_ignore_ascii_case("UPDATE") {
-                if size_matched + tolerance >= original_size { OrderStatus::Filled }
-                else if size_matched > tolerance { OrderStatus::PartiallyFilled }
-                else { OrderStatus::Accepted }
+                if size_matched + tolerance >= original_size {
+                    OrderStatus::Filled
+                } else if size_matched > tolerance {
+                    OrderStatus::PartiallyFilled
+                } else {
+                    OrderStatus::Accepted
+                }
             } else if lifecycle.eq_ignore_ascii_case("CANCELLATION")
                 || lifecycle.eq_ignore_ascii_case("CANCELLED")
                 || lifecycle.eq_ignore_ascii_case("CANCELED")
@@ -1539,15 +1618,18 @@ fn route_private_event_fast(
             let associate_trades = match data.get("associate_trades") {
                 None => Vec::new(),
                 Some(value) => {
-                    let values = value.as_array()
-                        .ok_or_else(|| {
+                    let values = value.as_array().ok_or_else(|| {
                             "order lifecycle associate_trades is not an array".to_string()
                         })?;
                     let mut trades = Vec::with_capacity(values.len());
                     for value in values {
-                        let trade_id = value.as_str().map(str::trim)
+                        let trade_id = value
+                            .as_str()
+                            .map(str::trim)
                             .filter(|value| !value.is_empty())
-                            .ok_or_else(|| "order lifecycle associate_trades contains invalid id".to_string())?;
+                            .ok_or_else(|| {
+                                "order lifecycle associate_trades contains invalid id".to_string()
+                            })?;
                         if trades.iter().any(|existing| existing == trade_id) {
                             return Err(format!(
                                 "order lifecycle associate_trades contains duplicate id `{trade_id}`"
@@ -1599,20 +1681,29 @@ fn route_private_event_fast(
             }])
         }
         PrivateEventDelta::Trade(_) => {
-            let role = validate_trade_event(data, shared)?;
             let (status_name, status, rank) = private_status(data);
-            if rank == 0 || status_name == "RETRYING" {
-                return Ok(Vec::new());
+            // Repeated terminal pushes dominate live private traffic. Consult
+            // the nonblocking terminal fingerprint before doing ownership and
+            // economics validation; an identical terminal already committed
+            // by the single cold writer cannot change StrategyAccount.
+            if matches!(status_name, "CONFIRMED" | "FAILED") {
+                let terminal_started = crate::latency::Instant::now();
+                let resolved = terminal_trade_is_durably_resolved(data, shared);
+                crate::latency::record(
+                    "polymarket.user.terminal_high_water",
+                    terminal_started,
+                );
+                if resolved {
+                    return Ok(Vec::new());
+                }
             }
-            // A terminal replay can outlive its parent order row after
-            // history compaction. Its durable trade ownership/tombstone is
-            // already the authoritative high-water mark, so there is no
-            // advancing strategy update to route. The cold single-writer
-            // still receives this event and validates the immutable trade
-            // economics before acknowledging replay completion.
-            if matches!(status_name, "CONFIRMED" | "FAILED")
-                && terminal_trade_is_durably_resolved(data, shared)
-            {
+            let fields_started = crate::latency::Instant::now();
+            let role = validate_trade_event(data, shared)?;
+            crate::latency::record(
+                "polymarket.user.validate_trade_fields",
+                fields_started,
+            );
+            if rank == 0 || status_name == "RETRYING" {
                 return Ok(Vec::new());
             }
             let trade_id = required_string(data, &["id", "trade_id"], "trade_id")?;
@@ -1636,10 +1727,24 @@ fn route_private_event_fast(
                         })
                     {
                         let order_id = required_string(maker, &["order_id"], "maker order_id")?;
-                        let ownership =
-                            shared.lookup_order_ownership(order_id).ok_or_else(|| {
-                            format!("unowned maker trade `{trade_id}` order_id `{order_id}`")
-                        })?;
+                        let ownership = match shared.lookup_order_ownership(order_id) {
+                            Some(ownership) => ownership,
+                            None if matches!(status_name, "CONFIRMED" | "FAILED")
+                                && terminal_trade_is_durably_resolved(data, shared) =>
+                            {
+                                // Historical terminal replay after the
+                                // runtime OID route was compacted. Only this
+                                // cold fallback consults the durable ledger;
+                                // ordinary terminal updates stay entirely on
+                                // the runtime ownership mirror.
+                                return Ok(Vec::new());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "unowned maker trade `{trade_id}` order_id `{order_id}`"
+                                ));
+                            }
+                        };
                         let symbol = required_string(maker, &["asset_id"], "maker asset_id")?;
                         let side = strict_side(
                             required_string(maker, &["side"], "maker side")?,
@@ -1681,9 +1786,19 @@ fn route_private_event_fast(
                 }
                 PrivateTradeRole::Taker => {
                     let order_id = taker_order_id(data).unwrap_or("");
-                    let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
-                        format!("unowned taker trade `{trade_id}` order_id `{order_id}`")
-                    })?;
+                    let ownership = match shared.lookup_order_ownership(order_id) {
+                        Some(ownership) => ownership,
+                        None if matches!(status_name, "CONFIRMED" | "FAILED")
+                            && terminal_trade_is_durably_resolved(data, shared) =>
+                        {
+                            return Ok(Vec::new());
+                        }
+                        None => {
+                            return Err(format!(
+                                "unowned taker trade `{trade_id}` order_id `{order_id}`"
+                            ));
+                        }
+                    };
                     let symbol = required_string(data, &["asset_id", "token_id"], "asset_id")?;
                     let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
                     let quantity = strict_number(
@@ -1808,8 +1923,12 @@ fn dispatch_private_update(
         };
         debug!(
             "[PolyUserFeed] {} coid={} {} {:?} filled={} price={}",
-            update.symbol, coid, update.side, update.status,
-            update.filled_quantity, update.avg_fill_price,
+            update.symbol,
+            coid,
+            update.side,
+            update.status,
+            update.filled_quantity,
+            update.avg_fill_price,
         );
     }
     let dispatch_started = crate::latency::Instant::now();
@@ -1817,13 +1936,13 @@ fn dispatch_private_update(
         enqueue_recovery_update(shared, update_tx, generation, update)
             .map_err(|error| error.to_string())
     } else {
-        update_tx
-            .try_send(update)
-            .map_err(|error| match error {
-                crossbeam_channel::TrySendError::Full(_) =>
-                    "root order-update queue saturated; private event remains replayable".to_string(),
-                crossbeam_channel::TrySendError::Disconnected(_) =>
-                    "order update channel closed".to_string(),
+        update_tx.try_send(update).map_err(|error| match error {
+            crossbeam_channel::TrySendError::Full(_) => {
+                "root order-update queue saturated; private event remains replayable".to_string()
+            }
+            crossbeam_channel::TrySendError::Disconnected(_) => {
+                "order update channel closed".to_string()
+            }
             })
     };
     crate::latency::record("polymarket.user.dispatch", dispatch_started);
@@ -1960,7 +2079,10 @@ fn spawn_private_apply_worker(
     let cold_worker = std::thread::Builder::new()
         .name(format!("poly-private-cold-{}", cold_account_id))
         .spawn(move || {
-            crate::os_tune::pin_private_account_cold("polymarket-private-cold");
+            crate::os_tune::pin_private_account_cold(
+                "polymarket-private-cold",
+                &cold_account_id,
+            );
             loop {
                 match cold_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(command) => {
@@ -2445,9 +2567,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                             leg_id,
                         );
                     }
-                    shared
-                        .account_state
-                        .resolve_unresolved_trade_match_time(&leg_id);
+                    update_trade_finality_replay_anchor(
+                        shared,
+                        &leg_id,
+                        status_str,
+                        match_time.replay_watermark_secs,
+                    );
                     if match_time.replay_watermark_secs > 0 {
                         shared
                             .live_position
@@ -2571,9 +2696,12 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         trade_id,
                     );
                 }
-                shared
-                    .account_state
-                    .resolve_unresolved_trade_match_time(trade_id);
+                update_trade_finality_replay_anchor(
+                    shared,
+                    trade_id,
+                    status_str,
+                    match_time.replay_watermark_secs,
+                );
                 if match_time.replay_watermark_secs > 0 {
                     shared
                         .live_position
@@ -3404,6 +3532,7 @@ async fn user_feed_loop(
                             }
                             .into_iter()
                             .filter_map(PrivateEventDelta::classify)
+                            .filter(|event| !event.is_registered_probe_order(&shared))
                             .collect();
                             let apply_enqueue_started = crate::latency::Instant::now();
                             if let Err(error) = apply_lane.dispatch_live(events) {
@@ -3568,8 +3697,14 @@ mod tests {
     #[test]
     fn private_route_fingerprint_is_case_stable_and_role_scoped() {
         let maker = private_route_fingerprint(b'm', &["Trade-1", "0xAbCd"]);
-        assert_eq!(maker, private_route_fingerprint(b'm', &["trade-1", "0xabcd"]));
-        assert_ne!(maker, private_route_fingerprint(b't', &["trade-1", "0xabcd"]));
+        assert_eq!(
+            maker,
+            private_route_fingerprint(b'm', &["trade-1", "0xabcd"])
+        );
+        assert_ne!(
+            maker,
+            private_route_fingerprint(b't', &["trade-1", "0xabcd"])
+        );
     }
 
     #[test]
@@ -3684,6 +3819,36 @@ mod tests {
         )
         .unwrap()
         .shared_state()
+    }
+
+    #[test]
+    fn registered_probe_order_is_filtered_before_private_owner_lane() {
+        let shared = test_shared();
+        shared
+            .probe_order_ids
+            .lock()
+            .unwrap()
+            .push_back("0xAbC123".into());
+        let probe = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "order",
+            "order_id": "0xabc123",
+        }))
+        .unwrap();
+        assert!(probe.is_registered_probe_order(&shared));
+
+        let real_order = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "order",
+            "order_id": "0xdef456",
+        }))
+        .unwrap();
+        assert!(!real_order.is_registered_probe_order(&shared));
+
+        let trade = PrivateEventDelta::classify(serde_json::json!({
+            "event_type": "trade",
+            "id": "0xabc123",
+        }))
+        .unwrap();
+        assert!(!trade.is_registered_probe_order(&shared));
     }
 
     #[test]
@@ -3859,11 +4024,23 @@ mod tests {
         assert!(!shared.account_state.is_uncertain());
         assert_eq!(
             shared.account_state.earliest_unresolved_trade_match_time(),
-            None
+            Some(123),
+            "an owned MATCHED trade must keep gap replay pinned until finality",
         );
         assert_eq!(
             shared.live_position.lock().unwrap().last_match_time_secs(),
             123
+        );
+
+        let mut confirmed = event;
+        confirmed["status"] = serde_json::json!("CONFIRMED");
+        let updates = parse_user_event(&confirmed, &shared);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].client_order_id, "owner-1");
+        assert_eq!(
+            shared.account_state.earliest_unresolved_trade_match_time(),
+            None,
+            "terminal finality releases the replay anchor",
         );
     }
 
@@ -4959,6 +5136,22 @@ mod tests {
         assert!(cold.valid_business_event);
         assert!(!cold.invalid_business_event);
         assert!(cold.updates.is_empty());
+    }
+
+    #[test]
+    fn fast_route_does_not_suppress_failed_after_matched_high_water() {
+        let shared = owned_taker_shared(0.5);
+        let matched = valid_taker_event();
+        let first = parse_user_event_diagnosed(&matched, &shared);
+        assert!(first.valid_business_event);
+        assert_eq!(first.updates.len(), 1);
+
+        let mut failed = matched;
+        failed["status"] = serde_json::json!("FAILED");
+        let failed = PrivateEventDelta::classify(failed).unwrap();
+        let routed = route_private_event_fast(&failed, &shared).unwrap();
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].update.status, OrderStatus::Failed);
     }
 
     #[test]

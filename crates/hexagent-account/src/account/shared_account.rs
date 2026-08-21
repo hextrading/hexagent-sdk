@@ -131,6 +131,13 @@ impl ShardedRouteMap {
             .cloned()
     }
 
+    fn try_get(&self, key: &str) -> Result<Option<String>, ()> {
+        self.shards[Self::shard_index(key)]
+            .try_read()
+            .map(|shard| shard.get(key).cloned())
+            .map_err(|_| ())
+    }
+
     fn write_shard(&self, key: &str) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
         self.shards[Self::shard_index(key)].write().unwrap()
     }
@@ -2918,6 +2925,10 @@ pub struct SharedAccount {
     /// Monotonic for one process: once the startup wallet snapshot is applied,
     /// hot readiness checks remain a single acquire load until restart.
     startup_snapshot_applied_fast: AtomicBool,
+    /// Cold startup wallet reconciliation must wait while any trade or
+    /// maintenance lifecycle can still advance physical economics. Strategy
+    /// workers read this without entering the aggregate account transaction.
+    startup_snapshot_deferred_fast: AtomicBool,
     /// Account-wide outcome map published by the cold control plane.
     settled_token_values_fast: ArcSwap<SettledTokenValuesSnapshot>,
     settled_token_values_generation_fast: AtomicU64,
@@ -3032,6 +3043,10 @@ impl SharedAccount {
             state.startup_snapshot_applied_this_process,
             Ordering::Release,
         );
+        self.startup_snapshot_deferred_fast.store(
+            has_unsettled_trade_lifecycle(state) || has_unsettled_maintenance_operation(state),
+            Ordering::Release,
+        );
         let current_reason = self.uncertain_reason_fast.load_full();
         if current_reason.as_deref().map(String::as_str) != state.uncertain_reason.as_deref() {
             self.uncertain_reason_fast
@@ -3083,6 +3098,7 @@ impl SharedAccount {
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
             startup_snapshot_applied_fast: AtomicBool::new(false),
+            startup_snapshot_deferred_fast: AtomicBool::new(false),
             settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot::default()),
             settled_token_values_generation_fast: AtomicU64::new(0),
             uncertain_reason_fast: ArcSwapOption::empty(),
@@ -3252,6 +3268,42 @@ impl SharedAccount {
             if role_migrated {
                 recompute_reconciliation(&mut state, "legacy trade-role attribution migration");
             }
+            // A crash can leave an economically-booked trade at MATCHED while
+            // its MINED/CONFIRMED/FAILED edge is still outstanding.  The
+            // ordinary gap-replay watermark may already be newer than that
+            // trade, so reconstruct a durable rewind anchor from the trade row
+            // itself.  Until finality arrives, startup wallet snapshots must
+            // remain deferred: applying one could book the same physical fill
+            // twice when the terminal lifecycle is replayed later.
+            let pending_finality_anchors: Vec<(String, u64)> = state
+                .trades
+                .iter()
+                .filter(|(_, trade)| {
+                    trade.booked
+                        && !trade.failed
+                        && (!trade.physical_booked
+                            || (trade.virtual_fee_booked && !trade.physical_fee_booked))
+                        && trade.match_time_secs > 0
+                })
+                .map(|(trade_key, trade)| (trade_key.clone(), trade.match_time_secs))
+                .collect();
+            let mut restored_finality_anchors = 0usize;
+            for (trade_key, match_time_secs) in pending_finality_anchors {
+                if state
+                    .unresolved_trade_match_times
+                    .insert(trade_key, match_time_secs)
+                    != Some(match_time_secs)
+                {
+                    restored_finality_anchors = restored_finality_anchors.saturating_add(1);
+                }
+            }
+            if restored_finality_anchors > 0 {
+                log::warn!(
+                    "[shared_account] account={} restored {} pending trade-finality replay anchor(s) from durable MATCHED lifecycle state",
+                    account_id,
+                    restored_finality_anchors,
+                );
+            }
             // A persisted trade-persistence blocker proves that the snapshot
             // containing both the trade and the blocker reached disk. The new
             // process can therefore clear only this source-owned blocker; all
@@ -3398,6 +3450,7 @@ impl SharedAccount {
             admission_fast: AtomicBool::new(false),
             passive_admission_fast: AtomicBool::new(false),
             startup_snapshot_applied_fast: AtomicBool::new(false),
+            startup_snapshot_deferred_fast: AtomicBool::new(false),
             settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot {
                 generation: initial_settled_generation,
                 values: initial_settled_values,
@@ -5896,6 +5949,10 @@ impl SharedAccount {
     }
     pub fn startup_snapshot_applied(&self) -> bool {
         self.startup_snapshot_applied_fast.load(Ordering::Acquire)
+    }
+
+    pub fn startup_snapshot_deferred_by_pending_lifecycle(&self) -> bool {
+        self.startup_snapshot_deferred_fast.load(Ordering::Acquire)
     }
 
     /// Attribute only a proven 1:1 platform redemption. This deliberately
@@ -10442,6 +10499,58 @@ impl SharedAccount {
             })
     }
 
+    /// Non-blocking terminal high-water lookup for the authenticated private
+    /// owner route. A contended shard is deliberately reported as "not yet
+    /// resolved": routing the event again is safe because StrategyAccount and
+    /// the cold ledger both deduplicate by trade id, whereas waiting for the
+    /// cold lifecycle writer would add its scheduling tail to private apply.
+    pub fn trade_status_matches_nonblocking(&self, trade_key: &str, status: &str) -> bool {
+        if trade_key.is_empty() || status.is_empty() {
+            return false;
+        }
+        let instance_id = match self.trade_routes.try_get(trade_key) {
+            Ok(instance_id) => instance_id,
+            Err(()) => return false,
+        };
+        if let Some(instance_id) = instance_id {
+            let account = match self.virtual_accounts.try_read() {
+                Ok(accounts) => accounts.get(&instance_id).cloned(),
+                Err(_) => return false,
+            };
+            let Some(account) = account else {
+                return false;
+            };
+            return account
+                .lifecycle
+                .try_lock()
+                .ok()
+                .and_then(|lifecycle| {
+                    lifecycle
+                        .trades
+                        .get(trade_key)
+                        .map(|trade| trade.ownership.status.eq_ignore_ascii_case(status))
+                })
+                .unwrap_or(false);
+        }
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        state
+            .trades
+            .get(trade_key)
+            .map(|trade| trade.ownership.status.eq_ignore_ascii_case(status))
+            .or_else(|| {
+                state
+                    .retired_trade_ownership_tombstones
+                    .get(trade_key)
+                    .map(|tombstone| {
+                        tombstone.ownership.status.eq_ignore_ascii_case(status)
+                            && retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                    })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn restored_trades(&self) -> Vec<RestoredTrade> {
         self.lock_state()
             .trades
@@ -11626,9 +11735,11 @@ fn repair_failed_trade_under_reservations_for_query(
                 "query-repair order `{coid}` is missing its durable order root"
             ));
         }
-        if !failed_trade_keys_by_order.contains_key(coid) {
+        if !failed_trade_keys_by_order.contains_key(coid)
+            && !state.routine_cancel_audits.contains(coid)
+        {
             return Err(format!(
-                "query-repair order `{coid}` is missing its durable FAILED-trade root"
+                "query-repair order `{coid}` is missing its durable FAILED-trade or routine-cancel-audit root"
             ));
         }
     }
@@ -11737,6 +11848,67 @@ fn repair_failed_trade_under_reservations_for_query(
         mutated |= state.recovery_pending_orders.insert(coid.clone());
         mutated |= state.startup_query_repair_orders.insert(coid.clone());
         query_orders.insert(coid);
+    }
+
+    // A cancel response may release the local reservation immediately and a
+    // subsequent partial MATCHED/MINED push can then install a routine audit
+    // marker before its authoritative cancel-vs-fill query completes. If the
+    // process stops in that narrow interval, the durable root is a cancelled
+    // order plus `routine_cancel_audits`, not a FAILED trade. Restore the
+    // remaining quantity conservatively and force the same pre-admission CLOB
+    // query; never infer finality or availability from the local status.
+    let routine_cancel_candidates: Vec<String> =
+        state.routine_cancel_audits.iter().cloned().collect();
+    for coid in routine_cancel_candidates {
+        let Some(snapshot) = state.orders.get(&coid).cloned() else {
+            continue;
+        };
+        if !matches!(
+            snapshot.status,
+            OrderStatus::Cancelled
+                | OrderStatus::CancelUncertain
+                | OrderStatus::CancelOrderTimeout
+        ) {
+            continue;
+        }
+        let (expected_cash, expected_quantity) = desired_order_reservation(&snapshot);
+        let cash_tolerance = reconciliation_tolerance(expected_cash, snapshot.reserved_cash);
+        let quantity_tolerance =
+            reconciliation_tolerance(expected_quantity, snapshot.reserved_quantity);
+        let reservation_under = snapshot.reserved_cash + cash_tolerance < expected_cash
+            || snapshot.reserved_quantity + quantity_tolerance < expected_quantity;
+        if !reservation_under
+            || snapshot.reserved_cash > expected_cash + cash_tolerance
+            || snapshot.reserved_quantity > expected_quantity + quantity_tolerance
+        {
+            continue;
+        }
+
+        let cash_delta = expected_cash - snapshot.reserved_cash;
+        let quantity_delta = expected_quantity - snapshot.reserved_quantity;
+        let instance = state.instances.get_mut(&snapshot.instance_id).ok_or_else(|| {
+            format!(
+                "query-repair order `{coid}` references missing instance `{}`",
+                snapshot.instance_id,
+            )
+        })?;
+        instance.reserved_cash += cash_delta;
+        if quantity_delta.abs() > quantity_tolerance {
+            *instance
+                .reserved_positions
+                .entry(snapshot.token_id.clone())
+                .or_insert(0.0) += quantity_delta;
+        }
+        let order = state
+            .orders
+            .get_mut(&coid)
+            .expect("routine-cancel order disappeared during startup repair");
+        order.reserved_cash = expected_cash;
+        order.reserved_quantity = expected_quantity;
+        state.recovery_pending_orders.insert(coid.clone());
+        state.startup_query_repair_orders.insert(coid.clone());
+        query_orders.insert(coid);
+        mutated = true;
     }
 
     Ok((query_orders, mutated))
@@ -12920,7 +13092,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
         };
         if order.status != OrderStatus::Cancelled
             || order.terminal_matched_quantity.is_some()
-            || state.recovery_pending_orders.contains(coid)
+            || (state.recovery_pending_orders.contains(coid)
+                && !state.startup_query_repair_orders.contains(coid))
         {
             return Err(format!(
                 "routine cancel audit `{coid}` must be a distinct cancelled order without terminal matched quantity"
@@ -17092,6 +17265,79 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn persistent_ledger_rebuilds_pending_trade_finality_replay_anchor() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-pending-trade-finality-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("pending-finality", &path).unwrap();
+            account.register_instance("btc", 1.0);
+            account
+                .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+                .unwrap();
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account
+                .reserve_order(
+                    "btc",
+                    "btc-1",
+                    "oid-1",
+                    "TOKEN",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            assert!(matches!(
+                account.apply_trade_transition_with_context(
+                    "trade-1",
+                    "MATCHED",
+                    "btc-1",
+                    "oid-1",
+                    "TOKEN",
+                    Side::Buy,
+                    2.0,
+                    0.5,
+                    true,
+                    123,
+                ),
+                TradeTransitionResult::Applied(_)
+            ));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("pending-finality", &path).unwrap();
+        assert_eq!(restored.earliest_unresolved_trade_match_time(), Some(123));
+        assert!(restored.startup_snapshot_deferred_by_pending_lifecycle());
+        assert!(matches!(
+            restored.apply_trade_transition_with_context(
+                "trade-1",
+                "CONFIRMED",
+                "btc-1",
+                "oid-1",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                123,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        restored.resolve_unresolved_trade_match_time("trade-1");
+        assert!(
+            !restored.startup_snapshot_deferred_by_pending_lifecycle(),
+            "confirmed trade remained unsettled: {:?}",
+            restored.lock_state().trades.get("trade-1"),
+        );
+    }
+
+    #[test]
     fn persistence_wal_replays_and_compacts_on_restart() {
         let _persistence_guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!(
@@ -17709,6 +17955,116 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         );
         assert!(reopened.mark_cancelled_pending_audit(coid));
         assert!(reopened.startup_query_repair_pending_order_ids().is_empty());
+        drop(reopened);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn live_query_repair_restores_cancel_audit_remaining_reservation() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-cancel-audit-query-repair-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "cancel-audit-query-repair";
+        let instance_id = "btc";
+        let coid = "btc-cancelled-partial";
+        let token = "BTC-UP";
+        let mut state = SharedAccountState::default();
+        let mut instance = InstanceLedger::new(1.0);
+        instance.positions.insert(token.to_string(), 100.0);
+        state.instances.insert(instance_id.to_string(), instance);
+        state.orders.insert(
+            coid.to_string(),
+            OrderOwnership {
+                account_id: account_id.to_string(),
+                instance_id: instance_id.to_string(),
+                client_order_id: coid.to_string(),
+                order_id: "0xCANCELLEDPARTIAL".to_string(),
+                token_id: token.to_string(),
+                side: Side::Sell,
+                quantity: 10.0,
+                filled_quantity: 2.25,
+                terminal_matched_quantity: None,
+                terminal_trade_ids: Vec::new(),
+                terminal_trade_ids_authoritative: false,
+                price: 0.43,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Cancelled,
+            },
+        );
+        state.trades.insert(
+            "trade-mined:0xCANCELLEDPARTIAL".to_string(),
+            AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: account_id.to_string(),
+                    instance_id: instance_id.to_string(),
+                    trade_key: "trade-mined:0xCANCELLEDPARTIAL".to_string(),
+                    client_order_id: coid.to_string(),
+                    order_id: "0xCANCELLEDPARTIAL".to_string(),
+                    token_id: token.to_string(),
+                    side: Side::Sell,
+                    quantity: 2.25,
+                    price: 0.43,
+                    status: "MINED".to_string(),
+                },
+                booked: true,
+                physical_booked: true,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: true,
+                physical_fee_booked: true,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: 0,
+            },
+        );
+        state.routine_cancel_audits.insert(coid.to_string());
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.to_string(),
+                persistence_generation: 0,
+                state,
+            },
+        )
+        .unwrap();
+
+        let strict_error = SharedAccount::new_persistent(account_id, &path).unwrap_err();
+        assert!(
+            strict_error.contains("reservation disagrees with effective remaining quantity"),
+            "{strict_error}",
+        );
+        let restored = SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+        assert_eq!(
+            restored.startup_query_repair_pending_order_ids(),
+            vec![coid.to_string()],
+        );
+        assert_eq!(restored.order(coid).unwrap().reserved_quantity, 7.75);
+        assert_eq!(
+            restored
+                .instance_snapshot(instance_id)
+                .unwrap()
+                .reserved_positions[token],
+            7.75,
+        );
+        restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(restored);
+
+        // Crash-reopen remains admitted only through the same conservative
+        // query path; ordinary strict startup still refuses it.
+        assert!(SharedAccount::new_persistent(account_id, &path).is_err());
+        let reopened = SharedAccount::new_persistent_for_query_repair(account_id, &path).unwrap();
+        assert_eq!(reopened.order(coid).unwrap().reserved_quantity, 7.75);
         drop(reopened);
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");

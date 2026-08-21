@@ -1278,6 +1278,20 @@ fn elapsed_ns(origin: &std::time::Instant) -> u64 {
     origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
+/// Process-local monotonic timestamp used by the cross-thread market lane.
+///
+/// `types::now_ns()` is wall time and may jump when NTP or the VM host adjusts
+/// the clock.  Subtracting two wall timestamps made a clock correction look
+/// like strategy-queue latency (live samples showed repeatable ~40 ms false
+/// tails around future-instrument registration).  A single process origin
+/// keeps the compact atomic `u64` representation required by latest-value
+/// slots while making producer/consumer deltas strictly monotonic.
+#[inline]
+fn market_queue_monotonic_ns() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    elapsed_ns(ORIGIN.get_or_init(std::time::Instant::now))
+}
+
 fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
     if origin_ns == 0 {
         return -1.0;
@@ -1745,7 +1759,7 @@ fn enqueue_market_event(
     event: Arc<MarketEvent>,
     latest_key_id: Option<u16>,
 ) -> bool {
-    let enqueued_ns = crate::types::now_ns();
+    let enqueued_ns = market_queue_monotonic_ns();
     let epoch = lane.barrier_epoch.load(Ordering::Relaxed);
     let Some(key_id) = latest_key_id else {
         lane.barrier_epoch.fetch_add(1, Ordering::Relaxed);
@@ -1757,8 +1771,7 @@ fn enqueue_market_event(
             }))
             .is_ok();
     };
-    let slot_id = key_id as usize * LATEST_EPOCH_SLOTS
-        + (epoch as usize % LATEST_EPOCH_SLOTS);
+    let slot_id = key_id as usize * LATEST_EPOCH_SLOTS + (epoch as usize % LATEST_EPOCH_SLOTS);
     let Some(slot) = lane.latest.slots.get(slot_id) else {
         return lane
             .tx
@@ -1774,7 +1787,11 @@ fn enqueue_market_event(
             true
         }
         LatestPublish::MarkerRequired => {
-            if lane.tx.try_send(QueuedMarketEvent::Latest(slot_id as u16)).is_ok() {
+            if lane
+                .tx
+                .try_send(QueuedMarketEvent::Latest(slot_id as u16))
+                .is_ok()
+            {
                 true
             } else {
                 slot.discard_if_pending();
@@ -2279,7 +2296,10 @@ fn is_routine_clob_resubscribe(reason: &str) -> bool {
     reason == "CLOB resubscribe requested"
 }
 
-fn forward_recorder_shared(recorder_tx: Option<&Sender<Arc<MarketEvent>>>, event: Arc<MarketEvent>) {
+fn forward_recorder_shared(
+    recorder_tx: Option<&Sender<Arc<MarketEvent>>>,
+    event: Arc<MarketEvent>,
+) {
     if let Some(tx) = recorder_tx {
         if matches!(event.as_ref(), MarketEvent::Exit) {
             let _ = tx.send(event);
@@ -2298,7 +2318,9 @@ fn forward_recorder_shared(recorder_tx: Option<&Sender<Arc<MarketEvent>>>, event
                 let now = now_ns();
                 let last = LAST_WARN_NS.load(Ordering::Relaxed);
                 if now.saturating_sub(last) >= 10_000_000_000
-                    && LAST_WARN_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                    && LAST_WARN_NS
+                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
                 {
                     warn!("[Recorder] live queue saturated; dropped_events_total={} action=preserve_strategy_latency", dropped);
                 }
@@ -6292,8 +6314,40 @@ impl Engine {
                 let shutdown_done_rx = shutdown_done_rx
                     .unwrap_or_else(crossbeam_channel::never);
                 let mut shutdown_in_progress = false;
+                let never_root_update_rx = crossbeam_channel::never::<OrderUpdate>();
+                let mut root_private_update_burst = 0usize;
                 loop {
-                    crossbeam_channel::select! {
+                    // Private/order lifecycle is lossless and higher priority
+                    // than replaceable market data. Bound the priority burst
+                    // so a pathological update storm still permits one public
+                    // event, then immediately return to private-first routing.
+                    let selectable_update_rx = if private_update_lane_enabled(
+                        root_private_update_burst,
+                        !market_rx.is_empty(),
+                    ) {
+                        &update_rx
+                    } else {
+                        &never_root_update_rx
+                    };
+                    crossbeam_channel::select_biased! {
+                        recv(selectable_update_rx) -> msg => match msg {
+                            // Route by coid → numeric owner. Missing ownership
+                            // is unowned and dropped rather than contaminating
+                            // sibling StrategyAccounts.
+                            Ok(u) => {
+                                root_private_update_burst =
+                                    root_private_update_burst.saturating_add(1);
+                                Self::route_private_update(
+                                    u,
+                                    &iid_to_idx,
+                                    &update_txs,
+                                    &worker_quarantined,
+                                    &instance_ids,
+                                    &signal_tx,
+                                );
+                            }
+                            Err(_) => break,
+                        },
                         recv(market_rx) -> msg => match msg {
                             Ok(MarketEvent::Exit) => {
                                 if shutdown_in_progress { continue; }
@@ -6336,6 +6390,7 @@ impl Engine {
                                 }
                             }
                             Ok(event) => {
+                                root_private_update_burst = 0;
                                 if shutdown_in_progress { continue; }
                                 let event = Arc::new(event);
                                 let mut dropped_mask = Self::route_market_event(
@@ -6378,22 +6433,6 @@ impl Engine {
                                     }
                                     market_overflow_log_at = std::time::Instant::now();
                                 }
-                            }
-                            Err(_) => break,
-                        },
-                        recv(update_rx) -> msg => match msg {
-                            // Route by coid → numeric owner. Missing ownership
-                            // is unowned and dropped rather than contaminating
-                            // sibling StrategyAccounts.
-                            Ok(u) => {
-                                Self::route_private_update(
-                                    u,
-                                    &iid_to_idx,
-                                    &update_txs,
-                                    &worker_quarantined,
-                                    &instance_ids,
-                                    &signal_tx,
-                                );
                             }
                             Err(_) => break,
                         },
@@ -6485,6 +6524,13 @@ impl Engine {
         instance_ids: &[String],
         signal_tx: &SignalSender,
     ) {
+        // RTT probes reserve/release their synthetic orders directly in the
+        // shared monitoring account.  Their executor-style acknowledgements
+        // deliberately have no numeric strategy owner and must not enter (or
+        // contaminate the latency metrics of) the lossless strategy lane.
+        if is_synthetic_probe_update(&update) {
+            return;
+        }
         // Polymarket execution completions and private owner-fast routing stamp
         // OrderUpdate with a local wall-clock timestamp. Reject stale/exchange
         // timestamps so this boundary metric cannot poison its histogram.
@@ -6623,24 +6669,12 @@ impl Engine {
                     .unwrap_or_default(),
             ),
             // Spot venues keyed by stable symbol.
-            MarketEvent::OrderBook(ob) => sym_to_instances
-                .get(&SymbolId::of(&ob.symbol))
-                .copied(),
-            MarketEvent::Trade(t) => sym_to_instances
-                .get(&SymbolId::of(&t.symbol))
-                .copied(),
-            MarketEvent::Quote(q) => sym_to_instances
-                .get(&SymbolId::of(&q.symbol))
-                .copied(),
-            MarketEvent::Bar(b) => sym_to_instances
-                .get(&SymbolId::of(&b.symbol))
-                .copied(),
-            MarketEvent::SpotPrice(sp) => sym_to_instances
-                .get(&SymbolId::of(&sp.symbol))
-                .copied(),
-            MarketEvent::AssetCtx(ac) => sym_to_instances
-                .get(&SymbolId::of(&ac.symbol))
-                .copied(),
+            MarketEvent::OrderBook(ob) => sym_to_instances.get(&SymbolId::of(&ob.symbol)).copied(),
+            MarketEvent::Trade(t) => sym_to_instances.get(&SymbolId::of(&t.symbol)).copied(),
+            MarketEvent::Quote(q) => sym_to_instances.get(&SymbolId::of(&q.symbol)).copied(),
+            MarketEvent::Bar(b) => sym_to_instances.get(&SymbolId::of(&b.symbol)).copied(),
+            MarketEvent::SpotPrice(sp) => sym_to_instances.get(&SymbolId::of(&sp.symbol)).copied(),
+            MarketEvent::AssetCtx(ac) => sym_to_instances.get(&SymbolId::of(&ac.symbol)).copied(),
             MarketEvent::MarketDataHealth(health) => Some(
                 token_to_instances
                     .get(&SymbolId::of(&health.symbol))
@@ -6779,9 +6813,8 @@ impl Engine {
                 } else {
                     &update_rx
                 };
-            let selectable_watchdog_rx = if !market_rx.is_empty()
-                && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL
-            {
+            let selectable_watchdog_rx =
+                if !market_rx.is_empty() && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL {
                 &never_watchdog_rx
             } else {
                 &watchdog_rx
@@ -6892,7 +6925,7 @@ impl Engine {
                         if quarantined.load(Ordering::Acquire) { return; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if shutdown_started { continue; }
-                        let queue_last_us = crate::types::now_ns()
+                        let queue_last_us = market_queue_monotonic_ns()
                             .saturating_sub(queued.enqueued_ns)
                             / 1_000;
                         let event_kind = market_event_metric_kind(queued.event.as_ref());
@@ -8666,7 +8699,7 @@ impl Engine {
                                         fingerprint,
                                     );
                                 }
-                                if recovery_update_tx.send(update).is_err() {
+                                if send_executor_update(&recovery_update_tx, update).is_err() {
                                     return;
                                 }
                             }
@@ -9052,7 +9085,7 @@ impl Engine {
                                         queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                                     );
                                     for update in (queued.complete)(&mut router) {
-                                        if queued.update_tx.send(update).is_err() { break; }
+                                        if send_executor_update(&queued.update_tx, update).is_err() { break; }
                                     }
                                 }
                             })
@@ -9424,7 +9457,7 @@ impl Engine {
                                     info!("[Executor] shutdown cancel barrier account_id={} representative_instance={}",
                                         account_id, instance_id);
                                     trade.cancel_all_orders_until_final(|update| {
-                                        let _ = update_tx.send(update);
+                                        let _ = send_executor_update(&update_tx, update);
                                     });
                                 }
                                 shutdown_finalized = true;
@@ -9555,7 +9588,7 @@ impl Engine {
                             } else {
                                 let updates = execute_fallback_signal(&mut fallback, signal, stale_threshold_ms);
                                 for update in updates {
-                                    if update_tx.send(update).is_err() { break; }
+                                    if send_executor_update(&update_tx, update).is_err() { break; }
                                 }
                             }
                         }
@@ -9591,6 +9624,10 @@ impl Engine {
 fn owner_from_coid(coid: &str, iid_to_idx: &HashMap<String, usize>) -> Option<usize> {
     let (iid, _counter) = coid.rsplit_once('-')?;
     iid_to_idx.get(iid).copied()
+}
+
+fn is_synthetic_probe_update(update: &OrderUpdate) -> bool {
+    update.exchange == Exchange::Polymarket && update.client_order_id.starts_with("probe:")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9826,6 +9863,24 @@ struct QueuedPolyCompletion {
     enqueued_at: std::time::Instant,
 }
 
+/// Stamp the actual executor-producer boundary immediately before publishing
+/// an update to the root strategy router. Some cold operations (notably an
+/// orphan reconcile batch) construct an `OrderUpdate`, perform more HTTP
+/// requests, and only then publish the accumulated results. Keeping the
+/// construction timestamp in that case incorrectly charges the remaining
+/// cold HTTP work to `producer_to_root_router` and can also make a prompt
+/// reconcile-triggered quote look stale. Private-feed producers retain their
+/// own receipt timestamp because they publish each routed update immediately.
+fn send_executor_update(
+    tx: &Sender<OrderUpdate>,
+    mut update: OrderUpdate,
+) -> Result<(), crossbeam_channel::SendError<OrderUpdate>> {
+    if update.exchange == Exchange::Polymarket {
+        update.timestamp_ns = now_ns();
+    }
+    tx.send(update)
+}
+
 /// ExecutorRejected update for a placement we never sent (admission skip /
 /// stale / pre-flight). Free-fn twin of the closure in `execute_fallback_signal`.
 fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
@@ -10012,7 +10067,7 @@ fn shed_saturated_place_signal(
         places.len(),
     );
     for order in places {
-        if utx.send(exec_rejected_place(&order)).is_err() {
+        if send_executor_update(utx, exec_rejected_place(&order)).is_err() {
             break;
         }
     }
@@ -10036,7 +10091,7 @@ fn defer_reconcile_signal(signal: Signal, utx: &Sender<OrderUpdate>) {
     for update in
         reconcile_deferred_updates(&iid, &pending_places, &pending_cancels, &pending_trade_ids)
     {
-        if utx.send(update).is_err() {
+        if send_executor_update(utx, update).is_err() {
             break;
         }
     }
@@ -10070,7 +10125,11 @@ fn fire_or_execute(
         {
             if order.timestamp_ns > 0 {
                 crate::latency::record_ns(
-                    if order.post_only { "polymarket.order.post_only.quote_age_at_dispatch" } else { "polymarket.order.quote_age_at_dispatch" },
+                    if order.post_only {
+                        "polymarket.order.post_only.quote_age_at_dispatch"
+                    } else {
+                        "polymarket.order.quote_age_at_dispatch"
+                    },
                     now_ns().saturating_sub(order.timestamp_ns),
                 );
             }
@@ -10084,12 +10143,13 @@ fn fire_or_execute(
             // reject a freshly-emitted order computed from a market trigger
             // that sat stale in a scheduler/callback queue.
             if is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns) {
-                let _ = utx.send(exec_rejected_place(&order));
+                let _ = send_executor_update(utx, exec_rejected_place(&order));
                 return;
             }
             match try_acquire(&iid, Role::Fast) {
                 None => {
-                    let _ = utx.send(exec_rejected_place(&order)); // skip = hold
+                    let _ = send_executor_update(utx, exec_rejected_place(&order));
+                    // skip = hold
                 }
                 Some(permit) => {
                     let client = permit.pooled_client();
@@ -10098,7 +10158,7 @@ fn fire_or_execute(
                         Err(error) => {
                             error!("[Executor] Polymarket place route error: {}", error);
                             drop(permit);
-                            let _ = utx.send(exec_rejected_place(&order));
+                            let _ = send_executor_update(utx, exec_rejected_place(&order));
                             return;
                         }
                     };
@@ -10121,11 +10181,16 @@ fn fire_or_execute(
                                 drop(permit); // release the reserved connection
                                 vec![u]
                             });
-                            let _ = done_tx.send(QueuedPolyCompletion { complete: f, update_tx: utx.clone(), kind: "place", enqueued_at: std::time::Instant::now() });
+                            let _ = done_tx.send(QueuedPolyCompletion {
+                                complete: f,
+                                update_tx: utx.clone(),
+                                kind: "place",
+                                enqueued_at: std::time::Instant::now(),
+                            });
                         }
                         Err(update) => {
                             drop(permit); // pre-flight reject: nothing sent
-                            let _ = utx.send(update);
+                            let _ = send_executor_update(utx, update);
                         }
                     }
                 }
@@ -10146,7 +10211,8 @@ fn fire_or_execute(
                 None => {
                     // Unknown instance/role is permanent; ordinary saturation
                     // never reaches this branch.
-                    let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
+                    let _ =
+                        send_executor_update(utx, exec_rejected_cancel(client_order_id, exchange));
                 }
                 Some(permit) => {
                     let wait = wait_started.elapsed();
@@ -10164,7 +10230,10 @@ fn fire_or_execute(
                         Err(error) => {
                             error!("[Executor] Polymarket cancel route error: {}", error);
                             drop(permit);
-                            let _ = utx.send(exec_rejected_cancel(client_order_id, exchange));
+                            let _ = send_executor_update(
+                                utx,
+                                exec_rejected_cancel(client_order_id, exchange),
+                            );
                             return;
                         }
                     };
@@ -10187,7 +10256,12 @@ fn fire_or_execute(
                         drop(permit);
                         vec![u]
                     });
-                    let _ = done_tx.send(QueuedPolyCompletion { complete: f, update_tx: utx.clone(), kind: "cancel", enqueued_at: std::time::Instant::now() });
+                    let _ = done_tx.send(QueuedPolyCompletion {
+                        complete: f,
+                        update_tx: utx.clone(),
+                        kind: "cancel",
+                        enqueued_at: std::time::Instant::now(),
+                    });
                 }
             }
         }
@@ -10206,7 +10280,11 @@ fn fire_or_execute(
             let place = place_orders.into_iter().next().unwrap();
             if place.timestamp_ns > 0 {
                 crate::latency::record_ns(
-                    if place.post_only { "polymarket.order.post_only.quote_age_at_dispatch" } else { "polymarket.order.quote_age_at_dispatch" },
+                    if place.post_only {
+                        "polymarket.order.post_only.quote_age_at_dispatch"
+                    } else {
+                        "polymarket.order.quote_age_at_dispatch"
+                    },
                     now_ns().saturating_sub(place.timestamp_ns),
                 );
             }
@@ -10223,11 +10301,11 @@ fn fire_or_execute(
             // Account admission still requires enough physical + virtual funds
             // for both old and new reservations at the same time.
             if is_stale(timestamp_ns) || is_stale(place.quote_trigger_local_timestamp_ns) {
-                let _ = utx.send(exec_rejected_place(&place));
+                let _ = send_executor_update(utx, exec_rejected_place(&place));
             } else {
                 match try_acquire(&iid, Role::Fast) {
                     None => {
-                        let _ = utx.send(exec_rejected_place(&place));
+                        let _ = send_executor_update(utx, exec_rejected_place(&place));
                     }
                     Some(ppermit) => {
                         let pclient = ppermit.pooled_client();
@@ -10239,8 +10317,9 @@ fn fire_or_execute(
                                     error
                                 );
                                 drop(ppermit);
-                                let _ = utx.send(exec_rejected_place(&place));
-                                let _ = utx.send(exec_rejected_cancel(coid, exchange));
+                                let _ = send_executor_update(utx, exec_rejected_place(&place));
+                                let _ =
+                                    send_executor_update(utx, exec_rejected_cancel(coid, exchange));
                                 return;
                             }
                         };
@@ -10260,11 +10339,16 @@ fn fire_or_execute(
                                     drop(ppermit);
                                     vec![u]
                                 });
-                                let _ = done_tx.send(QueuedPolyCompletion { complete: pf, update_tx: utx.clone(), kind: "place", enqueued_at: std::time::Instant::now() });
+                                let _ = done_tx.send(QueuedPolyCompletion {
+                                    complete: pf,
+                                    update_tx: utx.clone(),
+                                    kind: "place",
+                                    enqueued_at: std::time::Instant::now(),
+                                });
                             }
                             Err(update) => {
                                 drop(ppermit);
-                                let _ = utx.send(update);
+                                let _ = send_executor_update(utx, update);
                             }
                         }
                     }
@@ -10284,7 +10368,7 @@ fn fire_or_execute(
                 .send((cancel_signal, stale_ms, utx.clone()))
                 .is_err()
             {
-                let _ = utx.send(exec_rejected_cancel(coid, exchange));
+                let _ = send_executor_update(utx, exec_rejected_cancel(coid, exchange));
             }
         }
         // Reconcile: concurrency gate on the dedicated per-account Reconcile
@@ -10307,7 +10391,7 @@ fn fire_or_execute(
                     &pending_cancels,
                     &pending_trade_ids,
                 ) {
-                    if utx.send(update).is_err() {
+                    if send_executor_update(utx, update).is_err() {
                         break;
                     }
                 }
@@ -10331,7 +10415,7 @@ fn fire_or_execute(
                     }
                 };
                 for update in updates {
-                    if utx.send(update).is_err() {
+                    if send_executor_update(utx, update).is_err() {
                         break;
                     }
                 }
@@ -10348,7 +10432,7 @@ fn fire_or_execute(
         // and spill to the fixed global fallback-order pool when saturated.
         other => {
             for update in execute_fallback_signal(worker, other, stale_ms) {
-                if utx.send(update).is_err() {
+                if send_executor_update(utx, update).is_err() {
                     break;
                 }
             }
@@ -11694,7 +11778,9 @@ mod market_router_tests {
         );
 
         forward_recorder_event(Some(&tx), &spot("btc/usd"));
-        assert!(matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::SpotPrice(_))));
+        assert!(
+            matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::SpotPrice(_)))
+        );
         assert!(
             rx.try_recv().is_err(),
             "external event must be enqueued once"
@@ -12001,13 +12087,7 @@ mod market_router_tests {
             &txs,
         );
         // BTC chainlink spot (lowercase "btc/usd") → only instance 0.
-        Engine::route_market_event(
-            Arc::new(spot("btc/usd")),
-            &sym,
-            &mut tok,
-            &mut latest,
-            &txs,
-        );
+        Engine::route_market_event(Arc::new(spot("btc/usd")), &sym, &mut tok, &mut latest, &txs);
         // ETH Coinbase OB → only instance 1.
         Engine::route_market_event(
             Arc::new(ob(Exchange::Coinbase, "ETH-USD")),
@@ -12032,21 +12112,33 @@ mod market_router_tests {
 
         assert_eq!(
             Engine::route_market_event(
-                Arc::new(spot("btc/usd")), &sym, &mut tok, &mut latest, &txs,
+                Arc::new(spot("btc/usd")),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &txs,
             ),
             0
         );
         // BTC queue is now full. Routing ETH must remain independent.
         assert_eq!(
             Engine::route_market_event(
-                Arc::new(spot("eth/usd")), &sym, &mut tok, &mut latest, &txs,
+                Arc::new(spot("eth/usd")),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &txs,
             ),
             0
         );
         assert_eq!(drain(&rx1), 1);
         assert_eq!(
             Engine::route_market_event(
-                Arc::new(spot("btc/usd")), &sym, &mut tok, &mut latest, &txs,
+                Arc::new(spot("btc/usd")),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &txs,
             ),
             1
         );
@@ -12294,7 +12386,9 @@ mod market_router_tests {
     fn signal_sender_tags_numeric_owner_without_registry() {
         let (raw_tx, rx) = bounded(1);
         let sender = SignalSender::system(raw_tx).with_owner(7);
-        sender.send(Signal::NewOrder(order_req("c1", "btc"))).unwrap();
+        sender
+            .send(Signal::NewOrder(order_req("c1", "btc")))
+            .unwrap();
         let routed = rx.recv().unwrap();
         assert_eq!(routed.owner, 7);
         assert!(matches!(routed.signal, Signal::NewOrder(_)));
@@ -12310,14 +12404,22 @@ mod market_router_tests {
         let system = SignalSender::system_with_owner_lanes(root_tx, vec![owner_tx], control_tx);
         let owner = system.with_owner(0);
 
-        owner.send(Signal::NewOrder(order_req("c1", "btc"))).unwrap();
-        owner.send(Signal::NewOrder(order_req("c2", "btc"))).unwrap();
+        owner
+            .send(Signal::NewOrder(order_req("c1", "btc")))
+            .unwrap();
+        owner
+            .send(Signal::NewOrder(order_req("c2", "btc")))
+            .unwrap();
         system.send(Signal::BeginShutdown).unwrap();
         system.send(Signal::Exit).unwrap();
 
         let routed = (0..4).map(|_| root_rx.recv().unwrap()).collect::<Vec<_>>();
-        assert!(matches!(&routed[0].signal, Signal::NewOrder(order) if order.client_order_id == "c1"));
-        assert!(matches!(&routed[1].signal, Signal::NewOrder(order) if order.client_order_id == "c2"));
+        assert!(
+            matches!(&routed[0].signal, Signal::NewOrder(order) if order.client_order_id == "c1")
+        );
+        assert!(
+            matches!(&routed[1].signal, Signal::NewOrder(order) if order.client_order_id == "c2")
+        );
         assert!(matches!(routed[2].signal, Signal::BeginShutdown));
         assert!(matches!(routed[3].signal, Signal::Exit));
         arbiter.join().unwrap();
@@ -12383,6 +12485,32 @@ mod market_router_tests {
                 .collect::<Vec<_>>(),
             vec!["trade-1"]
         );
+    }
+
+    #[test]
+    fn executor_publish_restamps_reconcile_result_at_actual_send_boundary() {
+        let mut update = reconcile_deferred_updates(
+            "zhu-03",
+            &[(
+                "zhu-03-place".to_string(),
+                "UP".to_string(),
+                Side::Buy,
+                0.41,
+                None,
+            )],
+            &[],
+            &[],
+        )
+        .pop()
+        .unwrap();
+        update.timestamp_ns = 1;
+        let (tx, rx) = bounded(1);
+        let before = now_ns();
+        send_executor_update(&tx, update).unwrap();
+        let published = rx.recv().unwrap();
+        let after = now_ns();
+        assert!(published.timestamp_ns >= before);
+        assert!(published.timestamp_ns <= after);
     }
 
     #[test]
@@ -12503,6 +12631,32 @@ mod market_router_tests {
             classify_private_update_route(Some(9), 2, &flags),
             PrivateUpdateRoute::DropInvalid(9),
         );
+    }
+
+    #[test]
+    fn polymarket_rtt_probe_updates_are_not_strategy_private_events() {
+        let probe = OrderUpdate {
+            client_order_id: "probe:btc01:0xabc".into(),
+            exchange: Exchange::Polymarket,
+            symbol: "UP".into(),
+            side: Side::Buy,
+            exchange_order_id: Some("0xabc".into()),
+            status: OrderStatus::Accepted,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 100.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns(),
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            order_audit: None,
+            error: None,
+        };
+        assert!(is_synthetic_probe_update(&probe));
+
+        let mut strategy = probe;
+        strategy.client_order_id = "btc01-42".into();
+        assert!(!is_synthetic_probe_update(&strategy));
     }
 
     #[test]

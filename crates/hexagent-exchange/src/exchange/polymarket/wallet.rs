@@ -4293,9 +4293,17 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
     let tx = map.entry(account.clone()).or_insert_with(|| {
         let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceQueueItem>();
         let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        let worker_name = format!("poly-maint-{}", worker_label);
         std::thread::Builder::new()
-            .name(format!("poly-maint-{}", worker_label))
+            .name(worker_name.clone())
             .spawn(move || {
+                // This worker is lazily spawned by the strategy owner, which
+                // is SCHED_FIFO and pinned in low-latency live mode. pthreads
+                // inherit both policy and affinity: without an immediate
+                // demotion the first split/redeem burst time-sliced on the
+                // strategy core and produced repeatable ~40 ms Instrument and
+                // quote-queue tails at every event pre-registration.
+                crate::os_tune::pin_background(&worker_name);
                 // Serial drain with an idle-debounce coalescing window. Jobs for the
                 // same account + series arriving together (the normal case
                 // for sibling instances on one event boundary) become one
@@ -4714,9 +4722,14 @@ fn enqueue_merge_maintenance(
     let tx = map.entry(account.clone()).or_insert_with(|| {
         let (tx, rx) = crossbeam_channel::unbounded::<MergeQueueItem>();
         let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        let worker_name = format!("poly-merge-{}", worker_label);
         std::thread::Builder::new()
-            .name(format!("poly-merge-{}", worker_label))
+            .name(worker_name.clone())
             .spawn(move || {
+                // Merge is also first spawned from a strategy callback. Drop
+                // inherited real-time policy/affinity before touching its
+                // cold coalescing and chain-I/O path.
+                crate::os_tune::pin_background(&worker_name);
                 while let Ok(first) = rx.recv() {
                     let mut burst = vec![first];
                     let burst_started = std::time::Instant::now();
