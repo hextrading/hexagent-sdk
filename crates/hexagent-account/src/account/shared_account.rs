@@ -413,6 +413,11 @@ pub struct SettledGcOwnerMailbox {
     instance_id: String,
     registration_id: u64,
     request_rx: crossbeam_channel::Receiver<SettledGcDeleteRequest>,
+    /// A request already removed from the bounded lane but unable to acquire
+    /// every cold account lock without waiting.  The strategy thread retries
+    /// it on a later watchdog turn; it never blocks behind a control writer
+    /// and the coordinator never observes a false completion.
+    pending_request: Option<SettledGcDeleteRequest>,
     completion_tx: crossbeam_channel::Sender<SettledGcCompletionCertificate>,
     pending_completion: Option<SettledGcCompletionCertificate>,
     completion_queue_high_water: Arc<AtomicUsize>,
@@ -424,6 +429,12 @@ pub struct SettledGcOwnerMailbox {
 struct SettledGcOwnerRoute {
     registration_id: u64,
     tx: crossbeam_channel::Sender<SettledGcDeleteRequest>,
+}
+
+#[derive(Debug)]
+enum SettledGcDeleteAttempt {
+    Busy(SettledGcDeleteRequest),
+    Completed(SettledGcCompletionCertificate),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,7 +475,7 @@ impl SettledGcOwnerMailbox {
     }
 
     pub fn request_depth(&self) -> usize {
-        self.request_rx.len()
+        self.request_rx.len() + usize::from(self.pending_request.is_some())
     }
 
     fn try_publish_completion(
@@ -510,12 +521,15 @@ impl SettledGcOwnerMailbox {
             }
             return Ok(Some(published));
         }
-        let request = match self.request_rx.try_recv() {
-            Ok(request) => request,
-            Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                return Err("settled GC request route disconnected".to_string())
-            }
+        let (request, first_attempt) = match self.pending_request.take() {
+            Some(request) => (request, false),
+            None => match self.request_rx.try_recv() {
+                Ok(request) => (request, true),
+                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return Err("settled GC request route disconnected".to_string())
+                }
+            },
         };
         if request.instance_id != self.instance_id
             || request.registration_id != self.registration_id
@@ -528,9 +542,21 @@ impl SettledGcOwnerMailbox {
                 request.registration_id,
             ));
         }
-        crate::latency::record("polymarket.account.settled_gc_owner_queue", request.enqueued_at);
+        if first_attempt {
+            crate::latency::record(
+                "polymarket.account.settled_gc_owner_queue",
+                request.enqueued_at,
+            );
+        }
         let started = crate::latency::Instant::now();
-        let certificate = account.process_settled_gc_delete_request(request)?;
+        let certificate = match account.process_settled_gc_delete_request(request)? {
+            SettledGcDeleteAttempt::Busy(request) => {
+                self.pending_request = Some(request);
+                crate::latency::record("polymarket.account.settled_gc_owner_apply", started);
+                return Ok(None);
+            }
+            SettledGcDeleteAttempt::Completed(certificate) => certificate,
+        };
         crate::latency::record("polymarket.account.settled_gc_owner_apply", started);
         let published = certificate.clone();
         if let Err(certificate) = self.try_publish_completion(certificate) {
@@ -6201,6 +6227,7 @@ impl SharedAccount {
             instance_id: instance_id.to_string(),
             registration_id,
             request_rx,
+            pending_request: None,
             completion_tx: self.settled_gc_completion_tx.clone(),
             pending_completion: None,
             completion_queue_high_water: Arc::clone(
@@ -7287,21 +7314,31 @@ impl SharedAccount {
     /// balance-changing maintenance remains fail-closed until authoritative
     /// terminal metadata arrives.
     pub fn begin_order_recovery<'a>(&self, client_order_ids: impl IntoIterator<Item = &'a str>) {
-        let _control = self.control_gate.read().unwrap();
         let mut newly_pending = false;
         for client_order_id in client_order_ids.into_iter().filter(|id| !id.is_empty()) {
             let Some(account) = self.virtual_account_for_coid(client_order_id) else {
                 continue;
             };
             let mut lifecycle = account.lifecycle.lock().unwrap();
-            if !lifecycle.orders.contains_key(client_order_id) {
+            let Some(token_id) = lifecycle
+                .orders
+                .get(client_order_id)
+                .map(|order| order.token_id.clone())
+            else {
                 continue;
-            }
+            };
             if lifecycle
                 .recovery_pending_orders
                 .insert(client_order_id.to_string())
             {
                 newly_pending = true;
+                Self::record_virtual_trade_mutation(
+                    &account,
+                    &mut lifecycle,
+                    "",
+                    client_order_id,
+                    &token_id,
+                );
                 self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
             }
         }
@@ -7311,16 +7348,27 @@ impl SharedAccount {
     }
 
     pub fn finish_order_recovery(&self, client_order_id: &str) {
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        let token_id = lifecycle
+            .orders
+            .get(client_order_id)
+            .map(|order| order.token_id.clone())
+            .unwrap_or_default();
         let recovery_removed = lifecycle.recovery_pending_orders.remove(client_order_id);
         let query_repair_removed = lifecycle
             .startup_query_repair_orders
             .remove(client_order_id);
         if recovery_removed || query_repair_removed {
+            Self::record_virtual_trade_mutation(
+                &account,
+                &mut lifecycle,
+                "",
+                client_order_id,
+                &token_id,
+            );
             self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         }
     }
@@ -8207,7 +8255,6 @@ impl SharedAccount {
         if client_order_id.is_empty() || order_id.is_empty() {
             return false;
         }
-        let control = self.control_gate.read().unwrap();
         if let Some(account) = self.virtual_account_for_coid(client_order_id) {
             let mut lifecycle = account.lifecycle.lock().unwrap();
             let Some(old_order_id) = lifecycle
@@ -8216,7 +8263,6 @@ impl SharedAccount {
                 .map(|order| order.order_id.clone())
             else {
                 drop(lifecycle);
-                drop(control);
                 return self.record_order_binding_anomaly(
                     client_order_id,
                     format!("cannot bind oid `{order_id}` to unknown coid `{client_order_id}`"),
@@ -8240,7 +8286,6 @@ impl SharedAccount {
             if conflicts || routed_elsewhere {
                 drop(new_oid_routes);
                 drop(lifecycle);
-                drop(control);
                 return self.record_order_binding_anomaly(
                     client_order_id,
                     format!(
@@ -8253,9 +8298,22 @@ impl SharedAccount {
                 .get_mut(client_order_id)
                 .expect("order checked above")
                 .order_id = order_id.into();
+            let token_id = lifecycle
+                .orders
+                .get(client_order_id)
+                .expect("order checked above")
+                .token_id
+                .clone();
             new_oid_routes.insert(normalized, account.instance_id.clone());
             drop(new_oid_routes);
             self.oid_routes.remove(&normalized_old);
+            Self::record_virtual_trade_mutation(
+                &account,
+                &mut lifecycle,
+                "",
+                client_order_id,
+                &token_id,
+            );
             self.schedule_virtual_rebind_persist(
                 &account,
                 &lifecycle,
@@ -8264,7 +8322,6 @@ impl SharedAccount {
             );
             return true;
         }
-        drop(control);
         let mut state = self.lock_state();
         let Some(old_order_id) = state
             .orders
@@ -9044,7 +9101,6 @@ impl SharedAccount {
     /// the sticky audit gate until those fills are booked. The edge result lets
     /// callers suppress duplicate WARNs from repeated Filled lifecycle rows.
     pub fn mark_filled_pending_audit(&self, client_order_id: &str) -> FillAuditPendingTransition {
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return FillAuditPendingTransition::NotTracked;
         };
@@ -9053,6 +9109,7 @@ impl SharedAccount {
             return FillAuditPendingTransition::NotTracked;
         };
         order.status = OrderStatus::Filled;
+        let token_id = order.token_id.clone();
         let has_exact_terminal_audit = order.terminal_trade_ids_authoritative;
         let residual_pending = order.reserved_cash > EPS || order.reserved_quantity > EPS;
         let pending = if has_exact_terminal_audit {
@@ -9067,6 +9124,13 @@ impl SharedAccount {
                 .recovery_pending_orders
                 .insert(client_order_id.to_string());
         }
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            "",
+            client_order_id,
+            &token_id,
+        );
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         let transition = if !pending {
             FillAuditPendingTransition::Resolved
@@ -9232,7 +9296,6 @@ impl SharedAccount {
     }
 
     pub fn terminal_order_audit_complete(&self, client_order_id: &str) -> bool {
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
@@ -9248,7 +9311,6 @@ impl SharedAccount {
         client_order_id: &str,
         size_matched: f64,
     ) -> bool {
-        let control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
@@ -9270,7 +9332,6 @@ impl SharedAccount {
                 .cancel_audit_anomalies
                 .insert(client_order_id.to_string());
             drop(lifecycle);
-            drop(control);
             let mut state = self.lock_state();
             set_ownership_anomaly(
                 &mut state,
@@ -9304,12 +9365,18 @@ impl SharedAccount {
             lifecycle.recovery_pending_orders.remove(client_order_id);
         }
         let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            "",
+            client_order_id,
+            &token_id,
+        );
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         if pending && !already_pending {
             self.notify_order_audit_worker();
         }
         drop(lifecycle);
-        drop(control);
         if clear_cancel_anomaly {
             self.clear_cancel_audit_anomaly(client_order_id);
         }
@@ -9320,7 +9387,6 @@ impl SharedAccount {
     /// residual lock until an order-specific audit arrives, without globally
     /// pausing unrelated instances on the same account.
     pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
@@ -9332,6 +9398,7 @@ impl SharedAccount {
         order.terminal_matched_quantity = None;
         order.terminal_trade_ids.clear();
         order.terminal_trade_ids_authoritative = false;
+        let token_id = order.token_id.clone();
         lifecycle.recovery_pending_orders.remove(client_order_id);
         lifecycle
             .startup_query_repair_orders
@@ -9339,6 +9406,13 @@ impl SharedAccount {
         let newly_pending = lifecycle
             .routine_cancel_audits
             .insert(client_order_id.to_string());
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            "",
+            client_order_id,
+            &token_id,
+        );
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         if newly_pending {
             self.notify_order_audit_worker();
@@ -9349,7 +9423,6 @@ impl SharedAccount {
     /// Release the still-unfilled reservation after an authoritative terminal
     /// order outcome. Ownership is retained for late fill attribution.
     pub fn release_order(&self, client_order_id: &str, status: OrderStatus) {
-        let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
@@ -9365,8 +9438,16 @@ impl SharedAccount {
         order.reserved_cash = 0.0;
         order.reserved_quantity = 0.0;
         order.status = status;
+        let token_id = order.token_id.clone();
         lifecycle.orders.insert(client_order_id.into(), order);
         lifecycle.routine_cancel_audits.remove(client_order_id);
+        Self::record_virtual_trade_mutation(
+            &account,
+            &mut lifecycle,
+            "",
+            client_order_id,
+            &token_id,
+        );
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
     }
 
@@ -11973,7 +12054,83 @@ impl SharedAccount {
     fn process_settled_gc_delete_request(
         &self,
         request: SettledGcDeleteRequest,
-    ) -> Result<SettledGcCompletionCertificate, String> {
+    ) -> Result<SettledGcDeleteAttempt, String> {
+        // Hold the route generation read guard for the whole deletion turn.
+        // Re-registration takes the write side, so once it returns an old
+        // strategy mailbox can no longer mutate the replacement owner's
+        // lifecycle even if it still held a previously queued request.
+        let route_wait_started = crate::latency::Instant::now();
+        let owner_routes = match self.settled_gc_owner_routes.try_read() {
+            Ok(owner_routes) => owner_routes,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::latency::record_ns("polymarket.account.settled_gc_owner_route_busy", 1);
+                return Ok(SettledGcDeleteAttempt::Busy(request));
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_route_wait",
+            route_wait_started,
+        );
+        if !owner_routes
+            .get(&request.instance_id)
+            .is_some_and(|route| route.registration_id == request.registration_id)
+        {
+            return Err(format!(
+                "settled GC request has stale owner registration: instance={} registration={}",
+                request.instance_id, request.registration_id,
+            ));
+        }
+        // Never park the strategy thread behind a 20-80 ms aggregate account
+        // publication.  Retain the already-consumed request in the mailbox and
+        // retry on a later watchdog turn when every lock can be acquired
+        // immediately.  Once acquired, the existing all-or-nothing lock order
+        // and crash-recovery semantics remain unchanged.
+        let control_wait_started = crate::latency::Instant::now();
+        let control = match self.control_gate.try_write() {
+            Ok(control) => control,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::latency::record_ns("polymarket.account.settled_gc_owner_control_busy", 1);
+                return Ok(SettledGcDeleteAttempt::Busy(request));
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_control_wait",
+            control_wait_started,
+        );
+        let Some(account) = self.virtual_account(&request.instance_id) else {
+            return Err(format!(
+                "settled GC request targets unknown instance `{}`",
+                request.instance_id,
+            ));
+        };
+        let state_wait_started = crate::latency::Instant::now();
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::latency::record_ns("polymarket.account.settled_gc_owner_state_busy", 1);
+                return Ok(SettledGcDeleteAttempt::Busy(request));
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_state_wait",
+            state_wait_started,
+        );
+        let lifecycle_wait_started = crate::latency::Instant::now();
+        let mut lifecycle = match account.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::latency::record_ns("polymarket.account.settled_gc_owner_lifecycle_busy", 1);
+                return Ok(SettledGcDeleteAttempt::Busy(request));
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_lifecycle_wait",
+            lifecycle_wait_started,
+        );
         let SettledGcDeleteRequest {
             request_id,
             registration_id,
@@ -11982,49 +12139,6 @@ impl SharedAccount {
             tokens,
             ..
         } = request;
-        // Hold the route generation read guard for the whole deletion turn.
-        // Re-registration takes the write side, so once it returns an old
-        // strategy mailbox can no longer mutate the replacement owner's
-        // lifecycle even if it still held a previously queued request.
-        let route_wait_started = crate::latency::Instant::now();
-        let owner_routes = self.settled_gc_owner_routes.read().unwrap();
-        crate::latency::record(
-            "polymarket.account.settled_gc_owner_route_wait",
-            route_wait_started,
-        );
-        if !owner_routes.get(&instance_id).is_some_and(|route| {
-            route.registration_id == registration_id
-        }) {
-            return Err(format!(
-                "settled GC request has stale owner registration: instance={instance_id} registration={registration_id}",
-            ));
-        }
-        let control_wait_started = crate::latency::Instant::now();
-        let control = self.control_gate.write().unwrap();
-        crate::latency::record(
-            "polymarket.account.settled_gc_owner_control_wait",
-            control_wait_started,
-        );
-        let Some(account) = self.virtual_account(&instance_id) else {
-            return Err(format!(
-                "settled GC request targets unknown instance `{instance_id}`",
-            ));
-        };
-        let state_wait_started = crate::latency::Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::latency::record(
-            "polymarket.account.settled_gc_owner_state_wait",
-            state_wait_started,
-        );
-        let lifecycle_wait_started = crate::latency::Instant::now();
-        let mut lifecycle = account.lifecycle.lock().unwrap();
-        crate::latency::record(
-            "polymarket.account.settled_gc_owner_lifecycle_wait",
-            lifecycle_wait_started,
-        );
         let critical_started = crate::latency::Instant::now();
         let eligible = state
             .settled_audit_references
@@ -12032,25 +12146,30 @@ impl SharedAccount {
             .is_some_and(|reference| {
                 reference.instances.is_empty()
                     && reference.asset_ids.len() == tokens.len()
-                    && reference.asset_ids.iter().all(|token| tokens.contains(token))
+                    && reference
+                        .asset_ids
+                        .iter()
+                        .all(|token| tokens.contains(token))
             });
         if !eligible {
             crate::latency::record(
                 "polymarket.account.settled_gc_owner_critical",
                 critical_started,
             );
-            return Ok(SettledGcCompletionCertificate {
-                request_id,
-                registration_id,
-                instance_id,
-                condition_id,
-                retired_orders: 0,
-                retired_trades: 0,
-                remaining_rows: false,
-                eligible: false,
-                reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
-                trade_epoch: account.trade_epoch.load(Ordering::Acquire),
-            });
+            return Ok(SettledGcDeleteAttempt::Completed(
+                SettledGcCompletionCertificate {
+                    request_id,
+                    registration_id,
+                    instance_id,
+                    condition_id,
+                    retired_orders: 0,
+                    retired_trades: 0,
+                    remaining_rows: false,
+                    eligible: false,
+                    reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
+                    trade_epoch: account.trade_epoch.load(Ordering::Acquire),
+                },
+            ));
         }
 
         let protected_coids: HashSet<String> = lifecycle
@@ -12199,7 +12318,7 @@ impl SharedAccount {
         drop(state);
         drop(control);
         drop(owner_routes);
-        Ok(certificate)
+        Ok(SettledGcDeleteAttempt::Completed(certificate))
     }
 
     fn prune_terminal_history_scoped(
@@ -13430,11 +13549,11 @@ fn repair_failed_trade_under_reservations_for_query(
         let cash_delta = expected_cash - snapshot.reserved_cash;
         let quantity_delta = expected_quantity - snapshot.reserved_quantity;
         let instance = state.instances.get_mut(&snapshot.instance_id).ok_or_else(|| {
-            format!(
-                "query-repair order `{coid}` references missing instance `{}`",
-                snapshot.instance_id,
-            )
-        })?;
+                format!(
+                    "query-repair order `{coid}` references missing instance `{}`",
+                    snapshot.instance_id,
+                )
+            })?;
         instance.reserved_cash += cash_delta;
         if quantity_delta.abs() > quantity_tolerance {
             *instance
@@ -15276,6 +15395,9 @@ mod tests {
                     enqueued_at: crate::latency::Instant::now(),
                 })
                 .unwrap();
+            let SettledGcDeleteAttempt::Completed(certificate) = certificate else {
+                panic!("test owner deletion unexpectedly encountered a busy cold lock");
+            };
             assert!(certificate.eligible);
             orders = orders.saturating_add(certificate.retired_orders);
             trades = trades.saturating_add(certificate.retired_trades);
@@ -17891,6 +18013,55 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert_eq!(published.condition_id, "condition");
         assert!(owner.pending_completion.is_none());
         assert_eq!(owner.request_depth(), 0);
+    }
+
+    #[test]
+    fn settled_gc_owner_retains_request_instead_of_waiting_for_control_writer() {
+        const BUSY_ATTEMPTS: usize = 1_000;
+        let account = SharedAccount::new("settled-gc-control-busy");
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .retain_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        account
+            .release_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        let mut owner = account.register_settled_gc_owner("owner").unwrap();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+
+        let control = account.lock_state();
+        let mut samples = Vec::with_capacity(BUSY_ATTEMPTS);
+        for _ in 0..BUSY_ATTEMPTS {
+            let started = Instant::now();
+            assert!(owner.poll_once(&account).unwrap().is_none());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+        eprintln!(
+            "settled GC owner control-busy retry: n={BUSY_ATTEMPTS} p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} pending_depth=1 overflow=0",
+        );
+        assert!(max < 50_000_000, "owner mailbox retry exceeded 50 ms");
+        assert_eq!(
+            owner.request_depth(),
+            1,
+            "busy request must remain lossless"
+        );
+        assert!(owner.pending_request.is_some());
+        drop(control);
+
+        let certificate = owner.poll_once(&account).unwrap().unwrap();
+        assert!(!certificate.remaining_rows);
+        assert!(owner.pending_request.is_none());
+        assert_eq!(owner.request_depth(), 0);
+        assert_eq!(
+            account.finalize_ready_settled_audit_retirements(),
+            vec![HashSet::from(["UP".to_string()])],
+        );
     }
 
     #[test]
@@ -22051,6 +22222,122 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let order = account.order("a-lifecycle-fast").unwrap();
         assert_eq!(order.status, OrderStatus::Cancelled);
         assert_eq!(order.reserved_cash, 0.0);
+    }
+
+    #[test]
+    fn ordinary_lifecycle_does_not_wait_for_control_writer_and_survives_publish() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-lifecycle-no-control",
+                "oid-lifecycle-no-control",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let control = account.lock_state();
+        let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(worker_account.rebind_order_id(
+                "a-lifecycle-no-control",
+                "oid-lifecycle-no-control-rebound",
+            ));
+            worker_account.begin_order_recovery(["a-lifecycle-no-control"]);
+            worker_account.finish_order_recovery("a-lifecycle-no-control");
+            assert!(worker_account.mark_cancelled_pending_audit("a-lifecycle-no-control"));
+            assert!(
+                !worker_account.mark_cancelled_pending_trade_audit("a-lifecycle-no-control", 0.0)
+            );
+            worker_account.release_order("a-lifecycle-no-control", OrderStatus::Cancelled);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("ordinary lifecycle must not wait for account control publication");
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            aggregate_acquisitions,
+            "ordinary lifecycle must not materialize the aggregate account",
+        );
+        drop(control);
+        worker.join().unwrap();
+
+        let order = account.order("a-lifecycle-no-control").unwrap();
+        assert_eq!(order.order_id, "oid-lifecycle-no-control-rebound");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.reserved_cash, 0.0);
+        assert_eq!(order.reserved_quantity, 0.0);
+        assert!(account.recovery_pending_order_ids().is_empty());
+        assert!(account.pending_order_audit_ids().is_empty());
+    }
+
+    #[test]
+    fn ordinary_lifecycle_control_writer_latency_distribution() {
+        const EVENTS: usize = 1_000;
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-lifecycle-latency",
+                "oid-lifecycle-latency-0",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let control = account.lock_state();
+        let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut samples = Vec::with_capacity(EVENTS);
+            let order_ids: Vec<String> = (1..=EVENTS)
+                .map(|event| format!("oid-lifecycle-latency-{event}"))
+                .collect();
+            for order_id in &order_ids {
+                let started = Instant::now();
+                assert!(worker_account.rebind_order_id(
+                    "a-lifecycle-latency",
+                    order_id,
+                ));
+                worker_account.begin_order_recovery(["a-lifecycle-latency"]);
+                worker_account.finish_order_recovery("a-lifecycle-latency");
+                assert_eq!(
+                    worker_account.mark_order_status_effective(
+                        "a-lifecycle-latency",
+                        OrderStatus::Accepted,
+                    ),
+                    Some(OrderStatus::Accepted),
+                );
+                samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            }
+            tx.send(samples).unwrap();
+        });
+        let mut samples = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ordinary lifecycle distribution must not wait for control publication");
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            aggregate_acquisitions,
+        );
+        drop(control);
+        worker.join().unwrap();
+        let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+        eprintln!(
+            "ordinary lifecycle while control writer held: n={EVENTS} p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} account_lock_acquisitions=0",
+        );
+        assert!(max < 50_000_000, "owner-local lifecycle max exceeded 50 ms");
+        assert_eq!(
+            account.order("a-lifecycle-latency").unwrap().order_id,
+            format!("oid-lifecycle-latency-{EVENTS}"),
+        );
     }
 
     #[test]
