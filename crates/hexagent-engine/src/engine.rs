@@ -4657,6 +4657,8 @@ impl Engine {
             adverse_sel_rate: bt.sim_v2_adverse_sel_rate,
             adverse_scale_ticks: bt.sim_v2_adverse_scale_ticks,
             book_through_rate: bt.sim_v2_book_through_rate,
+            unexplained_depletion_exec_rate: bt.sim_v2_unexplained_depletion_exec_rate,
+            replay_self_depth_rate: bt.sim_v2_replay_self_depth_rate,
             fill_markout_vn: bt.sim_v2_fill_markout_vn,
             fill_markout_horizon_ns: bt.sim_v2_fill_markout_horizon_ms.saturating_mul(1_000_000),
             dynamic_fill_markout: bt.sim_v2_dynamic_fill_markout,
@@ -5031,6 +5033,10 @@ impl Engine {
         if bt_fills > 0 {
             info!("  Sim v2:   book-through adverse fills: {} (resting orders the contra swept through → picked off)", bt_fills);
         }
+        let depletion_fills = sim.unexplained_depletion_fills();
+        if depletion_fills > 0 {
+            info!("  Sim v2:   unexplained-depletion maker fills: {} (residual L2 shrinkage treated as hidden execution)", depletion_fills);
+        }
         let hc = sim.fill_haircuts();
         if hc > 0 {
             info!("  Sim v2:   forward-markout haircuts: {} favorable maker fills downweighted (markout → live −0.75c)", hc);
@@ -5092,7 +5098,7 @@ impl Engine {
         }
         if bt.sim_v2_fill_audit {
             for a in sim.fill_audit_rows() {
-                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_race_added_q={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
+                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_fill_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
                     a.slug,
                     a.iid,
                     a.place_orders,
@@ -5107,10 +5113,16 @@ impl Engine {
                     a.maker_rest_qty,
                     a.maker_q_init_sum,
                     a.maker_race_added_q,
+                    a.maker_replay_self_depth_credit,
                     a.maker_trade_matches,
                     a.maker_trade_qty,
                     a.maker_queue_drained_qty,
                     a.maker_candidate_qty,
+                    a.maker_depletion_observed_qty,
+                    a.maker_depletion_exec_qty,
+                    a.maker_depletion_cancel_advance_qty,
+                    a.maker_depletion_candidate_qty,
+                    a.maker_depletion_fill_qty,
                     a.maker_fill_qty,
                     a.stale_trade_matches,
                     a.stale_trade_candidate_qty,
@@ -5124,7 +5136,7 @@ impl Engine {
                 );
             }
             for a in sim.maker_order_audit_rows() {
-                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} q_init={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} q_init={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
                     a.slug,
                     a.iid,
                     a.coid,
@@ -5140,10 +5152,16 @@ impl Engine {
                     a.await_fresh_book,
                     a.visible_depth_at_entry,
                     a.q_init,
+                    a.replay_self_depth_credit,
                     a.trade_match_n,
                     a.trade_match_qty,
                     a.queue_drained_qty,
                     a.candidate_qty,
+                    a.depletion_observed_qty,
+                    a.depletion_exec_qty,
+                    a.depletion_cancel_advance_qty,
+                    a.depletion_candidate_qty,
+                    a.depletion_fill_qty,
                     a.book_through_candidate_qty,
                     a.book_through_fill_qty,
                     a.fill_qty,
@@ -5215,8 +5233,8 @@ impl Engine {
     /// race/markout lookahead) is backtest-only, so paper drives the core
     /// directly, exactly as the old v1 paper executor drove `SimExchange`.
     /// Lookahead-based knobs (race, forward-markout) are inert here (no future
-    /// book live); the queue/taker/book-through/fold knobs are mirrored from the
-    /// backtest config so paper fills track the calibrated backtest behaviour.
+    /// book live); the queue/taker/book-through/depletion/fold knobs are mirrored
+    /// from the backtest config so paper fills track calibrated backtest behaviour.
     fn spawn_paper_execution_thread(
         signal_rx: Receiver<RoutedSignal>,
         sim_feed_rx: Receiver<MarketEvent>,
@@ -5250,6 +5268,10 @@ impl Engine {
                 sim.configure(ahead_frac, bt.sim_matched_cant_cancel_window_ms.saturating_mul(1_000_000));
                 sim.configure_adverse_sel(bt.sim_v2_adverse_sel_rate, bt.sim_v2_adverse_scale_ticks);
                 sim.configure_book_through(bt.sim_v2_book_through_rate);
+                sim.configure_unexplained_depletion_execution(
+                    bt.sim_v2_unexplained_depletion_exec_rate,
+                );
+                sim.configure_replay_self_depth(bt.sim_v2_replay_self_depth_rate);
                 sim.set_fold_outcomes(bt.sim_v2_fold_outcomes);
                 sim.configure_book_stale_gate(
                     bt.sim_v2_book_stale_after_ms.saturating_mul(1_000_000),
@@ -5275,9 +5297,9 @@ impl Engine {
                         recv(sim_feed_rx) -> msg => {
                             match msg {
                                 Ok(MarketEvent::OrderBook(ref ob)) => {
-                                    // v2 `on_orderbook` returns book-through
-                                    // adverse fills directly (empty unless
-                                    // sim_v2_book_through_rate > 0).
+                                    // v2 `on_orderbook` returns causal maker
+                                    // fills from unexplained depletion and/or a
+                                    // trade-confirmed book-through sweep.
                                     let fills = sim.on_orderbook(ob);
                                     sim.on_local_orderbook(ob, ob.local_timestamp_ns);
                                     send_updates(fills, &update_tx, latency);

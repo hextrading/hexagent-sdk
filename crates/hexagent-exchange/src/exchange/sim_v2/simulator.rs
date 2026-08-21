@@ -55,6 +55,12 @@ pub struct SimV2Config {
     /// contra side sweeps strictly through gets picked off (latency adverse
     /// selection). See `exchange.rs`.
     pub book_through_rate: f64,
+    /// Maximum fraction of adverse, unexplained same-level depletion treated as
+    /// hidden execution volume. 0 keeps cancel-only attribution result-neutral.
+    pub unexplained_depletion_exec_rate: f64,
+    /// Approximate leave-one-out correction for tapes containing this
+    /// strategy's original live resting order.
+    pub replay_self_depth_rate: f64,
     /// Volume-neutral forward-markout adverse-reprice strength (0 = off). Keeps the
     /// full fill, settles it adverse toward the forward mid (peeked `horizon` ns
     /// ahead) → edge drops at preserved maker volume → the sim's maker-fill markout
@@ -327,6 +333,8 @@ impl Simulator {
         core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
+        core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
+        core.configure_replay_self_depth(cfg.replay_self_depth_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
         core.set_fold_outcomes(cfg.fold_outcomes);
@@ -616,6 +624,11 @@ impl Simulator {
     /// `sim_v2_book_through_rate`).
     pub fn book_through_fills(&self) -> u64 {
         self.core.book_through_fills_n
+    }
+
+    /// # maker fill fragments produced by unexplained L2 depletion.
+    pub fn unexplained_depletion_fills(&self) -> u64 {
+        self.core.unexplained_depletion_fills_n
     }
 
     /// # maker fills haircut by the forward-markout conditioning (diagnostic).

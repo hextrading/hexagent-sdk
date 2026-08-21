@@ -410,6 +410,21 @@ pub struct BacktestConfig {
     /// (adverse). The trade-gate filters the ~56% of locks that are flicker.
     #[serde(default = "default_sim_v2_book_through_rate")]
     pub sim_v2_book_through_rate: f64,
+    /// sim_v2 only — fraction of same-level book depletion not explained by
+    /// observed public trades that may be treated as hidden/aggregated
+    /// execution volume instead of cancellation. The fraction is multiplied
+    /// by a causal adverse-mid-move gate, then consumes queue ahead before any
+    /// overflow can fill our maker order. 0 disables the shadow and preserves
+    /// the historical model exactly.
+    #[serde(default)]
+    pub sim_v2_unexplained_depletion_exec_rate: f64,
+    /// sim_v2 only — fraction of this replayed strategy order's quantity that
+    /// is subtracted from visible queue-ahead at entry. Use only for a market
+    /// tape recorded while the same live strategy was resting on the CLOB;
+    /// otherwise leave at 0. Exact leave-one-out replay should supersede this
+    /// bounded approximation once full live order tuples are available.
+    #[serde(default)]
+    pub sim_v2_replay_self_depth_rate: f64,
     /// sim_v2 only — VOLUME-NEUTRAL forward-markout adverse reprice ∈ [0,∞) (0 =
     /// off). The sim fills makers symmetrically (markout ≈ 0); live makers are
     /// adversely selected (markout ≈ −0.75c at 1-5s). Keeps the full favorable
@@ -1020,6 +1035,8 @@ impl Default for BacktestConfig {
             sim_v2_adverse_sel_rate: default_sim_v2_adverse_sel_rate(),
             sim_v2_adverse_scale_ticks: default_sim_v2_adverse_scale_ticks(),
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
+            sim_v2_unexplained_depletion_exec_rate: 0.0,
+            sim_v2_replay_self_depth_rate: 0.0,
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
             sim_v2_fill_markout_horizon_ms: default_sim_v2_fill_markout_horizon_ms(),
             sim_v2_dynamic_fill_markout: false,
