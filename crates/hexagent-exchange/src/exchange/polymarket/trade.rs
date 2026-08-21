@@ -1399,12 +1399,13 @@ struct AttemptAuditJob {
     enqueued_ns: u64,
 }
 
+const ATTEMPT_AUDIT_QUEUE_CAPACITY: usize = 4_096;
+
 #[derive(Debug)]
 enum AccountMaintenanceJob {
     PersistOwnership(OrderOwnership),
     FilledCleanup(FilledCleanupJob),
     DeferredLifecycle(DeferredLifecycleJob),
-    AttemptAudit(AttemptAuditJob),
 }
 
 async fn send_and_drain(
@@ -2075,6 +2076,11 @@ pub struct SharedState {
     /// Private account-apply only enqueues the coid; a background worker owns
     /// the readiness check and final teardown.
     account_maintenance_tx: crossbeam_channel::Sender<AccountMaintenanceJob>,
+    /// Multi-producer completion telemetry → one SCHED_OTHER audit worker.
+    /// FIFO capacity is [`ATTEMPT_AUDIT_QUEUE_CAPACITY`]; overflow drops only
+    /// the audit record and logs loudly, never an account/lifecycle mutation.
+    /// This lane has no replay because attempt timing is operational telemetry.
+    attempt_audit_tx: crossbeam_channel::Sender<AttemptAuditJob>,
 }
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
@@ -2299,9 +2305,6 @@ impl SharedState {
                         AccountMaintenanceJob::DeferredLifecycle(job) => {
                             shared.apply_deferred_lifecycle(job);
                         }
-                        AccountMaintenanceJob::AttemptAudit(job) => {
-                            shared.write_attempt_audit(job);
-                        }
                         AccountMaintenanceJob::PersistOwnership(ownership) => {
                             let mut batch = Vec::with_capacity(64);
                             batch.push(ownership);
@@ -2317,9 +2320,6 @@ impl SharedState {
                                     }
                                     Ok(AccountMaintenanceJob::DeferredLifecycle(job)) => {
                                         shared.apply_deferred_lifecycle(job);
-                                    }
-                                    Ok(AccountMaintenanceJob::AttemptAudit(job)) => {
-                                        shared.write_attempt_audit(job);
                                     }
                                     Err(_) => break,
                                 }
@@ -2339,6 +2339,26 @@ impl SharedState {
                             }
                         }
                     }
+                }
+            });
+    }
+
+    fn spawn_attempt_audit_worker(
+        shared: &Arc<Self>,
+        rx: crossbeam_channel::Receiver<AttemptAuditJob>,
+    ) {
+        let weak = Arc::downgrade(shared);
+        let _ = std::thread::Builder::new()
+            .name(format!("poly-attempt-audit-{}", shared.instance_id))
+            .spawn(move || {
+                // Audit formatting/export is explicitly lower priority than
+                // lifecycle/account mutation and has its own bounded lane.
+                crate::os_tune::pin_background("polymarket-attempt-audit");
+                while let Ok(job) = rx.recv() {
+                    let Some(shared) = weak.upgrade() else {
+                        break;
+                    };
+                    shared.write_attempt_audit(job);
                 }
             });
     }
@@ -2581,10 +2601,7 @@ impl SharedState {
             completed_ns,
             enqueued_ns: now_ns(),
         };
-        if let Err(error) = self
-            .account_maintenance_tx
-            .try_send(AccountMaintenanceJob::AttemptAudit(job))
-        {
+        if let Err(error) = self.attempt_audit_tx.try_send(job) {
             // This is an audit/measurement loss, not an account mutation.
             // Keep the order completion lane non-blocking and make the loss
             // operationally loud instead of delaying StrategyAccount apply.
@@ -4184,6 +4201,8 @@ impl PolymarketTrade {
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
+        let (attempt_audit_tx, attempt_audit_rx) =
+            crossbeam_channel::bounded(ATTEMPT_AUDIT_QUEUE_CAPACITY);
         let shared = Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
                 account_state,
@@ -4232,12 +4251,14 @@ impl PolymarketTrade {
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
                 settled_gc_tx,
                 account_maintenance_tx,
+                attempt_audit_tx,
             });
         SharedState::spawn_settled_gc_worker(&shared, settled_gc_rx);
         // Resume a durable zero-reference cleanup request without waiting for
         // an unrelated private trade to provide the first wake after restart.
         shared.request_settled_gc();
         SharedState::spawn_account_maintenance_worker(&shared, account_maintenance_rx);
+        SharedState::spawn_attempt_audit_worker(&shared, attempt_audit_rx);
         Ok(Self {
             shared,
             owner: api_key.to_string(),

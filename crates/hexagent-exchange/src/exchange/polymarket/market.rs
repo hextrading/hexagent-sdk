@@ -1,15 +1,19 @@
 use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
-use log::{debug, info, warn};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, Stream, StreamExt};
+use log::{info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -33,6 +37,14 @@ const ENGINE_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// the single-threaded parser processes the preceding frame. Linux doubles
 /// the requested value for bookkeeping, so metrics normally report 16 MiB.
 const CLOB_SOCKET_RCVBUF_BYTES: libc::c_int = 8 * 1024 * 1024;
+/// A redundant CLOB lane is considered safe to promote only when it has been
+/// actively drained recently. This rejects a half-open standby while still
+/// covering the venue's observed microburst slow-consumer closes.
+const CLOB_STANDBY_MAX_RAW_AGE: Duration = Duration::from_secs(15);
+
+fn clob_standby_is_hot(observed_data: bool, last_raw_at: Instant, now: Instant) -> bool {
+    observed_data && now.saturating_duration_since(last_raw_at) <= CLOB_STANDBY_MAX_RAW_AGE
+}
 
 /// The synchronous Polymarket feed's externally visible phase.  This lives in
 /// atomics shared with the engine supervisor, so it remains observable even if
@@ -421,6 +433,16 @@ const CLOB_HEALTH_RECOVERY_STABLE_INTERVAL: Duration = Duration::from_millis(500
 const CLOB_BBO_DIAGNOSTIC_FRAMES: usize = 4;
 const CLOB_BBO_MAX_SUPERSEDED_REPAIRS: u8 = 2;
 const CLOB_BURST_METRIC_INTERVAL: Duration = Duration::from_secs(1);
+/// Sample the kernel receive queue often enough to expose sub-second CLOB
+/// bursts without turning socket introspection into a per-frame syscall.
+const CLOB_SOCKET_UNREAD_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// Peak frame/byte rates are retained in fixed 100 ms buckets inside each
+/// one-second diagnostic window. This is deliberately identical to the
+/// unread probe interval so the two series have the same time boundary.
+const CLOB_MICROBURST_BUCKET_INTERVAL: Duration = Duration::from_millis(100);
+/// `poll_next` is normally re-armed by the 10 ms scheduler probe even when the
+/// venue is quiet. Twice that interval is therefore an actionable poll gap.
+const CLOB_SOCKET_POLL_STALL_THRESHOLD: Duration = Duration::from_millis(20);
 const CLOB_DIAGNOSTIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const RTDS_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
@@ -2237,21 +2259,21 @@ impl ClobWindowMetrics {
     }
 
     fn record_loop_scheduler(&mut self, elapsed: Duration) {
-        self.loop_scheduler_max_us = self.loop_scheduler_max_us.max(
-            elapsed.as_micros().min(u64::MAX as u128) as u64,
-        );
+        self.loop_scheduler_max_us = self
+            .loop_scheduler_max_us
+            .max(elapsed.as_micros().min(u64::MAX as u128) as u64);
     }
 
     fn record_read_handler(&mut self, elapsed: Duration) {
-        self.read_handler_max_us = self.read_handler_max_us.max(
-            elapsed.as_micros().min(u64::MAX as u128) as u64,
-        );
+        self.read_handler_max_us = self
+            .read_handler_max_us
+            .max(elapsed.as_micros().min(u64::MAX as u128) as u64);
     }
 
     fn record_parse_apply(&mut self, elapsed: Duration) {
-        self.parse_apply_max_us = self.parse_apply_max_us.max(
-            elapsed.as_micros().min(u64::MAX as u128) as u64,
-        );
+        self.parse_apply_max_us = self
+            .parse_apply_max_us
+            .max(elapsed.as_micros().min(u64::MAX as u128) as u64);
     }
 
     fn close_summary(&self, now: Instant, queue_depth_now: usize) -> String {
@@ -2366,11 +2388,142 @@ impl ClobWindowMetrics {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ClobSocketPollWindow {
+    poll_calls: u64,
+    poll_gap_samples: u64,
+    poll_gap_max_us: u64,
+    poll_gap_over_20ms: u64,
+}
+
+impl ClobSocketPollWindow {
+    fn record_poll(&mut self, last_poll_at: &mut Option<Instant>, now: Instant) {
+        self.poll_calls = self.poll_calls.saturating_add(1);
+        if let Some(previous) = last_poll_at.replace(now) {
+            let gap = now.saturating_duration_since(previous);
+            let gap_us = gap.as_micros().min(u64::MAX as u128) as u64;
+            self.poll_gap_samples = self.poll_gap_samples.saturating_add(1);
+            self.poll_gap_max_us = self.poll_gap_max_us.max(gap_us);
+            self.poll_gap_over_20ms = self
+                .poll_gap_over_20ms
+                .saturating_add(u64::from(gap >= CLOB_SOCKET_POLL_STALL_THRESHOLD));
+        }
+    }
+}
+
+/// Instruments the exact `WebSocketStream::poll_next` boundary. The wrapper is
+/// owned and mutated only by the dedicated CLOB runtime thread; it adds no
+/// locks, allocation, queueing, or cross-thread state to socket processing.
+struct ClobPollInstrumentedStream<S> {
+    inner: S,
+    last_poll_at: Option<Instant>,
+    pending: ClobSocketPollWindow,
+}
+
+impl<S> ClobPollInstrumentedStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            last_poll_at: None,
+            pending: ClobSocketPollWindow::default(),
+        }
+    }
+
+    fn take_poll_window(&mut self) -> ClobSocketPollWindow {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+impl<S> Stream for ClobPollInstrumentedStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        this.pending
+            .record_poll(&mut this.last_poll_at, Instant::now());
+        Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
+type ClobWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type ClobSocketWriter = SplitSink<ClobWebSocket, Message>;
+type ClobSocketReader = ClobPollInstrumentedStream<SplitStream<ClobWebSocket>>;
+type ClobSocketReadResult =
+    Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>;
+
+struct ClobConnection {
+    lane_id: u64,
+    write: ClobSocketWriter,
+    read: ClobSocketReader,
+    tcp_fd: Option<i32>,
+    peer_addr: Option<SocketAddr>,
+    last_raw_at: Instant,
+    observed_data: bool,
+    diagnostics: ClobWindowMetrics,
+    burst: ClobBurstMetrics,
+}
+
+impl ClobConnection {
+    fn record_raw(&mut self, now: Instant) {
+        self.last_raw_at = now;
+    }
+
+    fn record_data_frame(&mut self, now: Instant) {
+        self.last_raw_at = now;
+        self.observed_data = true;
+    }
+
+    fn is_hot_standby(&self, now: Instant) -> bool {
+        clob_standby_is_hot(self.observed_data, self.last_raw_at, now)
+    }
+}
+
+enum ClobLaneRead {
+    Active(ClobSocketReadResult),
+    Standby(ClobSocketReadResult),
+}
+
+async fn next_clob_lane(
+    active: &mut ClobConnection,
+    standby: Option<&mut ClobConnection>,
+) -> ClobLaneRead {
+    if let Some(standby) = standby {
+        tokio::select! {
+            message = active.read.next() => ClobLaneRead::Active(message),
+            message = standby.read.next() => ClobLaneRead::Standby(message),
+        }
+    } else {
+        ClobLaneRead::Active(active.read.next().await)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ClobMicroburstBucket {
+    frames: u64,
+    bytes: u64,
+    max_frame_bytes: usize,
+}
+
 struct ClobBurstMetrics {
     window_started_at: Instant,
     frames: u64,
     bytes: u64,
     max_frame_bytes: usize,
+    micro_started_at: Instant,
+    micro: ClobMicroburstBucket,
+    peak_100ms_frames: u64,
+    peak_100ms_bytes: u64,
+    peak_100ms_max_frame_bytes: usize,
+    kernel_unread_latest: Option<u32>,
+    kernel_unread_max: u32,
+    kernel_unread_samples: u64,
+    kernel_unread_errors: u64,
+    socket_probe_max_us: u64,
+    socket_poll: ClobSocketPollWindow,
 }
 
 impl ClobBurstMetrics {
@@ -2380,22 +2533,157 @@ impl ClobBurstMetrics {
             frames: 0,
             bytes: 0,
             max_frame_bytes: 0,
+            micro_started_at: now,
+            micro: ClobMicroburstBucket::default(),
+            peak_100ms_frames: 0,
+            peak_100ms_bytes: 0,
+            peak_100ms_max_frame_bytes: 0,
+            kernel_unread_latest: None,
+            kernel_unread_max: 0,
+            kernel_unread_samples: 0,
+            kernel_unread_errors: 0,
+            socket_probe_max_us: 0,
+            socket_poll: ClobSocketPollWindow::default(),
         }
     }
 
-    fn record_frame(&mut self, bytes: usize) {
+    fn finish_micro_bucket(&mut self) {
+        self.peak_100ms_frames = self.peak_100ms_frames.max(self.micro.frames);
+        self.peak_100ms_bytes = self.peak_100ms_bytes.max(self.micro.bytes);
+        self.peak_100ms_max_frame_bytes = self
+            .peak_100ms_max_frame_bytes
+            .max(self.micro.max_frame_bytes);
+        self.micro = ClobMicroburstBucket::default();
+    }
+
+    fn advance_micro_bucket(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.micro_started_at) >= CLOB_MICROBURST_BUCKET_INTERVAL {
+            self.finish_micro_bucket();
+            self.micro_started_at = now;
+        }
+    }
+
+    fn record_frame(&mut self, now: Instant, bytes: usize) {
+        self.advance_micro_bucket(now);
         self.frames = self.frames.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes as u64);
         self.max_frame_bytes = self.max_frame_bytes.max(bytes);
+        self.micro.frames = self.micro.frames.saturating_add(1);
+        self.micro.bytes = self.micro.bytes.saturating_add(bytes as u64);
+        self.micro.max_frame_bytes = self.micro.max_frame_bytes.max(bytes);
     }
 
-    fn log_and_reset(&mut self, now: Instant, tcp: TcpSocketMetrics) {
-        debug!(
-            "[clob_1s_metric] window_ms={} frames={} frame_bytes={} max_frame_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
+    fn record_socket_probe(&mut self, now: Instant, unread_bytes: Option<u32>, elapsed: Duration) {
+        self.advance_micro_bucket(now);
+        self.socket_probe_max_us = self
+            .socket_probe_max_us
+            .max(elapsed.as_micros().min(u64::MAX as u128) as u64);
+        match unread_bytes {
+            Some(unread) => {
+                self.kernel_unread_latest = Some(unread);
+                self.kernel_unread_max = self.kernel_unread_max.max(unread);
+                self.kernel_unread_samples = self.kernel_unread_samples.saturating_add(1);
+            }
+            None => {
+                self.kernel_unread_errors = self.kernel_unread_errors.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_socket_polls(&mut self, polls: ClobSocketPollWindow) {
+        self.socket_poll.poll_calls = self.socket_poll.poll_calls.saturating_add(polls.poll_calls);
+        self.socket_poll.poll_gap_samples = self
+            .socket_poll
+            .poll_gap_samples
+            .saturating_add(polls.poll_gap_samples);
+        self.socket_poll.poll_gap_max_us =
+            self.socket_poll.poll_gap_max_us.max(polls.poll_gap_max_us);
+        self.socket_poll.poll_gap_over_20ms = self
+            .socket_poll
+            .poll_gap_over_20ms
+            .saturating_add(polls.poll_gap_over_20ms);
+    }
+
+    fn finish_window(&mut self, now: Instant) {
+        self.advance_micro_bucket(now);
+        self.finish_micro_bucket();
+    }
+
+    fn close_summary(&mut self, now: Instant) -> String {
+        self.finish_window(now);
+        format!(
+            "clob_recent_window_ms={} recent_frames={} recent_frame_bytes={} recent_max_frame_bytes={} peak_100ms_frames={} peak_100ms_frame_bytes={} peak_100ms_max_frame_bytes={} kernel_unread_latest={} kernel_unread_max={} kernel_unread_samples={} kernel_unread_errors={} socket_probe_max_us={} socket_poll_calls={} socket_poll_gap_samples={} socket_poll_gap_max_us={} socket_poll_gap_over_20ms={} decoded_frame_queue_mode=inline decoded_frame_queue_depth=0 decoded_frame_queue_capacity=0",
             now.saturating_duration_since(self.window_started_at).as_millis(),
             self.frames,
             self.bytes,
             self.max_frame_bytes,
+            self.peak_100ms_frames,
+            self.peak_100ms_bytes,
+            self.peak_100ms_max_frame_bytes,
+            self.kernel_unread_latest.map(i64::from).unwrap_or(-1),
+            if self.kernel_unread_samples == 0 {
+                -1
+            } else {
+                i64::from(self.kernel_unread_max)
+            },
+            self.kernel_unread_samples,
+            self.kernel_unread_errors,
+            self.socket_probe_max_us,
+            self.socket_poll.poll_calls,
+            self.socket_poll.poll_gap_samples,
+            self.socket_poll.poll_gap_max_us,
+            self.socket_poll.poll_gap_over_20ms,
+        )
+    }
+
+    fn log_and_reset(
+        &mut self,
+        now: Instant,
+        tcp: TcpSocketMetrics,
+        peer_addr: Option<SocketAddr>,
+        lane_role: &'static str,
+        lane_id: u64,
+        subscription_tokens: usize,
+        event_queue_depth: usize,
+        diagnostics: &ClobWindowMetrics,
+    ) {
+        self.finish_window(now);
+        info!(
+            "[clob_1s_metric] lane_role={} lane_id={} peer={:?} subscription_tokens={} window_ms={} frames={} frame_bytes={} max_frame_bytes={} peak_100ms_frames={} peak_100ms_frame_bytes={} peak_100ms_max_frame_bytes={} kernel_unread_latest={} kernel_unread_max={} kernel_unread_samples={} kernel_unread_errors={} socket_probe_max_us={} socket_poll_calls={} socket_poll_gap_samples={} socket_poll_gap_max_us={} socket_poll_gap_over_20ms={} decoded_frame_queue_mode=inline decoded_frame_queue_depth=0 decoded_frame_queue_capacity=0 event_queue_mode=unbounded event_queue_depth={} event_queue_high_water_30s={} parse_apply_max_us_30s={} read_handler_max_us_30s={} forward_max_us_30s={} event_send_max_us_30s={} event_send_over_1ms_30s={} loop_scheduler_max_us_30s={} runtime_scheduler_max_us_30s={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
+            lane_role,
+            lane_id,
+            peer_addr,
+            subscription_tokens,
+            now.saturating_duration_since(self.window_started_at).as_millis(),
+            self.frames,
+            self.bytes,
+            self.max_frame_bytes,
+            self.peak_100ms_frames,
+            self.peak_100ms_bytes,
+            self.peak_100ms_max_frame_bytes,
+            self.kernel_unread_latest.map(i64::from).unwrap_or(-1),
+            if self.kernel_unread_samples == 0 {
+                -1
+            } else {
+                i64::from(self.kernel_unread_max)
+            },
+            self.kernel_unread_samples,
+            self.kernel_unread_errors,
+            self.socket_probe_max_us,
+            self.socket_poll.poll_calls,
+            self.socket_poll.poll_gap_samples,
+            self.socket_poll.poll_gap_max_us,
+            self.socket_poll.poll_gap_over_20ms,
+            event_queue_depth,
+            diagnostics.max_event_queue_depth,
+            diagnostics.parse_apply_max_us,
+            diagnostics.read_handler_max_us,
+            diagnostics.forward_max_us,
+            diagnostics.event_send_max_us,
+            diagnostics.event_send_over_1ms,
+            diagnostics.loop_scheduler_max_us,
+            diagnostics.runtime_scheduler_max_us,
+            tcp.unread_bytes.map(i64::from).unwrap_or(-1),
             tcp.rcv_space.map(i64::from).unwrap_or(-1),
             tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
             tcp.rcv_ssthresh.map(i64::from).unwrap_or(-1),
@@ -2409,6 +2697,9 @@ impl ClobBurstMetrics {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TcpSocketMetrics {
+    /// Exact bytes currently pending in the kernel receive queue, sampled via
+    /// `FIONREAD`. Unlike TCP_INFO receive-space fields, this is the Recv-Q.
+    unread_bytes: Option<u32>,
     rcv_space: Option<u32>,
     rcv_wnd: Option<u32>,
     rcv_ssthresh: Option<u32>,
@@ -2459,12 +2750,41 @@ fn clob_socket_fd(
     }
 }
 
+fn clob_socket_peer_addr(
+    stream: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<SocketAddr> {
+    match stream.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().ok(),
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => tls.get_ref().0.peer_addr().ok(),
+        _ => None,
+    }
+}
+
 #[cfg(not(unix))]
 fn clob_socket_fd(
     _stream: &tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Option<i32> {
+    None
+}
+
+/// Return the exact number of bytes currently pending in the kernel receive
+/// queue. This deliberately uses portable `FIONREAD` rather than treating
+/// `TCP_INFO.tcpi_rcv_space` as Recv-Q; the latter is receive-space tuning
+/// state and does not report unread bytes.
+#[cfg(unix)]
+fn sample_socket_unread_bytes(fd: Option<i32>) -> Option<u32> {
+    let fd = fd?;
+    let mut unread: libc::c_int = 0;
+    let result = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut unread) };
+    (result == 0 && unread >= 0).then_some(unread as u32)
+}
+
+#[cfg(not(unix))]
+fn sample_socket_unread_bytes(_fd: Option<i32>) -> Option<u32> {
     None
 }
 
@@ -2519,6 +2839,7 @@ fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
         return TcpSocketMetrics::default();
     };
     let mut metrics = TcpSocketMetrics::default();
+    metrics.unread_bytes = sample_socket_unread_bytes(Some(fd));
     #[cfg(unix)]
     unsafe {
         let mut value: libc::c_int = 0;
@@ -2618,6 +2939,90 @@ where
         );
     }
     result
+}
+
+async fn connect_clob_lane(
+    tokens: &[String],
+    lane_id: u64,
+) -> std::result::Result<ClobConnection, String> {
+    let stream = match tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(POLYMARKET_WS_URL),
+    )
+    .await
+    {
+        Ok(Ok((stream, _))) => stream,
+        Ok(Err(error)) => return Err(format!("connect failed: {error}")),
+        Err(_) => {
+            return Err(format!(
+                "connect stalled >{:.0}s",
+                WS_CONNECT_TIMEOUT.as_secs_f64(),
+            ));
+        }
+    };
+    let tcp_fd = clob_socket_fd(&stream);
+    let peer_addr = clob_socket_peer_addr(&stream);
+    match configure_clob_socket_receive_buffer(tcp_fd, CLOB_SOCKET_RCVBUF_BYTES) {
+        Ok(actual_bytes) => info!(
+            "[clob_socket_config] lane_id={} peer={:?} requested_rcvbuf={} actual_rcvbuf={} unread_probe_ms={} microburst_bucket_ms={} decoded_frame_queue_mode=inline decoded_frame_queue_capacity=0",
+            lane_id,
+            peer_addr,
+            CLOB_SOCKET_RCVBUF_BYTES,
+            actual_bytes,
+            CLOB_SOCKET_UNREAD_PROBE_INTERVAL.as_millis(),
+            CLOB_MICROBURST_BUCKET_INTERVAL.as_millis(),
+        ),
+        Err(error) => warn!(
+            "[clob_socket_config] lane_id={} peer={:?} failed to raise receive buffer requested_rcvbuf={}: {}",
+            lane_id,
+            peer_addr,
+            CLOB_SOCKET_RCVBUF_BYTES,
+            error,
+        ),
+    }
+
+    let (write, read) = stream.split();
+    let connected_at = Instant::now();
+    let mut lane = ClobConnection {
+        lane_id,
+        write,
+        read: ClobPollInstrumentedStream::new(read),
+        tcp_fd,
+        peer_addr,
+        last_raw_at: connected_at,
+        observed_data: false,
+        diagnostics: ClobWindowMetrics::new(connected_at),
+        burst: ClobBurstMetrics::new(connected_at),
+    };
+    let subscription = clob_subscription_message(tokens);
+    timed_clob_ws_send(
+        &mut lane.write,
+        Message::Text(subscription.to_string()),
+        "polymarket.ws.clob_send.subscribe",
+        &mut lane.diagnostics,
+    )
+    .await
+    .map_err(|error| format!("subscribe send failed: {error}"))?;
+    info!(
+        "[clob_lane_connected] lane_id={} peer={:?} subscription_tokens={}",
+        lane_id,
+        peer_addr,
+        tokens.len(),
+    );
+    Ok(lane)
+}
+
+fn spawn_clob_standby_connect(
+    tokens: Vec<String>,
+    lane_id: u64,
+    delay: Duration,
+) -> tokio::task::JoinHandle<std::result::Result<ClobConnection, String>> {
+    tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        connect_clob_lane(&tokens, lane_id).await
+    })
 }
 
 impl ClobLifecycle {
@@ -2856,6 +3261,201 @@ fn request_clob_book_repair_after(
     });
 }
 
+fn reset_clob_books_for_failover(
+    books: &mut ClobLocalBooks,
+    subscription: &ClobSubscription,
+    now: Instant,
+) {
+    *books = ClobLocalBooks::new(&subscription.canonical_events);
+    for token in &subscription.tokens {
+        books.quarantined_tokens.insert(token.clone());
+        books.repair_started_at.insert(token.clone(), now);
+    }
+}
+
+async fn handle_clob_standby_read(
+    lane: &mut ClobConnection,
+    result: ClobSocketReadResult,
+    subscription_tokens: usize,
+) -> bool {
+    let received_at = Instant::now();
+    match result {
+        Some(Ok(Message::Text(text))) => {
+            let body = text.trim();
+            if body.eq_ignore_ascii_case("PING") {
+                lane.record_raw(received_at);
+                if let Err(error) = timed_clob_ws_send(
+                    &mut lane.write,
+                    Message::Text("PONG".to_string()),
+                    "polymarket.ws.clob_standby_send.text_pong",
+                    &mut lane.diagnostics,
+                )
+                .await
+                {
+                    warn!(
+                        "[clob_standby_send_failed] lane_id={} peer={:?} error={}",
+                        lane.lane_id, lane.peer_addr, error,
+                    );
+                    return true;
+                }
+            } else if body.eq_ignore_ascii_case("PONG") {
+                lane.record_raw(received_at);
+            } else {
+                lane.record_data_frame(received_at);
+                lane.burst.record_frame(received_at, text.len());
+            }
+            false
+        }
+        Some(Ok(Message::Ping(payload))) => {
+            lane.record_raw(received_at);
+            if let Err(error) = timed_clob_ws_send(
+                &mut lane.write,
+                Message::Pong(payload),
+                "polymarket.ws.clob_standby_send.frame_pong",
+                &mut lane.diagnostics,
+            )
+            .await
+            {
+                warn!(
+                    "[clob_standby_send_failed] lane_id={} peer={:?} error={}",
+                    lane.lane_id, lane.peer_addr, error,
+                );
+                return true;
+            }
+            false
+        }
+        Some(Ok(Message::Close(reason))) => {
+            let normalized_reason = reason
+                .as_ref()
+                .map(|frame| frame.reason.to_ascii_lowercase())
+                .unwrap_or_default();
+            let slow_consumer = ["slow consumer", "slow-consumer", "slow_consumer"]
+                .iter()
+                .any(|needle| normalized_reason.contains(needle));
+            let tcp = sample_tcp_socket(lane.tcp_fd);
+            let burst_summary = lane.burst.close_summary(received_at);
+            warn!(
+                "[clob_close_metric] lane_role=standby lane_id={} peer={:?} subscription_tokens={} reason={:?} server_slow_consumer={} tcp_unread_bytes={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {}",
+                lane.lane_id,
+                lane.peer_addr,
+                subscription_tokens,
+                reason,
+                slow_consumer,
+                tcp.unread_bytes.map(i64::from).unwrap_or(-1),
+                tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+                tcp.total_retrans.map(i64::from).unwrap_or(-1),
+                tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
+                burst_summary,
+            );
+            true
+        }
+        Some(Ok(_)) => {
+            lane.record_raw(received_at);
+            false
+        }
+        Some(Err(error)) => {
+            warn!(
+                "[clob_standby_read_failed] lane_id={} peer={:?} error={}",
+                lane.lane_id, lane.peer_addr, error,
+            );
+            true
+        }
+        None => {
+            warn!(
+                "[clob_standby_closed] lane_id={} peer={:?}",
+                lane.lane_id, lane.peer_addr,
+            );
+            true
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_clob_standby(
+    active: &mut ClobConnection,
+    standby: &mut Option<ClobConnection>,
+    standby_connect: &mut Option<
+        tokio::task::JoinHandle<std::result::Result<ClobConnection, String>>,
+    >,
+    next_lane_id: &mut u64,
+    subscription: &ClobSubscription,
+    health: &mut WsHealth,
+    books: &mut ClobLocalBooks,
+    repair_tx: &mut tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
+    repair_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClobBookRepairResult>,
+    repairs_in_flight: &mut HashSet<String>,
+    repair_superseded_attempts: &mut HashMap<String, u8>,
+    liveness: &PolymarketLiveness,
+    reason: &str,
+) -> bool {
+    let now = Instant::now();
+    let Some(mut promoted) = standby.take() else {
+        return false;
+    };
+    let standby_raw_age = now.saturating_duration_since(promoted.last_raw_at);
+    if !promoted.is_hot_standby(now) {
+        warn!(
+            "[clob_failover_rejected] old_lane_id={} candidate_lane_id={} candidate_peer={:?} candidate_raw_age_ms={} max_raw_age_ms={} reason={}",
+            active.lane_id,
+            promoted.lane_id,
+            promoted.peer_addr,
+            standby_raw_age.as_millis(),
+            CLOB_STANDBY_MAX_RAW_AGE.as_millis(),
+            reason,
+        );
+        return false;
+    }
+
+    let old_lane_id = active.lane_id;
+    let old_peer = active.peer_addr;
+    std::mem::swap(active, &mut promoted);
+    // Delineate active processing from the preceding drain-only standby
+    // window. The promoted socket and its kernel receive queue stay intact.
+    active.diagnostics = ClobWindowMetrics::new(now);
+    active.burst = ClobBurstMetrics::new(now);
+    *health = WsHealth::new(now);
+
+    // The standby was continuously drained but deliberately not parsed. It
+    // can therefore contain one newer frame that the former active lane never
+    // applied. Fail closed, discard the derived books, and reseed every token
+    // from an authoritative full snapshot before READY is emitted again.
+    reset_clob_books_for_failover(books, subscription, now);
+    let (new_repair_tx, new_repair_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
+    *repair_tx = new_repair_tx;
+    *repair_rx = new_repair_rx;
+    repairs_in_flight.clear();
+    repair_superseded_attempts.clear();
+    request_clob_book_repairs(subscription.tokens.clone(), repairs_in_flight, repair_tx);
+    liveness.mark_subscribed();
+
+    if let Some(connect) = standby_connect.take() {
+        connect.abort();
+    }
+    let replacement_lane_id = *next_lane_id;
+    *next_lane_id = (*next_lane_id).saturating_add(1);
+    *standby_connect = Some(spawn_clob_standby_connect(
+        subscription.tokens.clone(),
+        replacement_lane_id,
+        Duration::ZERO,
+    ));
+    crate::latency::record_ns(
+        "polymarket.ws.clob_hot_failover",
+        now.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+    );
+    warn!(
+        "[clob_hot_failover] old_lane_id={} old_peer={:?} promoted_lane_id={} promoted_peer={:?} standby_raw_age_ms={} repair_tokens={} reason={}",
+        old_lane_id,
+        old_peer,
+        active.lane_id,
+        active.peer_addr,
+        standby_raw_age.as_millis(),
+        subscription.tokens.len(),
+        reason,
+    );
+    true
+}
+
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
     event_tx: crossbeam_channel::Sender<MarketEvent>,
@@ -2894,6 +3494,7 @@ async fn clob_ws_task(
     });
     let mut subscription = initial_subscription;
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
@@ -2936,92 +3537,43 @@ async fn clob_ws_task(
             POLYMARKET_WS_URL,
             subscription.tokens.len()
         );
-        let stream = match tokio::time::timeout(
-            WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(POLYMARKET_WS_URL),
-        )
-        .await
-        {
-            Ok(Ok((s, _))) => s,
-            Ok(Err(e)) => {
+        let active_lane_id = next_lane_id;
+        next_lane_id = next_lane_id.saturating_add(1);
+        let mut active = match connect_clob_lane(&subscription.tokens, active_lane_id).await {
+            Ok(lane) => lane,
+            Err(error) => {
                 announce_clob_not_ready(
                     &event_tx,
                     &mut lifecycle,
-                    format!("WS connect failed: {}", e),
+                    format!("WS connect failed: {error}"),
                 );
                 let delay = backoff.next_delay();
                 warn!(
                     "[Polymarket] WS connect failed: {}, retry in {:.1}s",
-                    e,
+                    error,
                     delay.as_secs_f64()
-                );
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            Err(_) => {
-                announce_clob_not_ready(
-                    &event_tx,
-                    &mut lifecycle,
-                    format!(
-                        "WS connect stalled >{:.0}s",
-                        WS_CONNECT_TIMEOUT.as_secs_f64(),
-                    ),
-                );
-                let delay = backoff.next_delay();
-                warn!(
-                    "[Polymarket] WS connect stalled >{:.0}s (TLS handshake never \
-                     completed), retry in {:.1}s",
-                    WS_CONNECT_TIMEOUT.as_secs_f64(),
-                    delay.as_secs_f64(),
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
         };
         backoff.reset();
-        let tcp_fd = clob_socket_fd(&stream);
-        match configure_clob_socket_receive_buffer(tcp_fd, CLOB_SOCKET_RCVBUF_BYTES) {
-            Ok(actual_bytes) => info!(
-                "[clob_socket_config] requested_rcvbuf={} actual_rcvbuf={}",
-                CLOB_SOCKET_RCVBUF_BYTES, actual_bytes,
-            ),
-            Err(error) => warn!(
-                "[clob_socket_config] failed to raise receive buffer requested_rcvbuf={}: {}",
-                CLOB_SOCKET_RCVBUF_BYTES, error,
-            ),
-        }
-        let (mut write, mut read) = stream.split();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
-        let mut diagnostics = ClobWindowMetrics::new(connected_at);
-        let mut burst_metrics = ClobBurstMetrics::new(connected_at);
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
         let (repair_tx, mut repair_rx) =
             tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
+        let mut repair_tx = repair_tx;
         let mut repairs_in_flight = HashSet::new();
         let mut repair_superseded_attempts: HashMap<String, u8> = HashMap::new();
-
-        // Align with the official CLOB SDK: lowercase channel `"market"`
-        // (the user channel already uses lowercase `"user"`; the server is
-        // case-tolerant) plus `custom_feature_enabled`. Our frame parser
-        // drops unknown messages/fields silently, so this can only add data.
-        let sub_msg = clob_subscription_message(&subscription.tokens);
-        if let Err(e) = timed_clob_ws_send(
-            &mut write,
-            Message::Text(sub_msg.to_string()),
-            "polymarket.ws.clob_send.subscribe",
-            &mut diagnostics,
-        )
-        .await
-        {
-            announce_clob_not_ready(
-                &event_tx,
-                &mut lifecycle,
-                format!("WS subscribe send failed: {}", e),
-            );
-            warn!("[Polymarket] WS subscribe send failed: {}", e);
-            continue;
-        }
+        let standby_lane_id = next_lane_id;
+        next_lane_id = next_lane_id.saturating_add(1);
+        let mut standby = None;
+        let mut standby_connect = Some(spawn_clob_standby_connect(
+            subscription.tokens.clone(),
+            standby_lane_id,
+            Duration::ZERO,
+        ));
         info!(
             "[Polymarket] Subscribed to {} tokens across {} canonical events",
             subscription.tokens.len(),
@@ -3049,12 +3601,16 @@ async fn clob_ws_task(
         let mut burst_interval = tokio::time::interval(CLOB_BURST_METRIC_INTERVAL);
         burst_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         burst_interval.tick().await;
+        let mut socket_unread_probe = tokio::time::interval(CLOB_SOCKET_UNREAD_PROBE_INTERVAL);
+        socket_unread_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        socket_unread_probe.tick().await;
         let mut coalesce_interval = tokio::time::interval(CLOB_BOOK_COALESCE_INTERVAL);
         coalesce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         coalesce_interval.tick().await;
         let mut scheduler_probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
         scheduler_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         scheduler_probe.tick().await;
+        let mut immediate_reconnect = false;
 
         loop {
             let deferred_deadline = books
@@ -3082,21 +3638,65 @@ async fn clob_ws_task(
                             );
                             info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", subscription.tokens.len());
                             let _ = timed_clob_ws_send(
-                                &mut write,
+                                &mut active.write,
                                 Message::Close(None),
                                 "polymarket.ws.clob_send.close",
-                                &mut diagnostics,
+                                &mut active.diagnostics,
                             ).await;
+                            if let Some(connect) = standby_connect.take() {
+                                connect.abort();
+                            }
                             continue 'outer;
                         }
                         Some(WsCtrl::Shutdown) | None => break 'outer,
                     }
                 }
 
+                standby_result = async {
+                    standby_connect
+                        .as_mut()
+                        .expect("standby connect branch is guarded")
+                        .await
+                }, if standby_connect.is_some() => {
+                    standby_connect = None;
+                    match standby_result {
+                        Ok(Ok(lane)) => {
+                            info!(
+                                "[clob_standby_ready] lane_id={} peer={:?} active_lane_id={} active_peer={:?}",
+                                lane.lane_id,
+                                lane.peer_addr,
+                                active.lane_id,
+                                active.peer_addr,
+                            );
+                            standby = Some(lane);
+                        }
+                        Ok(Err(error)) => {
+                            warn!("[clob_standby_connect_failed] error={error}; retrying");
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                subscription.tokens.clone(),
+                                lane_id,
+                                Duration::from_millis(500),
+                            ));
+                        }
+                        Err(error) => {
+                            warn!("[clob_standby_connect_failed] join_error={error}; retrying");
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                subscription.tokens.clone(),
+                                lane_id,
+                                Duration::from_millis(500),
+                            ));
+                        }
+                    }
+                }
+
                 _ = &mut deferred_sleep => {
                     let now = Instant::now();
                     let batch = books.flush_deferred_due(now, now_ns());
-                    diagnostics.record_deferred(&batch);
+                    active.diagnostics.record_deferred(&batch);
                     for diagnostic in batch.diagnostics {
                         diagnostic_sampler.observe(now, diagnostic);
                     }
@@ -3113,7 +3713,7 @@ async fn clob_ws_task(
                         &event_tx,
                         &mut lifecycle,
                         &mut health,
-                        &mut diagnostics,
+                        &mut active.diagnostics,
                         &books,
                         &subscription.tokens,
                         now,
@@ -3139,7 +3739,7 @@ async fn clob_ws_task(
                             now,
                             local_now,
                             ClobBookSource::RestRepair,
-                            &mut diagnostics.wire,
+                            &mut active.diagnostics.wire,
                         ) {
                             Ok(ClobBookApplyOutcome::Applied(events)) => {
                                 repair_superseded_attempts.remove(&repair.token);
@@ -3148,13 +3748,13 @@ async fn clob_ws_task(
                                     repair.token,
                                 );
                                 if !events.is_empty() {
-                                    diagnostics.record_coalesced(&events);
+                                    active.diagnostics.record_coalesced(&events);
                                     if !forward_clob_events(
                                         events,
                                         &event_tx,
                                         &mut lifecycle,
                                         &mut health,
-                                        &mut diagnostics,
+                                        &mut active.diagnostics,
                                         &books,
                                         &subscription.tokens,
                                         now,
@@ -3201,13 +3801,13 @@ async fn clob_ws_task(
                                     local_now,
                                 ) {
                                     repair_superseded_attempts.remove(&repair.token);
-                                    diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                    active.diagnostics.record_coalesced(std::slice::from_ref(&event));
                                     if !forward_clob_events(
                                         vec![event],
                                         &event_tx,
                                         &mut lifecycle,
                                         &mut health,
-                                        &mut diagnostics,
+                                        &mut active.diagnostics,
                                         &books,
                                         &subscription.tokens,
                                         now,
@@ -3228,13 +3828,13 @@ async fn clob_ws_task(
                                     now,
                                     local_now,
                                 ) {
-                                    diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                    active.diagnostics.record_coalesced(std::slice::from_ref(&event));
                                     if !forward_clob_events(
                                         vec![event],
                                         &event_tx,
                                         &mut lifecycle,
                                         &mut health,
-                                        &mut diagnostics,
+                                        &mut active.diagnostics,
                                         &books,
                                         &subscription.tokens,
                                         now,
@@ -3256,13 +3856,13 @@ async fn clob_ws_task(
                                 now,
                                 local_now,
                             ) {
-                                diagnostics.record_coalesced(std::slice::from_ref(&event));
+                                active.diagnostics.record_coalesced(std::slice::from_ref(&event));
                                 if !forward_clob_events(
                                     vec![event],
                                     &event_tx,
                                     &mut lifecycle,
                                     &mut health,
-                                    &mut diagnostics,
+                                    &mut active.diagnostics,
                                     &books,
                                     &subscription.tokens,
                                     now,
@@ -3276,8 +3876,8 @@ async fn clob_ws_task(
 
                 scheduled_at = scheduler_probe.tick() => {
                     let lag = scheduled_at.elapsed();
-                    diagnostics.record_loop_scheduler(lag);
-                    diagnostics.runtime_scheduler_max_us = diagnostics.runtime_scheduler_max_us.max(
+                    active.diagnostics.record_loop_scheduler(lag);
+                    active.diagnostics.runtime_scheduler_max_us = active.diagnostics.runtime_scheduler_max_us.max(
                         runtime_scheduler_max_us.load(Ordering::Relaxed),
                     );
                     let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
@@ -3300,10 +3900,10 @@ async fn clob_ws_task(
                     // Send both the CLOB application-level text heartbeat and
                     // a WebSocket protocol Ping frame every 5s.
                     if let Err(e) = timed_clob_ws_send(
-                        &mut write,
+                        &mut active.write,
                         Message::Text("PING".to_string()),
                         "polymarket.ws.clob_send.heartbeat_text",
-                        &mut diagnostics,
+                        &mut active.diagnostics,
                     ).await {
                         announce_clob_not_ready(
                             &event_tx,
@@ -3318,10 +3918,10 @@ async fn clob_ws_task(
                         break;
                     }
                     if let Err(e) = timed_clob_ws_send(
-                        &mut write,
+                        &mut active.write,
                         Message::Ping(Vec::new()),
                         "polymarket.ws.clob_send.heartbeat_frame",
-                        &mut diagnostics,
+                        &mut active.diagnostics,
                     ).await {
                         announce_clob_not_ready(
                             &event_tx,
@@ -3335,19 +3935,53 @@ async fn clob_ws_task(
                         );
                         break;
                     }
+                    if let Some(lane) = standby.as_mut() {
+                        let text_result = timed_clob_ws_send(
+                            &mut lane.write,
+                            Message::Text("PING".to_string()),
+                            "polymarket.ws.clob_standby_send.heartbeat_text",
+                            &mut lane.diagnostics,
+                        ).await;
+                        let frame_result = if text_result.is_ok() {
+                            timed_clob_ws_send(
+                                &mut lane.write,
+                                Message::Ping(Vec::new()),
+                                "polymarket.ws.clob_standby_send.heartbeat_frame",
+                                &mut lane.diagnostics,
+                            ).await
+                        } else {
+                            text_result
+                        };
+                        if let Err(error) = frame_result {
+                            warn!(
+                                "[clob_standby_send_failed] lane_id={} peer={:?} error={}",
+                                lane.lane_id,
+                                lane.peer_addr,
+                                error,
+                            );
+                            standby = None;
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                subscription.tokens.clone(),
+                                lane_id,
+                                Duration::from_millis(500),
+                            ));
+                        }
+                    }
                 }
 
                 _ = coalesce_interval.tick() => {
                     let now = Instant::now();
                     let events = books.flush_due(now, now_ns());
                     if !events.is_empty() {
-                        diagnostics.record_coalesced(&events);
+                        active.diagnostics.record_coalesced(&events);
                         if !forward_clob_events(
                             events,
                             &event_tx,
                             &mut lifecycle,
                             &mut health,
-                            &mut diagnostics,
+                            &mut active.diagnostics,
                             &books,
                             &subscription.tokens,
                             now,
@@ -3359,12 +3993,57 @@ async fn clob_ws_task(
 
                 _ = burst_interval.tick() => {
                     let now = Instant::now();
-                    burst_metrics.log_and_reset(now, sample_tcp_socket(tcp_fd));
+                    active.burst.record_socket_polls(active.read.take_poll_window());
+                    active.burst.log_and_reset(
+                        now,
+                        sample_tcp_socket(active.tcp_fd),
+                        active.peer_addr,
+                        "active",
+                        active.lane_id,
+                        subscription.tokens.len(),
+                        event_tx.len(),
+                        &active.diagnostics,
+                    );
+                    if let Some(lane) = standby.as_mut() {
+                        lane.burst.record_socket_polls(lane.read.take_poll_window());
+                        lane.burst.log_and_reset(
+                            now,
+                            sample_tcp_socket(lane.tcp_fd),
+                            lane.peer_addr,
+                            "standby",
+                            lane.lane_id,
+                            subscription.tokens.len(),
+                            event_tx.len(),
+                            &lane.diagnostics,
+                        );
+                    }
+                }
+
+                _ = socket_unread_probe.tick() => {
+                    let now = Instant::now();
+                    let probe_started = Instant::now();
+                    let unread_bytes = sample_socket_unread_bytes(active.tcp_fd);
+                    let probe_elapsed = probe_started.elapsed();
+                    active.burst.record_socket_probe(now, unread_bytes, probe_elapsed);
+                    crate::latency::record_ns(
+                        "polymarket.ws.clob_socket_unread_probe",
+                        probe_elapsed.as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    if let Some(lane) = standby.as_mut() {
+                        let probe_started = Instant::now();
+                        let unread_bytes = sample_socket_unread_bytes(lane.tcp_fd);
+                        let probe_elapsed = probe_started.elapsed();
+                        lane.burst.record_socket_probe(now, unread_bytes, probe_elapsed);
+                        crate::latency::record_ns(
+                            "polymarket.ws.clob_standby_socket_unread_probe",
+                            probe_elapsed.as_nanos().min(u64::MAX as u128) as u64,
+                        );
+                    }
                 }
 
                 _ = health_interval.tick() => {
                     let now = Instant::now();
-                    diagnostics.log_and_reset(now, event_tx.len());
+                    active.diagnostics.log_and_reset(now, event_tx.len());
                     if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
                         warn!(
                             "[Polymarket] CLOB topic silent; {}",
@@ -3404,51 +4083,111 @@ async fn clob_ws_task(
                     }
                 }
 
-                read_result = tokio::time::timeout(CLOB_STALE_THRESHOLD, read.next()) => {
-                    let msg = match read_result {
-                        Ok(Some(Ok(m))) => m,
-                        Ok(Some(Err(e))) => {
-                            announce_clob_not_ready(
-                                &event_tx,
-                                &mut lifecycle,
-                                format!("WS read error: {}", e),
-                            );
-                            let now = Instant::now();
-                            warn!(
-                                "[Polymarket] WS read error: {} — reconnecting; {}",
-                                e,
-                                health.clob_summary(now),
-                            );
-                            break;
-                        }
-                        Ok(None) => {
-                            announce_clob_not_ready(
-                                &event_tx,
-                                &mut lifecycle,
-                                "WS closed",
-                            );
-                            let now = Instant::now();
-                            warn!(
-                                "[Polymarket] WS closed — reconnecting; {}",
-                                health.clob_summary(now),
-                            );
-                            break;
-                        }
+                read_result = tokio::time::timeout(
+                    CLOB_STALE_THRESHOLD,
+                    next_clob_lane(&mut active, standby.as_mut()),
+                ) => {
+                    let lane_read = match read_result {
+                        Ok(lane_read) => lane_read,
                         Err(_elapsed) => {
                             announce_clob_not_ready(
                                 &event_tx,
                                 &mut lifecycle,
                                 format!(
-                                    "CLOB no message for {:.0}s",
+                                    "CLOB no message on either lane for {:.0}s",
                                     CLOB_STALE_THRESHOLD.as_secs_f64(),
                                 ),
                             );
                             let now = Instant::now();
                             warn!(
-                                "[Polymarket] CLOB no raw frame for {:.0}s (stall watchdog) — reconnecting; {}",
+                                "[Polymarket] CLOB no raw frame on either lane for {:.0}s (stall watchdog) — reconnecting; {}",
                                 CLOB_STALE_THRESHOLD.as_secs_f64(),
                                 health.clob_summary(now),
                             );
+                            break;
+                        }
+                    };
+
+                    let result = match lane_read {
+                        ClobLaneRead::Standby(result) => {
+                            let lane = standby
+                                .as_mut()
+                                .expect("standby read result requires a standby lane");
+                            lane.burst.record_socket_polls(lane.read.take_poll_window());
+                            if handle_clob_standby_read(
+                                lane,
+                                result,
+                                subscription.tokens.len(),
+                            ).await {
+                                standby = None;
+                                let lane_id = next_lane_id;
+                                next_lane_id = next_lane_id.saturating_add(1);
+                                standby_connect = Some(spawn_clob_standby_connect(
+                                    subscription.tokens.clone(),
+                                    lane_id,
+                                    Duration::from_millis(500),
+                                ));
+                            }
+                            continue;
+                        }
+                        ClobLaneRead::Active(result) => result,
+                    };
+                    active.burst.record_socket_polls(active.read.take_poll_window());
+                    let msg = match result {
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => {
+                            let failover_reason = format!("active WS read error: {error}");
+                            announce_clob_not_ready(&event_tx, &mut lifecycle, &failover_reason);
+                            let now = Instant::now();
+                            warn!(
+                                "[Polymarket] active WS read error: {} — failover/reconnect; {}",
+                                error,
+                                health.clob_summary(now),
+                            );
+                            if promote_clob_standby(
+                                &mut active,
+                                &mut standby,
+                                &mut standby_connect,
+                                &mut next_lane_id,
+                                &subscription,
+                                &mut health,
+                                &mut books,
+                                &mut repair_tx,
+                                &mut repair_rx,
+                                &mut repairs_in_flight,
+                                &mut repair_superseded_attempts,
+                                &liveness,
+                                &failover_reason,
+                            ) {
+                                continue;
+                            }
+                            break;
+                        }
+                        None => {
+                            let failover_reason = "active WS closed";
+                            announce_clob_not_ready(&event_tx, &mut lifecycle, failover_reason);
+                            let now = Instant::now();
+                            warn!(
+                                "[Polymarket] active WS closed — failover/reconnect; {}",
+                                health.clob_summary(now),
+                            );
+                            if promote_clob_standby(
+                                &mut active,
+                                &mut standby,
+                                &mut standby_connect,
+                                &mut next_lane_id,
+                                &subscription,
+                                &mut health,
+                                &mut books,
+                                &mut repair_tx,
+                                &mut repair_rx,
+                                &mut repairs_in_flight,
+                                &mut repair_superseded_attempts,
+                                &liveness,
+                                failover_reason,
+                            ) {
+                                continue;
+                            }
                             break;
                         }
                     };
@@ -3460,6 +4199,7 @@ async fn clob_ws_task(
                             // match made every close diagnostic report
                             // `last_raw_frame=0.0s_ago`, hiding the actual
                             // pre-close receive gap.
+                            active.record_raw(received_at);
                             health.record_raw_frame(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
                             // Server answers our text "PING" heartbeat with
@@ -3473,10 +4213,10 @@ async fn clob_ws_task(
                             }
                             if body.eq_ignore_ascii_case("PING") {
                                 let _ = timed_clob_ws_send(
-                                    &mut write,
+                                    &mut active.write,
                                     Message::Text("PONG".to_string()),
                                     "polymarket.ws.clob_send.text_pong",
-                                    &mut diagnostics,
+                                    &mut active.diagnostics,
                                 ).await;
                                 continue;
                             }
@@ -3489,13 +4229,13 @@ async fn clob_ws_task(
                                 now_ns(),
                             );
                             let parse_apply_elapsed = t_parse.elapsed();
-                            diagnostics.record_parse_apply(parse_apply_elapsed);
+                            active.diagnostics.record_parse_apply(parse_apply_elapsed);
                             crate::latency::record_ns(
                                 "polymarket.ws.clob_parse_apply",
                                 parse_apply_elapsed.as_nanos().min(u64::MAX as u128) as u64,
                             );
-                            burst_metrics.record_frame(text.len());
-                            diagnostics.record_frame(received_at, text.len(), &batch);
+                            active.burst.record_frame(received_at, text.len());
+                            active.diagnostics.record_frame(received_at, text.len(), &batch);
                             if batch.recognized_topic {
                                 health.record_topic_frame(received_at);
                                 liveness.record_market_data(clob_monotonic_now_ns());
@@ -3516,7 +4256,7 @@ async fn clob_ws_task(
                                 &event_tx,
                                 &mut lifecycle,
                                 &mut health,
-                                &mut diagnostics,
+                                &mut active.diagnostics,
                                 &books,
                                 &subscription.tokens,
                                 received_at,
@@ -3527,80 +4267,134 @@ async fn clob_ws_task(
                             // CLOB WS frame (simd-json + typed deser +
                             // all contained items + crossbeam sends).
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
-                            diagnostics.record_read_handler(received_at.elapsed());
+                            active.diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Ping(payload) => {
+                            active.record_raw(received_at);
                             health.record_raw_frame(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
                             let _ = timed_clob_ws_send(
-                                &mut write,
+                                &mut active.write,
                                 Message::Pong(payload),
                                 "polymarket.ws.clob_send.frame_pong",
-                                &mut diagnostics,
+                                &mut active.diagnostics,
                             ).await;
-                            diagnostics.record_read_handler(received_at.elapsed());
+                            active.diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Pong(_) => {
+                            active.record_raw(received_at);
                             health.record_raw_frame(received_at);
                             health.record_pong(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
-                            diagnostics.record_read_handler(received_at.elapsed());
+                            active.diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Close(reason) => {
-                            diagnostics.runtime_scheduler_max_us = diagnostics
+                            active.diagnostics.runtime_scheduler_max_us = active.diagnostics
                                 .runtime_scheduler_max_us
                                 .max(runtime_scheduler_max_us.load(Ordering::Relaxed));
-                            announce_clob_not_ready(
-                                &event_tx,
-                                &mut lifecycle,
-                                "Server closed WS",
-                            );
+                            let mut server_slow_consumer = false;
                             match reason.as_ref() {
                                 Some(frame) => {
-                                    let server_slow_consumer = frame
-                                        .reason
-                                        .to_ascii_lowercase()
-                                        .contains("slow consumer");
-                                    let tcp = sample_tcp_socket(tcp_fd);
+                                    let normalized_reason = frame.reason.to_ascii_lowercase();
+                                    server_slow_consumer = [
+                                        "slow consumer",
+                                        "slow-consumer",
+                                        "slow_consumer",
+                                    ]
+                                    .iter()
+                                    .any(|needle| normalized_reason.contains(needle));
+                                    let tcp = sample_tcp_socket(active.tcp_fd);
+                                    let burst_summary = active.burst.close_summary(received_at);
                                     warn!(
-                                        "[clob_close_metric] code={:?} reason={:?} server_slow_consumer={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {}",
+                                        "[clob_close_metric] lane_role=active lane_id={} peer={:?} subscription_tokens={} code={:?} reason={:?} server_slow_consumer={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {} {}",
+                                        active.lane_id,
+                                        active.peer_addr,
+                                        subscription.tokens.len(),
                                         frame.code,
                                         frame.reason,
                                         server_slow_consumer,
+                                        tcp.unread_bytes.map(i64::from).unwrap_or(-1),
                                         tcp.rcv_space.map(i64::from).unwrap_or(-1),
                                         tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
                                         tcp.total_retrans.map(i64::from).unwrap_or(-1),
                                         tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
                                         health.clob_summary(received_at),
-                                        diagnostics.close_summary(received_at, event_tx.len()),
+                                        active.diagnostics.close_summary(received_at, event_tx.len()),
+                                        burst_summary,
                                     );
                                 }
-                                None => warn!(
-                                    "[clob_close_metric] code=none reason=none {} {}",
-                                    health.clob_summary(received_at),
-                                    diagnostics.close_summary(received_at, event_tx.len()),
-                                ),
+                                None => {
+                                    let tcp = sample_tcp_socket(active.tcp_fd);
+                                    let burst_summary = active.burst.close_summary(received_at);
+                                    warn!(
+                                        "[clob_close_metric] lane_role=active lane_id={} peer={:?} subscription_tokens={} code=none reason=none server_slow_consumer=false tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {} {}",
+                                        active.lane_id,
+                                        active.peer_addr,
+                                        subscription.tokens.len(),
+                                        tcp.unread_bytes.map(i64::from).unwrap_or(-1),
+                                        tcp.rcv_space.map(i64::from).unwrap_or(-1),
+                                        tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+                                        tcp.total_retrans.map(i64::from).unwrap_or(-1),
+                                        tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
+                                        health.clob_summary(received_at),
+                                        active.diagnostics.close_summary(received_at, event_tx.len()),
+                                        burst_summary,
+                                    );
+                                }
                             }
                             warn!(
-                                "[Polymarket] Server closed WS {:?} — reconnecting; {}",
+                                "[Polymarket] Server closed active WS {:?} — failover/reconnect; {}",
                                 reason,
                                 health.clob_summary(received_at),
                             );
+                            let failover_reason = if server_slow_consumer {
+                                "active server slow-consumer close"
+                            } else {
+                                "active server close"
+                            };
+                            announce_clob_not_ready(&event_tx, &mut lifecycle, failover_reason);
+                            if promote_clob_standby(
+                                &mut active,
+                                &mut standby,
+                                &mut standby_connect,
+                                &mut next_lane_id,
+                                &subscription,
+                                &mut health,
+                                &mut books,
+                                &mut repair_tx,
+                                &mut repair_rx,
+                                &mut repairs_in_flight,
+                                &mut repair_superseded_attempts,
+                                &liveness,
+                                failover_reason,
+                            ) {
+                                continue;
+                            }
+                            immediate_reconnect = server_slow_consumer;
                             break;
                         }
                         _ => {
+                            active.record_raw(received_at);
                             health.record_raw_frame(received_at);
                             liveness.record_raw_frame(clob_monotonic_now_ns());
-                            diagnostics.record_read_handler(received_at.elapsed());
+                            active.diagnostics.record_read_handler(received_at.elapsed());
                         }
                     }
                 }
             }
         }
 
-        // Inner loop broke → reconnect after backoff.
+        // Inner loop broke → retire any in-flight standby handshake before
+        // reconnecting or shutting down this subscription generation.
+        if let Some(connect) = standby_connect.take() {
+            connect.abort();
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+        if immediate_reconnect {
+            warn!("[clob_fast_reconnect] skipping backoff after server slow-consumer close");
+            continue;
         }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
@@ -5057,9 +5851,9 @@ impl ClobLocalBooks {
                 .price_changes
                 .iter()
                 .fold(HashMap::new(), |mut counts, change| {
-                *counts.entry(change.asset_id.clone()).or_insert(0) += 1;
-                counts
-            });
+                    *counts.entry(change.asset_id.clone()).or_insert(0) += 1;
+                    counts
+                });
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
         let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
         let mut off_tick_tokens: HashSet<String> = HashSet::new();
@@ -5204,14 +5998,14 @@ impl ClobLocalBooks {
                     .entry(token.clone())
                     .or_insert_with(|| PendingBboCheck {
                         exchange_timestamp_ns,
-                    expected: ReportedBbo::default(),
-                    first_observed_at: received_at,
-                    last_update_at: received_at,
-                    saw_mismatch: false,
-                    saw_newer_checkpoint: false,
-                    frame_summaries: VecDeque::new(),
-                    awaiting_tick_change: false,
-                });
+                        expected: ReportedBbo::default(),
+                        first_observed_at: received_at,
+                        last_update_at: received_at,
+                        saw_mismatch: false,
+                        saw_newer_checkpoint: false,
+                        frame_summaries: VecDeque::new(),
+                        awaiting_tick_change: false,
+                    });
             if exchange_timestamp_ns > pending.exchange_timestamp_ns {
                 // A newer advertised checkpoint supersedes the unfinished
                 // older one. Apply the newer delta first, then validate the
@@ -6094,6 +6888,86 @@ impl ExchangeMarket for PolymarketMarket {
 mod pick_current_event_tests {
     use super::*;
 
+    #[test]
+    fn clob_socket_poll_window_records_actionable_gaps() {
+        let start = Instant::now();
+        let mut last_poll_at = None;
+        let mut window = ClobSocketPollWindow::default();
+
+        window.record_poll(&mut last_poll_at, start);
+        window.record_poll(&mut last_poll_at, start + Duration::from_millis(10));
+        window.record_poll(&mut last_poll_at, start + Duration::from_millis(31));
+
+        assert_eq!(window.poll_calls, 3);
+        assert_eq!(window.poll_gap_samples, 2);
+        assert_eq!(window.poll_gap_max_us, 21_000);
+        assert_eq!(window.poll_gap_over_20ms, 1);
+    }
+
+    #[test]
+    fn standby_requires_an_observed_recent_data_frame() {
+        let now = Instant::now();
+        assert!(!clob_standby_is_hot(false, now, now));
+        assert!(clob_standby_is_hot(
+            true,
+            now,
+            now + CLOB_STANDBY_MAX_RAW_AGE,
+        ));
+        assert!(!clob_standby_is_hot(
+            true,
+            now,
+            now + CLOB_STANDBY_MAX_RAW_AGE + Duration::from_nanos(1),
+        ));
+    }
+
+    #[test]
+    fn failover_reseed_is_not_ready_until_every_token_has_a_full_book() {
+        let subscription = ClobSubscription {
+            tokens: vec!["up".to_string(), "down".to_string()],
+            canonical_events: Vec::new(),
+        };
+        let mut books = ClobLocalBooks::default();
+        reset_clob_books_for_failover(&mut books, &subscription, Instant::now());
+
+        assert!(!books.has_all_seeded(&subscription.tokens));
+        assert!(books.quarantined_tokens.contains("up"));
+        assert!(books.quarantined_tokens.contains("down"));
+        assert_eq!(books.repair_started_at.len(), 2);
+    }
+
+    #[test]
+    fn clob_burst_metrics_retain_microburst_and_unread_high_water() {
+        let start = Instant::now();
+        let mut metrics = ClobBurstMetrics::new(start);
+
+        metrics.record_frame(start + Duration::from_millis(10), 100);
+        metrics.record_frame(start + Duration::from_millis(20), 200);
+        metrics.record_socket_probe(
+            start + Duration::from_millis(99),
+            Some(7),
+            Duration::from_micros(3),
+        );
+        metrics.record_frame(start + Duration::from_millis(110), 50);
+        metrics.record_socket_probe(
+            start + Duration::from_millis(199),
+            Some(11),
+            Duration::from_micros(5),
+        );
+        metrics.finish_window(start + Duration::from_millis(200));
+
+        assert_eq!(metrics.frames, 3);
+        assert_eq!(metrics.bytes, 350);
+        assert_eq!(metrics.max_frame_bytes, 200);
+        assert_eq!(metrics.peak_100ms_frames, 2);
+        assert_eq!(metrics.peak_100ms_bytes, 300);
+        assert_eq!(metrics.peak_100ms_max_frame_bytes, 200);
+        assert_eq!(metrics.kernel_unread_latest, Some(11));
+        assert_eq!(metrics.kernel_unread_max, 11);
+        assert_eq!(metrics.kernel_unread_samples, 2);
+        assert_eq!(metrics.kernel_unread_errors, 0);
+        assert_eq!(metrics.socket_probe_max_us, 5);
+    }
+
     #[cfg(unix)]
     #[test]
     fn clob_receive_buffer_is_configurable_and_observable() {
@@ -6101,6 +6975,20 @@ mod pick_current_event_tests {
         let actual = configure_clob_socket_receive_buffer(Some(socket.as_raw_fd()), 64 * 1024)
             .expect("configure receive buffer");
         assert!(actual >= 64 * 1024, "actual receive buffer={actual}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clob_socket_unread_probe_reports_kernel_receive_queue_bytes() {
+        use std::io::Write;
+
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(b"abcdef").unwrap();
+
+        assert_eq!(
+            sample_socket_unread_bytes(Some(reader.as_raw_fd())),
+            Some(6)
+        );
     }
 
     #[test]
