@@ -3679,15 +3679,7 @@ fn repair_retired_trade_replays_from_wal(
         return false;
     };
     let current = current_account_economics(&candidate);
-    if compare_economic_value("physical cash", current.physical_cash, replayed.physical_cash)
-        .is_err()
-        || compare_economic_positions(
-            "physical positions",
-            &current.physical_positions,
-            &replayed.physical_positions,
-        )
-        .is_err()
-        || !economic_effects_match(&current, &replayed)
+    if !economic_effects_match(&current, &replayed)
         || derive_reservation_aggregates(&candidate).is_err()
     {
         return false;
@@ -20712,6 +20704,10 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &effect,
             1.0,
         );
+        // An authoritative wallet snapshot is independent of immutable
+        // instance-event replay and may legitimately move physical cash.
+        // Retired-trade recovery must preserve that newer observation.
+        re_compacted.physical_cash += 10.0;
         recompute_reconciliation(&mut re_compacted, "test duplicate retirement");
 
         let evidence = RetiredTradeReplayWalEvidence {
@@ -20777,6 +20773,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             restored_instance.positions[token],
             base.instances[instance_id].positions[token],
         );
+        assert_eq!(restored.lock_state().physical_cash, 110.0);
 
         // The startup-populated retired route must keep a same-process replay
         // on the tombstone no-op path even while the parent coid still exists.
