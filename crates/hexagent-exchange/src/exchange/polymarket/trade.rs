@@ -15,7 +15,9 @@ use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
-use hexagent_account::account::shared_account::{normalize_order_id, OrderOwnership};
+use hexagent_account::account::shared_account::{
+    measure_deferred_lifecycle_stages, normalize_order_id, OrderOwnership,
+};
 use log::{debug, info, warn};
 
 use super::auth::PolyAuth;
@@ -2379,7 +2381,12 @@ impl SharedState {
             now_ns().saturating_sub(job.enqueued_ns),
         );
         let apply_started = crate::latency::Instant::now();
-        match job.status {
+        let branch_stage = match job.status {
+            OrderStatus::Cancelled => "polymarket.account.lifecycle_apply.cancelled",
+            OrderStatus::Rejected => "polymarket.account.lifecycle_apply.rejected",
+            _ => "polymarket.account.lifecycle_apply.status_update",
+        };
+        let ((), timing) = measure_deferred_lifecycle_stages(|| match job.status {
             OrderStatus::Cancelled => {
                 self.account_state
                     .mark_cancelled_pending_audit(&job.client_order_id);
@@ -2394,8 +2401,34 @@ impl SharedState {
                 self.account_state
                     .mark_order_status_effective(&job.client_order_id, status);
             }
-        }
-        crate::latency::record("polymarket.account.lifecycle_apply", apply_started);
+        });
+        let total_ns = apply_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let attributed_ns = timing
+            .lock_wait_ns
+            .saturating_add(timing.mutation_ns)
+            .saturating_add(timing.persist_enqueue_ns);
+        crate::latency::record_ns(
+            "polymarket.account.lifecycle_apply.lock_wait",
+            timing.lock_wait_ns.max(1),
+        );
+        crate::latency::record_ns(
+            "polymarket.account.lifecycle_apply.mutation",
+            timing.mutation_ns.max(1),
+        );
+        crate::latency::record_ns(
+            "polymarket.account.lifecycle_apply.persist_enqueue",
+            timing.persist_enqueue_ns.max(1),
+        );
+        // Route lookup, audit wakeup, anomaly cleanup and Rejected's runtime
+        // mutex cleanup intentionally remain outside the three account stages.
+        // Preserve their remainder so an apparently fast account mutation
+        // cannot hide a slow non-account tail.
+        crate::latency::record_ns(
+            "polymarket.account.lifecycle_apply.unattributed",
+            total_ns.saturating_sub(attributed_ns).max(1),
+        );
+        crate::latency::record_ns(branch_stage, total_ns.max(1));
+        crate::latency::record_ns("polymarket.account.lifecycle_apply", total_ns.max(1));
     }
 
     fn defer_lifecycle_account_apply(&self, client_order_id: &str, status: OrderStatus) {
