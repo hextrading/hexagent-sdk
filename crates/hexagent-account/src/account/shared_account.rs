@@ -2827,10 +2827,152 @@ struct StaleVirtualTradeSnapshotWalEvidence {
 }
 
 #[derive(Debug, Clone)]
+struct RetiredTradeReplayWalEvidence {
+    resurrection_generation: u64,
+    trade_key: String,
+    tombstone: RetiredTradeOwnershipTombstone,
+    applied_trade: AppliedTrade,
+    re_compacted: bool,
+}
+
+#[derive(Debug, Clone)]
 struct LedgerGenerationRegressionWalEvidence {
     persistence_generation: u64,
     previous_ledger_generation: u64,
     regressed_ledger_generation: u64,
+}
+
+fn retired_trade_replay_wal_evidence(
+    record: &PersistenceWalRecord,
+    state_before: &serde_json::Value,
+) -> Result<Vec<RetiredTradeReplayWalEvidence>, String> {
+    let mut evidence = Vec::new();
+    for change in &record.changes {
+        let PersistenceWalChange::Set { path, value } = change else {
+            continue;
+        };
+        if path.len() != 2 || path[0] != "trades" {
+            continue;
+        }
+        let trade_key = &path[1];
+        if json_value_at_path(state_before, path).is_some() {
+            continue;
+        }
+        let tombstone_path = vec![
+            "retired_trade_ownership_tombstones".to_string(),
+            trade_key.clone(),
+        ];
+        let Some(tombstone_value) = json_value_at_path(state_before, &tombstone_path) else {
+            continue;
+        };
+        let tombstone: RetiredTradeOwnershipTombstone =
+            serde_json::from_value(tombstone_value.clone()).map_err(|error| {
+                format!(
+                    "decode retired trade `{trade_key}` before WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?;
+        let trade: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
+            format!(
+                "decode resurrected trade `{trade_key}` in WAL generation {}: {error}",
+                record.generation,
+            )
+        })?;
+        let ownership = &trade.ownership;
+        if tombstone.authenticated_terminal_noop
+            || tombstone.ownership.status != "CONFIRMED"
+            || ownership.status != "CONFIRMED"
+            || !trade.booked
+            || trade.failed
+            || ownership.trade_key != *trade_key
+            || tombstone.ownership.account_id != ownership.account_id
+            || tombstone.ownership.instance_id != ownership.instance_id
+            || tombstone.ownership.trade_key != ownership.trade_key
+            || validate_owned_trade_replay(
+                &tombstone.ownership,
+                &ownership.client_order_id,
+                &ownership.order_id,
+                &ownership.token_id,
+                ownership.side,
+                ownership.quantity,
+                ownership.price,
+            )
+            .is_err()
+            || tombstone
+                .is_maker
+                .zip(trade.is_maker)
+                .is_some_and(|(retired, replayed)| retired != replayed)
+        {
+            continue;
+        }
+        evidence.push(RetiredTradeReplayWalEvidence {
+            resurrection_generation: record.generation,
+            trade_key: trade_key.clone(),
+            tombstone,
+            applied_trade: trade,
+            re_compacted: false,
+        });
+    }
+    Ok(evidence)
+}
+
+fn update_retired_trade_replay_wal_evidence(
+    evidence: &mut [RetiredTradeReplayWalEvidence],
+    state_before: &serde_json::Value,
+    state_after: &serde_json::Value,
+) -> Result<(), String> {
+    for item in evidence {
+        let trade_path = vec!["trades".to_string(), item.trade_key.clone()];
+        let before = json_value_at_path(state_before, &trade_path);
+        let after = json_value_at_path(state_after, &trade_path);
+        if let Some(value) = after {
+            let trade: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
+                format!(
+                    "decode replayed trade `{}` after WAL generation {}: {error}",
+                    item.trade_key, item.resurrection_generation,
+                )
+            })?;
+            if trade.booked
+                && !trade.failed
+                && validate_owned_trade_replay(
+                    &item.tombstone.ownership,
+                    &trade.ownership.client_order_id,
+                    &trade.ownership.order_id,
+                    &trade.ownership.token_id,
+                    trade.ownership.side,
+                    trade.ownership.quantity,
+                    trade.ownership.price,
+                )
+                .is_ok()
+            {
+                item.applied_trade = trade;
+            }
+        } else if let Some(value) = before {
+            let trade: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
+                format!(
+                    "decode replayed trade `{}` before WAL retirement: {error}",
+                    item.trade_key,
+                )
+            })?;
+            if trade.booked
+                && !trade.failed
+                && validate_owned_trade_replay(
+                    &item.tombstone.ownership,
+                    &trade.ownership.client_order_id,
+                    &trade.ownership.order_id,
+                    &trade.ownership.token_id,
+                    trade.ownership.side,
+                    trade.ownership.quantity,
+                    trade.ownership.price,
+                )
+                .is_ok()
+            {
+                item.applied_trade = trade;
+                item.re_compacted = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn json_value_at_path<'a>(
@@ -3355,6 +3497,211 @@ fn repair_stale_virtual_trade_snapshots_from_wal(
     true
 }
 
+fn retired_trade_tombstone_matches_replay(
+    tombstone: &RetiredTradeOwnershipTombstone,
+    evidence: &RetiredTradeReplayWalEvidence,
+) -> bool {
+    let ownership = &evidence.applied_trade.ownership;
+    !tombstone.authenticated_terminal_noop
+        && tombstone.ownership.status == "CONFIRMED"
+        && ownership.status == "CONFIRMED"
+        && tombstone.ownership.account_id == ownership.account_id
+        && tombstone.ownership.instance_id == ownership.instance_id
+        && tombstone.ownership.trade_key == evidence.trade_key
+        && ownership.trade_key == evidence.trade_key
+        && tombstone.is_maker == evidence.applied_trade.is_maker
+        && validate_owned_trade_replay(
+            &tombstone.ownership,
+            &ownership.client_order_id,
+            &ownership.order_id,
+            &ownership.token_id,
+            ownership.side,
+            ownership.quantity,
+            ownership.price,
+        )
+        .is_ok()
+}
+
+/// Repair only the historical owner-shard race proved by the WAL itself:
+/// a confirmed trade already represented by a compacted ownership tombstone
+/// was inserted as a live trade again and then optionally compacted a second
+/// time. The candidate is admitted only when removing exactly those duplicate
+/// effects restores both immutable-baseline economics and every derived order
+/// reservation. Any unrelated mismatch remains fatal at normal validation.
+fn repair_retired_trade_replays_from_wal(
+    account_id: &str,
+    state: &mut SharedAccountState,
+    evidence: &[RetiredTradeReplayWalEvidence],
+) -> bool {
+    if evidence.is_empty() || !state.seeded {
+        return false;
+    }
+    let unique_keys: HashSet<&str> = evidence
+        .iter()
+        .map(|item| item.trade_key.as_str())
+        .collect();
+    if unique_keys.len() != evidence.len() {
+        return false;
+    }
+
+    let mut candidate = state.clone();
+    let mut affected_orders = BTreeSet::new();
+    for item in evidence {
+        let Some(current_tombstone) = candidate
+            .retired_trade_ownership_tombstones
+            .get(&item.trade_key)
+        else {
+            return false;
+        };
+        if !retired_trade_tombstone_matches_replay(current_tombstone, item)
+            || !retired_trade_tombstone_matches_replay(&item.tombstone, item)
+        {
+            return false;
+        }
+
+        let live_duplicate = candidate.trades.remove(&item.trade_key);
+        let trade = if let Some(trade) = live_duplicate.as_ref() {
+            if item.re_compacted
+                || !trade.booked
+                || trade.failed
+                || validate_owned_trade_replay(
+                    &item.tombstone.ownership,
+                    &trade.ownership.client_order_id,
+                    &trade.ownership.order_id,
+                    &trade.ownership.token_id,
+                    trade.ownership.side,
+                    trade.ownership.quantity,
+                    trade.ownership.price,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            trade
+        } else {
+            if !item.re_compacted {
+                return false;
+            }
+            &item.applied_trade
+        };
+        let effect = trade_economic_effect(trade);
+        for (instance_id, balance) in &effect.instances {
+            let Some(instance) = candidate.instances.get_mut(instance_id) else {
+                return false;
+            };
+            instance.cash -= balance.cash;
+            for (token, quantity) in &balance.positions {
+                add_position_delta(&mut instance.positions, token, -*quantity);
+            }
+        }
+        if live_duplicate.is_none() {
+            add_economic_state(&mut candidate.compacted_economic_effects, &effect, -1.0);
+        }
+        candidate.fee_attribution_pending.remove(&item.trade_key);
+        candidate
+            .unresolved_trade_match_times
+            .remove(&item.trade_key);
+        affected_orders.insert(trade.ownership.client_order_id.clone());
+    }
+
+    for coid in affected_orders {
+        let Some(order_snapshot) = candidate.orders.get(&coid).cloned() else {
+            return false;
+        };
+        let mut booked = 0.0;
+        for trade in candidate
+            .trades
+            .values()
+            .filter(|trade| trade.booked && !trade.failed)
+        {
+            if trade.ownership.client_order_id == coid
+                && trade_ownership_matches_order_root(&trade.ownership, &order_snapshot)
+            {
+                booked += trade.ownership.quantity;
+            }
+        }
+        for tombstone in candidate.retired_trade_ownership_tombstones.values() {
+            if !tombstone.authenticated_terminal_noop
+                && tombstone.ownership.status == "CONFIRMED"
+                && tombstone.ownership.client_order_id == coid
+                && trade_ownership_matches_order_root(&tombstone.ownership, &order_snapshot)
+            {
+                booked += tombstone.ownership.quantity;
+            }
+        }
+        let terminal_and_released = matches!(
+            order_snapshot.status,
+            OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Filled
+        ) && !candidate.recovery_pending_orders.contains(&coid)
+            && !candidate.routine_cancel_audits.contains(&coid);
+        let mut corrected_order = order_snapshot.clone();
+        corrected_order.filled_quantity = booked;
+        let (expected_cash, expected_quantity) = if terminal_and_released {
+            (0.0, 0.0)
+        } else {
+            desired_order_reservation(&corrected_order)
+        };
+        corrected_order.reserved_cash = expected_cash;
+        corrected_order.reserved_quantity = expected_quantity;
+        let Some(instance) = candidate.instances.get_mut(&corrected_order.instance_id) else {
+            return false;
+        };
+        instance.reserved_cash += expected_cash - order_snapshot.reserved_cash;
+        let reserved = instance
+            .reserved_positions
+            .entry(corrected_order.token_id.clone())
+            .or_insert(0.0);
+        *reserved += expected_quantity - order_snapshot.reserved_quantity;
+        if reserved.abs() <= EPS {
+            instance
+                .reserved_positions
+                .remove(&corrected_order.token_id);
+        }
+        candidate.orders.insert(coid, corrected_order);
+    }
+
+    recompute_reconciliation(&mut candidate, "WAL-proven retired trade replay recovery");
+    let Ok(replayed) = replay_account_economics(&candidate) else {
+        return false;
+    };
+    let current = current_account_economics(&candidate);
+    if compare_economic_value("physical cash", current.physical_cash, replayed.physical_cash)
+        .is_err()
+        || compare_economic_positions(
+            "physical positions",
+            &current.physical_positions,
+            &replayed.physical_positions,
+        )
+        .is_err()
+        || !economic_effects_match(&current, &replayed)
+        || derive_reservation_aggregates(&candidate).is_err()
+    {
+        return false;
+    }
+
+    let recovered: Vec<String> = evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{}@{}{}",
+                item.trade_key,
+                item.resurrection_generation,
+                if item.re_compacted { "/recompacted" } else { "/live" },
+            )
+        })
+        .collect();
+    candidate.verified_trade_replay_recoveries = candidate
+        .verified_trade_replay_recoveries
+        .saturating_add(evidence.len() as u64);
+    *state = candidate;
+    log::warn!(
+        "[shared_account] account={} repaired WAL-proven retired trade replay(s) evidence={:?}",
+        account_id,
+        recovered,
+    );
+    true
+}
+
 fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Result<(), String> {
     use std::io::BufRead as _;
 
@@ -3379,6 +3726,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
     let mut applied_generation = snapshot_generation;
     let mut incomplete_maintenance_cash = Vec::new();
     let mut stale_virtual_trade_snapshots = Vec::new();
+    let mut retired_trade_replays = Vec::new();
     let mut ledger_generation_regressions = Vec::new();
     let mut reader = std::io::BufReader::new(wal);
     let mut line_number = 0usize;
@@ -3497,8 +3845,10 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         }
         stale_virtual_trade_snapshots
             .extend(stale_virtual_trade_snapshot_wal_evidence(&record, &state)?);
+        retired_trade_replays.extend(retired_trade_replay_wal_evidence(&record, &state)?);
         ledger_generation_regressions
             .extend(ledger_generation_regression_wal_evidence(&record, &state));
+        let replay_state_before = (!retired_trade_replays.is_empty()).then(|| state.clone());
         for change in record.changes.iter().cloned() {
             apply_persistence_wal_change(&mut state, change).map_err(|error| {
                 format!(
@@ -3507,6 +3857,13 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
                     line_number
                 )
             })?;
+        }
+        if let Some(state_before) = replay_state_before.as_ref() {
+            update_retired_trade_replay_wal_evidence(
+                &mut retired_trade_replays,
+                state_before,
+                &state,
+            )?;
         }
         incomplete_maintenance_cash
             .extend(incomplete_maintenance_cash_wal_evidence(&record, &state)?);
@@ -3530,6 +3887,11 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         &persisted.account_id,
         &mut persisted.state,
         &stale_virtual_trade_snapshots,
+    );
+    repair_retired_trade_replays_from_wal(
+        &persisted.account_id,
+        &mut persisted.state,
+        &retired_trade_replays,
     );
     repair_regressed_trade_ledger_generation_from_wal(
         &persisted.account_id,
@@ -3607,6 +3969,11 @@ pub struct SharedAccount {
     /// from being booked into two instance shards without serializing unrelated
     /// fills on `SharedAccount::state`.
     trade_routes: ShardedRouteMap,
+    /// Trade ids whose terminal economics have already been compacted. The
+    /// owner/coid route can legitimately outlive a trade row, so this separate
+    /// membership index forces an exact replay through the cold tombstone
+    /// validator instead of letting the owner shard book it again.
+    retired_trade_routes: ShardedRouteMap,
     /// Only anomalous trade ids are present. Exact replays for those ids take
     /// the cold audit path until a verified replay clears the durable anomaly.
     anomalous_trade_keys: RwLock<HashSet<String>>,
@@ -3875,6 +4242,7 @@ impl SharedAccount {
             coid_routes: ShardedRouteMap::new(),
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
+            retired_trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
@@ -4203,6 +4571,13 @@ impl SharedAccount {
             .values()
             .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
             .count();
+        let initial_retired_trade_routes: Vec<(String, String)> = state
+            .retired_trade_ownership_tombstones
+            .iter()
+            .map(|(trade_key, tombstone)| {
+                (trade_key.clone(), tombstone.ownership.instance_id.clone())
+            })
+            .collect();
         let initial_unresolved_trade_match_times = state.unresolved_trade_match_times.clone();
         let initial_unresolved_trade_keys: Vec<String> =
             initial_unresolved_trade_match_times.keys().cloned().collect();
@@ -4244,6 +4619,7 @@ impl SharedAccount {
             coid_routes: ShardedRouteMap::new(),
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
+            retired_trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
@@ -4306,6 +4682,9 @@ impl SharedAccount {
             account
                 .unresolved_trade_keys
                 .insert(trade_key, String::new());
+        }
+        for (trade_key, instance_id) in initial_retired_trade_routes {
+            account.retired_trade_routes.insert(trade_key, instance_id);
         }
         Ok(account)
     }
@@ -10622,6 +11001,8 @@ impl SharedAccount {
                 retired_at_ms,
             },
         );
+        self.retired_trade_routes
+            .insert(trade_key.to_string(), ownership.instance_id.clone());
         prune_retired_trade_ownership_tombstones(&mut state, retired_at_ms);
         self.retired_trade_tombstone_count_fast.store(
             state.retired_trade_ownership_tombstones.len(),
@@ -10683,6 +11064,12 @@ impl SharedAccount {
         let mut lifecycle = account.lifecycle.lock().unwrap();
         let normalized_order_id = normalize_order_id(order_id);
         let existing = lifecycle.trades.get(trade_key).cloned();
+        // GC publishes this membership before releasing the owner lifecycle
+        // mutex. Recheck after taking that same mutex so a concurrent retire
+        // cannot leave this call with a stale pre-GC route decision.
+        if existing.is_none() && self.retired_trade_routes.get(trade_key).is_some() {
+            return VirtualTradeAttempt::Fallback;
+        }
 
         // A terminal/non-advancing replay is resolved by the trade id before
         // consulting its parent order. Settled cleanup may retire order roots
@@ -11180,6 +11567,8 @@ impl SharedAccount {
         let coid_scope = self.coid_routes.get(client_order_id);
         let oid_scope = self.oid_routes.get(&normalize_order_id(order_id));
         let trade_scope = self.trade_routes.get(trade_key);
+        let retired_trade = trade_scope.is_none()
+            && self.retired_trade_routes.get(trade_key).is_some();
         let anomalous_trade = self
             .anomalous_trade_keys
             .read()
@@ -11194,7 +11583,7 @@ impl SharedAccount {
         let route_conflict = first_scope.as_ref().is_some_and(|first| {
             routed_instances.any(|candidate| candidate.as_str() != first.as_str())
         });
-        let instance_scope = if anomalous_trade || route_conflict {
+        let instance_scope = if anomalous_trade || route_conflict || retired_trade {
             None
         } else {
             first_scope
@@ -11387,6 +11776,10 @@ impl SharedAccount {
                 *owned_noop = true;
                 return Some(tombstone.ownership);
             }
+            // A bounded tombstone can expire while its process-local route
+            // entry remains. Once the cold durable map proves absence, remove
+            // the stale hint so a legitimately new id does not stay cold.
+            self.retired_trade_routes.remove(trade_key);
         }
 
         let durable_coid = state.oid_to_coid.get(&normalized_order_id).cloned();
@@ -12369,6 +12762,10 @@ impl SharedAccount {
             state.trades.remove(trade_key);
             state.fee_attribution_pending.remove(trade_key);
             if let Some(trade) = removed {
+                self.retired_trade_routes.insert(
+                    trade_key.clone(),
+                    trade.ownership.instance_id.clone(),
+                );
                 state.retired_trade_ownership_tombstones.insert(
                     trade_key.clone(),
                     RetiredTradeOwnershipTombstone {
@@ -12455,6 +12852,14 @@ impl SharedAccount {
         }
         let mut state = self.lock_state();
         let outcome = prune_terminal_history_locked(&mut state, instance_id, tokens);
+        for trade_key in &outcome.trades {
+            if let Some(tombstone) = state.retired_trade_ownership_tombstones.get(trade_key) {
+                self.retired_trade_routes.insert(
+                    trade_key.clone(),
+                    tombstone.ownership.instance_id.clone(),
+                );
+            }
+        }
         self.retired_trade_tombstone_count_fast.store(
             state.retired_trade_ownership_tombstones.len(),
             Ordering::Relaxed,
@@ -20191,6 +20596,193 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "MINED",
         );
         assert!(!restored.is_uncertain());
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn restart_repairs_only_wal_proven_retired_trade_replay_and_keeps_replay_noop() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-retired-trade-wal-replay-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "retired-trade-wal-replay";
+        let instance_id = "maker";
+        let coid = "maker-order";
+        let oid = "maker-oid";
+        let token = "UP";
+        let trade_key = "maker-trade";
+
+        let account = SharedAccount::new(account_id);
+        account.register_instance(instance_id, 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([(token.into(), 40.0)]))
+            .unwrap();
+        account
+            .reserve_order(
+                instance_id,
+                coid,
+                oid,
+                token,
+                Side::Sell,
+                10.0,
+                0.36,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                trade_key,
+                "CONFIRMED",
+                coid,
+                oid,
+                token,
+                Side::Sell,
+                4.0,
+                0.36,
+                true,
+                1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        account.release_order(coid, OrderStatus::Cancelled);
+        let live = account.lock_state().clone();
+        let trade = live.trades[trade_key].clone();
+        let effect = trade_economic_effect(&trade);
+
+        let mut base = live.clone();
+        base.trades.remove(trade_key);
+        base.fee_attribution_pending.remove(trade_key);
+        base.retired_trade_ownership_tombstones.insert(
+            trade_key.into(),
+            RetiredTradeOwnershipTombstone {
+                ownership: trade.ownership.clone(),
+                is_maker: trade.is_maker,
+                authenticated_terminal_noop: false,
+                retired_at_ms: wall_clock_ms(),
+            },
+        );
+        add_economic_state(&mut base.compacted_economic_effects, &effect, 1.0);
+        recompute_reconciliation(&mut base, "test original retirement");
+        validate_persisted_state(account_id, &base).unwrap();
+
+        // Reproduce the old owner/coid fast-path bug: a compacted trade was
+        // booked into the instance again even though its tombstone survived.
+        let mut resurrected = base.clone();
+        resurrected.trades.insert(trade_key.into(), trade.clone());
+        for (owner, balance) in &effect.instances {
+            let instance = resurrected.instances.get_mut(owner).unwrap();
+            instance.cash += balance.cash;
+            for (asset, quantity) in &balance.positions {
+                add_position_delta(&mut instance.positions, asset, *quantity);
+            }
+        }
+        {
+            let order = resurrected.orders.get_mut(coid).unwrap();
+            order.filled_quantity += trade.ownership.quantity;
+            order.reserved_quantity = order.quantity - order.filled_quantity;
+            let instance = resurrected.instances.get_mut(instance_id).unwrap();
+            instance
+                .reserved_positions
+                .insert(token.into(), order.reserved_quantity);
+        }
+        recompute_reconciliation(&mut resurrected, "test duplicate resurrection");
+
+        let mut re_compacted = resurrected.clone();
+        re_compacted.trades.remove(trade_key);
+        add_economic_state(
+            &mut re_compacted.compacted_economic_effects,
+            &effect,
+            1.0,
+        );
+        recompute_reconciliation(&mut re_compacted, "test duplicate retirement");
+
+        let evidence = RetiredTradeReplayWalEvidence {
+            resurrection_generation: 1,
+            trade_key: trade_key.into(),
+            tombstone: base.retired_trade_ownership_tombstones[trade_key].clone(),
+            applied_trade: trade.clone(),
+            re_compacted: true,
+        };
+        let mut unrelated_damage = re_compacted.clone();
+        unrelated_damage.instances.get_mut(instance_id).unwrap().cash += 0.25;
+        assert!(!repair_retired_trade_replays_from_wal(
+            account_id,
+            &mut unrelated_damage,
+            std::slice::from_ref(&evidence),
+        ));
+
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.into(),
+                persistence_generation: 0,
+                state: base.clone(),
+            },
+        )
+        .unwrap();
+        reset_persistence_wal(&path).unwrap();
+        let base_json = serde_json::to_value(&base).unwrap();
+        let resurrected_json = serde_json::to_value(&resurrected).unwrap();
+        let re_compacted_json = serde_json::to_value(&re_compacted).unwrap();
+        let mut wal_len = 0;
+        append_persistence_wal(
+            &path,
+            &PersistenceWalRecord {
+                version: PERSISTENCE_WAL_VERSION,
+                account_id: account_id.into(),
+                generation: 1,
+                changes: persistence_json_diff(&base_json, &resurrected_json),
+            },
+            &mut wal_len,
+        )
+        .unwrap();
+        append_persistence_wal(
+            &path,
+            &PersistenceWalRecord {
+                version: PERSISTENCE_WAL_VERSION,
+                account_id: account_id.into(),
+                generation: 2,
+                changes: persistence_json_diff(&resurrected_json, &re_compacted_json),
+            },
+            &mut wal_len,
+        )
+        .unwrap();
+
+        let restored = SharedAccount::new_persistent(account_id, &path).unwrap();
+        let restored_order = restored.order(coid).unwrap();
+        assert_eq!(restored_order.filled_quantity, 4.0);
+        assert_eq!(restored_order.reserved_quantity, 0.0);
+        let restored_instance = restored.instance_snapshot(instance_id).unwrap();
+        assert_eq!(restored_instance.cash, base.instances[instance_id].cash);
+        assert_eq!(
+            restored_instance.positions[token],
+            base.instances[instance_id].positions[token],
+        );
+
+        // The startup-populated retired route must keep a same-process replay
+        // on the tombstone no-op path even while the parent coid still exists.
+        let before = restored.instance_snapshot(instance_id).unwrap();
+        assert!(matches!(
+            restored.apply_trade_transition_with_context(
+                trade_key,
+                "CONFIRMED",
+                coid,
+                oid,
+                token,
+                Side::Sell,
+                4.0,
+                0.36,
+                true,
+                1,
+            ),
+            TradeTransitionResult::OwnedNoop(_)
+        ));
+        assert_eq!(restored.instance_snapshot(instance_id).unwrap(), before);
+        assert_eq!(restored.order(coid).unwrap().filled_quantity, 4.0);
         drop(restored);
         remove_persistence_test_files(&path);
     }
