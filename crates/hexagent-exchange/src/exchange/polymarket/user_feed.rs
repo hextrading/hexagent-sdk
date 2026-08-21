@@ -105,7 +105,7 @@ fn admit_failed_trade_diagnostic(venue_trade_id: &str) -> bool {
     DEDUPE
         .get_or_init(|| {
             Mutex::new(FailedTradeDiagnosticDedupe::new(
-        FAILED_TRADE_DIAGNOSTIC_CAPACITY,
+                FAILED_TRADE_DIAGNOSTIC_CAPACITY,
             ))
         })
         .lock()
@@ -855,10 +855,8 @@ fn validate_trade_event(
                         required_string(order, &["side"], "maker side")?,
                         "maker side",
                     )?;
-                    let quantity = strict_number(
-                        order.get("matched_amount"),
-                        "maker matched_amount",
-                    )?;
+                    let quantity =
+                        strict_number(order.get("matched_amount"), "maker matched_amount")?;
                     let price = strict_number(order.get("price"), "maker price")?;
                     validate_quantity_price(
                         quantity,
@@ -914,9 +912,10 @@ fn parse_order_event(
         ));
     }
     let retired_audit_started = crate::latency::Instant::now();
-    let retired_audit_covers = shared
-        .account_state
-        .retired_order_audit_covers(order_id, original_size, size_matched);
+    let retired_audit_covers =
+        shared
+            .account_state
+            .retired_order_audit_covers(order_id, original_size, size_matched);
     crate::latency::record(
         "polymarket.user.retired_order_audit_lookup",
         retired_audit_started,
@@ -933,6 +932,7 @@ fn parse_order_event(
     })?;
     // Cold account application needs the ledger's advancing lifecycle status;
     // the fast owner route intentionally uses the immutable runtime mirror.
+    let reconcile_started = crate::latency::Instant::now();
     let ownership = shared
         .account_state
         .reconcile_order_route(&coid, order_id)
@@ -940,6 +940,10 @@ fn parse_order_event(
         .ok_or_else(|| {
             format!("order lifecycle event has runtime mapping but no ledger row coid `{coid}`")
         })?;
+    crate::latency::record(
+        "polymarket.user.account_order_reconcile_route",
+        reconcile_started,
+    );
     if normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
         || ownership.token_id != asset_id
         || ownership.side != side
@@ -1007,6 +1011,7 @@ fn parse_order_event(
         size_matched: Some(size_matched.to_string()),
         associate_trades,
     };
+    let lifecycle_started = crate::latency::Instant::now();
     match status {
         OrderStatus::Filled | OrderStatus::Cancelled => {
             shared.commit_authoritative_terminal_audit(&coid, status, &order_audit);
@@ -1025,6 +1030,10 @@ fn parse_order_event(
         }
         _ => shared.account_state.mark_order_status(&coid, status),
     }
+    crate::latency::record(
+        "polymarket.user.account_order_lifecycle_commit",
+        lifecycle_started,
+    );
     let update = OrderUpdate {
         client_order_id: coid,
         exchange: Exchange::Polymarket,
@@ -1043,6 +1052,7 @@ fn parse_order_event(
         order_audit: Some(order_audit),
         error: None,
     };
+    let log_started = crate::latency::Instant::now();
     shared.log_order_lifecycle(
         &update.client_order_id,
         "private_order",
@@ -1050,6 +1060,7 @@ fn parse_order_event(
         Some(update.status),
         None,
     );
+    crate::latency::record("polymarket.user.account_order_log", log_started);
     Ok(vec![update])
 }
 
@@ -1221,11 +1232,11 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
             shared
                 .account_state
                 .mark_private_order_event_anomaly_with_token(
-                order_id,
-                coid.as_deref(),
-                token_id,
-                reason,
-            );
+                    order_id,
+                    coid.as_deref(),
+                    token_id,
+                    reason,
+                );
             shared.user_feed_health.set_inventory_uncertain(true);
             warn!("[PolyUserFeed] rejecting invalid private event: {error}; raw={data}");
             return;
@@ -1429,6 +1440,10 @@ enum PrivateApplyCommand {
 /// private owner route.
 struct PrivateColdCommand {
     events: Vec<PrivateEventDelta>,
+    /// Lifecycle identities durably covered when this whole command commits.
+    /// They return to the single owner over a bounded advisory ack lane; only
+    /// then may another cold-ledger replay be suppressed.
+    identities: Vec<PrivateRouteIdentity>,
     recovery_generation: Option<u64>,
     completion: Option<tokio::sync::oneshot::Sender<std::result::Result<usize, String>>>,
     routed_at: crate::latency::Instant,
@@ -1442,7 +1457,7 @@ struct PrivateApplyLane {
     reconnect_notify: Arc<tokio::sync::Notify>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum PrivateRouteIdentity {
     TradeLifecycle { fingerprint: u128, rank: u8 },
 }
@@ -1458,6 +1473,11 @@ struct PrivateRouteDedupe {
     capacity: usize,
     ranks: HashMap<u128, u8>,
     order: VecDeque<(u128, u8)>,
+}
+
+struct RoutedPrivateBatch {
+    events: Vec<PrivateEventDelta>,
+    identities: Vec<PrivateRouteIdentity>,
 }
 
 impl PrivateRouteDedupe {
@@ -1626,8 +1646,8 @@ fn route_private_event_fast(
                 None => Vec::new(),
                 Some(value) => {
                     let values = value.as_array().ok_or_else(|| {
-                            "order lifecycle associate_trades is not an array".to_string()
-                        })?;
+                        "order lifecycle associate_trades is not an array".to_string()
+                    })?;
                     let mut trades = Vec::with_capacity(values.len());
                     for value in values {
                         let trade_id = value
@@ -1696,20 +1716,14 @@ fn route_private_event_fast(
             if matches!(status_name, "CONFIRMED" | "FAILED") {
                 let terminal_started = crate::latency::Instant::now();
                 let resolved = terminal_trade_is_durably_resolved(data, shared);
-                crate::latency::record(
-                    "polymarket.user.terminal_high_water",
-                    terminal_started,
-                );
+                crate::latency::record("polymarket.user.terminal_high_water", terminal_started);
                 if resolved {
                     return Ok(Vec::new());
                 }
             }
             let fields_started = crate::latency::Instant::now();
             let role = validate_trade_event(data, shared)?;
-            crate::latency::record(
-                "polymarket.user.validate_trade_fields",
-                fields_started,
-            );
+            crate::latency::record("polymarket.user.validate_trade_fields", fields_started);
             if rank == 0 || status_name == "RETRYING" {
                 return Ok(Vec::new());
             }
@@ -1950,7 +1964,7 @@ fn dispatch_private_update(
             crossbeam_channel::TrySendError::Disconnected(_) => {
                 "order update channel closed".to_string()
             }
-            })
+        })
     };
     crate::latency::record("polymarket.user.dispatch", dispatch_started);
     result
@@ -1959,15 +1973,18 @@ fn dispatch_private_update(
 fn route_private_batch(
     shared: &SharedState,
     update_tx: &Sender<OrderUpdate>,
-    events: &[PrivateEventDelta],
+    events: Vec<PrivateEventDelta>,
     recovery_generation: Option<u64>,
     route_dedupe: &mut PrivateRouteDedupe,
-) -> std::result::Result<(), String> {
+    cold_committed: Option<&PrivateRouteDedupe>,
+) -> std::result::Result<RoutedPrivateBatch, String> {
+    let mut cold_events = Vec::with_capacity(events.len());
+    let mut cold_identities = Vec::with_capacity(events.len());
     for event in events {
         let payload = event.payload();
         let route_started = crate::latency::Instant::now();
         let validate_started = crate::latency::Instant::now();
-        let routed = match route_private_event_fast(event, shared) {
+        let routed = match route_private_event_fast(&event, shared) {
             Ok(routed) => routed,
             Err(error) => {
                 flag_invalid_private_event(payload, shared, &error);
@@ -1975,7 +1992,13 @@ fn route_private_batch(
             }
         };
         crate::latency::record("polymarket.user.validate_route", validate_started);
+        let cold_already_committed = !routed.is_empty()
+            && cold_committed
+                .is_some_and(|dedupe| routed.iter().all(|routed| dedupe.seen(&routed.identity)));
         for routed in routed {
+            if !cold_already_committed {
+                cold_identities.push(routed.identity);
+            }
             if route_dedupe.seen(&routed.identity) {
                 continue;
             }
@@ -1983,9 +2006,26 @@ fn route_private_batch(
             // Delivery is the commit edge for actor-local replay suppression.
             route_dedupe.remember(routed.identity);
         }
+        // Fast validation succeeded, so duplicate lifecycle traffic remains a
+        // valid private-feed heartbeat even when an acknowledged cold commit
+        // makes another shared-ledger transition unnecessary.
+        shared
+            .user_feed_health
+            .record_valid_business_event(now_ns());
+        if cold_already_committed {
+            crate::latency::record_ns("polymarket.user.cold_committed_skip", 1);
+        } else {
+            // An empty identity set is intentionally not suppressible. Rare
+            // retired/historical terminal events still receive durable cold
+            // validation after a process restart.
+            cold_events.push(event);
+        }
         crate::latency::record("polymarket.user.validate_route_dispatch", route_started);
     }
-    Ok(())
+    Ok(RoutedPrivateBatch {
+        events: cold_events,
+        identities: cold_identities,
+    })
 }
 
 fn apply_private_cold_batch(
@@ -1999,6 +2039,14 @@ fn apply_private_cold_batch(
         let is_trade = matches!(event, PrivateEventDelta::Trade(_));
         let account_apply_started = crate::latency::Instant::now();
         let parsed = parse_user_event_with_health(payload, shared);
+        crate::latency::record(
+            if is_trade {
+                "polymarket.user.account_apply.trade"
+            } else {
+                "polymarket.user.account_apply.order"
+            },
+            account_apply_started,
+        );
         crate::latency::record("polymarket.user.account_apply", account_apply_started);
         let health_apply_started = crate::latency::Instant::now();
         if parsed.valid_business_event {
@@ -2070,6 +2118,11 @@ fn spawn_private_apply_worker(
     // private lifecycle is silently dropped.
     let (cold_tx, cold_rx) =
         crossbeam_channel::bounded::<PrivateColdCommand>(PRIVATE_APPLY_QUEUE_CAPACITY);
+    // Cold worker -> private owner, SPSC and bounded. Overflow drops only the
+    // duplicate-suppression hint: the owner safely re-enqueues the idempotent
+    // event, so no private lifecycle or recovery edge can be lost.
+    let (cold_ack_tx, cold_ack_rx) =
+        crossbeam_channel::bounded::<Vec<PrivateRouteIdentity>>(PRIVATE_APPLY_QUEUE_CAPACITY);
     let reconnect_generation = Arc::new(AtomicU64::new(0));
     let reconnect_notify = Arc::new(tokio::sync::Notify::new());
     let lane = PrivateApplyLane {
@@ -2093,15 +2146,19 @@ fn spawn_private_apply_worker(
             loop {
                 match cold_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(command) => {
+                        let PrivateColdCommand {
+                            events,
+                            identities,
+                            recovery_generation,
+                            completion,
+                            routed_at,
+                        } = command;
                         crate::latency::record(
                             "polymarket.user.fast_route_to_cold_worker",
-                            command.routed_at,
+                            routed_at,
                         );
-                        let result = apply_private_cold_batch(
-                            &cold_shared,
-                            &command.events,
-                            command.recovery_generation,
-                        );
+                        let result =
+                            apply_private_cold_batch(&cold_shared, &events, recovery_generation);
                         if let Err(error) = &result {
                             cold_shared.user_feed_health.set_recovering(true);
                             warn!(
@@ -2111,7 +2168,16 @@ fn spawn_private_apply_worker(
                             cold_reconnect_generation.fetch_add(1, Ordering::AcqRel);
                             cold_reconnect_notify.notify_one();
                         }
-                        if let Some(completion) = command.completion {
+                        if result.is_ok()
+                            && !identities.is_empty()
+                            && cold_ack_tx.try_send(identities).is_err()
+                        {
+                            crate::latency::record_ns(
+                                "polymarket.user.cold_commit_ack_overflow",
+                                1,
+                            );
+                        }
+                        if let Some(completion) = completion {
                             let _ = completion.send(result);
                         }
                     }
@@ -2128,32 +2194,49 @@ fn spawn_private_apply_worker(
                 &account_id,
             );
             let mut route_dedupe = PrivateRouteDedupe::new();
+            let mut cold_committed = PrivateRouteDedupe::new();
             while !shutdown.load(Ordering::Relaxed) {
                 crossbeam_channel::select_biased! {
+                    recv(cold_ack_rx) -> ack => match ack {
+                        Ok(identities) => {
+                            for identity in identities {
+                                cold_committed.remember(identity);
+                            }
+                        }
+                        Err(_) => break,
+                    },
                     recv(live_rx) -> command => match command {
                         Ok(PrivateApplyCommand::Live { events, enqueued_at }) => {
                             crate::latency::record(
                                 "polymarket.user.ws_enqueue_to_owner_dequeue",
                                 enqueued_at,
                             );
-                            if let Err(error) = route_private_batch(
+                            let routed = match route_private_batch(
                                 &shared,
                                 &update_tx,
-                                &events,
+                                events,
                                 None,
                                 &mut route_dedupe,
+                                Some(&cold_committed),
                             ) {
-                                shared.user_feed_health.set_recovering(true);
-                                warn!(
-                                    "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
-                                    error,
-                                );
-                                reconnect_generation.fetch_add(1, Ordering::AcqRel);
-                                reconnect_notify.notify_one();
+                                Ok(routed) => routed,
+                                Err(error) => {
+                                    shared.user_feed_health.set_recovering(true);
+                                    warn!(
+                                        "[PolyUserFeed] invalid private business event; forcing reconnect for authoritative trade/order audit: {}",
+                                        error,
+                                    );
+                                    reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                                    reconnect_notify.notify_one();
+                                    continue;
+                                }
+                            };
+                            if routed.events.is_empty() {
                                 continue;
                             }
                             let cold = PrivateColdCommand {
-                                events,
+                                events: routed.events,
+                                identities: routed.identities,
                                 recovery_generation: None,
                                 completion: None,
                                 routed_at: crate::latency::Instant::now(),
@@ -2183,17 +2266,19 @@ fn spawn_private_apply_worker(
                             let routed = route_private_batch(
                                 &shared,
                                 &update_tx,
-                                &events,
+                                events,
                                 recovery_generation,
                                 &mut route_dedupe,
+                                None,
                             );
                             match routed {
                                 Err(error) => {
                                     let _ = completion.send(Err(error));
                                 }
-                                Ok(()) => {
+                                Ok(routed) => {
                                     let cold = PrivateColdCommand {
-                                        events,
+                                        events: routed.events,
+                                        identities: routed.identities,
                                         recovery_generation,
                                         completion: Some(completion),
                                         routed_at: crate::latency::Instant::now(),
@@ -2243,7 +2328,9 @@ fn parse_user_event_with_health(
     }
     match parse_user_event_checked(data, shared) {
         Ok(updates) => {
+            let anomaly_started = crate::latency::Instant::now();
             resolve_valid_private_event_anomaly(data, shared);
+            crate::latency::record("polymarket.user.account_resolve_anomaly", anomaly_started);
             ParsedPrivateEvent {
                 updates,
                 valid_business_event: true,
@@ -2527,6 +2614,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     }
 
                     let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
+                    let transition_started = crate::latency::Instant::now();
                     let transition = shared.account_state.apply_trade_transition_with_context(
                         &leg_id,
                         status_str,
@@ -2539,21 +2627,25 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         true,
                         match_time.business_secs,
                     );
+                    crate::latency::record(
+                        "polymarket.user.account_trade_transition",
+                        transition_started,
+                    );
                     let transition = if transition.ownership().is_none()
                         && matches!(status_str, "CONFIRMED" | "FAILED")
                     {
                         shared
                             .account_state
                             .record_authenticated_terminal_trade_noop(
-                            &leg_id,
-                            status_str,
-                            mo_order_id,
-                            &mo_asset_id,
-                            mo_side,
-                            mo_size,
-                            mo_price,
-                            true,
-                        )
+                                &leg_id,
+                                status_str,
+                                mo_order_id,
+                                &mo_asset_id,
+                                mo_side,
+                                mo_size,
+                                mo_price,
+                                true,
+                            )
                     } else {
                         transition
                     };
@@ -2594,6 +2686,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     // Only advance the feed-level dedupe after ownership was
                     // successfully resolved. An unowned event must remain
                     // replayable after its order mapping arrives later.
+                    let live_position_started = crate::latency::Instant::now();
                     let lifecycle_advanced = record_trade_transition(
                         &shared.live_position,
                         &leg_id,
@@ -2604,6 +2697,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         mo_price,
                         true,
                         reason_ref,
+                    );
+                    crate::latency::record(
+                        "polymarket.user.account_live_position",
+                        live_position_started,
                     );
                     if !lifecycle_advanced {
                         continue;
@@ -2659,6 +2756,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 }
 
                 let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
+                let transition_started = crate::latency::Instant::now();
                 let transition = shared.account_state.apply_trade_transition_with_context(
                     trade_id,
                     status_str,
@@ -2671,6 +2769,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     false,
                     match_time.business_secs,
                 );
+                crate::latency::record(
+                    "polymarket.user.account_trade_transition",
+                    transition_started,
+                );
                 let transition = if transition.ownership().is_none()
                     && matches!(status_str, "CONFIRMED" | "FAILED")
                     && top_level_maker_matches_account(data, shared)
@@ -2678,15 +2780,15 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     shared
                         .account_state
                         .record_authenticated_terminal_trade_noop(
-                        trade_id,
-                        status_str,
-                        taker_order_id,
-                        &asset_id,
-                        side,
-                        matched_amount,
-                        price,
-                        false,
-                    )
+                            trade_id,
+                            status_str,
+                            taker_order_id,
+                            &asset_id,
+                            side,
+                            matched_amount,
+                            price,
+                            false,
+                        )
                 } else {
                     transition
                 };
@@ -2720,6 +2822,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     return Vec::new();
                 }
                 let coid = ownership.client_order_id;
+                let live_position_started = crate::latency::Instant::now();
                 let lifecycle_advanced = record_trade_transition(
                     &shared.live_position,
                     trade_id,
@@ -2730,6 +2833,10 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     price,
                     false,
                     reason_ref,
+                );
+                crate::latency::record(
+                    "polymarket.user.account_live_position",
+                    live_position_started,
                 );
                 if !lifecycle_advanced {
                     return Vec::new();
@@ -3197,7 +3304,7 @@ async fn user_feed_loop(
                         &gap_transport,
                         None,
                     )
-                            .await;
+                    .await;
                     match replay_result {
                         Ok(outcome @ GapReplayOutcome::Complete { .. }) => {
                             if consecutive_failures > 0 {
@@ -3405,7 +3512,7 @@ async fn user_feed_loop(
                 }
                 if let Err(error) =
                     wait_for_recovery_delivery(&shared, recovery_generation, &update_tx, &shutdown)
-                    .await
+                        .await
                 {
                     shared.user_feed_health.set_recovering(true);
                     let delay = backoff.next_delay();
@@ -3657,7 +3764,7 @@ pub fn spawn_user_feed(
         user_feed_loop(
             api_key, api_secret, passphrase, shared, update_tx, apply_lane, shutdown,
         )
-            .instrument(tracing::info_span!("user_feed", acct = %acct)),
+        .instrument(tracing::info_span!("user_feed", acct = %acct)),
     );
 
     let handle = std::thread::Builder::new()
@@ -3921,6 +4028,80 @@ mod tests {
                 .filled_quantity
                 > before.filled_quantity
         );
+    }
+
+    #[test]
+    fn cold_duplicate_is_suppressed_only_after_commit_ack() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner-1", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner-1",
+                "owner-1-1",
+                "0xabc1",
+                "TOKEN",
+                Side::Buy,
+                5.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        shared.register_order_id("owner-1-1", "0xabc1", "TOKEN");
+        let event = || {
+            PrivateEventDelta::classify(serde_json::json!({
+                "event_type": "trade",
+                "id": "cold-ack-trade",
+                "status": "MATCHED",
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "size": "2",
+                "price": "0.5",
+                "taker_order_id": "0xabc1",
+                "maker_orders": []
+            }))
+            .unwrap()
+        };
+        let (update_tx, _update_rx) = crossbeam_channel::bounded(8);
+        let mut route_dedupe = PrivateRouteDedupe::new();
+        let mut cold_committed = PrivateRouteDedupe::new();
+
+        let first = route_private_batch(
+            &shared,
+            &update_tx,
+            vec![event()],
+            None,
+            &mut route_dedupe,
+            Some(&cold_committed),
+        )
+        .unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.identities.len(), 1);
+
+        apply_private_cold_batch(&shared, &first.events, None).unwrap();
+        for identity in first.identities {
+            cold_committed.remember(identity);
+        }
+
+        let duplicate = route_private_batch(
+            &shared,
+            &update_tx,
+            vec![event()],
+            None,
+            &mut route_dedupe,
+            Some(&cold_committed),
+        )
+        .unwrap();
+        assert!(duplicate.events.is_empty());
+        assert!(duplicate.identities.is_empty());
     }
 
     fn record(manager: &Mutex<LivePositionManager>, status: &str) -> bool {
