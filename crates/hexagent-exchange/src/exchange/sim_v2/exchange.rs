@@ -75,10 +75,11 @@ struct FeeParams {
 struct RecentFill {
     ts: u64,
     trade_id: String,
-    cum_filled: f64,
+    filled_quantity: f64,
     price: f64,
     side: Side,
     symbol: String,
+    liquidity: Liquidity,
 }
 
 struct MakerFill {
@@ -457,20 +458,28 @@ impl SimExchangeV2 {
         price: f64,
         side: Side,
         symbol: &str,
+        liquidity: Liquidity,
         ts: u64,
     ) {
         let e = self.recent_fills.entry(coid.to_string()).or_insert(RecentFill {
             ts,
             trade_id: trade_id.clone(),
-            cum_filled: 0.0,
+            filled_quantity: add_qty,
             price,
             side,
             symbol: symbol.to_string(),
+            liquidity,
         });
         e.ts = ts;
         e.trade_id = trade_id;
-        e.cum_filled += add_qty;
+        // `trade_id` identifies one immutable execution.  If an order fills in
+        // multiple fragments, the newest id replaces the previous one, so its
+        // quantity must be replaced as well.  Summing quantities while
+        // replacing the id makes a matched-can't-cancel replay mutate the
+        // trade tuple and defeats downstream idempotence checks.
+        e.filled_quantity = add_qty;
         e.price = price;
+        e.liquidity = liquidity;
         // Memory bound: drop fills older than the matched-can't-cancel window.
         // `cancel_order` only matches a fill within that window (it checks
         // `now - rf.ts <= window`), and the sim processes events in ts order, so
@@ -1201,7 +1210,16 @@ impl SimExchangeV2 {
                 }
             }
             let trade_id = format!("simv2-maker-{}-{}", f.coid, self.maker_fills);
-            self.record_recent_fill(&f.coid, trade_id.clone(), f.fill, f.price, f.side, &f.token, now_ns);
+            self.record_recent_fill(
+                &f.coid,
+                trade_id.clone(),
+                f.fill,
+                f.price,
+                f.side,
+                &f.token,
+                Liquidity::Maker,
+                now_ns,
+            );
             let status = if f.fully { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
             out.push(OrderUpdate {
                 client_order_id: f.coid.clone(),
@@ -1762,7 +1780,16 @@ impl SimExchangeV2 {
             self.insert_resting(o, remainder, now_ns, false);
         }
         let taker_tid = format!("simv2-taker-{}", o.client_order_id);
-        self.record_recent_fill(&o.client_order_id, taker_tid.clone(), filled, avg, o.side, &o.symbol, now_ns);
+        self.record_recent_fill(
+            &o.client_order_id,
+            taker_tid.clone(),
+            filled,
+            avg,
+            o.side,
+            &o.symbol,
+            Liquidity::Taker,
+            now_ns,
+        );
         let status = if remainder > EPS { OrderStatus::PartiallyFilled } else { OrderStatus::Filled };
         OrderUpdate {
             client_order_id: o.client_order_id.clone(),
@@ -2053,8 +2080,17 @@ impl SimExchangeV2 {
             .recent_fills
             .get(coid)
             .filter(|rf| now_ns.saturating_sub(rf.ts) <= window)
-            .map(|rf| (rf.symbol.clone(), rf.side, rf.cum_filled, rf.price, rf.trade_id.clone()));
-        if let Some((symbol, side, cum, price, trade_id)) = hit {
+            .map(|rf| {
+                (
+                    rf.symbol.clone(),
+                    rf.side,
+                    rf.filled_quantity,
+                    rf.price,
+                    rf.trade_id.clone(),
+                    rf.liquidity,
+                )
+            });
+        if let Some((symbol, side, filled_quantity, price, trade_id, liquidity)) = hit {
             self.matched_cant_cancel += 1;
             return OrderUpdate {
                 client_order_id: coid.to_string(),
@@ -2063,8 +2099,8 @@ impl SimExchangeV2 {
                 side,
                 exchange_order_id: None,
                 status: OrderStatus::Filled,
-                liquidity: None,
-                filled_quantity: cum,
+                liquidity: Some(liquidity),
+                filled_quantity,
                 remaining_quantity: 0.0,
                 avg_fill_price: price,
                 timestamp_ns: now_ns,
@@ -2988,7 +3024,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_cant_cancel_returns_filled_with_same_trade_id() {
+    fn matched_cant_cancel_replays_exact_maker_fill_idempotently() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
         let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
@@ -3001,7 +3037,66 @@ mod tests {
         let u = c.cancel_order(Exchange::Polymarket, "a", 200);
         assert_eq!(u.status, OrderStatus::Filled);
         assert_eq!(u.trade_id, Some(fill_tid));
+        assert_eq!(u.liquidity, Some(Liquidity::Maker));
+        assert_eq!(u.filled_quantity, fills[0].filled_quantity);
+        assert_eq!(u.avg_fill_price, fills[0].avg_fill_price);
+        assert_eq!(u.side, fills[0].side);
+        assert_eq!(u.symbol, fills[0].symbol);
         assert_eq!(c.matched_cant_cancel, 1);
+
+        // A duplicate cancel is another replay of the same immutable trade
+        // tuple. Downstream trade-id dedupe must see no invariant change.
+        let duplicate = c.cancel_order(Exchange::Polymarket, "a", 300);
+        assert_eq!(duplicate.trade_id, u.trade_id);
+        assert_eq!(duplicate.liquidity, u.liquidity);
+        assert_eq!(duplicate.filled_quantity, u.filled_quantity);
+        assert_eq!(duplicate.avg_fill_price, u.avg_fill_price);
+        assert_eq!(duplicate.side, u.side);
+        assert_eq!(duplicate.symbol, u.symbol);
+        assert_eq!(c.matched_cant_cancel, 2);
+    }
+
+    #[test]
+    fn matched_cant_cancel_replays_latest_fragment_not_order_cumulative() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+
+        // The first trade drains the 50 shares ahead and fills four; the next
+        // trade fills the remaining six under a distinct trade id.
+        let first = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 54.0, 100));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].status, OrderStatus::PartiallyFilled);
+        assert!((first[0].filled_quantity - 4.0).abs() < 1e-9);
+        let final_fill = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 6.0, 150));
+        assert_eq!(final_fill.len(), 1);
+        assert_eq!(final_fill[0].status, OrderStatus::Filled);
+        assert!((final_fill[0].filled_quantity - 6.0).abs() < 1e-9);
+
+        let replay = c.cancel_order(Exchange::Polymarket, "a", 200);
+        assert_eq!(replay.trade_id, final_fill[0].trade_id);
+        assert_eq!(replay.liquidity, Some(Liquidity::Maker));
+        assert_eq!(replay.filled_quantity, final_fill[0].filled_quantity);
+        assert_ne!(replay.trade_id, first[0].trade_id);
+    }
+
+    #[test]
+    fn matched_cant_cancel_preserves_taker_role() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        let fill = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Limit),
+            100,
+        );
+        assert_eq!(fill.status, OrderStatus::Filled);
+        assert_eq!(fill.liquidity, Some(Liquidity::Taker));
+
+        let replay = c.cancel_order(Exchange::Polymarket, "t", 200);
+        assert_eq!(replay.status, OrderStatus::Filled);
+        assert_eq!(replay.trade_id, fill.trade_id);
+        assert_eq!(replay.liquidity, Some(Liquidity::Taker));
+        assert_eq!(replay.filled_quantity, fill.filled_quantity);
+        assert_eq!(replay.avg_fill_price, fill.avg_fill_price);
     }
 
     #[test]
