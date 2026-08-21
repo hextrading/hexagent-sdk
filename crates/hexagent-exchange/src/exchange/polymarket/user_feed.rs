@@ -406,6 +406,7 @@ fn update_trade_finality_replay_anchor(
     status: &str,
     match_time_secs: u64,
 ) {
+    let started = crate::latency::Instant::now();
     let normalized = status
         .trim_start_matches("TRADE_STATUS_")
         .to_ascii_uppercase();
@@ -418,6 +419,7 @@ fn update_trade_finality_replay_anchor(
             .account_state
             .resolve_unresolved_trade_match_time(trade_key);
     }
+    crate::latency::record("polymarket.user.trade_replay_anchor_apply", started);
 }
 
 #[derive(Debug, Clone)]
