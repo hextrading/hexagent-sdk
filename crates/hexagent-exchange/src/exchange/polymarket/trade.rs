@@ -2247,27 +2247,25 @@ impl SharedState {
             .name(format!("poly-settled-gc-{}", shared.instance_id))
             .spawn(move || {
                 crate::os_tune::pin_background("polymarket-settled-gc");
-                while rx.recv().is_ok() {
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
                     let Some(shared) = weak.upgrade() else { break };
-                    let mut exhausted = true;
-                    for _ in 0..8 {
-                        let started = crate::latency::Instant::now();
-                        let (retired_events, retired_live_trades) =
-                            shared.finalize_ready_settled_audit_retirements();
-                        crate::latency::record("polymarket.account.settled_gc", started);
-                        if retired_events == 0 {
-                            exhausted = false;
-                            break;
-                        }
+                    if !shared.account_state.has_settled_gc_candidates() {
+                        continue;
+                    }
+                    let started = crate::latency::Instant::now();
+                    let (retired_events, retired_live_trades) =
+                        shared.finalize_ready_settled_audit_retirements();
+                    crate::latency::record("polymarket.account.settled_gc", started);
+                    if retired_events > 0 {
                         debug!(
                             "[PolySettledGc] account={} retired_events={} retired_live_trades={}",
                             shared.account_state.account_id(), retired_events, retired_live_trades,
                         );
-                        std::thread::yield_now();
                     }
-                        if exhausted {
-                            shared.request_settled_gc();
-                        }
                 }
             });
     }
@@ -2276,6 +2274,7 @@ impl SharedState {
         if !self.account_state.has_settled_gc_candidates() {
             return;
         }
+        self.account_state.note_settled_gc_activity();
         let _ = self.settled_gc_tx.try_send(());
     }
 
@@ -2286,6 +2285,7 @@ impl SharedState {
         {
             return;
         }
+        self.account_state.note_settled_gc_activity();
         let _ = self.settled_gc_tx.try_send(());
     }
 
@@ -2976,11 +2976,49 @@ impl SharedState {
             return (0, 0);
         }
         let retired_events = ready.len();
+        let mut retired_runtime_mappings = 0usize;
+        for tokens in &ready {
+            let owned_coids: HashSet<String> = self
+                .coid_to_token
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, token)| tokens.contains(*token))
+                .map(|(coid, _)| coid.clone())
+                .collect();
+            if owned_coids.is_empty() {
+                continue;
+            }
+            let token_list: Vec<String> = tokens.iter().cloned().collect();
+            retired_runtime_mappings = retired_runtime_mappings.saturating_add({
+                let mut coid_to_oid = self.coid_to_oid.lock().unwrap();
+                let mut oid_to_coid = self.oid_to_coid.lock().unwrap();
+                let mut coid_to_token = self.coid_to_token.lock().unwrap();
+                reclaim_token_mappings(
+                    &mut coid_to_oid,
+                    &mut oid_to_coid,
+                    &mut coid_to_token,
+                    &token_list,
+                    Some(&owned_coids),
+                )
+            });
+            self.order_lifecycle_traces
+                .lock()
+                .unwrap()
+                .retain(|coid, _| !owned_coids.contains(coid));
+            self.runtime_order_ownership
+                .remove_client_orders(&owned_coids);
+        }
         let mut live = self.live_position.lock().unwrap();
         let retired_live_trades = ready
             .iter()
             .map(|tokens| live.prune_terminal_history(tokens))
             .sum();
+        debug!(
+            "[PolySettledGc] account={} owner certificates complete runtime_mappings={}",
+            self.account_state.account_id(),
+            retired_runtime_mappings,
+        );
         (retired_events, retired_live_trades)
     }
 
@@ -6112,15 +6150,9 @@ impl PolymarketTrade {
         let owned_condition_id = condition_id.to_string();
         let asset_ids = asset_ids.to_vec();
         if let Err(error) = hexagent_runtime::background_jobs::try_submit(move || {
-            let owned_coids: HashSet<String> = shared
+            let owned_coids = shared
                 .account_state
-                .orders()
-                .into_iter()
-                .filter(|order| {
-                    order.instance_id == instance_id && retired_tokens.contains(&order.token_id)
-                })
-                .map(|order| order.client_order_id)
-                .collect();
+                .order_ids_for_instance_tokens(&instance_id, &retired_tokens);
             let reclaimed = {
                 let mut coid_to_oid = shared.coid_to_oid.lock().unwrap();
                 let mut oid_to_coid = shared.oid_to_coid.lock().unwrap();
@@ -6142,9 +6174,6 @@ impl PolymarketTrade {
             shared
                 .runtime_order_ownership
                 .remove_client_orders(&owned_coids);
-            let (ledger_orders, ledger_trades) = shared
-                .account_state
-                .prune_terminal_history_for_instance(&instance_id, &retired_tokens);
             if let Err(error) = shared.account_state.release_settled_event_audit(
                 &instance_id,
                 &owned_condition_id,
@@ -6157,10 +6186,8 @@ impl PolymarketTrade {
             }
             shared.request_settled_gc();
             info!(
-                "[PolymarketTrade] settled background cleanup retired {} runtime mapping(s), {} ledger order(s), {} ledger trade(s); account GC queued for {} token(s)",
+                "[PolymarketTrade] settled background cleanup retired {} runtime mapping(s); owner-thread ledger GC queued for {} token(s)",
                 reclaimed,
-                ledger_orders,
-                ledger_trades,
                 retired_tokens.len(),
             );
         }) {

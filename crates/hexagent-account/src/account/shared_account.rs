@@ -39,6 +39,15 @@ const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
 const ROUTE_SHARD_COUNT: usize = 64;
 const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
+/// One request can be executing while one retry waits behind it. The GC
+/// coordinator never intentionally has more than one outstanding request per
+/// owner, so reaching this bound means a stale/rebound mailbox is applying
+/// backpressure and must be retried rather than expanded.
+const SETTLED_GC_OWNER_QUEUE_CAPACITY: usize = 2;
+const SETTLED_GC_COMPLETION_QUEUE_CAPACITY: usize = 1_024;
+const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
+const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
+const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LockMonitoringSnapshot {
@@ -334,6 +343,23 @@ pub struct AccountMonitoringSnapshot {
     pub persistence_flushes: u64,
     pub persistence_flush_last_us: u64,
     pub persistence_flush_max_us: u64,
+    pub persistence_scheduled_generation: u64,
+    pub persistence_completed_generation: u64,
+    pub persistence_generation_lag: u64,
+    pub persistence_pending_jobs: usize,
+    pub persistence_pending_high_water: usize,
+    /// Settled-history deletion is routed to the owning strategy threads.
+    /// These counters make a missing/stalled owner mailbox distinguishable
+    /// from persistence or account-lock latency.
+    pub settled_gc_candidates: usize,
+    pub settled_gc_inflight_requests: usize,
+    pub settled_gc_request_queue_depth: usize,
+    pub settled_gc_request_queue_high_water: usize,
+    pub settled_gc_request_queue_overflows: u64,
+    pub settled_gc_completion_queue_depth: usize,
+    pub settled_gc_completion_queue_high_water: usize,
+    pub settled_gc_completion_queue_overflows: u64,
+    pub settled_gc_certificates_completed: u64,
     /// Time spent waiting for the account-wide control/state lock. Ordinary
     /// virtual-account order/trade paths do not contribute because they never
     /// acquire this lock.
@@ -349,6 +375,170 @@ pub struct AccountMonitoringSnapshot {
     pub reservation_coid_route_lock: LockMonitoringSnapshot,
     pub reservation_oid_route_lock: LockMonitoringSnapshot,
     pub reservation_lifecycle_lock: LockMonitoringSnapshot,
+}
+
+/// Result of one bounded owner-thread settled-history deletion turn. The
+/// mailbox retains an unsent certificate when the return lane is full, so a
+/// strategy callback never blocks and a completion is never silently lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledGcCompletionCertificate {
+    pub request_id: u64,
+    pub registration_id: u64,
+    pub instance_id: String,
+    pub condition_id: String,
+    pub retired_orders: usize,
+    pub retired_trades: usize,
+    pub remaining_rows: bool,
+    pub eligible: bool,
+    pub reservation_epoch: u64,
+    pub trade_epoch: u64,
+}
+
+#[derive(Debug)]
+struct SettledGcDeleteRequest {
+    request_id: u64,
+    registration_id: u64,
+    instance_id: String,
+    condition_id: String,
+    tokens: Arc<HashSet<String>>,
+    enqueued_at: crate::latency::Instant,
+}
+
+/// A bounded mailbox owned and polled by exactly one strategy thread. It is
+/// deliberately not `Clone`: moving it into the strategy object documents the
+/// single consumer, while the shared account retains only the sender route.
+#[derive(Debug)]
+pub struct SettledGcOwnerMailbox {
+    account_id: String,
+    instance_id: String,
+    registration_id: u64,
+    request_rx: crossbeam_channel::Receiver<SettledGcDeleteRequest>,
+    completion_tx: crossbeam_channel::Sender<SettledGcCompletionCertificate>,
+    pending_completion: Option<SettledGcCompletionCertificate>,
+    completion_queue_high_water: Arc<AtomicUsize>,
+    completion_queue_overflows: Arc<AtomicU64>,
+    certificates_completed: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+struct SettledGcOwnerRoute {
+    registration_id: u64,
+    tx: crossbeam_channel::Sender<SettledGcDeleteRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettledGcOwnerProgress {
+    NeedsDispatch,
+    Waiting {
+        request_id: u64,
+        registration_id: u64,
+    },
+    Certified {
+        reservation_epoch: u64,
+        trade_epoch: u64,
+    },
+}
+
+#[derive(Debug)]
+struct SettledGcInflight {
+    condition_id: String,
+    tokens: Arc<HashSet<String>>,
+    owners: BTreeMap<String, SettledGcOwnerProgress>,
+    retired_orders: usize,
+    retired_trades: usize,
+}
+
+#[derive(Debug, Default)]
+struct SettledGcCoordinator {
+    next_request_id: u64,
+    next_registration_id: u64,
+    inflight: Option<SettledGcInflight>,
+    /// A no-progress certificate means protected rows remain. Do not poll the
+    /// owner again until a private/lifecycle edge advances this generation.
+    blocked_at_activity: BTreeMap<String, u64>,
+}
+
+impl SettledGcOwnerMailbox {
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn request_depth(&self) -> usize {
+        self.request_rx.len()
+    }
+
+    fn try_publish_completion(
+        &self,
+        certificate: SettledGcCompletionCertificate,
+    ) -> Result<(), SettledGcCompletionCertificate> {
+        match self.completion_tx.try_send(certificate) {
+            Ok(()) => {
+                self.completion_queue_high_water
+                    .fetch_max(self.completion_tx.len(), Ordering::Relaxed);
+                self.certificates_completed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(crossbeam_channel::TrySendError::Full(certificate)) => {
+                self.completion_queue_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(certificate)
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(certificate)) => Err(certificate),
+        }
+    }
+
+    /// Process at most one bounded request on the calling strategy thread.
+    /// `Ok(None)` means the mailbox was idle or its lossless completion was
+    /// still backpressured; callers should simply poll again on a later
+    /// watchdog turn.
+    pub fn poll_once(
+        &mut self,
+        account: &SharedAccount,
+    ) -> Result<Option<SettledGcCompletionCertificate>, String> {
+        if account.account_id() != self.account_id {
+            return Err(format!(
+                "settled GC mailbox account mismatch: registered={} supplied={}",
+                self.account_id,
+                account.account_id(),
+            ));
+        }
+        if let Some(certificate) = self.pending_completion.take() {
+            let published = certificate.clone();
+            if let Err(certificate) = self.try_publish_completion(certificate) {
+                self.pending_completion = Some(certificate);
+                return Ok(None);
+            }
+            return Ok(Some(published));
+        }
+        let request = match self.request_rx.try_recv() {
+            Ok(request) => request,
+            Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                return Err("settled GC request route disconnected".to_string())
+            }
+        };
+        if request.instance_id != self.instance_id
+            || request.registration_id != self.registration_id
+        {
+            return Err(format!(
+                "settled GC mailbox ownership mismatch: mailbox={}/{} request={}/{}",
+                self.instance_id,
+                self.registration_id,
+                request.instance_id,
+                request.registration_id,
+            ));
+        }
+        crate::latency::record("polymarket.account.settled_gc_owner_queue", request.enqueued_at);
+        let started = crate::latency::Instant::now();
+        let certificate = account.process_settled_gc_delete_request(request)?;
+        crate::latency::record("polymarket.account.settled_gc_owner_apply", started);
+        let published = certificate.clone();
+        if let Err(certificate) = self.try_publish_completion(certificate) {
+            self.pending_completion = Some(certificate);
+            return Ok(None);
+        }
+        Ok(Some(published))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1411,6 +1601,7 @@ struct AccountPersistence {
     flushes: AtomicU64,
     flush_last_us: AtomicU64,
     flush_max_us: AtomicU64,
+    pending_high_water: AtomicUsize,
     writer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1429,6 +1620,8 @@ impl AccountPersistence {
             generation,
             payload,
         });
+        self.pending_high_water
+            .fetch_max(pending.len(), Ordering::Relaxed);
         drop(pending);
         let _ = self.wake.try_send(PersistenceSignal::Wake);
     }
@@ -1529,13 +1722,13 @@ impl AccountPersistence {
                             break;
                         };
                         let generation = last.generation;
+                        jobs = coalesce_persistence_jobs(jobs);
                         let started = std::time::Instant::now();
-                        let result = (|| -> Result<serde_json::Value, String> {
+                        let result = (|| -> Result<(), String> {
                             let last_full_snapshot = jobs.iter().rposition(|job| {
                                 matches!(job.payload, PersistenceJobPayload::FullSnapshot)
                             });
-                            let (changes, next_state) = if let Some(full_index) = last_full_snapshot
-                            {
+                            let changes = if let Some(full_index) = last_full_snapshot {
                                 // schedule_persist() runs while the same state
                                 // mutex is held, so once the writer acquires it
                                 // this clone includes every queued generation.
@@ -1560,27 +1753,45 @@ impl AccountPersistence {
                                         apply_persistence_wal_change(&mut next_state, change)?;
                                     }
                                 }
-                                (
-                                    persistence_json_diff(&durable_state, &next_state),
-                                    next_state,
-                                )
+                                let changes = persistence_json_diff(&durable_state, &next_state);
+                                // Full snapshots are intentionally rare cold-control
+                                // fallbacks. Keep their detached replacement semantics;
+                                // unlike ordinary typed batches, replacing the complete
+                                // tree is the operation being requested.
+                                if !changes.is_empty() {
+                                    append_persistence_wal(
+                                        &thread_path,
+                                        &PersistenceWalRecord {
+                                            version: PERSISTENCE_WAL_VERSION,
+                                            account_id: account_id.clone(),
+                                            generation,
+                                            changes,
+                                        },
+                                        &mut durable_wal_len,
+                                    )?;
+                                }
+                                durable_state = next_state;
+                                return Ok(());
                             } else {
                                 let mut changes = Vec::new();
                                 for job in &jobs {
                                     changes.extend(materialize_persistence_job(job)?);
                                 }
-                                // Validate paths against a detached JSON value.
-                                // This can be CPU-heavy for a large ledger, but
-                                // never holds the account mutex or delays order
-                                // admission/private-feed processing.
-                                let mut next_state = durable_state.clone();
-                                for change in changes.iter().cloned() {
-                                    apply_persistence_wal_change(&mut next_state, change)?;
-                                }
-                                (changes, next_state)
+                                changes
                             };
                             if !changes.is_empty() {
-                                append_persistence_wal(
+                                // Apply typed deltas transactionally in place. The old
+                                // implementation cloned the complete durable JSON tree
+                                // for every writer batch (28 MB in live operation),
+                                // making the single writer fall behind during bursts.
+                                // The bounded undo log preserves the same rule: invalid
+                                // changes or an fsync failure leave the baseline exactly
+                                // as it was before this generation.
+                                let undo = apply_persistence_wal_changes_transactional(
+                                    &mut durable_state,
+                                    &changes,
+                                )?;
+                                if let Err(error) = append_persistence_wal(
                                     &thread_path,
                                     &PersistenceWalRecord {
                                         version: PERSISTENCE_WAL_VERSION,
@@ -1589,17 +1800,20 @@ impl AccountPersistence {
                                         changes,
                                     },
                                     &mut durable_wal_len,
-                                )?;
+                                ) {
+                                    rollback_persistence_wal_changes(&mut durable_state, undo)
+                                        .map_err(|rollback| {
+                                            format!(
+                                                "{error}; additionally failed to roll back in-memory account WAL batch: {rollback}"
+                                            )
+                                        })?;
+                                    return Err(error);
+                                }
                             }
-                            Ok(next_state)
+                            Ok(())
                         })();
                         let error = match result {
-                            Ok(next_state) => {
-                                // Consume directly; avoid cloning the complete
-                                // 10-13 MB durable JSON tree a second time.
-                                durable_state = next_state;
-                                None
-                            }
+                            Ok(_) => None,
                             Err(error) => {
                                 // Failed jobs must stay ahead of work queued
                                 // while this batch was being written.
@@ -1644,6 +1858,7 @@ impl AccountPersistence {
             flushes: AtomicU64::new(0),
             flush_last_us: AtomicU64::new(0),
             flush_max_us: AtomicU64::new(0),
+            pending_high_water: AtomicUsize::new(0),
             writer: Some(writer),
         })
     }
@@ -1756,8 +1971,9 @@ impl AccountPersistence {
         Ok(progress.completed_generation >= target)
     }
 
-    fn metrics(&self) -> (u64, u64, u64, u64, u64, u64) {
-        let (writes, write_last_us, write_max_us) = self
+    fn metrics(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, usize, usize) {
+        let scheduled_generation = self.scheduled_generation();
+        let (writes, write_last_us, write_max_us, completed_generation) = self
             .progress
             .0
             .lock()
@@ -1766,8 +1982,14 @@ impl AccountPersistence {
                     progress.writes,
                     progress.write_last_us,
                     progress.write_max_us,
+                    progress.completed_generation,
                 )
             })
+            .unwrap_or_default();
+        let pending_jobs = self
+            .pending
+            .lock()
+            .map(|pending| pending.len())
             .unwrap_or_default();
         (
             writes,
@@ -1776,6 +1998,11 @@ impl AccountPersistence {
             self.flushes.load(Ordering::Relaxed),
             self.flush_last_us.load(Ordering::Relaxed),
             self.flush_max_us.load(Ordering::Relaxed),
+            scheduled_generation,
+            completed_generation,
+            scheduled_generation.saturating_sub(completed_generation),
+            pending_jobs,
+            self.pending_high_water.load(Ordering::Relaxed),
         )
     }
 }
@@ -2094,6 +2321,38 @@ fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWa
     }
 }
 
+/// Collapse repeated absolute updates for the same owned row inside one
+/// detached writer batch. Cross-kind ordering is preserved: an order lifecycle
+/// update is never discarded merely because a trade for the same coid exists.
+/// Full snapshots and arbitrary change vectors remain untouched.
+fn coalesce_persistence_jobs(jobs: Vec<PersistenceJob>) -> Vec<PersistenceJob> {
+    let mut reservations = HashSet::new();
+    let mut lifecycles = HashSet::new();
+    let mut trades = HashSet::new();
+    let mut unresolved = HashSet::new();
+    let mut retained = Vec::with_capacity(jobs.len());
+    for job in jobs.into_iter().rev() {
+        let keep = match &job.payload {
+            PersistenceJobPayload::Reservation(delta) => {
+                reservations.insert(delta.client_order_id.clone())
+            }
+            PersistenceJobPayload::VirtualLifecycle(delta) => {
+                lifecycles.insert(delta.client_order_id.clone())
+            }
+            PersistenceJobPayload::VirtualTrade(delta) => trades.insert(delta.trade_key.clone()),
+            PersistenceJobPayload::UnresolvedTradeMatchTime { trade_key, .. } => {
+                unresolved.insert(trade_key.clone())
+            }
+            PersistenceJobPayload::FullSnapshot | PersistenceJobPayload::Changes(_) => true,
+        };
+        if keep {
+            retained.push(job);
+        }
+    }
+    retained.reverse();
+    retained
+}
+
 fn apply_persistence_wal_change(
     state: &mut serde_json::Value,
     change: PersistenceWalChange,
@@ -2171,6 +2430,214 @@ fn apply_persistence_wal_change(
         // Typed jobs may coalesce repeated removal of the same map entry before
         // the writer drains them. Removal is intentionally idempotent.
         object.remove(key);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PersistenceWalUndo {
+    Root(serde_json::Value),
+    ObjectEntry {
+        path: Vec<String>,
+        previous: Option<serde_json::Value>,
+    },
+    SetMembership {
+        path: Vec<String>,
+        value: serde_json::Value,
+        was_present: bool,
+    },
+}
+
+/// Apply a typed WAL batch without cloning the complete durable JSON tree.
+/// Each mutation moves its replaced leaf into a bounded undo log. The caller
+/// keeps that log until the WAL frame has reached `sync_data`; on failure the
+/// exact pre-batch tree is restored in reverse order.
+fn apply_persistence_wal_changes_transactional(
+    state: &mut serde_json::Value,
+    changes: &[PersistenceWalChange],
+) -> Result<Vec<PersistenceWalUndo>, String> {
+    let mut undo = Vec::with_capacity(changes.len());
+    for change in changes {
+        let applied = apply_persistence_wal_change_transactional(state, change);
+        match applied {
+            Ok(Some(entry)) => undo.push(entry),
+            Ok(None) => {}
+            Err(error) => {
+                rollback_persistence_wal_changes(state, undo).map_err(|rollback| {
+                    format!(
+                        "{error}; additionally failed to roll back invalid in-memory account WAL batch: {rollback}"
+                    )
+                })?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(undo)
+}
+
+fn apply_persistence_wal_change_transactional(
+    state: &mut serde_json::Value,
+    change: &PersistenceWalChange,
+) -> Result<Option<PersistenceWalUndo>, String> {
+    if let PersistenceWalChange::SetInsert { path, value }
+    | PersistenceWalChange::SetRemove { path, value } = change
+    {
+        let mut target = state;
+        for component in path {
+            target = target
+                .as_object_mut()
+                .and_then(|object| object.get_mut(component))
+                .ok_or_else(|| {
+                    format!(
+                        "account ledger WAL set path has missing/non-object parent: {}",
+                        path.join("/")
+                    )
+                })?;
+        }
+        let array = target.as_array_mut().ok_or_else(|| {
+            format!(
+                "account ledger WAL set path is not an array: {}",
+                path.join("/")
+            )
+        })?;
+        let was_present = array.contains(value);
+        let should_be_present = matches!(change, PersistenceWalChange::SetInsert { .. });
+        if was_present == should_be_present {
+            return Ok(None);
+        }
+        if should_be_present {
+            array.push(value.clone());
+        } else {
+            array.retain(|member| member != value);
+        }
+        return Ok(Some(PersistenceWalUndo::SetMembership {
+            path: path.clone(),
+            value: value.clone(),
+            was_present,
+        }));
+    }
+
+    let (path, value) = match change {
+        PersistenceWalChange::Set { path, value } => (path, Some(value)),
+        PersistenceWalChange::Remove { path } => (path, None),
+        PersistenceWalChange::SetInsert { .. } | PersistenceWalChange::SetRemove { .. } => {
+            unreachable!("set membership changes handled above")
+        }
+    };
+    if path.is_empty() {
+        let Some(value) = value else {
+            return Err("account ledger WAL cannot remove the state root".to_string());
+        };
+        if state == value {
+            return Ok(None);
+        }
+        let previous = std::mem::replace(state, value.clone());
+        return Ok(Some(PersistenceWalUndo::Root(previous)));
+    }
+
+    let (key, parents) = path.split_last().expect("empty WAL path handled above");
+    let mut target = state;
+    for component in parents {
+        target = target
+            .as_object_mut()
+            .and_then(|object| object.get_mut(component))
+            .ok_or_else(|| {
+                format!(
+                    "account ledger WAL path has missing/non-object parent: {}",
+                    path.join("/")
+                )
+            })?;
+    }
+    let object = target.as_object_mut().ok_or_else(|| {
+        format!(
+            "account ledger WAL path parent is not an object: {}",
+            path.join("/")
+        )
+    })?;
+    if value.is_some_and(|value| object.get(key) == Some(value)) {
+        return Ok(None);
+    }
+    let previous = if let Some(value) = value {
+        object.insert(key.clone(), value.clone())
+    } else {
+        object.remove(key)
+    };
+    if value.is_none() && previous.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PersistenceWalUndo::ObjectEntry {
+        path: path.clone(),
+        previous,
+    }))
+}
+
+fn rollback_persistence_wal_changes(
+    state: &mut serde_json::Value,
+    undo: Vec<PersistenceWalUndo>,
+) -> Result<(), String> {
+    for entry in undo.into_iter().rev() {
+        match entry {
+            PersistenceWalUndo::Root(previous) => *state = previous,
+            PersistenceWalUndo::ObjectEntry { path, previous } => {
+                let (key, parents) = path.split_last().ok_or_else(|| {
+                    "account ledger WAL rollback object path is empty".to_string()
+                })?;
+                let mut target = &mut *state;
+                for component in parents {
+                    target = target
+                        .as_object_mut()
+                        .and_then(|object| object.get_mut(component))
+                        .ok_or_else(|| {
+                            format!(
+                                "account ledger WAL rollback path has missing/non-object parent: {}",
+                                path.join("/")
+                            )
+                        })?;
+                }
+                let object = target.as_object_mut().ok_or_else(|| {
+                    format!(
+                        "account ledger WAL rollback parent is not an object: {}",
+                        path.join("/")
+                    )
+                })?;
+                if let Some(previous) = previous {
+                    object.insert(key.clone(), previous);
+                } else {
+                    object.remove(key);
+                }
+            }
+            PersistenceWalUndo::SetMembership {
+                path,
+                value,
+                was_present,
+            } => {
+                let mut target = &mut *state;
+                for component in &path {
+                    target = target
+                        .as_object_mut()
+                        .and_then(|object| object.get_mut(component))
+                        .ok_or_else(|| {
+                            format!(
+                                "account ledger WAL rollback set path has missing/non-object parent: {}",
+                                path.join("/")
+                            )
+                        })?;
+                }
+                let array = target.as_array_mut().ok_or_else(|| {
+                    format!(
+                        "account ledger WAL rollback set path is not an array: {}",
+                        path.join("/")
+                    )
+                })?;
+                if was_present {
+                    if !array.contains(&value) {
+                        array.push(value);
+                    }
+                } else {
+                    array.retain(|member| member != &value);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3091,6 +3558,21 @@ pub struct SharedAccount {
     /// path. Candidate publication is rare and runs outside account apply;
     /// terminal trade messages only load this immutable set.
     settled_gc_candidate_tokens_fast: ArcSwap<HashSet<String>>,
+    /// GC is a coordinator only: every destructive instance mutation is sent
+    /// through one bounded route and executed by that instance's strategy
+    /// thread. Completion certificates return on one account-scoped lane.
+    settled_gc_owner_routes: RwLock<BTreeMap<String, SettledGcOwnerRoute>>,
+    settled_gc_completion_tx:
+        crossbeam_channel::Sender<SettledGcCompletionCertificate>,
+    settled_gc_completion_rx:
+        crossbeam_channel::Receiver<SettledGcCompletionCertificate>,
+    settled_gc_coordinator: Mutex<SettledGcCoordinator>,
+    settled_gc_activity_generation: AtomicU64,
+    settled_gc_request_queue_high_water: AtomicUsize,
+    settled_gc_request_queue_overflows: AtomicU64,
+    settled_gc_completion_queue_high_water: Arc<AtomicUsize>,
+    settled_gc_completion_queue_overflows: Arc<AtomicU64>,
+    settled_gc_certificates_completed: Arc<AtomicU64>,
     persistence: Option<AccountPersistence>,
     /// Highest account-persistence generation containing a trade mutation.
     /// Trade ingestion never waits for this generation: subsequent admission
@@ -3259,6 +3741,8 @@ impl SharedAccount {
     }
 
     pub fn new(account_id: impl Into<String>) -> Self {
+        let (settled_gc_completion_tx, settled_gc_completion_rx) =
+            crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let account = Self {
             account_id: account_id.into(),
             state: Arc::new(Mutex::new(SharedAccountState::default())),
@@ -3291,6 +3775,16 @@ impl SharedAccount {
             settled_gc_candidates: Mutex::new(BTreeMap::new()),
             settled_gc_candidate_count_fast: AtomicUsize::new(0),
             settled_gc_candidate_tokens_fast: ArcSwap::from_pointee(HashSet::new()),
+            settled_gc_owner_routes: RwLock::new(BTreeMap::new()),
+            settled_gc_completion_tx,
+            settled_gc_completion_rx,
+            settled_gc_coordinator: Mutex::new(SettledGcCoordinator::default()),
+            settled_gc_activity_generation: AtomicU64::new(0),
+            settled_gc_request_queue_high_water: AtomicUsize::new(0),
+            settled_gc_request_queue_overflows: AtomicU64::new(0),
+            settled_gc_completion_queue_high_water: Arc::new(AtomicUsize::new(0)),
+            settled_gc_completion_queue_overflows: Arc::new(AtomicU64::new(0)),
+            settled_gc_certificates_completed: Arc::new(AtomicU64::new(0)),
             persistence: None,
             trade_persistence_pending_generation: AtomicU64::new(0),
             trade_persistence_blocker_active: AtomicBool::new(false),
@@ -3616,6 +4110,8 @@ impl SharedAccount {
                 startup_aggregate_repairs,
             );
         }
+        let (settled_gc_completion_tx, settled_gc_completion_rx) =
+            crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let account = Self {
             account_id,
             state,
@@ -3655,6 +4151,16 @@ impl SharedAccount {
             settled_gc_candidate_tokens_fast: ArcSwap::from_pointee(
                 initial_settled_gc_candidate_tokens,
             ),
+            settled_gc_owner_routes: RwLock::new(BTreeMap::new()),
+            settled_gc_completion_tx,
+            settled_gc_completion_rx,
+            settled_gc_coordinator: Mutex::new(SettledGcCoordinator::default()),
+            settled_gc_activity_generation: AtomicU64::new(0),
+            settled_gc_request_queue_high_water: AtomicUsize::new(0),
+            settled_gc_request_queue_overflows: AtomicU64::new(0),
+            settled_gc_completion_queue_high_water: Arc::new(AtomicUsize::new(0)),
+            settled_gc_completion_queue_overflows: Arc::new(AtomicU64::new(0)),
+            settled_gc_certificates_completed: Arc::new(AtomicU64::new(0)),
             persistence: Some(persistence),
             trade_persistence_pending_generation: AtomicU64::new(0),
             trade_persistence_blocker_active: AtomicBool::new(false),
@@ -4720,6 +5226,24 @@ impl SharedAccount {
                         &normalized,
                         state.oid_to_coid.get(&normalized),
                     )?;
+                    persistence_wal_set_membership(
+                        &mut changes,
+                        "recovery_pending_orders",
+                        coid,
+                        state.recovery_pending_orders.contains(coid),
+                    )?;
+                    persistence_wal_set_membership(
+                        &mut changes,
+                        "startup_query_repair_orders",
+                        coid,
+                        state.startup_query_repair_orders.contains(coid),
+                    )?;
+                    persistence_wal_set_membership(
+                        &mut changes,
+                        "routine_cancel_audits",
+                        coid,
+                        state.routine_cancel_audits.contains(coid),
+                    )?;
                 }
                 for trade_key in &outcome.trades {
                     persistence_wal_map_entry(
@@ -5570,6 +6094,15 @@ impl SharedAccount {
             })();
             self.schedule_typed_persist(&state, changes);
         }
+        let mut coordinator = self.settled_gc_coordinator.lock().unwrap();
+        if coordinator
+            .inflight
+            .as_ref()
+            .is_some_and(|inflight| inflight.condition_id == condition_id)
+        {
+            coordinator.inflight = None;
+        }
+        coordinator.blocked_at_activity.remove(condition_id);
         let mut candidates = self.settled_gc_candidates.lock().unwrap();
         candidates.remove(condition_id);
         self.publish_settled_gc_candidates(&candidates);
@@ -5624,82 +6157,392 @@ impl SharedAccount {
         Ok(())
     }
 
-    /// Claim a bounded batch of zero-reference events whose durable audit is
-    /// fully terminal. Callers run this from the private-feed GC lane; bounding
-    /// each transaction prevents a long settled backlog from monopolising the
-    /// account control lock.
+    /// Register the bounded settled-history request lane consumed by this
+    /// instance's strategy thread. Re-registration replaces the route with a
+    /// new generation; certificates from an old worker are then ignored.
+    pub fn register_settled_gc_owner(
+        &self,
+        instance_id: &str,
+    ) -> Result<SettledGcOwnerMailbox, String> {
+        if instance_id.trim().is_empty() || self.virtual_account(instance_id).is_none() {
+            return Err(format!(
+                "cannot register settled GC owner for unknown instance `{instance_id}`",
+            ));
+        }
+        let (tx, request_rx) =
+            crossbeam_channel::bounded(SETTLED_GC_OWNER_QUEUE_CAPACITY);
+        let registration_id = {
+            let mut coordinator = self.settled_gc_coordinator.lock().unwrap();
+            coordinator.next_registration_id = coordinator
+                .next_registration_id
+                .checked_add(1)
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| "settled GC registration generation exhausted".to_string())?;
+            let registration_id = coordinator.next_registration_id;
+            self.settled_gc_owner_routes.write().unwrap().insert(
+                instance_id.to_string(),
+                SettledGcOwnerRoute {
+                    registration_id,
+                    tx,
+                },
+            );
+            if let Some(progress) = coordinator
+                .inflight
+                .as_mut()
+                .and_then(|inflight| inflight.owners.get_mut(instance_id))
+            {
+                *progress = SettledGcOwnerProgress::NeedsDispatch;
+            }
+            registration_id
+        };
+        self.note_settled_gc_activity();
+        Ok(SettledGcOwnerMailbox {
+            account_id: self.account_id.clone(),
+            instance_id: instance_id.to_string(),
+            registration_id,
+            request_rx,
+            completion_tx: self.settled_gc_completion_tx.clone(),
+            pending_completion: None,
+            completion_queue_high_water: Arc::clone(
+                &self.settled_gc_completion_queue_high_water,
+            ),
+            completion_queue_overflows: Arc::clone(
+                &self.settled_gc_completion_queue_overflows,
+            ),
+            certificates_completed: Arc::clone(&self.settled_gc_certificates_completed),
+        })
+    }
+
+    /// Advance the retry epoch after a private/lifecycle edge can have made a
+    /// previously protected row terminal. The exchange's coalesced GC wakeup
+    /// calls this before notifying the coordinator thread.
+    pub fn note_settled_gc_activity(&self) {
+        self.settled_gc_activity_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Drive one non-blocking GC coordinator turn. This method never locks an
+    /// owner lifecycle: it dispatches bounded requests and consumes the
+    /// certificates produced asynchronously by strategy threads. The final
+    /// account-global commit is allowed only when every current owner has a
+    /// certificate whose reservation/trade epochs are still current.
     pub fn finalize_ready_settled_audit_retirements(&self) -> Vec<HashSet<String>> {
-        const SETTLED_GC_EVENTS_PER_BATCH: usize = 4;
-        // Keep candidates published while the cold check runs. A terminal
-        // trade racing this transaction can then still enqueue a follow-up
-        // wake; removing a claimed key up front created a missed-wakeup gap.
-        let claimed: Vec<String> = self
-            .settled_gc_candidates
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        if claimed.is_empty() {
-            return Vec::new();
-        }
-        let mut state = self.lock_state();
-        let mut inactive = Vec::new();
-        let ready: Vec<(String, HashSet<String>)> = claimed
-            .into_iter()
-            .filter_map(|condition_id| {
-                let Some(reference) = state.settled_audit_references.get(&condition_id) else {
-                    inactive.push(condition_id);
-                    return None;
+        let activity = self
+            .settled_gc_activity_generation
+            .load(Ordering::Acquire);
+        let mut coordinator = self.settled_gc_coordinator.lock().unwrap();
+
+        // The return lane is lossless: an owner retains its certificate when
+        // this bounded queue is full. Drain a bounded amount per coordinator
+        // turn so a burst cannot monopolize the background GC thread.
+        for _ in 0..SETTLED_GC_COMPLETION_QUEUE_CAPACITY {
+            let certificate = match self.settled_gc_completion_rx.try_recv() {
+                Ok(certificate) => certificate,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            };
+            let mut block_condition = None;
+            let mut cancel_condition = None;
+            if let Some(inflight) = coordinator.inflight.as_mut() {
+                if inflight.condition_id != certificate.condition_id {
+                    continue;
+                }
+                let Some(progress) = inflight.owners.get_mut(&certificate.instance_id) else {
+                    continue;
                 };
-                if !reference.instances.is_empty() {
-                    inactive.push(condition_id);
-                    return None;
+                if !matches!(
+                    progress,
+                    SettledGcOwnerProgress::Waiting {
+                        request_id,
+                        registration_id,
+                    } if *request_id == certificate.request_id
+                        && *registration_id == certificate.registration_id
+                ) {
+                    continue;
                 }
-                let tokens: HashSet<String> = reference.asset_ids.iter().cloned().collect();
-                if settled_audit_has_revisable_rows(&state, &tokens) {
-                    None
+                if !certificate.eligible {
+                    cancel_condition = Some(inflight.condition_id.clone());
                 } else {
-                    Some((condition_id, tokens))
+                    inflight.retired_orders = inflight
+                        .retired_orders
+                        .saturating_add(certificate.retired_orders);
+                    inflight.retired_trades = inflight
+                        .retired_trades
+                        .saturating_add(certificate.retired_trades);
+                    if certificate.remaining_rows {
+                        if certificate.retired_orders > 0 || certificate.retired_trades > 0 {
+                            *progress = SettledGcOwnerProgress::NeedsDispatch;
+                        } else {
+                            block_condition = Some(inflight.condition_id.clone());
+                        }
+                    } else {
+                        *progress = SettledGcOwnerProgress::Certified {
+                            reservation_epoch: certificate.reservation_epoch,
+                            trade_epoch: certificate.trade_epoch,
+                        };
+                    }
                 }
-            })
-            .take(SETTLED_GC_EVENTS_PER_BATCH)
-            .collect();
-        if ready.is_empty() {
-            drop(state);
-            if !inactive.is_empty() {
+            }
+            if let Some(condition_id) = block_condition {
+                coordinator
+                    .blocked_at_activity
+                    .insert(condition_id, activity);
+                coordinator.inflight = None;
+            } else if cancel_condition.is_some() {
+                coordinator.inflight = None;
+            }
+        }
+
+        if coordinator.inflight.is_none() {
+            let candidate = self
+                .settled_gc_candidates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(condition_id, _)| {
+                    coordinator
+                        .blocked_at_activity
+                        .get(*condition_id)
+                        .is_none_or(|blocked| *blocked != activity)
+                })
+                .map(|(condition_id, tokens)| {
+                    (
+                        condition_id.clone(),
+                        Arc::new(tokens.iter().cloned().collect::<HashSet<_>>()),
+                    )
+                });
+            let Some((condition_id, tokens)) = candidate else {
+                return Vec::new();
+            };
+
+            // Confirm the ephemeral worklist still matches a durable empty
+            // reference before any owner is asked to delete history.
+            let eligible = {
+                let _control = self.control_gate.read().unwrap();
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state
+                    .settled_audit_references
+                    .get(&condition_id)
+                    .is_some_and(|reference| {
+                        reference.instances.is_empty()
+                            && reference.asset_ids.len() == tokens.len()
+                            && reference
+                                .asset_ids
+                                .iter()
+                                .all(|token| tokens.contains(token))
+                    })
+            };
+            if !eligible {
                 let mut candidates = self.settled_gc_candidates.lock().unwrap();
-                for condition_id in inactive {
-                    candidates.remove(&condition_id);
-                }
+                candidates.remove(&condition_id);
                 self.publish_settled_gc_candidates(&candidates);
+                coordinator.blocked_at_activity.remove(&condition_id);
+                return Vec::new();
+            }
+            let owners = self
+                .virtual_accounts
+                .read()
+                .unwrap()
+                .keys()
+                .map(|instance_id| {
+                    (instance_id.clone(), SettledGcOwnerProgress::NeedsDispatch)
+                })
+                .collect();
+            coordinator.inflight = Some(SettledGcInflight {
+                condition_id,
+                tokens,
+                owners,
+                retired_orders: 0,
+                retired_trades: 0,
+            });
+        }
+
+        let needs_dispatch: Vec<String> = coordinator
+            .inflight
+            .as_ref()
+            .into_iter()
+            .flat_map(|inflight| inflight.owners.iter())
+            .filter_map(|(instance_id, progress)| {
+                (*progress == SettledGcOwnerProgress::NeedsDispatch)
+                    .then(|| instance_id.clone())
+            })
+            .collect();
+        for instance_id in needs_dispatch {
+            let route = self
+                .settled_gc_owner_routes
+                .read()
+                .unwrap()
+                .get(&instance_id)
+                .map(|route| (route.registration_id, route.tx.clone()));
+            let Some((registration_id, tx)) = route else {
+                continue;
+            };
+            coordinator.next_request_id = coordinator
+                .next_request_id
+                .checked_add(1)
+                .filter(|request_id| *request_id > 0)
+                .expect("settled GC request generation exhausted");
+            let request_id = coordinator.next_request_id;
+            let Some(inflight) = coordinator.inflight.as_ref() else {
+                break;
+            };
+            let request = SettledGcDeleteRequest {
+                request_id,
+                registration_id,
+                instance_id: instance_id.clone(),
+                condition_id: inflight.condition_id.clone(),
+                tokens: Arc::clone(&inflight.tokens),
+                enqueued_at: crate::latency::Instant::now(),
+            };
+            match tx.try_send(request) {
+                Ok(()) => {
+                    self.settled_gc_request_queue_high_water
+                        .fetch_max(tx.len(), Ordering::Relaxed);
+                    if let Some(progress) = coordinator
+                        .inflight
+                        .as_mut()
+                        .and_then(|inflight| inflight.owners.get_mut(&instance_id))
+                    {
+                        *progress = SettledGcOwnerProgress::Waiting {
+                            request_id,
+                            registration_id,
+                        };
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    self.settled_gc_request_queue_overflows
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            }
+        }
+
+        let all_certified = coordinator.inflight.as_ref().is_some_and(|inflight| {
+            inflight
+                .owners
+                .values()
+                .all(|progress| matches!(progress, SettledGcOwnerProgress::Certified { .. }))
+        });
+        if !all_certified {
+            return Vec::new();
+        }
+
+        let (condition_id, tokens, certificates) = {
+            let inflight = coordinator.inflight.as_ref().expect("checked above");
+            let certificates = inflight
+                .owners
+                .iter()
+                .filter_map(|(instance_id, progress)| match progress {
+                    SettledGcOwnerProgress::Certified {
+                        reservation_epoch,
+                        trade_epoch,
+                    } => Some((instance_id.clone(), (*reservation_epoch, *trade_epoch))),
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            (
+                inflight.condition_id.clone(),
+                Arc::clone(&inflight.tokens),
+                certificates,
+            )
+        };
+
+        // Validate certificates without acquiring any owner lifecycle lock.
+        // A reservation or private-trade insertion after certification changes
+        // its epoch and causes another owner-thread request instead of a stale
+        // global commit.
+        let current_accounts = self.virtual_accounts.read().unwrap();
+        let current_ids: BTreeSet<String> = current_accounts.keys().cloned().collect();
+        let certified_ids: BTreeSet<String> = certificates.keys().cloned().collect();
+        let mut stale_owners = Vec::new();
+        if current_ids == certified_ids {
+            for (instance_id, (reservation_epoch, trade_epoch)) in &certificates {
+                let account = current_accounts
+                    .get(instance_id)
+                    .expect("membership checked above");
+                if account.reservation_epoch.load(Ordering::Acquire) != *reservation_epoch
+                    || account.trade_epoch.load(Ordering::Acquire) != *trade_epoch
+                {
+                    stale_owners.push(instance_id.clone());
+                }
+            }
+        } else {
+            stale_owners.extend(current_ids.symmetric_difference(&certified_ids).cloned());
+        }
+        drop(current_accounts);
+        if !stale_owners.is_empty() {
+            if let Some(inflight) = coordinator.inflight.as_mut() {
+                for instance_id in stale_owners {
+                    inflight
+                        .owners
+                        .insert(instance_id, SettledGcOwnerProgress::NeedsDispatch);
+                }
+                inflight
+                    .owners
+                    .retain(|instance_id, _| current_ids.contains(instance_id));
             }
             return Vec::new();
         }
-        let mut retired = Vec::with_capacity(ready.len());
-        let mut outcomes = Vec::with_capacity(ready.len());
-        let mut retired_conditions = Vec::with_capacity(ready.len());
-        for (condition_id, tokens) in ready {
-            outcomes.push(prune_terminal_history_locked(&mut state, None, &tokens));
-            state.settled_audit_references.remove(&condition_id);
-            retired_conditions.push(condition_id.clone());
-            inactive.push(condition_id);
-            retired.push(tokens);
-        }
-        self.retired_trade_tombstone_count_fast.store(
-            state.retired_trade_ownership_tombstones.len(),
-            Ordering::Relaxed,
-        );
-        self.schedule_settled_prune_persist(&state, &outcomes, &retired_conditions);
-        drop(state);
-        if !inactive.is_empty() {
-            let mut candidates = self.settled_gc_candidates.lock().unwrap();
-            for condition_id in inactive {
-                candidates.remove(&condition_id);
+
+        let committed = {
+            let _control = self.control_gate.write().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let eligible = state
+                .settled_audit_references
+                .get(&condition_id)
+                .is_some_and(|reference| {
+                    reference.instances.is_empty()
+                        && reference.asset_ids.len() == tokens.len()
+                        && reference
+                            .asset_ids
+                            .iter()
+                            .all(|token| tokens.contains(token))
+                });
+            if !eligible {
+                false
+            } else {
+                state.settled_audit_references.remove(&condition_id);
+                let fee_tokens = tokens
+                    .iter()
+                    .filter_map(|token| {
+                        state.token_fee_configs.remove(token).map(|_| token.clone())
+                    })
+                    .collect();
+                let outcome = SettledPruneOutcome {
+                    fee_tokens,
+                    ..SettledPruneOutcome::default()
+                };
+                self.schedule_settled_prune_persist(
+                    &state,
+                    &[outcome],
+                    std::slice::from_ref(&condition_id),
+                );
+                self.ended_token_ids_fast
+                    .store(Arc::new(Self::ended_token_ids(&state)));
+                true
             }
-            self.publish_settled_gc_candidates(&candidates);
+        };
+        coordinator.inflight = None;
+        coordinator.blocked_at_activity.remove(&condition_id);
+        let mut candidates = self.settled_gc_candidates.lock().unwrap();
+        candidates.remove(&condition_id);
+        self.publish_settled_gc_candidates(&candidates);
+        if !committed {
+            return Vec::new();
         }
-        retired
+        {
+            let mut fast_fee_configs = self.token_fee_configs_fast.write().unwrap();
+            for token in tokens.iter() {
+                fast_fee_configs.remove(token);
+            }
+        }
+        vec![tokens.as_ref().clone()]
     }
 
     /// Cheap edge used by the exchange worker before sending a coalesced GC
@@ -5716,6 +6559,47 @@ impl SharedAccount {
                 .settled_gc_candidate_tokens_fast
                 .load()
                 .contains(token_id)
+    }
+
+    fn settled_gc_metrics(&self) -> (usize, usize, usize, usize, u64, usize, usize, u64, u64) {
+        let inflight_requests = self
+            .settled_gc_coordinator
+            .lock()
+            .unwrap()
+            .inflight
+            .as_ref()
+            .map_or(0, |inflight| {
+                inflight
+                    .owners
+                    .values()
+                    .filter(|progress| {
+                        !matches!(progress, SettledGcOwnerProgress::Certified { .. })
+                    })
+                    .count()
+            });
+        let request_depth = self
+            .settled_gc_owner_routes
+            .read()
+            .unwrap()
+            .values()
+            .map(|route| route.tx.len())
+            .sum();
+        (
+            self.settled_gc_candidate_count_fast.load(Ordering::Acquire),
+            inflight_requests,
+            request_depth,
+            self.settled_gc_request_queue_high_water
+                .load(Ordering::Relaxed),
+            self.settled_gc_request_queue_overflows
+                .load(Ordering::Relaxed),
+            self.settled_gc_completion_rx.len(),
+            self.settled_gc_completion_queue_high_water
+                .load(Ordering::Relaxed),
+            self.settled_gc_completion_queue_overflows
+                .load(Ordering::Relaxed),
+            self.settled_gc_certificates_completed
+                .load(Ordering::Relaxed),
+        )
     }
 
     fn publish_settled_gc_candidates(&self, candidates: &BTreeMap<String, BTreeSet<String>>) {
@@ -6617,6 +7501,7 @@ impl SharedAccount {
 
     pub fn monitoring_snapshot(&self) -> AccountMonitoringSnapshot {
         self.refresh_trade_persistence_blocker();
+        let settled_gc_metrics = self.settled_gc_metrics();
         let state = self.lock_state();
         let persistence_error = self
             .persistence
@@ -6705,6 +7590,20 @@ impl SharedAccount {
             persistence_flushes: persistence_metrics.3,
             persistence_flush_last_us: persistence_metrics.4,
             persistence_flush_max_us: persistence_metrics.5,
+            persistence_scheduled_generation: persistence_metrics.6,
+            persistence_completed_generation: persistence_metrics.7,
+            persistence_generation_lag: persistence_metrics.8,
+            persistence_pending_jobs: persistence_metrics.9,
+            persistence_pending_high_water: persistence_metrics.10,
+            settled_gc_candidates: settled_gc_metrics.0,
+            settled_gc_inflight_requests: settled_gc_metrics.1,
+            settled_gc_request_queue_depth: settled_gc_metrics.2,
+            settled_gc_request_queue_high_water: settled_gc_metrics.3,
+            settled_gc_request_queue_overflows: settled_gc_metrics.4,
+            settled_gc_completion_queue_depth: settled_gc_metrics.5,
+            settled_gc_completion_queue_high_water: settled_gc_metrics.6,
+            settled_gc_completion_queue_overflows: settled_gc_metrics.7,
+            settled_gc_certificates_completed: settled_gc_metrics.8,
             account_lock_wait_last_us: self.account_lock_wait_last_us.load(Ordering::Relaxed),
             account_lock_wait_max_us: self.account_lock_wait_max_us.load(Ordering::Relaxed),
             account_lock_hold_last_us: self.account_lock_hold_last_us.load(Ordering::Relaxed),
@@ -6727,6 +7626,7 @@ impl SharedAccount {
     /// the live owner shards. It is observability-only and must not be used as
     /// an admission or reconciliation authority.
     pub fn monitoring_snapshot_fast(&self) -> AccountMonitoringSnapshot {
+        let settled_gc_metrics = self.settled_gc_metrics();
         let persistence_error = self
             .persistence
             .as_ref()
@@ -6838,6 +7738,20 @@ impl SharedAccount {
             persistence_flushes: persistence_metrics.3,
             persistence_flush_last_us: persistence_metrics.4,
             persistence_flush_max_us: persistence_metrics.5,
+            persistence_scheduled_generation: persistence_metrics.6,
+            persistence_completed_generation: persistence_metrics.7,
+            persistence_generation_lag: persistence_metrics.8,
+            persistence_pending_jobs: persistence_metrics.9,
+            persistence_pending_high_water: persistence_metrics.10,
+            settled_gc_candidates: settled_gc_metrics.0,
+            settled_gc_inflight_requests: settled_gc_metrics.1,
+            settled_gc_request_queue_depth: settled_gc_metrics.2,
+            settled_gc_request_queue_high_water: settled_gc_metrics.3,
+            settled_gc_request_queue_overflows: settled_gc_metrics.4,
+            settled_gc_completion_queue_depth: settled_gc_metrics.5,
+            settled_gc_completion_queue_high_water: settled_gc_metrics.6,
+            settled_gc_completion_queue_overflows: settled_gc_metrics.7,
+            settled_gc_certificates_completed: settled_gc_metrics.8,
             account_lock_wait_last_us: self.account_lock_wait_last_us.load(Ordering::Relaxed),
             account_lock_wait_max_us: self.account_lock_wait_max_us.load(Ordering::Relaxed),
             account_lock_hold_last_us: self.account_lock_hold_last_us.load(Ordering::Relaxed),
@@ -10997,18 +11911,234 @@ impl SharedAccount {
         self.prune_terminal_history_scoped(None, tokens)
     }
 
-    /// Instance-scoped settled-FIFO retirement. Multiple strategies may share
-    /// one physical wallet and even the same event tokens; one instance's FIFO
-    /// eviction must never erase a sibling's still-revisable ownership rows.
-    pub fn prune_terminal_history_for_instance(
+    /// Return only the route keys needed by settled-event runtime cleanup.
+    /// Avoid materialising every `OrderOwnership` across all instances before
+    /// filtering one owner and two event tokens.
+    pub fn order_ids_for_instance_tokens(
         &self,
         instance_id: &str,
         tokens: &HashSet<String>,
-    ) -> (usize, usize) {
-        if instance_id.is_empty() {
-            return (0, 0);
+    ) -> HashSet<String> {
+        if instance_id.is_empty() || tokens.is_empty() {
+            return HashSet::new();
         }
-        self.prune_terminal_history_scoped(Some(instance_id), tokens)
+        let _control = self.control_gate.read().unwrap();
+        let Some(account) = self.virtual_account(instance_id) else {
+            return HashSet::new();
+        };
+        let lifecycle = account.lifecycle.lock().unwrap();
+        lifecycle
+            .orders
+            .iter()
+            .filter(|(_, order)| tokens.contains(&order.token_id))
+            .map(|(coid, _)| coid.clone())
+            .collect()
+    }
+
+    /// Execute exactly one bounded deletion request. This private entry point
+    /// is reachable only through [`SettledGcOwnerMailbox::poll_once`], making
+    /// the caller the instance strategy thread instead of the GC coordinator.
+    fn process_settled_gc_delete_request(
+        &self,
+        request: SettledGcDeleteRequest,
+    ) -> Result<SettledGcCompletionCertificate, String> {
+        let SettledGcDeleteRequest {
+            request_id,
+            registration_id,
+            instance_id,
+            condition_id,
+            tokens,
+            ..
+        } = request;
+        // Hold the route generation read guard for the whole deletion turn.
+        // Re-registration takes the write side, so once it returns an old
+        // strategy mailbox can no longer mutate the replacement owner's
+        // lifecycle even if it still held a previously queued request.
+        let owner_routes = self.settled_gc_owner_routes.read().unwrap();
+        if !owner_routes.get(&instance_id).is_some_and(|route| {
+            route.registration_id == registration_id
+        }) {
+            return Err(format!(
+                "settled GC request has stale owner registration: instance={instance_id} registration={registration_id}",
+            ));
+        }
+        let control = self.control_gate.write().unwrap();
+        let Some(account) = self.virtual_account(&instance_id) else {
+            return Err(format!(
+                "settled GC request targets unknown instance `{instance_id}`",
+            ));
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let eligible = state
+            .settled_audit_references
+            .get(&condition_id)
+            .is_some_and(|reference| {
+                reference.instances.is_empty()
+                    && reference.asset_ids.len() == tokens.len()
+                    && reference.asset_ids.iter().all(|token| tokens.contains(token))
+            });
+        if !eligible {
+            return Ok(SettledGcCompletionCertificate {
+                request_id,
+                registration_id,
+                instance_id,
+                condition_id,
+                retired_orders: 0,
+                retired_trades: 0,
+                remaining_rows: false,
+                eligible: false,
+                reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
+                trade_epoch: account.trade_epoch.load(Ordering::Acquire),
+            });
+        }
+
+        let protected_coids: HashSet<String> = lifecycle
+            .trades
+            .iter()
+            .filter(|(trade_key, trade)| {
+                tokens.contains(&trade.ownership.token_id)
+                    && !trade.failed
+                    && (trade.ownership.status != "CONFIRMED"
+                        || lifecycle.fee_attribution_pending.contains(*trade_key))
+            })
+            .map(|(_, trade)| trade.ownership.client_order_id.clone())
+            .collect();
+        let stale_orders: Vec<(String, String)> = lifecycle
+            .orders
+            .iter()
+            .filter(|(coid, order)| {
+                tokens.contains(&order.token_id)
+                    && !protected_coids.contains(*coid)
+                    && !lifecycle.recovery_pending_orders.contains(*coid)
+                    && !lifecycle.startup_query_repair_orders.contains(*coid)
+                    && !lifecycle.routine_cancel_audits.contains(*coid)
+                    && !lifecycle.cancel_audit_anomalies.contains(*coid)
+                    && order.reserved_cash <= EPS
+                    && order.reserved_quantity <= EPS
+                    && matches!(
+                        order.status,
+                        OrderStatus::Cancelled
+                            | OrderStatus::Rejected
+                            | OrderStatus::Filled
+                            | OrderStatus::Failed
+                    )
+            })
+            .take(SETTLED_GC_ORDERS_PER_OWNER_TURN)
+            .map(|(coid, order)| (coid.clone(), order.order_id.clone()))
+            .collect();
+        let stale_trades: Vec<String> = lifecycle
+            .trades
+            .iter()
+            .filter(|(trade_key, trade)| {
+                tokens.contains(&trade.ownership.token_id)
+                    && !lifecycle.fee_attribution_pending.contains(*trade_key)
+                    && (trade.failed || trade.ownership.status == "CONFIRMED")
+            })
+            .take(SETTLED_GC_TRADES_PER_OWNER_TURN)
+            .map(|(trade_key, _)| trade_key.clone())
+            .collect();
+
+        for (coid, order_id) in &stale_orders {
+            lifecycle.orders.remove(coid);
+            lifecycle.recovery_pending_orders.remove(coid);
+            lifecycle.startup_query_repair_orders.remove(coid);
+            lifecycle.routine_cancel_audits.remove(coid);
+            lifecycle.cancel_audit_anomalies.remove(coid);
+            state.orders.remove(coid);
+            state.recovery_pending_orders.remove(coid);
+            state.startup_query_repair_orders.remove(coid);
+            state.routine_cancel_audits.remove(coid);
+            let normalized = normalize_order_id(order_id);
+            if state
+                .oid_to_coid
+                .get(&normalized)
+                .is_some_and(|mapped| mapped == coid)
+            {
+                state.oid_to_coid.remove(&normalized);
+            }
+        }
+
+        let retired_at_ms = wall_clock_ms();
+        for trade_key in &stale_trades {
+            let removed = lifecycle.trades.remove(trade_key);
+            lifecycle.fee_attribution_pending.remove(trade_key);
+            state.trades.remove(trade_key);
+            state.fee_attribution_pending.remove(trade_key);
+            if let Some(trade) = removed {
+                state.retired_trade_ownership_tombstones.insert(
+                    trade_key.clone(),
+                    RetiredTradeOwnershipTombstone {
+                        ownership: trade.ownership.clone(),
+                        is_maker: trade.is_maker,
+                        authenticated_terminal_noop: false,
+                        retired_at_ms,
+                    },
+                );
+                add_economic_state(
+                    &mut state.compacted_economic_effects,
+                    &trade_economic_effect(&trade),
+                    1.0,
+                );
+            }
+        }
+        if !stale_orders.is_empty() || !stale_trades.is_empty() {
+            let expired_tombstones = prune_retired_trade_ownership_tombstones_bounded(
+                &mut state,
+                retired_at_ms,
+                SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN,
+            );
+            let outcome = SettledPruneOutcome {
+                orders: stale_orders.clone(),
+                trades: stale_trades.clone(),
+                fee_tokens: Vec::new(),
+                expired_tombstones,
+            };
+            self.retired_trade_tombstone_count_fast.store(
+                state.retired_trade_ownership_tombstones.len(),
+                Ordering::Relaxed,
+            );
+            self.schedule_settled_prune_persist(&state, &[outcome], &[]);
+        }
+
+        // Keep route teardown inside the owner lifecycle critical section. A
+        // late private insertion must happen either wholly before this proof or
+        // after it and advance the epoch observed by the coordinator.
+        for (coid, order_id) in &stale_orders {
+            self.coid_routes.remove(coid);
+            self.oid_routes.remove(&normalize_order_id(order_id));
+        }
+        for trade_key in &stale_trades {
+            self.trade_routes.remove(trade_key);
+        }
+        let remaining_rows = lifecycle
+            .orders
+            .values()
+            .any(|order| tokens.contains(&order.token_id))
+            || lifecycle
+                .trades
+                .values()
+                .any(|trade| tokens.contains(&trade.ownership.token_id));
+        let certificate = SettledGcCompletionCertificate {
+            request_id,
+            registration_id,
+            instance_id,
+            condition_id,
+            retired_orders: stale_orders.len(),
+            retired_trades: stale_trades.len(),
+            remaining_rows,
+            eligible: true,
+            reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
+            trade_epoch: account.trade_epoch.load(Ordering::Acquire),
+        };
+        drop(lifecycle);
+        drop(state);
+        drop(control);
+        drop(owner_routes);
+        Ok(certificate)
     }
 
     fn prune_terminal_history_scoped(
@@ -11055,29 +12185,6 @@ fn validate_settled_audit_identity(
         ));
     }
     Ok(normalized)
-}
-
-fn settled_audit_has_revisable_rows(state: &SharedAccountState, tokens: &HashSet<String>) -> bool {
-    state.orders.iter().any(|(coid, order)| {
-        tokens.contains(&order.token_id)
-            && (state.recovery_pending_orders.contains(coid)
-                || state.routine_cancel_audits.contains(coid)
-                || order.reserved_cash > EPS
-                || order.reserved_quantity > EPS
-                || !matches!(
-                    order.status,
-                    OrderStatus::Cancelled
-                        | OrderStatus::Rejected
-                        | OrderStatus::Filled
-                        | OrderStatus::Failed
-                ))
-    }) || state.trades.iter().any(|(trade_key, trade)| {
-        tokens.contains(&trade.ownership.token_id)
-            && !trade.failed
-            && (trade.ownership.status != "CONFIRMED"
-                || trade.is_maker.is_none()
-                || state.fee_attribution_pending.contains(trade_key))
-    })
 }
 
 #[derive(Debug, Default)]
@@ -11265,6 +12372,27 @@ fn prune_retired_trade_ownership_tombstones(
     for (_, trade_key) in oldest.into_iter().take(excess) {
         state.retired_trade_ownership_tombstones.remove(&trade_key);
         removed.push(trade_key);
+    }
+    removed
+}
+
+fn prune_retired_trade_ownership_tombstones_bounded(
+    state: &mut SharedAccountState,
+    now_ms: u64,
+    scan_limit: usize,
+) -> Vec<String> {
+    if state.retired_trade_ownership_tombstones.len() > MAX_RETIRED_TRADE_TOMBSTONES {
+        return prune_retired_trade_ownership_tombstones(state, now_ms);
+    }
+    let removed: Vec<String> = state
+        .retired_trade_ownership_tombstones
+        .iter()
+        .take(scan_limit)
+        .filter(|(_, tombstone)| !retired_trade_tombstone_is_live(tombstone, now_ms))
+        .map(|(trade_key, _)| trade_key.clone())
+        .collect();
+    for trade_key in &removed {
+        state.retired_trade_ownership_tombstones.remove(trade_key);
     }
     removed
 }
@@ -13939,6 +15067,331 @@ mod tests {
         }
     }
 
+    fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
+        samples.sort_unstable();
+        let percentile = |per_mille: usize| {
+            let rank = (samples.len() * per_mille).div_ceil(1000).max(1);
+            samples[rank.saturating_sub(1).min(samples.len() - 1)]
+        };
+        (
+            percentile(500),
+            percentile(990),
+            percentile(999),
+            *samples.last().unwrap(),
+        )
+    }
+
+    fn settled_gc_benchmark_account() -> SharedAccount {
+        const INSTANCE_COUNT: usize = 4;
+        const UNRELATED_ROWS_PER_INSTANCE: usize = 128;
+        const TARGET_ROWS: usize = 70;
+
+        let account = SharedAccount::new("settled-gc-bench");
+        for index in 0..INSTANCE_COUNT {
+            let instance_id = if index == 0 {
+                "owner".to_string()
+            } else {
+                format!("sibling-{index}")
+            };
+            account.register_instance(&instance_id, 1.0);
+        }
+        for index in 0..INSTANCE_COUNT {
+            let instance_id = if index == 0 {
+                "owner".to_string()
+            } else {
+                format!("sibling-{index}")
+            };
+            let rows = UNRELATED_ROWS_PER_INSTANCE + if index == 0 { TARGET_ROWS } else { 0 };
+            let owner = account.virtual_account(&instance_id).unwrap();
+            let mut lifecycle = owner.lifecycle.lock().unwrap();
+            let mut state = account.state.lock().unwrap();
+            for row in 0..rows {
+                let is_target = index == 0 && row >= UNRELATED_ROWS_PER_INSTANCE;
+                let token_id = if is_target { "SETTLED" } else { "UNRELATED" };
+                let coid = format!("{instance_id}-gc-{row}");
+                let oid = format!("oid-{instance_id}-gc-{row}");
+                let trade_key = format!("trade-{instance_id}-gc-{row}");
+                let order = OrderOwnership {
+                    account_id: "settled-gc-bench".into(),
+                    instance_id: instance_id.clone(),
+                    client_order_id: coid.clone(),
+                    order_id: oid.clone(),
+                    token_id: token_id.into(),
+                    side: Side::Buy,
+                    quantity: 1.0,
+                    filled_quantity: 1.0,
+                    terminal_matched_quantity: Some(1.0),
+                    terminal_trade_ids: vec![trade_key.clone()],
+                    terminal_trade_ids_authoritative: true,
+                    price: 0.5,
+                    fee_rate_bps: 0,
+                    reserved_cash: 0.0,
+                    reserved_quantity: 0.0,
+                    status: OrderStatus::Filled,
+                };
+                let trade = AppliedTrade {
+                    ownership: TradeOwnership {
+                        account_id: "settled-gc-bench".into(),
+                        instance_id: instance_id.clone(),
+                        trade_key: trade_key.clone(),
+                        client_order_id: coid.clone(),
+                        order_id: oid.clone(),
+                        token_id: token_id.into(),
+                        side: Side::Buy,
+                        quantity: 1.0,
+                        price: 0.5,
+                        status: "CONFIRMED".into(),
+                    },
+                    booked: true,
+                    physical_booked: true,
+                    usdc_fee: 0.0,
+                    shares_fee: 0.0,
+                    virtual_fee_booked: true,
+                    physical_fee_booked: true,
+                    failed: false,
+                    failure_reconciled: false,
+                    is_maker: Some(true),
+                    match_time_secs: 1,
+                    ledger_generation: row as u64 + 1,
+                };
+                lifecycle.orders.insert(coid.clone(), order.clone());
+                lifecycle.trades.insert(trade_key.clone(), trade.clone());
+                state.orders.insert(coid.clone(), order);
+                state.trades.insert(trade_key.clone(), trade);
+                state
+                    .oid_to_coid
+                    .insert(normalize_order_id(&oid), coid.clone());
+                account.coid_routes.insert(coid, instance_id.clone());
+                account
+                    .oid_routes
+                    .insert(normalize_order_id(&oid), instance_id.clone());
+                account
+                    .trade_routes
+                    .insert(trade_key, instance_id.clone());
+            }
+        }
+        account
+    }
+
+    fn install_test_settled_gc_candidate(
+        account: &SharedAccount,
+        condition_id: &str,
+        tokens: &HashSet<String>,
+    ) {
+        {
+            let mut state = account.state.lock().unwrap();
+            state.settled_audit_references.insert(
+                condition_id.to_string(),
+                SettledAuditReference {
+                    condition_id: condition_id.to_string(),
+                    asset_ids: tokens.iter().cloned().collect(),
+                    instances: BTreeSet::new(),
+                },
+            );
+        }
+        let mut candidates = account.settled_gc_candidates.lock().unwrap();
+        candidates.insert(condition_id.to_string(), tokens.iter().cloned().collect());
+        account.publish_settled_gc_candidates(&candidates);
+    }
+
+    fn process_test_owner_delete_all(
+        account: &SharedAccount,
+        instance_id: &str,
+        condition_id: &str,
+        tokens: &HashSet<String>,
+    ) -> (usize, usize) {
+        install_test_settled_gc_candidate(account, condition_id, tokens);
+        let mailbox = account.register_settled_gc_owner(instance_id).unwrap();
+        let mut orders = 0usize;
+        let mut trades = 0usize;
+        for request_id in 1..=1_024 {
+            let certificate = account
+                .process_settled_gc_delete_request(SettledGcDeleteRequest {
+                    request_id,
+                    registration_id: mailbox.registration_id,
+                    instance_id: instance_id.to_string(),
+                    condition_id: condition_id.to_string(),
+                    tokens: Arc::new(tokens.clone()),
+                    enqueued_at: crate::latency::Instant::now(),
+                })
+                .unwrap();
+            assert!(certificate.eligible);
+            orders = orders.saturating_add(certificate.retired_orders);
+            trades = trades.saturating_add(certificate.retired_trades);
+            if !certificate.remaining_rows {
+                return (orders, trades);
+            }
+            assert!(
+                certificate.retired_orders > 0 || certificate.retired_trades > 0,
+                "test owner deletion is blocked by a protected row",
+            );
+        }
+        panic!("test owner deletion did not converge");
+    }
+
+    #[test]
+    fn typed_wal_batch_rolls_back_every_leaf_after_validation_failure() {
+        let original = serde_json::json!({
+            "orders": {"a": {"status": "accepted"}},
+            "pending": ["a"],
+            "generation": 7,
+        });
+        let mut state = original.clone();
+        let changes = vec![
+            PersistenceWalChange::Set {
+                path: vec!["generation".to_string()],
+                value: serde_json::json!(8),
+            },
+            PersistenceWalChange::SetInsert {
+                path: vec!["pending".to_string()],
+                value: serde_json::json!("b"),
+            },
+            PersistenceWalChange::Remove {
+                path: vec!["orders".to_string(), "a".to_string()],
+            },
+            PersistenceWalChange::Set {
+                path: vec!["missing_parent".to_string(), "value".to_string()],
+                value: serde_json::json!(1),
+            },
+        ];
+
+        assert!(apply_persistence_wal_changes_transactional(&mut state, &changes).is_err());
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn typed_wal_batch_can_be_reverted_after_fsync_failure() {
+        let original = serde_json::json!({
+            "orders": {"a": {"status": "accepted"}},
+            "pending": ["a"],
+            "generation": 7,
+        });
+        let mut state = original.clone();
+        let changes = vec![
+            PersistenceWalChange::Set {
+                path: vec!["generation".to_string()],
+                value: serde_json::json!(8),
+            },
+            PersistenceWalChange::SetRemove {
+                path: vec!["pending".to_string()],
+                value: serde_json::json!("a"),
+            },
+            PersistenceWalChange::Remove {
+                path: vec!["orders".to_string(), "a".to_string()],
+            },
+        ];
+
+        let undo = apply_persistence_wal_changes_transactional(&mut state, &changes).unwrap();
+        assert_ne!(state, original);
+        rollback_persistence_wal_changes(&mut state, undo).unwrap();
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn persistence_batch_coalesces_only_same_absolute_row_kind() {
+        let jobs = vec![
+            PersistenceJob {
+                generation: 1,
+                payload: PersistenceJobPayload::UnresolvedTradeMatchTime {
+                    trade_key: "trade-a".into(),
+                    match_time_secs: Some(10),
+                },
+            },
+            PersistenceJob {
+                generation: 2,
+                payload: PersistenceJobPayload::Changes(vec![PersistenceWalChange::Set {
+                    path: vec!["ledger_generation".into()],
+                    value: serde_json::json!(2),
+                }]),
+            },
+            PersistenceJob {
+                generation: 3,
+                payload: PersistenceJobPayload::UnresolvedTradeMatchTime {
+                    trade_key: "trade-a".into(),
+                    match_time_secs: None,
+                },
+            },
+            PersistenceJob {
+                generation: 4,
+                payload: PersistenceJobPayload::UnresolvedTradeMatchTime {
+                    trade_key: "trade-b".into(),
+                    match_time_secs: Some(11),
+                },
+            },
+        ];
+
+        let coalesced = coalesce_persistence_jobs(jobs);
+        assert_eq!(
+            coalesced
+                .iter()
+                .map(|job| job.generation)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4],
+        );
+        assert!(matches!(
+            &coalesced[1].payload,
+            PersistenceJobPayload::UnresolvedTradeMatchTime {
+                trade_key,
+                match_time_secs: None,
+            } if trade_key == "trade-a"
+        ));
+    }
+
+    #[test]
+    #[ignore = "focused persistence latency benchmark"]
+    fn benchmark_typed_wal_in_place_vs_full_tree_clone() {
+        const ITERATIONS: u64 = 1_000;
+        let baseline = serde_json::json!({
+            "ledger_generation": 0,
+            "large_untouched_history": "x".repeat(16 * 1024 * 1024),
+        });
+
+        let mut clone_samples = Vec::with_capacity(ITERATIONS as usize);
+        for generation in 1..=ITERATIONS {
+            let started = Instant::now();
+            let mut next = baseline.clone();
+            apply_persistence_wal_change(
+                &mut next,
+                PersistenceWalChange::Set {
+                    path: vec!["ledger_generation".into()],
+                    value: serde_json::json!(generation),
+                },
+            )
+            .unwrap();
+            std::hint::black_box(next);
+            clone_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+
+        let mut in_place = baseline;
+        let mut in_place_samples = Vec::with_capacity(ITERATIONS as usize);
+        for generation in 1..=ITERATIONS {
+            let started = Instant::now();
+            let changes = [PersistenceWalChange::Set {
+                path: vec!["ledger_generation".into()],
+                value: serde_json::json!(generation),
+            }];
+            let undo = apply_persistence_wal_changes_transactional(&mut in_place, &changes).unwrap();
+            std::hint::black_box(&in_place);
+            drop(undo);
+            in_place_samples
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let clone = latency_summary_ns(&mut clone_samples);
+        let in_place = latency_summary_ns(&mut in_place_samples);
+        eprintln!(
+            "typed WAL apply-only boundary (16MiB untouched tree, events={ITERATIONS}, queue_depth=0, overflow=0) ns: clone median/p99/p999/max={}/{}/{}/{} in_place={}/{}/{}/{}",
+            clone.0,
+            clone.1,
+            clone.2,
+            clone.3,
+            in_place.0,
+            in_place.1,
+            in_place.2,
+            in_place.3,
+        );
+        assert!(in_place.1 < clone.1);
+    }
+
     #[test]
     fn control_snapshot_publication_cannot_regress_fast_ledger_generation() {
         let account = SharedAccount::new("monotonic-ledger-generation");
@@ -15966,7 +17419,12 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         }
 
         assert_eq!(
-            account.prune_terminal_history_for_instance("a", &HashSet::from(["UP".to_string()]),),
+            process_test_owner_delete_all(
+                &account,
+                "a",
+                "condition-instance-isolation",
+                &HashSet::from(["UP".to_string()]),
+            ),
             (1, 1),
         );
         assert!(account.order_owner_by_oid("oid-a-same").is_none());
@@ -15981,8 +17439,200 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn instance_scoped_pruning_drains_more_than_one_bounded_chunk() {
+        let account = seeded_account();
+        let owner = account.virtual_account("a").unwrap();
+        let mut orders = Vec::new();
+        let mut trades = Vec::new();
+        for index in 0..70 {
+            let coid = format!("a-gc-{index}");
+            let oid = format!("oid-gc-{index}");
+            let trade_key = format!("trade-gc-{index}");
+            let order = OrderOwnership {
+                account_id: "acct".into(),
+                instance_id: "a".into(),
+                client_order_id: coid.clone(),
+                order_id: oid.clone(),
+                token_id: "UP".into(),
+                side: Side::Buy,
+                quantity: 1.0,
+                filled_quantity: 1.0,
+                terminal_matched_quantity: Some(1.0),
+                terminal_trade_ids: vec![trade_key.clone()],
+                terminal_trade_ids_authoritative: true,
+                price: 0.5,
+                fee_rate_bps: 0,
+                reserved_cash: 0.0,
+                reserved_quantity: 0.0,
+                status: OrderStatus::Filled,
+            };
+            let trade = AppliedTrade {
+                ownership: TradeOwnership {
+                    account_id: "acct".into(),
+                    instance_id: "a".into(),
+                    trade_key: trade_key.clone(),
+                    client_order_id: coid.clone(),
+                    order_id: oid.clone(),
+                    token_id: "UP".into(),
+                    side: Side::Buy,
+                    quantity: 1.0,
+                    price: 0.5,
+                    status: "CONFIRMED".into(),
+                },
+                booked: true,
+                physical_booked: true,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: true,
+                physical_fee_booked: true,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 1,
+                ledger_generation: index + 1,
+            };
+            orders.push((coid, oid, order));
+            trades.push((trade_key, trade));
+        }
+        {
+            let mut lifecycle = owner.lifecycle.lock().unwrap();
+            let mut state = account.state.lock().unwrap();
+            for (coid, oid, order) in &orders {
+                lifecycle.orders.insert(coid.clone(), order.clone());
+                state.orders.insert(coid.clone(), order.clone());
+                state
+                    .oid_to_coid
+                    .insert(normalize_order_id(oid), coid.clone());
+                account.coid_routes.insert(coid.clone(), "a".into());
+                account
+                    .oid_routes
+                    .insert(normalize_order_id(oid), "a".into());
+            }
+            for (trade_key, trade) in &trades {
+                lifecycle.trades.insert(trade_key.clone(), trade.clone());
+                state.trades.insert(trade_key.clone(), trade.clone());
+                account
+                    .trade_routes
+                    .insert(trade_key.clone(), "a".into());
+            }
+        }
+
+        assert_eq!(
+            process_test_owner_delete_all(
+                &account,
+                "a",
+                "condition-multi-chunk",
+                &HashSet::from(["UP".to_string()]),
+            ),
+            (70, 70),
+        );
+        let lifecycle = owner.lifecycle.lock().unwrap();
+        assert!(lifecycle.orders.is_empty());
+        assert!(lifecycle.trades.is_empty());
+        drop(lifecycle);
+        assert_eq!(
+            account
+                .state
+                .lock()
+                .unwrap()
+                .retired_trade_ownership_tombstones
+                .len(),
+            70,
+        );
+        for (coid, oid, _) in orders {
+            assert!(account.coid_routes.get(&coid).is_none());
+            assert!(account.oid_routes.get(&normalize_order_id(&oid)).is_none());
+        }
+        for (trade_key, _) in trades {
+            assert!(account.trade_routes.get(&trade_key).is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "focused settled GC critical-section latency benchmark"]
+    fn benchmark_instance_settled_gc_without_aggregate_materialization() {
+        const EVENTS: usize = 1_000;
+        let tokens = HashSet::from(["SETTLED".to_string()]);
+        let mut aggregate_samples = Vec::with_capacity(EVENTS);
+        let mut owner_all_samples = Vec::with_capacity(EVENTS);
+        let mut owner_turn_samples = Vec::with_capacity(EVENTS);
+
+        for _ in 0..EVENTS {
+            let account = settled_gc_benchmark_account();
+            let started = Instant::now();
+            assert_eq!(
+                account.prune_terminal_history_scoped(Some("owner"), &tokens),
+                (70, 70),
+            );
+            aggregate_samples
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        for _ in 0..EVENTS {
+            let account = settled_gc_benchmark_account();
+            let started = Instant::now();
+            assert_eq!(
+                process_test_owner_delete_all(
+                    &account,
+                    "owner",
+                    "condition-owner-benchmark",
+                    &tokens,
+                ),
+                (70, 70),
+            );
+            owner_all_samples
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        for _ in 0..EVENTS {
+            let account = settled_gc_benchmark_account();
+            install_test_settled_gc_candidate(
+                &account,
+                "condition-owner-turn-benchmark",
+                &tokens,
+            );
+            let mut mailbox = account.register_settled_gc_owner("owner").unwrap();
+            assert!(account
+                .finalize_ready_settled_audit_retirements()
+                .is_empty());
+            let started = Instant::now();
+            let certificate = mailbox.poll_once(&account).unwrap().unwrap();
+            owner_turn_samples
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            assert_eq!(
+                (certificate.retired_orders, certificate.retired_trades),
+                (
+                    SETTLED_GC_ORDERS_PER_OWNER_TURN,
+                    SETTLED_GC_TRADES_PER_OWNER_TURN,
+                ),
+            );
+            assert!(certificate.remaining_rows);
+        }
+
+        let aggregate = latency_summary_ns(&mut aggregate_samples);
+        let owner_all = latency_summary_ns(&mut owner_all_samples);
+        let owner_turn = latency_summary_ns(&mut owner_turn_samples);
+        eprintln!(
+            "settled GC boundaries (events={EVENTS}, 4 instances, 582 order+trade pairs/event, 70 target pairs, owner_turn=8 order+8 trade, request_peak_depth=1, completion_peak_depth=1, overflow=0) ns: aggregate_full median/p99/p999/max={}/{}/{}/{} owner_all_chunks={}/{}/{}/{} owner_mailbox_turn={}/{}/{}/{}",
+            aggregate.0,
+            aggregate.1,
+            aggregate.2,
+            aggregate.3,
+            owner_all.0,
+            owner_all.1,
+            owner_all.2,
+            owner_all.3,
+            owner_turn.0,
+            owner_turn.1,
+            owner_turn.2,
+            owner_turn.3,
+        );
+        assert!(owner_turn.1 < aggregate.1);
+    }
+
+    #[test]
     fn settled_audit_cleanup_waits_for_every_instance_reference() {
         let account = seeded_account();
+        let mut owner_a = account.register_settled_gc_owner("a").unwrap();
+        let mut owner_b = account.register_settled_gc_owner("b").unwrap();
         account
             .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
             .unwrap();
@@ -16012,6 +17662,16 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!(account.has_settled_gc_candidates());
         assert!(account.has_settled_gc_candidate_for_token("UP"));
         assert!(!account.has_settled_gc_candidate_for_token("DOWN"));
+        // First coordinator turn only dispatches. One owner's certificate is
+        // insufficient to delete account-global state.
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(owner_a.poll_once(&account).unwrap().is_some());
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(owner_b.poll_once(&account).unwrap().is_some());
         assert_eq!(
             account.finalize_ready_settled_audit_retirements(),
             vec![HashSet::from(["UP".to_string()])],
@@ -16020,6 +17680,156 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let state = account.lock_state();
         assert!(!state.token_fee_configs.contains_key("UP"));
         assert!(!state.settled_audit_references.contains_key("condition"));
+    }
+
+    #[test]
+    fn settled_gc_rejects_stale_certificate_and_retries_after_owner_activity() {
+        let account = SharedAccount::new("settled-gc-stale-certificate");
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        let mut owner = account.register_settled_gc_owner("owner").unwrap();
+        account
+            .retain_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        account
+            .release_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        let first = owner.poll_once(&account).unwrap().unwrap();
+        assert!(!first.remaining_rows);
+
+        // A newly admitted row advances the reservation epoch after the first
+        // proof. The coordinator must reject that certificate without ever
+        // locking the owner lifecycle itself.
+        account
+            .reserve_order(
+                "owner",
+                "owner-late",
+                "oid-owner-late",
+                "UP",
+                Side::Buy,
+                1.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        let blocked = owner.poll_once(&account).unwrap().unwrap();
+        assert!(blocked.remaining_rows);
+        assert_eq!((blocked.retired_orders, blocked.retired_trades), (0, 0));
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(account.has_settled_gc_candidates());
+
+        account.release_order("owner-late", OrderStatus::Rejected);
+        account.note_settled_gc_activity();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        let completed = owner.poll_once(&account).unwrap().unwrap();
+        assert_eq!(completed.retired_orders, 1);
+        assert!(!completed.remaining_rows);
+        assert_eq!(
+            account.finalize_ready_settled_audit_retirements(),
+            vec![HashSet::from(["UP".to_string()])],
+        );
+        assert!(!account.has_settled_gc_candidates());
+    }
+
+    #[test]
+    fn settled_gc_reregistration_revokes_queued_old_owner_request() {
+        let account = SharedAccount::new("settled-gc-reregister");
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .retain_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        account
+            .release_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+
+        let mut old_owner = account.register_settled_gc_owner("owner").unwrap();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert_eq!(old_owner.request_depth(), 1);
+
+        let mut replacement = account.register_settled_gc_owner("owner").unwrap();
+        let error = old_owner.poll_once(&account).unwrap_err();
+        assert!(error.contains("stale owner registration"));
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        let certificate = replacement.poll_once(&account).unwrap().unwrap();
+        assert!(!certificate.remaining_rows);
+        assert_eq!(
+            account.finalize_ready_settled_audit_retirements(),
+            vec![HashSet::from(["UP".to_string()])],
+        );
+    }
+
+    #[test]
+    fn settled_gc_mailbox_retries_a_backpressured_completion_without_reapplying() {
+        let account = SharedAccount::new("settled-gc-completion-backpressure");
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .retain_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        account
+            .release_settled_event_audit("owner", "condition", &["UP".to_string()])
+            .unwrap();
+        let mut owner = account.register_settled_gc_owner("owner").unwrap();
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+
+        for request_id in 0..SETTLED_GC_COMPLETION_QUEUE_CAPACITY as u64 {
+            account
+                .settled_gc_completion_tx
+                .try_send(SettledGcCompletionCertificate {
+                    request_id,
+                    registration_id: u64::MAX,
+                    instance_id: "noise".to_string(),
+                    condition_id: "noise".to_string(),
+                    retired_orders: 0,
+                    retired_trades: 0,
+                    remaining_rows: false,
+                    eligible: false,
+                    reservation_epoch: 0,
+                    trade_epoch: 0,
+                })
+                .unwrap();
+        }
+        assert!(owner.poll_once(&account).unwrap().is_none());
+        assert!(owner.pending_completion.is_some());
+        assert_eq!(
+            account
+                .settled_gc_completion_queue_overflows
+                .load(Ordering::Relaxed),
+            1,
+        );
+
+        account.settled_gc_completion_rx.try_recv().unwrap();
+        let published = owner.poll_once(&account).unwrap().unwrap();
+        assert_eq!(published.condition_id, "condition");
+        assert!(owner.pending_completion.is_none());
+        assert_eq!(owner.request_depth(), 0);
     }
 
     #[test]
@@ -17661,6 +19471,15 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             assert!(metric.persistence_flushes > 0);
             assert!(metric.persistence_write_max_us >= metric.persistence_write_last_us);
             assert!(metric.persistence_flush_max_us >= metric.persistence_flush_last_us);
+            assert_eq!(
+                metric.persistence_generation_lag,
+                metric
+                    .persistence_scheduled_generation
+                    .saturating_sub(metric.persistence_completed_generation),
+            );
+            assert_eq!(metric.persistence_generation_lag, 0);
+            assert_eq!(metric.persistence_pending_jobs, 0);
+            assert!(metric.persistence_pending_high_water > 0);
             assert!(
                 SharedAccount::new_persistent("durable", &path).is_err(),
                 "a second process must not open the live ledger",
@@ -19393,7 +21212,12 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             ));
             account.release_order("retired-order", OrderStatus::Filled);
             assert_eq!(
-                account.prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
+                process_test_owner_delete_all(
+                    &account,
+                    "owner",
+                    "condition-persistent-retired",
+                    &HashSet::from(["TOKEN".to_string()]),
+                ),
                 (1, 1),
             );
             account.flush_persistence(Duration::from_secs(2)).unwrap();

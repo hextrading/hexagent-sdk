@@ -9291,7 +9291,7 @@ impl Engine {
                                             let unallocated = account_metric_position_summary(&snapshot.unallocated_positions);
                                             let reserved = account_metric_position_summary(&snapshot.reserved_positions);
                                             format!(
-                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} pos_physical(count/abs/invalid)={}/{:.4}/{} pos_virtual={}/{:.4}/{} pos_unallocated={}/{:.4}/{} pos_reserved={}/{:.4}/{} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{}",
+                                                "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} pos_physical(count/abs/invalid)={}/{:.4}/{} pos_virtual={}/{:.4}/{} pos_unallocated={}/{:.4}/{} pos_reserved={}/{:.4}/{} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{} persistence_generation(scheduled/completed/lag)={}/{}/{} persistence_pending_jobs(current/high)={}/{} settled_gc(candidate/inflight)={}/{} settled_gc_request_queue(depth/high/overflow)={}/{}/{} settled_gc_completion_queue(depth/high/overflow)={}/{}/{} settled_gc_certificates={}",
                                                 snapshot.physical_cash,
                                                 snapshot.virtual_cash,
                                                 snapshot.unallocated_cash,
@@ -9326,6 +9326,20 @@ impl Engine {
                                                 snapshot.persistence_flush_last_us,
                                                 snapshot.persistence_flush_max_us,
                                                 snapshot.persistence_flushes,
+                                                snapshot.persistence_scheduled_generation,
+                                                snapshot.persistence_completed_generation,
+                                                snapshot.persistence_generation_lag,
+                                                snapshot.persistence_pending_jobs,
+                                                snapshot.persistence_pending_high_water,
+                                                snapshot.settled_gc_candidates,
+                                                snapshot.settled_gc_inflight_requests,
+                                                snapshot.settled_gc_request_queue_depth,
+                                                snapshot.settled_gc_request_queue_high_water,
+                                                snapshot.settled_gc_request_queue_overflows,
+                                                snapshot.settled_gc_completion_queue_depth,
+                                                snapshot.settled_gc_completion_queue_high_water,
+                                                snapshot.settled_gc_completion_queue_overflows,
+                                                snapshot.settled_gc_certificates_completed,
                                             )
                                         };
                                         if snapshot.uncertain || snapshot.persistence_error.is_some() {

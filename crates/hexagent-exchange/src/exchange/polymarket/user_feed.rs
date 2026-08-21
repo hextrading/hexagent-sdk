@@ -5401,7 +5401,7 @@ mod tests {
     }
 
     #[test]
-    fn corrected_trade_replay_clears_schema_anomaly_and_receipt_anchor() {
+    fn corrected_trade_replay_replaces_receipt_anchor_with_business_anchor() {
         let shared = owned_taker_shared(0.5);
         let mut event = valid_taker_event();
         event["side"] = serde_json::json!("HOLD");
@@ -5415,13 +5415,15 @@ mod tests {
             .is_some_and(|anchor| anchor > 0));
 
         event["side"] = serde_json::json!("BUY");
+        event["match_time"] = serde_json::json!("123");
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert!(!shared.account_state.is_uncertain());
         assert!(!shared.user_feed_health.inventory_uncertain());
         assert_eq!(
             shared.account_state.earliest_unresolved_trade_match_time(),
-            None
+            Some(123),
+            "a corrected MATCHED event clears the receipt-time syntax anchor but remains replayable from its authenticated business time",
         );
     }
 
