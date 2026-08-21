@@ -714,11 +714,20 @@ pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
     }
 }
 
-/// Shared-ledger/audit/persistence half of the private feed. It is explicitly
-/// demoted to the background pool; only the owner-fast route receives the
-/// account-specific FIFO core.
-pub fn pin_private_account_cold(thread_name: &str) {
-    pin_background(thread_name);
+/// Shared-ledger/audit/persistence half of the private feed. Keep it
+/// SCHED_OTHER, but place it on the same account-specific CPU as the FIFO
+/// owner-fast worker. The owner always preempts it, while the cold writer no
+/// longer starves behind the execution dispatcher's FIFO workload on the
+/// background core while holding an instance lifecycle lock.
+pub fn pin_private_account_cold(thread_name: &str, account_id: &str) {
+    demote_current_to_other(thread_name);
+    let p = plan();
+    if let Some(core) = p.private_apply_cores.get(account_id).copied() {
+        pin_current(core, thread_name);
+    } else {
+        let core = p.route_background();
+        pin_current(core, thread_name);
+    }
 }
 
 /// Pin a critical execution-path thread (`execution` dispatcher,
@@ -752,6 +761,12 @@ pub fn pin_background(thread_name: &str) {
     // pthreads inherit their creator's scheduling policy. Several background
     // join/persistence workers are spawned by FIFO runtime threads, so affinity
     // alone is not enough: explicitly demote before sharing an execution CPU.
+    demote_current_to_other(thread_name);
+    let core = plan().route_background();
+    pin_current(core, thread_name);
+}
+
+fn demote_current_to_other(_thread_name: &str) {
     #[cfg(target_os = "linux")]
     {
         let param = libc::sched_param { sched_priority: 0 };
@@ -761,16 +776,14 @@ pub fn pin_background(thread_name: &str) {
             let err = std::io::Error::from_raw_os_error(rc);
             warn!(
                 "[os_tune] failed to demote background '{}' to SCHED_OTHER: {}",
-                thread_name, err,
+                _thread_name, err,
             );
             abort_if_strict(&format!(
                 "demote background '{}' to SCHED_OTHER: {}",
-                thread_name, err
+                _thread_name, err
             ));
         }
     }
-    let core = plan().route_background();
-    pin_current(core, thread_name);
 }
 
 /// Pin the main (bootstrap) thread + any children spawned before

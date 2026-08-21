@@ -1120,6 +1120,7 @@ name = "hexagent-exchange"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrow",
  "base64",
  "bip39",
