@@ -4881,6 +4881,9 @@ impl PolymarketTrade {
     /// ledger. Startup callers may use `reconcile_recovered_orders()` and seed
     /// strategy state from the recovered virtual snapshot instead.
     pub fn reconcile_recovered_orders_with_updates(&self) -> (usize, Vec<OrderUpdate>) {
+        let _reconcile_stage = crate::latency::TimedStage::new(
+            "polymarket.recovery.reconcile_recovered_orders",
+        );
         // Keep a single pass sub-second. The account worker is now woken on
         // pending-audit edges and retries every 500 ms, so multi-second sleeps
         // here would only serialize unrelated orders behind one slow replica.
@@ -4928,11 +4931,10 @@ impl PolymarketTrade {
                     .collect()
             };
             if pending.is_empty() {
-                let unresolved = self
-                    .shared
-                    .account_state
-                    .monitoring_snapshot()
-                    .recovery_pending_orders;
+                // A durable pending row may temporarily lack an executor OID
+                // binding, so preserve the old unresolved result without
+                // materializing the aggregate account under control_gate.
+                let unresolved = self.shared.account_state.pending_order_audit_counts().0;
                 return (unresolved, replayed_updates);
             }
 
@@ -5175,20 +5177,17 @@ impl PolymarketTrade {
                     );
                 }
             }
-            let after = self.shared.account_state.monitoring_snapshot();
+            let (recovery_pending, routine_cancel_audits) =
+                self.shared.account_state.pending_order_audit_counts();
             if startup_recovery_audits_complete(
-                after.recovery_pending_orders,
-                after.routine_cancel_audits,
+                recovery_pending,
+                routine_cancel_audits,
             ) {
-                return (after.recovery_pending_orders, replayed_updates);
+                return (recovery_pending, replayed_updates);
             }
         }
 
-        let unresolved = self
-            .shared
-            .account_state
-            .monitoring_snapshot()
-            .recovery_pending_orders;
+        let unresolved = self.shared.account_state.pending_order_audit_counts().0;
         if unresolved > 0 {
             warn!(
                 "[PolymarketTrade] startup recovery left {} order(s) awaiting exact private-trade replay",
