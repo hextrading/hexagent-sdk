@@ -129,6 +129,43 @@ pub struct FillAuditRow {
     pub taker_fill_qty: f64,
 }
 
+/// Diagnostic-only maker lifecycle for one simulated order.
+///
+/// Enabled only with the backtest fill-audit switch.  These immutable/request
+/// fields plus causal queue transitions are the sim half of the live
+/// `[order_attempt]` replica join; none feed back into matching.
+#[derive(Clone, Debug)]
+pub struct MakerOrderAuditRow {
+    pub slug: String,
+    pub iid: String,
+    pub coid: String,
+    pub token: String,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price: f64,
+    pub quantity: f64,
+    pub strategy_emit_ns: u64,
+    pub trigger_exchange_ns: u64,
+    pub trigger_local_ns: u64,
+    pub place_arrival_ns: u64,
+    pub await_fresh_book: bool,
+    pub visible_depth_at_entry: f64,
+    pub q_init: f64,
+    pub trade_match_n: u64,
+    pub trade_match_qty: f64,
+    pub queue_drained_qty: f64,
+    pub candidate_qty: f64,
+    pub book_through_candidate_qty: f64,
+    pub book_through_fill_qty: f64,
+    pub fill_qty: f64,
+    pub first_fill_ns: u64,
+    pub last_fill_ns: u64,
+    pub cancel_arrival_ns: u64,
+    pub cancel_result: &'static str,
+    pub q_ahead_final: f64,
+    pub remaining_final: f64,
+}
+
 fn flip(s: Side) -> Side {
     match s {
         Side::Buy => Side::Sell,
@@ -162,6 +199,10 @@ pub struct SimExchangeV2 {
     /// themselves are retained for the complete replay and emitted at exit.
     event_slug_by_token: HashMap<String, String>,
     fill_audit: BTreeMap<(String, String), FillAuditRow>,
+    /// Per-order rows are opt-in because a multi-day replay can place hundreds
+    /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
+    maker_order_audit_enabled: bool,
+    maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
     /// Symmetric outcome-sibling map (a↔b) for the race lookahead (peek the
     /// canonical frame's next book from EITHER outcome stream).
     fold_sibling: HashMap<String, String>,
@@ -369,6 +410,8 @@ impl SimExchangeV2 {
             fold_to: HashMap::new(),
             event_slug_by_token: HashMap::new(),
             fill_audit: BTreeMap::new(),
+            maker_order_audit_enabled: false,
+            maker_order_audit: BTreeMap::new(),
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
             last_book_local_ts: HashMap::new(),
@@ -532,6 +575,17 @@ impl SimExchangeV2 {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         self.fill_audit.values().cloned().collect()
+    }
+
+    pub fn configure_maker_order_audit(&mut self, enabled: bool) {
+        self.maker_order_audit_enabled = enabled;
+        if !enabled {
+            self.maker_order_audit.clear();
+        }
+    }
+
+    pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
+        self.maker_order_audit.values().cloned().collect()
     }
 
     /// Configure the fail-closed full-book age gate. A single threshold is
@@ -829,6 +883,7 @@ impl SimExchangeV2 {
         {
             let books = &self.books;
             let pend = &self.pend_cross;
+            let order_audits = &mut self.maker_order_audit;
             let mut n = 0u64;
             for (coid, o) in self.orders.iter_mut() {
                 if o.remaining <= EPS {
@@ -867,6 +922,12 @@ impl SimExchangeV2 {
                 let limit = o.request.price.unwrap_or(0.0);
                 if o.request.side == Side::Buy {
                     o.locked_usdc = limit * o.remaining;
+                }
+                if let Some(a) = order_audits.get_mut(coid) {
+                    a.book_through_candidate_qty += fillable.min(o.remaining + fill);
+                    a.book_through_fill_qty += fill;
+                    a.q_ahead_final = o.q_ahead;
+                    a.remaining_final = o.remaining;
                 }
                 n += 1;
                 mfills.push(MakerFill {
@@ -986,7 +1047,7 @@ impl SimExchangeV2 {
                     self.audit_stale_trade(&canon, t.side, t.price, t.quantity);
                     self.count_book_stale_block(exchange_stale, local_stale, false);
                 } else {
-                    self.match_trade(&canon, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                    self.match_trade(&canon, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills);
                 }
             } else {
                 self.record_trade(&canon, flip(t.side), 1.0 - t.price, t.quantity, ts);
@@ -999,6 +1060,7 @@ impl SimExchangeV2 {
                         flip(t.side),
                         1.0 - t.price,
                         t.quantity,
+                        ts,
                         fwd_mid,
                         &mut fills,
                     );
@@ -1012,7 +1074,7 @@ impl SimExchangeV2 {
                 self.audit_stale_trade(&t.symbol, t.side, t.price, t.quantity);
                 self.count_book_stale_block(exchange_stale, local_stale, false);
             } else {
-                self.match_trade(&t.symbol, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                self.match_trade(&t.symbol, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills);
             }
             // Cross-outcome mirror: flip side, 1 − price on the complement token.
             if let Some(comp) = self.books.complement(&t.symbol).cloned() {
@@ -1027,6 +1089,7 @@ impl SimExchangeV2 {
                         flip(t.side),
                         1.0 - t.price,
                         t.quantity,
+                        ts,
                         fwd_mid.map(|m| 1.0 - m),
                         &mut fills,
                     );
@@ -1086,6 +1149,7 @@ impl SimExchangeV2 {
         aggressor_side: Side,
         price: f64,
         qty: f64,
+        now_ns: u64,
         fwd_mid: Option<f64>,
         out: &mut Vec<MakerFill>,
     ) {
@@ -1105,6 +1169,7 @@ impl SimExchangeV2 {
         let mut haircuts = 0u64;
         let audit_slug = self.event_slug_by_token.get(symbol).cloned();
         let audits = &mut self.fill_audit;
+        let order_audits = &mut self.maker_order_audit;
         for (coid, o) in self.orders.iter_mut() {
             // Match in the canonical frame: `symbol`/`aggressor_side`/`price`
             // are canonical (the caller already folded the trade). Fills settle
@@ -1122,6 +1187,15 @@ impl SimExchangeV2 {
             }
             let q_before = o.q_ahead;
             let over = qty - q_before;
+            if let Some(a) = order_audits.get_mut(coid) {
+                a.trade_match_n += 1;
+                a.trade_match_qty += qty;
+                a.queue_drained_qty += qty.min(q_before);
+                a.candidate_qty += over.max(0.0).min(o.remaining);
+                a.q_ahead_final = (q_before - qty).max(0.0);
+                a.remaining_final = o.remaining;
+                debug_assert!(now_ns >= a.place_arrival_ns);
+            }
             if let Some(slug) = audit_slug.as_ref() {
                 let key = (slug.clone(), o.request.instance_id.clone());
                 let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
@@ -1195,6 +1269,18 @@ impl SimExchangeV2 {
             self.maker_fills += 1;
             if let Some(a) = self.audit_row_mut(&f.token, &f.iid) {
                 a.maker_fill_qty += f.fill;
+            }
+            if let Some(a) = self.maker_order_audit.get_mut(&f.coid) {
+                a.fill_qty += f.fill;
+                if a.first_fill_ns == 0 {
+                    a.first_fill_ns = now_ns;
+                }
+                a.last_fill_ns = now_ns;
+                a.remaining_final = f.remaining_after;
+                if f.fully {
+                    a.cancel_result = "filled";
+                    a.q_ahead_final = 0.0;
+                }
             }
             // Diagnostic: fill-age = how long after placement this maker order
             // filled. High age ⇒ orders linger before filling (race leaking).
@@ -1930,6 +2016,43 @@ impl SimExchangeV2 {
             a.maker_q_init_sum += q_ahead;
             a.maker_race_added_q += maker_race_added_q;
         }
+        if self.maker_order_audit_enabled {
+            if let Some((slug, _)) = self.audit_key(&o.symbol, &o.instance_id) {
+                self.maker_order_audit.insert(
+                    o.client_order_id.clone(),
+                    MakerOrderAuditRow {
+                        slug,
+                        iid: o.instance_id.clone(),
+                        coid: o.client_order_id.clone(),
+                        token: o.symbol.clone(),
+                        side: o.side,
+                        order_type: o.order_type,
+                        price,
+                        quantity: o.quantity,
+                        strategy_emit_ns: o.timestamp_ns,
+                        trigger_exchange_ns: o.quote_trigger_exchange_timestamp_ns,
+                        trigger_local_ns: o.quote_trigger_local_timestamp_ns,
+                        place_arrival_ns: now_ns,
+                        await_fresh_book,
+                        visible_depth_at_entry: now_depth,
+                        q_init: q_ahead,
+                        trade_match_n: 0,
+                        trade_match_qty: 0.0,
+                        queue_drained_qty: 0.0,
+                        candidate_qty: 0.0,
+                        book_through_candidate_qty: 0.0,
+                        book_through_fill_qty: 0.0,
+                        fill_qty: 0.0,
+                        first_fill_ns: 0,
+                        last_fill_ns: 0,
+                        cancel_arrival_ns: 0,
+                        cancel_result: "open",
+                        q_ahead_final: q_ahead,
+                        remaining_final: remaining,
+                    },
+                );
+            }
+        }
         self.orders.insert(
             o.client_order_id.clone(),
             RestingOrder {
@@ -2054,6 +2177,12 @@ impl SimExchangeV2 {
     pub fn cancel_order(&mut self, exchange: Exchange, coid: &str, now_ns: u64) -> OrderUpdate {
         if let Some(o) = self.orders.remove(coid) {
             self.record_lifetime(o.placed_ns, now_ns);
+            if let Some(a) = self.maker_order_audit.get_mut(coid) {
+                a.cancel_arrival_ns = now_ns;
+                a.cancel_result = "cancelled";
+                a.q_ahead_final = o.q_ahead;
+                a.remaining_final = o.remaining;
+            }
             return OrderUpdate {
                 client_order_id: coid.to_string(),
                 exchange,
@@ -2092,6 +2221,10 @@ impl SimExchangeV2 {
             });
         if let Some((symbol, side, filled_quantity, price, trade_id, liquidity)) = hit {
             self.matched_cant_cancel += 1;
+            if let Some(a) = self.maker_order_audit.get_mut(coid) {
+                a.cancel_arrival_ns = now_ns;
+                a.cancel_result = "matched_before_cancel";
+            }
             return OrderUpdate {
                 client_order_id: coid.to_string(),
                 exchange,
@@ -2336,6 +2469,45 @@ mod tests {
         let u = c.submit_order(&order("a", "up", Side::Buy, 0.61, 10.0, false, OrderType::Limit), 1);
         assert_eq!(u.status, OrderStatus::Filled);
         assert!((u.avg_fill_price - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maker_order_audit_preserves_causal_queue_fill_and_cancel_timeline() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        let accepted = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 12.0, 100));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(fills[0].filled_quantity, 2.0);
+        let cancelled = c.cancel_order(Exchange::Polymarket, "m", 150);
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+
+        let rows = c.maker_order_audit_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.slug, "s");
+        assert_eq!(row.coid, "m");
+        assert_eq!(row.place_arrival_ns, 1);
+        assert_eq!(row.q_init, 10.0);
+        assert_eq!(row.trade_match_n, 1);
+        assert_eq!(row.trade_match_qty, 12.0);
+        assert_eq!(row.queue_drained_qty, 10.0);
+        assert_eq!(row.candidate_qty, 2.0);
+        assert_eq!(row.book_through_candidate_qty, 0.0);
+        assert_eq!(row.book_through_fill_qty, 0.0);
+        assert_eq!(row.fill_qty, 2.0);
+        assert_eq!(row.first_fill_ns, 100);
+        assert_eq!(row.cancel_arrival_ns, 150);
+        assert_eq!(row.cancel_result, "cancelled");
+        assert_eq!(row.q_ahead_final, 0.0);
+        assert_eq!(row.remaining_final, 3.0);
     }
 
     #[test]
@@ -3202,6 +3374,32 @@ mod tests {
         assert_eq!(fills[0].liquidity, Some(Liquidity::Maker));
         assert!((fills[0].avg_fill_price - 0.55).abs() < 1e-9, "fills at the limit (adverse)");
         assert!(probe(false).is_empty(), "cross with NO trade is flicker → no fill");
+    }
+
+    #[test]
+    fn maker_order_audit_attributes_book_through_fill_separately() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+        assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+        let fills = c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]));
+        assert_eq!(fills.len(), 1);
+
+        let rows = c.maker_order_audit_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.candidate_qty, 0.0);
+        assert_eq!(row.book_through_candidate_qty, 10.0);
+        assert_eq!(row.book_through_fill_qty, 10.0);
+        assert_eq!(row.fill_qty, 10.0);
+        assert_eq!(row.q_ahead_final, 0.0);
+        assert_eq!(row.remaining_final, 0.0);
     }
 
     #[test]

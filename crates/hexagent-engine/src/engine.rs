@@ -4712,6 +4712,7 @@ impl Engine {
             place_profile,
             cancel_profile,
         })?;
+        sim.configure_maker_order_audit(bt.sim_v2_fill_audit);
 
         info!(
             "[Backtest v2] {} strat replayers, {} bar events",
@@ -5120,6 +5121,38 @@ impl Engine {
                     a.taker_comp_suppressed_qty,
                     a.taker_zero_fills,
                     a.taker_fill_qty,
+                );
+            }
+            for a in sim.maker_order_audit_rows() {
+                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} q_init={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                    a.slug,
+                    a.iid,
+                    a.coid,
+                    a.token,
+                    a.side,
+                    a.order_type,
+                    a.price,
+                    a.quantity,
+                    a.strategy_emit_ns,
+                    a.trigger_exchange_ns,
+                    a.trigger_local_ns,
+                    a.place_arrival_ns,
+                    a.await_fresh_book,
+                    a.visible_depth_at_entry,
+                    a.q_init,
+                    a.trade_match_n,
+                    a.trade_match_qty,
+                    a.queue_drained_qty,
+                    a.candidate_qty,
+                    a.book_through_candidate_qty,
+                    a.book_through_fill_qty,
+                    a.fill_qty,
+                    a.first_fill_ns,
+                    a.last_fill_ns,
+                    a.cancel_arrival_ns,
+                    a.cancel_result,
+                    a.q_ahead_final,
+                    a.remaining_final,
                 );
             }
         }

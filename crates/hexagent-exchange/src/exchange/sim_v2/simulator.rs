@@ -18,7 +18,7 @@ use crate::types::{Exchange, Instrument, OrderStatus, OrderUpdate, Side, Signal}
 
 use super::clock::Scheduler;
 use super::event::{ReachAction, SimEvent};
-use super::exchange::{FillAuditRow, SimExchangeV2};
+use super::exchange::{FillAuditRow, MakerOrderAuditRow, SimExchangeV2};
 use super::feed::ServerFeed;
 use super::latency::LatencyModel;
 use crate::exchange::sim::latency::LatencyProfile;
@@ -530,6 +530,14 @@ impl Simulator {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         self.core.fill_audit_rows()
+    }
+
+    pub fn configure_maker_order_audit(&mut self, enabled: bool) {
+        self.core.configure_maker_order_audit(enabled);
+    }
+
+    pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
+        self.core.maker_order_audit_rows()
     }
 
     /// Double-clock full-book stale gate diagnostics:

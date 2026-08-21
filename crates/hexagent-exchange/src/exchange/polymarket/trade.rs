@@ -1403,12 +1403,67 @@ struct DeferredLifecycleJob {
 struct AttemptAuditJob {
     attempt: crate::http1_pool::AttemptTraceSnapshot,
     kind: &'static str,
+    /// Execution-route owner, also present for cancels that have no placement
+    /// tuple.  This keeps every audit row instance-scoped without inferring
+    /// ownership from the coid.
+    route_instance_id: String,
+    /// Immutable placement inputs copied only after the HTTP reply reaches the
+    /// completion worker.  Keeping these on the bounded audit lane makes a
+    /// live order attempt reproducible without formatting or allocating on the
+    /// strategy quote thread.  Cancels join back to their place by `coid` and
+    /// therefore carry `None` here.
+    order: Option<AttemptOrderReplica>,
     client_order_id: String,
     exchange_order_id: Option<String>,
     status: OrderStatus,
     error: Option<String>,
     completed_ns: u64,
     enqueued_ns: u64,
+}
+
+/// Order-level inputs required to replay a live placement in sim_v2.
+///
+/// This is deliberately an audit payload, not mutable runtime authority.  It
+/// crosses exactly one boundary: the order completion worker transfers it to
+/// the single background audit writer through `attempt_audit_tx`.
+#[derive(Debug, Clone, PartialEq)]
+struct AttemptOrderReplica {
+    instance_id: String,
+    event_id: String,
+    token: String,
+    side: Side,
+    order_type: crate::types::OrderType,
+    price: Option<f64>,
+    quantity: f64,
+    post_only: bool,
+    reduce_only: bool,
+    fee_rate_bps: u32,
+    trigger_source: QuoteTriggerSource,
+    trigger_exchange_ns: u64,
+    trigger_local_ns: u64,
+}
+
+impl AttemptOrderReplica {
+    fn from_order(order: &OrderRequest, route_instance_id: &str) -> Self {
+        // The executor route is the routing authority.  `OrderRequest` should
+        // carry the same ID, but logging the route ID also covers legacy
+        // callers whose request field is empty.
+        Self {
+            instance_id: route_instance_id.to_string(),
+            event_id: order.quote_event_id.clone(),
+            token: order.symbol.clone(),
+            side: order.side,
+            order_type: order.order_type,
+            price: order.price,
+            quantity: order.quantity,
+            post_only: order.post_only,
+            reduce_only: order.reduce_only,
+            fee_rate_bps: order.fee_rate_bps,
+            trigger_source: order.quote_trigger_source,
+            trigger_exchange_ns: order.quote_trigger_exchange_timestamp_ns,
+            trigger_local_ns: order.quote_trigger_local_timestamp_ns,
+        }
+    }
 }
 
 const ATTEMPT_AUDIT_QUEUE_CAPACITY: usize = 4_096;
@@ -2611,6 +2666,8 @@ impl SharedState {
         &self,
         attempt: &crate::http1_pool::AttemptTraceHandle,
         kind: &'static str,
+        order: Option<&OrderRequest>,
+        route_instance_id: &str,
         client_order_id: &str,
         exchange_order_id: Option<&str>,
         status: OrderStatus,
@@ -2637,6 +2694,8 @@ impl SharedState {
         let job = AttemptAuditJob {
             attempt,
             kind,
+            route_instance_id: route_instance_id.to_string(),
+            order: order.map(|order| AttemptOrderReplica::from_order(order, route_instance_id)),
             client_order_id: client_order_id.to_string(),
             exchange_order_id: exchange_order_id.map(str::to_string),
             status,
@@ -2664,12 +2723,26 @@ impl SharedState {
         );
         let attempt = job.attempt;
         let elapsed_ns = job.completed_ns.saturating_sub(attempt.dispatched_ns);
+        let order = job.order.as_ref();
         info!(
-            "[order_attempt] attempt_id={} kind={} role={:?} slot={} coid={} oid={} status={:?} signal_ns={} prep_ns={} signed_ns={} account_recorded_ns={} dispatched_ns={} completed_ns={} dispatch_to_done_ms={:.3}",
+            "[order_attempt] attempt_id={} kind={} role={:?} slot={} iid={} event_id={} token={} side={} order_type={} price={} quantity={} post_only={} reduce_only={} fee_rate_bps={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} coid={} oid={} status={:?} signal_ns={} prep_ns={} signed_ns={} account_recorded_ns={} dispatched_ns={} completed_ns={} dispatch_to_done_ms={:.3}",
             attempt.attempt_id,
             job.kind,
             attempt.role,
             attempt.slot,
+            order.map(|order| order.instance_id.as_str()).filter(|value| !value.is_empty()).unwrap_or(job.route_instance_id.as_str()),
+            order.map(|order| order.event_id.as_str()).filter(|value| !value.is_empty()).unwrap_or("-"),
+            order.map(|order| order.token.as_str()).filter(|value| !value.is_empty()).unwrap_or("-"),
+            order.map(|order| order.side.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| format!("{:?}", order.order_type)).as_deref().unwrap_or("-"),
+            order.and_then(|order| order.price).map(|price| price.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.quantity.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.post_only.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.reduce_only.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.fee_rate_bps.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.trigger_source.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.trigger_exchange_ns.to_string()).as_deref().unwrap_or("-"),
+            order.map(|order| order.trigger_local_ns.to_string()).as_deref().unwrap_or("-"),
             job.client_order_id,
             job.exchange_order_id.as_deref().unwrap_or(""),
             job.status,
@@ -7715,6 +7788,8 @@ impl PolymarketTrade {
         self.shared.log_admission_attempt(
             &attempt,
             "place",
+            Some(order),
+            &self.instance_id,
             &order.client_order_id,
             Some(&local_oid),
             update.status,
@@ -7819,6 +7894,8 @@ impl PolymarketTrade {
             self.shared.log_admission_attempt(
                 attempt,
                 "cancel",
+                None,
+                &self.instance_id,
                 client_order_id,
                 update.exchange_order_id.as_deref(),
                 update.status,
@@ -10465,6 +10542,37 @@ mod tests {
             0.5,
             1.0,
         )
+    }
+
+    #[test]
+    fn attempt_order_replica_preserves_replay_identity_and_inputs() {
+        let mut order = valid_signing_order();
+        order.client_order_id = "btc01-42".into();
+        order.instance_id = "untrusted-request-iid".into();
+        order.quote_event_id = "btc-updown-5m-42".into();
+        order.quote_trigger_source = QuoteTriggerSource::OrderBook(Exchange::Polymarket);
+        order.quote_trigger_exchange_timestamp_ns = 101;
+        order.quote_trigger_local_timestamp_ns = 202;
+        order.order_type = crate::types::OrderType::Fak;
+        order.post_only = false;
+        order.reduce_only = true;
+        order.fee_rate_bps = 125;
+
+        let replica = AttemptOrderReplica::from_order(&order, "btc01");
+
+        assert_eq!(replica.instance_id, "btc01");
+        assert_eq!(replica.event_id, "btc-updown-5m-42");
+        assert_eq!(replica.token, "123456789");
+        assert_eq!(replica.side, Side::Buy);
+        assert_eq!(replica.order_type, crate::types::OrderType::Fak);
+        assert_eq!(replica.price, Some(0.5));
+        assert_eq!(replica.quantity, 1.0);
+        assert!(!replica.post_only);
+        assert!(replica.reduce_only);
+        assert_eq!(replica.fee_rate_bps, 125);
+        assert_eq!(replica.trigger_source, QuoteTriggerSource::OrderBook(Exchange::Polymarket));
+        assert_eq!(replica.trigger_exchange_ns, 101);
+        assert_eq!(replica.trigger_local_ns, 202);
     }
 
     #[test]
