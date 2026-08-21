@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use quanta::Instant;
 
-const MAX_STAGES: usize = 128;
+const MAX_STAGES: usize = 256;
 const SUB_BUCKETS: usize = 8;
 const BUCKETS: usize = 64 * SUB_BUCKETS;
+static DROPPED_STAGE_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// One process-wide mapping from static stage names to dense numeric IDs.
 /// It is touched only on the first observation of a stage by each thread.
@@ -37,22 +38,25 @@ impl StageRegistry {
         }
     }
 
-    fn id(&self, stage: &'static str) -> usize {
+    fn id(&self, stage: &'static str) -> Option<usize> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(id) = state.by_name.get(stage) {
-            return *id;
+            return Some(*id);
         }
         let id = state.names.len();
-        assert!(
-            id < MAX_STAGES,
-            "latency stage capacity exhausted ({MAX_STAGES}); increase MAX_STAGES"
-        );
+        if id >= MAX_STAGES {
+            // Telemetry must never take down a business or maintenance task.
+            // The caller caches this disabled registration, so the stage is
+            // dropped without repeatedly entering the global registry.
+            DROPPED_STAGE_REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         state.names.push(stage);
         state.by_name.insert(stage, id);
-        id
+        Some(id)
     }
 
     fn names(&self) -> Vec<&'static str> {
@@ -101,7 +105,7 @@ impl ThreadTelemetry {
 struct ThreadRecorder {
     telemetry: Arc<ThreadTelemetry>,
     /// Thread-local cache: no global stage-registry access after first use.
-    stage_ids: HashMap<&'static str, usize>,
+    stage_ids: HashMap<&'static str, Option<usize>>,
 }
 
 impl ThreadRecorder {
@@ -127,7 +131,9 @@ impl ThreadRecorder {
                 id
             }
         };
-        self.telemetry.record(stage_id, ns);
+        if let Some(stage_id) = stage_id {
+            self.telemetry.record(stage_id, ns);
+        }
     }
 }
 
@@ -167,7 +173,10 @@ fn bucket_upper_ns(bucket: usize) -> u64 {
 /// Record elapsed time under a static stage name.
 #[inline]
 pub fn record(stage: &'static str, start: Instant) {
-    record_ns(stage, start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    record_ns(
+        stage,
+        start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+    );
 }
 
 /// Record a raw nanosecond duration.
@@ -244,7 +253,9 @@ fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
                 snapshot.bins[bucket] = snapshot.bins[bucket].saturating_add(value);
                 snapshot.count = snapshot.count.saturating_add(value);
             }
-            snapshot.max = snapshot.max.max(recorder.maxima[stage_id].swap(0, Ordering::AcqRel));
+            snapshot.max = snapshot
+                .max
+                .max(recorder.maxima[stage_id].swap(0, Ordering::AcqRel));
         }
     }
     names
@@ -307,6 +318,14 @@ pub fn spawn_periodic_dump(interval: std::time::Duration) {
             crate::os_tune::pin_background("latency-dump");
             loop {
                 std::thread::sleep(interval);
+                let dropped = DROPPED_STAGE_REGISTRATIONS.swap(0, Ordering::AcqRel);
+                if dropped > 0 {
+                    log::warn!(
+                        "[latency] stage_capacity_exhausted capacity={} dropped_registrations={} action=metrics_only_dropped",
+                        MAX_STAGES,
+                        dropped,
+                    );
+                }
                 for (stage, snapshot) in snapshot_and_reset() {
                     log::info!("{}", format_line(stage, &snapshot));
                 }
@@ -321,7 +340,18 @@ mod tests {
 
     #[test]
     fn logarithmic_buckets_are_monotonic_and_cover_u64() {
-        let values = [0, 1, 2, 3, 10, 999, 1_000, 1_000_000, 60_000_000_000, u64::MAX];
+        let values = [
+            0,
+            1,
+            2,
+            3,
+            10,
+            999,
+            1_000,
+            1_000_000,
+            60_000_000_000,
+            u64::MAX,
+        ];
         let mut previous = 0;
         for value in values {
             let bucket = latency_bucket(value);
@@ -347,5 +377,16 @@ mod tests {
         assert!(value_at_quantile(snapshot, 0.50) >= 500);
         assert!(value_at_quantile(snapshot, 0.999) >= 900);
         assert_eq!(snapshot.max, 1_000);
+    }
+
+    #[test]
+    fn stage_capacity_exhaustion_drops_telemetry_without_panicking() {
+        let registry = StageRegistry::new();
+        for index in 0..MAX_STAGES {
+            let stage: &'static str =
+                Box::leak(format!("latency.test.capacity.{index}").into_boxed_str());
+            assert_eq!(registry.id(stage), Some(index));
+        }
+        assert_eq!(registry.id("latency.test.capacity.overflow"), None);
     }
 }
