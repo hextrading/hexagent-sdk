@@ -105,6 +105,9 @@ pub struct CorePlan {
     pub strategy_cores: HashMap<String, usize>,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
+    /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
+    /// must be disjoint from the FIFO private-apply cores in strict mode.
+    pub private_cold_cores: HashMap<String, usize>,
     pub execution: usize,
     pub feed_cores: HashMap<String, usize>,
     pub hex_worker_cores: Vec<usize>,
@@ -136,6 +139,7 @@ impl CorePlan {
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
             private_apply_cores: HashMap::new(),
+            private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -178,6 +182,7 @@ impl CorePlan {
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
             private_apply_cores: cfg.private_apply_cores.clone(),
+            private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
             feed_cores: cfg.feed_cores.clone(),
             hex_worker_cores: cfg.hex_worker_cores.clone(),
@@ -334,6 +339,23 @@ impl CorePlan {
                 format!("private_account_apply:{account_id}"),
                 &mut exclusive,
             )?;
+            let cold_core = self.private_cold_cores.get(account_id).copied().ok_or_else(|| {
+                format!(
+                    "strict_core_isolation requires private_cold_cores entry for account `{account_id}`"
+                )
+            })?;
+            claim(
+                cold_core,
+                format!("private_account_cold:{account_id}"),
+                &mut exclusive,
+            )?;
+        }
+        for account_id in self.private_cold_cores.keys() {
+            if !self.private_apply_cores.contains_key(account_id) {
+                return Err(format!(
+                    "private_cold_cores account `{account_id}` has no private_apply_cores entry"
+                ));
+            }
         }
 
         // Feed-to-feed sharing is allowed, but a feed may not overlap an
@@ -445,9 +467,10 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
-        plan.feed_cores, plan.private_apply_cores, plan.hex_worker_cores,
+        plan.feed_cores, plan.private_apply_cores, plan.private_cold_cores,
+        plan.hex_worker_cores,
         plan.poly_exec_cores, plan.poly_cancel_cores, plan.poly_completion_cores,
         plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
@@ -715,14 +738,18 @@ pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
 }
 
 /// Shared-ledger/audit/persistence half of the private feed. Keep it
-/// SCHED_OTHER, but place it on the same account-specific CPU as the FIFO
-/// owner-fast worker. The owner always preempts it, while the cold writer no
-/// longer starves behind the execution dispatcher's FIFO workload on the
-/// background core while holding an instance lifecycle lock.
+/// SCHED_OTHER on an account-specific cold CPU that is disjoint from the FIFO
+/// owner-fast worker. Co-locating them lets a private-event microburst preempt
+/// the cold writer for the whole burst, producing 20-50ms account/lifecycle
+/// tails even when the host is otherwise idle.
 pub fn pin_private_account_cold(thread_name: &str, account_id: &str) {
     demote_current_to_other(thread_name);
     let p = plan();
-    if let Some(core) = p.private_apply_cores.get(account_id).copied() {
+    if let Some(core) = p.private_cold_cores.get(account_id).copied() {
+        pin_current(core, thread_name);
+    } else if let Some(core) = p.private_apply_cores.get(account_id).copied() {
+        // Backwards-compatible non-strict fallback. Strict topology
+        // validation requires a disjoint private_cold_cores entry.
         pin_current(core, thread_name);
     } else {
         let core = p.route_background();
@@ -930,6 +957,7 @@ mod tests {
         let mut cfg = five_instance_config();
         cfg.async_clob_core = Some(16);
         cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11), ("zhu03".into(), 12)]);
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17), ("zhu03".into(), 18)]);
         let plan = CorePlan::from_config(&cfg);
         let enabled = vec!["btc01".to_string(), "btc02".to_string()];
         assert_eq!(plan.validate_strategy_isolation(&enabled), Ok(()));
@@ -940,6 +968,35 @@ mod tests {
         assert!(
             err.contains("strategy:btc03") && err.contains("private_account_apply:zhu02"),
             "unexpected validation error: {err}",
+        );
+    }
+
+    #[test]
+    fn strict_plan_requires_disjoint_private_cold_core() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11)]);
+        let enabled = vec!["btc01".to_string(), "btc02".to_string()];
+
+        let missing = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .unwrap_err();
+        assert!(missing.contains("private_cold_cores entry"));
+
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 11)]);
+        let overlap = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .unwrap_err();
+        assert!(
+            overlap.contains("private_account_apply:zhu02")
+                && overlap.contains("private_account_cold:zhu02"),
+            "unexpected validation error: {overlap}",
+        );
+
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17)]);
+        assert_eq!(
+            CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled),
+            Ok(())
         );
     }
 

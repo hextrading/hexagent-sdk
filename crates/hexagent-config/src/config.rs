@@ -73,6 +73,13 @@ pub struct OsTuneConfig {
     /// settlement and recorder work from delaying private fills.
     #[serde(default)]
     pub private_apply_cores: HashMap<String, usize>,
+    /// Shared-account id -> dedicated private cold-account core. The
+    /// SCHED_OTHER ledger and lifecycle workers must not share the FIFO
+    /// private-apply CPU: an authenticated event burst would otherwise
+    /// preempt cold accounting for the entire burst and turn microsecond work
+    /// into tens of milliseconds of wall-clock tail latency.
+    #[serde(default)]
+    pub private_cold_cores: HashMap<String, usize>,
     pub execution_core: Option<usize>,
     /// Exchange name → core id. Matched against the suffix of
     /// `feed-<name>` thread names. Missing entries fall back to
@@ -130,6 +137,7 @@ impl Default for OsTuneConfig {
             strategy_core: None,
             strategy_cores: HashMap::new(),
             private_apply_cores: HashMap::new(),
+            private_cold_cores: HashMap::new(),
             execution_core: None,
             feed_cores: HashMap::new(),
             hex_worker_cores: Vec::new(),
@@ -157,6 +165,7 @@ mod os_tune_config_tests {
              allow_background_on_execution_core = true\n\
              async_clob_core = 11\n\
              private_apply_cores = { zhu02 = 12, zhu03 = 13 }\n\
+             private_cold_cores = { zhu02 = 14, zhu03 = 15 }\n\
              execution_core = 4\n\
              background_cores = [4]\n\
              fifo_execution = 50\n\
@@ -167,6 +176,7 @@ mod os_tune_config_tests {
         assert!(cfg.allow_background_on_execution_core);
         assert_eq!(cfg.async_clob_core, Some(11));
         assert_eq!(cfg.private_apply_cores.get("zhu02"), Some(&12));
+        assert_eq!(cfg.private_cold_cores.get("zhu02"), Some(&14));
         assert_eq!(cfg.background_cores, vec![4]);
         assert_eq!(cfg.fifo_polymarket_feed, Some(71));
         assert_eq!(cfg.fifo_completion, Some(55));
