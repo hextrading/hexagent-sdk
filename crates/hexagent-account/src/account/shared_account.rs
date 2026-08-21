@@ -3068,6 +3068,13 @@ pub struct SharedAccount {
     /// Account-wide outcome map published by the cold control plane.
     settled_token_values_fast: ArcSwap<SettledTokenValuesSnapshot>,
     settled_token_values_generation_fast: AtomicU64,
+    /// Immutable membership proof for tokens whose event has ended. Recovery
+    /// and runtime order audits consult this on every pass; forcing those
+    /// readers through `lock_state()` would turn a read-only durable marker
+    /// lookup into a full account publication and block private-event apply.
+    /// The cold control writer rebuilds the snapshot from the same three
+    /// durable authorities used by `token_event_has_ended`.
+    ended_token_ids_fast: ArcSwap<HashSet<String>>,
     uncertain_reason_fast: ArcSwapOption<String>,
     ledger_generation_fast: AtomicU64,
     /// Cached after startup and every settled-history GC transaction. Reading
@@ -3181,6 +3188,26 @@ impl SharedAccount {
         }
     }
 
+    fn ended_token_ids(state: &SharedAccountState) -> HashSet<String> {
+        let mut tokens: HashSet<String> = state.settled_token_values.keys().cloned().collect();
+        tokens.extend(
+            state
+                .settled_audit_references
+                .values()
+                .flat_map(|reference| reference.asset_ids.iter().cloned()),
+        );
+        tokens.extend(state.instances.values().flat_map(|instance| {
+            instance
+                .token_interests
+                .values()
+                .filter(|interest| interest.retire_after_ms.is_some())
+                .flat_map(|interest| {
+                    [interest.up_token_id.clone(), interest.down_token_id.clone()]
+                })
+        }));
+        tokens
+    }
+
     /// Publish read-mostly control state after a cold transaction. This runs
     /// while the transaction still owns the state guard, so readers observing
     /// a new generation also observe the matching immutable values map.
@@ -3215,6 +3242,8 @@ impl SharedAccount {
             self.settled_token_values_generation_fast
                 .store(generation, Ordering::Release);
         }
+        self.ended_token_ids_fast
+            .store(Arc::new(Self::ended_token_ids(state)));
         self.retired_order_audit_tombstones_fast
             .store(Arc::new(state.retired_order_audit_tombstones.clone()));
     }
@@ -3255,6 +3284,7 @@ impl SharedAccount {
             unsettled_maintenance_fast: AtomicBool::new(false),
             settled_token_values_fast: ArcSwap::from_pointee(SettledTokenValuesSnapshot::default()),
             settled_token_values_generation_fast: AtomicU64::new(0),
+            ended_token_ids_fast: ArcSwap::from_pointee(HashSet::new()),
             uncertain_reason_fast: ArcSwapOption::empty(),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(0),
@@ -3616,6 +3646,7 @@ impl SharedAccount {
                 values: initial_settled_values,
             }),
             settled_token_values_generation_fast: AtomicU64::new(initial_settled_generation),
+            ended_token_ids_fast: ArcSwap::from_pointee(HashSet::new()),
             uncertain_reason_fast: ArcSwapOption::empty(),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(initial_retired_trade_tombstones),
@@ -5475,18 +5506,7 @@ impl SharedAccount {
         if token_id.trim().is_empty() {
             return false;
         }
-        let state = self.lock_state();
-        state.settled_token_values.contains_key(token_id)
-            || state
-                .settled_audit_references
-                .values()
-                .any(|reference| reference.asset_ids.iter().any(|token| token == token_id))
-            || state.instances.values().any(|instance| {
-                instance.token_interests.values().any(|interest| {
-                    interest.retire_after_ms.is_some()
-                        && (interest.up_token_id == token_id || interest.down_token_id == token_id)
-                })
-            })
+        self.ended_token_ids_fast.load().contains(token_id)
     }
 
     /// Retire a finished/abandoned event after a ten-minute reconciliation
@@ -14043,10 +14063,22 @@ mod tests {
         retired
             .register_token_interest("maker", "retired", "RET-UP", "RET-DOWN")
             .unwrap();
+        let acquisitions = retired.account_lock_acquisitions.load(Ordering::Acquire);
         assert!(!retired.token_event_has_ended("RET-UP"));
+        assert_eq!(
+            retired.account_lock_acquisitions.load(Ordering::Acquire),
+            acquisitions,
+            "event-end negative lookup must use the immutable snapshot",
+        );
         retired.retire_token_interest("maker", "retired");
+        let acquisitions = retired.account_lock_acquisitions.load(Ordering::Acquire);
         assert!(retired.token_event_has_ended("RET-UP"));
         assert!(retired.token_event_has_ended("RET-DOWN"));
+        assert_eq!(
+            retired.account_lock_acquisitions.load(Ordering::Acquire),
+            acquisitions,
+            "event-end positive lookup must use the immutable snapshot",
+        );
 
         let audited = SharedAccount::new("settled-audit-marker");
         audited.register_instance("maker", 1.0);
