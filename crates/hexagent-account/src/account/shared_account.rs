@@ -8,6 +8,7 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
 use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -56,6 +57,103 @@ pub struct LockMonitoringSnapshot {
     pub hold_last_us: u64,
     pub hold_max_us: u64,
     pub acquisitions: u64,
+}
+
+/// Additive timings for one deferred lifecycle application. A rejected order
+/// can enter the owner lifecycle shard several times, so each field is the sum
+/// across every instrumented lifecycle operation in the measured scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeferredLifecycleStageTiming {
+    /// Time waiting to acquire `VirtualAccount::lifecycle` mutexes.
+    pub lock_wait_ns: u64,
+    /// Time mutating owner-local lifecycle/account state while holding the mutex.
+    pub mutation_ns: u64,
+    /// Time constructing and enqueueing typed lifecycle persistence deltas.
+    pub persist_enqueue_ns: u64,
+}
+
+thread_local! {
+    static DEFERRED_LIFECYCLE_TIMING: Cell<Option<DeferredLifecycleStageTiming>> =
+        const { Cell::new(None) };
+}
+
+struct DeferredLifecycleMeasurementScope {
+    previous: Option<DeferredLifecycleStageTiming>,
+    armed: bool,
+}
+
+impl Drop for DeferredLifecycleMeasurementScope {
+    fn drop(&mut self) {
+        if self.armed {
+            DEFERRED_LIFECYCLE_TIMING.with(|timing| timing.set(self.previous));
+        }
+    }
+}
+
+/// Measure the account-owned stages reached by one cold deferred lifecycle
+/// operation. Nested scopes are isolated and restore their caller's counters.
+pub fn measure_deferred_lifecycle_stages<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, DeferredLifecycleStageTiming) {
+    let previous = DEFERRED_LIFECYCLE_TIMING
+        .with(|timing| timing.replace(Some(DeferredLifecycleStageTiming::default())));
+    let mut scope = DeferredLifecycleMeasurementScope {
+        previous,
+        armed: true,
+    };
+    let output = operation();
+    let timing = DEFERRED_LIFECYCLE_TIMING.with(|timing| {
+        let measured = timing.get().unwrap_or_default();
+        timing.set(scope.previous);
+        measured
+    });
+    scope.armed = false;
+    (output, timing)
+}
+
+#[derive(Clone, Copy)]
+enum DeferredLifecycleStage {
+    LockWait,
+    Mutation,
+    PersistEnqueue,
+}
+
+struct DeferredLifecycleStageTimer {
+    stage: DeferredLifecycleStage,
+    started: Option<Instant>,
+}
+
+impl DeferredLifecycleStageTimer {
+    #[inline]
+    fn start(stage: DeferredLifecycleStage) -> Self {
+        let active = DEFERRED_LIFECYCLE_TIMING.with(|timing| timing.get().is_some());
+        Self {
+            stage,
+            started: active.then(Instant::now),
+        }
+    }
+}
+
+impl Drop for DeferredLifecycleStageTimer {
+    #[inline]
+    fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        DEFERRED_LIFECYCLE_TIMING.with(|timing| {
+            let Some(mut measured) = timing.get() else {
+                return;
+            };
+            let field = match self.stage {
+                DeferredLifecycleStage::LockWait => &mut measured.lock_wait_ns,
+                DeferredLifecycleStage::Mutation => &mut measured.mutation_ns,
+                DeferredLifecycleStage::PersistEnqueue => &mut measured.persist_enqueue_ns,
+            };
+            *field = field.saturating_add(elapsed_ns);
+            timing.set(Some(measured));
+        });
+    }
 }
 
 #[derive(Debug, Default)]
@@ -7351,7 +7449,10 @@ impl SharedAccount {
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
+        let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        drop(lock_wait);
+        let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let token_id = lifecycle
             .orders
             .get(client_order_id)
@@ -7369,7 +7470,11 @@ impl SharedAccount {
                 client_order_id,
                 &token_id,
             );
+            drop(mutation);
+            let persist_enqueue =
+                DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
             self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+            drop(persist_enqueue);
         }
     }
 
@@ -8780,14 +8885,10 @@ impl SharedAccount {
 
     pub fn order(&self, client_order_id: &str) -> Option<OrderOwnership> {
         if let Some(account) = self.virtual_account_for_coid(client_order_id) {
-            if let Some(order) = account
-                .lifecycle
-                .lock()
-                .unwrap()
-                .orders
-                .get(client_order_id)
-                .cloned()
-            {
+            let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
+            let lifecycle = account.lifecycle.lock().unwrap();
+            drop(lock_wait);
+            if let Some(order) = lifecycle.orders.get(client_order_id).cloned() {
                 return Some(order);
             }
         }
@@ -8803,13 +8904,11 @@ impl SharedAccount {
             .cloned()
             .collect();
         for account in accounts {
-            let order = account
-                .lifecycle
-                .lock()
-                .unwrap()
-                .orders
-                .get(client_order_id)
-                .cloned();
+            let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
+            let lifecycle = account.lifecycle.lock().unwrap();
+            drop(lock_wait);
+            let order = lifecycle.orders.get(client_order_id).cloned();
+            drop(lifecycle);
             if let Some(order) = order {
                 self.coid_routes
                     .insert(client_order_id.to_string(), account.instance_id.clone());
@@ -8990,7 +9089,10 @@ impl SharedAccount {
         status: OrderStatus,
     ) -> Option<OrderStatus> {
         let account = self.virtual_account_for_coid(client_order_id)?;
+        let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        drop(lock_wait);
+        let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         if let Some(current_status) = lifecycle
             .orders
             .get(client_order_id)
@@ -9064,7 +9166,11 @@ impl SharedAccount {
                     client_order_id,
                     &token_id,
                 );
+                drop(mutation);
+                let persist_enqueue =
+                    DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
                 self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+                drop(persist_enqueue);
                 drop(lifecycle);
                 if clear_cancel_anomaly {
                     self.clear_cancel_audit_anomaly(client_order_id);
@@ -9090,7 +9196,11 @@ impl SharedAccount {
                     &token_id,
                 );
             }
+            drop(mutation);
+            let persist_enqueue =
+                DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
             self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+            drop(persist_enqueue);
             return Some(status);
         }
         None
@@ -9390,7 +9500,10 @@ impl SharedAccount {
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
+        let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        drop(lock_wait);
+        let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(order) = lifecycle.orders.get_mut(client_order_id) else {
             return false;
         };
@@ -9413,7 +9526,11 @@ impl SharedAccount {
             client_order_id,
             &token_id,
         );
+        drop(mutation);
+        let persist_enqueue =
+            DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+        drop(persist_enqueue);
         if newly_pending {
             self.notify_order_audit_worker();
         }
@@ -9426,7 +9543,10 @@ impl SharedAccount {
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
+        let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        drop(lock_wait);
+        let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(mut order) = lifecycle.orders.remove(client_order_id) else {
             return;
         };
@@ -9448,7 +9568,11 @@ impl SharedAccount {
             client_order_id,
             &token_id,
         );
+        drop(mutation);
+        let persist_enqueue =
+            DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+        drop(persist_enqueue);
     }
 
     pub fn release_all_orders(&self) {
@@ -22155,6 +22279,113 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!(restored.retired_order_audit_covers("0xDURABLE", 5.0, 0.0));
         drop(restored);
         remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn deferred_lifecycle_stage_timing_splits_owner_account_work() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-deferred-stages",
+                "oid-deferred-stages",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+
+        let (cancelled, cancelled_timing) = measure_deferred_lifecycle_stages(|| {
+            account.mark_cancelled_pending_audit("a-deferred-stages")
+        });
+        assert!(cancelled);
+        assert!(cancelled_timing.lock_wait_ns > 0);
+        assert!(cancelled_timing.mutation_ns > 0);
+        assert!(cancelled_timing.persist_enqueue_ns > 0);
+
+        account.begin_order_recovery(["a-deferred-stages"]);
+        let ((), rejected_timing) = measure_deferred_lifecycle_stages(|| {
+            assert!(account.order("a-deferred-stages").is_some());
+            account.release_order("a-deferred-stages", OrderStatus::Rejected);
+            account.finish_order_recovery("a-deferred-stages");
+        });
+        assert!(rejected_timing.lock_wait_ns > 0);
+        assert!(rejected_timing.mutation_ns > 0);
+        assert!(rejected_timing.persist_enqueue_ns > 0);
+
+        let ((), empty_timing) = measure_deferred_lifecycle_stages(|| {});
+        assert_eq!(empty_timing, DeferredLifecycleStageTiming::default());
+    }
+
+    #[test]
+    fn deferred_lifecycle_stage_latency_distribution() {
+        const EVENTS: usize = 1_000;
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-deferred-lifecycle-latency-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let mut totals = Vec::with_capacity(EVENTS);
+        let mut lock_waits = Vec::with_capacity(EVENTS);
+        let mut mutations = Vec::with_capacity(EVENTS);
+        let mut persist_enqueues = Vec::with_capacity(EVENTS);
+        let persistence_high_water;
+        {
+            let account = SharedAccount::new_persistent("deferred-lifecycle-latency", &path)
+                .expect("persistent benchmark account");
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account
+                .reserve_order(
+                    "a",
+                    "a-deferred-latency",
+                    "oid-deferred-latency",
+                    "UP",
+                    Side::Buy,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+
+            for _ in 0..EVENTS {
+                let started = Instant::now();
+                let (status, timing) = measure_deferred_lifecycle_stages(|| {
+                    account.mark_order_status_effective(
+                        "a-deferred-latency",
+                        OrderStatus::Accepted,
+                    )
+                });
+                totals.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                lock_waits.push(timing.lock_wait_ns);
+                mutations.push(timing.mutation_ns);
+                persist_enqueues.push(timing.persist_enqueue_ns);
+                assert_eq!(status, Some(OrderStatus::Accepted));
+            }
+            persistence_high_water = account
+                .monitoring_snapshot_fast()
+                .persistence_pending_high_water;
+            account.flush_persistence(Duration::from_secs(5)).unwrap();
+        }
+        remove_persistence_test_files(&path);
+
+        let total = latency_summary_ns(&mut totals);
+        let lock_wait = latency_summary_ns(&mut lock_waits);
+        let mutation = latency_summary_ns(&mut mutations);
+        let persist_enqueue = latency_summary_ns(&mut persist_enqueues);
+        eprintln!(
+            "deferred lifecycle stages: n={EVENTS} total_ns={total:?} lock_wait_ns={lock_wait:?} mutation_ns={mutation:?} persist_enqueue_ns={persist_enqueue:?} persistence_pending_high_water={persistence_high_water}",
+        );
+        assert!(
+            total.3 < 50_000_000,
+            "local deferred lifecycle maximum exceeded 50 ms",
+        );
     }
 
     #[test]
