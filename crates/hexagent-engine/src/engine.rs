@@ -8667,10 +8667,10 @@ impl Engine {
                             }
                             orphan_audit_started = std::time::Instant::now();
                         }
-                        let before = recovery_shared.account_state.monitoring_snapshot();
-                        let pending = before
-                            .recovery_pending_orders
-                            .saturating_add(before.routine_cancel_audits);
+                        let (before_recovery_pending, before_routine_cancel_audits) =
+                            recovery_shared.account_state.pending_order_audit_counts();
+                        let pending = before_recovery_pending
+                            .saturating_add(before_routine_cancel_audits);
                         if pending > 0 {
                             let recovery = PolymarketTrade::from_shared(
                                 recovery_shared.clone(),
@@ -8703,12 +8703,12 @@ impl Engine {
                                     return;
                                 }
                             }
-                            let after = recovery_shared.account_state.monitoring_snapshot();
+                            let (after_recovery_pending, after_routine_cancel_audits) =
+                                recovery_shared.account_state.pending_order_audit_counts();
                             completed_recoveries = completed_recoveries.saturating_add(
                                 u64::try_from(
-                                    before
-                                        .recovery_pending_orders
-                                        .saturating_sub(after.recovery_pending_orders),
+                                    before_recovery_pending
+                                        .saturating_sub(after_recovery_pending),
                                 )
                                 .unwrap_or(u64::MAX),
                             );
@@ -8733,11 +8733,11 @@ impl Engine {
                                 }
                             } else {
                                 warned_pending_ids.clear();
-                                if after.routine_cancel_audits > 0 {
+                                if after_routine_cancel_audits > 0 {
                                     log::debug!(
                                         "[Engine] Polymarket account={} routine cancel audits still pending: {} order(s)",
                                         recovery_account_id,
-                                        after.routine_cancel_audits,
+                                        after_routine_cancel_audits,
                                     );
                                 }
                             }
@@ -9254,7 +9254,7 @@ impl Engine {
                                         }
                                     }
                                     for account in &monitoring_accounts {
-                                        let snapshot = account.monitoring_snapshot();
+                                        let snapshot = account.monitoring_snapshot_fast();
                                         let reservation_acquisitions = snapshot
                                             .reservation_control_lock
                                             .acquisitions
