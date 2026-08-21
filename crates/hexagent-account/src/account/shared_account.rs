@@ -2950,8 +2950,8 @@ pub struct SharedAccount {
     /// account state merely to discover there is nothing to remove.
     unresolved_trade_keys: ShardedRouteMap,
     /// Authoritative live rewind anchors. MATCHED trade edges update this
-    /// small map under the shared control gate and enqueue one typed WAL row;
-    /// they never clone or reconcile the aggregate account.
+    /// small map and enqueue one typed WAL row; they never wait for, clone or
+    /// reconcile the aggregate account.
     unresolved_trade_match_times_fast: RwLock<BTreeMap<String, u64>>,
     /// Serializes the rare mark/resolve transition so a corrected replay
     /// cannot race between the fast anomaly index and its durable row.
@@ -3046,6 +3046,16 @@ impl DerefMut for AccountStateGuard<'_> {
 
 impl Drop for AccountStateGuard<'_> {
     fn drop(&mut self) {
+        // Replay anchors may advance while this cold transaction holds the
+        // control writer. Fold the authoritative private-event map back into
+        // the aggregate immediately before any full snapshot can observe it;
+        // the typed WAL still preserves every ordered insert/remove.
+        self.state.unresolved_trade_match_times = self
+            .account
+            .unresolved_trade_match_times_fast
+            .read()
+            .unwrap()
+            .clone();
         if let Some(instance_id) = self.instance_scope.as_deref() {
             self.account.sync_state_to_virtual_account(
                 &mut self.state,
@@ -3117,8 +3127,6 @@ impl SharedAccount {
         }
         self.retired_order_audit_tombstones_fast
             .store(Arc::new(state.retired_order_audit_tombstones.clone()));
-        *self.unresolved_trade_match_times_fast.write().unwrap() =
-            state.unresolved_trade_match_times.clone();
     }
 
     #[inline]
@@ -6324,7 +6332,6 @@ impl SharedAccount {
     }
 
     pub fn recovery_pending_order_ids(&self) -> Vec<String> {
-        let _control = self.control_gate.read().unwrap();
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending: Vec<String> = accounts
             .values()
@@ -6348,7 +6355,6 @@ impl SharedAccount {
     /// for their owner instance; quote admission continues under retained
     /// reservations while the worker retries metadata and exact private trades.
     pub fn pending_order_audit_ids(&self) -> Vec<String> {
-        let _control = self.control_gate.read().unwrap();
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending = HashSet::new();
         for account in accounts.values() {
@@ -6359,6 +6365,25 @@ impl SharedAccount {
         let mut pending: Vec<String> = pending.into_iter().collect();
         pending.sort();
         pending
+    }
+
+    /// Cheap recovery-worker observation over owner-local lifecycle shards.
+    /// This deliberately avoids the aggregate account transaction: polling a
+    /// safety work queue must not clone durable trade history or publish state
+    /// back into the private-event owner lane.
+    pub fn pending_order_audit_counts(&self) -> (usize, usize) {
+        let accounts = self.virtual_accounts.read().unwrap();
+        accounts.values().fold((0usize, 0usize), |counts, account| {
+            let lifecycle = account.lifecycle.lock().unwrap();
+            (
+                counts
+                    .0
+                    .saturating_add(lifecycle.recovery_pending_orders.len()),
+                counts
+                    .1
+                    .saturating_add(lifecycle.routine_cancel_audits.len()),
+            )
+        })
     }
 
     /// Diagnostic for terminal orders still missing a complete authoritative
@@ -6558,6 +6583,139 @@ impl SharedAccount {
                 .count(),
             recovery_pending_orders: state.recovery_pending_orders.len(),
             routine_cancel_audits: state.routine_cancel_audits.len(),
+            retired_trade_ownership_tombstones: self
+                .retired_trade_tombstone_count_fast
+                .load(Ordering::Relaxed),
+            verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
+            persistence_path: self.persistence.as_ref().map(|p| p.path.clone()),
+            persistence_error,
+            persistence_writes: persistence_metrics.0,
+            persistence_write_last_us: persistence_metrics.1,
+            persistence_write_max_us: persistence_metrics.2,
+            persistence_flushes: persistence_metrics.3,
+            persistence_flush_last_us: persistence_metrics.4,
+            persistence_flush_max_us: persistence_metrics.5,
+            account_lock_wait_last_us: self.account_lock_wait_last_us.load(Ordering::Relaxed),
+            account_lock_wait_max_us: self.account_lock_wait_max_us.load(Ordering::Relaxed),
+            account_lock_hold_last_us: self.account_lock_hold_last_us.load(Ordering::Relaxed),
+            account_lock_hold_max_us: self.account_lock_hold_max_us.load(Ordering::Relaxed),
+            account_lock_acquisitions: self.account_lock_acquisitions.load(Ordering::Relaxed),
+            reservation_control_lock: self.reservation_control_lock.snapshot(),
+            reservation_coid_route_lock: self.reservation_coid_route_lock.snapshot(),
+            reservation_oid_route_lock: self.reservation_oid_route_lock.snapshot(),
+            reservation_lifecycle_lock: self.reservation_lifecycle_lock.snapshot(),
+        }
+    }
+
+    /// Read-only operational snapshot for periodic logging and queue polling.
+    ///
+    /// Unlike [`Self::monitoring_snapshot`], this method never materializes
+    /// the virtual shards into the aggregate account and never publishes a
+    /// cold snapshot back into an owner lifecycle. Physical reconciliation
+    /// fields therefore reflect the latest completed cold transaction, while
+    /// virtual balances, reservations and pending-audit counts are read from
+    /// the live owner shards. It is observability-only and must not be used as
+    /// an admission or reconciliation authority.
+    pub fn monitoring_snapshot_fast(&self) -> AccountMonitoringSnapshot {
+        let persistence_error = self
+            .persistence
+            .as_ref()
+            .and_then(AccountPersistence::last_error);
+        let persistence_metrics = self
+            .persistence
+            .as_ref()
+            .map(AccountPersistence::metrics)
+            .unwrap_or_default();
+        let ledger_generation = self.ledger_generation_fast.load(Ordering::Acquire);
+        let accounts: Vec<Arc<VirtualAccount>> = self
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let mut virtual_positions = HashMap::<String, f64>::new();
+        let mut reserved_positions = HashMap::<String, f64>::new();
+        let mut virtual_cash = 0.0;
+        let mut reserved_cash = 0.0;
+        let mut recovery_pending_orders = 0usize;
+        let mut routine_cancel_audits = 0usize;
+        let mut instances = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let (recovery_count, routine_count) = {
+                let lifecycle = account.lifecycle.lock().unwrap();
+                (
+                    lifecycle.recovery_pending_orders.len(),
+                    lifecycle.routine_cancel_audits.len(),
+                )
+            };
+            recovery_pending_orders = recovery_pending_orders.saturating_add(recovery_count);
+            routine_cancel_audits = routine_cancel_audits.saturating_add(routine_count);
+            let instance = account.ledger_snapshot();
+            let instance_reserved_positions = instance.total_reserved_positions();
+            let instance_reserved_cash = instance.total_reserved_cash();
+            virtual_cash += instance.cash;
+            reserved_cash += instance_reserved_cash;
+            for (token, qty) in &instance.positions {
+                *virtual_positions.entry(token.clone()).or_insert(0.0) += *qty;
+            }
+            for (token, qty) in &instance_reserved_positions {
+                *reserved_positions.entry(token.clone()).or_insert(0.0) += *qty;
+            }
+            instances.push(InstanceAccountSnapshot {
+                instance_id: account.instance_id.clone(),
+                weight: instance.weight,
+                ledger_generation,
+                cash: instance.cash,
+                positions: instance.positions,
+                reserved_cash: instance_reserved_cash,
+                reserved_positions: instance_reserved_positions,
+            });
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        AccountMonitoringSnapshot {
+            account_id: self.account_id.clone(),
+            seeded: self.seeded_fast.load(Ordering::Acquire),
+            physical_cash: state.physical_cash,
+            virtual_cash,
+            unallocated_cash: state.unallocated_cash,
+            physical_positions: state.physical_positions.clone(),
+            virtual_positions,
+            unallocated_positions: state.unallocated_positions.clone(),
+            provisional_position_owners: state.provisional_position_owners.clone(),
+            reserved_cash,
+            reserved_positions,
+            uncertain: self.uncertain_fast.load(Ordering::Acquire)
+                || persistence_error.is_some(),
+            uncertain_reason: persistence_error
+                .as_ref()
+                .map(|error| format!("account ledger persistence error: {error}"))
+                .or_else(|| state.uncertain_reason.clone()),
+            uncertain_since_ms: state.uncertain_since_ms,
+            instances,
+            gap_replay_last_pages: state.gap_replay_last_pages,
+            gap_replay_max_pages: state.gap_replay_max_pages,
+            gap_replay_total_pages: state.gap_replay_total_pages,
+            maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
+            maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
+            maintenance_queue_jobs: state.maintenance_queue_jobs,
+            pending_maintenance_operations: state
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .count(),
+            recovery_pending_orders,
+            routine_cancel_audits,
             retired_trade_ownership_tombstones: self
                 .retired_trade_tombstone_count_fast
                 .load(Ordering::Relaxed),
@@ -7449,11 +7607,9 @@ impl SharedAccount {
         if trade_key.is_empty() || match_time_secs == 0 {
             return;
         }
-        // Serialize against cold state publication without entering the
-        // aggregate state mutex. The typed writer makes this exact map entry
-        // durable, while the virtual trade WAL independently persists the
-        // lifecycle/economics that require the rewind anchor.
-        let _control = self.control_gate.read().unwrap();
+        // AccountStateGuard folds this map into concurrent cold full
+        // snapshots. The typed writer makes the exact entry durable while the
+        // virtual trade WAL independently persists lifecycle/economics.
         let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
         if anchors
             .get(trade_key)
@@ -7479,12 +7635,7 @@ impl SharedAccount {
         if trade_key.is_empty() {
             return;
         }
-        // Ordinary owned trades have no unresolved anchor. Keep that dominant
-        // path completely out of the account-wide control/state lock.
-        if self.unresolved_trade_keys.remove(trade_key).is_none() {
-            return;
-        }
-        let _control = self.control_gate.read().unwrap();
+        self.unresolved_trade_keys.remove(trade_key);
         let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
         if anchors.remove(trade_key).is_some() {
             let all_trades_resolved = anchors.is_empty();
@@ -17794,6 +17945,36 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         );
     }
 
+    #[test]
+    fn fast_monitoring_and_recovery_counts_do_not_materialize_aggregate_account() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-fast-monitoring",
+                "oid-fast-monitoring",
+                "UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        account.begin_order_recovery(["a-fast-monitoring"]);
+        let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
+        assert_eq!(account.pending_order_audit_counts(), (1, 0));
+        let snapshot = account.monitoring_snapshot_fast();
+        assert_eq!(snapshot.recovery_pending_orders, 1);
+        assert_eq!(snapshot.routine_cancel_audits, 0);
+        assert_eq!(snapshot.instances.len(), 2);
+        assert_eq!(snapshot.reserved_cash, 1.0);
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            aggregate_acquisitions,
+            "periodic monitoring must not enter the aggregate account transaction",
+        );
+    }
+
     fn remove_persistence_test_files(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(persistence_wal_path(path));
@@ -19940,11 +20121,20 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
 
     #[test]
     fn normal_trade_replay_anchor_mark_and_resolve_skip_aggregate_account() {
-        let account = seeded_account();
+        let account = Arc::new(seeded_account());
+        let cold_control = account.lock_state();
         let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
-        account.mark_unresolved_trade_match_time("ordinary-trade", 123);
-        assert_eq!(account.earliest_unresolved_trade_match_time(), Some(123));
-        account.resolve_unresolved_trade_match_time("ordinary-trade");
+        let worker_account = Arc::clone(&account);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_account.mark_unresolved_trade_match_time("ordinary-trade", 123);
+            worker_account.resolve_unresolved_trade_match_time("ordinary-trade");
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("replay-anchor updates must not wait for cold control publication");
+        drop(cold_control);
+        worker.join().unwrap();
         assert_eq!(account.earliest_unresolved_trade_match_time(), None);
         assert_eq!(
             account.account_lock_acquisitions.load(Ordering::Relaxed),
