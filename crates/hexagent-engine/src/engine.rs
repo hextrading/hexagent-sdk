@@ -9348,6 +9348,14 @@ impl Engine {
                                                 snapshot.account_id,
                                                 log_account(),
                                             );
+                                        } else {
+                                            info!(
+                                                "[account_metric] account={} {}",
+                                                snapshot.account_id,
+                                                log_account(),
+                                            );
+                                        }
+                                        if snapshot.uncertain || snapshot.persistence_error.is_some() {
                                             for instance in snapshot.instances {
                                                 let positions = account_metric_position_summary(&instance.positions);
                                                 let reserved_positions = account_metric_position_summary(&instance.reserved_positions);

@@ -11954,7 +11954,12 @@ impl SharedAccount {
         // Re-registration takes the write side, so once it returns an old
         // strategy mailbox can no longer mutate the replacement owner's
         // lifecycle even if it still held a previously queued request.
+        let route_wait_started = crate::latency::Instant::now();
         let owner_routes = self.settled_gc_owner_routes.read().unwrap();
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_route_wait",
+            route_wait_started,
+        );
         if !owner_routes.get(&instance_id).is_some_and(|route| {
             route.registration_id == registration_id
         }) {
@@ -11962,17 +11967,33 @@ impl SharedAccount {
                 "settled GC request has stale owner registration: instance={instance_id} registration={registration_id}",
             ));
         }
+        let control_wait_started = crate::latency::Instant::now();
         let control = self.control_gate.write().unwrap();
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_control_wait",
+            control_wait_started,
+        );
         let Some(account) = self.virtual_account(&instance_id) else {
             return Err(format!(
                 "settled GC request targets unknown instance `{instance_id}`",
             ));
         };
+        let state_wait_started = crate::latency::Instant::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_state_wait",
+            state_wait_started,
+        );
+        let lifecycle_wait_started = crate::latency::Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_lifecycle_wait",
+            lifecycle_wait_started,
+        );
+        let critical_started = crate::latency::Instant::now();
         let eligible = state
             .settled_audit_references
             .get(&condition_id)
@@ -11982,6 +12003,10 @@ impl SharedAccount {
                     && reference.asset_ids.iter().all(|token| tokens.contains(token))
             });
         if !eligible {
+            crate::latency::record(
+                "polymarket.account.settled_gc_owner_critical",
+                critical_started,
+            );
             return Ok(SettledGcCompletionCertificate {
                 request_id,
                 registration_id,
@@ -12134,6 +12159,10 @@ impl SharedAccount {
             reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
             trade_epoch: account.trade_epoch.load(Ordering::Acquire),
         };
+        crate::latency::record(
+            "polymarket.account.settled_gc_owner_critical",
+            critical_started,
+        );
         drop(lifecycle);
         drop(state);
         drop(control);
