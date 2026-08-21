@@ -2902,6 +2902,12 @@ pub struct SharedAccount {
     /// Successful ordinary events can skip the account-wide reconciliation
     /// lock unless their own key is known to need repair.
     anomalous_private_event_keys: RwLock<HashSet<String>>,
+    /// Immutable replay guards for retired zero-fill order lifecycle rows.
+    /// Polymarket emits an order row for every ordinary lifecycle edge, so a
+    /// membership check must never materialize the aggregate account merely
+    /// to consult this cold audit map. Cold control transactions publish the
+    /// complete map atomically when their state guard commits.
+    retired_order_audit_tombstones_fast: ArcSwap<HashMap<String, RetiredOrderAuditTombstone>>,
     /// Read-mostly membership mirror for sticky risk blockers.  Normal
     /// private fills clear a trade-scoped blocker defensively even though one
     /// was almost never installed.  Missing in this set is authoritative, so
@@ -3066,6 +3072,8 @@ impl SharedAccount {
             self.settled_token_values_generation_fast
                 .store(generation, Ordering::Release);
         }
+        self.retired_order_audit_tombstones_fast
+            .store(Arc::new(state.retired_order_audit_tombstones.clone()));
     }
 
     #[inline]
@@ -3089,6 +3097,7 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
             risk_blocker_sources_fast: RwLock::new(HashSet::new()),
             unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
@@ -3441,6 +3450,7 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
             risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
             private_anomaly_transition: Mutex::new(()),
@@ -7332,9 +7342,8 @@ impl SharedAccount {
         size_matched: f64,
     ) -> bool {
         let normalized = normalize_order_id(order_id);
-        let state = self.lock_state();
-        state
-            .retired_order_audit_tombstones
+        self.retired_order_audit_tombstones_fast
+            .load()
             .get(&normalized)
             .is_some_and(|audit| {
                 (audit.covers_any_zero_fill_size
@@ -19534,7 +19543,14 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         ));
         assert!(!account.is_uncertain());
         assert!(account.ownership_anomalies().is_empty());
+        let aggregate_acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
         assert!(account.retired_order_audit_covers("0xABCDEF", 10.0, 0.0));
+        assert!(!account.retired_order_audit_covers("0xMISSING", 10.0, 0.0));
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            aggregate_acquisitions,
+            "retired-order replay guards must not materialize the aggregate account",
+        );
         account.mark_private_order_event_anomaly(
             "0xabcdef",
             Some("a-123"),
