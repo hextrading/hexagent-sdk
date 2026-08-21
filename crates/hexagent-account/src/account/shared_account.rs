@@ -2235,12 +2235,94 @@ struct StaleVirtualTradeSnapshotWalEvidence {
     position_corrections: BTreeMap<String, f64>,
 }
 
+#[derive(Debug, Clone)]
+struct LedgerGenerationRegressionWalEvidence {
+    persistence_generation: u64,
+    previous_ledger_generation: u64,
+    regressed_ledger_generation: u64,
+}
+
 fn json_value_at_path<'a>(
     state: &'a serde_json::Value,
     path: &[String],
 ) -> Option<&'a serde_json::Value> {
     path.iter()
         .try_fold(state, |value, component| value.as_object()?.get(component))
+}
+
+fn ledger_generation_regression_wal_evidence(
+    record: &PersistenceWalRecord,
+    state_before: &serde_json::Value,
+) -> Vec<LedgerGenerationRegressionWalEvidence> {
+    let mut current = json_value_at_path(state_before, &["ledger_generation".to_string()])
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut evidence = Vec::new();
+    for change in &record.changes {
+        let PersistenceWalChange::Set { path, value } = change else {
+            continue;
+        };
+        if path.len() != 1 || path[0] != "ledger_generation" {
+            continue;
+        }
+        let Some(next) = value.as_u64() else {
+            continue;
+        };
+        if next < current {
+            evidence.push(LedgerGenerationRegressionWalEvidence {
+                persistence_generation: record.generation,
+                previous_ledger_generation: current,
+                regressed_ledger_generation: next,
+            });
+        }
+        current = next;
+    }
+    evidence
+}
+
+fn repair_regressed_trade_ledger_generation_from_wal(
+    account_id: &str,
+    state: &mut SharedAccountState,
+    evidence: &[LedgerGenerationRegressionWalEvidence],
+) -> bool {
+    let max_trade_generation = state
+        .trades
+        .values()
+        .map(|trade| trade.ledger_generation)
+        .max()
+        .unwrap_or(0);
+    if max_trade_generation <= state.ledger_generation || evidence.is_empty() {
+        return false;
+    }
+    let max_wal_proven_generation = evidence
+        .iter()
+        .map(|item| item.previous_ledger_generation)
+        .max()
+        .unwrap_or(0);
+    if max_trade_generation > max_wal_proven_generation {
+        return false;
+    }
+    let previous = state.ledger_generation;
+    state.ledger_generation = max_trade_generation;
+    let regressions: Vec<String> = evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}->{}",
+                item.persistence_generation,
+                item.previous_ledger_generation,
+                item.regressed_ledger_generation,
+            )
+        })
+        .collect();
+    log::warn!(
+        "[shared_account] account={} repaired regressed trade ledger generation {}->{} from WAL-proven high-water mark regressions={:?}",
+        account_id,
+        previous,
+        state.ledger_generation,
+        regressions,
+    );
+    true
 }
 
 fn economic_effects_match(left: &AccountEconomicState, right: &AccountEconomicState) -> bool {
@@ -2706,6 +2788,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
     let mut applied_generation = snapshot_generation;
     let mut incomplete_maintenance_cash = Vec::new();
     let mut stale_virtual_trade_snapshots = Vec::new();
+    let mut ledger_generation_regressions = Vec::new();
     let mut reader = std::io::BufReader::new(wal);
     let mut line_number = 0usize;
     loop {
@@ -2823,6 +2906,8 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         }
         stale_virtual_trade_snapshots
             .extend(stale_virtual_trade_snapshot_wal_evidence(&record, &state)?);
+        ledger_generation_regressions
+            .extend(ledger_generation_regression_wal_evidence(&record, &state));
         for change in record.changes.iter().cloned() {
             apply_persistence_wal_change(&mut state, change).map_err(|error| {
                 format!(
@@ -2854,6 +2939,11 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         &persisted.account_id,
         &mut persisted.state,
         &stale_virtual_trade_snapshots,
+    );
+    repair_regressed_trade_ledger_generation_from_wal(
+        &persisted.account_id,
+        &mut persisted.state,
+        &ledger_generation_regressions,
     );
     Ok(())
 }
@@ -4200,7 +4290,7 @@ impl SharedAccount {
         self.passive_admission_fast
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
-            .store(state.ledger_generation, Ordering::Release);
+            .fetch_max(state.ledger_generation, Ordering::AcqRel);
         *self.token_fee_configs_fast.write().unwrap() = state.token_fee_configs.clone();
     }
 
@@ -4337,7 +4427,7 @@ impl SharedAccount {
         self.passive_admission_fast
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
-            .store(state.ledger_generation, Ordering::Release);
+            .fetch_max(state.ledger_generation, Ordering::AcqRel);
         *self.token_fee_configs_fast.write().unwrap() = state.token_fee_configs.clone();
     }
 
@@ -13799,6 +13889,90 @@ mod tests {
         account.register_instance("b", 3.0);
         account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
         account
+    }
+
+    fn applied_trade_with_generation(generation: u64) -> AppliedTrade {
+        AppliedTrade {
+            ownership: TradeOwnership {
+                account_id: "acct".to_string(),
+                instance_id: "a".to_string(),
+                trade_key: "trade".to_string(),
+                client_order_id: "a-order".to_string(),
+                order_id: "oid".to_string(),
+                token_id: "UP".to_string(),
+                side: Side::Buy,
+                quantity: 1.0,
+                price: 0.5,
+                status: "CONFIRMED".to_string(),
+            },
+            booked: false,
+            physical_booked: false,
+            usdc_fee: 0.0,
+            shares_fee: 0.0,
+            virtual_fee_booked: false,
+            physical_fee_booked: false,
+            failed: false,
+            failure_reconciled: false,
+            is_maker: Some(true),
+            match_time_secs: 1,
+            ledger_generation: generation,
+        }
+    }
+
+    #[test]
+    fn control_snapshot_publication_cannot_regress_fast_ledger_generation() {
+        let account = SharedAccount::new("monotonic-ledger-generation");
+        account
+            .ledger_generation_fast
+            .store(12, Ordering::Release);
+        let mut stale = SharedAccountState::default();
+        stale.ledger_generation = 11;
+
+        account.publish_control_snapshots(&stale);
+
+        assert_eq!(
+            account.ledger_generation_fast.load(Ordering::Acquire),
+            12,
+        );
+    }
+
+    #[test]
+    fn wal_proven_ledger_generation_regression_is_repaired_without_masking_unknown_damage() {
+        let mut state = SharedAccountState::default();
+        state.ledger_generation = 12;
+        state
+            .trades
+            .insert("trade".to_string(), applied_trade_with_generation(12));
+        let state_before = serde_json::to_value(&state).unwrap();
+        let record = PersistenceWalRecord {
+            version: PERSISTENCE_WAL_VERSION,
+            account_id: "acct".to_string(),
+            generation: 42,
+            changes: vec![PersistenceWalChange::Set {
+                path: vec!["ledger_generation".to_string()],
+                value: serde_json::json!(11),
+            }],
+        };
+        let evidence = ledger_generation_regression_wal_evidence(&record, &state_before);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].previous_ledger_generation, 12);
+        assert_eq!(evidence[0].regressed_ledger_generation, 11);
+        state.ledger_generation = 11;
+
+        assert!(repair_regressed_trade_ledger_generation_from_wal(
+            "acct", &mut state, &evidence,
+        ));
+        assert_eq!(state.ledger_generation, 12);
+
+        state.ledger_generation = 11;
+        state.trades.insert(
+            "unproven".to_string(),
+            applied_trade_with_generation(13),
+        );
+        assert!(!repair_regressed_trade_ledger_generation_from_wal(
+            "acct", &mut state, &evidence,
+        ));
+        assert_eq!(state.ledger_generation, 11);
     }
 
     fn persisted_buy_reservation_state(
