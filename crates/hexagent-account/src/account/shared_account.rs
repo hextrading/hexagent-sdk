@@ -2918,12 +2918,11 @@ fn retired_trade_replay_wal_evidence(
 
 fn update_retired_trade_replay_wal_evidence(
     evidence: &mut [RetiredTradeReplayWalEvidence],
-    state_before: &serde_json::Value,
+    trades_before: &HashMap<String, AppliedTrade>,
     state_after: &serde_json::Value,
 ) -> Result<(), String> {
     for item in evidence {
         let trade_path = vec!["trades".to_string(), item.trade_key.clone()];
-        let before = json_value_at_path(state_before, &trade_path);
         let after = json_value_at_path(state_after, &trade_path);
         if let Some(value) = after {
             let trade: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
@@ -2947,13 +2946,7 @@ fn update_retired_trade_replay_wal_evidence(
             {
                 item.applied_trade = trade;
             }
-        } else if let Some(value) = before {
-            let trade: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
-                format!(
-                    "decode replayed trade `{}` before WAL retirement: {error}",
-                    item.trade_key,
-                )
-            })?;
+        } else if let Some(trade) = trades_before.get(&item.trade_key) {
             if trade.booked
                 && !trade.failed
                 && validate_owned_trade_replay(
@@ -2967,12 +2960,33 @@ fn update_retired_trade_replay_wal_evidence(
                 )
                 .is_ok()
             {
-                item.applied_trade = trade;
+                item.applied_trade = trade.clone();
                 item.re_compacted = true;
             }
         }
     }
     Ok(())
+}
+
+fn retired_trade_replay_trades_before(
+    evidence: &[RetiredTradeReplayWalEvidence],
+    state: &serde_json::Value,
+) -> Result<HashMap<String, AppliedTrade>, String> {
+    let mut trades = HashMap::with_capacity(evidence.len());
+    for item in evidence {
+        let path = vec!["trades".to_string(), item.trade_key.clone()];
+        let Some(value) = json_value_at_path(state, &path) else {
+            continue;
+        };
+        let trade = serde_json::from_value(value.clone()).map_err(|error| {
+            format!(
+                "decode replayed trade `{}` before WAL apply: {error}",
+                item.trade_key,
+            )
+        })?;
+        trades.insert(item.trade_key.clone(), trade);
+    }
+    Ok(trades)
 }
 
 fn json_value_at_path<'a>(
@@ -3848,7 +3862,8 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         retired_trade_replays.extend(retired_trade_replay_wal_evidence(&record, &state)?);
         ledger_generation_regressions
             .extend(ledger_generation_regression_wal_evidence(&record, &state));
-        let replay_state_before = (!retired_trade_replays.is_empty()).then(|| state.clone());
+        let replay_trades_before =
+            retired_trade_replay_trades_before(&retired_trade_replays, &state)?;
         for change in record.changes.iter().cloned() {
             apply_persistence_wal_change(&mut state, change).map_err(|error| {
                 format!(
@@ -3858,10 +3873,10 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
                 )
             })?;
         }
-        if let Some(state_before) = replay_state_before.as_ref() {
+        if !retired_trade_replays.is_empty() {
             update_retired_trade_replay_wal_evidence(
                 &mut retired_trade_replays,
-                state_before,
+                &replay_trades_before,
                 &state,
             )?;
         }
