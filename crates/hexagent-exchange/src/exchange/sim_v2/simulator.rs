@@ -14,7 +14,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::exchange::sim::per_event_rtt::EventRttOverride;
-use crate::types::{Exchange, Instrument, OrderStatus, OrderUpdate, Side, Signal};
+use crate::types::{Exchange, Instrument, OrderRequest, OrderStatus, OrderUpdate, Side, Signal};
 
 use super::clock::Scheduler;
 use super::event::{ReachAction, SimEvent};
@@ -165,6 +165,18 @@ pub struct SimV2Config {
     pub cancel_profile: Option<LatencyProfile>,
 }
 
+/// A potentially marketable order observed by the simulator's single writer
+/// from client emission through the matching-engine window. Entries are
+/// bounded by concurrent in-flight places and removed at engine admission or
+/// when their `TakerMatch` event runs.
+struct PendingTakerRace {
+    order: OrderRequest,
+    /// `None` until the order first becomes marketable. This prevents a limit
+    /// that starts outside the touch from being treated as a full race miss.
+    min_available_qty: Option<f64>,
+    observe_until_ns: u64,
+}
+
 pub struct Simulator {
     sched: Scheduler,
     feed: ServerFeed,
@@ -186,6 +198,8 @@ pub struct Simulator {
     race_enabled: bool,
     /// Matching uses only state observed by the simulated engine clock.
     causal_matching: bool,
+    /// Causal taker-race state, owned and mutated only by the simulator thread.
+    pending_taker_races: HashMap<String, PendingTakerRace>,
     /// Maker / taker race lookahead horizons (ns).
     maker_race_horizon_ns: u64,
     taker_race_horizon_ns: u64,
@@ -407,6 +421,7 @@ impl Simulator {
             dynamic_overhead_p99_sum_ms: 0.0,
             race_enabled,
             causal_matching: cfg.causal_matching,
+            pending_taker_races: HashMap::new(),
             maker_race_horizon_ns: cfg.maker_race_horizon_ns,
             taker_race_horizon_ns: cfg.taker_race_horizon_ns,
             base_taker_race_horizon_ns: cfg.taker_race_horizon_ns,
@@ -1265,6 +1280,39 @@ impl Simulator {
         (best_bid.is_finite() && best_ask.is_finite()).then(|| 0.5 * (best_bid + best_ask))
     }
 
+    fn observe_causal_taker_races(&mut self, now_ns: u64) {
+        let core = &self.core;
+        for pending in self.pending_taker_races.values_mut() {
+            if now_ns > pending.observe_until_ns {
+                continue;
+            }
+            let available = core.taker_available_qty(&pending.order);
+            pending.min_available_qty = match pending.min_available_qty {
+                Some(minimum) => Some(minimum.min(available)),
+                None if available > 0.0 => Some(available),
+                None => None,
+            };
+        }
+    }
+
+    /// Start the causal race clock when the client emits a place, not when the
+    /// order reaches the exchange. The outbound transit is the main interval
+    /// in which another taker can consume the touch that triggered our order.
+    fn begin_causal_taker_race(&mut self, order: &OrderRequest, t_emit: u64) {
+        if !self.causal_matching || !self.core.taker_race_enabled() {
+            return;
+        }
+        let available = self.core.taker_available_qty(order);
+        self.pending_taker_races.insert(
+            order.client_order_id.clone(),
+            PendingTakerRace {
+                order: order.clone(),
+                min_available_qty: (available > 0.0).then_some(available),
+                observe_until_ns: t_emit.saturating_add(self.taker_race_horizon_ns),
+            },
+        );
+    }
+
     fn step_feed(&mut self) -> Vec<OrderUpdate> {
         if let Some((when, ev)) = self.feed.next_server_event() {
             match ev {
@@ -1281,6 +1329,7 @@ impl Simulator {
                         None
                     };
                     let fills = self.core.on_orderbook_fwd(&ob, fwd_mid);
+                    self.observe_causal_taker_races(when);
                     self.observe_markout_book(&ob);
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
@@ -1360,6 +1409,26 @@ impl Simulator {
                             // so the book can move in-flight (natural taker miss).
                             let overhead = self.latency.sample_taker_overhead(when);
                             let match_at = when.saturating_add(overhead / 2);
+                            if self.causal_matching && self.core.taker_race_enabled() {
+                                let current = self.core.taker_available_qty(&o);
+                                let pending = self
+                                    .pending_taker_races
+                                    .entry(o.client_order_id.clone())
+                                    .or_insert_with(|| PendingTakerRace {
+                                        min_available_qty: (current > 0.0).then_some(current),
+                                        order: o.clone(),
+                                        observe_until_ns: when
+                                            .saturating_add(self.taker_race_horizon_ns),
+                                    });
+                                pending.observe_until_ns = pending.observe_until_ns.min(match_at);
+                                if when <= pending.observe_until_ns && current > 0.0 {
+                                    pending.min_available_qty = Some(
+                                        pending
+                                            .min_available_qty
+                                            .map_or(current, |minimum| minimum.min(current)),
+                                    );
+                                }
+                            }
                             self.sched.push(
                                 match_at,
                                 SimEvent::TakerMatch {
@@ -1370,6 +1439,7 @@ impl Simulator {
                                 },
                             );
                         } else {
+                            self.pending_taker_races.remove(&o.client_order_id);
                             // Maker race: peek the queue `maker_race_horizon` ahead
                             // (the book the resting order faces shortly after entry)
                             // for the q_ahead-init blend.
@@ -1432,11 +1502,21 @@ impl Simulator {
             } => {
                 // Re-match against the (now possibly moved) book: still crossing
                 // → taker fill; moved away → rests (miss) or cancels per type.
-                // Taker race: take the MIN available volume over EVERY book in
-                // the `(now, now+taker_race_horizon]` in-flight window -> tighter
-                // liquidity-recede check than a single endpoint snapshot.
-                self.prime_taker_window(&order.symbol, when, self.taker_race_horizon_ns);
-                let u = self.core.submit_order(&order, when);
+                // Causal mode consumes the minimum volume observed since this
+                // order was emitted by the client; legacy mode retains its
+                // post-match lookahead for byte-compatible experiments.
+                let causal_race_cap = if self.causal_matching {
+                    self.core.clear_next_books();
+                    self.pending_taker_races
+                        .remove(&order.client_order_id)
+                        .and_then(|pending| pending.min_available_qty)
+                } else {
+                    self.prime_taker_window(&order.symbol, when, self.taker_race_horizon_ns);
+                    None
+                };
+                let u = self
+                    .core
+                    .submit_order_with_taker_race_cap(&order, when, causal_race_cap);
                 let is_fill =
                     matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
                 // Filled taker: residual overhead/2 + L2 to the ack. Missed→rest:
@@ -1519,6 +1599,9 @@ impl Simulator {
     /// delivered to the strategy. Shared by the batched (one RTT) and
     /// split (per-action RTT) dispatch paths.
     fn dispatch_action(&mut self, action: ReachAction, t_emit: u64, l1: u64, l2: u64) {
+        if let ReachAction::Place(order) = &action {
+            self.begin_causal_taker_race(order, t_emit);
+        }
         let rtt = l1 + l2;
         let timed_out = rtt > self.client_timeout_ns;
         let reach = t_emit.saturating_add(l1);
@@ -1747,6 +1830,7 @@ mod tests {
             dynamic_overhead_p99_sum_ms: 0.0,
             race_enabled: false,
             causal_matching: false,
+            pending_taker_races: HashMap::new(),
             maker_race_horizon_ns: 0,
             taker_race_horizon_ns: 0,
             base_taker_race_horizon_ns: 0,
@@ -1828,6 +1912,7 @@ mod tests {
             dynamic_overhead_p99_sum_ms: 0.0,
             race_enabled: false,
             causal_matching: false,
+            pending_taker_races: HashMap::new(),
             maker_race_horizon_ns: 0,
             taker_race_horizon_ns: 0,
             base_taker_race_horizon_ns: 0,
@@ -1956,6 +2041,119 @@ mod tests {
             reduce_only: false,
             outcome_label: String::new(),
         })
+    }
+
+    #[test]
+    fn causal_taker_race_observes_outbound_transit() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.causal_matching = true;
+        sim.taker_race_horizon_ns = 950_000_000;
+        sim.core.configure_race(0.0, 1.0);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.62,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        let Signal::NewOrder(mut order) = place_signal("race") else {
+            unreachable!()
+        };
+        order.price = Some(0.7);
+        order.post_only = false;
+        let emit = 1_000_000_000;
+        sim.submit(&Signal::NewOrder(order), emit);
+
+        let pending = sim.pending_taker_races.get("race").unwrap();
+        assert_eq!(pending.min_available_qty, Some(100.0));
+        assert_eq!(pending.observe_until_ns, emit + 950_000_000);
+
+        // Another taker consumes most of the touch before our L1 reach. The
+        // causal cap must see that smaller quantity without future lookahead.
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.62,
+                quantity: 35.0,
+            }],
+            exchange_timestamp_ns: emit + 25_000_000,
+            local_timestamp_ns: emit + 25_000_000,
+        });
+        sim.observe_causal_taker_races(emit + 25_000_000);
+        assert_eq!(
+            sim.pending_taker_races
+                .get("race")
+                .unwrap()
+                .min_available_qty,
+            Some(35.0)
+        );
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+    }
+
+    #[test]
+    #[ignore = "focused release benchmark"]
+    fn benchmark_causal_taker_race_observation_latency() {
+        fn sample(depth: usize, iterations: usize) -> Vec<u64> {
+            let mut sim = sim_with_fixed_rtt(100);
+            sim.causal_matching = true;
+            sim.taker_race_horizon_ns = 950_000_000;
+            sim.core.configure_race(0.0, 1.0);
+            sim.core.on_orderbook(&OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: 0.62,
+                    quantity: 100.0,
+                }],
+                exchange_timestamp_ns: 1,
+                local_timestamp_ns: 1,
+            });
+            for index in 0..depth {
+                let Signal::NewOrder(mut order) = place_signal(&format!("race-{index}")) else {
+                    unreachable!()
+                };
+                order.price = Some(0.7);
+                order.post_only = false;
+                sim.submit(&Signal::NewOrder(order), 1_000_000_000);
+            }
+            assert_eq!(sim.pending_taker_races.len(), depth);
+
+            let mut samples = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let started = std::time::Instant::now();
+                sim.observe_causal_taker_races(1_025_000_000);
+                std::hint::black_box(&sim.pending_taker_races);
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            samples
+        }
+
+        fn describe(depth: usize, mut samples: Vec<u64>) {
+            samples.sort_unstable();
+            let at = |fraction: f64| {
+                samples[((samples.len() - 1) as f64 * fraction) as usize]
+            };
+            println!(
+                "SIMV2_TAKER_RACE_BENCH n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth={} overflow=0 boundary=observe_causal_taker_races",
+                samples.len(),
+                at(0.50),
+                at(0.99),
+                at(0.999),
+                samples.last().copied().unwrap_or(0),
+                depth,
+            );
+        }
+
+        const N: usize = 50_000;
+        describe(1, sample(1, N));
+        describe(8, sample(8, N));
     }
 
     #[test]

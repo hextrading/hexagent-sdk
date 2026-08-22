@@ -3764,6 +3764,22 @@ impl Engine {
                 strat_replayers.push(r);
             }
         }
+        if !bt.market_data_health_replay_path.trim().is_empty() {
+            let path = PathBuf::from(bt.market_data_health_replay_path.trim());
+            let replayer = MarketReplayer::from_market_data_health_csv(
+                &path,
+                start_dt,
+                end_dt,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot load market_data_health_replay_path {}: {}",
+                    path.display(),
+                    error,
+                )
+            })?;
+            strat_replayers.push(replayer);
+        }
         for (_exchange, symbol) in &replay_sources {
             let rtds_rest = match symbol.strip_prefix("rtds:") {
                 Some(r) => r,
@@ -4890,6 +4906,9 @@ impl Engine {
                         MarketEvent::Disconnected { exchange, reason } => {
                             strategy.on_disconnected(*exchange, reason);
                             Vec::new()
+                        }
+                        MarketEvent::MarketDataHealth(health) => {
+                            strategy.on_market_data_health(health)
                         }
                         _ => Vec::new(),
                     };

@@ -44,7 +44,7 @@ fn market_event_schema() -> Schema {
         Field::new("timestamp_ns", DataType::UInt64, false),       // exchange timestamp
         Field::new("local_timestamp_ns", DataType::UInt64, false), // local receive timestamp
         Field::new("exchange", DataType::Utf8, false),
-        Field::new("event_type", DataType::Utf8, false),   // "orderbook", "trade", "quote", "instrument", "tick_size_change"
+        Field::new("event_type", DataType::Utf8, false),   // "orderbook", "trade", "quote", "instrument", "market_data_health", "tick_size_change"
         Field::new("symbol", DataType::Utf8, false),        // clob_token_id or symbol
         Field::new("side", DataType::Utf8, true),            // buy/sell (trades)
         Field::new("price", DataType::Float64, true),
@@ -228,6 +228,31 @@ impl ParquetBuffer {
         self.bids_json.push(None);
         self.asks_json.push(None);
         self.data_json.push(Some(serde_json::to_string(event).unwrap_or_default()));
+    }
+
+    fn push_market_data_health(
+        &mut self,
+        local_ts: u64,
+        exchange: &str,
+        symbol: &str,
+        event: &MarketEvent,
+    ) {
+        self.timestamp_ns.push(local_ts);
+        self.local_timestamp_ns.push(local_ts);
+        self.exchange.push(exchange.to_string());
+        self.event_type.push("market_data_health".to_string());
+        self.symbol.push(symbol.to_string());
+        self.side.push(None);
+        self.price.push(None);
+        self.quantity.push(None);
+        self.bid_price.push(None);
+        self.ask_price.push(None);
+        self.bid_qty.push(None);
+        self.ask_qty.push(None);
+        self.bids_json.push(None);
+        self.asks_json.push(None);
+        self.data_json
+            .push(Some(serde_json::to_string(event).unwrap_or_default()));
     }
 
     /// Asset-context row (`event_type = "asset_ctx"`): mark px in `price`,
@@ -615,6 +640,25 @@ impl MarketRecorder {
                     self.total_event_count += 1;
                 }
             }
+            MarketEvent::MarketDataHealth(health) => {
+                let ex = health.exchange.to_string();
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &health.symbol, health.local_timestamp_ns)
+                {
+                    self.rotate_buffer(&file_key);
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.push_market_data_health(
+                        health.local_timestamp_ns,
+                        &ex,
+                        &health.symbol,
+                        event,
+                    );
+                    self.total_event_count += 1;
+                }
+            }
             MarketEvent::Bar(bar) => {
                 if bar.is_closed {
                     let key = format!("{}/{}/{}", bar.exchange, bar.symbol, bar.interval);
@@ -660,7 +704,6 @@ impl MarketRecorder {
             }
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
-            | MarketEvent::MarketDataHealth(_)
             | MarketEvent::Exit => {}
         }
 
@@ -826,5 +869,35 @@ mod tests {
                 "column {} ({:?}) must be SNAPPY-compressed", ci, col.column_path(),
             );
         }
+    }
+
+    #[test]
+    fn market_data_health_row_preserves_complete_event() {
+        let event = MarketEvent::MarketDataHealth(crate::types::MarketDataHealth {
+            exchange: crate::types::Exchange::Polymarket,
+            market_id: "condition".to_string(),
+            symbol: "up-token".to_string(),
+            state: crate::types::MarketDataHealthState::Settling,
+            passive_ready: true,
+            taker_ready: false,
+            reason: "BBO checkpoint mismatch".to_string(),
+            local_timestamp_ns: 123,
+        });
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut buffer = ParquetBuffer::new(tempdir.path().join("health.parquet"));
+        buffer.push_market_data_health(123, "polymarket", "up-token", &event);
+
+        assert_eq!(buffer.event_type, vec!["market_data_health"]);
+        assert_eq!(buffer.symbol, vec!["up-token"]);
+        let decoded: MarketEvent = serde_json::from_str(
+            buffer.data_json[0].as_deref().expect("health JSON"),
+        )
+        .expect("decode health event");
+        let MarketEvent::MarketDataHealth(health) = decoded else {
+            panic!("decoded wrong event variant")
+        };
+        assert_eq!(health.market_id, "condition");
+        assert_eq!(health.state, crate::types::MarketDataHealthState::Settling);
+        assert!(!health.taker_ready);
     }
 }
