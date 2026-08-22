@@ -4672,6 +4672,9 @@ impl Engine {
             dynamic_markout_min_mult: bt.sim_v2_dynamic_markout_min_mult,
             dynamic_markout_max_mult: bt.sim_v2_dynamic_markout_max_mult,
             fill_push_mult: bt.sim_v2_fill_push_mult,
+            private_fill_p50_ms: bt.sim_v2_private_fill_p50_ms,
+            private_fill_p95_ms: bt.sim_v2_private_fill_p95_ms,
+            private_fill_p99_ms: bt.sim_v2_private_fill_p99_ms,
             matched_cant_cancel_window_ns: bt
                 .sim_matched_cant_cancel_window_ms
                 .saturating_mul(1_000_000),
@@ -4682,6 +4685,9 @@ impl Engine {
             dynamic_taker_overhead_by_event,
             maker_race_rate: bt.sim_v2_maker_race_rate,
             taker_race_rate: bt.sim_v2_taker_race_rate,
+            order_queue_position_strength: bt.sim_v2_order_queue_position_strength,
+            maker_toxicity_strength: bt.sim_v2_maker_toxicity_strength,
+            maker_toxicity_scale_ticks: bt.sim_v2_maker_toxicity_scale_ticks,
             maker_race_horizon_ns: bt.sim_v2_maker_race_horizon_ms.saturating_mul(1_000_000),
             taker_race_horizon_ns: bt.sim_v2_taker_race_horizon_ms.saturating_mul(1_000_000),
             fold_outcomes: bt.sim_v2_fold_outcomes,
@@ -5031,6 +5037,21 @@ impl Engine {
         if adv_adv > 0 {
             info!("  Sim v2:   adverse-sel tilt advanced queue on {} resyncs (cancel-attribution ahead_frac→1 on adverse mid moves)", adv_adv);
         }
+        let (own_positioned, own_initial, own_cancel_n, own_cancel_qty) =
+            sim.own_queue_position_stats();
+        if own_positioned > 0 || own_cancel_n > 0 {
+            info!(
+                "  Sim v2:   own FIFO positioned_orders={} initial_ahead_qty={:.4} cancel_advances={} cancel_advance_qty={:.4}",
+                own_positioned, own_initial, own_cancel_n, own_cancel_qty
+            );
+        }
+        let (toxicity_n, toxicity_qty) = sim.maker_toxicity_stats();
+        if toxicity_n > 0 {
+            info!(
+                "  Sim v2:   causal maker toxicity suppressed_fragments={} suppressed_qty={:.4} (fills stay at real limit)",
+                toxicity_n, toxicity_qty
+            );
+        }
         if let Some((n, mean, min, max)) = sim.dynamic_ahead_frac_stats() {
             info!(
                 "  Sim v2:   dynamic ahead_frac cancel-resyncs={} mean={:.3} range=[{:.3},{:.3}]",
@@ -5106,7 +5127,7 @@ impl Engine {
         }
         if bt.sim_v2_fill_audit {
             for a in sim.fill_audit_rows() {
-                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
+                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_own_q_init_sum={:.4} maker_own_cancel_queue_advance_qty={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
                     a.slug,
                     a.iid,
                     a.place_orders,
@@ -5120,12 +5141,15 @@ impl Engine {
                     a.maker_rests,
                     a.maker_rest_qty,
                     a.maker_q_init_sum,
+                    a.maker_own_q_init_sum,
+                    a.maker_own_cancel_queue_advance_qty,
                     a.maker_race_added_q,
                     a.maker_replay_self_depth_credit,
                     a.maker_trade_matches,
                     a.maker_trade_qty,
                     a.maker_queue_drained_qty,
                     a.maker_candidate_qty,
+                    a.maker_toxicity_suppressed_qty,
                     a.maker_depletion_observed_qty,
                     a.maker_depletion_exec_qty,
                     a.maker_depletion_cancel_advance_qty,
@@ -5145,7 +5169,7 @@ impl Engine {
                 );
             }
             for a in sim.maker_order_audit_rows() {
-                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} q_init={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
                     a.slug,
                     a.iid,
                     a.coid,
@@ -5160,12 +5184,17 @@ impl Engine {
                     a.place_arrival_ns,
                     a.await_fresh_book,
                     a.visible_depth_at_entry,
+                    a.entry_mid,
+                    a.queue_seq,
                     a.q_init,
+                    a.simulated_own_ahead_qty,
+                    a.own_cancel_queue_advance_qty,
                     a.replay_self_depth_credit,
                     a.trade_match_n,
                     a.trade_match_qty,
                     a.queue_drained_qty,
                     a.candidate_qty,
+                    a.maker_toxicity_suppressed_qty,
                     a.depletion_observed_qty,
                     a.depletion_exec_qty,
                     a.depletion_cancel_advance_qty,
@@ -5177,6 +5206,8 @@ impl Engine {
                     a.fill_qty,
                     a.first_fill_ns,
                     a.last_fill_ns,
+                    a.first_fill_delivery_ns,
+                    a.last_fill_delivery_ns,
                     a.cancel_arrival_ns,
                     a.cancel_result,
                     a.q_ahead_final,

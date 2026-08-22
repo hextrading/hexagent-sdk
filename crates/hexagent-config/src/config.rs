@@ -354,6 +354,16 @@ pub struct BacktestConfig {
     /// when delivering fills back to the strategy (v1 calibrated ≈ 1.5).
     #[serde(default = "default_sim_v2_fill_push_mult")]
     pub sim_v2_fill_push_mult: f64,
+    /// sim_v2 only — independent private WebSocket fill-observation latency
+    /// anchors (ms). A non-positive p50 keeps the historical half-place-RTT
+    /// multiplier. Positive anchors isolate private-event timing from HTTP RTT
+    /// sampler state and should be calibrated from private/reconcile evidence.
+    #[serde(default)]
+    pub sim_v2_private_fill_p50_ms: f64,
+    #[serde(default)]
+    pub sim_v2_private_fill_p95_ms: f64,
+    #[serde(default)]
+    pub sim_v2_private_fill_p99_ms: f64,
     /// sim_v2 only — TAKER matching-engine overhead (ms) added on top of the
     /// (time-varying) place RTT for marketable/taker fills: a `status=matched`
     /// ack traverses the matching engine. Additive model: taker_rtt ≈
@@ -391,6 +401,12 @@ pub struct BacktestConfig {
     /// → adverse selection emerges (queue+book only, one-snapshot lookahead).
     #[serde(default = "default_sim_v2_maker_race_rate")]
     pub sim_v2_maker_race_rate: f64,
+    /// sim_v2 only — how strongly earlier simulated orders at the exact same
+    /// canonical CLOB level occupy FIFO queue ahead of a newly resting order.
+    /// 0 preserves the historical independent-order queues; 1 applies full
+    /// exchange-arrival FIFO. Earlier cancellations advance later orders.
+    #[serde(default)]
+    pub sim_v2_order_queue_position_strength: f64,
     /// sim_v2 only — ADVERSE-SELECTION conditioning of the cancel attribution
     /// (`ahead_frac`) ∈ [0,∞) (0 = off → pure proportional). Cancellations are
     /// informed: when the mid moves AGAINST a resting order between snapshots,
@@ -403,6 +419,15 @@ pub struct BacktestConfig {
     /// (`s = ±1`). Larger ⇒ a bigger move is needed to fully tilt ahead_frac.
     #[serde(default = "default_sim_v2_adverse_scale_ticks")]
     pub sim_v2_adverse_scale_ticks: f64,
+    /// sim_v2 only — causal maker selection against fills after a favorable
+    /// mid move since order entry. The eligible trade overflow is suppressed
+    /// in proportion to `strength * favorable_ticks / scale_ticks`, and the
+    /// suppressed quantity becomes queue-ahead uncertainty at the real limit.
+    /// Unlike forward markout this never peeks or reprices an execution.
+    #[serde(default)]
+    pub sim_v2_maker_toxicity_strength: f64,
+    #[serde(default = "default_sim_v2_maker_toxicity_scale_ticks")]
+    pub sim_v2_maker_toxicity_scale_ticks: f64,
     /// sim_v2 only — BOOK-THROUGH adverse fill rate ∈ [0,1] (0 = off, option C).
     /// When the contra side TOUCHES/crosses a resting order's price (bid:
     /// `eff_best_ask≤p`) AND a trade in the interval confirms a real match
@@ -903,6 +928,9 @@ fn default_sim_v2_adverse_sel_rate() -> f64 {
 fn default_sim_v2_adverse_scale_ticks() -> f64 {
     1.0
 }
+fn default_sim_v2_maker_toxicity_scale_ticks() -> f64 {
+    1.0
+}
 fn default_sim_v2_book_through_rate() -> f64 {
     0.0
 }
@@ -1027,6 +1055,9 @@ impl Default for BacktestConfig {
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
             sim_v2_dynamic_ahead_frac_strength: 0.0,
             sim_v2_fill_push_mult: default_sim_v2_fill_push_mult(),
+            sim_v2_private_fill_p50_ms: 0.0,
+            sim_v2_private_fill_p95_ms: 0.0,
+            sim_v2_private_fill_p99_ms: 0.0,
             sim_v2_taker_overhead_p50_ms: default_sim_v2_taker_overhead_p50_ms(),
             sim_v2_taker_overhead_p95_ms: default_sim_v2_taker_overhead_p95_ms(),
             sim_v2_taker_overhead_p99_ms: default_sim_v2_taker_overhead_p99_ms(),
@@ -1039,8 +1070,11 @@ impl Default for BacktestConfig {
                 default_sim_v2_dynamic_taker_overhead_min_samples(),
             sim_v2_dynamic_taker_overhead_blend: default_sim_v2_dynamic_taker_overhead_blend(),
             sim_v2_maker_race_rate: default_sim_v2_maker_race_rate(),
+            sim_v2_order_queue_position_strength: 0.0,
             sim_v2_adverse_sel_rate: default_sim_v2_adverse_sel_rate(),
             sim_v2_adverse_scale_ticks: default_sim_v2_adverse_scale_ticks(),
+            sim_v2_maker_toxicity_strength: 0.0,
+            sim_v2_maker_toxicity_scale_ticks: default_sim_v2_maker_toxicity_scale_ticks(),
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_unexplained_depletion_exec_rate: 0.0,
             sim_v2_replay_self_depth_rate: 0.0,

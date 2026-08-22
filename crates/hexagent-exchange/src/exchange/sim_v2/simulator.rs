@@ -79,6 +79,11 @@ pub struct SimV2Config {
     pub dynamic_markout_max_mult: f64,
     /// WS fill-push latency multiplier on the half-RTT.
     pub fill_push_mult: f64,
+    /// Independent private WebSocket fill-observation latency anchors (ms).
+    /// A non-positive p50 preserves the historical HTTP-derived path.
+    pub private_fill_p50_ms: f64,
+    pub private_fill_p95_ms: f64,
+    pub private_fill_p99_ms: f64,
     /// matched-can't-cancel window (ns).
     pub matched_cant_cancel_window_ns: u64,
     /// Per-event RTT override table (sim_rtt_mode="exact"); `None` = pooled.
@@ -93,6 +98,12 @@ pub struct SimV2Config {
     /// Maker/taker "race" rates in [0,1] (0 = off). See `exchange.rs`.
     pub maker_race_rate: f64,
     pub taker_race_rate: f64,
+    /// Earlier same-level simulated orders included in a new order's FIFO
+    /// queue position (0 = legacy independent orders, 1 = full own FIFO).
+    pub order_queue_position_strength: f64,
+    /// Causal suppression of favorable maker fills at the real limit.
+    pub maker_toxicity_strength: f64,
+    pub maker_toxicity_scale_ticks: f64,
     /// Maker / taker race lookahead horizons (ns): the entry / match peek looks
     /// this far ahead (0 = immediate next snapshot).
     pub maker_race_horizon_ns: u64,
@@ -322,6 +333,11 @@ impl Simulator {
         });
         let mut latency = LatencyModel::new(place, cancel, cfg.rho_cross, cfg.seed);
         latency.set_fill_push_mult(cfg.fill_push_mult);
+        latency.set_private_fill_anchors(
+            cfg.private_fill_p50_ms,
+            cfg.private_fill_p95_ms,
+            cfg.private_fill_p99_ms,
+        );
         // Censoring threshold for the per-event timeout-rate injection — must
         // equal the engine's timeout boundary (`rtt > client_timeout_ns`).
         latency.set_client_timeout_ms(cfg.client_timeout_ns as f64 / 1_000_000.0);
@@ -343,6 +359,11 @@ impl Simulator {
         core.configure_replay_self_depth(cfg.replay_self_depth_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
+        core.configure_order_queue_position(cfg.order_queue_position_strength);
+        core.configure_maker_toxicity(
+            cfg.maker_toxicity_strength,
+            cfg.maker_toxicity_scale_ticks,
+        );
         core.set_fold_outcomes(cfg.fold_outcomes);
         core.configure_book_stale_gate(cfg.book_stale_after_ns);
         core.configure_stale_resting_exchange_only(cfg.stale_resting_exchange_only);
@@ -626,6 +647,27 @@ impl Simulator {
     /// proportional baseline (diagnostic for `sim_v2_adverse_sel_rate`).
     pub fn adverse_advanced(&self) -> u64 {
         self.core.adverse_advanced
+    }
+
+    /// Per-order own FIFO diagnostics: positioned orders, initial own queue
+    /// quantity, later-order cancellation advances, and their summed quantity.
+    pub fn own_queue_position_stats(&self) -> (u64, f64, u64, f64) {
+        let c = &self.core;
+        (
+            c.own_queue_positioned_orders,
+            c.own_queue_initial_qty,
+            c.own_queue_cancel_advances_n,
+            c.own_queue_cancel_advance_qty,
+        )
+    }
+
+    /// Maker trade fragments/quantity suppressed by the causal favorable-move
+    /// selection model.
+    pub fn maker_toxicity_stats(&self) -> (u64, f64) {
+        (
+            self.core.maker_toxicity_suppressed_n,
+            self.core.maker_toxicity_suppressed_qty,
+        )
     }
 
     /// Dynamic ahead-fraction diagnostics: cancel-resync count, mean and range.
@@ -1205,6 +1247,8 @@ impl Simulator {
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
                         let deliver = when.saturating_add(push);
+                        self.core
+                            .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
                         self.sched.push(deliver, SimEvent::FillToStrategy(fill));
                     }
@@ -1228,6 +1272,8 @@ impl Simulator {
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
                         let deliver = when.saturating_add(push);
+                        self.core
+                            .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
                         self.sched.push(deliver, SimEvent::FillToStrategy(fill));
                     }
