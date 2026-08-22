@@ -2267,7 +2267,39 @@ impl SimExchangeV2 {
     }
 
     // ── order entry ──────────────────────────────────────────────
+    /// Fillable quantity for a taker order against the currently observed
+    /// canonical book, after replay self-depth removal. The simulator samples
+    /// this while a marketable order is inside the matching-engine window so a
+    /// causal race can retain the minimum liquidity seen before the match.
+    pub fn taker_available_qty(&self, o: &OrderRequest) -> f64 {
+        let (msym, mside, mprice) = self.match_view(o);
+        let is_market = matches!(o.order_type, OrderType::Market) || o.price.is_none();
+        let lim = if is_market { None } else { mprice };
+        let ladder = match mside {
+            Side::Buy => self.books.buy_ladder(&msym),
+            Side::Sell => self.books.sell_ladder(&msym),
+        };
+        self.replay_clean_taker_available(&o.instance_id, &msym, mside, &ladder, lim)
+    }
+
+    pub fn taker_race_enabled(&self) -> bool {
+        self.taker_race_rate > 0.0
+    }
+
     pub fn submit_order(&mut self, o: &OrderRequest, now_ns: u64) -> OrderUpdate {
+        self.submit_order_with_taker_race_cap(o, now_ns, None)
+    }
+
+    /// Submit with an optional one-order causal race observation. `cap` is the
+    /// minimum fillable quantity seen from exchange arrival through the
+    /// pre-match window. Passing it by value prevents a miss or cancel from
+    /// leaking race state into a later order.
+    pub fn submit_order_with_taker_race_cap(
+        &mut self,
+        o: &OrderRequest,
+        now_ns: u64,
+        causal_race_cap: Option<f64>,
+    ) -> OrderUpdate {
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.place_orders += 1;
             a.place_qty += o.quantity;
@@ -2332,7 +2364,7 @@ impl SimExchangeV2 {
             return self.rejected(o, now_ns, "invalid post-only order: order crosses book");
         }
         if marketable {
-            return self.take(o, &msym, mside, &ladder, lim, now_ns);
+            return self.take(o, &msym, mside, &ladder, lim, now_ns, causal_race_cap);
         }
         if is_market || matches!(o.order_type, OrderType::Fak | OrderType::Fok) {
             return self.cancelled(o, now_ns, o.quantity);
@@ -2352,6 +2384,7 @@ impl SimExchangeV2 {
         ladder: &[PriceLevel],
         lim: Option<f64>,
         now_ns: u64,
+        causal_race_cap: Option<f64>,
     ) -> OrderUpdate {
         let folded = msym != o.symbol;
         let raw_available = self.books.available_volume(msym, mside == Side::Buy, lim);
@@ -2393,7 +2426,8 @@ impl SimExchangeV2 {
             let requested = o.quantity;
             let is_buy = mside == Side::Buy;
             let mut race_cap = requested;
-            if let Some(mut next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+            let observed_avail = causal_race_cap.or_else(|| {
+                let mut next_avail = self.books.available_volume_next(msym, is_buy, lim)?;
                 if self.replay_self_taker_depth_rate > 0.0 {
                     // The future tape can contain the same historical live
                     // quotes too. Without exact historical order tuples, the
@@ -2401,6 +2435,9 @@ impl SimExchangeV2 {
                     // for the lookahead race leg.
                     next_avail = next_avail.min(now_available);
                 }
+                Some(next_avail)
+            });
+            if let Some(next_avail) = observed_avail {
                 if next_avail < now_available {
                     let eff = self.taker_race_rate * next_avail
                         + (1.0 - self.taker_race_rate) * now_available;
@@ -2455,10 +2492,14 @@ impl SimExchangeV2 {
             if self.taker_race_rate > 0.0 {
                 let before = rem;
                 let is_buy = mside == Side::Buy;
-                if let Some(mut next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+                let observed_avail = causal_race_cap.or_else(|| {
+                    let mut next_avail = self.books.available_volume_next(msym, is_buy, lim)?;
                     if self.replay_self_taker_depth_rate > 0.0 {
                         next_avail = next_avail.min(now_available);
                     }
+                    Some(next_avail)
+                });
+                if let Some(next_avail) = observed_avail {
                     if next_avail < now_available {
                         let eff = self.taker_race_rate * next_avail
                             + (1.0 - self.taker_race_rate) * now_available;
@@ -3976,6 +4017,22 @@ mod tests {
         assert_eq!(u.status, OrderStatus::PartiallyFilled);
         assert!((u.filled_quantity - 3.0).abs() < 1e-6, "fill {} != 3", u.filled_quantity);
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
+    }
+
+    #[test]
+    fn causal_taker_race_cap_does_not_require_a_future_book() {
+        let mut c = core();
+        c.configure_race(0.0, 1.0);
+        c.on_orderbook(&book("up", vec![(0.58, 10.0)], vec![(0.62, 25.0)]));
+        let o = order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit);
+        assert!((c.taker_available_qty(&o) - 25.0).abs() < 1e-9);
+
+        // The simulator observed a transient dip to seven shares between
+        // exchange arrival and match. No post-match next-book peek is present.
+        let u = c.submit_order_with_taker_race_cap(&o, 1, Some(7.0));
+        assert_eq!(u.status, OrderStatus::PartiallyFilled);
+        assert!((u.filled_quantity - 7.0).abs() < 1e-9);
+        assert_eq!(c.taker_race_capped, 1);
     }
 
     #[test]

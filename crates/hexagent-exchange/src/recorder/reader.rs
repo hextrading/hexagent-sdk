@@ -86,6 +86,122 @@ impl MarketReplayer {
         })
     }
 
+    /// Create a timestamp-ordered replayer from a CSV health sidecar.
+    ///
+    /// Schema:
+    /// `timestamp_ns,market_id,state,passive_ready,taker_ready,reason`
+    ///
+    /// This is intentionally a startup-only loader.  It is used to replay
+    /// legacy operational evidence that was logged separately from the market
+    /// parquet, while newly recorded tapes carry the same event natively.
+    pub fn from_market_data_health_csv(
+        path: &Path,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Self> {
+        let start_ns = start.timestamp_nanos_opt().unwrap_or(0) as u64;
+        let end_ns = end.timestamp_nanos_opt().unwrap_or(0) as u64;
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow!("cannot read health replay {}: {}", path.display(), error))?;
+        let mut rows = Vec::new();
+        for (line_index, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("timestamp_ns,") {
+                continue;
+            }
+            let fields: Vec<&str> = line.splitn(6, ',').map(str::trim).collect();
+            if fields.len() != 6 {
+                return Err(anyhow!(
+                    "{}:{} expected 6 health replay columns, found {}",
+                    path.display(),
+                    line_index + 1,
+                    fields.len(),
+                ));
+            }
+            let local_timestamp_ns = fields[0].parse::<u64>().map_err(|error| {
+                anyhow!(
+                    "{}:{} invalid timestamp_ns: {}",
+                    path.display(),
+                    line_index + 1,
+                    error,
+                )
+            })?;
+            if local_timestamp_ns < start_ns || local_timestamp_ns >= end_ns {
+                continue;
+            }
+            let state = match fields[2].to_ascii_lowercase().as_str() {
+                "healthy" => MarketDataHealthState::Healthy,
+                "settling" => MarketDataHealthState::Settling,
+                "repairing" => MarketDataHealthState::Repairing,
+                "degraded" => MarketDataHealthState::Degraded,
+                other => {
+                    return Err(anyhow!(
+                        "{}:{} invalid health state {}",
+                        path.display(),
+                        line_index + 1,
+                        other,
+                    ))
+                }
+            };
+            let parse_bool = |value: &str, name: &str| -> Result<bool> {
+                match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" => Ok(true),
+                    "false" | "0" => Ok(false),
+                    other => Err(anyhow!(
+                        "{}:{} invalid {} {}",
+                        path.display(),
+                        line_index + 1,
+                        name,
+                        other,
+                    )),
+                }
+            };
+            rows.push(ReplayRow {
+                local_timestamp_ns,
+                event: MarketEvent::MarketDataHealth(MarketDataHealth {
+                    exchange: Exchange::Polymarket,
+                    market_id: fields[1].to_string(),
+                    // Condition id is sufficient for strategy-local routing in
+                    // the single-thread backtest driver. Live/worker routing
+                    // continues to use the canonical token symbol from native
+                    // health events.
+                    symbol: String::new(),
+                    state,
+                    passive_ready: parse_bool(fields[3], "passive_ready")?,
+                    taker_ready: parse_bool(fields[4], "taker_ready")?,
+                    reason: fields[5].to_string(),
+                    local_timestamp_ns,
+                }),
+            });
+        }
+        rows.sort_by_key(|row| row.local_timestamp_ns);
+        if rows.is_empty() {
+            return Err(anyhow!(
+                "No MarketDataHealth rows found in {} for time range",
+                path.display(),
+            ));
+        }
+        let loaded_rows = rows.len() as u64;
+        info!(
+            "[Replayer] Loaded {} MarketDataHealth sidecar rows from {}",
+            loaded_rows,
+            path.display(),
+        );
+        Ok(Self {
+            files: Vec::new(),
+            file_cursor: 0,
+            rows,
+            row_cursor: 0,
+            start_ns,
+            end_ns,
+            event_count: 0,
+            source: format!("health-sidecar/{}", path.display()),
+            loaded_files: 1,
+            loaded_rows,
+            summary_logged: false,
+        })
+    }
+
     /// Load the next file's events into memory.
     fn load_next_file(&mut self) -> bool {
         while self.file_cursor < self.files.len() {
@@ -519,6 +635,10 @@ fn fast_parse_levels(b: &[u8]) -> Option<Vec<PriceLevel>> {
     }
 }
 
+fn parse_market_event_json(json: Option<&str>) -> Option<MarketEvent> {
+    serde_json::from_str::<MarketEvent>(json?).ok()
+}
+
 fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<ReplayRow>> {
     // Defensive size check before opening the parquet builder.
     // Zero-byte files appear at hour boundaries when the recorder
@@ -755,15 +875,21 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                     // Reconstruct from data_json
                     let json_str = data_json_col
                         .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
-                    if let Some(json) = json_str {
-                        if let Ok(evt) = serde_json::from_str::<MarketEvent>(json) {
-                            evt
-                        } else {
-                            continue;
-                        }
+                    if let Some(event) = parse_market_event_json(json_str) {
+                        event
                     } else {
                         continue;
                     }
+                }
+                "market_data_health" => {
+                    let json_str = data_json_col
+                        .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+                    let Some(event @ MarketEvent::MarketDataHealth(_)) =
+                        parse_market_event_json(json_str)
+                    else {
+                        continue;
+                    };
+                    event
                 }
                 _ => continue,
             };
@@ -782,6 +908,62 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_data_health_json_roundtrips_for_replay() {
+        let event = MarketEvent::MarketDataHealth(crate::types::MarketDataHealth {
+            exchange: Exchange::Polymarket,
+            market_id: "condition".to_string(),
+            symbol: "up-token".to_string(),
+            state: crate::types::MarketDataHealthState::Repairing,
+            passive_ready: true,
+            taker_ready: false,
+            reason: "repair in progress".to_string(),
+            local_timestamp_ns: 456,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded = parse_market_event_json(Some(&json)).expect("decode health event");
+        let MarketEvent::MarketDataHealth(health) = decoded else {
+            panic!("decoded wrong event variant")
+        };
+        assert_eq!(health.market_id, "condition");
+        assert_eq!(health.state, crate::types::MarketDataHealthState::Repairing);
+        assert_eq!(health.local_timestamp_ns, 456);
+    }
+
+    #[test]
+    fn market_data_health_csv_replays_in_timestamp_order_and_filters_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.csv");
+        std::fs::write(
+            &path,
+            concat!(
+                "timestamp_ns,market_id,state,passive_ready,taker_ready,reason\n",
+                "3000000000,cid,Healthy,true,true,recovered\n",
+                "1000000000,cid,Settling,true,false,bbo edge\n",
+                "5000000000,cid,Degraded,false,false,outside window\n",
+            ),
+        )
+        .unwrap();
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(4, 0).unwrap();
+        let mut replay = MarketReplayer::from_market_data_health_csv(&path, start, end).unwrap();
+        let (first_ts, first) = replay.next_event().unwrap().unwrap();
+        let (second_ts, second) = replay.next_event().unwrap().unwrap();
+        assert_eq!(first_ts, 1_000_000_000);
+        assert_eq!(second_ts, 3_000_000_000);
+        let MarketEvent::MarketDataHealth(first) = first else {
+            panic!("expected health event")
+        };
+        let MarketEvent::MarketDataHealth(second) = second else {
+            panic!("expected health event")
+        };
+        assert_eq!(first.state, MarketDataHealthState::Settling);
+        assert!(!first.taker_ready);
+        assert_eq!(second.state, MarketDataHealthState::Healthy);
+        assert!(second.taker_ready);
+        assert!(replay.next_event().unwrap().is_none());
+    }
 
     /// The custom order-book parser must produce **bit-identical** `f64` output
     /// to `serde_json::from_str::<Vec<PriceLevel>>` for every input — otherwise

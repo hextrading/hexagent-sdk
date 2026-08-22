@@ -339,6 +339,13 @@ pub struct BacktestConfig {
     /// Root directory containing recorded data (same as recording.output_dir).
     #[serde(default = "default_output_dir")]
     pub data_dir: String,
+    /// Optional CSV sidecar containing condition-scoped `MarketDataHealth`
+    /// events reconstructed outside the normal parquet tape.  The backtest
+    /// driver merges these rows into the strategy lane by local timestamp.
+    /// An empty path disables the sidecar; native health rows embedded in
+    /// parquet continue to replay independently.
+    #[serde(default)]
+    pub market_data_health_replay_path: String,
     /// sim_v2 only — cancel-attribution ahead-fraction (the single
     /// microstructure knob, design §5). `< 0` (default) = proportional model
     /// `q_ahead/level`; `[0,1]` pins the fraction of attributed cancels that
@@ -1067,6 +1074,7 @@ impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             data_dir: default_output_dir(),
+            market_data_health_replay_path: String::new(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
             sim_v2_dynamic_ahead_frac_strength: 0.0,
             sim_v2_fill_push_mult: default_sim_v2_fill_push_mult(),
