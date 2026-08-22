@@ -61,6 +61,9 @@ pub struct SimV2Config {
     /// Approximate leave-one-out correction for tapes containing this
     /// strategy's original live resting order.
     pub replay_self_depth_rate: f64,
+    /// Fraction of the sampled cancel L2 reserved for exchange-side matching
+    /// finality before the cancellation becomes effective. 0 = immediate.
+    pub cancel_finality_delay_frac: f64,
     /// Volume-neutral forward-markout adverse-reprice strength (0 = off). Keeps the
     /// full fill, settles it adverse toward the forward mid (peeked `horizon` ns
     /// ahead) → edge drops at preserved maker volume → the sim's maker-fill markout
@@ -153,6 +156,9 @@ pub struct Simulator {
     latency: LatencyModel,
     client_timeout_ns: u64,
     timeouts: u64,
+    cancel_finality_delay_frac: f64,
+    cancel_finality_delayed: u64,
+    cancel_finality_matched: u64,
     per_event_rtt: Option<HashMap<u64, EventRttOverride>>,
     dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
     last_dynamic_overhead_event: Option<u64>,
@@ -355,6 +361,13 @@ impl Simulator {
             latency,
             client_timeout_ns: cfg.client_timeout_ns,
             timeouts: 0,
+            cancel_finality_delay_frac: if cfg.cancel_finality_delay_frac.is_finite() {
+                cfg.cancel_finality_delay_frac.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: cfg.per_event_rtt,
             dynamic_taker_overhead_by_event: cfg.dynamic_taker_overhead_by_event,
             last_dynamic_overhead_event: None,
@@ -529,6 +542,12 @@ impl Simulator {
     /// (timeouts, matched_cant_cancel) for the summary.
     pub fn timeout_stats(&self) -> (u64, u64) {
         (self.timeouts, self.core.matched_cant_cancel)
+    }
+
+    /// (cancels whose exchange finality was delayed, those that matched before
+    /// the delayed finalization) for end-of-run calibration diagnostics.
+    pub fn cancel_finality_stats(&self) -> (u64, u64) {
+        (self.cancel_finality_delayed, self.cancel_finality_matched)
     }
 
     /// (post_only_rejects, post_only_seen) for the summary.
@@ -1279,8 +1298,25 @@ impl Simulator {
                         exchange,
                         client_order_id,
                     } => {
-                        let u = self.core.cancel_order(exchange, &client_order_id, when);
-                        self.deliver_ack(u, when.saturating_add(l2_ns), suppress_ack);
+                        let ack_deliver_ns = when.saturating_add(l2_ns);
+                        let delay_ns = ((l2_ns as f64) * self.cancel_finality_delay_frac)
+                            .round()
+                            .clamp(0.0, l2_ns as f64) as u64;
+                        if delay_ns == 0 {
+                            let u = self.core.cancel_order(exchange, &client_order_id, when);
+                            self.deliver_ack(u, ack_deliver_ns, suppress_ack);
+                        } else {
+                            self.cancel_finality_delayed += 1;
+                            self.sched.push(
+                                when.saturating_add(delay_ns),
+                                SimEvent::CancelFinalizes {
+                                    exchange,
+                                    client_order_id,
+                                    ack_deliver_ns,
+                                    suppress_ack,
+                                },
+                            );
+                        }
                     }
                     ReachAction::CancelAll { exchange, symbol } => {
                         let d = when.saturating_add(l2_ns);
@@ -1289,6 +1325,19 @@ impl Simulator {
                         }
                     }
                 }
+                Vec::new()
+            }
+            SimEvent::CancelFinalizes {
+                exchange,
+                client_order_id,
+                ack_deliver_ns,
+                suppress_ack,
+            } => {
+                let u = self.core.cancel_order(exchange, &client_order_id, when);
+                if u.status == OrderStatus::Filled {
+                    self.cancel_finality_matched += 1;
+                }
+                self.deliver_ack(u, ack_deliver_ns.max(when), suppress_ack);
                 Vec::new()
             }
             SimEvent::TakerMatch {
@@ -1571,7 +1620,9 @@ fn expand_signal(sig: &Signal) -> (Vec<ReachAction>, bool) {
 mod tests {
     use super::*;
     use crate::exchange::sim::latency::LatencyProfile;
-    use crate::types::{Exchange, OrderBookSnapshot, OrderRequest, OrderStatus, PriceLevel, Side};
+    use crate::types::{
+        Exchange, OrderBookSnapshot, OrderRequest, OrderStatus, PriceLevel, Side, TradeTick,
+    };
 
     /// Build a Simulator with an empty feed and a deterministic fixed RTT so
     /// ack-delivery timing is exact.
@@ -1600,6 +1651,9 @@ mod tests {
             latency,
             client_timeout_ns: 500_000_000,
             timeouts: 0,
+            cancel_finality_delay_frac: 0.0,
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -1677,6 +1731,9 @@ mod tests {
             latency,
             client_timeout_ns: 500_000_000,
             timeouts: 0,
+            cancel_finality_delay_frac: 0.0,
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -1832,6 +1889,106 @@ mod tests {
         assert_eq!(r2[0].status, OrderStatus::Accepted);
         assert_eq!(r2[0].timestamp_ns, emit + 100_000_000);
         assert!(sim.peek_when().is_none());
+    }
+
+    fn seed_front_order(sim: &mut Simulator, coid: &str) {
+        sim.core.configure_replay_self_depth(1.0);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![PriceLevel {
+                price: 0.6,
+                quantity: 10.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 0.62,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        let Signal::NewOrder(request) = place_signal(coid) else {
+            unreachable!()
+        };
+        assert_eq!(
+            sim.core.submit_order(&request, 2).status,
+            OrderStatus::Accepted
+        );
+        assert!(sim.core.order_symbol_side(coid).is_some());
+    }
+
+    fn cancel_signal(coid: &str, timestamp_ns: u64) -> Signal {
+        Signal::CancelOrder {
+            exchange: Exchange::Polymarket,
+            client_order_id: coid.into(),
+            instance_id: String::new(),
+            timestamp_ns,
+        }
+    }
+
+    #[test]
+    fn zero_cancel_finality_delay_preserves_immediate_cancel() {
+        let mut sim = sim_with_fixed_rtt(100);
+        seed_front_order(&mut sim, "a");
+        let emit = 1_000_000_000u64;
+        sim.submit(&cancel_signal("a", emit), emit);
+
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_none());
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 10.0,
+            side: Side::Sell,
+            exchange_timestamp_ns: emit + 75_000_000,
+            local_timestamp_ns: emit + 75_000_000,
+        });
+        assert!(fills.is_empty());
+        let ack = sim.step();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].status, OrderStatus::Cancelled);
+        assert_eq!(sim.cancel_finality_stats(), (0, 0));
+    }
+
+    #[test]
+    fn delayed_cancel_finality_allows_causal_match_within_sampled_l2() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.cancel_finality_delay_frac = 1.0;
+        seed_front_order(&mut sim, "a");
+        let emit = 1_000_000_000u64;
+        sim.submit(&cancel_signal("a", emit), emit);
+
+        // Cancel reaches the API lane at L1 but remains live through L2.
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_some());
+        assert_eq!(sim.peek_when(), Some(emit + 100_000_000));
+
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 10.0,
+            side: Side::Sell,
+            exchange_timestamp_ns: emit + 75_000_000,
+            local_timestamp_ns: emit + 75_000_000,
+        });
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::Filled);
+        let trade_id = fills[0].trade_id.clone();
+
+        // Finalization observes the immutable recent fill, then delivers the
+        // idempotent Filled resolution at the original RTT boundary.
+        assert!(sim.step().is_empty());
+        let ack = sim.step();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].status, OrderStatus::Filled);
+        assert_eq!(ack[0].trade_id, trade_id);
+        assert_eq!(sim.cancel_finality_stats(), (1, 1));
     }
 
     #[test]

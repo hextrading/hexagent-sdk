@@ -47,6 +47,15 @@ pub enum SimEvent {
     /// NewOrder/CancelOrderTimeout and will reconcile. Fills are always
     /// delivered (the strategy must learn of them).
     OrderReachesEngine { action: ReachAction, l2_ns: u64, suppress_ack: bool },
+    /// A cancel accepted by the API lane but not yet final in the matching
+    /// engine. `ack_deliver_ns` remains the original reach+L2 response time;
+    /// market events at the same timestamp win the scheduler tie.
+    CancelFinalizes {
+        exchange: Exchange,
+        client_order_id: String,
+        ack_deliver_ns: u64,
+        suppress_ack: bool,
+    },
     /// A marketable (taker) order's actual book-match, deferred to the MIDPOINT
     /// of the matching window (`when = reach + overhead/2`) so the book can move
     /// in-flight — a taker that no longer crosses by then naturally misses and

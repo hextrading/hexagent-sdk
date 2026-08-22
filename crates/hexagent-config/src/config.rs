@@ -425,6 +425,13 @@ pub struct BacktestConfig {
     /// bounded approximation once full live order tuples are available.
     #[serde(default)]
     pub sim_v2_replay_self_depth_rate: f64,
+    /// sim_v2 backtest only — fraction of the sampled cancel response leg (L2)
+    /// during which exchange matching may finish before cancel finality. The
+    /// cancel acknowledgement still arrives at the original sampled RTT. 0
+    /// preserves immediate cancellation at engine arrival exactly; 1 delays
+    /// finality to the response boundary.
+    #[serde(default)]
+    pub sim_v2_cancel_finality_delay_frac: f64,
     /// sim_v2 only — VOLUME-NEUTRAL forward-markout adverse reprice ∈ [0,∞) (0 =
     /// off). The sim fills makers symmetrically (markout ≈ 0); live makers are
     /// adversely selected (markout ≈ −0.75c at 1-5s). Keeps the full favorable
@@ -1037,6 +1044,7 @@ impl Default for BacktestConfig {
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_unexplained_depletion_exec_rate: 0.0,
             sim_v2_replay_self_depth_rate: 0.0,
+            sim_v2_cancel_finality_delay_frac: 0.0,
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
             sim_v2_fill_markout_horizon_ms: default_sim_v2_fill_markout_horizon_ms(),
             sim_v2_dynamic_fill_markout: false,

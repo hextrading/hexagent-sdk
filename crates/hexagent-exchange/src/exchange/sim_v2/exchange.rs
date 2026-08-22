@@ -98,6 +98,25 @@ struct MakerFill {
     fully: bool,
 }
 
+/// A possible maker fill caused by one shared same-level depletion event.
+/// Queue advancement is evaluated per order, but the execution volume that
+/// crosses the queue is a property of the public level and may be consumed
+/// only once across all of our orders at that level.
+struct DepletionCandidate {
+    match_symbol: String,
+    match_side_rank: u8,
+    match_price_tick: i64,
+    match_tick_bits: u64,
+    placed_ns: u64,
+    coid: String,
+    token: String,
+    side: Side,
+    iid: String,
+    price: f64,
+    potential: f64,
+    level_execution: f64,
+}
+
 /// Diagnostic-only attribution for one strategy instance in one binary event.
 /// Quantities are deliberately kept separate from decision counts: a gate that
 /// blocks many tiny probes is materially different from one that suppresses a
@@ -127,6 +146,7 @@ pub struct FillAuditRow {
     pub maker_depletion_exec_qty: f64,
     pub maker_depletion_cancel_advance_qty: f64,
     pub maker_depletion_candidate_qty: f64,
+    pub maker_depletion_budget_suppressed_qty: f64,
     pub maker_depletion_fill_qty: f64,
     pub maker_fill_qty: f64,
     pub stale_trade_matches: u64,
@@ -171,6 +191,7 @@ pub struct MakerOrderAuditRow {
     pub depletion_exec_qty: f64,
     pub depletion_cancel_advance_qty: f64,
     pub depletion_candidate_qty: f64,
+    pub depletion_budget_suppressed_qty: f64,
     pub depletion_fill_qty: f64,
     pub book_through_candidate_qty: f64,
     pub book_through_fill_qty: f64,
@@ -1034,7 +1055,7 @@ impl SimExchangeV2 {
         let slugs = &self.event_slug_by_token;
         let audits = &mut self.fill_audit;
         let order_audits = &mut self.maker_order_audit;
-        let mut mfills: Vec<MakerFill> = Vec::new();
+        let mut candidates: Vec<DepletionCandidate> = Vec::new();
         for (coid, o) in self.orders.iter_mut() {
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
@@ -1127,32 +1148,22 @@ impl SimExchangeV2 {
                 }
             }
             if candidate > EPS {
-                o.remaining -= candidate;
-                let limit = o.request.price.unwrap_or(0.0);
-                if o.request.side == Side::Buy {
-                    o.locked_usdc = limit * o.remaining;
-                }
-                if audit_enabled {
-                    if let Some(a) = order_audits.get_mut(coid) {
-                        a.depletion_fill_qty += candidate;
-                        a.remaining_final = o.remaining;
-                    }
-                    if let Some(slug) = slugs.get(&o.request.symbol) {
-                        let key = (slug.clone(), o.request.instance_id.clone());
-                        if let Some(a) = audits.get_mut(&key) {
-                            a.maker_depletion_fill_qty += candidate;
-                        }
-                    }
-                }
-                mfills.push(MakerFill {
+                candidates.push(DepletionCandidate {
+                    match_symbol: o.match_symbol.clone(),
+                    match_side_rank: match o.match_side {
+                        Side::Buy => 0,
+                        Side::Sell => 1,
+                    },
+                    match_price_tick: (o.match_price / o.tick).round() as i64,
+                    match_tick_bits: o.tick.to_bits(),
+                    placed_ns: o.placed_ns,
                     coid: coid.clone(),
                     token: o.request.symbol.clone(),
                     side: o.request.side,
                     iid: o.request.instance_id.clone(),
-                    fill: candidate,
-                    price: limit,
-                    remaining_after: o.remaining,
-                    fully: o.remaining <= EPS,
+                    price: o.request.price.unwrap_or(0.0),
+                    potential: candidate,
+                    level_execution: execution,
                 });
             }
             // Own depth cannot survive after it disappears from the replayed
@@ -1167,6 +1178,89 @@ impl SimExchangeV2 {
                 o.mid_at_sync = mid_now;
             }
             o.traded_since_sync = 0.0;
+        }
+
+        // One public level depletion supplies one execution budget even when
+        // several of our orders observe it. Allocate only the fill overflow in
+        // exchange-arrival FIFO order; queue advancement above was correctly
+        // applied to every queue position. The max (rather than sum) handles
+        // orders whose sync anchors differ without manufacturing volume.
+        candidates.sort_by(|a, b| {
+            a.match_symbol
+                .cmp(&b.match_symbol)
+                .then(a.match_side_rank.cmp(&b.match_side_rank))
+                .then(a.match_tick_bits.cmp(&b.match_tick_bits))
+                .then(a.match_price_tick.cmp(&b.match_price_tick))
+                .then(a.placed_ns.cmp(&b.placed_ns))
+                .then(a.coid.cmp(&b.coid))
+        });
+        let same_level = |a: &DepletionCandidate, b: &DepletionCandidate| {
+            a.match_symbol == b.match_symbol
+                && a.match_side_rank == b.match_side_rank
+                && a.match_tick_bits == b.match_tick_bits
+                && a.match_price_tick == b.match_price_tick
+        };
+        let mut mfills: Vec<MakerFill> = Vec::new();
+        let mut begin = 0usize;
+        while begin < candidates.len() {
+            let mut end = begin + 1;
+            while end < candidates.len() && same_level(&candidates[begin], &candidates[end]) {
+                end += 1;
+            }
+            let mut budget = candidates[begin..end]
+                .iter()
+                .map(|candidate| candidate.level_execution)
+                .fold(0.0, f64::max);
+            for candidate in &candidates[begin..end] {
+                let actual = candidate.potential.min(budget);
+                budget = (budget - actual).max(0.0);
+                let suppressed = (candidate.potential - actual).max(0.0);
+                if audit_enabled && suppressed > EPS {
+                    if let Some(a) = order_audits.get_mut(&candidate.coid) {
+                        a.depletion_budget_suppressed_qty += suppressed;
+                    }
+                    if let Some(slug) = slugs.get(&candidate.token) {
+                        let key = (slug.clone(), candidate.iid.clone());
+                        if let Some(a) = audits.get_mut(&key) {
+                            a.maker_depletion_budget_suppressed_qty += suppressed;
+                        }
+                    }
+                }
+                if actual <= EPS {
+                    continue;
+                }
+                let Some(o) = self.orders.get_mut(&candidate.coid) else {
+                    continue;
+                };
+                let fill = actual.min(o.remaining);
+                o.remaining -= fill;
+                if o.request.side == Side::Buy {
+                    o.locked_usdc = candidate.price * o.remaining;
+                }
+                if audit_enabled {
+                    if let Some(a) = order_audits.get_mut(&candidate.coid) {
+                        a.depletion_fill_qty += fill;
+                        a.remaining_final = o.remaining;
+                    }
+                    if let Some(slug) = slugs.get(&candidate.token) {
+                        let key = (slug.clone(), candidate.iid.clone());
+                        if let Some(a) = audits.get_mut(&key) {
+                            a.maker_depletion_fill_qty += fill;
+                        }
+                    }
+                }
+                mfills.push(MakerFill {
+                    coid: candidate.coid.clone(),
+                    token: candidate.token.clone(),
+                    side: candidate.side,
+                    iid: candidate.iid.clone(),
+                    fill,
+                    price: candidate.price,
+                    remaining_after: o.remaining,
+                    fully: o.remaining <= EPS,
+                });
+            }
+            begin = end;
         }
         self.adverse_advanced += advanced;
         self.dynamic_ahead_frac_n += dynamic_n;
@@ -2238,6 +2332,7 @@ impl SimExchangeV2 {
                         depletion_exec_qty: 0.0,
                         depletion_cancel_advance_qty: 0.0,
                         depletion_candidate_qty: 0.0,
+                        depletion_budget_suppressed_qty: 0.0,
                         depletion_fill_qty: 0.0,
                         book_through_candidate_qty: 0.0,
                         book_through_fill_qty: 0.0,
@@ -3788,6 +3883,61 @@ mod tests {
         assert!(!c.orders.contains_key("a"));
         assert_eq!(c.orders["b"].remaining, 5.0);
         assert_eq!(c.orders["b"].q_ahead, 0.0);
+    }
+
+    #[test]
+    fn same_level_depletion_execution_budget_fills_once_in_arrival_order() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book(
+            "up",
+            vec![(0.55, 5.0)],
+            vec![(0.57, 100.0)],
+        ));
+
+        // Reverse lexical coids prove allocation follows exchange arrival,
+        // not BTreeMap/coid order. Both approximate leave-one-out queues reach
+        // zero, but the public level supplied only five execution shares.
+        assert_eq!(
+            c.submit_order(
+                &order("z-older", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("a-newer", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].client_order_id, "z-older");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert!(!c.orders.contains_key("z-older"));
+        assert_eq!(c.orders["a-newer"].remaining, 5.0);
+        assert_eq!(c.orders["a-newer"].q_ahead, 0.0);
+
+        let newer = c
+            .maker_order_audit_rows()
+            .into_iter()
+            .find(|row| row.coid == "a-newer")
+            .unwrap();
+        assert_eq!(newer.depletion_candidate_qty, 5.0);
+        assert_eq!(newer.depletion_budget_suppressed_qty, 5.0);
+        assert_eq!(newer.depletion_fill_qty, 0.0);
     }
 
     /// Focused hot-section evidence for changes to `resync_queues`. Run with:
