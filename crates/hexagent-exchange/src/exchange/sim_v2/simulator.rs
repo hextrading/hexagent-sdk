@@ -58,13 +58,18 @@ pub struct SimV2Config {
     /// Maximum fraction of adverse, unexplained same-level depletion treated as
     /// hidden execution volume. 0 keeps cancel-only attribution result-neutral.
     pub unexplained_depletion_exec_rate: f64,
+    /// Deterministic fraction of orders whose maker executions retain
+    /// an exchange-side residual small enough for 99%-coverage release.
+    pub inferred_maker_residual_rate: f64,
+    pub inferred_maker_residual_fraction: f64,
     /// Approximate leave-one-out correction for tapes containing this
     /// strategy's original live resting order.
     pub replay_self_depth_rate: f64,
     /// Leave-one-out correction for taker sweeps on a self-contaminated tape.
     pub replay_self_taker_depth_rate: f64,
-    /// Fraction of the sampled cancel L2 reserved for exchange-side matching
-    /// finality before the cancellation becomes effective. 0 = immediate.
+    /// Multiplier of sampled cancel L2 reserved for exchange-side matching
+    /// finality before cancellation becomes effective. Values above 1 model
+    /// processing tails beyond the nominal response boundary.
     pub cancel_finality_delay_frac: f64,
     /// Volume-neutral forward-markout adverse-reprice strength (0 = off). Keeps the
     /// full fill, settles it adverse toward the forward mid (peeked `horizon` ns
@@ -377,6 +382,10 @@ impl Simulator {
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
+        core.configure_inferred_maker_residual(
+            cfg.inferred_maker_residual_rate,
+            cfg.inferred_maker_residual_fraction,
+        );
         core.configure_replay_self_depth(cfg.replay_self_depth_rate);
         core.configure_replay_self_taker_depth(cfg.replay_self_taker_depth_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
@@ -406,7 +415,7 @@ impl Simulator {
             client_timeout_ns: cfg.client_timeout_ns,
             timeouts: 0,
             cancel_finality_delay_frac: if cfg.cancel_finality_delay_frac.is_finite() {
-                cfg.cancel_finality_delay_frac.clamp(0.0, 1.0)
+                cfg.cancel_finality_delay_frac.clamp(0.0, 64.0)
             } else {
                 0.0
             },
@@ -716,6 +725,15 @@ impl Simulator {
     /// # maker fill fragments produced by unexplained L2 depletion.
     pub fn unexplained_depletion_fills(&self) -> u64 {
         self.core.unexplained_depletion_fills_n
+    }
+
+    /// Orders where a maker fill stopped at the configured inferred residual,
+    /// and total fill quantity withheld by that physical lifecycle model.
+    pub fn inferred_maker_residual_stats(&self) -> (u64, f64) {
+        (
+            self.core.inferred_maker_residual_orders_n,
+            self.core.inferred_maker_residual_qty,
+        )
     }
 
     /// Taker sweeps corrected by the same-instance leave-one-out book view and
@@ -1455,7 +1473,7 @@ impl Simulator {
                         let ack_deliver_ns = when.saturating_add(l2_ns);
                         let delay_ns = ((l2_ns as f64) * self.cancel_finality_delay_frac)
                             .round()
-                            .clamp(0.0, l2_ns as f64) as u64;
+                            .clamp(0.0, u64::MAX as f64) as u64;
                         if delay_ns == 0 {
                             let u = self.core.cancel_order(exchange, &client_order_id, when);
                             self.deliver_ack(u, ack_deliver_ns, suppress_ack);
@@ -2273,6 +2291,28 @@ mod tests {
         assert_eq!(ack[0].status, OrderStatus::Filled);
         assert_eq!(ack[0].trade_id, trade_id);
         assert_eq!(sim.cancel_finality_stats(), (1, 1));
+    }
+
+    #[test]
+    fn cancel_finality_multiplier_can_model_processing_beyond_response_l2() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.cancel_finality_delay_frac = 4.0;
+        seed_front_order(&mut sim, "a");
+        let emit = 1_000_000_000u64;
+        sim.submit(&cancel_signal("a", emit), emit);
+
+        // L1=50ms; four response legs add 200ms of exchange-side finality.
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_some());
+        assert_eq!(sim.peek_when(), Some(emit + 250_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_none());
+        let ack = sim.step();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].status, OrderStatus::Cancelled);
+        assert_eq!(ack[0].timestamp_ns, emit + 250_000_000);
+        assert_eq!(sim.cancel_finality_stats(), (1, 0));
     }
 
     #[test]

@@ -43,6 +43,12 @@ struct RestingOrder {
     locked_usdc: f64,
     /// Remaining (unfilled) quantity resting on the book.
     remaining: f64,
+    /// Exchange-side dust retained when a selected order is nearly exhausted
+    /// by maker matching. Public aggregate prints cannot identify whether this
+    /// individual residual was allocated, so it remains until cancel/retire.
+    /// 0 preserves exact historical full-fill behaviour.
+    inferred_residual_floor: f64,
+    inferred_residual_realized: bool,
     /// Tick size snapshot (avoids a self.tick borrow during re-sync).
     tick: f64,
     /// Shares ahead of us in the FIFO queue at our synthetic level (§5).
@@ -260,6 +266,8 @@ pub struct MakerOrderAuditRow {
     pub depletion_candidate_qty: f64,
     pub depletion_budget_suppressed_qty: f64,
     pub depletion_fill_qty: f64,
+    pub inferred_residual_floor: f64,
+    pub inferred_residual_suppressed_qty: f64,
     pub book_through_candidate_qty: f64,
     pub book_through_fill_qty: f64,
     pub book_markout_qty: f64,
@@ -280,6 +288,25 @@ fn flip(s: Side) -> Side {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     }
+}
+
+/// Stable, allocation-free [0,1) sample for a client order id. FNV-1a is
+/// sufficient here because this is deterministic cohort selection, not
+/// randomness or an execution hot-path probability draw.
+fn stable_order_sample(coid: &str) -> f64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in coid.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Avalanche the structured iid/timestamp/counter suffixes before taking
+    // the high 53 bits. Raw FNV high bits are biased for adjacent client ids.
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    ((hash >> 11) as f64) / ((1_u64 << 53) as f64)
 }
 
 /// Reprice only the favorable component of a maker fill toward the future
@@ -428,6 +455,12 @@ pub struct SimExchangeV2 {
     unexplained_depletion_exec_rate: f64,
     /// # maker fill fragments produced by unexplained depletion. Diagnostic.
     pub unexplained_depletion_fills_n: u64,
+    /// Deterministic share of orders whose inferred fills retain exchange-side
+    /// dust, plus the configured fraction of original order size.
+    inferred_maker_residual_rate: f64,
+    inferred_maker_residual_fraction: f64,
+    pub inferred_maker_residual_orders_n: u64,
+    pub inferred_maker_residual_qty: f64,
     /// Approximate leave-one-out fraction for a replay tape containing this
     /// strategy's original live order at the same level. 0 = ordinary clean
     /// tape; positive values subtract up to rate·remaining from queue-ahead.
@@ -633,6 +666,10 @@ impl SimExchangeV2 {
             book_through_fills_n: 0,
             unexplained_depletion_exec_rate: 0.0,
             unexplained_depletion_fills_n: 0,
+            inferred_maker_residual_rate: 0.0,
+            inferred_maker_residual_fraction: 0.0006,
+            inferred_maker_residual_orders_n: 0,
+            inferred_maker_residual_qty: 0.0,
             replay_self_depth_rate: 0.0,
             replay_self_taker_depth_rate: 0.0,
             taker_replay_self_sweeps_n: 0,
@@ -1046,6 +1083,15 @@ impl SimExchangeV2 {
         self.unexplained_depletion_exec_rate = rate.clamp(0.0, 1.0);
     }
 
+    /// Model the exchange/live-order split exposed by near-complete maker
+    /// matches: the strategy order manager releases at 99% cumulative coverage,
+    /// while a tiny residual can remain physically executable on the CLOB.
+    /// Selection is stable per client order id, so replay output is deterministic.
+    pub fn configure_inferred_maker_residual(&mut self, rate: f64, fraction: f64) {
+        self.inferred_maker_residual_rate = rate.clamp(0.0, 1.0);
+        self.inferred_maker_residual_fraction = fraction.clamp(0.0, 0.01);
+    }
+
     /// Configure approximate leave-one-out queue credit in [0,1]. This must be
     /// enabled only for a tape recorded while the replayed strategy was live.
     pub fn configure_replay_self_depth(&mut self, rate: f64) {
@@ -1260,6 +1306,8 @@ impl SimExchangeV2 {
         let mut haircut_n = 0u64;
         let mut haircut_qty = 0.0;
         let mut haircut_cost = 0.0;
+        let mut residual_orders_n = 0u64;
+        let mut residual_qty = 0.0;
         {
             let books = &self.books;
             let pend = &self.pend_cross;
@@ -1294,9 +1342,18 @@ impl SimExchangeV2 {
                 // Contra volume marketable at our limit (asks≤p for a buy).
                 let through = books.available_volume(&o.match_symbol, is_buy, Some(p));
                 let fillable = (through - o.q_ahead).max(0.0) * rate;
-                let fill = fillable.min(o.remaining);
+                let uncapped_fill = fillable.min(o.remaining);
+                let inferred_capacity =
+                    (o.remaining - o.inferred_residual_floor).max(0.0);
+                let fill = uncapped_fill.min(inferred_capacity);
+                let residual_suppressed = (uncapped_fill - fill).max(0.0);
                 if fill <= EPS {
                     continue;
+                }
+                if residual_suppressed > EPS {
+                    o.inferred_residual_realized = true;
+                    residual_orders_n += 1;
+                    residual_qty += residual_suppressed;
                 }
                 // The sweep consumes the queue ahead of us then takes our fill.
                 o.q_ahead = (o.q_ahead - through).max(0.0);
@@ -1319,6 +1376,7 @@ impl SimExchangeV2 {
                     accrue_order_exposure(a, now_ns, o.remaining + fill);
                     a.book_through_candidate_qty += fillable.min(o.remaining + fill);
                     a.book_through_fill_qty += fill;
+                    a.inferred_residual_suppressed_qty += residual_suppressed;
                     if price_penalty > 0.0 {
                         a.book_markout_qty += fill;
                         a.book_markout_cost_usdc += fill_cost;
@@ -1358,6 +1416,8 @@ impl SimExchangeV2 {
         self.book_fill_haircut_n += haircut_n;
         self.book_fill_haircut_qty += haircut_qty;
         self.book_fill_haircut_cost_usdc += haircut_cost;
+        self.inferred_maker_residual_orders_n += residual_orders_n;
+        self.inferred_maker_residual_qty += residual_qty;
         // Reset the trade-gate window for the next book interval.
         self.pend_cross.clear();
         if mfills.is_empty() {
@@ -1399,6 +1459,8 @@ impl SimExchangeV2 {
         let mut haircut_n = 0u64;
         let mut haircut_qty = 0.0;
         let mut haircut_cost = 0.0;
+        let mut residual_orders_n = 0u64;
+        let mut residual_qty = 0.0;
         for (coid, o) in self.orders.iter_mut() {
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
@@ -1588,7 +1650,19 @@ impl SimExchangeV2 {
                 let Some(o) = self.orders.get_mut(&candidate.coid) else {
                     continue;
                 };
-                let fill = actual.min(o.remaining);
+                let uncapped_fill = actual.min(o.remaining);
+                let inferred_capacity =
+                    (o.remaining - o.inferred_residual_floor).max(0.0);
+                let fill = uncapped_fill.min(inferred_capacity);
+                let residual_suppressed = (uncapped_fill - fill).max(0.0);
+                if fill <= EPS {
+                    continue;
+                }
+                if residual_suppressed > EPS {
+                    o.inferred_residual_realized = true;
+                    residual_orders_n += 1;
+                    residual_qty += residual_suppressed;
+                }
                 o.remaining -= fill;
                 let (effective_price, price_penalty) = maker_markout_reprice(
                     candidate.price,
@@ -1606,6 +1680,7 @@ impl SimExchangeV2 {
                     if let Some(a) = order_audits.get_mut(&candidate.coid) {
                         accrue_order_exposure(a, now_ns, o.remaining + fill);
                         a.depletion_fill_qty += fill;
+                        a.inferred_residual_suppressed_qty += residual_suppressed;
                         if price_penalty > 0.0 {
                             a.book_markout_qty += fill;
                             a.book_markout_cost_usdc += fill_cost;
@@ -1651,6 +1726,8 @@ impl SimExchangeV2 {
         self.book_fill_haircut_n += haircut_n;
         self.book_fill_haircut_qty += haircut_qty;
         self.book_fill_haircut_cost_usdc += haircut_cost;
+        self.inferred_maker_residual_orders_n += residual_orders_n;
+        self.inferred_maker_residual_qty += residual_qty;
         if mfills.is_empty() {
             Vec::new()
         } else {
@@ -1815,6 +1892,8 @@ impl SimExchangeV2 {
         let mut haircuts = 0u64;
         let mut toxicity_suppressed_n = 0u64;
         let mut toxicity_suppressed_qty = 0.0;
+        let mut residual_orders_n = 0u64;
+        let mut residual_qty = 0.0;
         let audit_slug = self.event_slug_by_token.get(symbol).cloned();
         let audits = &mut self.fill_audit;
         let order_audits = &mut self.maker_order_audit;
@@ -1891,7 +1970,19 @@ impl SimExchangeV2 {
                 0.0
             };
             let suppressed = candidate * suppress_frac;
-            let fill = (candidate - suppressed).max(0.0);
+            let uncapped_fill = (candidate - suppressed).max(0.0);
+            let inferred_capacity =
+                (o.remaining - o.inferred_residual_floor).max(0.0);
+            let fill = uncapped_fill.min(inferred_capacity);
+            let residual_suppressed = (uncapped_fill - fill).max(0.0);
+            if residual_suppressed > EPS && !o.inferred_residual_realized {
+                o.inferred_residual_realized = true;
+                residual_orders_n += 1;
+                residual_qty += residual_suppressed;
+                if let Some(a) = order_audits.get_mut(coid) {
+                    a.inferred_residual_suppressed_qty += residual_suppressed;
+                }
+            }
             if suppressed > EPS {
                 o.q_ahead += suppressed;
                 toxicity_suppressed_n += 1;
@@ -1954,6 +2045,8 @@ impl SimExchangeV2 {
         self.fill_haircut_n += haircuts;
         self.maker_toxicity_suppressed_n += toxicity_suppressed_n;
         self.maker_toxicity_suppressed_qty += toxicity_suppressed_qty;
+        self.inferred_maker_residual_orders_n += residual_orders_n;
+        self.inferred_maker_residual_qty += residual_qty;
     }
 
     fn apply_maker_fills(&mut self, mut fills: Vec<MakerFill>, now_ns: u64) -> Vec<OrderUpdate> {
@@ -2951,6 +3044,14 @@ impl SimExchangeV2 {
         }
         let locked = if o.side == Side::Buy { price * remaining } else { 0.0 };
         let mid0 = self.books.eff_mid(&msym);
+        let inferred_residual_floor = if self.inferred_maker_residual_rate > 0.0
+            && self.inferred_maker_residual_fraction > 0.0
+            && stable_order_sample(&o.client_order_id) < self.inferred_maker_residual_rate
+        {
+            (o.quantity * self.inferred_maker_residual_fraction).min(remaining)
+        } else {
+            0.0
+        };
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.maker_rests += 1;
             a.maker_rest_qty += remaining;
@@ -3005,6 +3106,8 @@ impl SimExchangeV2 {
                         depletion_candidate_qty: 0.0,
                         depletion_budget_suppressed_qty: 0.0,
                         depletion_fill_qty: 0.0,
+                        inferred_residual_floor,
+                        inferred_residual_suppressed_qty: 0.0,
                         book_through_candidate_qty: 0.0,
                         book_through_fill_qty: 0.0,
                         book_markout_qty: 0.0,
@@ -3031,6 +3134,8 @@ impl SimExchangeV2 {
                 match_price,
                 locked_usdc: locked,
                 remaining,
+                inferred_residual_floor,
+                inferred_residual_realized: false,
                 tick,
                 q_ahead,
                 own_q_ahead: simulated_own_ahead_qty,
@@ -4999,6 +5104,67 @@ mod tests {
         assert_eq!(cancel.filled_quantity, 5.0);
         assert_eq!(c.matched_cant_cancel, 1);
         assert_eq!(c.maker_order_audit_rows()[0].cancel_result, "matched_before_cancel");
+    }
+
+    #[test]
+    fn inferred_depletion_fill_retains_dust_across_aggregate_public_trade() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.configure_inferred_maker_residual(1.0, 0.001);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 5.0)],
+            vec![(0.57, 100.0)],
+            10,
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("dust", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                11,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        let inferred = c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+            100,
+        ));
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].status, OrderStatus::PartiallyFilled);
+        assert!((inferred[0].filled_quantity - 4.995).abs() < EPS);
+        assert!((inferred[0].remaining_quantity - 0.005).abs() < EPS);
+        assert!((c.orders["dust"].remaining - 0.005).abs() < EPS);
+        assert_eq!(c.inferred_maker_residual_orders_n, 1);
+        assert!((c.inferred_maker_residual_qty - 0.005).abs() < EPS);
+
+        // An aggregate public print cannot prove that this individual dust
+        // allocation completed, so it remains physically resting.
+        let explicit = c.on_trade_tick(&trade_ts(
+            "up",
+            Side::Sell,
+            0.55,
+            1.0,
+            150,
+        ));
+        assert!(explicit.is_empty());
+        assert!((c.orders["dust"].remaining - 0.005).abs() < EPS);
+        assert_eq!(c.inferred_maker_residual_orders_n, 1);
+        assert!((c.inferred_maker_residual_qty - 0.005).abs() < EPS);
+
+        let cancelled = c.cancel_order(Exchange::Polymarket, "dust", 200);
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert!(!c.orders.contains_key("dust"));
+
+        let row = &c.maker_order_audit_rows()[0];
+        assert!((row.inferred_residual_floor - 0.005).abs() < EPS);
+        assert!((row.inferred_residual_suppressed_qty - 0.005).abs() < EPS);
+        assert!((row.fill_qty - 4.995).abs() < EPS);
     }
 
     #[test]

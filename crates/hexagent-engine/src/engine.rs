@@ -4674,6 +4674,8 @@ impl Engine {
             adverse_scale_ticks: bt.sim_v2_adverse_scale_ticks,
             book_through_rate: bt.sim_v2_book_through_rate,
             unexplained_depletion_exec_rate: bt.sim_v2_unexplained_depletion_exec_rate,
+            inferred_maker_residual_rate: bt.sim_v2_inferred_maker_residual_rate,
+            inferred_maker_residual_fraction: bt.sim_v2_inferred_maker_residual_fraction,
             replay_self_depth_rate: bt.sim_v2_replay_self_depth_rate,
             replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
@@ -5092,6 +5094,13 @@ impl Engine {
         if depletion_fills > 0 {
             info!("  Sim v2:   unexplained-depletion maker fills: {} (residual L2 shrinkage treated as hidden execution)", depletion_fills);
         }
+        let (residual_orders, residual_qty) = sim.inferred_maker_residual_stats();
+        if residual_orders > 0 {
+            info!(
+                "  Sim v2:   inferred maker residuals: orders={} retained_qty={:.6} (exchange-side dust remains after 99%-coverage release)",
+                residual_orders, residual_qty
+            );
+        }
         let hc = sim.fill_haircuts();
         if hc > 0 {
             info!("  Sim v2:   forward-markout haircuts: {} favorable maker fills downweighted (markout → live −0.75c)", hc);
@@ -5222,7 +5231,7 @@ impl Engine {
                 );
             }
             for a in sim.maker_order_audit_rows() {
-                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} inferred_residual_floor={:.6} inferred_residual_suppressed_qty={:.6} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
                     a.slug,
                     a.iid,
                     a.coid,
@@ -5257,6 +5266,8 @@ impl Engine {
                     a.depletion_candidate_qty,
                     a.depletion_budget_suppressed_qty,
                     a.depletion_fill_qty,
+                    a.inferred_residual_floor,
+                    a.inferred_residual_suppressed_qty,
                     a.book_through_candidate_qty,
                     a.book_through_fill_qty,
                     a.book_markout_qty,
@@ -5369,6 +5380,10 @@ impl Engine {
                 sim.configure_book_through(bt.sim_v2_book_through_rate);
                 sim.configure_unexplained_depletion_execution(
                     bt.sim_v2_unexplained_depletion_exec_rate,
+                );
+                sim.configure_inferred_maker_residual(
+                    bt.sim_v2_inferred_maker_residual_rate,
+                    bt.sim_v2_inferred_maker_residual_fraction,
                 );
                 sim.configure_replay_self_depth(bt.sim_v2_replay_self_depth_rate);
                 sim.configure_replay_self_taker_depth(
