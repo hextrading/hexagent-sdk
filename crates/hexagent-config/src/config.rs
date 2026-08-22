@@ -450,6 +450,13 @@ pub struct BacktestConfig {
     /// bounded approximation once full live order tuples are available.
     #[serde(default)]
     pub sim_v2_replay_self_depth_rate: f64,
+    /// sim_v2 only — leave-one-out correction for TAKER sweeps replayed on a
+    /// tape recorded while the same strategy was live. At each canonical price
+    /// level, subtract this fraction of the replay instance's currently resting
+    /// opposite-side simulated quantity before testing marketability, sizing,
+    /// and pricing the taker fill. 0 preserves the recorded public book exactly.
+    #[serde(default)]
+    pub sim_v2_replay_self_taker_depth_rate: f64,
     /// sim_v2 backtest only — fraction of the sampled cancel response leg (L2)
     /// during which exchange matching may finish before cancel finality. The
     /// cancel acknowledgement still arrives at the original sampled RTT. 0
@@ -464,6 +471,14 @@ pub struct BacktestConfig {
     /// drops at preserved maker volume.
     #[serde(default = "default_sim_v2_fill_markout_vn")]
     pub sim_v2_fill_markout_vn: f64,
+    /// sim_v2 only — forward-markout adverse reprice for maker fills inferred
+    /// from book-through and unexplained-depletion queue transitions. These
+    /// fills previously bypassed `sim_v2_fill_markout_vn`, making the dominant
+    /// non-trade maker path systematically less adverse. Quantity and the real
+    /// resting limit remain unchanged; only favorable fills settle toward the
+    /// forward canonical mid. 0 preserves the historical path exactly.
+    #[serde(default)]
+    pub sim_v2_book_fill_markout_vn: f64,
     /// sim_v2 only — forward horizon (ms) at which the canonical mid is peeked
     /// for the markout haircut. Data: adverse selection is sharp at 1-5s.
     #[serde(default = "default_sim_v2_fill_markout_horizon_ms")]
@@ -1078,8 +1093,10 @@ impl Default for BacktestConfig {
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_unexplained_depletion_exec_rate: 0.0,
             sim_v2_replay_self_depth_rate: 0.0,
+            sim_v2_replay_self_taker_depth_rate: 0.0,
             sim_v2_cancel_finality_delay_frac: 0.0,
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
+            sim_v2_book_fill_markout_vn: 0.0,
             sim_v2_fill_markout_horizon_ms: default_sim_v2_fill_markout_horizon_ms(),
             sim_v2_dynamic_fill_markout: false,
             sim_v2_dynamic_markout_spot_vol: false,

@@ -61,6 +61,8 @@ pub struct SimV2Config {
     /// Approximate leave-one-out correction for tapes containing this
     /// strategy's original live resting order.
     pub replay_self_depth_rate: f64,
+    /// Leave-one-out correction for taker sweeps on a self-contaminated tape.
+    pub replay_self_taker_depth_rate: f64,
     /// Fraction of the sampled cancel L2 reserved for exchange-side matching
     /// finality before the cancellation becomes effective. 0 = immediate.
     pub cancel_finality_delay_frac: f64,
@@ -69,6 +71,9 @@ pub struct SimV2Config {
     /// ahead) → edge drops at preserved maker volume → the sim's maker-fill markout
     /// matches live's −0.75¢. See `exchange.rs`.
     pub fill_markout_vn: f64,
+    /// Forward-markout adverse reprice for maker fills inferred from book
+    /// depletion / book-through rather than an explicit public trade.
+    pub book_fill_markout_vn: f64,
     pub fill_markout_horizon_ns: u64,
     pub dynamic_fill_markout: bool,
     pub dynamic_markout_spot_vol: bool,
@@ -202,10 +207,12 @@ pub struct Simulator {
     dynamic_window_mult_max: f64,
     /// See `SimV2Config::use_batch_orders`.
     use_batch_orders: bool,
-    /// Forward horizon (ns) for the markout fill haircut; peek the canonical mid
-    /// this far past each trade. `markout_on` gates the peek (vn>0 && horizon>0).
+    /// Forward horizon (ns) for markout fill haircuts; peek the canonical mid
+    /// this far past each eligible trade/book event. Separate gates avoid any
+    /// future-book lookup on a disabled origin path.
     fill_markout_horizon_ns: u64,
     markout_on: bool,
+    book_markout_on: bool,
     base_fill_markout_vn: f64,
     dynamic_fill_markout: bool,
     dynamic_markout_spot_vol: bool,
@@ -357,7 +364,9 @@ impl Simulator {
         core.configure_book_through(cfg.book_through_rate);
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
         core.configure_replay_self_depth(cfg.replay_self_depth_rate);
+        core.configure_replay_self_taker_depth(cfg.replay_self_taker_depth_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
+        core.configure_book_fill_markout_vn(cfg.book_fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
         core.configure_order_queue_position(cfg.order_queue_position_strength);
         core.configure_maker_toxicity(
@@ -419,6 +428,8 @@ impl Simulator {
             use_batch_orders: cfg.use_batch_orders,
             fill_markout_horizon_ns: cfg.fill_markout_horizon_ns,
             markout_on: cfg.fill_markout_vn > 0.0 && cfg.fill_markout_horizon_ns > 0,
+            book_markout_on: cfg.book_fill_markout_vn > 0.0
+                && cfg.fill_markout_horizon_ns > 0,
             base_fill_markout_vn: cfg.fill_markout_vn.max(0.0),
             dynamic_fill_markout: cfg.dynamic_fill_markout,
             dynamic_markout_spot_vol: cfg.dynamic_markout_spot_vol,
@@ -692,9 +703,28 @@ impl Simulator {
         self.core.unexplained_depletion_fills_n
     }
 
+    /// Taker sweeps corrected by the same-instance leave-one-out book view and
+    /// the total public depth removed from those sweep ladders.
+    pub fn replay_self_taker_stats(&self) -> (u64, f64) {
+        (
+            self.core.taker_replay_self_sweeps_n,
+            self.core.taker_replay_self_depth_qty,
+        )
+    }
+
     /// # maker fills haircut by the forward-markout conditioning (diagnostic).
     pub fn fill_haircuts(&self) -> u64 {
         self.core.fill_haircut_n
+    }
+
+    /// Book/depletion maker fills repriced by forward markout, their quantity,
+    /// and the resulting settlement-cost increase in USDC.
+    pub fn book_fill_markout_stats(&self) -> (u64, f64, f64) {
+        (
+            self.core.book_fill_haircut_n,
+            self.core.book_fill_haircut_qty,
+            self.core.book_fill_haircut_cost_usdc,
+        )
     }
 
     /// Distribution of maker initial queue length (`q_ahead` at placement) and
@@ -1242,7 +1272,15 @@ impl Simulator {
                     // Book-through adverse fills (a resting order the contra just
                     // swept through) surface here, delivered like trade fills
                     // after a ws fill-push delay. Empty unless book_through_rate>0.
-                    let fills = self.core.on_orderbook(&ob);
+                    let fwd_mid = if self.book_markout_on {
+                        self.peek_fwd_canonical_mid(
+                            &ob.symbol,
+                            when.saturating_add(self.fill_markout_horizon_ns),
+                        )
+                    } else {
+                        None
+                    };
+                    let fills = self.core.on_orderbook_fwd(&ob, fwd_mid);
                     self.observe_markout_book(&ob);
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
@@ -1730,6 +1768,7 @@ mod tests {
             use_batch_orders: true,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            book_markout_on: false,
             base_fill_markout_vn: 0.0,
             dynamic_fill_markout: false,
             dynamic_markout_spot_vol: false,
@@ -1810,6 +1849,7 @@ mod tests {
             use_batch_orders,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            book_markout_on: false,
             base_fill_markout_vn: 0.0,
             dynamic_fill_markout: false,
             dynamic_markout_spot_vol: false,

@@ -4659,8 +4659,10 @@ impl Engine {
             book_through_rate: bt.sim_v2_book_through_rate,
             unexplained_depletion_exec_rate: bt.sim_v2_unexplained_depletion_exec_rate,
             replay_self_depth_rate: bt.sim_v2_replay_self_depth_rate,
+            replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
             fill_markout_vn: bt.sim_v2_fill_markout_vn,
+            book_fill_markout_vn: bt.sim_v2_book_fill_markout_vn,
             fill_markout_horizon_ns: bt.sim_v2_fill_markout_horizon_ms.saturating_mul(1_000_000),
             dynamic_fill_markout: bt.sim_v2_dynamic_fill_markout,
             dynamic_markout_spot_vol: bt.sim_v2_dynamic_markout_spot_vol,
@@ -4960,6 +4962,11 @@ impl Engine {
         info!("  Sim v2:   reject reasons: taker_buy={} taker_sell={} rest_buy={} rest_sell={} (rest_sell short Σ={:.0} shares, mean={:.1})",
             rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short,
             if rj_rs > 0 { rj_rs_short / rj_rs as f64 } else { 0.0 });
+        let (self_clean_n, self_clean_qty) = sim.replay_self_taker_stats();
+        info!(
+            "  Sim v2:   replay self-depth taker cleaning: sweeps={} removed_depth={:.4}",
+            self_clean_n, self_clean_qty
+        );
         for s in &self.config.strategies {
             if s.enabled
                 && self.registry.capabilities(&s.name).needs_sim_wallet
@@ -5070,6 +5077,13 @@ impl Engine {
         if hc > 0 {
             info!("  Sim v2:   forward-markout haircuts: {} favorable maker fills downweighted (markout → live −0.75c)", hc);
         }
+        let (book_hc_n, book_hc_qty, book_hc_cost) = sim.book_fill_markout_stats();
+        if book_hc_n > 0 {
+            info!(
+                "  Sim v2:   book-fill markout haircuts: fragments={} qty={:.4} settlement_cost_usdc={:.4} (depletion/book-through, volume preserved)",
+                book_hc_n, book_hc_qty, book_hc_cost
+            );
+        }
         let (mq, tv) = sim.depth_distributions();
         info!("  Sim v2:   maker q_init (shares ahead at placement) n={:.0} mean={:.1} | p10={:.0} p25={:.0} p50={:.0} p75={:.0} p90={:.0} p99={:.0} | zero-queue={:.1}%",
             mq[0], mq[1], mq[2], mq[3], mq[4], mq[5], mq[6], mq[7], 100.0 * mq[8]);
@@ -5127,7 +5141,7 @@ impl Engine {
         }
         if bt.sim_v2_fill_audit {
             for a in sim.fill_audit_rows() {
-                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_own_q_init_sum={:.4} maker_own_cancel_queue_advance_qty={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
+                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} maker_q_init_sum={:.4} maker_own_q_init_sum={:.4} maker_own_cancel_queue_advance_qty={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_book_markout_qty={:.4} maker_book_markout_cost_usdc={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_replay_self_depth_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
                     a.slug,
                     a.iid,
                     a.place_orders,
@@ -5156,12 +5170,15 @@ impl Engine {
                     a.maker_depletion_candidate_qty,
                     a.maker_depletion_budget_suppressed_qty,
                     a.maker_depletion_fill_qty,
+                    a.maker_book_markout_qty,
+                    a.maker_book_markout_cost_usdc,
                     a.maker_fill_qty,
                     a.stale_trade_matches,
                     a.stale_trade_candidate_qty,
                     a.taker_candidates,
                     a.taker_requested_qty,
                     a.taker_available_qty,
+                    a.taker_replay_self_depth_qty,
                     a.taker_race_suppressed_qty,
                     a.taker_comp_suppressed_qty,
                     a.taker_zero_fills,
@@ -5169,7 +5186,7 @@ impl Engine {
                 );
             }
             for a in sim.maker_order_audit_rows() {
-                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
                     a.slug,
                     a.iid,
                     a.coid,
@@ -5203,6 +5220,8 @@ impl Engine {
                     a.depletion_fill_qty,
                     a.book_through_candidate_qty,
                     a.book_through_fill_qty,
+                    a.book_markout_qty,
+                    a.book_markout_cost_usdc,
                     a.fill_qty,
                     a.first_fill_ns,
                     a.last_fill_ns,
@@ -5313,6 +5332,9 @@ impl Engine {
                     bt.sim_v2_unexplained_depletion_exec_rate,
                 );
                 sim.configure_replay_self_depth(bt.sim_v2_replay_self_depth_rate);
+                sim.configure_replay_self_taker_depth(
+                    bt.sim_v2_replay_self_taker_depth_rate,
+                );
                 sim.set_fold_outcomes(bt.sim_v2_fold_outcomes);
                 sim.configure_book_stale_gate(
                     bt.sim_v2_book_stale_after_ms.saturating_mul(1_000_000),
