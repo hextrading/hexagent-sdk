@@ -450,6 +450,18 @@ pub struct BacktestConfig {
     /// the historical model exactly.
     #[serde(default)]
     pub sim_v2_unexplained_depletion_exec_rate: f64,
+    /// sim_v2 only — deterministic share of maker orders for which matching
+    /// retains a tiny inferred exchange-side residual instead of manufacturing
+    /// an exact full fill. The private order manager can release
+    /// these at its existing 99% matched-coverage threshold while the residual
+    /// remains physically present on the replayed book. 0 disables the model.
+    #[serde(default)]
+    pub sim_v2_inferred_maker_residual_rate: f64,
+    /// Fraction of original order quantity retained by the inferred residual
+    /// model. Clamped to [0, 0.01] so a selected order is still terminal under
+    /// the live 99% matched-coverage rule. Fixed33 live median is about 0.0006.
+    #[serde(default = "default_sim_v2_inferred_maker_residual_fraction")]
+    pub sim_v2_inferred_maker_residual_fraction: f64,
     /// sim_v2 only — fraction of this replayed strategy order's quantity that
     /// is subtracted from visible queue-ahead at entry. Use only for a market
     /// tape recorded while the same live strategy was resting on the CLOB;
@@ -464,11 +476,11 @@ pub struct BacktestConfig {
     /// and pricing the taker fill. 0 preserves the recorded public book exactly.
     #[serde(default)]
     pub sim_v2_replay_self_taker_depth_rate: f64,
-    /// sim_v2 backtest only — fraction of the sampled cancel response leg (L2)
-    /// during which exchange matching may finish before cancel finality. The
-    /// cancel acknowledgement still arrives at the original sampled RTT. 0
-    /// preserves immediate cancellation at engine arrival exactly; 1 delays
-    /// finality to the response boundary.
+    /// sim_v2 backtest only — multiplier of the sampled cancel response leg
+    /// (L2) during which exchange matching may finish before cancel finality.
+    /// Values in [0,1] retain the original within-RTT interpretation; values
+    /// above 1 model exchange/gateway finality tails and delay the acknowledgement
+    /// until finality. 0 preserves immediate cancellation at engine arrival.
     #[serde(default)]
     pub sim_v2_cancel_finality_delay_frac: f64,
     /// sim_v2 only — VOLUME-NEUTRAL forward-markout adverse reprice ∈ [0,∞) (0 =
@@ -956,6 +968,9 @@ fn default_sim_v2_maker_toxicity_scale_ticks() -> f64 {
 fn default_sim_v2_book_through_rate() -> f64 {
     0.0
 }
+fn default_sim_v2_inferred_maker_residual_fraction() -> f64 {
+    0.0006
+}
 fn default_sim_v2_fill_markout_vn() -> f64 {
     0.0
 }
@@ -1100,6 +1115,9 @@ impl Default for BacktestConfig {
             sim_v2_maker_toxicity_scale_ticks: default_sim_v2_maker_toxicity_scale_ticks(),
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_unexplained_depletion_exec_rate: 0.0,
+            sim_v2_inferred_maker_residual_rate: 0.0,
+            sim_v2_inferred_maker_residual_fraction:
+                default_sim_v2_inferred_maker_residual_fraction(),
             sim_v2_replay_self_depth_rate: 0.0,
             sim_v2_replay_self_taker_depth_rate: 0.0,
             sim_v2_cancel_finality_delay_frac: 0.0,
