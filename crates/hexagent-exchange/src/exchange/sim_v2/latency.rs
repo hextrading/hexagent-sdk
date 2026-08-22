@@ -13,6 +13,11 @@ use crate::exchange::sim::per_event_rtt::{EventRttOverride, SEGMENT_BOUNDARY_SEC
 pub struct LatencyModel {
     coupled: CoupledLatencySamplers,
     fill_push_mult: f64,
+    /// Optional private WebSocket fill-observation delay.  This deliberately
+    /// owns an independent RNG/AR state: observing a private fill must not
+    /// advance the HTTP place sampler and thereby change a later order RTT.
+    /// `None` preserves the historical half-place-RTT multiplier exactly.
+    private_fill: Option<LatencySampler>,
     /// TAKER matching-engine overhead, added on top of the (time-varying) place
     /// RTT for taker fills (additive model: taker ≈ place(now) + overhead).
     overhead: LatencySampler,
@@ -44,6 +49,7 @@ impl LatencyModel {
         Self {
             coupled,
             fill_push_mult: 1.5,
+            private_fill: None,
             overhead,
             seed,
             client_timeout_ms: 2000.0,
@@ -54,6 +60,29 @@ impl LatencyModel {
         if mult > 0.0 {
             self.fill_push_mult = mult;
         }
+    }
+
+    /// Configure an independent private-fill observation distribution.  A
+    /// non-positive p50 disables it and keeps the legacy coupled-HTTP path.
+    pub fn set_private_fill_anchors(&mut self, p50_ms: f64, p95_ms: f64, p99_ms: f64) {
+        if !p50_ms.is_finite() || p50_ms <= 0.0 {
+            self.private_fill = None;
+            return;
+        }
+        let p95 = if p95_ms.is_finite() {
+            p95_ms.max(p50_ms + 1.0)
+        } else {
+            p50_ms + 1.0
+        };
+        let p99 = if p99_ms.is_finite() {
+            p99_ms.max(p95 + 1.0)
+        } else {
+            p95 + 1.0
+        };
+        self.private_fill = Some(LatencySampler::new(
+            Self::empirical_profile(p50_ms, p95, p99, 0.3),
+            self.seed.wrapping_add(0xF111_F111),
+        ));
     }
 
     /// Set the client-timeout cap (ms) used as the per-event exceedance
@@ -223,9 +252,13 @@ impl LatencyModel {
     }
 
     /// WebSocket fill-push delay (ns) for a maker/taker fill landing back at
-    /// the strategy. Mirrors v1: ~1.5× the half-RTT (server bookkeeping for a
-    /// trade event is heavier than a plain place ack). Sampled once per fill.
+    /// the strategy.  When private-fill anchors are configured this samples an
+    /// independent private-event lane. Otherwise it mirrors v1 exactly:
+    /// ~1.5× the sampled half place RTT. Sampled once per fill.
     pub fn sample_fill_push(&mut self, now_ns: u64) -> u64 {
+        if let Some(private_fill) = self.private_fill.as_mut() {
+            return private_fill.sample_ns(now_ns);
+        }
         let (l1, l2) = self.sample_place_split(now_ns);
         (((l1 + l2) as f64) * 0.5 * self.fill_push_mult) as u64
     }
@@ -257,5 +290,44 @@ mod tests {
             "mean overhead {mean_ms}ms implausible"
         );
         assert!(over_100ms > n / 2, "expected most draws > 100ms");
+    }
+
+    #[test]
+    fn independent_private_fill_does_not_perturb_http_place_sequence() {
+        let profile = LatencyModel::empirical_profile(50.0, 150.0, 300.0, 0.4);
+        let mut with_fill = LatencyModel::new(profile.clone(), profile.clone(), 0.3, 17);
+        let mut control = LatencyModel::new(profile.clone(), profile, 0.3, 17);
+        with_fill.set_private_fill_anchors(39.0, 198.0, 296.0);
+
+        let push = with_fill.sample_fill_push(1_000_000_000);
+        assert!(push > 0);
+        assert_eq!(
+            with_fill.sample_place_split(1_001_000_000),
+            control.sample_place_split(1_001_000_000),
+            "private WS delivery must not consume coupled HTTP sampler state"
+        );
+    }
+
+    #[test]
+    fn private_fill_anchor_quantiles_are_plausible() {
+        let mut m = LatencyModel::new(
+            LatencyProfile::Fixed(50),
+            LatencyProfile::Fixed(50),
+            0.0,
+            23,
+        );
+        m.set_private_fill_anchors(39.0, 198.0, 296.0);
+        let mut samples = Vec::with_capacity(10_000);
+        for i in 0..10_000u64 {
+            samples.push(m.sample_fill_push(1_000_000_000 + i * 1_000_000));
+        }
+        samples.sort_unstable();
+        let ms = |p: f64| samples[((p * samples.len() as f64) as usize).min(samples.len() - 1)] as f64 / 1e6;
+        let p50 = ms(0.50);
+        let p95 = ms(0.95);
+        let p99 = ms(0.99);
+        assert!((25.0..=65.0).contains(&p50), "p50={p50:.2}ms");
+        assert!((140.0..=255.0).contains(&p95), "p95={p95:.2}ms");
+        assert!((220.0..=390.0).contains(&p99), "p99={p99:.2}ms");
     }
 }

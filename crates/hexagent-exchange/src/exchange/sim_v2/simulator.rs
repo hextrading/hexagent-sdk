@@ -18,7 +18,7 @@ use crate::types::{Exchange, Instrument, OrderStatus, OrderUpdate, Side, Signal}
 
 use super::clock::Scheduler;
 use super::event::{ReachAction, SimEvent};
-use super::exchange::{FillAuditRow, SimExchangeV2};
+use super::exchange::{FillAuditRow, MakerOrderAuditRow, SimExchangeV2};
 use super::feed::ServerFeed;
 use super::latency::LatencyModel;
 use crate::exchange::sim::latency::LatencyProfile;
@@ -55,11 +55,25 @@ pub struct SimV2Config {
     /// contra side sweeps strictly through gets picked off (latency adverse
     /// selection). See `exchange.rs`.
     pub book_through_rate: f64,
+    /// Maximum fraction of adverse, unexplained same-level depletion treated as
+    /// hidden execution volume. 0 keeps cancel-only attribution result-neutral.
+    pub unexplained_depletion_exec_rate: f64,
+    /// Approximate leave-one-out correction for tapes containing this
+    /// strategy's original live resting order.
+    pub replay_self_depth_rate: f64,
+    /// Leave-one-out correction for taker sweeps on a self-contaminated tape.
+    pub replay_self_taker_depth_rate: f64,
+    /// Fraction of the sampled cancel L2 reserved for exchange-side matching
+    /// finality before the cancellation becomes effective. 0 = immediate.
+    pub cancel_finality_delay_frac: f64,
     /// Volume-neutral forward-markout adverse-reprice strength (0 = off). Keeps the
     /// full fill, settles it adverse toward the forward mid (peeked `horizon` ns
     /// ahead) → edge drops at preserved maker volume → the sim's maker-fill markout
     /// matches live's −0.75¢. See `exchange.rs`.
     pub fill_markout_vn: f64,
+    /// Forward-markout adverse reprice for maker fills inferred from book
+    /// depletion / book-through rather than an explicit public trade.
+    pub book_fill_markout_vn: f64,
     pub fill_markout_horizon_ns: u64,
     pub dynamic_fill_markout: bool,
     pub dynamic_markout_spot_vol: bool,
@@ -70,6 +84,11 @@ pub struct SimV2Config {
     pub dynamic_markout_max_mult: f64,
     /// WS fill-push latency multiplier on the half-RTT.
     pub fill_push_mult: f64,
+    /// Independent private WebSocket fill-observation latency anchors (ms).
+    /// A non-positive p50 preserves the historical HTTP-derived path.
+    pub private_fill_p50_ms: f64,
+    pub private_fill_p95_ms: f64,
+    pub private_fill_p99_ms: f64,
     /// matched-can't-cancel window (ns).
     pub matched_cant_cancel_window_ns: u64,
     /// Per-event RTT override table (sim_rtt_mode="exact"); `None` = pooled.
@@ -84,6 +103,12 @@ pub struct SimV2Config {
     /// Maker/taker "race" rates in [0,1] (0 = off). See `exchange.rs`.
     pub maker_race_rate: f64,
     pub taker_race_rate: f64,
+    /// Earlier same-level simulated orders included in a new order's FIFO
+    /// queue position (0 = legacy independent orders, 1 = full own FIFO).
+    pub order_queue_position_strength: f64,
+    /// Causal suppression of favorable maker fills at the real limit.
+    pub maker_toxicity_strength: f64,
+    pub maker_toxicity_scale_ticks: f64,
     /// Maker / taker race lookahead horizons (ns): the entry / match peek looks
     /// this far ahead (0 = immediate next snapshot).
     pub maker_race_horizon_ns: u64,
@@ -147,6 +172,9 @@ pub struct Simulator {
     latency: LatencyModel,
     client_timeout_ns: u64,
     timeouts: u64,
+    cancel_finality_delay_frac: f64,
+    cancel_finality_delayed: u64,
+    cancel_finality_matched: u64,
     per_event_rtt: Option<HashMap<u64, EventRttOverride>>,
     dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
     last_dynamic_overhead_event: Option<u64>,
@@ -179,10 +207,12 @@ pub struct Simulator {
     dynamic_window_mult_max: f64,
     /// See `SimV2Config::use_batch_orders`.
     use_batch_orders: bool,
-    /// Forward horizon (ns) for the markout fill haircut; peek the canonical mid
-    /// this far past each trade. `markout_on` gates the peek (vn>0 && horizon>0).
+    /// Forward horizon (ns) for markout fill haircuts; peek the canonical mid
+    /// this far past each eligible trade/book event. Separate gates avoid any
+    /// future-book lookup on a disabled origin path.
     fill_markout_horizon_ns: u64,
     markout_on: bool,
+    book_markout_on: bool,
     base_fill_markout_vn: f64,
     dynamic_fill_markout: bool,
     dynamic_markout_spot_vol: bool,
@@ -310,6 +340,11 @@ impl Simulator {
         });
         let mut latency = LatencyModel::new(place, cancel, cfg.rho_cross, cfg.seed);
         latency.set_fill_push_mult(cfg.fill_push_mult);
+        latency.set_private_fill_anchors(
+            cfg.private_fill_p50_ms,
+            cfg.private_fill_p95_ms,
+            cfg.private_fill_p99_ms,
+        );
         // Censoring threshold for the per-event timeout-rate injection — must
         // equal the engine's timeout boundary (`rtt > client_timeout_ns`).
         latency.set_client_timeout_ms(cfg.client_timeout_ns as f64 / 1_000_000.0);
@@ -327,8 +362,17 @@ impl Simulator {
         core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
+        core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
+        core.configure_replay_self_depth(cfg.replay_self_depth_rate);
+        core.configure_replay_self_taker_depth(cfg.replay_self_taker_depth_rate);
         core.configure_fill_markout_vn(cfg.fill_markout_vn);
+        core.configure_book_fill_markout_vn(cfg.book_fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
+        core.configure_order_queue_position(cfg.order_queue_position_strength);
+        core.configure_maker_toxicity(
+            cfg.maker_toxicity_strength,
+            cfg.maker_toxicity_scale_ticks,
+        );
         core.set_fold_outcomes(cfg.fold_outcomes);
         core.configure_book_stale_gate(cfg.book_stale_after_ns);
         core.configure_stale_resting_exchange_only(cfg.stale_resting_exchange_only);
@@ -347,6 +391,13 @@ impl Simulator {
             latency,
             client_timeout_ns: cfg.client_timeout_ns,
             timeouts: 0,
+            cancel_finality_delay_frac: if cfg.cancel_finality_delay_frac.is_finite() {
+                cfg.cancel_finality_delay_frac.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: cfg.per_event_rtt,
             dynamic_taker_overhead_by_event: cfg.dynamic_taker_overhead_by_event,
             last_dynamic_overhead_event: None,
@@ -377,6 +428,8 @@ impl Simulator {
             use_batch_orders: cfg.use_batch_orders,
             fill_markout_horizon_ns: cfg.fill_markout_horizon_ns,
             markout_on: cfg.fill_markout_vn > 0.0 && cfg.fill_markout_horizon_ns > 0,
+            book_markout_on: cfg.book_fill_markout_vn > 0.0
+                && cfg.fill_markout_horizon_ns > 0,
             base_fill_markout_vn: cfg.fill_markout_vn.max(0.0),
             dynamic_fill_markout: cfg.dynamic_fill_markout,
             dynamic_markout_spot_vol: cfg.dynamic_markout_spot_vol,
@@ -523,6 +576,12 @@ impl Simulator {
         (self.timeouts, self.core.matched_cant_cancel)
     }
 
+    /// (cancels whose exchange finality was delayed, those that matched before
+    /// the delayed finalization) for end-of-run calibration diagnostics.
+    pub fn cancel_finality_stats(&self) -> (u64, u64) {
+        (self.cancel_finality_delayed, self.cancel_finality_matched)
+    }
+
     /// (post_only_rejects, post_only_seen) for the summary.
     pub fn post_only_stats(&self) -> (u64, u64) {
         (self.core.post_only_rejects, self.core.post_only_seen)
@@ -530,6 +589,14 @@ impl Simulator {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         self.core.fill_audit_rows()
+    }
+
+    pub fn configure_maker_order_audit(&mut self, enabled: bool) {
+        self.core.configure_maker_order_audit(enabled);
+    }
+
+    pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
+        self.core.maker_order_audit_rows()
     }
 
     /// Double-clock full-book stale gate diagnostics:
@@ -593,6 +660,27 @@ impl Simulator {
         self.core.adverse_advanced
     }
 
+    /// Per-order own FIFO diagnostics: positioned orders, initial own queue
+    /// quantity, later-order cancellation advances, and their summed quantity.
+    pub fn own_queue_position_stats(&self) -> (u64, f64, u64, f64) {
+        let c = &self.core;
+        (
+            c.own_queue_positioned_orders,
+            c.own_queue_initial_qty,
+            c.own_queue_cancel_advances_n,
+            c.own_queue_cancel_advance_qty,
+        )
+    }
+
+    /// Maker trade fragments/quantity suppressed by the causal favorable-move
+    /// selection model.
+    pub fn maker_toxicity_stats(&self) -> (u64, f64) {
+        (
+            self.core.maker_toxicity_suppressed_n,
+            self.core.maker_toxicity_suppressed_qty,
+        )
+    }
+
     /// Dynamic ahead-fraction diagnostics: cancel-resync count, mean and range.
     pub fn dynamic_ahead_frac_stats(&self) -> Option<(u64, f64, f64, f64)> {
         let c = &self.core;
@@ -610,9 +698,33 @@ impl Simulator {
         self.core.book_through_fills_n
     }
 
+    /// # maker fill fragments produced by unexplained L2 depletion.
+    pub fn unexplained_depletion_fills(&self) -> u64 {
+        self.core.unexplained_depletion_fills_n
+    }
+
+    /// Taker sweeps corrected by the same-instance leave-one-out book view and
+    /// the total public depth removed from those sweep ladders.
+    pub fn replay_self_taker_stats(&self) -> (u64, f64) {
+        (
+            self.core.taker_replay_self_sweeps_n,
+            self.core.taker_replay_self_depth_qty,
+        )
+    }
+
     /// # maker fills haircut by the forward-markout conditioning (diagnostic).
     pub fn fill_haircuts(&self) -> u64 {
         self.core.fill_haircut_n
+    }
+
+    /// Book/depletion maker fills repriced by forward markout, their quantity,
+    /// and the resulting settlement-cost increase in USDC.
+    pub fn book_fill_markout_stats(&self) -> (u64, f64, f64) {
+        (
+            self.core.book_fill_haircut_n,
+            self.core.book_fill_haircut_qty,
+            self.core.book_fill_haircut_cost_usdc,
+        )
     }
 
     /// Distribution of maker initial queue length (`q_ahead` at placement) and
@@ -1160,11 +1272,21 @@ impl Simulator {
                     // Book-through adverse fills (a resting order the contra just
                     // swept through) surface here, delivered like trade fills
                     // after a ws fill-push delay. Empty unless book_through_rate>0.
-                    let fills = self.core.on_orderbook(&ob);
+                    let fwd_mid = if self.book_markout_on {
+                        self.peek_fwd_canonical_mid(
+                            &ob.symbol,
+                            when.saturating_add(self.fill_markout_horizon_ns),
+                        )
+                    } else {
+                        None
+                    };
+                    let fills = self.core.on_orderbook_fwd(&ob, fwd_mid);
                     self.observe_markout_book(&ob);
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
                         let deliver = when.saturating_add(push);
+                        self.core
+                            .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
                         self.sched.push(deliver, SimEvent::FillToStrategy(fill));
                     }
@@ -1188,6 +1310,8 @@ impl Simulator {
                     for mut fill in fills {
                         let push = self.latency.sample_fill_push(when);
                         let deliver = when.saturating_add(push);
+                        self.core
+                            .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
                         self.sched.push(deliver, SimEvent::FillToStrategy(fill));
                     }
@@ -1258,8 +1382,25 @@ impl Simulator {
                         exchange,
                         client_order_id,
                     } => {
-                        let u = self.core.cancel_order(exchange, &client_order_id, when);
-                        self.deliver_ack(u, when.saturating_add(l2_ns), suppress_ack);
+                        let ack_deliver_ns = when.saturating_add(l2_ns);
+                        let delay_ns = ((l2_ns as f64) * self.cancel_finality_delay_frac)
+                            .round()
+                            .clamp(0.0, l2_ns as f64) as u64;
+                        if delay_ns == 0 {
+                            let u = self.core.cancel_order(exchange, &client_order_id, when);
+                            self.deliver_ack(u, ack_deliver_ns, suppress_ack);
+                        } else {
+                            self.cancel_finality_delayed += 1;
+                            self.sched.push(
+                                when.saturating_add(delay_ns),
+                                SimEvent::CancelFinalizes {
+                                    exchange,
+                                    client_order_id,
+                                    ack_deliver_ns,
+                                    suppress_ack,
+                                },
+                            );
+                        }
                     }
                     ReachAction::CancelAll { exchange, symbol } => {
                         let d = when.saturating_add(l2_ns);
@@ -1268,6 +1409,19 @@ impl Simulator {
                         }
                     }
                 }
+                Vec::new()
+            }
+            SimEvent::CancelFinalizes {
+                exchange,
+                client_order_id,
+                ack_deliver_ns,
+                suppress_ack,
+            } => {
+                let u = self.core.cancel_order(exchange, &client_order_id, when);
+                if u.status == OrderStatus::Filled {
+                    self.cancel_finality_matched += 1;
+                }
+                self.deliver_ack(u, ack_deliver_ns.max(when), suppress_ack);
                 Vec::new()
             }
             SimEvent::TakerMatch {
@@ -1550,7 +1704,9 @@ fn expand_signal(sig: &Signal) -> (Vec<ReachAction>, bool) {
 mod tests {
     use super::*;
     use crate::exchange::sim::latency::LatencyProfile;
-    use crate::types::{Exchange, OrderBookSnapshot, OrderRequest, OrderStatus, PriceLevel, Side};
+    use crate::types::{
+        Exchange, OrderBookSnapshot, OrderRequest, OrderStatus, PriceLevel, Side, TradeTick,
+    };
 
     /// Build a Simulator with an empty feed and a deterministic fixed RTT so
     /// ack-delivery timing is exact.
@@ -1579,6 +1735,9 @@ mod tests {
             latency,
             client_timeout_ns: 500_000_000,
             timeouts: 0,
+            cancel_finality_delay_frac: 0.0,
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -1609,6 +1768,7 @@ mod tests {
             use_batch_orders: true,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            book_markout_on: false,
             base_fill_markout_vn: 0.0,
             dynamic_fill_markout: false,
             dynamic_markout_spot_vol: false,
@@ -1656,6 +1816,9 @@ mod tests {
             latency,
             client_timeout_ns: 500_000_000,
             timeouts: 0,
+            cancel_finality_delay_frac: 0.0,
+            cancel_finality_delayed: 0,
+            cancel_finality_matched: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -1686,6 +1849,7 @@ mod tests {
             use_batch_orders,
             fill_markout_horizon_ns: 0,
             markout_on: false,
+            book_markout_on: false,
             base_fill_markout_vn: 0.0,
             dynamic_fill_markout: false,
             dynamic_markout_spot_vol: false,
@@ -1811,6 +1975,106 @@ mod tests {
         assert_eq!(r2[0].status, OrderStatus::Accepted);
         assert_eq!(r2[0].timestamp_ns, emit + 100_000_000);
         assert!(sim.peek_when().is_none());
+    }
+
+    fn seed_front_order(sim: &mut Simulator, coid: &str) {
+        sim.core.configure_replay_self_depth(1.0);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![PriceLevel {
+                price: 0.6,
+                quantity: 10.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 0.62,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        let Signal::NewOrder(request) = place_signal(coid) else {
+            unreachable!()
+        };
+        assert_eq!(
+            sim.core.submit_order(&request, 2).status,
+            OrderStatus::Accepted
+        );
+        assert!(sim.core.order_symbol_side(coid).is_some());
+    }
+
+    fn cancel_signal(coid: &str, timestamp_ns: u64) -> Signal {
+        Signal::CancelOrder {
+            exchange: Exchange::Polymarket,
+            client_order_id: coid.into(),
+            instance_id: String::new(),
+            timestamp_ns,
+        }
+    }
+
+    #[test]
+    fn zero_cancel_finality_delay_preserves_immediate_cancel() {
+        let mut sim = sim_with_fixed_rtt(100);
+        seed_front_order(&mut sim, "a");
+        let emit = 1_000_000_000u64;
+        sim.submit(&cancel_signal("a", emit), emit);
+
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_none());
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 10.0,
+            side: Side::Sell,
+            exchange_timestamp_ns: emit + 75_000_000,
+            local_timestamp_ns: emit + 75_000_000,
+        });
+        assert!(fills.is_empty());
+        let ack = sim.step();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].status, OrderStatus::Cancelled);
+        assert_eq!(sim.cancel_finality_stats(), (0, 0));
+    }
+
+    #[test]
+    fn delayed_cancel_finality_allows_causal_match_within_sampled_l2() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.cancel_finality_delay_frac = 1.0;
+        seed_front_order(&mut sim, "a");
+        let emit = 1_000_000_000u64;
+        sim.submit(&cancel_signal("a", emit), emit);
+
+        // Cancel reaches the API lane at L1 but remains live through L2.
+        assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("a").is_some());
+        assert_eq!(sim.peek_when(), Some(emit + 100_000_000));
+
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 10.0,
+            side: Side::Sell,
+            exchange_timestamp_ns: emit + 75_000_000,
+            local_timestamp_ns: emit + 75_000_000,
+        });
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::Filled);
+        let trade_id = fills[0].trade_id.clone();
+
+        // Finalization observes the immutable recent fill, then delivers the
+        // idempotent Filled resolution at the original RTT boundary.
+        assert!(sim.step().is_empty());
+        let ack = sim.step();
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].status, OrderStatus::Filled);
+        assert_eq!(ack[0].trade_id, trade_id);
+        assert_eq!(sim.cancel_finality_stats(), (1, 1));
     }
 
     #[test]

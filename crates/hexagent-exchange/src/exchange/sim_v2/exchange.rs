@@ -47,12 +47,28 @@ struct RestingOrder {
     tick: f64,
     /// Shares ahead of us in the FIFO queue at our synthetic level (§5).
     q_ahead: f64,
+    /// Portion of `q_ahead` contributed by earlier simulated orders at this
+    /// exact canonical level. It is tracked separately so a fresh-book rebase
+    /// cannot erase own FIFO priority and an earlier cancel can advance only
+    /// the later orders it actually preceded.
+    own_q_ahead: f64,
+    /// Monotonic exchange-arrival identity. Unlike client ids and nanosecond
+    /// timestamps this remains a strict FIFO tie-break for same-batch orders.
+    queue_seq: u64,
+    /// Approximate own-live-order depth removed from queue-ahead for a replay
+    /// tape captured while that strategy was active. The raw book reference is
+    /// intentionally retained so disappearance of this depth remains visible
+    /// to the unexplained-depletion execution model.
+    replay_self_depth_credit: f64,
     /// Visible level depth at the last book snapshot (cancel-attribution ref).
     level_qty_at_sync: f64,
     /// Canonical-frame effective mid at the last snapshot. The signed move
     /// vs the current mid is the adverse-selection signal for the cancel
     /// attribution (see `resync_queues`). 0.0 ⇒ no mid at placement.
     mid_at_sync: f64,
+    /// Canonical effective mid when the order first rested. This is immutable
+    /// and is the causal maker-toxicity reference (no forward book peek).
+    entry_mid: f64,
     /// Trade qty matched at our level since the last snapshot.
     traded_since_sync: f64,
     /// Server-time this order rested (for lifetime / fill-age diagnostics).
@@ -75,10 +91,11 @@ struct FeeParams {
 struct RecentFill {
     ts: u64,
     trade_id: String,
-    cum_filled: f64,
+    filled_quantity: f64,
     price: f64,
     side: Side,
     symbol: String,
+    liquidity: Liquidity,
 }
 
 struct MakerFill {
@@ -90,6 +107,28 @@ struct MakerFill {
     price: f64,
     remaining_after: f64,
     fully: bool,
+    queue_seq: u64,
+}
+
+/// A possible maker fill caused by one shared same-level depletion event.
+/// Queue advancement is evaluated per order, but the execution volume that
+/// crosses the queue is a property of the public level and may be consumed
+/// only once across all of our orders at that level.
+struct DepletionCandidate {
+    match_symbol: String,
+    match_side: Side,
+    match_price: f64,
+    match_side_rank: u8,
+    match_price_tick: i64,
+    match_tick_bits: u64,
+    placed_ns: u64,
+    coid: String,
+    token: String,
+    side: Side,
+    iid: String,
+    price: f64,
+    potential: f64,
+    level_execution: f64,
 }
 
 /// Diagnostic-only attribution for one strategy instance in one binary event.
@@ -111,21 +150,87 @@ pub struct FillAuditRow {
     pub maker_rests: u64,
     pub maker_rest_qty: f64,
     pub maker_q_init_sum: f64,
+    pub maker_own_q_init_sum: f64,
+    pub maker_own_cancel_queue_advance_qty: f64,
     pub maker_race_added_q: f64,
+    pub maker_replay_self_depth_credit: f64,
     pub maker_trade_matches: u64,
     pub maker_trade_qty: f64,
     pub maker_queue_drained_qty: f64,
     pub maker_candidate_qty: f64,
+    pub maker_toxicity_suppressed_qty: f64,
+    pub maker_depletion_observed_qty: f64,
+    pub maker_depletion_exec_qty: f64,
+    pub maker_depletion_cancel_advance_qty: f64,
+    pub maker_depletion_candidate_qty: f64,
+    pub maker_depletion_budget_suppressed_qty: f64,
+    pub maker_depletion_fill_qty: f64,
+    pub maker_book_markout_qty: f64,
+    pub maker_book_markout_cost_usdc: f64,
     pub maker_fill_qty: f64,
     pub stale_trade_matches: u64,
     pub stale_trade_candidate_qty: f64,
     pub taker_candidates: u64,
     pub taker_requested_qty: f64,
     pub taker_available_qty: f64,
+    pub taker_replay_self_depth_qty: f64,
     pub taker_race_suppressed_qty: f64,
     pub taker_comp_suppressed_qty: f64,
     pub taker_zero_fills: u64,
     pub taker_fill_qty: f64,
+}
+
+/// Diagnostic-only maker lifecycle for one simulated order.
+///
+/// Enabled only with the backtest fill-audit switch.  These immutable/request
+/// fields plus causal queue transitions are the sim half of the live
+/// `[order_attempt]` replica join; none feed back into matching.
+#[derive(Clone, Debug)]
+pub struct MakerOrderAuditRow {
+    pub slug: String,
+    pub iid: String,
+    pub coid: String,
+    pub token: String,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price: f64,
+    pub quantity: f64,
+    pub strategy_emit_ns: u64,
+    pub trigger_exchange_ns: u64,
+    pub trigger_local_ns: u64,
+    pub place_arrival_ns: u64,
+    pub await_fresh_book: bool,
+    pub visible_depth_at_entry: f64,
+    pub entry_mid: f64,
+    pub queue_seq: u64,
+    pub q_init: f64,
+    pub simulated_own_ahead_qty: f64,
+    pub own_cancel_queue_advance_qty: f64,
+    pub replay_self_depth_credit: f64,
+    pub trade_match_n: u64,
+    pub trade_match_qty: f64,
+    pub queue_drained_qty: f64,
+    pub candidate_qty: f64,
+    pub maker_toxicity_suppressed_qty: f64,
+    pub depletion_observed_qty: f64,
+    pub depletion_exec_qty: f64,
+    pub depletion_cancel_advance_qty: f64,
+    pub depletion_candidate_qty: f64,
+    pub depletion_budget_suppressed_qty: f64,
+    pub depletion_fill_qty: f64,
+    pub book_through_candidate_qty: f64,
+    pub book_through_fill_qty: f64,
+    pub book_markout_qty: f64,
+    pub book_markout_cost_usdc: f64,
+    pub fill_qty: f64,
+    pub first_fill_ns: u64,
+    pub last_fill_ns: u64,
+    pub first_fill_delivery_ns: u64,
+    pub last_fill_delivery_ns: u64,
+    pub cancel_arrival_ns: u64,
+    pub cancel_result: &'static str,
+    pub q_ahead_final: f64,
+    pub remaining_final: f64,
 }
 
 fn flip(s: Side) -> Side {
@@ -133,6 +238,38 @@ fn flip(s: Side) -> Side {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     }
+}
+
+/// Reprice only the favorable component of a maker fill toward the future
+/// canonical mid. The penalty magnitude is invariant under outcome folding;
+/// settlement direction follows the original order side.
+fn maker_markout_reprice(
+    limit: f64,
+    original_side: Side,
+    match_side: Side,
+    match_price: f64,
+    fwd_mid: Option<f64>,
+    strength: f64,
+) -> (f64, f64) {
+    let Some(fm) = fwd_mid.filter(|mid| mid.is_finite()) else {
+        return (limit, 0.0);
+    };
+    if strength <= 0.0 {
+        return (limit, 0.0);
+    }
+    let favorable = match match_side {
+        Side::Buy => fm - match_price,
+        Side::Sell => match_price - fm,
+    };
+    if favorable <= 0.0 {
+        return (limit, 0.0);
+    }
+    let requested_penalty = strength * favorable;
+    let price = match original_side {
+        Side::Buy => (limit + requested_penalty).min(1.0),
+        Side::Sell => (limit - requested_penalty).max(0.0),
+    };
+    (price, (price - limit).abs())
 }
 
 pub struct SimExchangeV2 {
@@ -144,6 +281,15 @@ pub struct SimExchangeV2 {
     // HashMap's per-process-randomized iteration made that order non-deterministic
     // → ±0.3% edge/vol run-to-run noise. Sorted coid iteration = reproducible.
     orders: BTreeMap<String, RestingOrder>,
+    /// Single-writer exchange-arrival sequence for per-order FIFO identity.
+    next_queue_seq: u64,
+    /// Fraction of earlier simulated same-level remaining quantity included in
+    /// a new resting order's queue ahead. 0 = exact historical behaviour.
+    order_queue_position_strength: f64,
+    pub own_queue_positioned_orders: u64,
+    pub own_queue_initial_qty: f64,
+    pub own_queue_cancel_advances_n: u64,
+    pub own_queue_cancel_advance_qty: f64,
     fees: HashMap<String, FeeParams>,
     tick: HashMap<String, f64>,
     split_by_iid: HashMap<String, f64>,
@@ -161,6 +307,10 @@ pub struct SimExchangeV2 {
     /// themselves are retained for the complete replay and emitted at exit.
     event_slug_by_token: HashMap<String, String>,
     fill_audit: BTreeMap<(String, String), FillAuditRow>,
+    /// Per-order rows are opt-in because a multi-day replay can place hundreds
+    /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
+    maker_order_audit_enabled: bool,
+    maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
     /// Symmetric outcome-sibling map (a↔b) for the race lookahead (peek the
     /// canonical frame's next book from EITHER outcome stream).
     fold_sibling: HashMap<String, String>,
@@ -207,6 +357,14 @@ pub struct SimExchangeV2 {
     /// # resyncs where the adverse tilt pushed ahead_frac above its proportional
     /// baseline (advanced the queue → toxic-fill exposure). Diagnostic.
     pub adverse_advanced: u64,
+    /// Causal maker selection: favorable movement since entry makes an
+    /// apparent public-trade overflow less likely to execute our order. The
+    /// suppressed portion becomes latent queue ahead; actual fills remain at
+    /// the real limit. 0 preserves the historical trade matcher.
+    maker_toxicity_strength: f64,
+    maker_toxicity_scale_ticks: f64,
+    pub maker_toxicity_suppressed_n: u64,
+    pub maker_toxicity_suppressed_qty: f64,
     /// **Book-through adverse fill** rate ∈ [0,1] (2026-05-31, option C). When
     /// the contra side TOUCHES or crosses a resting order's price (for a bid:
     /// `eff_best_ask ≤ p`) AND a trade in the same book interval CONFIRMS a real
@@ -217,6 +375,26 @@ pub struct SimExchangeV2 {
     book_through_rate: f64,
     /// # book-through adverse fills produced. Diagnostic.
     pub book_through_fills_n: u64,
+    /// Maximum fraction of same-level shrinkage left after public trades that
+    /// can be interpreted as hidden/aggregated execution rather than
+    /// cancellation. A causal adverse-mid-move gate scales the fraction;
+    /// unlike a fill-probability scalar, the resulting volume must drain queue
+    /// ahead before its overflow can fill.
+    unexplained_depletion_exec_rate: f64,
+    /// # maker fill fragments produced by unexplained depletion. Diagnostic.
+    pub unexplained_depletion_fills_n: u64,
+    /// Approximate leave-one-out fraction for a replay tape containing this
+    /// strategy's original live order at the same level. 0 = ordinary clean
+    /// tape; positive values subtract up to rate·remaining from queue-ahead.
+    replay_self_depth_rate: f64,
+    /// Leave-one-out fraction for taker sweeps on a tape recorded while this
+    /// same strategy instance was live. Opposite-side simulated resting orders
+    /// are removed from their exact canonical levels before marketability,
+    /// available-volume, and sweep-price decisions. The exchange core is the
+    /// sole writer; no shared account or cross-instance state is consulted.
+    replay_self_taker_depth_rate: f64,
+    pub taker_replay_self_sweeps_n: u64,
+    pub taker_replay_self_depth_qty: f64,
     /// **Volume-neutral forward-markout adverse selection** (`vn>0`; 2026-05-31).
     /// The sim fills makers symmetrically on trades → fill markout ≈ 0; live makers
     /// are adversely selected (markout ≈ −0.75¢ at 1-5 s: the mid moves against the
@@ -229,6 +407,12 @@ pub struct SimExchangeV2 {
     fill_markout_vn: f64,
     /// # maker fills haircut/repriced by the forward-markout conditioning. Diagnostic.
     pub fill_haircut_n: u64,
+    /// Independent markout strength for maker fills inferred from order-book
+    /// transitions rather than public trade prints.
+    book_fill_markout_vn: f64,
+    pub book_fill_haircut_n: u64,
+    pub book_fill_haircut_qty: f64,
+    pub book_fill_haircut_cost_usdc: f64,
     /// **Trade-gate for the book-through fill** (option C): per canonical symbol,
     /// the (min canonical-SELL price, max canonical-BUY price) of trades since the
     /// last book update. A touch/cross only fills if a trade CONFIRMS a real
@@ -360,6 +544,12 @@ impl SimExchangeV2 {
             books: BookSet::new(),
             wallets,
             orders: BTreeMap::new(),
+            next_queue_seq: 0,
+            order_queue_position_strength: 0.0,
+            own_queue_positioned_orders: 0,
+            own_queue_initial_qty: 0.0,
+            own_queue_cancel_advances_n: 0,
+            own_queue_cancel_advance_qty: 0.0,
             fees: HashMap::new(),
             tick: HashMap::new(),
             split_by_iid,
@@ -368,6 +558,8 @@ impl SimExchangeV2 {
             fold_to: HashMap::new(),
             event_slug_by_token: HashMap::new(),
             fill_audit: BTreeMap::new(),
+            maker_order_audit_enabled: false,
+            maker_order_audit: BTreeMap::new(),
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
             last_book_local_ts: HashMap::new(),
@@ -387,10 +579,24 @@ impl SimExchangeV2 {
             adverse_sel_rate: 0.0,
             adverse_scale_ticks: 1.0,
             adverse_advanced: 0,
+            maker_toxicity_strength: 0.0,
+            maker_toxicity_scale_ticks: 1.0,
+            maker_toxicity_suppressed_n: 0,
+            maker_toxicity_suppressed_qty: 0.0,
             book_through_rate: 0.0,
             book_through_fills_n: 0,
+            unexplained_depletion_exec_rate: 0.0,
+            unexplained_depletion_fills_n: 0,
+            replay_self_depth_rate: 0.0,
+            replay_self_taker_depth_rate: 0.0,
+            taker_replay_self_sweeps_n: 0,
+            taker_replay_self_depth_qty: 0.0,
             fill_markout_vn: 0.0,
             fill_haircut_n: 0,
+            book_fill_markout_vn: 0.0,
+            book_fill_haircut_n: 0,
+            book_fill_haircut_qty: 0.0,
+            book_fill_haircut_cost_usdc: 0.0,
             pend_cross: HashMap::new(),
             maker_race_rate: 0.0,
             taker_race_rate: 0.0,
@@ -457,20 +663,28 @@ impl SimExchangeV2 {
         price: f64,
         side: Side,
         symbol: &str,
+        liquidity: Liquidity,
         ts: u64,
     ) {
         let e = self.recent_fills.entry(coid.to_string()).or_insert(RecentFill {
             ts,
             trade_id: trade_id.clone(),
-            cum_filled: 0.0,
+            filled_quantity: add_qty,
             price,
             side,
             symbol: symbol.to_string(),
+            liquidity,
         });
         e.ts = ts;
         e.trade_id = trade_id;
-        e.cum_filled += add_qty;
+        // `trade_id` identifies one immutable execution.  If an order fills in
+        // multiple fragments, the newest id replaces the previous one, so its
+        // quantity must be replaced as well.  Summing quantities while
+        // replacing the id makes a matched-can't-cancel replay mutate the
+        // trade tuple and defeats downstream idempotence checks.
+        e.filled_quantity = add_qty;
         e.price = price;
+        e.liquidity = liquidity;
         // Memory bound: drop fills older than the matched-can't-cancel window.
         // `cancel_order` only matches a fill within that window (it checks
         // `now - rf.ts <= window`), and the sim processes events in ts order, so
@@ -490,6 +704,20 @@ impl SimExchangeV2 {
         self.tick.get(token).copied().unwrap_or(0.01)
     }
 
+    #[inline]
+    fn same_queue_level(
+        o: &RestingOrder,
+        match_symbol: &str,
+        match_side: Side,
+        match_price: f64,
+        tick: f64,
+    ) -> bool {
+        o.match_symbol == match_symbol
+            && o.match_side == match_side
+            && o.tick.to_bits() == tick.to_bits()
+            && price_to_ticks(o.match_price, tick) == price_to_ticks(match_price, tick)
+    }
+
     /// Apply v2 model knobs from config (ahead_frac override, matched-can't-
     /// cancel window). `ahead_frac=None` keeps the default proportional model.
     pub fn configure(&mut self, ahead_frac: Option<f64>, matched_cant_cancel_window_ns: u64) {
@@ -501,6 +729,14 @@ impl SimExchangeV2 {
 
     pub fn configure_dynamic_ahead_frac(&mut self, strength: f64) {
         self.dynamic_ahead_frac_strength = strength.clamp(0.0, 1.0);
+    }
+
+    /// Include earlier simulated orders at the same canonical price level in
+    /// each later order's FIFO queue position. The core is a single writer, so
+    /// sequence assignment and cancellation advancement require no shared
+    /// mutable state or cross-thread synchronization.
+    pub fn configure_order_queue_position(&mut self, strength: f64) {
+        self.order_queue_position_strength = strength.clamp(0.0, 1.0);
     }
 
     fn audit_key(&self, token: &str, iid: &str) -> Option<(String, String)> {
@@ -523,6 +759,29 @@ impl SimExchangeV2 {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         self.fill_audit.values().cloned().collect()
+    }
+
+    pub fn configure_maker_order_audit(&mut self, enabled: bool) {
+        self.maker_order_audit_enabled = enabled;
+        if !enabled {
+            self.maker_order_audit.clear();
+        }
+    }
+
+    pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
+        self.maker_order_audit.values().cloned().collect()
+    }
+
+    /// Record when a matched maker fill becomes visible on the simulated
+    /// strategy's private-event lane. Matching owns `first_fill_ns`; the
+    /// simulator owns this delivery timestamp after sampling private latency.
+    pub fn record_fill_delivery(&mut self, coid: &str, delivery_ns: u64) {
+        if let Some(a) = self.maker_order_audit.get_mut(coid) {
+            if a.first_fill_delivery_ns == 0 || delivery_ns < a.first_fill_delivery_ns {
+                a.first_fill_delivery_ns = delivery_ns;
+            }
+            a.last_fill_delivery_ns = a.last_fill_delivery_ns.max(delivery_ns);
+        }
     }
 
     /// Configure the fail-closed full-book age gate. A single threshold is
@@ -613,9 +872,17 @@ impl SimExchangeV2 {
                 continue;
             }
             let depth = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
-            o.q_ahead = depth;
+            o.replay_self_depth_credit = o
+                .replay_self_depth_credit
+                .min(depth)
+                .min(o.remaining);
+            o.q_ahead = (depth - o.replay_self_depth_credit).max(0.0) + o.own_q_ahead;
             o.level_qty_at_sync = depth;
-            o.mid_at_sync = books.eff_mid(&o.match_symbol);
+            let mid = books.eff_mid(&o.match_symbol);
+            o.mid_at_sync = mid;
+            if o.entry_mid <= 0.0 && mid > 0.0 {
+                o.entry_mid = mid;
+            }
             o.traded_since_sync = 0.0;
             o.await_fresh_book = false;
             rebased += 1;
@@ -656,10 +923,41 @@ impl SimExchangeV2 {
         self.adverse_scale_ticks = scale_ticks.max(1e-6);
     }
 
+    /// Configure causal maker fill selection at the actual resting limit.
+    /// Favorable movement since entry suppresses a bounded fraction of an
+    /// otherwise eligible trade overflow; adverse/no movement remains fully
+    /// fillable. No future book state is read.
+    pub fn configure_maker_toxicity(&mut self, strength: f64, scale_ticks: f64) {
+        self.maker_toxicity_strength = strength.clamp(0.0, 1.0);
+        self.maker_toxicity_scale_ticks = scale_ticks.max(1e-6);
+    }
+
     /// Configure the book-through adverse fill rate (latency-race fraction in
     /// [0,1]; 0 = off). See the `book_through_rate` field.
     pub fn configure_book_through(&mut self, rate: f64) {
         self.book_through_rate = rate.clamp(0.0, 1.0);
+    }
+
+    /// Configure the maximum adverse unexplained-depletion execution fraction
+    /// in [0,1].
+    /// At zero, book shrinkage remains cancel-only and follows the exact legacy
+    /// arithmetic path. At a positive value, only causally available residual
+    /// shrinkage can drain the queue and its gated execution component caps the
+    /// fill.
+    pub fn configure_unexplained_depletion_execution(&mut self, rate: f64) {
+        self.unexplained_depletion_exec_rate = rate.clamp(0.0, 1.0);
+    }
+
+    /// Configure approximate leave-one-out queue credit in [0,1]. This must be
+    /// enabled only for a tape recorded while the replayed strategy was live.
+    pub fn configure_replay_self_depth(&mut self, rate: f64) {
+        self.replay_self_depth_rate = rate.clamp(0.0, 1.0);
+    }
+
+    /// Configure exact-level leave-one-out cleaning for taker sweeps. Enable
+    /// only when the replay tape contains this strategy instance's live quotes.
+    pub fn configure_replay_self_taker_depth(&mut self, rate: f64) {
+        self.replay_self_taker_depth_rate = rate.clamp(0.0, 1.0);
     }
 
     /// Configure the VOLUME-NEUTRAL forward-markout adverse-reprice strength `vn`
@@ -667,6 +965,12 @@ impl SimExchangeV2 {
     /// See `fill_markout_vn`.
     pub fn configure_fill_markout_vn(&mut self, vn: f64) {
         self.fill_markout_vn = vn.max(0.0);
+    }
+
+    /// Configure the independent VOLUME-NEUTRAL markout strength for maker
+    /// fills inferred from queue depletion and trade-confirmed book-through.
+    pub fn configure_book_fill_markout_vn(&mut self, vn: f64) {
+        self.book_fill_markout_vn = vn.max(0.0);
     }
 
     /// Enable outcome-folding (single canonical up-frame book; down mapped in).
@@ -751,10 +1055,28 @@ impl SimExchangeV2 {
     }
 
     // ── market data ──────────────────────────────────────────────
-    /// Apply a book snapshot. Returns any **book-through adverse fills** (a
-    /// resting order the contra just swept through) for the caller to deliver,
-    /// empty unless `book_through_rate > 0`.
+    /// Apply a book snapshot. Returns any maker fills caused by causally
+    /// available book depletion or a trade-confirmed book-through sweep.
     pub fn on_orderbook(&mut self, ob: &OrderBookSnapshot) -> Vec<OrderUpdate> {
+        self.on_orderbook_inner(ob, None)
+    }
+
+    /// Apply a book snapshot with the canonical forward mid at `t+h`. The
+    /// future value is used only by the opt-in volume-neutral book-fill
+    /// markout; matching eligibility and fill quantity remain causal.
+    pub fn on_orderbook_fwd(
+        &mut self,
+        ob: &OrderBookSnapshot,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
+        self.on_orderbook_inner(ob, fwd_mid)
+    }
+
+    fn on_orderbook_inner(
+        &mut self,
+        ob: &OrderBookSnapshot,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
         let now_ns = ob.exchange_timestamp_ns;
         if self.fold_outcomes {
             // Fold onto the canonical frame: the non-canonical token's snapshot
@@ -779,8 +1101,14 @@ impl SimExchangeV2 {
                 self.books.update(&canon, b, a);
             }
             self.maybe_rebase_stale_orders(&canon, now_ns);
-            self.resync_queues();
-            return self.run_book_through_if_fresh(&canon, now_ns);
+            let mut depletion_fills = self.resync_queues(now_ns, &canon, fwd_mid);
+            let book_through_fills =
+                self.run_book_through_if_fresh(&canon, now_ns, fwd_mid);
+            if depletion_fills.is_empty() {
+                return book_through_fills;
+            }
+            depletion_fills.extend(book_through_fills);
+            return depletion_fills;
         }
         self.books.update(&ob.symbol, ob.bids.clone(), ob.asks.clone());
         self.last_book_ts
@@ -788,11 +1116,22 @@ impl SimExchangeV2 {
             .and_modify(|ts| *ts = (*ts).max(ob.exchange_timestamp_ns))
             .or_insert(ob.exchange_timestamp_ns);
         self.maybe_rebase_stale_orders(&ob.symbol, now_ns);
-        self.resync_queues();
-        self.run_book_through_if_fresh(&ob.symbol, now_ns)
+        let mut depletion_fills = self.resync_queues(now_ns, &ob.symbol, fwd_mid);
+        let book_through_fills =
+            self.run_book_through_if_fresh(&ob.symbol, now_ns, fwd_mid);
+        if depletion_fills.is_empty() {
+            return book_through_fills;
+        }
+        depletion_fills.extend(book_through_fills);
+        depletion_fills
     }
 
-    fn run_book_through_if_fresh(&mut self, token: &str, now_ns: u64) -> Vec<OrderUpdate> {
+    fn run_book_through_if_fresh(
+        &mut self,
+        token: &str,
+        now_ns: u64,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
         let (exchange_stale, local_stale) = self.book_stale_reasons(token, now_ns);
         if exchange_stale || local_stale {
             // A trade-confirmation belongs only to the immediately following
@@ -801,7 +1140,7 @@ impl SimExchangeV2 {
             self.pend_cross.clear();
             Vec::new()
         } else {
-            self.run_book_through(now_ns)
+            self.run_book_through(now_ns, fwd_mid)
         }
     }
 
@@ -811,15 +1150,23 @@ impl SimExchangeV2 {
     /// — verified 99.9% of crosses), gets picked off. Fill `rate·(through_vol −
     /// q_ahead)` at the order's limit (adverse: mid is now through it). No-op
     /// when `book_through_rate == 0`.
-    fn run_book_through(&mut self, now_ns: u64) -> Vec<OrderUpdate> {
+    fn run_book_through(&mut self, now_ns: u64, fwd_mid: Option<f64>) -> Vec<OrderUpdate> {
         let rate = self.book_through_rate;
         if rate <= 0.0 {
             return Vec::new();
         }
+        let markout_vn = self.book_fill_markout_vn;
+        let audit_enabled = self.maker_order_audit_enabled;
         let mut mfills: Vec<MakerFill> = Vec::new();
+        let mut haircut_n = 0u64;
+        let mut haircut_qty = 0.0;
+        let mut haircut_cost = 0.0;
         {
             let books = &self.books;
             let pend = &self.pend_cross;
+            let slugs = &self.event_slug_by_token;
+            let audits = &mut self.fill_audit;
+            let order_audits = &mut self.maker_order_audit;
             let mut n = 0u64;
             for (coid, o) in self.orders.iter_mut() {
                 if o.remaining <= EPS {
@@ -854,10 +1201,44 @@ impl SimExchangeV2 {
                 }
                 // The sweep consumes the queue ahead of us then takes our fill.
                 o.q_ahead = (o.q_ahead - through).max(0.0);
+                o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
                 o.remaining -= fill;
                 let limit = o.request.price.unwrap_or(0.0);
+                let (effective_price, price_penalty) = maker_markout_reprice(
+                    limit,
+                    o.request.side,
+                    o.match_side,
+                    o.match_price,
+                    fwd_mid,
+                    markout_vn,
+                );
+                let fill_cost = price_penalty * fill;
                 if o.request.side == Side::Buy {
                     o.locked_usdc = limit * o.remaining;
+                }
+                if let Some(a) = order_audits.get_mut(coid) {
+                    a.book_through_candidate_qty += fillable.min(o.remaining + fill);
+                    a.book_through_fill_qty += fill;
+                    if price_penalty > 0.0 {
+                        a.book_markout_qty += fill;
+                        a.book_markout_cost_usdc += fill_cost;
+                    }
+                    a.q_ahead_final = o.q_ahead;
+                    a.remaining_final = o.remaining;
+                }
+                if audit_enabled && price_penalty > 0.0 {
+                    if let Some(slug) = slugs.get(&o.request.symbol) {
+                        let key = (slug.clone(), o.request.instance_id.clone());
+                        if let Some(a) = audits.get_mut(&key) {
+                            a.maker_book_markout_qty += fill;
+                            a.maker_book_markout_cost_usdc += fill_cost;
+                        }
+                    }
+                }
+                if price_penalty > 0.0 {
+                    haircut_n += 1;
+                    haircut_qty += fill;
+                    haircut_cost += fill_cost;
                 }
                 n += 1;
                 mfills.push(MakerFill {
@@ -866,13 +1247,17 @@ impl SimExchangeV2 {
                     side: o.request.side,
                     iid: o.request.instance_id.clone(),
                     fill,
-                    price: limit,
+                    price: effective_price,
                     remaining_after: o.remaining,
                     fully: o.remaining <= EPS,
+                    queue_seq: o.queue_seq,
                 });
             }
             self.book_through_fills_n += n;
         }
+        self.book_fill_haircut_n += haircut_n;
+        self.book_fill_haircut_qty += haircut_qty;
+        self.book_fill_haircut_cost_usdc += haircut_cost;
         // Reset the trade-gate window for the next book interval.
         self.pend_cross.clear();
         if mfills.is_empty() {
@@ -881,26 +1266,44 @@ impl SimExchangeV2 {
         self.apply_maker_fills(mfills, now_ns)
     }
 
-    /// Cancel attribution (§5): level shrinkage not explained by trades since the
-    /// last snapshot is attributed to cancels; a fraction `ahead_frac` sits ahead
-    /// of us and advances our queue. (The maker race is NOT applied here — it
-    /// fires once, at the order's entry-match moment; see `insert_resting`.)
-    fn resync_queues(&mut self) {
+    /// Depletion attribution (§5): level shrinkage not explained by public trades
+    /// since the last snapshot is split into hidden execution and cancellation.
+    /// Hidden execution drains the queue before it can fill us; only the fraction
+    /// of cancellations represented by `ahead_frac` advances our queue. (The maker
+    /// race is NOT applied here — it fires once, at the order's entry-match moment;
+    /// see `insert_resting`.)
+    fn resync_queues(
+        &mut self,
+        now_ns: u64,
+        changed_token: &str,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
         let books = &self.books;
         let af_override = self.ahead_frac_override;
         let dynamic_af_strength = self.dynamic_ahead_frac_strength;
         let adv_rate = self.adverse_sel_rate;
         let adv_scale = self.adverse_scale_ticks;
+        let depletion_rate = self.unexplained_depletion_exec_rate;
+        let markout_vn = self.book_fill_markout_vn;
+        let own_fifo_strength = self.order_queue_position_strength;
+        let audit_enabled = self.maker_order_audit_enabled;
         let mut advanced = 0u64;
         let mut dynamic_n = 0u64;
         let mut dynamic_sum = 0.0;
         let mut dynamic_min = f64::INFINITY;
         let mut dynamic_max = f64::NEG_INFINITY;
-        for o in self.orders.values_mut() {
+        let slugs = &self.event_slug_by_token;
+        let audits = &mut self.fill_audit;
+        let order_audits = &mut self.maker_order_audit;
+        let mut candidates: Vec<DepletionCandidate> = Vec::new();
+        let mut haircut_n = 0u64;
+        let mut haircut_qty = 0.0;
+        let mut haircut_cost = 0.0;
+        for (coid, o) in self.orders.iter_mut() {
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
-            let cancels = (l_prev - o.traded_since_sync - l_now).max(0.0);
+            let unexplained = (l_prev - o.traded_since_sync - l_now).max(0.0);
             // Baseline (neutral) ahead-fraction: pinned override or proportional.
             let proportional = if l_prev > EPS {
                 (o.q_ahead / l_prev).clamp(0.0, 1.0)
@@ -909,7 +1312,7 @@ impl SimExchangeV2 {
             };
             let fixed = af_override.unwrap_or(proportional).clamp(0.0, 1.0);
             let base = (fixed + dynamic_af_strength * (proportional - fixed)).clamp(0.0, 1.0);
-            if dynamic_af_strength > 0.0 && cancels > EPS {
+            if dynamic_af_strength > 0.0 && unexplained > EPS {
                 dynamic_n += 1;
                 dynamic_sum += base;
                 dynamic_min = dynamic_min.min(base);
@@ -923,9 +1326,16 @@ impl SimExchangeV2 {
             // exactly the prior model. The fill's adverse cost is realised later
             // at settlement (down move ⇒ a filled `up` bid loses).
             let mid_now = books.eff_mid(&o.match_symbol);
-            let ahead_frac = if adv_rate > 0.0 && mid_now > 0.0 && o.mid_at_sync > 0.0 {
+            let adverse = if (adv_rate > 0.0 || depletion_rate > 0.0)
+                && mid_now > 0.0
+                && o.mid_at_sync > 0.0
+            {
                 let raw = mid_now - o.mid_at_sync; // + = canonical(up) mid rose
-                let adverse = match o.match_side { Side::Buy => -raw, Side::Sell => raw };
+                match o.match_side { Side::Buy => -raw, Side::Sell => raw }
+            } else {
+                0.0
+            };
+            let ahead_frac = if adv_rate > 0.0 {
                 let s = (adv_rate * adverse / (adv_scale * o.tick)).clamp(-1.0, 1.0);
                 if s > 0.0 {
                     advanced += 1;
@@ -936,18 +1346,215 @@ impl SimExchangeV2 {
             } else {
                 base
             };
-            o.q_ahead = (o.q_ahead - cancels * ahead_frac).max(0.0);
+            let q_before = o.q_ahead;
+            // A zero rate deliberately takes the original cancel-only
+            // arithmetic path. This makes the feature result-neutral when it
+            // is absent from config or explicitly disabled.
+            let execution = if depletion_rate > 0.0 && o.match_symbol == changed_token {
+                let adverse_gate = (adverse / (adv_scale * o.tick)).clamp(0.0, 1.0);
+                unexplained * depletion_rate * adverse_gate
+            } else {
+                0.0
+            };
+            let cancels = unexplained - execution;
+            let raw_cancel_advance = cancels * ahead_frac;
+            // Public cancellations can remove only the public portion of our
+            // queue. Earlier simulated orders remain ahead until they fill or
+            // cancel explicitly; treating public L2 shrinkage as their cancel
+            // would reintroduce the same multi-order volume duplication FIFO is
+            // meant to prevent. The disabled path keeps legacy arithmetic.
+            let cancel_advance = if own_fifo_strength > 0.0 && o.own_q_ahead > EPS {
+                raw_cancel_advance.min((q_before - o.own_q_ahead).max(0.0))
+            } else {
+                raw_cancel_advance
+            };
+            let total_advance = cancel_advance + execution;
+            o.q_ahead = (q_before - total_advance).max(0.0);
+            o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
+
+            let candidate = if execution > EPS {
+                (total_advance - q_before)
+                    .max(0.0)
+                    .min(execution)
+                    .min(o.remaining)
+            } else {
+                0.0
+            };
+            if audit_enabled {
+                if let Some(a) = order_audits.get_mut(coid) {
+                    a.depletion_observed_qty += unexplained;
+                    a.depletion_exec_qty += execution;
+                    a.depletion_cancel_advance_qty += cancel_advance;
+                    a.depletion_candidate_qty += candidate;
+                    a.q_ahead_final = o.q_ahead;
+                }
+                if let Some(slug) = slugs.get(&o.request.symbol) {
+                    let key = (slug.clone(), o.request.instance_id.clone());
+                    let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                        slug: key.0,
+                        iid: key.1,
+                        ..FillAuditRow::default()
+                    });
+                    a.maker_depletion_observed_qty += unexplained;
+                    a.maker_depletion_exec_qty += execution;
+                    a.maker_depletion_cancel_advance_qty += cancel_advance;
+                    a.maker_depletion_candidate_qty += candidate;
+                }
+            }
+            if candidate > EPS {
+                candidates.push(DepletionCandidate {
+                    match_symbol: o.match_symbol.clone(),
+                    match_side: o.match_side,
+                    match_price: o.match_price,
+                    match_side_rank: match o.match_side {
+                        Side::Buy => 0,
+                        Side::Sell => 1,
+                    },
+                    match_price_tick: (o.match_price / o.tick).round() as i64,
+                    match_tick_bits: o.tick.to_bits(),
+                    placed_ns: o.placed_ns,
+                    coid: coid.clone(),
+                    token: o.request.symbol.clone(),
+                    side: o.request.side,
+                    iid: o.request.instance_id.clone(),
+                    price: o.request.price.unwrap_or(0.0),
+                    potential: candidate,
+                    level_execution: execution,
+                });
+            }
+            // Own depth cannot survive after it disappears from the replayed
+            // level. Capping here prevents a later, unrelated level re-entry
+            // from receiving the same leave-one-out credit a second time.
+            o.replay_self_depth_credit = o
+                .replay_self_depth_credit
+                .min(l_now)
+                .min(o.remaining);
             o.level_qty_at_sync = l_now;
             if mid_now > 0.0 {
                 o.mid_at_sync = mid_now;
             }
             o.traded_since_sync = 0.0;
         }
+
+        // One public level depletion supplies one execution budget even when
+        // several of our orders observe it. Allocate only the fill overflow in
+        // exchange-arrival FIFO order; queue advancement above was correctly
+        // applied to every queue position. The max (rather than sum) handles
+        // orders whose sync anchors differ without manufacturing volume.
+        candidates.sort_by(|a, b| {
+            a.match_symbol
+                .cmp(&b.match_symbol)
+                .then(a.match_side_rank.cmp(&b.match_side_rank))
+                .then(a.match_tick_bits.cmp(&b.match_tick_bits))
+                .then(a.match_price_tick.cmp(&b.match_price_tick))
+                .then(a.placed_ns.cmp(&b.placed_ns))
+                .then(a.coid.cmp(&b.coid))
+        });
+        let same_level = |a: &DepletionCandidate, b: &DepletionCandidate| {
+            a.match_symbol == b.match_symbol
+                && a.match_side_rank == b.match_side_rank
+                && a.match_tick_bits == b.match_tick_bits
+                && a.match_price_tick == b.match_price_tick
+        };
+        let mut mfills: Vec<MakerFill> = Vec::new();
+        let mut begin = 0usize;
+        while begin < candidates.len() {
+            let mut end = begin + 1;
+            while end < candidates.len() && same_level(&candidates[begin], &candidates[end]) {
+                end += 1;
+            }
+            let mut budget = candidates[begin..end]
+                .iter()
+                .map(|candidate| candidate.level_execution)
+                .fold(0.0, f64::max);
+            for candidate in &candidates[begin..end] {
+                let actual = candidate.potential.min(budget);
+                budget = (budget - actual).max(0.0);
+                let suppressed = (candidate.potential - actual).max(0.0);
+                if audit_enabled && suppressed > EPS {
+                    if let Some(a) = order_audits.get_mut(&candidate.coid) {
+                        a.depletion_budget_suppressed_qty += suppressed;
+                    }
+                    if let Some(slug) = slugs.get(&candidate.token) {
+                        let key = (slug.clone(), candidate.iid.clone());
+                        if let Some(a) = audits.get_mut(&key) {
+                            a.maker_depletion_budget_suppressed_qty += suppressed;
+                        }
+                    }
+                }
+                if actual <= EPS {
+                    continue;
+                }
+                let Some(o) = self.orders.get_mut(&candidate.coid) else {
+                    continue;
+                };
+                let fill = actual.min(o.remaining);
+                o.remaining -= fill;
+                let (effective_price, price_penalty) = maker_markout_reprice(
+                    candidate.price,
+                    candidate.side,
+                    candidate.match_side,
+                    candidate.match_price,
+                    fwd_mid,
+                    markout_vn,
+                );
+                let fill_cost = price_penalty * fill;
+                if o.request.side == Side::Buy {
+                    o.locked_usdc = candidate.price * o.remaining;
+                }
+                if audit_enabled {
+                    if let Some(a) = order_audits.get_mut(&candidate.coid) {
+                        a.depletion_fill_qty += fill;
+                        if price_penalty > 0.0 {
+                            a.book_markout_qty += fill;
+                            a.book_markout_cost_usdc += fill_cost;
+                        }
+                        a.remaining_final = o.remaining;
+                    }
+                    if let Some(slug) = slugs.get(&candidate.token) {
+                        let key = (slug.clone(), candidate.iid.clone());
+                        if let Some(a) = audits.get_mut(&key) {
+                            a.maker_depletion_fill_qty += fill;
+                            if price_penalty > 0.0 {
+                                a.maker_book_markout_qty += fill;
+                                a.maker_book_markout_cost_usdc += fill_cost;
+                            }
+                        }
+                    }
+                }
+                if price_penalty > 0.0 {
+                    haircut_n += 1;
+                    haircut_qty += fill;
+                    haircut_cost += fill_cost;
+                }
+                mfills.push(MakerFill {
+                    coid: candidate.coid.clone(),
+                    token: candidate.token.clone(),
+                    side: candidate.side,
+                    iid: candidate.iid.clone(),
+                    fill,
+                    price: effective_price,
+                    remaining_after: o.remaining,
+                    fully: o.remaining <= EPS,
+                    queue_seq: o.queue_seq,
+                });
+            }
+            begin = end;
+        }
         self.adverse_advanced += advanced;
         self.dynamic_ahead_frac_n += dynamic_n;
         self.dynamic_ahead_frac_sum += dynamic_sum;
         self.dynamic_ahead_frac_min = self.dynamic_ahead_frac_min.min(dynamic_min);
         self.dynamic_ahead_frac_max = self.dynamic_ahead_frac_max.max(dynamic_max);
+        self.unexplained_depletion_fills_n += mfills.len() as u64;
+        self.book_fill_haircut_n += haircut_n;
+        self.book_fill_haircut_qty += haircut_qty;
+        self.book_fill_haircut_cost_usdc += haircut_cost;
+        if mfills.is_empty() {
+            Vec::new()
+        } else {
+            self.apply_maker_fills(mfills, now_ns)
+        }
     }
 
     /// Maker fills: a trade print drains the resting queue at the matched level
@@ -977,7 +1584,7 @@ impl SimExchangeV2 {
                     self.audit_stale_trade(&canon, t.side, t.price, t.quantity);
                     self.count_book_stale_block(exchange_stale, local_stale, false);
                 } else {
-                    self.match_trade(&canon, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                    self.match_trade(&canon, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills);
                 }
             } else {
                 self.record_trade(&canon, flip(t.side), 1.0 - t.price, t.quantity, ts);
@@ -990,6 +1597,7 @@ impl SimExchangeV2 {
                         flip(t.side),
                         1.0 - t.price,
                         t.quantity,
+                        ts,
                         fwd_mid,
                         &mut fills,
                     );
@@ -1003,7 +1611,7 @@ impl SimExchangeV2 {
                 self.audit_stale_trade(&t.symbol, t.side, t.price, t.quantity);
                 self.count_book_stale_block(exchange_stale, local_stale, false);
             } else {
-                self.match_trade(&t.symbol, t.side, t.price, t.quantity, fwd_mid, &mut fills);
+                self.match_trade(&t.symbol, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills);
             }
             // Cross-outcome mirror: flip side, 1 − price on the complement token.
             if let Some(comp) = self.books.complement(&t.symbol).cloned() {
@@ -1018,6 +1626,7 @@ impl SimExchangeV2 {
                         flip(t.side),
                         1.0 - t.price,
                         t.quantity,
+                        ts,
                         fwd_mid.map(|m| 1.0 - m),
                         &mut fills,
                     );
@@ -1077,6 +1686,7 @@ impl SimExchangeV2 {
         aggressor_side: Side,
         price: f64,
         qty: f64,
+        now_ns: u64,
         fwd_mid: Option<f64>,
         out: &mut Vec<MakerFill>,
     ) {
@@ -1093,9 +1703,19 @@ impl SimExchangeV2 {
         let tick = self.tick_of(symbol);
         let trade_ticks = price_to_ticks(price, tick);
         let vn = self.fill_markout_vn;
+        let toxicity_strength = self.maker_toxicity_strength;
+        let toxicity_scale_ticks = self.maker_toxicity_scale_ticks;
+        let mid_now = if toxicity_strength > 0.0 {
+            self.books.eff_mid(symbol)
+        } else {
+            0.0
+        };
         let mut haircuts = 0u64;
+        let mut toxicity_suppressed_n = 0u64;
+        let mut toxicity_suppressed_qty = 0.0;
         let audit_slug = self.event_slug_by_token.get(symbol).cloned();
         let audits = &mut self.fill_audit;
+        let order_audits = &mut self.maker_order_audit;
         for (coid, o) in self.orders.iter_mut() {
             // Match in the canonical frame: `symbol`/`aggressor_side`/`price`
             // are canonical (the caller already folded the trade). Fills settle
@@ -1113,6 +1733,15 @@ impl SimExchangeV2 {
             }
             let q_before = o.q_ahead;
             let over = qty - q_before;
+            if let Some(a) = order_audits.get_mut(coid) {
+                a.trade_match_n += 1;
+                a.trade_match_qty += qty;
+                a.queue_drained_qty += qty.min(q_before);
+                a.candidate_qty += over.max(0.0).min(o.remaining);
+                a.q_ahead_final = (q_before - qty).max(0.0);
+                a.remaining_final = o.remaining;
+                debug_assert!(now_ns >= a.place_arrival_ns);
+            }
             if let Some(slug) = audit_slug.as_ref() {
                 let key = (slug.clone(), o.request.instance_id.clone());
                 let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
@@ -1126,11 +1755,56 @@ impl SimExchangeV2 {
                 a.maker_candidate_qty += over.max(0.0).min(o.remaining);
             }
             o.q_ahead = (o.q_ahead - qty).max(0.0);
+            o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
             o.traded_since_sync += qty;
             if over <= EPS {
                 continue;
             }
-            let fill = over.min(o.remaining);
+            let candidate = over.min(o.remaining);
+            if candidate <= EPS {
+                continue;
+            }
+            // Causal maker selection at the real limit. A move in our favor
+            // since exchange entry is exactly the regime where a public print
+            // is least likely to have reached our individual queue position.
+            // Suppress a bounded fraction and turn it into latent queue ahead;
+            // adverse/no movement remains fully fillable. Only current book
+            // state is used — no future markout and no execution repricing.
+            let favorable_ticks = if toxicity_strength > 0.0
+                && mid_now > 0.0
+                && o.entry_mid > 0.0
+                && o.tick > 0.0
+            {
+                let favorable_move = match o.match_side {
+                    Side::Buy => mid_now - o.entry_mid,
+                    Side::Sell => o.entry_mid - mid_now,
+                };
+                (favorable_move / o.tick).max(0.0)
+            } else {
+                0.0
+            };
+            let suppress_frac = if favorable_ticks > 0.0 {
+                toxicity_strength * (favorable_ticks / toxicity_scale_ticks).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let suppressed = candidate * suppress_frac;
+            let fill = (candidate - suppressed).max(0.0);
+            if suppressed > EPS {
+                o.q_ahead += suppressed;
+                toxicity_suppressed_n += 1;
+                toxicity_suppressed_qty += suppressed;
+                if let Some(a) = order_audits.get_mut(coid) {
+                    a.maker_toxicity_suppressed_qty += suppressed;
+                    a.q_ahead_final = o.q_ahead;
+                }
+                if let Some(slug) = audit_slug.as_ref() {
+                    let key = (slug.clone(), o.request.instance_id.clone());
+                    if let Some(a) = audits.get_mut(&key) {
+                        a.maker_toxicity_suppressed_qty += suppressed;
+                    }
+                }
+            }
             if fill <= EPS {
                 continue;
             }
@@ -1141,25 +1815,26 @@ impl SimExchangeV2 {
             // the forward mid (limit ± vn·markout) → edge drops at preserved maker
             // volume. Settle in the ORIGINAL frame (down price q, not up-frame 1−q).
             let limit = o.request.price.unwrap_or(0.0);
-            let mut eff_price = limit;
-            if let (Some(fm), true) = (fwd_mid, vn > 0.0) {
-                let markout = match o.match_side { Side::Buy => fm - o.match_price, Side::Sell => o.match_price - fm };
-                if markout > 0.0 {
-                    // Penalty magnitude is frame-invariant (p↔1−p preserves |Δ|);
-                    // apply by ORIGINAL side: BUY pays more, SELL receives less.
-                    let pen = vn * markout;
-                    eff_price = match o.request.side {
-                        Side::Buy => (limit + pen).min(1.0),
-                        Side::Sell => (limit - pen).max(0.0),
-                    };
-                    haircuts += 1;
-                }
+            let (eff_price, price_penalty) = maker_markout_reprice(
+                limit,
+                o.request.side,
+                o.match_side,
+                o.match_price,
+                fwd_mid,
+                vn,
+            );
+            if price_penalty > 0.0 {
+                haircuts += 1;
             }
             o.remaining -= fill;
             // Resting remainder stays at the real limit (only the FILLED share is
             // repriced under vn); locked USDC tracks the limit.
             if o.request.side == Side::Buy {
                 o.locked_usdc = limit * o.remaining;
+            }
+            if let Some(a) = order_audits.get_mut(coid) {
+                a.q_ahead_final = o.q_ahead;
+                a.remaining_final = o.remaining;
             }
             out.push(MakerFill {
                 coid: coid.clone(),
@@ -1170,14 +1845,25 @@ impl SimExchangeV2 {
                 price: eff_price,
                 remaining_after: o.remaining,
                 fully: o.remaining <= EPS,
+                queue_seq: o.queue_seq,
             });
         }
         self.fill_haircut_n += haircuts;
+        self.maker_toxicity_suppressed_n += toxicity_suppressed_n;
+        self.maker_toxicity_suppressed_qty += toxicity_suppressed_qty;
     }
 
-    fn apply_maker_fills(&mut self, fills: Vec<MakerFill>, now_ns: u64) -> Vec<OrderUpdate> {
+    fn apply_maker_fills(&mut self, mut fills: Vec<MakerFill>, now_ns: u64) -> Vec<OrderUpdate> {
+        if self.order_queue_position_strength > 0.0 {
+            fills.sort_unstable_by_key(|fill| fill.queue_seq);
+        }
         let mut out = Vec::with_capacity(fills.len());
         for f in fills {
+            if let Some(order) = self.orders.get_mut(&f.coid) {
+                order.replay_self_depth_credit = order
+                    .replay_self_depth_credit
+                    .min(f.remaining_after.max(0.0));
+            }
             // Maker fills settle at our limit; Polymarket maker fee = 0.
             match f.side {
                 Side::Buy => self.wallets.settle_buy(&f.iid, &f.token, f.fill, f.price * f.fill),
@@ -1186,6 +1872,18 @@ impl SimExchangeV2 {
             self.maker_fills += 1;
             if let Some(a) = self.audit_row_mut(&f.token, &f.iid) {
                 a.maker_fill_qty += f.fill;
+            }
+            if let Some(a) = self.maker_order_audit.get_mut(&f.coid) {
+                a.fill_qty += f.fill;
+                if a.first_fill_ns == 0 {
+                    a.first_fill_ns = now_ns;
+                }
+                a.last_fill_ns = now_ns;
+                a.remaining_final = f.remaining_after;
+                if f.fully {
+                    a.cancel_result = "filled";
+                    a.q_ahead_final = 0.0;
+                }
             }
             // Diagnostic: fill-age = how long after placement this maker order
             // filled. High age ⇒ orders linger before filling (race leaking).
@@ -1201,7 +1899,16 @@ impl SimExchangeV2 {
                 }
             }
             let trade_id = format!("simv2-maker-{}-{}", f.coid, self.maker_fills);
-            self.record_recent_fill(&f.coid, trade_id.clone(), f.fill, f.price, f.side, &f.token, now_ns);
+            self.record_recent_fill(
+                &f.coid,
+                trade_id.clone(),
+                f.fill,
+                f.price,
+                f.side,
+                &f.token,
+                Liquidity::Maker,
+                now_ns,
+            );
             let status = if f.fully { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
             out.push(OrderUpdate {
                 client_order_id: f.coid.clone(),
@@ -1401,7 +2108,13 @@ impl SimExchangeV2 {
             }
             o.tick = t.new_tick_size;
             let d = books.level_depth(&o.match_symbol, o.match_side, o.match_price, t.new_tick_size);
-            o.q_ahead = o.q_ahead.min(d);
+            o.replay_self_depth_credit = o
+                .replay_self_depth_credit
+                .min(d)
+                .min(o.remaining);
+            o.q_ahead = o
+                .q_ahead
+                .min((d - o.replay_self_depth_credit).max(0.0));
             o.level_qty_at_sync = d;
             o.traded_since_sync = 0.0;
         }
@@ -1440,6 +2153,89 @@ impl SimExchangeV2 {
         }
     }
 
+    /// Quantity at one public taker level after removing the replay instance's
+    /// currently-resting opposite-side simulated orders at that exact canonical
+    /// level. This is a leave-one-out view of a tape captured while the same
+    /// strategy was live; it never subtracts another instance's orders.
+    fn replay_clean_taker_level_qty(
+        &self,
+        iid: &str,
+        match_symbol: &str,
+        taker_side: Side,
+        price: f64,
+        public_qty: f64,
+        tick: f64,
+    ) -> f64 {
+        let rate = self.replay_self_taker_depth_rate;
+        if rate <= 0.0 || public_qty <= EPS {
+            return public_qty;
+        }
+        let maker_side = flip(taker_side);
+        let price_tick = price_to_ticks(price, tick);
+        let own_qty = self
+            .orders
+            .values()
+            .filter(|resting| {
+                resting.request.instance_id == iid
+                    && resting.match_symbol == match_symbol
+                    && resting.match_side == maker_side
+                    && price_to_ticks(resting.match_price, tick) == price_tick
+            })
+            .map(|resting| resting.remaining)
+            .sum::<f64>();
+        (public_qty - rate * own_qty).max(0.0)
+    }
+
+    fn replay_clean_taker_available(
+        &self,
+        iid: &str,
+        match_symbol: &str,
+        taker_side: Side,
+        ladder: &[PriceLevel],
+        lim: Option<f64>,
+    ) -> f64 {
+        let tick = self.tick_of(match_symbol);
+        ladder
+            .iter()
+            .take_while(|level| match (lim, taker_side) {
+                (None, _) => true,
+                (Some(p), Side::Buy) => level.price <= p + EPS,
+                (Some(p), Side::Sell) => level.price >= p - EPS,
+            })
+            .map(|level| {
+                self.replay_clean_taker_level_qty(
+                    iid,
+                    match_symbol,
+                    taker_side,
+                    level.price,
+                    level.quantity,
+                    tick,
+                )
+            })
+            .sum()
+    }
+
+    fn replay_clean_best_taker_price(
+        &self,
+        iid: &str,
+        match_symbol: &str,
+        taker_side: Side,
+        ladder: &[PriceLevel],
+    ) -> Option<f64> {
+        let tick = self.tick_of(match_symbol);
+        ladder.iter().find_map(|level| {
+            (self.replay_clean_taker_level_qty(
+                iid,
+                match_symbol,
+                taker_side,
+                level.price,
+                level.quantity,
+                tick,
+            ) > EPS)
+                .then_some(level.price)
+        })
+    }
+
     /// Would this order taker-fill against the *current* book if it arrived
     /// now? (marketable & not post-only). Used to decide whether to defer the
     /// match to the midpoint of the matching window. Post-only / non-marketable
@@ -1460,7 +2256,9 @@ impl SimExchangeV2 {
             Side::Buy => self.books.buy_ladder(&msym),
             Side::Sell => self.books.sell_ladder(&msym),
         };
-        match (ladder.first().map(|l| l.price), mside, lim) {
+        let best_opposing =
+            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder);
+        match (best_opposing, mside, lim) {
             (Some(bp), Side::Buy, Some(l)) => bp <= l + EPS,
             (Some(bp), Side::Sell, Some(l)) => bp >= l - EPS,
             (Some(_), _, None) => true,
@@ -1515,7 +2313,8 @@ impl SimExchangeV2 {
             Side::Buy => self.books.buy_ladder(&msym),
             Side::Sell => self.books.sell_ladder(&msym),
         };
-        let best_opposing = ladder.first().map(|l| l.price);
+        let best_opposing =
+            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder);
         let marketable = match (best_opposing, mside, lim) {
             (Some(bp), Side::Buy, Some(l)) => bp <= l + EPS,
             (Some(bp), Side::Sell, Some(l)) => bp >= l - EPS,
@@ -1555,11 +2354,24 @@ impl SimExchangeV2 {
         now_ns: u64,
     ) -> OrderUpdate {
         let folded = msym != o.symbol;
-        let now_available = self.books.available_volume(msym, mside == Side::Buy, lim);
+        let raw_available = self.books.available_volume(msym, mside == Side::Buy, lim);
+        let now_available = self.replay_clean_taker_available(
+            &o.instance_id,
+            msym,
+            mside,
+            ladder,
+            lim,
+        );
+        let replay_self_depth = (raw_available - now_available).max(0.0);
+        if replay_self_depth > EPS {
+            self.taker_replay_self_sweeps_n += 1;
+            self.taker_replay_self_depth_qty += replay_self_depth;
+        }
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.taker_candidates += 1;
             a.taker_requested_qty += o.quantity;
             a.taker_available_qty += now_available.min(o.quantity);
+            a.taker_replay_self_depth_qty += replay_self_depth;
         }
         // Distribution sample: fillable volume within our limit at the match
         // moment (what this taker order can actually hit on the current book).
@@ -1581,7 +2393,14 @@ impl SimExchangeV2 {
             let requested = o.quantity;
             let is_buy = mside == Side::Buy;
             let mut race_cap = requested;
-            if let Some(next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+            if let Some(mut next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+                if self.replay_self_taker_depth_rate > 0.0 {
+                    // The future tape can contain the same historical live
+                    // quotes too. Without exact historical order tuples, the
+                    // current clean availability is a conservative upper bound
+                    // for the lookahead race leg.
+                    next_avail = next_avail.min(now_available);
+                }
                 if next_avail < now_available {
                     let eff = self.taker_race_rate * next_avail
                         + (1.0 - self.taker_race_rate) * now_available;
@@ -1636,11 +2455,13 @@ impl SimExchangeV2 {
             if self.taker_race_rate > 0.0 {
                 let before = rem;
                 let is_buy = mside == Side::Buy;
-                if let Some(next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
-                    let now_avail = self.books.available_volume(msym, is_buy, lim);
-                    if next_avail < now_avail {
+                if let Some(mut next_avail) = self.books.available_volume_next(msym, is_buy, lim) {
+                    if self.replay_self_taker_depth_rate > 0.0 {
+                        next_avail = next_avail.min(now_available);
+                    }
+                    if next_avail < now_available {
                         let eff = self.taker_race_rate * next_avail
-                            + (1.0 - self.taker_race_rate) * now_avail;
+                            + (1.0 - self.taker_race_rate) * now_available;
                         if eff.max(0.0) < rem {
                             self.taker_race_capped += 1;
                             if eff.max(0.0) <= EPS {
@@ -1665,12 +2486,10 @@ impl SimExchangeV2 {
             // competition the book heals between snapshots (invisible to the race).
             if self.taker_comp_rate > 0.0 {
                 let before = rem;
-                let is_buy = mside == Side::Buy;
-                let now_avail = self.books.available_volume(msym, is_buy, lim);
                 let comp = self.taker_competition_volume(msym, mside, lim, now_ns);
                 self.taker_comp_vol_sum += comp;
                 self.taker_comp_n += 1;
-                let eff = (now_avail - self.taker_comp_rate * comp).max(0.0);
+                let eff = (now_available - self.taker_comp_rate * comp).max(0.0);
                 if eff < rem {
                     self.taker_comp_capped += 1;
                     if eff <= EPS {
@@ -1686,6 +2505,7 @@ impl SimExchangeV2 {
                 }
             }
         }
+        let tick = self.tick_of(msym);
         for l in ladder {
             if rem <= EPS {
                 break;
@@ -1698,7 +2518,18 @@ impl SimExchangeV2 {
             if !within {
                 break;
             }
-            let take = rem.min(l.quantity);
+            let clean_qty = self.replay_clean_taker_level_qty(
+                &o.instance_id,
+                msym,
+                mside,
+                l.price,
+                l.quantity,
+                tick,
+            );
+            let take = rem.min(clean_qty);
+            if take <= EPS {
+                continue;
+            }
             filled += take;
             notional += take * l.price;
             // Fee is frame-invariant (p·(1−p) symmetric); compute on the original.
@@ -1762,7 +2593,16 @@ impl SimExchangeV2 {
             self.insert_resting(o, remainder, now_ns, false);
         }
         let taker_tid = format!("simv2-taker-{}", o.client_order_id);
-        self.record_recent_fill(&o.client_order_id, taker_tid.clone(), filled, avg, o.side, &o.symbol, now_ns);
+        self.record_recent_fill(
+            &o.client_order_id,
+            taker_tid.clone(),
+            filled,
+            avg,
+            o.side,
+            &o.symbol,
+            Liquidity::Taker,
+            now_ns,
+        );
         let status = if remainder > EPS { OrderStatus::PartiallyFilled } else { OrderStatus::Filled };
         OrderUpdate {
             client_order_id: o.client_order_id.clone(),
@@ -1803,6 +2643,12 @@ impl SimExchangeV2 {
         // transiently differ if only one outcome stream emitted a tick-size change.
         let tick = self.tick_of(&msym);
         let now_depth = self.books.level_depth(&msym, mside, match_price, tick);
+        let replay_self_depth_credit = if now_depth > EPS {
+            (self.replay_self_depth_rate * remaining).min(now_depth)
+        } else {
+            0.0
+        };
+        let queue_now_depth = (now_depth - replay_self_depth_credit).max(0.0);
         // Maker race: if the queue at our (canonical) level GROWS in the next
         // snapshot, the level is strengthening (price about to move favorably) —
         // init q_ahead higher so we sit further back and DON'T fill on that
@@ -1812,16 +2658,25 @@ impl SimExchangeV2 {
             self.maker_race_placements += 1;
         }
         let race_q_ahead = match self.books.level_depth_next(&msym, mside, match_price, tick) {
-            Some(next_depth) if self.maker_race_rate > 0.0 && next_depth > now_depth => {
+            Some(next_depth)
+                if self.maker_race_rate > 0.0
+                    && (next_depth - replay_self_depth_credit).max(0.0) > queue_now_depth =>
+            {
+                let queue_next_depth = (next_depth - replay_self_depth_credit).max(0.0);
                 let blended =
-                    self.maker_race_rate * next_depth + (1.0 - self.maker_race_rate) * now_depth;
+                    self.maker_race_rate * queue_next_depth
+                        + (1.0 - self.maker_race_rate) * queue_now_depth;
                 self.maker_race_inflated += 1;
-                self.maker_race_ratio_sum += if now_depth > EPS { blended / now_depth } else { 1.0 };
+                self.maker_race_ratio_sum += if queue_now_depth > EPS {
+                    blended / queue_now_depth
+                } else {
+                    1.0
+                };
                 blended
             }
-            _ => now_depth,
+            _ => queue_now_depth,
         };
-        let maker_race_added_q = (race_q_ahead - now_depth).max(0.0);
+        let maker_race_added_q = (race_q_ahead - queue_now_depth).max(0.0);
         // Data-truncation fallback: the recorded book is only 5 levels deep, so a
         // quote reads level_depth = 0 (empty queue) even though live has real
         // resting size + competition there. Two cases:
@@ -1830,7 +2685,12 @@ impl SimExchangeV2 {
         //         the recorded qty band);
         //   (2) a gap INSIDE the window (inside the spread / between levels)
         //       → keep the best-level default: own side, else opposite side.
-        let q_ahead = if race_q_ahead < EPS {
+        let public_q_ahead = if race_q_ahead < EPS && replay_self_depth_credit > EPS {
+            // The visible level was entirely attributable to the replayed
+            // strategy's own original order. It is not queue ahead; do not
+            // invoke the missing-level extrapolation fallback.
+            0.0
+        } else if race_q_ahead < EPS {
             if let Some((extra, effective_decay)) = self
                 .books
                 .extrapolate_level_depth_with_decay(&msym, mside, match_price, tick)
@@ -1862,6 +2722,35 @@ impl SimExchangeV2 {
         } else {
             race_q_ahead
         };
+        let queue_seq = self.next_queue_seq;
+        self.next_queue_seq = self
+            .next_queue_seq
+            .checked_add(1)
+            .expect("sim_v2 queue sequence exhausted");
+        // A public trade is applied to every order at this level. Giving later
+        // orders the remaining size of earlier simulated orders as an explicit
+        // queue offset turns those repeated observations into one FIFO volume
+        // budget: the print must consume public depth, then earlier own size,
+        // before it can reach the later order.
+        let simulated_own_ahead_qty = if self.order_queue_position_strength > 0.0 {
+            self.order_queue_position_strength
+                * self
+                    .orders
+                    .values()
+                    .filter(|prior| {
+                        prior.request.instance_id == o.instance_id
+                            && Self::same_queue_level(prior, &msym, mside, match_price, tick)
+                    })
+                    .map(|prior| prior.remaining.max(0.0))
+                    .sum::<f64>()
+        } else {
+            0.0
+        };
+        let q_ahead = public_q_ahead + simulated_own_ahead_qty;
+        if simulated_own_ahead_qty > EPS {
+            self.own_queue_positioned_orders += 1;
+            self.own_queue_initial_qty += simulated_own_ahead_qty;
+        }
         // Distribution sample: this resting (maker) order's initial queue length.
         self.maker_q_init.push(q_ahead as f32);
         // Classify placement price vs our-side BBO (explains why q_init is 0):
@@ -1901,7 +2790,62 @@ impl SimExchangeV2 {
             a.maker_rests += 1;
             a.maker_rest_qty += remaining;
             a.maker_q_init_sum += q_ahead;
+            a.maker_own_q_init_sum += simulated_own_ahead_qty;
             a.maker_race_added_q += maker_race_added_q;
+            a.maker_replay_self_depth_credit += replay_self_depth_credit;
+        }
+        if self.maker_order_audit_enabled {
+            if let Some((slug, _)) = self.audit_key(&o.symbol, &o.instance_id) {
+                self.maker_order_audit.insert(
+                    o.client_order_id.clone(),
+                    MakerOrderAuditRow {
+                        slug,
+                        iid: o.instance_id.clone(),
+                        coid: o.client_order_id.clone(),
+                        token: o.symbol.clone(),
+                        side: o.side,
+                        order_type: o.order_type,
+                        price,
+                        quantity: o.quantity,
+                        strategy_emit_ns: o.timestamp_ns,
+                        trigger_exchange_ns: o.quote_trigger_exchange_timestamp_ns,
+                        trigger_local_ns: o.quote_trigger_local_timestamp_ns,
+                        place_arrival_ns: now_ns,
+                        await_fresh_book,
+                        visible_depth_at_entry: now_depth,
+                        entry_mid: mid0,
+                        queue_seq,
+                        q_init: q_ahead,
+                        simulated_own_ahead_qty,
+                        own_cancel_queue_advance_qty: 0.0,
+                        replay_self_depth_credit,
+                        trade_match_n: 0,
+                        trade_match_qty: 0.0,
+                        queue_drained_qty: 0.0,
+                        candidate_qty: 0.0,
+                        maker_toxicity_suppressed_qty: 0.0,
+                        depletion_observed_qty: 0.0,
+                        depletion_exec_qty: 0.0,
+                        depletion_cancel_advance_qty: 0.0,
+                        depletion_candidate_qty: 0.0,
+                        depletion_budget_suppressed_qty: 0.0,
+                        depletion_fill_qty: 0.0,
+                        book_through_candidate_qty: 0.0,
+                        book_through_fill_qty: 0.0,
+                        book_markout_qty: 0.0,
+                        book_markout_cost_usdc: 0.0,
+                        fill_qty: 0.0,
+                        first_fill_ns: 0,
+                        last_fill_ns: 0,
+                        first_fill_delivery_ns: 0,
+                        last_fill_delivery_ns: 0,
+                        cancel_arrival_ns: 0,
+                        cancel_result: "open",
+                        q_ahead_final: q_ahead,
+                        remaining_final: remaining,
+                    },
+                );
+            }
         }
         self.orders.insert(
             o.client_order_id.clone(),
@@ -1914,8 +2858,12 @@ impl SimExchangeV2 {
                 remaining,
                 tick,
                 q_ahead,
+                own_q_ahead: simulated_own_ahead_qty,
+                queue_seq,
+                replay_self_depth_credit,
                 level_qty_at_sync: now_depth,
                 mid_at_sync: mid0,
+                entry_mid: mid0,
                 traded_since_sync: 0.0,
                 placed_ns: now_ns,
                 await_fresh_book,
@@ -2026,7 +2974,66 @@ impl SimExchangeV2 {
 
     pub fn cancel_order(&mut self, exchange: Exchange, coid: &str, now_ns: u64) -> OrderUpdate {
         if let Some(o) = self.orders.remove(coid) {
+            // Cancelling an earlier own order removes only its still-resting
+            // contribution from later same-level FIFO positions. Public queue
+            // depth and orders at other levels/instances remain untouched.
+            let max_advance = self.order_queue_position_strength * o.remaining.max(0.0);
+            let mut advanced_n = 0u64;
+            let mut advanced_qty = 0.0;
+            if max_advance > EPS {
+                let slugs = &self.event_slug_by_token;
+                let audits = &mut self.fill_audit;
+                let order_audits = &mut self.maker_order_audit;
+                for (later_coid, later) in self.orders.iter_mut() {
+                    if later.queue_seq <= o.queue_seq
+                        || later.request.instance_id != o.request.instance_id
+                        || !Self::same_queue_level(
+                            later,
+                            &o.match_symbol,
+                            o.match_side,
+                            o.match_price,
+                            o.tick,
+                        )
+                    {
+                        continue;
+                    }
+                    let advance = max_advance
+                        .min(later.own_q_ahead)
+                        .min(later.q_ahead);
+                    if advance <= EPS {
+                        continue;
+                    }
+                    later.own_q_ahead = (later.own_q_ahead - advance).max(0.0);
+                    later.q_ahead = (later.q_ahead - advance).max(0.0);
+                    advanced_n += 1;
+                    advanced_qty += advance;
+                    if let Some(a) = order_audits.get_mut(later_coid) {
+                        a.own_cancel_queue_advance_qty += advance;
+                        a.q_ahead_final = later.q_ahead;
+                    }
+                    if let Some(slug) = slugs
+                        .get(&later.request.symbol)
+                        .or_else(|| slugs.get(&later.match_symbol))
+                    {
+                        let key = (slug.clone(), later.request.instance_id.clone());
+                        let a = audits.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                            slug: key.0,
+                            iid: key.1,
+                            ..FillAuditRow::default()
+                        });
+                        a.maker_own_cancel_queue_advance_qty += advance;
+                    }
+                }
+            }
+            self.own_queue_cancel_advances_n += advanced_n;
+            self.own_queue_cancel_advance_qty += advanced_qty;
             self.record_lifetime(o.placed_ns, now_ns);
+            if let Some(a) = self.maker_order_audit.get_mut(coid) {
+                a.cancel_arrival_ns = now_ns;
+                a.cancel_result = "cancelled";
+                a.q_ahead_final = o.q_ahead;
+                a.remaining_final = o.remaining;
+            }
             return OrderUpdate {
                 client_order_id: coid.to_string(),
                 exchange,
@@ -2053,9 +3060,22 @@ impl SimExchangeV2 {
             .recent_fills
             .get(coid)
             .filter(|rf| now_ns.saturating_sub(rf.ts) <= window)
-            .map(|rf| (rf.symbol.clone(), rf.side, rf.cum_filled, rf.price, rf.trade_id.clone()));
-        if let Some((symbol, side, cum, price, trade_id)) = hit {
+            .map(|rf| {
+                (
+                    rf.symbol.clone(),
+                    rf.side,
+                    rf.filled_quantity,
+                    rf.price,
+                    rf.trade_id.clone(),
+                    rf.liquidity,
+                )
+            });
+        if let Some((symbol, side, filled_quantity, price, trade_id, liquidity)) = hit {
             self.matched_cant_cancel += 1;
+            if let Some(a) = self.maker_order_audit.get_mut(coid) {
+                a.cancel_arrival_ns = now_ns;
+                a.cancel_result = "matched_before_cancel";
+            }
             return OrderUpdate {
                 client_order_id: coid.to_string(),
                 exchange,
@@ -2063,8 +3083,8 @@ impl SimExchangeV2 {
                 side,
                 exchange_order_id: None,
                 status: OrderStatus::Filled,
-                liquidity: None,
-                filled_quantity: cum,
+                liquidity: Some(liquidity),
+                filled_quantity,
                 remaining_quantity: 0.0,
                 avg_fill_price: price,
                 timestamp_ns: now_ns,
@@ -2300,6 +3320,329 @@ mod tests {
         let u = c.submit_order(&order("a", "up", Side::Buy, 0.61, 10.0, false, OrderType::Limit), 1);
         assert_eq!(u.status, OrderStatus::Filled);
         assert!((u.avg_fill_price - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replay_self_taker_cleaning_skips_own_recorded_level() {
+        let mut c = core();
+        c.configure_replay_self_taker_depth(1.0);
+        c.on_orderbook(&book(
+            "up",
+            vec![(0.58, 100.0)],
+            vec![(0.62, 5.0), (0.63, 10.0)],
+        ));
+        let maker = order(
+            "maker",
+            "up",
+            Side::Sell,
+            0.62,
+            5.0,
+            true,
+            OrderType::Limit,
+        );
+        assert_eq!(c.submit_order(&maker, 1).status, OrderStatus::Accepted);
+
+        let taker = order(
+            "taker",
+            "up",
+            Side::Buy,
+            0.63,
+            5.0,
+            false,
+            OrderType::Fak,
+        );
+        assert!(c.would_cross(&taker, 2));
+        let fill = c.submit_order(&taker, 2);
+        assert_eq!(fill.status, OrderStatus::Filled);
+        assert!((fill.filled_quantity - 5.0).abs() < EPS);
+        assert!((fill.avg_fill_price - 0.63).abs() < EPS);
+        assert_eq!(c.taker_replay_self_sweeps_n, 1);
+        assert!((c.taker_replay_self_depth_qty - 5.0).abs() < EPS);
+        let audit = c.fill_audit_rows();
+        assert_eq!(audit.len(), 1);
+        assert!((audit[0].taker_replay_self_depth_qty - 5.0).abs() < EPS);
+    }
+
+    #[test]
+    fn replay_self_taker_cleaning_is_disabled_and_instance_isolated() {
+        fn probe(rate: f64, taker_iid: &str) -> OrderUpdate {
+            let mut c = core();
+            c.configure_replay_self_taker_depth(rate);
+            c.on_orderbook(&book(
+                "up",
+                vec![(0.58, 100.0)],
+                vec![(0.62, 5.0), (0.63, 10.0)],
+            ));
+            let maker = order(
+                "maker",
+                "up",
+                Side::Sell,
+                0.62,
+                5.0,
+                true,
+                OrderType::Limit,
+            );
+            assert_eq!(c.submit_order(&maker, 1).status, OrderStatus::Accepted);
+            let mut taker = order(
+                "taker",
+                "up",
+                Side::Buy,
+                0.63,
+                5.0,
+                false,
+                OrderType::Fak,
+            );
+            taker.instance_id = taker_iid.to_string();
+            c.submit_order(&taker, 2)
+        }
+
+        let disabled = probe(0.0, "iid");
+        assert_eq!(disabled.status, OrderStatus::Filled);
+        assert!((disabled.avg_fill_price - 0.62).abs() < EPS);
+
+        let other_instance = probe(1.0, "other");
+        assert_eq!(other_instance.status, OrderStatus::Filled);
+        assert!((other_instance.avg_fill_price - 0.62).abs() < EPS);
+    }
+
+    #[test]
+    fn maker_order_audit_preserves_causal_queue_fill_and_cancel_timeline() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        let accepted = c.submit_order(
+            &order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 12.0, 100));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(fills[0].filled_quantity, 2.0);
+        let cancelled = c.cancel_order(Exchange::Polymarket, "m", 150);
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        // Independent private-lane samples may reorder partial fragments; the
+        // audit retains the true earliest/latest strategy-visible boundaries.
+        c.record_fill_delivery("m", 300);
+        c.record_fill_delivery("m", 250);
+        c.record_fill_delivery("m", 350);
+
+        let rows = c.maker_order_audit_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.slug, "s");
+        assert_eq!(row.coid, "m");
+        assert_eq!(row.place_arrival_ns, 1);
+        assert_eq!(row.q_init, 10.0);
+        assert_eq!(row.replay_self_depth_credit, 0.0);
+        assert_eq!(row.trade_match_n, 1);
+        assert_eq!(row.trade_match_qty, 12.0);
+        assert_eq!(row.queue_drained_qty, 10.0);
+        assert_eq!(row.candidate_qty, 2.0);
+        assert_eq!(row.book_through_candidate_qty, 0.0);
+        assert_eq!(row.book_through_fill_qty, 0.0);
+        assert_eq!(row.depletion_fill_qty, 0.0);
+        assert_eq!(row.fill_qty, 2.0);
+        assert_eq!(row.first_fill_ns, 100);
+        assert_eq!(row.first_fill_delivery_ns, 250);
+        assert_eq!(row.last_fill_delivery_ns, 350);
+        assert_eq!(row.cancel_arrival_ns, 150);
+        assert_eq!(row.cancel_result, "cancelled");
+        assert_eq!(row.q_ahead_final, 0.0);
+        assert_eq!(row.remaining_final, 3.0);
+    }
+
+    #[test]
+    fn same_level_own_orders_consume_one_public_trade_fifo_budget() {
+        let mut c = core();
+        c.configure_order_queue_position(1.0);
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+
+        // Reverse lexical ids prove both queue position and delivery order use
+        // exchange arrival, not BTreeMap/client-id order.
+        assert_eq!(
+            c.submit_order(
+                &order("z-older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("a-newer", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(c.orders["z-older"].q_ahead, 10.0);
+        assert_eq!(c.orders["a-newer"].q_ahead, 15.0);
+        assert_eq!(c.orders["a-newer"].own_q_ahead, 5.0);
+
+        // Six shares exceed the ten-share public queue: five fill the older
+        // order and exactly one reaches the newer order.
+        let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 16.0));
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].client_order_id, "z-older");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert_eq!(fills[1].client_order_id, "a-newer");
+        assert_eq!(fills[1].filled_quantity, 1.0);
+        assert_eq!(c.orders["a-newer"].remaining, 4.0);
+        assert_eq!(c.own_queue_positioned_orders, 1);
+        assert_eq!(c.own_queue_initial_qty, 5.0);
+    }
+
+    #[test]
+    fn cancelling_older_own_order_advances_only_later_same_instance_order() {
+        let mut c = core();
+        c.configure_order_queue_position(1.0);
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        let older = order("older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
+        let newer = order("newer", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
+        assert_eq!(c.submit_order(&older, 1).status, OrderStatus::Accepted);
+        assert_eq!(c.submit_order(&newer, 2).status, OrderStatus::Accepted);
+        assert_eq!(c.orders["newer"].q_ahead, 15.0);
+
+        assert_eq!(
+            c.cancel_order(Exchange::Polymarket, "older", 3).status,
+            OrderStatus::Cancelled
+        );
+        assert_eq!(c.orders["newer"].q_ahead, 10.0);
+        assert_eq!(c.orders["newer"].own_q_ahead, 0.0);
+        assert_eq!(c.own_queue_cancel_advances_n, 1);
+        assert_eq!(c.own_queue_cancel_advance_qty, 5.0);
+        let newer_audit = c
+            .maker_order_audit_rows()
+            .into_iter()
+            .find(|row| row.coid == "newer")
+            .unwrap();
+        assert_eq!(newer_audit.own_cancel_queue_advance_qty, 5.0);
+        assert_eq!(newer_audit.q_ahead_final, 10.0);
+    }
+
+    #[test]
+    fn public_book_cancellation_cannot_erase_earlier_own_fifo_quantity() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_order_queue_position(1.0);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("newer", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // The ten public shares disappear without a trade. They can advance
+        // both orders through public depth, but the older order's five shares
+        // must remain ahead of the newer order.
+        assert!(c
+            .on_orderbook(&book("up", vec![], vec![(0.62, 80.0)]))
+            .is_empty());
+        assert_eq!(c.orders["older"].q_ahead, 0.0);
+        assert_eq!(c.orders["newer"].q_ahead, 5.0);
+        assert_eq!(c.orders["newer"].own_q_ahead, 5.0);
+
+        // The next five-share print fills only the older FIFO head. One more
+        // share is required before the newer order can fill.
+        let head = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 5.0));
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].client_order_id, "older");
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.60, 1.0))
+            .iter()
+            .any(|fill| fill.client_order_id == "newer"));
+    }
+
+    #[test]
+    fn own_queue_position_is_disabled_and_instance_isolated() {
+        let legacy_duplicate_fill = |strength: f64| {
+            let mut c = core();
+            c.configure_order_queue_position(strength);
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("one", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            let mut second = order("two", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
+            second.instance_id = "other-iid".into();
+            assert_eq!(c.submit_order(&second, 2).status, OrderStatus::Accepted);
+            assert_eq!(c.orders["one"].q_ahead, 10.0);
+            assert_eq!(c.orders["two"].q_ahead, 10.0);
+            c.on_trade_tick(&trade("up", Side::Sell, 0.60, 11.0))
+        };
+
+        // Disabled mode preserves the historical independent-order result.
+        let disabled = legacy_duplicate_fill(0.0);
+        assert_eq!(disabled.len(), 2);
+        assert!(disabled.iter().all(|fill| fill.filled_quantity == 1.0));
+        // Full FIFO remains isolated between strategy instances/accounts.
+        let isolated = legacy_duplicate_fill(1.0);
+        assert_eq!(isolated.len(), 2);
+        assert!(isolated.iter().all(|fill| fill.filled_quantity == 1.0));
+    }
+
+    #[test]
+    fn causal_maker_toxicity_suppresses_only_favorable_trade_overflow() {
+        let probe = |ask_after: f64, strength: f64| {
+            let mut c = core();
+            c.configure_maker_toxicity(strength, 1.0);
+            c.configure_maker_order_audit(true);
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("maker", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(ask_after, 80.0)]));
+            let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 15.0));
+            (fills, c)
+        };
+
+        // Mid 0.61→0.62 is one favorable tick for the resting bid. Strength
+        // 0.5 suppresses half of the five-share candidate without repricing.
+        let (favorable, favorable_core) = probe(0.64, 0.5);
+        assert_eq!(favorable.len(), 1);
+        assert_eq!(favorable[0].filled_quantity, 2.5);
+        assert_eq!(favorable[0].avg_fill_price, 0.60);
+        assert_eq!(favorable_core.orders["maker"].q_ahead, 2.5);
+        assert_eq!(favorable_core.maker_toxicity_suppressed_n, 1);
+        assert_eq!(favorable_core.maker_toxicity_suppressed_qty, 2.5);
+        assert_eq!(
+            favorable_core.maker_order_audit_rows()[0].maker_toxicity_suppressed_qty,
+            2.5
+        );
+
+        // An adverse move is fully fillable; strength zero is exact legacy
+        // behavior even after the same favorable book move.
+        let (adverse, _) = probe(0.60, 1.0);
+        assert_eq!(adverse.len(), 1);
+        assert_eq!(adverse[0].filled_quantity, 5.0);
+        let (disabled, disabled_core) = probe(0.64, 0.0);
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(disabled[0].filled_quantity, 5.0);
+        assert_eq!(disabled_core.maker_toxicity_suppressed_n, 0);
     }
 
     #[test]
@@ -2988,7 +4331,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_cant_cancel_returns_filled_with_same_trade_id() {
+    fn matched_cant_cancel_replays_exact_maker_fill_idempotently() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
         let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
@@ -3001,7 +4344,66 @@ mod tests {
         let u = c.cancel_order(Exchange::Polymarket, "a", 200);
         assert_eq!(u.status, OrderStatus::Filled);
         assert_eq!(u.trade_id, Some(fill_tid));
+        assert_eq!(u.liquidity, Some(Liquidity::Maker));
+        assert_eq!(u.filled_quantity, fills[0].filled_quantity);
+        assert_eq!(u.avg_fill_price, fills[0].avg_fill_price);
+        assert_eq!(u.side, fills[0].side);
+        assert_eq!(u.symbol, fills[0].symbol);
         assert_eq!(c.matched_cant_cancel, 1);
+
+        // A duplicate cancel is another replay of the same immutable trade
+        // tuple. Downstream trade-id dedupe must see no invariant change.
+        let duplicate = c.cancel_order(Exchange::Polymarket, "a", 300);
+        assert_eq!(duplicate.trade_id, u.trade_id);
+        assert_eq!(duplicate.liquidity, u.liquidity);
+        assert_eq!(duplicate.filled_quantity, u.filled_quantity);
+        assert_eq!(duplicate.avg_fill_price, u.avg_fill_price);
+        assert_eq!(duplicate.side, u.side);
+        assert_eq!(duplicate.symbol, u.symbol);
+        assert_eq!(c.matched_cant_cancel, 2);
+    }
+
+    #[test]
+    fn matched_cant_cancel_replays_latest_fragment_not_order_cumulative() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+
+        // The first trade drains the 50 shares ahead and fills four; the next
+        // trade fills the remaining six under a distinct trade id.
+        let first = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 54.0, 100));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].status, OrderStatus::PartiallyFilled);
+        assert!((first[0].filled_quantity - 4.0).abs() < 1e-9);
+        let final_fill = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 6.0, 150));
+        assert_eq!(final_fill.len(), 1);
+        assert_eq!(final_fill[0].status, OrderStatus::Filled);
+        assert!((final_fill[0].filled_quantity - 6.0).abs() < 1e-9);
+
+        let replay = c.cancel_order(Exchange::Polymarket, "a", 200);
+        assert_eq!(replay.trade_id, final_fill[0].trade_id);
+        assert_eq!(replay.liquidity, Some(Liquidity::Maker));
+        assert_eq!(replay.filled_quantity, final_fill[0].filled_quantity);
+        assert_ne!(replay.trade_id, first[0].trade_id);
+    }
+
+    #[test]
+    fn matched_cant_cancel_preserves_taker_role() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        let fill = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 10.0, false, OrderType::Limit),
+            100,
+        );
+        assert_eq!(fill.status, OrderStatus::Filled);
+        assert_eq!(fill.liquidity, Some(Liquidity::Taker));
+
+        let replay = c.cancel_order(Exchange::Polymarket, "t", 200);
+        assert_eq!(replay.status, OrderStatus::Filled);
+        assert_eq!(replay.trade_id, fill.trade_id);
+        assert_eq!(replay.liquidity, Some(Liquidity::Taker));
+        assert_eq!(replay.filled_quantity, fill.filled_quantity);
+        assert_eq!(replay.avg_fill_price, fill.avg_fill_price);
     }
 
     #[test]
@@ -3110,6 +4512,528 @@ mod tests {
     }
 
     #[test]
+    fn maker_order_audit_attributes_book_through_fill_separately() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+        assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+        let fills = c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]));
+        assert_eq!(fills.len(), 1);
+
+        let rows = c.maker_order_audit_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.candidate_qty, 0.0);
+        assert_eq!(row.book_through_candidate_qty, 10.0);
+        assert_eq!(row.book_through_fill_qty, 10.0);
+        assert_eq!(row.fill_qty, 10.0);
+        assert_eq!(row.q_ahead_final, 0.0);
+        assert_eq!(row.remaining_final, 0.0);
+    }
+
+    #[test]
+    fn unexplained_depletion_is_result_neutral_without_self_depth_credit() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        // The ten-share depletion only consumes the ten-share public queue.
+        // With no leave-one-out credit there is no causal overflow to fill us.
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert!(fills.is_empty());
+        assert_eq!(c.orders["a"].q_ahead, 0.0);
+        assert_eq!(c.orders["a"].remaining, 5.0);
+    }
+
+    #[test]
+    fn replay_self_depth_and_hidden_depletion_produce_bounded_partial_fill() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(0.25);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        // q_init = raw 10 - own-tape credit 5 = 5. The new book moves the mid
+        // one tick against this bid, fully opening the causal adverse gate. The
+        // raw ten-share depletion therefore contains 2.5 hidden-execution
+        // shares and 7.5 cancels. At ahead_frac=1 the total reaches past q by
+        // five, but the fill remains capped by the 2.5 execution shares.
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert_eq!(fills[0].filled_quantity, 2.5);
+        assert_eq!(fills[0].remaining_quantity, 2.5);
+        assert_eq!(c.orders["a"].q_ahead, 0.0);
+        assert_eq!(c.orders["a"].replay_self_depth_credit, 0.0);
+
+        let row = &c.maker_order_audit_rows()[0];
+        assert_eq!(row.replay_self_depth_credit, 5.0);
+        assert_eq!(row.depletion_observed_qty, 10.0);
+        assert_eq!(row.depletion_exec_qty, 2.5);
+        assert_eq!(row.depletion_cancel_advance_qty, 7.5);
+        assert_eq!(row.depletion_candidate_qty, 2.5);
+        assert_eq!(row.depletion_fill_qty, 2.5);
+        assert_eq!(row.fill_qty, 2.5);
+    }
+
+    #[test]
+    fn replay_self_depth_without_execution_only_advances_queue() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+        assert_eq!(c.orders["a"].q_ahead, 5.0);
+
+        let fills = c.on_orderbook(&book("up", vec![], vec![(0.57, 100.0)]));
+        assert!(fills.is_empty());
+        assert_eq!(c.orders["a"].q_ahead, 0.0);
+        assert_eq!(c.orders["a"].remaining, 5.0);
+        assert_eq!(c.orders["a"].replay_self_depth_credit, 0.0);
+    }
+
+    #[test]
+    fn favorable_depletion_remains_cancel_only() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        // The old bid level disappears while the mid moves up, in our favor.
+        // This is consistent with cancellation/repricing, not an adverse maker
+        // execution, so it may advance q but must not fill.
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.56, 10.0)],
+            vec![(0.57, 100.0)],
+        ));
+        assert!(fills.is_empty());
+        assert_eq!(c.orders["a"].q_ahead, 0.0);
+        assert_eq!(c.orders["a"].remaining, 5.0);
+        assert_eq!(c.orders["a"].replay_self_depth_credit, 0.0);
+    }
+
+    #[test]
+    fn depletion_fill_then_cancel_replays_the_same_fill_idempotently() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 5.0)],
+            vec![(0.57, 100.0)],
+            10,
+        ));
+        let accepted = c.submit_order(
+            &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+            11,
+        );
+        assert_eq!(accepted.status, OrderStatus::Accepted);
+
+        let fills = c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+            100,
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::Filled);
+        let trade_id = fills[0].trade_id.clone();
+
+        let cancel = c.cancel_order(Exchange::Polymarket, "a", 150);
+        assert_eq!(cancel.status, OrderStatus::Filled);
+        assert_eq!(cancel.trade_id, trade_id);
+        assert_eq!(cancel.filled_quantity, 5.0);
+        assert_eq!(c.matched_cant_cancel, 1);
+        assert_eq!(c.maker_order_audit_rows()[0].cancel_result, "matched_before_cancel");
+    }
+
+    #[test]
+    fn depletion_fill_is_isolated_to_the_owning_instance() {
+        let mut balances = HashMap::new();
+        balances.insert("iid-a".to_string(), 100.0);
+        balances.insert("iid-b".to_string(), 100.0);
+        let mut c = SimExchangeV2::new(500_000_000, balances, HashMap::new());
+        c.on_instrument(&binary_instrument());
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book(
+            "up",
+            vec![(0.55, 5.0), (0.54, 5.0)],
+            vec![(0.57, 100.0)],
+        ));
+
+        let mut a = order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit);
+        a.instance_id = "iid-a".into();
+        let mut b = order("b", "up", Side::Buy, 0.54, 5.0, true, OrderType::Limit);
+        b.instance_id = "iid-b".into();
+        assert_eq!(c.submit_order(&a, 1).status, OrderStatus::Accepted);
+        assert_eq!(c.submit_order(&b, 1).status, OrderStatus::Accepted);
+
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 5.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].client_order_id, "a");
+        assert_eq!(c.wallet_usdc_raw("iid-a"), Some(97.25));
+        assert_eq!(c.wallet_usdc_raw("iid-b"), Some(100.0));
+        assert!(!c.orders.contains_key("a"));
+        assert_eq!(c.orders["b"].remaining, 5.0);
+        assert_eq!(c.orders["b"].q_ahead, 0.0);
+    }
+
+    #[test]
+    fn same_level_depletion_execution_budget_fills_once_in_arrival_order() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book(
+            "up",
+            vec![(0.55, 5.0)],
+            vec![(0.57, 100.0)],
+        ));
+
+        // Reverse lexical coids prove allocation follows exchange arrival,
+        // not BTreeMap/coid order. Both approximate leave-one-out queues reach
+        // zero, but the public level supplied only five execution shares.
+        assert_eq!(
+            c.submit_order(
+                &order("z-older", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("a-newer", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].client_order_id, "z-older");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert!(!c.orders.contains_key("z-older"));
+        assert_eq!(c.orders["a-newer"].remaining, 5.0);
+        assert_eq!(c.orders["a-newer"].q_ahead, 0.0);
+
+        let newer = c
+            .maker_order_audit_rows()
+            .into_iter()
+            .find(|row| row.coid == "a-newer")
+            .unwrap();
+        assert_eq!(newer.depletion_candidate_qty, 5.0);
+        assert_eq!(newer.depletion_budget_suppressed_qty, 5.0);
+        assert_eq!(newer.depletion_fill_qty, 0.0);
+    }
+
+    /// Focused hot-section evidence for changes to `resync_queues`. Run with:
+    /// `cargo test --release -p hexagent-exchange benchmark_orderbook_resync_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_orderbook_resync_latency() {
+        fn sample(rate: f64, n: usize) -> Vec<u64> {
+            let mut c = core();
+            c.configure(Some(1.0), 2_000_000_000);
+            c.configure_unexplained_depletion_execution(rate);
+            c.on_orderbook(&book_ts(
+                "up",
+                vec![(0.55, 10.0)],
+                vec![(0.57, 100.0)],
+                1,
+            ));
+            assert_eq!(
+                c.submit_order(
+                    &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                    2,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..(n + 2_000) {
+                // Restore the same ten-share public queue before every measured
+                // adverse level removal. All setup/allocation stays outside the
+                // timed section; no fill is possible because q_before equals the
+                // entire causal depletion.
+                let base_ts = 3 + (i as u64) * 2;
+                let down = book_ts(
+                    "up",
+                    vec![(0.54, 10.0)],
+                    vec![(0.56, 100.0)],
+                    base_ts,
+                );
+                let restored = book_ts(
+                    "up",
+                    vec![(0.55, 10.0)],
+                    vec![(0.57, 100.0)],
+                    base_ts + 1,
+                );
+                let resting = c.orders.get_mut("a").expect("benchmark order remains resting");
+                resting.q_ahead = 10.0;
+                resting.level_qty_at_sync = 10.0;
+                resting.mid_at_sync = 0.56;
+                resting.traded_since_sync = 0.0;
+
+                let start = std::time::Instant::now();
+                let updates = c.on_orderbook(&down);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                std::hint::black_box(updates);
+                std::hint::black_box(c.on_orderbook(&restored));
+                if i >= 2_000 {
+                    samples.push(elapsed);
+                }
+            }
+            samples
+        }
+
+        fn describe(label: &str, mut samples: Vec<u64>) {
+            samples.sort_unstable();
+            let at = |fraction: f64| {
+                samples[((samples.len() - 1) as f64 * fraction) as usize]
+            };
+            println!(
+                "SIMV2_RESYNC_BENCH profile={label} n={} median_ns={} p99_ns={} p999_ns={} max_ns={}",
+                samples.len(),
+                at(0.5),
+                at(0.99),
+                at(0.999),
+                samples[samples.len() - 1]
+            );
+        }
+
+        const N: usize = 100_000;
+        describe("disabled", sample(0.0, N));
+        describe("adverse_depletion", sample(0.1, N));
+    }
+
+    /// Focused evidence for the two new matching paths. Boundaries:
+    /// - trade: `on_trade_tick` entry through returned strategy updates;
+    /// - queue lifecycle: two place admissions plus FIFO-head cancel and tail
+    ///   cancel;
+    /// - book markout: `on_orderbook_fwd` through returned strategy updates;
+    /// - taker self-clean: `submit_order` through its returned update.
+    /// Active order depth is one or two as reported; no message queue is used.
+    /// Run with `cargo test --release -p hexagent-exchange benchmark_causal_maker_models_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_causal_maker_models_latency() {
+        fn describe(label: &str, mut samples: Vec<u64>, max_depth: usize) {
+            samples.sort_unstable();
+            let at = |fraction: f64| {
+                samples[((samples.len() - 1) as f64 * fraction) as usize]
+            };
+            println!(
+                "SIMV2_CAUSAL_BENCH profile={label} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} max_order_depth={} overflow=0 boundary={}",
+                samples.len(),
+                at(0.5),
+                at(0.99),
+                at(0.999),
+                samples[samples.len() - 1],
+                max_depth,
+                if label.starts_with("trade") {
+                    "on_trade_tick_to_updates"
+                } else if label.starts_with("queue") {
+                    "two_places_and_two_cancels"
+                } else if label.starts_with("book") {
+                    "on_orderbook_fwd_to_updates"
+                } else {
+                    "submit_taker_to_update"
+                }
+            );
+        }
+
+        fn sample_trade(toxicity: f64, n: usize) -> Vec<u64> {
+            let mut c = core();
+            c.configure_maker_toxicity(toxicity, 1.0);
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("maker", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            // One favorable tick since immutable entry_mid.
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.64, 80.0)]));
+            let t = trade("up", Side::Sell, 0.60, 1.0);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..(n + 2_000) {
+                let resting = c.orders.get_mut("maker").unwrap();
+                resting.q_ahead = 0.0;
+                resting.own_q_ahead = 0.0;
+                resting.remaining = 5.0;
+                resting.locked_usdc = 3.0;
+                let start = std::time::Instant::now();
+                let updates = c.on_trade_tick(&t);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                std::hint::black_box(updates);
+                if i >= 2_000 {
+                    samples.push(elapsed);
+                }
+            }
+            samples
+        }
+
+        fn sample_queue_lifecycle(strength: f64, n: usize) -> Vec<u64> {
+            let mut c = core();
+            c.configure_order_queue_position(strength);
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+            let older = order("older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
+            let later = order("later", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..(n + 2_000) {
+                let start = std::time::Instant::now();
+                std::hint::black_box(c.submit_order(&older, 1));
+                std::hint::black_box(c.submit_order(&later, 2));
+                std::hint::black_box(c.cancel_order(Exchange::Polymarket, "older", 3));
+                std::hint::black_box(c.cancel_order(Exchange::Polymarket, "later", 4));
+                let elapsed = start.elapsed().as_nanos() as u64;
+                debug_assert!(c.orders.is_empty());
+                if i >= 2_000 {
+                    samples.push(elapsed);
+                }
+            }
+            samples
+        }
+
+        fn sample_book_markout(strength: f64, n: usize) -> Vec<u64> {
+            let mut c = core();
+            c.configure(Some(1.0), 2_000_000_000);
+            c.configure_replay_self_depth(1.0);
+            c.configure_unexplained_depletion_execution(1.0);
+            c.configure_book_fill_markout_vn(strength);
+            c.on_orderbook(&book("up", vec![(0.55, 5.0)], vec![(0.57, 100.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("maker", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            let depleted = book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..(n + 2_000) {
+                let start = std::time::Instant::now();
+                let updates = c.on_orderbook_fwd(&depleted, Some(0.57));
+                let elapsed = start.elapsed().as_nanos() as u64;
+                std::hint::black_box(updates);
+                if i >= 2_000 {
+                    samples.push(elapsed);
+                }
+
+                // Reset outside the measured boundary. The order remains
+                // active because each synthetic depletion fills only half.
+                c.books.update(
+                    "up",
+                    vec![PriceLevel { price: 0.55, quantity: 5.0 }],
+                    vec![PriceLevel { price: 0.57, quantity: 100.0 }],
+                );
+                let resting = c.orders.get_mut("maker").unwrap();
+                resting.remaining = 10.0;
+                resting.locked_usdc = 5.5;
+                resting.q_ahead = 0.0;
+                resting.own_q_ahead = 0.0;
+                resting.level_qty_at_sync = 5.0;
+                resting.mid_at_sync = 0.56;
+                resting.traded_since_sync = 0.0;
+                resting.replay_self_depth_credit = 0.0;
+            }
+            samples
+        }
+
+        fn sample_taker_self_clean(strength: f64, n: usize) -> Vec<u64> {
+            let mut c = core();
+            c.configure_replay_self_taker_depth(strength);
+            c.on_orderbook(&book("up", vec![(0.60, 80.0)], vec![(0.62, 80.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("maker", "up", Side::Sell, 0.62, 10.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            let taker = order("taker", "up", Side::Buy, 0.62, 5.0, false, OrderType::Limit);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..(n + 2_000) {
+                let start = std::time::Instant::now();
+                let update = c.submit_order(&taker, i as u64 + 2);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                std::hint::black_box(update);
+                if i >= 2_000 {
+                    samples.push(elapsed);
+                }
+            }
+            samples
+        }
+
+        const N: usize = 50_000;
+        describe("trade_disabled", sample_trade(0.0, N), 1);
+        describe("trade_toxicity_0p5", sample_trade(0.5, N), 1);
+        describe("queue_disabled", sample_queue_lifecycle(0.0, N), 2);
+        describe("queue_fifo_1p0", sample_queue_lifecycle(1.0, N), 2);
+        describe("book_markout_disabled", sample_book_markout(0.0, N), 1);
+        describe("book_markout_0p78", sample_book_markout(0.78, N), 1);
+        describe("taker_self_clean_disabled", sample_taker_self_clean(0.0, N), 1);
+        describe("taker_self_clean_1p0", sample_taker_self_clean(1.0, N), 1);
+    }
+
+    #[test]
     fn forward_markout_vn_reprices_favorable_fills() {
         // A trade that fully fills a maker bid (10 sh) keeps the FULL quantity but
         // is RE-PRICED adverse toward the forward mid when markout>0 (vn>0); adverse
@@ -3135,5 +5059,100 @@ mod tests {
         assert!((fa[0].filled_quantity - 10.0).abs() < 1e-9, "adverse full fill");
         // No forward signal → no reprice → fill at the limit.
         assert!((probe(None)[0].avg_fill_price - 0.55).abs() < 1e-9, "no-signal at limit");
+    }
+
+    #[test]
+    fn book_fill_markout_reprices_depletion_without_changing_quantity() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_maker_order_audit(true);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(0.25);
+        c.configure_book_fill_markout_vn(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // Same causal 2.5-share hidden-depletion fill as the disabled model.
+        // The independent future mid is two cents favorable, so vn=1 settles
+        // the fragment at 0.57 while leaving quantity and real resting limit
+        // state unchanged.
+        let fills = c.on_orderbook_fwd(
+            &book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]),
+            Some(0.57),
+        );
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0].filled_quantity - 2.5).abs() < 1e-9);
+        assert!((fills[0].remaining_quantity - 2.5).abs() < 1e-9);
+        assert!((fills[0].avg_fill_price - 0.57).abs() < 1e-9);
+        assert!((c.orders["a"].request.price.unwrap() - 0.55).abs() < 1e-9);
+
+        assert_eq!(c.book_fill_haircut_n, 1);
+        assert!((c.book_fill_haircut_qty - 2.5).abs() < 1e-9);
+        assert!((c.book_fill_haircut_cost_usdc - 0.05).abs() < 1e-9);
+        let row = &c.maker_order_audit_rows()[0];
+        assert!((row.book_markout_qty - 2.5).abs() < 1e-9);
+        assert!((row.book_markout_cost_usdc - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn book_fill_markout_covers_book_through_and_disabled_path() {
+        let probe = |strength: f64, fwd_mid: Option<f64>| {
+            let mut c = core();
+            c.configure_book_through(1.0);
+            c.configure_book_fill_markout_vn(strength);
+            c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+            assert_eq!(
+                c.submit_order(
+                    &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                    1,
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+            assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+            let fills = c.on_orderbook_fwd(
+                &book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]),
+                fwd_mid,
+            );
+            (c, fills)
+        };
+
+        let (enabled, fills) = probe(1.0, Some(0.57));
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0].filled_quantity - 10.0).abs() < 1e-9);
+        assert!((fills[0].avg_fill_price - 0.57).abs() < 1e-9);
+        assert_eq!(enabled.book_fill_haircut_n, 1);
+        assert!((enabled.book_fill_haircut_cost_usdc - 0.20).abs() < 1e-9);
+
+        let (disabled, fills) = probe(0.0, Some(0.57));
+        assert!((fills[0].avg_fill_price - 0.55).abs() < 1e-9);
+        assert_eq!(disabled.book_fill_haircut_n, 0);
+        assert_eq!(disabled.book_fill_haircut_qty, 0.0);
+
+        let (_, adverse) = probe(1.0, Some(0.54));
+        assert!((adverse[0].avg_fill_price - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn maker_markout_reprice_preserves_folded_penalty_direction() {
+        // Original DOWN sell @0.40 is canonical UP buy @0.60. A favorable UP
+        // move to 0.61 must reduce the original sell settlement to 0.39.
+        let (price, penalty) = maker_markout_reprice(
+            0.40,
+            Side::Sell,
+            Side::Buy,
+            0.60,
+            Some(0.61),
+            1.0,
+        );
+        assert!((price - 0.39).abs() < 1e-9);
+        assert!((penalty - 0.01).abs() < 1e-9);
     }
 }
