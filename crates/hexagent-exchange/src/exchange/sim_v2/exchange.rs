@@ -79,6 +79,26 @@ struct RestingOrder {
     await_fresh_book: bool,
 }
 
+fn accrue_order_exposure(audit: &mut MakerOrderAuditRow, now_ns: u64, remaining_before: f64) {
+    let bounded_now_ns = if audit.exposure_end_ns > 0 {
+        now_ns.min(audit.exposure_end_ns)
+    } else {
+        now_ns
+    };
+    let delta_ns = bounded_now_ns.saturating_sub(audit.exposure_last_ns);
+    audit.rest_time_ns = audit.rest_time_ns.saturating_add(delta_ns);
+    audit.rest_qty_ns += remaining_before.max(0.0) * delta_ns as f64;
+    audit.exposure_last_ns = audit.exposure_last_ns.max(bounded_now_ns);
+}
+
+fn event_exposure_end_ns(slug: &str) -> u64 {
+    slug.rsplit_once('-')
+        .and_then(|(_, epoch)| epoch.parse::<u64>().ok())
+        .and_then(|epoch| epoch.checked_add(300))
+        .and_then(|epoch| epoch.checked_mul(1_000_000_000))
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy)]
 struct FeeParams {
     rate: f64,
@@ -141,6 +161,8 @@ pub struct FillAuditRow {
     pub iid: String,
     pub place_orders: u64,
     pub place_qty: f64,
+    pub passive_place_orders: u64,
+    pub passive_place_qty: f64,
     pub cancel_before_place_orders: u64,
     pub cancel_before_place_qty: f64,
     pub stale_order_blocks: u64,
@@ -149,6 +171,21 @@ pub struct FillAuditRow {
     pub post_only_reject_qty: f64,
     pub maker_rests: u64,
     pub maker_rest_qty: f64,
+    pub passive_rests: u64,
+    pub passive_rest_qty: f64,
+    pub maker_rest_time_ns: u128,
+    pub maker_rest_qty_ns: f64,
+    pub passive_rest_time_ns: u128,
+    pub passive_rest_qty_ns: f64,
+    pub maker_cancel_orders: u64,
+    pub maker_cancel_qty: f64,
+    pub maker_orders_with_fill: u64,
+    pub maker_open_orders: u64,
+    pub passive_cancel_orders: u64,
+    pub passive_cancel_qty: f64,
+    pub passive_orders_with_fill: u64,
+    pub passive_fill_qty: f64,
+    pub passive_open_orders: u64,
     pub maker_q_init_sum: f64,
     pub maker_own_q_init_sum: f64,
     pub maker_own_cancel_queue_advance_qty: f64,
@@ -195,10 +232,15 @@ pub struct MakerOrderAuditRow {
     pub order_type: OrderType,
     pub price: f64,
     pub quantity: f64,
+    pub post_only: bool,
     pub strategy_emit_ns: u64,
     pub trigger_exchange_ns: u64,
     pub trigger_local_ns: u64,
     pub place_arrival_ns: u64,
+    pub exposure_last_ns: u64,
+    pub exposure_end_ns: u64,
+    pub rest_time_ns: u64,
+    pub rest_qty_ns: f64,
     pub await_fresh_book: bool,
     pub visible_depth_at_entry: f64,
     pub entry_mid: f64,
@@ -311,6 +353,9 @@ pub struct SimExchangeV2 {
     /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
     maker_order_audit_enabled: bool,
     maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
+    /// Latest causal exchange timestamp observed by the matching core. Used
+    /// only to snapshot still-open exposure at the end of an audit run.
+    audit_clock_ns: u64,
     /// Symmetric outcome-sibling map (a↔b) for the race lookahead (peek the
     /// canonical frame's next book from EITHER outcome stream).
     fold_sibling: HashMap<String, String>,
@@ -560,6 +605,7 @@ impl SimExchangeV2 {
             fill_audit: BTreeMap::new(),
             maker_order_audit_enabled: false,
             maker_order_audit: BTreeMap::new(),
+            audit_clock_ns: 0,
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
             last_book_local_ts: HashMap::new(),
@@ -758,7 +804,49 @@ impl SimExchangeV2 {
     }
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
-        self.fill_audit.values().cloned().collect()
+        let mut rows = self.fill_audit.clone();
+        for order in self.maker_order_audit.values() {
+            let key = (order.slug.clone(), order.iid.clone());
+            let row = rows.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0,
+                iid: key.1,
+                ..FillAuditRow::default()
+            });
+            let mut snapshot = order.clone();
+            if snapshot.cancel_result == "open" {
+                let remaining = snapshot.remaining_final;
+                accrue_order_exposure(&mut snapshot, self.audit_clock_ns, remaining);
+                row.maker_open_orders += 1;
+                if snapshot.post_only {
+                    row.passive_open_orders += 1;
+                }
+            } else if matches!(snapshot.cancel_result, "cancelled" | "event_retired") {
+                row.maker_cancel_orders += 1;
+                row.maker_cancel_qty += snapshot.remaining_final.max(0.0);
+                if snapshot.post_only {
+                    row.passive_cancel_orders += 1;
+                    row.passive_cancel_qty += snapshot.remaining_final.max(0.0);
+                }
+            }
+            if snapshot.fill_qty > EPS {
+                row.maker_orders_with_fill += 1;
+                if snapshot.post_only {
+                    row.passive_orders_with_fill += 1;
+                    row.passive_fill_qty += snapshot.fill_qty;
+                }
+            }
+            row.maker_rest_time_ns = row
+                .maker_rest_time_ns
+                .saturating_add(snapshot.rest_time_ns as u128);
+            row.maker_rest_qty_ns += snapshot.rest_qty_ns;
+            if snapshot.post_only {
+                row.passive_rest_time_ns = row
+                    .passive_rest_time_ns
+                    .saturating_add(snapshot.rest_time_ns as u128);
+                row.passive_rest_qty_ns += snapshot.rest_qty_ns;
+            }
+        }
+        rows.into_values().collect()
     }
 
     pub fn configure_maker_order_audit(&mut self, enabled: bool) {
@@ -769,7 +857,17 @@ impl SimExchangeV2 {
     }
 
     pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
-        self.maker_order_audit.values().cloned().collect()
+        self.maker_order_audit
+            .values()
+            .cloned()
+            .map(|mut row| {
+                if row.cancel_result == "open" {
+                    let remaining = row.remaining_final;
+                    accrue_order_exposure(&mut row, self.audit_clock_ns, remaining);
+                }
+                row
+            })
+            .collect()
     }
 
     /// Record when a matched maker fill becomes visible on the simulated
@@ -1078,6 +1176,7 @@ impl SimExchangeV2 {
         fwd_mid: Option<f64>,
     ) -> Vec<OrderUpdate> {
         let now_ns = ob.exchange_timestamp_ns;
+        self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
         if self.fold_outcomes {
             // Fold onto the canonical frame: the non-canonical token's snapshot
             // is mirrored (p→1−p, bid↔ask); the canonical token is applied as-is.
@@ -1217,6 +1316,7 @@ impl SimExchangeV2 {
                     o.locked_usdc = limit * o.remaining;
                 }
                 if let Some(a) = order_audits.get_mut(coid) {
+                    accrue_order_exposure(a, now_ns, o.remaining + fill);
                     a.book_through_candidate_qty += fillable.min(o.remaining + fill);
                     a.book_through_fill_qty += fill;
                     if price_penalty > 0.0 {
@@ -1504,6 +1604,7 @@ impl SimExchangeV2 {
                 }
                 if audit_enabled {
                     if let Some(a) = order_audits.get_mut(&candidate.coid) {
+                        accrue_order_exposure(a, now_ns, o.remaining + fill);
                         a.depletion_fill_qty += fill;
                         if price_penalty > 0.0 {
                             a.book_markout_qty += fill;
@@ -1573,6 +1674,7 @@ impl SimExchangeV2 {
     fn on_trade_tick_inner(&mut self, t: &TradeTick, fwd_mid: Option<f64>) -> Vec<OrderUpdate> {
         let mut fills: Vec<MakerFill> = Vec::new();
         let ts = t.exchange_timestamp_ns;
+        self.audit_clock_ns = self.audit_clock_ns.max(ts);
         if self.fold_outcomes {
             // Fold the trade onto the canonical frame and drain the single
             // canonical queue once (a down trade mirrors: flip side, 1−price).
@@ -1833,6 +1935,7 @@ impl SimExchangeV2 {
                 o.locked_usdc = limit * o.remaining;
             }
             if let Some(a) = order_audits.get_mut(coid) {
+                accrue_order_exposure(a, now_ns, o.remaining + fill);
                 a.q_ahead_final = o.q_ahead;
                 a.remaining_final = o.remaining;
             }
@@ -2047,9 +2150,25 @@ impl SimExchangeV2 {
     /// order also frees its `locked_usdc`/share reservation, identical to the
     /// cancel path; verified result-neutral by the 5-day per-event PnL key.
     fn retire_event(&mut self, condition: &str, tokens: &[String; 2]) {
-        // Residual orders for this dead event — remove before retiring the tokens.
-        self.orders
-            .retain(|_, o| !(tokens.contains(&o.request.symbol) || tokens.contains(&o.match_symbol)));
+        // Residual orders for this dead event — finalize their exposure at the
+        // current causal exchange clock before retiring the tokens. Leaving the
+        // audit row "open" would otherwise snapshot it through the end of the
+        // entire replay and attribute later events' wall time to this quote.
+        let retired_coids: Vec<String> = self
+            .orders
+            .iter()
+            .filter(|(_, o)| tokens.contains(&o.request.symbol) || tokens.contains(&o.match_symbol))
+            .map(|(coid, _)| coid.clone())
+            .collect();
+        for coid in retired_coids {
+            if let Some(order) = self.orders.remove(&coid) {
+                if let Some(audit) = self.maker_order_audit.get_mut(&coid) {
+                    accrue_order_exposure(audit, self.audit_clock_ns, order.remaining);
+                    audit.cancel_result = "event_retired";
+                    audit.remaining_final = order.remaining;
+                }
+            }
+        }
         // Settlement payout to the gating wallet (mirror the strategy's pm so the
         // wallet doesn't bleed). The event is long settled by retire time, so the
         // canonical mid has converged to ~0/1: tokens[0] (canonical) wins iff its
@@ -2300,9 +2419,14 @@ impl SimExchangeV2 {
         now_ns: u64,
         causal_race_cap: Option<f64>,
     ) -> OrderUpdate {
+        self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.place_orders += 1;
             a.place_qty += o.quantity;
+            if o.post_only {
+                a.passive_place_orders += 1;
+                a.passive_place_qty += o.quantity;
+            }
         }
         // Cancel-on-arrival: a cancel for this coid already arrived (it raced
         // ahead of this place ack). Honour the strategy's cancel intent now —
@@ -2830,6 +2954,10 @@ impl SimExchangeV2 {
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.maker_rests += 1;
             a.maker_rest_qty += remaining;
+            if o.post_only {
+                a.passive_rests += 1;
+                a.passive_rest_qty += remaining;
+            }
             a.maker_q_init_sum += q_ahead;
             a.maker_own_q_init_sum += simulated_own_ahead_qty;
             a.maker_race_added_q += maker_race_added_q;
@@ -2837,6 +2965,7 @@ impl SimExchangeV2 {
         }
         if self.maker_order_audit_enabled {
             if let Some((slug, _)) = self.audit_key(&o.symbol, &o.instance_id) {
+                let exposure_end_ns = event_exposure_end_ns(&slug);
                 self.maker_order_audit.insert(
                     o.client_order_id.clone(),
                     MakerOrderAuditRow {
@@ -2848,10 +2977,15 @@ impl SimExchangeV2 {
                         order_type: o.order_type,
                         price,
                         quantity: o.quantity,
+                        post_only: o.post_only,
                         strategy_emit_ns: o.timestamp_ns,
                         trigger_exchange_ns: o.quote_trigger_exchange_timestamp_ns,
                         trigger_local_ns: o.quote_trigger_local_timestamp_ns,
                         place_arrival_ns: now_ns,
+                        exposure_last_ns: now_ns,
+                        exposure_end_ns,
+                        rest_time_ns: 0,
+                        rest_qty_ns: 0.0,
                         await_fresh_book,
                         visible_depth_at_entry: now_depth,
                         entry_mid: mid0,
@@ -3014,6 +3148,7 @@ impl SimExchangeV2 {
     }
 
     pub fn cancel_order(&mut self, exchange: Exchange, coid: &str, now_ns: u64) -> OrderUpdate {
+        self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
         if let Some(o) = self.orders.remove(coid) {
             // Cancelling an earlier own order removes only its still-resting
             // contribution from later same-level FIFO positions. Public queue
@@ -3070,6 +3205,7 @@ impl SimExchangeV2 {
             self.own_queue_cancel_advance_qty += advanced_qty;
             self.record_lifetime(o.placed_ns, now_ns);
             if let Some(a) = self.maker_order_audit.get_mut(coid) {
+                accrue_order_exposure(a, now_ns, o.remaining);
                 a.cancel_arrival_ns = now_ns;
                 a.cancel_result = "cancelled";
                 a.q_ahead_final = o.q_ahead;
@@ -3475,6 +3611,9 @@ mod tests {
         assert_eq!(row.slug, "s");
         assert_eq!(row.coid, "m");
         assert_eq!(row.place_arrival_ns, 1);
+        assert!(row.post_only);
+        assert_eq!(row.rest_time_ns, 149);
+        assert!((row.rest_qty_ns - 645.0).abs() < EPS);
         assert_eq!(row.q_init, 10.0);
         assert_eq!(row.replay_self_depth_credit, 0.0);
         assert_eq!(row.trade_match_n, 1);
@@ -3492,6 +3631,125 @@ mod tests {
         assert_eq!(row.cancel_result, "cancelled");
         assert_eq!(row.q_ahead_final, 0.0);
         assert_eq!(row.remaining_final, 3.0);
+
+        let event_rows = c.fill_audit_rows();
+        assert_eq!(event_rows.len(), 1);
+        let event = &event_rows[0];
+        assert_eq!(event.passive_place_orders, 1);
+        assert_eq!(event.passive_rests, 1);
+        assert_eq!(event.passive_cancel_orders, 1);
+        assert_eq!(event.passive_orders_with_fill, 1);
+        assert_eq!(event.passive_open_orders, 0);
+        assert_eq!(event.maker_rest_time_ns, 149);
+        assert!((event.maker_rest_qty_ns - 645.0).abs() < EPS);
+        assert_eq!(event.passive_rest_time_ns, 149);
+        assert!((event.passive_rest_qty_ns - 645.0).abs() < EPS);
+        assert!((event.passive_fill_qty - 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn passive_exposure_snapshots_still_open_orders_at_latest_exchange_time() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            1,
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("open", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            102,
+        ));
+
+        let order = &c.maker_order_audit_rows()[0];
+        assert_eq!(order.rest_time_ns, 100);
+        assert!((order.rest_qty_ns - 500.0).abs() < EPS);
+        let event = &c.fill_audit_rows()[0];
+        assert_eq!(event.maker_open_orders, 1);
+        assert_eq!(event.passive_open_orders, 1);
+        assert_eq!(event.passive_rest_time_ns, 100);
+        assert!((event.passive_rest_qty_ns - 500.0).abs() < EPS);
+    }
+
+    #[test]
+    fn passive_exposure_stops_when_event_is_retired() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            1,
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("retired", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            102,
+        ));
+        c.retire_event("cond1", &["up".to_string(), "down".to_string()]);
+        // Later exchange activity must not extend the retired quote's lifetime.
+        c.audit_clock_ns = 1_000;
+
+        let order = &c.maker_order_audit_rows()[0];
+        assert_eq!(order.cancel_result, "event_retired");
+        assert_eq!(order.rest_time_ns, 100);
+        assert!((order.rest_qty_ns - 500.0).abs() < EPS);
+        let event = &c.fill_audit_rows()[0];
+        assert_eq!(event.passive_cancel_orders, 1);
+        assert_eq!(event.passive_open_orders, 0);
+        assert_eq!(event.passive_rest_time_ns, 100);
+        assert!((event.passive_rest_qty_ns - 500.0).abs() < EPS);
+    }
+
+    #[test]
+    fn passive_exposure_is_capped_at_market_end() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            1,
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("capped", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        c.maker_order_audit.get_mut("capped").unwrap().exposure_end_ns = 52;
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            102,
+        ));
+
+        let order = &c.maker_order_audit_rows()[0];
+        assert_eq!(order.rest_time_ns, 50);
+        assert!((order.rest_qty_ns - 250.0).abs() < EPS);
     }
 
     #[test]
