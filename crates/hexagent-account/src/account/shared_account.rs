@@ -31,6 +31,12 @@ const MANUAL_RISK_BLOCKER: &str = "manual";
 const MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "maintenance_attribution:";
 const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
 const FEE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "fee_attribution:";
+/// Maintenance waits for its reservation WAL record to become durable before
+/// any chain side effect is allowed. Live full-snapshot WAL batches can
+/// legitimately exceed 250 ms (306 ms observed on 2026-08-21), so the generic
+/// deadline produced false split failures. Only the per-account maintenance
+/// worker uses this longer bound; ordinary admission retains its old deadline.
+const MAINTENANCE_ADMISSION_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Settled-event FIFO eviction may race a pinned gap replay by many hours.
 /// Keep a lightweight, durable ownership proof long after the full order and
 /// trade rows have been compacted so an already-applied fill remains an
@@ -1726,6 +1732,8 @@ struct AccountPersistence {
     flush_last_us: AtomicU64,
     flush_max_us: AtomicU64,
     pending_high_water: AtomicUsize,
+    #[cfg(test)]
+    write_delay_ms: Arc<AtomicU64>,
     writer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1756,6 +1764,10 @@ impl AccountPersistence {
         state: Arc<Mutex<SharedAccountState>>,
         initial_generation: u64,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        let write_delay_ms = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let thread_write_delay_ms = Arc::clone(&write_delay_ms);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 format!("create ledger directory {}: {error}", parent.display())
@@ -1848,6 +1860,13 @@ impl AccountPersistence {
                         let generation = last.generation;
                         jobs = coalesce_persistence_jobs(jobs);
                         let started = std::time::Instant::now();
+                        #[cfg(test)]
+                        {
+                            let delay_ms = thread_write_delay_ms.load(Ordering::Relaxed);
+                            if delay_ms > 0 {
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                            }
+                        }
                         let result = (|| -> Result<(), String> {
                             let last_full_snapshot = jobs.iter().rposition(|job| {
                                 matches!(job.payload, PersistenceJobPayload::FullSnapshot)
@@ -1983,6 +2002,8 @@ impl AccountPersistence {
             flush_last_us: AtomicU64::new(0),
             flush_max_us: AtomicU64::new(0),
             pending_high_water: AtomicUsize::new(0),
+            #[cfg(test)]
+            write_delay_ms,
             writer: Some(writer),
         })
     }
@@ -6053,6 +6074,11 @@ impl SharedAccount {
 
     fn flush_admission_persistence(&self) -> Result<(), ReservationError> {
         self.flush_persistence(Duration::from_millis(250))
+            .map_err(ReservationError::PersistenceUnavailable)
+    }
+
+    fn flush_maintenance_admission_persistence(&self) -> Result<(), ReservationError> {
+        self.flush_persistence(MAINTENANCE_ADMISSION_PERSISTENCE_TIMEOUT)
             .map_err(ReservationError::PersistenceUnavailable)
     }
 
@@ -10509,7 +10535,7 @@ impl SharedAccount {
         );
         self.schedule_persist(&state);
         drop(state);
-        if let Err(error) = self.flush_admission_persistence() {
+        if let Err(error) = self.flush_maintenance_admission_persistence() {
             self.fail_maintenance_operation(
                 operation_id,
                 format!("reservation persistence: {error}"),
@@ -22430,6 +22456,71 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn maintenance_admission_allows_a_slow_but_healthy_ledger_write() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-maintenance-admission-slow-write-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("maintenance-slow", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+
+            // Reproduce the live failure deterministically: the old 250 ms
+            // control admission deadline expired while this healthy writer
+            // was still completing its full-snapshot WAL batch.
+            account
+                .persistence
+                .as_ref()
+                .unwrap()
+                .write_delay_ms
+                .store(300, Ordering::Relaxed);
+            let started = Instant::now();
+            account
+                .reserve_maintenance_operation(
+                    "split-slow-ledger",
+                    MaintenanceOperationKind::Split,
+                    "condition",
+                    "UP",
+                    "DOWN",
+                    &HashMap::from([("a".to_string(), 30.0)]),
+                )
+                .unwrap();
+            assert!(started.elapsed() >= Duration::from_millis(300));
+            let operation = account
+                .maintenance_operation("split-slow-ledger")
+                .unwrap();
+            assert_eq!(operation.status, MaintenanceOperationStatus::Reserved);
+            assert_eq!(
+                account.instance_snapshot("a").unwrap().reserved_cash,
+                30.0,
+            );
+            let monitoring = account.monitoring_snapshot();
+            assert_eq!(monitoring.persistence_generation_lag, 0);
+            assert_eq!(
+                monitoring.persistence_completed_generation,
+                monitoring.persistence_scheduled_generation,
+            );
+            account
+                .persistence
+                .as_ref()
+                .unwrap()
+                .write_delay_ms
+                .store(0, Ordering::Relaxed);
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(persistence_wal_path(&path));
         let _ = std::fs::remove_file(PathBuf::from(lock_path));
     }
 
