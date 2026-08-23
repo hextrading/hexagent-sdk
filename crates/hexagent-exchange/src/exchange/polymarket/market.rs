@@ -41,9 +41,18 @@ const CLOB_SOCKET_RCVBUF_BYTES: libc::c_int = 8 * 1024 * 1024;
 /// actively drained recently. This rejects a half-open standby while still
 /// covering the venue's observed microburst slow-consumer closes.
 const CLOB_STANDBY_MAX_RAW_AGE: Duration = Duration::from_secs(15);
+const CLOB_STANDBY_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const CLOB_DUAL_SILENCE_WINDOWS: u8 = 2;
 
 fn clob_standby_is_hot(observed_data: bool, last_raw_at: Instant, now: Instant) -> bool {
     observed_data && now.saturating_duration_since(last_raw_at) <= CLOB_STANDBY_MAX_RAW_AGE
+}
+
+fn clob_peers_are_anti_affine(
+    active_peer: Option<SocketAddr>,
+    standby_peer: Option<SocketAddr>,
+) -> bool {
+    matches!((active_peer, standby_peer), (Some(active), Some(standby)) if active.ip() != standby.ip())
 }
 
 /// The synchronous Polymarket feed's externally visible phase.  This lives in
@@ -3431,6 +3440,7 @@ fn promote_clob_standby(
     let old_lane_id = active.lane_id;
     let old_peer = active.peer_addr;
     std::mem::swap(active, &mut promoted);
+    super::network_incident::update_ws_peers(active.peer_addr, None);
     // Delineate active processing from the preceding drain-only standby
     // window. The promoted socket and its kernel receive queue stay intact.
     active.diagnostics = ClobWindowMetrics::new(now);
@@ -3579,6 +3589,7 @@ async fn clob_ws_task(
                 continue;
             }
         };
+        super::network_incident::update_ws_peers(active.peer_addr, None);
         backoff.reset();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
@@ -3633,6 +3644,7 @@ async fn clob_ws_task(
         scheduler_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         scheduler_probe.tick().await;
         let mut immediate_reconnect = false;
+        let mut dual_silence_windows = 0_u8;
 
         loop {
             let deferred_deadline = books
@@ -3682,7 +3694,7 @@ async fn clob_ws_task(
                 }, if standby_connect.is_some() => {
                     standby_connect = None;
                     match standby_result {
-                        Ok(Ok(lane)) => {
+                        Ok(Ok(lane)) if clob_peers_are_anti_affine(active.peer_addr, lane.peer_addr) => {
                             info!(
                                 "[clob_standby_ready] lane_id={} peer={:?} active_lane_id={} active_peer={:?}",
                                 lane.lane_id,
@@ -3690,7 +3702,31 @@ async fn clob_ws_task(
                                 active.lane_id,
                                 active.peer_addr,
                             );
+                            super::network_incident::update_ws_peers(active.peer_addr, lane.peer_addr);
                             standby = Some(lane);
+                        }
+                        Ok(Ok(lane)) => {
+                            super::network_incident::update_ws_peers(active.peer_addr, lane.peer_addr);
+                            super::network_incident::record(
+                                super::network_incident::NetworkSignal::PeerCollision,
+                                "standby candidate rejected; reconnecting for a distinct peer IP",
+                            );
+                            warn!(
+                                "[clob_peer_collision] candidate_lane_id={} candidate_peer={:?} active_lane_id={} active_peer={:?}; retrying",
+                                lane.lane_id,
+                                lane.peer_addr,
+                                active.lane_id,
+                                active.peer_addr,
+                            );
+                            super::network_incident::update_ws_peers(active.peer_addr, None);
+                            drop(lane);
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                subscription.tokens.clone(),
+                                lane_id,
+                                CLOB_STANDBY_RECONNECT_DELAY,
+                            ));
                         }
                         Ok(Err(error)) => {
                             warn!("[clob_standby_connect_failed] error={error}; retrying");
@@ -3699,7 +3735,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 subscription.tokens.clone(),
                                 lane_id,
-                                Duration::from_millis(500),
+                                CLOB_STANDBY_RECONNECT_DELAY,
                             ));
                         }
                         Err(error) => {
@@ -3709,7 +3745,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 subscription.tokens.clone(),
                                 lane_id,
-                                Duration::from_millis(500),
+                                CLOB_STANDBY_RECONNECT_DELAY,
                             ));
                         }
                     }
@@ -3982,12 +4018,13 @@ async fn clob_ws_task(
                                 error,
                             );
                             standby = None;
+                            super::network_incident::update_ws_peers(active.peer_addr, None);
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
                                 subscription.tokens.clone(),
                                 lane_id,
-                                Duration::from_millis(500),
+                                CLOB_STANDBY_RECONNECT_DELAY,
                             ));
                         }
                     }
@@ -4015,6 +4052,32 @@ async fn clob_ws_task(
 
                 _ = burst_interval.tick() => {
                     let now = Instant::now();
+                    let both_silent = standby.as_ref().is_some_and(|lane| {
+                        active.observed_data
+                            && lane.observed_data
+                            && active.burst.frames == 0
+                            && lane.burst.frames == 0
+                    });
+                    if both_silent {
+                        dual_silence_windows = dual_silence_windows.saturating_add(1);
+                        if dual_silence_windows == CLOB_DUAL_SILENCE_WINDOWS {
+                            let detail = format!(
+                                "windows={} active_raw_age_ms={} standby_raw_age_ms={}",
+                                dual_silence_windows,
+                                now.saturating_duration_since(active.last_raw_at).as_millis(),
+                                standby
+                                    .as_ref()
+                                    .map(|lane| now.saturating_duration_since(lane.last_raw_at).as_millis())
+                                    .unwrap_or_default(),
+                            );
+                            super::network_incident::record(
+                                super::network_incident::NetworkSignal::DualWsSilence,
+                                &detail,
+                            );
+                        }
+                    } else {
+                        dual_silence_windows = 0;
+                    }
                     active.burst.record_socket_polls(active.read.take_poll_window());
                     active.burst.log_and_reset(
                         now,
@@ -4142,12 +4205,13 @@ async fn clob_ws_task(
                                 subscription.tokens.len(),
                             ).await {
                                 standby = None;
+                                super::network_incident::update_ws_peers(active.peer_addr, None);
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 standby_connect = Some(spawn_clob_standby_connect(
                                     subscription.tokens.clone(),
                                     lane_id,
-                                    Duration::from_millis(500),
+                                    CLOB_STANDBY_RECONNECT_DELAY,
                                 ));
                             }
                             continue;
@@ -8736,5 +8800,22 @@ mod pick_current_event_tests {
         lifecycle.subscribed();
         assert!(!lifecycle.ready);
         assert!(lifecycle.valid_market_data(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn clob_standby_requires_distinct_peer_ip() {
+        let active_v4 = Some("192.0.2.10:443".parse().unwrap());
+        let same_v4 = Some("192.0.2.10:8443".parse().unwrap());
+        let other_v4 = Some("198.51.100.20:443".parse().unwrap());
+        let active_v6 = Some("[2001:db8::10]:443".parse().unwrap());
+        let same_v6 = Some("[2001:db8::10]:8443".parse().unwrap());
+        let other_v6 = Some("[2001:db8::20]:443".parse().unwrap());
+
+        assert!(!clob_peers_are_anti_affine(active_v4, same_v4));
+        assert!(clob_peers_are_anti_affine(active_v4, other_v4));
+        assert!(!clob_peers_are_anti_affine(active_v6, same_v6));
+        assert!(clob_peers_are_anti_affine(active_v6, other_v6));
+        assert!(!clob_peers_are_anti_affine(active_v4, None));
+        assert!(!clob_peers_are_anti_affine(None, other_v4));
     }
 }

@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EPS: f64 = 1e-9;
@@ -55,6 +55,12 @@ const SETTLED_GC_COMPLETION_QUEUE_CAPACITY: usize = 1_024;
 const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
+const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
+
+/// Cold account control work transferred to the account's single writer.
+/// Callers must never enqueue quote-path work or perform external I/O inside
+/// the closure. The bounded lane is consumed by the exchange account owner.
+pub type AccountOwnerTask = Box<dyn FnOnce(&SharedAccount) + Send + 'static>;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LockMonitoringSnapshot {
@@ -3985,6 +3991,10 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
 pub struct SharedAccount {
     account_id: String,
     state: Arc<Mutex<SharedAccountState>>,
+    account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerTask>,
+    account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerTask>>>,
+    account_owner_lane_bound: AtomicBool,
+    account_owner_thread_id: OnceLock<std::thread::ThreadId>,
     /// Cold account-wide mutations (wallet snapshots, maintenance and explicit
     /// allocation migrations) take the write side. Ordinary order paths take
     /// only a shared guard and then mutate one virtual account shard.
@@ -4180,6 +4190,108 @@ impl Drop for AccountStateGuard<'_> {
 }
 
 impl SharedAccount {
+    /// Bind the fixed-capacity cold-control lane to the one account writer.
+    /// Binding twice is rejected because two consumers would violate ordered
+    /// single-writer ownership.
+    pub fn bind_account_owner_task_lane(
+        &self,
+    ) -> Result<crossbeam_channel::Receiver<AccountOwnerTask>, String> {
+        let mut receiver = self.account_owner_task_rx.lock().unwrap();
+        let receiver = receiver
+            .take()
+            .ok_or_else(|| format!("account {} owner task lane already bound", self.account_id))?;
+        self.account_owner_lane_bound.store(true, Ordering::Release);
+        Ok(receiver)
+    }
+
+    /// Mark the current consumer as the sole writer. Re-entrant owner calls
+    /// execute inline instead of deadlocking while waiting on their own lane.
+    pub fn mark_account_owner_thread(&self) -> Result<(), String> {
+        let current = std::thread::current().id();
+        match self.account_owner_thread_id.set(current) {
+            Ok(()) => Ok(()),
+            Err(existing) if existing == current => Ok(()),
+            Err(existing) => Err(format!(
+                "account {} owner already assigned to thread {:?}",
+                self.account_id, existing,
+            )),
+        }
+    }
+
+    pub fn is_account_owner_thread(&self) -> bool {
+        self.account_owner_thread_id
+            .get()
+            .is_some_and(|owner| *owner == std::thread::current().id())
+    }
+
+    fn must_dispatch_to_account_owner(&self) -> bool {
+        self.account_owner_lane_bound.load(Ordering::Acquire)
+            && !self.is_account_owner_thread()
+    }
+
+    /// Enqueue non-blocking cold account work. This API is intentionally
+    /// fail-closed on an unbound or full lane; callers choose their own retry
+    /// and admission behavior instead of silently mutating off-owner.
+    pub fn try_submit_account_owner_task(
+        &self,
+        task: AccountOwnerTask,
+    ) -> Result<(), String> {
+        if self.is_account_owner_thread() {
+            task(self);
+            return Ok(());
+        }
+        if !self.account_owner_lane_bound.load(Ordering::Acquire) {
+            return Err(format!("account {} owner task lane is not bound", self.account_id));
+        }
+        self.account_owner_task_tx
+            .try_send(task)
+            .map_err(|error| {
+                format!(
+                    "account {} owner task enqueue failed: {error}",
+                    self.account_id,
+                )
+            })
+    }
+
+    /// Transfer a cold mutation to the account writer and wait for its result.
+    /// The direct path exists only before the runtime binds the owner lane
+    /// (CLI/startup/tests); once bound, no non-owner thread may execute it.
+    pub fn call_on_account_owner<T, F>(&self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SharedAccount) -> T + Send + 'static,
+    {
+        if self.is_account_owner_thread()
+            || !self.account_owner_lane_bound.load(Ordering::Acquire)
+        {
+            return Ok(operation(self));
+        }
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.account_owner_task_tx
+            .send_timeout(
+                Box::new(move |account| {
+                    let _ = reply_tx.send(operation(account));
+                }),
+                Duration::from_secs(5),
+            )
+            .map_err(|error| {
+                format!(
+                    "account {} owner task enqueue timed out: {error}",
+                    self.account_id,
+                )
+            })?;
+        reply_rx.recv_timeout(Duration::from_secs(5)).map_err(|error| {
+            format!(
+                "account {} owner task completion timed out: {error}",
+                self.account_id,
+            )
+        })
+    }
+
+    pub fn account_owner_task_queue_depth(&self) -> usize {
+        self.account_owner_task_tx.len()
+    }
+
     fn effective_settled_token_values_generation(state: &SharedAccountState) -> u64 {
         if state.settled_token_values.is_empty() {
             state.settled_token_values_generation
@@ -4262,9 +4374,15 @@ impl SharedAccount {
     pub fn new(account_id: impl Into<String>) -> Self {
         let (settled_gc_completion_tx, settled_gc_completion_rx) =
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
+        let (account_owner_task_tx, account_owner_task_rx) =
+            crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
         let account = Self {
             account_id: account_id.into(),
             state: Arc::new(Mutex::new(SharedAccountState::default())),
+            account_owner_task_tx,
+            account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            account_owner_lane_bound: AtomicBool::new(false),
+            account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
@@ -4639,9 +4757,15 @@ impl SharedAccount {
         }
         let (settled_gc_completion_tx, settled_gc_completion_rx) =
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
+        let (account_owner_task_tx, account_owner_task_rx) =
+            crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
         let account = Self {
             account_id,
             state,
+            account_owner_task_tx,
+            account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            account_owner_lane_bound: AtomicBool::new(false),
+            account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
@@ -6448,6 +6572,13 @@ impl SharedAccount {
     }
 
     pub fn token_interests(&self) -> Vec<TokenInterest> {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(|account| account.token_interests())
+                .unwrap_or_else(|error| {
+                    panic!("account owner token-interest snapshot failed: {error}")
+                });
+        }
         let mut state = self.lock_state();
         let now_ms = wall_clock_ms();
         // Keep every owned historical token in the explicit ERC-1155 and
@@ -7195,6 +7326,17 @@ impl SharedAccount {
     }
 
     pub fn record_settled_token_values(&self, values: &HashMap<String, f64>) {
+        if self.must_dispatch_to_account_owner() {
+            let values = values.clone();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.record_settled_token_values(&values);
+            }) {
+                log::error!("[shared_account] settled-token owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut state = self.lock_state();
         let effective_generation = if state.settled_token_values.is_empty() {
             state.settled_token_values_generation
@@ -7443,6 +7585,16 @@ impl SharedAccount {
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(move |account| {
+                    account.apply_scoped_physical_snapshot(
+                        cash,
+                        positions,
+                        authoritative_tokens,
+                    )
+                })?;
+        }
         self.apply_scoped_physical_snapshot_inner(None, cash, positions, authoritative_tokens)
     }
 
@@ -7454,6 +7606,17 @@ impl SharedAccount {
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(move |account| {
+                    account.apply_scoped_physical_snapshot_versioned(
+                        generation,
+                        cash,
+                        positions,
+                        authoritative_tokens,
+                    )
+                })?;
+        }
         self.apply_scoped_physical_snapshot_inner(
             Some(generation),
             cash,
@@ -7470,6 +7633,12 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
+        if self
+            .startup_snapshot_applied_fast
+            .load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
         let mut state = self.lock_state();
         if state.startup_snapshot_applied_this_process {
             return Ok(false);
@@ -7574,12 +7743,42 @@ impl SharedAccount {
         observed_positions: &HashMap<String, f64>,
         authoritative_tokens: &HashSet<String>,
     ) -> bool {
+        if self.must_dispatch_to_account_owner() {
+            let observed_positions = observed_positions.clone();
+            let authoritative_tokens = authoritative_tokens.clone();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.observe_platform_binary_redeem(
+                        observed_cash,
+                        &observed_positions,
+                        &authoritative_tokens,
+                    )
+                })
+                .unwrap_or_else(|error| panic!("account owner redeem observation failed: {error}"));
+        }
         if !observed_cash.is_finite()
             || observed_cash < 0.0
             || observed_positions
                 .values()
                 .any(|qty| !qty.is_finite() || *qty < 0.0)
         {
+            return false;
+        }
+        if !self.seeded_fast.load(Ordering::Acquire)
+            || self.startup_snapshot_deferred_fast.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        // The periodic wallet poll normally observes no redeem. Reject that
+        // common case from the aggregate state snapshot without materializing
+        // and republishing every virtual lifecycle shard. Only a positive cash
+        // delta can be a candidate 1:1 platform redemption.
+        let prior_cash = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .physical_cash;
+        if observed_cash - prior_cash <= EPS {
             return false;
         }
         let mut state = self.lock_state();
@@ -7763,6 +7962,17 @@ impl SharedAccount {
             return;
         }
         let reason = reason.into();
+        if self.must_dispatch_to_account_owner() {
+            let source = source.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.set_risk_blocker(&source, reason);
+            }) {
+                log::error!("[shared_account] risk-blocker owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let reason = if reason.trim().is_empty() {
             "unspecified subsystem risk".to_string()
         } else {
@@ -7792,6 +8002,12 @@ impl SharedAccount {
     /// derived account invariant. Callers cannot accidentally reopen admission
     /// for a different source.
     pub fn clear_risk_blocker(&self, source: &str) -> bool {
+        if self.must_dispatch_to_account_owner() {
+            let source = source.to_string();
+            return self
+                .call_on_account_owner(move |account| account.clear_risk_blocker(&source))
+                .unwrap_or(false);
+        }
         let source = source.trim();
         if source.is_empty()
             || !self
@@ -8057,6 +8273,14 @@ impl SharedAccount {
     }
 
     pub fn record_maintenance_queue_wait(&self, wait: Duration) {
+        if self.must_dispatch_to_account_owner() {
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.record_maintenance_queue_wait(wait);
+            }) {
+                log::error!("[shared_account] maintenance metric owner dispatch failed: {error}");
+            }
+            return;
+        }
         let mut state = self.lock_state();
         let wait_ms = wait.as_millis().min(u64::MAX as u128) as u64;
         state.maintenance_queue_last_wait_ms = wait_ms;
@@ -8065,6 +8289,13 @@ impl SharedAccount {
     }
 
     pub fn monitoring_snapshot(&self) -> AccountMonitoringSnapshot {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(|account| account.monitoring_snapshot())
+                .unwrap_or_else(|error| {
+                    panic!("account owner monitoring snapshot failed: {error}")
+                });
+        }
         self.refresh_trade_persistence_blocker();
         let settled_gc_metrics = self.settled_gc_metrics();
         let state = self.lock_state();
@@ -8213,19 +8444,8 @@ impl SharedAccount {
         let mut reserved_positions = HashMap::<String, f64>::new();
         let mut virtual_cash = 0.0;
         let mut reserved_cash = 0.0;
-        let mut recovery_pending_orders = 0usize;
-        let mut routine_cancel_audits = 0usize;
         let mut instances = Vec::with_capacity(accounts.len());
         for account in accounts {
-            let (recovery_count, routine_count) = {
-                let lifecycle = account.lifecycle.lock().unwrap();
-                (
-                    lifecycle.recovery_pending_orders.len(),
-                    lifecycle.routine_cancel_audits.len(),
-                )
-            };
-            recovery_pending_orders = recovery_pending_orders.saturating_add(recovery_count);
-            routine_cancel_audits = routine_cancel_audits.saturating_add(routine_count);
             let instance = account.ledger_snapshot();
             let instance_reserved_positions = instance.total_reserved_positions();
             let instance_reserved_cash = instance.total_reserved_cash();
@@ -8251,6 +8471,12 @@ impl SharedAccount {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Operational monitoring must never contend with private lifecycle
+        // apply. These counts may lag until the next cold owner transaction;
+        // they are observability-only and the exact live sets remain owned by
+        // the account writer.
+        let recovery_pending_orders = state.recovery_pending_orders.len();
+        let routine_cancel_audits = state.routine_cancel_audits.len();
         AccountMonitoringSnapshot {
             account_id: self.account_id.clone(),
             seeded: self.seeded_fast.load(Ordering::Acquire),
@@ -10129,6 +10355,12 @@ impl SharedAccount {
     /// Each token's collateral payout is allocated in proportion to the
     /// virtual quantity owned by each instance immediately before the burn.
     pub fn apply_redeemed_legs(&self, legs: &[(String, f64, f64)]) -> Result<(), ReservationError> {
+        if self.must_dispatch_to_account_owner() {
+            let legs = legs.to_vec();
+            return self
+                .call_on_account_owner(move |account| account.apply_redeemed_legs(&legs))
+                .map_err(ReservationError::InvalidOrder)?;
+        }
         let mut state = self.lock_state();
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
@@ -10396,6 +10628,55 @@ impl SharedAccount {
         down_token_id: &str,
         allocations: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            let failed_operation_id = operation_id.clone();
+            let condition_id = condition_id.to_string();
+            let up_token_id = up_token_id.to_string();
+            let down_token_id = down_token_id.to_string();
+            let allocations = allocations.clone();
+            self.call_on_account_owner(move |account| {
+                account.reserve_maintenance_operation_inner(
+                    &operation_id,
+                    kind,
+                    &condition_id,
+                    &up_token_id,
+                    &down_token_id,
+                    &allocations,
+                    false,
+                )
+            })
+            .map_err(ReservationError::InvalidOrder)??;
+            if let Err(error) = self.flush_maintenance_admission_persistence() {
+                self.fail_maintenance_operation(
+                    &failed_operation_id,
+                    format!("reservation persistence: {error}"),
+                );
+                return Err(error);
+            }
+            return Ok(());
+        }
+        self.reserve_maintenance_operation_inner(
+            operation_id,
+            kind,
+            condition_id,
+            up_token_id,
+            down_token_id,
+            allocations,
+            true,
+        )
+    }
+
+    fn reserve_maintenance_operation_inner(
+        &self,
+        operation_id: &str,
+        kind: MaintenanceOperationKind,
+        condition_id: &str,
+        up_token_id: &str,
+        down_token_id: &str,
+        allocations: &HashMap<String, f64>,
+        flush_persistence: bool,
+    ) -> Result<(), ReservationError> {
         self.ensure_admission_persistence()?;
         if operation_id.is_empty()
             || condition_id.is_empty()
@@ -10535,12 +10816,14 @@ impl SharedAccount {
         );
         self.schedule_persist(&state);
         drop(state);
-        if let Err(error) = self.flush_maintenance_admission_persistence() {
-            self.fail_maintenance_operation(
-                operation_id,
-                format!("reservation persistence: {error}"),
-            );
-            return Err(error);
+        if flush_persistence {
+            if let Err(error) = self.flush_maintenance_admission_persistence() {
+                self.fail_maintenance_operation(
+                    operation_id,
+                    format!("reservation persistence: {error}"),
+                );
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -10550,6 +10833,13 @@ impl SharedAccount {
         operation_id: &str,
         tx_id: &str,
     ) -> Result<(), String> {
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            let tx_id = tx_id.to_string();
+            return self.call_on_account_owner(move |account| {
+                account.mark_maintenance_operation_submitted(&operation_id, &tx_id)
+            })?;
+        }
         if tx_id.is_empty() {
             return Err("maintenance submission returned an empty tx id".to_string());
         }
@@ -10588,6 +10878,17 @@ impl SharedAccount {
         detail: impl Into<String>,
     ) {
         let detail = detail.into();
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.mark_maintenance_operation_uncertain(&operation_id, detail);
+            }) {
+                log::error!("[shared_account] uncertain maintenance owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut state = self.lock_state();
         if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
             operation.status = MaintenanceOperationStatus::Uncertain;
@@ -10609,6 +10910,18 @@ impl SharedAccount {
         operation_id: &str,
         detail: impl Into<String>,
     ) {
+        let detail = detail.into();
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.mark_maintenance_attribution_uncertain(&operation_id, detail);
+            }) {
+                log::error!("[shared_account] maintenance attribution owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         self.set_risk_blocker(
             &format!("{MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX}{operation_id}"),
             detail,
@@ -10619,6 +10932,13 @@ impl SharedAccount {
     /// Confirmed. This also migrates the precise legacy `manual` reason emitted
     /// by older SDKs before maintenance blockers became operation-scoped.
     pub fn repair_confirmed_maintenance_risk_blockers(&self) -> usize {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(|account| {
+                    account.repair_confirmed_maintenance_risk_blockers()
+                })
+                .unwrap_or(0);
+        }
         let mut state = self.lock_state();
         let cleared = clear_confirmed_maintenance_risk_blockers(&mut state);
         if cleared.is_empty() {
@@ -10635,6 +10955,13 @@ impl SharedAccount {
     }
 
     pub fn pending_maintenance_operations(&self) -> Vec<MaintenanceOperation> {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(|account| account.pending_maintenance_operations())
+                .unwrap_or_else(|error| {
+                    panic!("account owner maintenance snapshot failed: {error}")
+                });
+        }
         self.lock_state()
             .maintenance_ops
             .values()
@@ -10651,11 +10978,30 @@ impl SharedAccount {
     }
 
     pub fn maintenance_operation(&self, operation_id: &str) -> Option<MaintenanceOperation> {
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.maintenance_operation(&operation_id)
+                })
+                .unwrap_or(None);
+        }
         self.lock_state().maintenance_ops.get(operation_id).cloned()
     }
 
     pub fn fail_maintenance_operation(&self, operation_id: &str, detail: impl Into<String>) {
         let detail = detail.into();
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.fail_maintenance_operation(&operation_id, detail);
+            }) {
+                log::error!("[shared_account] failed-maintenance owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut state = self.lock_state();
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return;
@@ -10698,6 +11044,14 @@ impl SharedAccount {
         &self,
         operation_id: &str,
     ) -> Result<(), ReservationError> {
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.confirm_maintenance_operation(&operation_id)
+                })
+                .map_err(ReservationError::InvalidOrder)?;
+        }
         let mut state = self.lock_state();
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return Err(ReservationError::InvalidOrder(format!(
@@ -12386,6 +12740,11 @@ impl SharedAccount {
     }
 
     pub fn trades(&self) -> Vec<TradeOwnership> {
+        if self.must_dispatch_to_account_owner() {
+            return self
+                .call_on_account_owner(|account| account.trades())
+                .unwrap_or_else(|error| panic!("account owner trade snapshot failed: {error}"));
+        }
         self.lock_state()
             .trades
             .values()
@@ -15765,6 +16124,99 @@ fn redistribute_all(state: &mut SharedAccountState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_cold_operations_execute_on_single_account_owner() {
+        let account = Arc::new(SharedAccount::new("owner-lane"));
+        let owner_rx = account.bind_account_owner_task_lane().unwrap();
+        let owner_account = Arc::clone(&account);
+        let (thread_tx, thread_rx) = crossbeam_channel::bounded(3);
+        let owner = std::thread::spawn(move || {
+            owner_account.mark_account_owner_thread().unwrap();
+            for _ in 0..3 {
+                let task = owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                thread_tx.send(std::thread::current().id()).unwrap();
+                task(&owner_account);
+            }
+        });
+
+        account.record_maintenance_queue_wait(Duration::from_millis(7));
+        account.record_settled_token_values(&HashMap::from([("UP".to_string(), 1.0)]));
+        let snapshot = account.monitoring_snapshot();
+
+        let owner_thread = thread_rx.recv().unwrap();
+        assert_eq!(thread_rx.recv().unwrap(), owner_thread);
+        assert_eq!(thread_rx.recv().unwrap(), owner_thread);
+        assert_ne!(owner_thread, std::thread::current().id());
+        assert_eq!(snapshot.maintenance_queue_jobs, 1);
+        assert_eq!(
+            account.settled_token_values_snapshot_arc().values.get("UP"),
+            Some(&1.0),
+        );
+        assert_eq!(account.account_owner_task_queue_depth(), 0);
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn account_owner_task_lane_is_bounded_and_fails_closed() {
+        let account = SharedAccount::new("owner-lane-capacity");
+        let _owner_rx = account.bind_account_owner_task_lane().unwrap();
+        for _ in 0..ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
+            account
+                .try_submit_account_owner_task(Box::new(|_| {}))
+                .unwrap();
+        }
+        assert!(account
+            .try_submit_account_owner_task(Box::new(|_| {}))
+            .unwrap_err()
+            .contains("full"));
+    }
+
+    #[test]
+    fn fast_monitoring_never_borrows_private_lifecycle() {
+        let account = SharedAccount::new("fast-monitoring");
+        account.register_instance("maker", 1.0);
+        let virtual_account = account.virtual_account("maker").unwrap();
+        let lifecycle = virtual_account.lifecycle.lock().unwrap();
+
+        let snapshot = account.monitoring_snapshot_fast();
+
+        assert_eq!(snapshot.account_id, "fast-monitoring");
+        drop(lifecycle);
+    }
+
+    #[test]
+    fn periodic_unchanged_wallet_snapshot_skips_cold_account_transaction() {
+        let account = SharedAccount::new("periodic-snapshot");
+        account.register_instance("maker", 1.0);
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                100.0,
+                HashMap::new(),
+                HashSet::new(),
+            )
+            .unwrap());
+        let acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
+
+        assert!(!account
+            .apply_scoped_physical_snapshot_versioned(
+                2,
+                100.0,
+                HashMap::new(),
+                HashSet::new(),
+            )
+            .unwrap());
+        assert!(!account.observe_platform_binary_redeem(
+            100.0,
+            &HashMap::new(),
+            &HashSet::new(),
+        ));
+        assert_eq!(
+            account.account_lock_acquisitions.load(Ordering::Relaxed),
+            acquisitions,
+        );
+    }
 
     fn persistence_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
