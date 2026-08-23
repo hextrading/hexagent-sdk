@@ -4357,6 +4357,14 @@ impl SharedAccount {
         }
         self.ended_token_ids_fast
             .store(Arc::new(Self::ended_token_ids(state)));
+        // `retired_order_audit_tombstones` is append-only and can contain
+        // tens of thousands of historical rows. Its immutable replay index is
+        // published only by the two mutation sites below; cloning it on every
+        // unrelated account transaction made every cold owner hold grow with
+        // historical audit cardinality.
+    }
+
+    fn publish_retired_order_audit_tombstones(&self, state: &SharedAccountState) {
         self.retired_order_audit_tombstones_fast
             .store(Arc::new(state.retired_order_audit_tombstones.clone()));
     }
@@ -4741,6 +4749,8 @@ impl SharedAccount {
             .collect();
         let initial_settled_generation = Self::effective_settled_token_values_generation(&state);
         let initial_settled_values = state.settled_token_values.clone();
+        let initial_retired_order_audit_tombstones =
+            state.retired_order_audit_tombstones.clone();
         let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
@@ -4774,7 +4784,9 @@ impl SharedAccount {
             retired_trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: RwLock::new(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
-            retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
+            retired_order_audit_tombstones_fast: ArcSwap::from_pointee(
+                initial_retired_order_audit_tombstones,
+            ),
             risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
             unresolved_trade_match_times_fast: RwLock::new(
@@ -4941,6 +4953,34 @@ impl SharedAccount {
             trade_epochs,
             acquired_at,
         }
+    }
+
+    /// Read account-owner cold state without materializing every virtual
+    /// lifecycle shard or publishing the aggregate back into those shards.
+    /// Maintenance/history polling reads only owner-authored fields, so the
+    /// full two-way `lock_state()` transaction was both unnecessary and the
+    /// source of its recurring 35-49 ms holds.
+    fn read_cold_state<T>(&self, read: impl FnOnce(&SharedAccountState) -> T) -> T {
+        let wait_started = Instant::now();
+        let control = self.control_gate.read().unwrap();
+        let state = self.state.lock().unwrap();
+        let acquired_at = Instant::now();
+        let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.account_lock_wait_last_us
+            .store(wait_us, Ordering::Relaxed);
+        self.account_lock_wait_max_us
+            .fetch_max(wait_us, Ordering::Relaxed);
+        self.account_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let result = read(&state);
+        let hold_us = acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.account_lock_hold_last_us
+            .store(hold_us, Ordering::Relaxed);
+        self.account_lock_hold_max_us
+            .fetch_max(hold_us, Ordering::Relaxed);
+        drop(state);
+        drop(control);
+        result
     }
 
     fn virtual_account(&self, instance_id: &str) -> Option<Arc<VirtualAccount>> {
@@ -9317,6 +9357,7 @@ impl SharedAccount {
         });
         state.orphan_order_anomaly_hints.remove(&normalized);
         recompute_reconciliation(&mut state, "authenticated terminal orphan order audit");
+        self.publish_retired_order_audit_tombstones(&state);
         self.schedule_persist(&state);
         true
     }
@@ -9372,6 +9413,7 @@ impl SharedAccount {
             &mut state,
             "authenticated absent historical orphan order audit",
         );
+        self.publish_retired_order_audit_tombstones(&state);
         self.schedule_persist(&state);
         true
     }
@@ -10962,19 +11004,21 @@ impl SharedAccount {
                     panic!("account owner maintenance snapshot failed: {error}")
                 });
         }
-        self.lock_state()
-            .maintenance_ops
-            .values()
-            .filter(|operation| {
-                matches!(
-                    operation.status,
-                    MaintenanceOperationStatus::Reserved
-                        | MaintenanceOperationStatus::Submitted
-                        | MaintenanceOperationStatus::Uncertain
-                )
-            })
-            .cloned()
-            .collect()
+        self.read_cold_state(|state| {
+            state
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .cloned()
+                .collect()
+        })
     }
 
     pub fn maintenance_operation(&self, operation_id: &str) -> Option<MaintenanceOperation> {
@@ -10986,7 +11030,7 @@ impl SharedAccount {
                 })
                 .unwrap_or(None);
         }
-        self.lock_state().maintenance_ops.get(operation_id).cloned()
+        self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
     }
 
     pub fn fail_maintenance_operation(&self, operation_id: &str, detail: impl Into<String>) {
@@ -16170,6 +16214,88 @@ mod tests {
             .try_submit_account_owner_task(Box::new(|_| {}))
             .unwrap_err()
             .contains("full"));
+    }
+
+    #[test]
+    fn unrelated_owner_transactions_do_not_clone_order_audit_history() {
+        let account = SharedAccount::new("owner-tombstone-publication");
+        assert!(account.record_authoritative_absent_orphan_order_audit(
+            "0xhistorical",
+            None,
+            "authoritative test absence",
+        ));
+        let published = account.retired_order_audit_tombstones_fast.load_full();
+        assert_eq!(published.len(), 1);
+
+        account.record_maintenance_queue_wait(Duration::from_millis(3));
+
+        let after = account.retired_order_audit_tombstones_fast.load_full();
+        assert!(Arc::ptr_eq(&published, &after));
+    }
+
+    #[test]
+    fn maintenance_history_reads_skip_full_virtual_publication() {
+        let account = SharedAccount::new("maintenance-cold-read");
+        let ended_tokens = account.ended_token_ids_fast.load_full();
+
+        assert!(account.pending_maintenance_operations().is_empty());
+        assert!(account.maintenance_operation("missing").is_none());
+
+        let after = account.ended_token_ids_fast.load_full();
+        assert!(Arc::ptr_eq(&ended_tokens, &after));
+    }
+
+    #[test]
+    #[ignore = "focused account-owner latency benchmark"]
+    fn benchmark_maintenance_cold_read_vs_full_account_transaction() {
+        const INSTANCES: usize = 256;
+        const EVENTS_PER_VARIANT: usize = 200;
+        let account = SharedAccount::new("maintenance-cold-read-benchmark");
+        for index in 0..INSTANCES {
+            account.register_instance(&format!("instance-{index}"), 1.0);
+        }
+
+        let mut full_transaction = Vec::with_capacity(EVENTS_PER_VARIANT);
+        let mut cold_read = Vec::with_capacity(EVENTS_PER_VARIANT);
+        for _ in 0..EVENTS_PER_VARIANT {
+            let started = Instant::now();
+            let pending: Vec<_> = account
+                .lock_state()
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .cloned()
+                .collect();
+            std::hint::black_box(pending);
+            full_transaction
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+
+            let started = Instant::now();
+            std::hint::black_box(account.pending_maintenance_operations());
+            cold_read.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+
+        let full = latency_summary_ns(&mut full_transaction);
+        let cold = latency_summary_ns(&mut cold_read);
+        eprintln!(
+            "maintenance owner read boundary (instances={INSTANCES}, events_per_variant={EVENTS_PER_VARIANT}, queue_depth=0, overflow=0) ns: full_transaction median/p99/p999/max={}/{}/{}/{} cold_read={}/{}/{}/{}",
+            full.0,
+            full.1,
+            full.2,
+            full.3,
+            cold.0,
+            cold.1,
+            cold.2,
+            cold.3,
+        );
+        assert!(cold.2 < full.2);
     }
 
     #[test]

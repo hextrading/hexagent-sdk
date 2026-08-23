@@ -1498,13 +1498,180 @@ fn clob_monotonic_now_ns() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+// Public trades, lifecycle and health transitions are ordered/lossless. Book
+// and quote snapshots are replaceable: when their lane is saturated the CLOB
+// reader evicts the oldest replaceable item and publishes the newest state.
+// This keeps a stalled engine from turning a transient burst into an
+// unbounded resident-memory queue while preserving the events that cannot be
+// reconstructed from a later snapshot.
+const CLOB_CRITICAL_EVENT_CAPACITY: usize = 2_048;
+const CLOB_REPLACEABLE_EVENT_CAPACITY: usize = 8_192;
+const CLOB_CRITICAL_SEND_TIMEOUT: Duration = Duration::from_millis(5);
+
+#[derive(Clone)]
+struct ClobEventSender {
+    critical_tx: crossbeam_channel::Sender<ClobEventEnvelope>,
+    replaceable_tx: crossbeam_channel::Sender<ClobEventEnvelope>,
+    replaceable_evict_rx: crossbeam_channel::Receiver<ClobEventEnvelope>,
+    next_sequence: Arc<AtomicU64>,
+    critical_overflows: Arc<AtomicU64>,
+    replaceable_evictions: Arc<AtomicU64>,
+}
+
+struct ClobEventEnvelope {
+    sequence: u64,
+    event: MarketEvent,
+}
+
+struct ClobEventReceiver {
+    critical_rx: crossbeam_channel::Receiver<ClobEventEnvelope>,
+    replaceable_rx: crossbeam_channel::Receiver<ClobEventEnvelope>,
+    pending_critical: Option<ClobEventEnvelope>,
+    pending_replaceable: Option<ClobEventEnvelope>,
+}
+
+fn clob_event_lanes() -> (ClobEventSender, ClobEventReceiver) {
+    let (critical_tx, critical_rx) = crossbeam_channel::bounded(CLOB_CRITICAL_EVENT_CAPACITY);
+    let (replaceable_tx, replaceable_rx) =
+        crossbeam_channel::bounded(CLOB_REPLACEABLE_EVENT_CAPACITY);
+    (
+        ClobEventSender {
+            critical_tx,
+            replaceable_tx,
+            replaceable_evict_rx: replaceable_rx.clone(),
+            next_sequence: Arc::new(AtomicU64::new(0)),
+            critical_overflows: Arc::new(AtomicU64::new(0)),
+            replaceable_evictions: Arc::new(AtomicU64::new(0)),
+        },
+        ClobEventReceiver {
+            critical_rx,
+            replaceable_rx,
+            pending_critical: None,
+            pending_replaceable: None,
+        },
+    )
+}
+
+impl ClobEventSender {
+    #[inline]
+    fn is_replaceable(event: &MarketEvent) -> bool {
+        matches!(event, MarketEvent::OrderBook(_) | MarketEvent::Quote(_))
+    }
+
+    /// Returns false only when the consumer is gone or the lossless lane
+    /// cannot make progress within its explicit backpressure budget. The CLOB
+    /// task then reconnects and re-seeds books instead of silently losing an
+    /// ordered event.
+    fn send(&self, event: MarketEvent) -> bool {
+        let replaceable = Self::is_replaceable(&event);
+        let event = ClobEventEnvelope {
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            event,
+        };
+        if !replaceable {
+            return match self
+                .critical_tx
+                .send_timeout(event, CLOB_CRITICAL_SEND_TIMEOUT)
+            {
+                Ok(()) => true,
+                Err(_) => {
+                    self.critical_overflows.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            };
+        }
+
+        match self.replaceable_tx.try_send(event) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+            Err(crossbeam_channel::TrySendError::Full(event)) => {
+                // There is one CLOB producer. A cloned receiver is retained
+                // solely to implement bounded latest-value overflow.
+                if self.replaceable_evict_rx.try_recv().is_ok() {
+                    self.replaceable_evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                self.replaceable_tx.try_send(event).is_ok()
+            }
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.critical_tx.len() + self.replaceable_tx.len()
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.critical_tx.is_full() || self.replaceable_tx.is_full()
+    }
+
+    #[inline]
+    fn overflow_totals(&self) -> (u64, u64) {
+        (
+            self.critical_overflows.load(Ordering::Relaxed),
+            self.replaceable_evictions.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl ClobEventReceiver {
+    fn fill_pending(&mut self) {
+        if self.pending_critical.is_none() {
+            self.pending_critical = self.critical_rx.try_recv().ok();
+        }
+        if self.pending_replaceable.is_none() {
+            self.pending_replaceable = self.replaceable_rx.try_recv().ok();
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<MarketEvent> {
+        match (&self.pending_critical, &self.pending_replaceable) {
+            (Some(critical), Some(replaceable)) if critical.sequence <= replaceable.sequence => {
+                self.pending_critical.take().map(|envelope| envelope.event)
+            }
+            (Some(_), Some(_)) => self
+                .pending_replaceable
+                .take()
+                .map(|envelope| envelope.event),
+            (Some(_), None) => self.pending_critical.take().map(|envelope| envelope.event),
+            (None, Some(_)) => self
+                .pending_replaceable
+                .take()
+                .map(|envelope| envelope.event),
+            (None, None) => None,
+        }
+    }
+
+    fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<MarketEvent, crossbeam_channel::RecvTimeoutError> {
+        self.fill_pending();
+        if let Some(event) = self.pop_next() {
+            return Ok(event);
+        }
+        crossbeam_channel::select_biased! {
+            recv(self.critical_rx) -> event => {
+                self.pending_critical = Some(event.map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)?);
+            },
+            recv(self.replaceable_rx) -> event => {
+                self.pending_replaceable = Some(event.map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)?);
+            },
+            default(timeout) => return Err(crossbeam_channel::RecvTimeoutError::Timeout),
+        }
+        self.fill_pending();
+        self.pop_next()
+            .ok_or(crossbeam_channel::RecvTimeoutError::Timeout)
+    }
+}
+
 pub struct PolymarketMarket {
     series: Vec<SeriesState>,
     /// Maps CLOB token_id → index into `series`, so we can tag events with the series symbol.
     token_to_series: HashMap<String, usize>,
     pending_events: VecDeque<MarketEvent>,
     /// Events parsed by the async WS task land here; `next_event()` drains.
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<ClobEventReceiver>,
     /// Control channel to the async WS task (Resubscribe / Shutdown).
     ws_ctrl_tx: Option<tokio::sync::mpsc::UnboundedSender<WsCtrl>>,
     /// Shared shutdown flag — shared between the main CLOB task and RTDS task.
@@ -2675,12 +2842,14 @@ impl ClobBurstMetrics {
         lane_role: &'static str,
         lane_id: u64,
         subscription_tokens: usize,
-        event_queue_depth: usize,
+        event_queue: &ClobEventSender,
         diagnostics: &ClobWindowMetrics,
     ) {
         self.finish_window(now);
+        let event_queue_depth = event_queue.len();
+        let (critical_overflows, replaceable_evictions) = event_queue.overflow_totals();
         info!(
-            "[clob_1s_metric] lane_role={} lane_id={} peer={:?} subscription_tokens={} window_ms={} frames={} frame_bytes={} max_frame_bytes={} peak_100ms_frames={} peak_100ms_frame_bytes={} peak_100ms_max_frame_bytes={} kernel_unread_latest={} kernel_unread_max={} kernel_unread_samples={} kernel_unread_errors={} socket_probe_max_us={} socket_poll_calls={} socket_poll_gap_samples={} socket_poll_gap_max_us={} socket_poll_gap_over_20ms={} decoded_frame_queue_mode=inline decoded_frame_queue_depth=0 decoded_frame_queue_capacity=0 event_queue_mode=unbounded event_queue_depth={} event_queue_high_water_30s={} parse_apply_max_us_30s={} read_handler_max_us_30s={} forward_max_us_30s={} event_send_max_us_30s={} event_send_over_1ms_30s={} loop_scheduler_max_us_30s={} runtime_scheduler_max_us_30s={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
+            "[clob_1s_metric] lane_role={} lane_id={} peer={:?} subscription_tokens={} window_ms={} frames={} frame_bytes={} max_frame_bytes={} peak_100ms_frames={} peak_100ms_frame_bytes={} peak_100ms_max_frame_bytes={} kernel_unread_latest={} kernel_unread_max={} kernel_unread_samples={} kernel_unread_errors={} socket_probe_max_us={} socket_poll_calls={} socket_poll_gap_samples={} socket_poll_gap_max_us={} socket_poll_gap_over_20ms={} decoded_frame_queue_mode=inline decoded_frame_queue_depth=0 decoded_frame_queue_capacity=0 event_queue_mode=bounded_tiered event_queue_critical_capacity={} event_queue_replaceable_capacity={} event_queue_depth={} event_queue_high_water_30s={} event_queue_critical_overflows_total={} event_queue_replaceable_evictions_total={} parse_apply_max_us_30s={} read_handler_max_us_30s={} forward_max_us_30s={} event_send_max_us_30s={} event_send_over_1ms_30s={} loop_scheduler_max_us_30s={} runtime_scheduler_max_us_30s={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
             lane_role,
             lane_id,
             peer_addr,
@@ -2705,8 +2874,12 @@ impl ClobBurstMetrics {
             self.socket_poll.poll_gap_samples,
             self.socket_poll.poll_gap_max_us,
             self.socket_poll.poll_gap_over_20ms,
+            CLOB_CRITICAL_EVENT_CAPACITY,
+            CLOB_REPLACEABLE_EVENT_CAPACITY,
             event_queue_depth,
             diagnostics.max_event_queue_depth,
+            critical_overflows,
+            replaceable_evictions,
             diagnostics.parse_apply_max_us,
             diagnostics.read_handler_max_us,
             diagnostics.forward_max_us,
@@ -3125,7 +3298,7 @@ fn clob_subscription_message(tokens: &[String]) -> serde_json::Value {
 }
 
 fn announce_clob_not_ready(
-    event_tx: &crossbeam_channel::Sender<MarketEvent>,
+    event_tx: &ClobEventSender,
     lifecycle: &mut ClobLifecycle,
     reason: impl Into<String>,
 ) {
@@ -3140,7 +3313,7 @@ fn announce_clob_not_ready(
 
 fn forward_clob_events(
     events: Vec<MarketEvent>,
-    event_tx: &crossbeam_channel::Sender<MarketEvent>,
+    event_tx: &ClobEventSender,
     lifecycle: &mut ClobLifecycle,
     health: &mut WsHealth,
     diagnostics: &mut ClobWindowMetrics,
@@ -3161,7 +3334,7 @@ fn forward_clob_events(
         let send_started = Instant::now();
         let send_result = event_tx.send(event);
         diagnostics.record_event_send(send_started.elapsed(), was_full);
-        if send_result.is_err() {
+        if !send_result {
             let elapsed = forward_started.elapsed();
             diagnostics.record_forward(elapsed, forwarded);
             crate::latency::record_ns(
@@ -3195,7 +3368,7 @@ fn forward_clob_events(
                 exchange: Exchange::Polymarket,
             });
             diagnostics.record_event_send(send_started.elapsed(), was_full);
-            if send_result.is_err() {
+            if !send_result {
                 let elapsed = forward_started.elapsed();
                 diagnostics.record_forward(elapsed, forwarded);
                 crate::latency::record_ns(
@@ -3490,7 +3663,7 @@ fn promote_clob_standby(
 
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: ClobEventSender,
     mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
     subscribed_once: Arc<AtomicBool>,
@@ -4086,7 +4259,7 @@ async fn clob_ws_task(
                         "active",
                         active.lane_id,
                         subscription.tokens.len(),
-                        event_tx.len(),
+                        &event_tx,
                         &active.diagnostics,
                     );
                     if let Some(lane) = standby.as_mut() {
@@ -4098,7 +4271,7 @@ async fn clob_ws_task(
                             "standby",
                             lane.lane_id,
                             subscription.tokens.len(),
-                            event_tx.len(),
+                            &event_tx,
                             &lane.diagnostics,
                         );
                     }
@@ -6677,7 +6850,7 @@ impl ExchangeMarket for PolymarketMarket {
         // (resubscribe / shutdown) via a tokio mpsc.
         let clob_subscription = self.current_clob_subscription();
         let clob_token_count = clob_subscription.tokens.len();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = clob_event_lanes();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<WsCtrl>();
         self.event_rx = Some(event_rx);
         self.ws_ctrl_tx = Some(ctrl_tx);
@@ -6928,7 +7101,7 @@ impl ExchangeMarket for PolymarketMarket {
         // is wake-driven (the sender unparks us immediately) and avoids the
         // old 100 µs SCHED_FIFO polling loop burning this shared CLOB core.
         // The timeout keeps rotation/readiness watchdogs responsive.
-        if let Some(rx) = &self.event_rx {
+        if let Some(rx) = &mut self.event_rx {
             match rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(mut event) => {
                     self.map_event_symbol(&mut event);
@@ -6967,6 +7140,144 @@ impl ExchangeMarket for PolymarketMarket {
     /// those windows.
     fn has_active_subscription(&self) -> bool {
         self.series.iter().any(|s| !s.market.symbols.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod clob_event_lane_tests {
+    use super::*;
+
+    fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
+        samples.sort_unstable();
+        let percentile = |per_mille: usize| {
+            let rank = (samples.len() * per_mille).div_ceil(1000).max(1);
+            samples[rank.saturating_sub(1).min(samples.len() - 1)]
+        };
+        (
+            percentile(500),
+            percentile(990),
+            percentile(999),
+            *samples.last().unwrap(),
+        )
+    }
+
+    fn quote(sequence: u64) -> MarketEvent {
+        MarketEvent::Quote(QuoteTick {
+            exchange: Exchange::Polymarket,
+            symbol: "token".to_string(),
+            bid_price: 0.4,
+            bid_qty: 0.0,
+            ask_price: 0.6,
+            ask_qty: 0.0,
+            exchange_timestamp_ns: sequence,
+            local_timestamp_ns: sequence,
+        })
+    }
+
+    #[test]
+    fn replaceable_lane_is_bounded_and_keeps_the_newest_snapshot() {
+        let (tx, mut rx) = clob_event_lanes();
+        for sequence in 0..(CLOB_REPLACEABLE_EVENT_CAPACITY as u64 + 17) {
+            assert!(tx.send(quote(sequence)));
+        }
+        assert_eq!(tx.replaceable_tx.len(), CLOB_REPLACEABLE_EVENT_CAPACITY);
+        assert_eq!(tx.overflow_totals(), (0, 17));
+
+        let mut newest = 0;
+        for _ in 0..CLOB_REPLACEABLE_EVENT_CAPACITY {
+            let MarketEvent::Quote(quote) = rx.recv_timeout(Duration::ZERO).unwrap() else {
+                panic!("replaceable lane returned a non-quote event");
+            };
+            newest = newest.max(quote.local_timestamp_ns);
+        }
+        assert_eq!(
+            newest,
+            CLOB_REPLACEABLE_EVENT_CAPACITY as u64 + 16,
+            "the most recent snapshot must survive overflow",
+        );
+    }
+
+    #[test]
+    fn tiered_lanes_preserve_cross_lane_event_order() {
+        let (tx, mut rx) = clob_event_lanes();
+        assert!(tx.send(quote(1)));
+        assert!(tx.send(MarketEvent::Disconnected {
+            exchange: Exchange::Polymarket,
+            reason: "test".to_string(),
+        }));
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO).unwrap(),
+            MarketEvent::Quote(_)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO).unwrap(),
+            MarketEvent::Disconnected { .. }
+        ));
+    }
+
+    #[test]
+    fn critical_lane_is_bounded_and_fails_closed_on_overflow() {
+        let (tx, _rx) = clob_event_lanes();
+        for _ in 0..CLOB_CRITICAL_EVENT_CAPACITY {
+            assert!(tx.send(MarketEvent::Connected {
+                exchange: Exchange::Polymarket,
+            }));
+        }
+        assert!(!tx.send(MarketEvent::Connected {
+            exchange: Exchange::Polymarket,
+        }));
+        assert_eq!(tx.overflow_totals().0, 1);
+    }
+
+    #[test]
+    #[ignore = "focused bounded CLOB bridge latency benchmark"]
+    fn benchmark_tiered_lane_send_receive() {
+        const EVENTS_PER_LANE: usize = 50_000;
+        let (tx, mut rx) = clob_event_lanes();
+        let mut critical = Vec::with_capacity(EVENTS_PER_LANE);
+        let mut replaceable = Vec::with_capacity(EVENTS_PER_LANE);
+        let mut peak_depth = 0usize;
+
+        for sequence in 0..EVENTS_PER_LANE as u64 {
+            let started = Instant::now();
+            assert!(tx.send(MarketEvent::Connected {
+                exchange: Exchange::Polymarket,
+            }));
+            peak_depth = peak_depth.max(tx.len());
+            assert!(matches!(
+                rx.recv_timeout(Duration::ZERO).unwrap(),
+                MarketEvent::Connected { .. }
+            ));
+            critical.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+
+            let started = Instant::now();
+            assert!(tx.send(quote(sequence)));
+            peak_depth = peak_depth.max(tx.len());
+            assert!(matches!(
+                rx.recv_timeout(Duration::ZERO).unwrap(),
+                MarketEvent::Quote(_)
+            ));
+            replaceable.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+
+        let critical = latency_summary_ns(&mut critical);
+        let replaceable = latency_summary_ns(&mut replaceable);
+        let overflows = tx.overflow_totals();
+        eprintln!(
+            "bounded CLOB bridge boundary (sender enqueue + tier merge dequeue, events_per_lane={EVENTS_PER_LANE}, peak_depth={peak_depth}, critical_overflow={}, replaceable_eviction={}) ns: critical median/p99/p999/max={}/{}/{}/{} replaceable={}/{}/{}/{}",
+            overflows.0,
+            overflows.1,
+            critical.0,
+            critical.1,
+            critical.2,
+            critical.3,
+            replaceable.0,
+            replaceable.1,
+            replaceable.2,
+            replaceable.3,
+        );
+        assert_eq!(overflows, (0, 0));
+        assert_eq!(peak_depth, 1);
     }
 }
 
