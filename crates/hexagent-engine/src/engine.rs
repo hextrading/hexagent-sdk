@@ -1549,10 +1549,76 @@ struct LatestMarketKey {
     symbol: SymbolId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatestMarketKeyHandle {
+    id: u16,
+    generation: u32,
+}
+
+/// Router-thread-owned fixed-capacity key registry. IDs are allocated from a
+/// startup-preallocated free-list and returned only after every per-instance
+/// slot for the retiring generation has been invalidated. Hash-map mutation is
+/// confined to the single strategy-router writer; worker threads only consume
+/// immutable `(id, generation)` markers through their bounded market lanes.
+#[derive(Debug)]
+struct LatestMarketKeyRegistry {
+    key_to_handle: HashMap<LatestMarketKey, LatestMarketKeyHandle>,
+    free_ids: Vec<u16>,
+    generations: [u32; MAX_LATEST_MARKET_KEYS],
+    capacity_fallbacks: u64,
+}
+
+impl Default for LatestMarketKeyRegistry {
+    fn default() -> Self {
+        let mut free_ids = Vec::with_capacity(MAX_LATEST_MARKET_KEYS);
+        free_ids.extend((0..MAX_LATEST_MARKET_KEYS as u16).rev());
+        Self {
+            key_to_handle: HashMap::with_capacity(MAX_LATEST_MARKET_KEYS),
+            free_ids,
+            generations: [0; MAX_LATEST_MARKET_KEYS],
+            capacity_fallbacks: 0,
+        }
+    }
+}
+
+impl LatestMarketKeyRegistry {
+    fn get_or_register(&mut self, key: LatestMarketKey) -> Option<LatestMarketKeyHandle> {
+        if let Some(handle) = self.key_to_handle.get(&key) {
+            return Some(*handle);
+        }
+        let Some(id) = self.free_ids.pop() else {
+            // Correctness-preserving overflow policy: route the event directly
+            // through the bounded lane instead of panicking or aliasing an
+            // active key. The periodic router metric reports this condition.
+            self.capacity_fallbacks = self.capacity_fallbacks.saturating_add(1);
+            return None;
+        };
+        let generation = self.generations[id as usize].wrapping_add(1).max(1);
+        self.generations[id as usize] = generation;
+        let handle = LatestMarketKeyHandle { id, generation };
+        self.key_to_handle.insert(key, handle);
+        Some(handle)
+    }
+
+    fn remove(&mut self, key: &LatestMarketKey) -> Option<LatestMarketKeyHandle> {
+        self.key_to_handle.remove(key)
+    }
+
+    fn release(&mut self, handle: LatestMarketKeyHandle) {
+        debug_assert!(!self.free_ids.contains(&handle.id));
+        self.free_ids.push(handle.id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.key_to_handle.len()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum QueuedMarketEvent {
     Direct(QueuedMarketPayload),
-    Latest(u16),
+    Latest { slot_id: u16, tag: u64 },
 }
 
 const MAX_LATEST_MARKET_KEYS: usize = 128;
@@ -1566,7 +1632,10 @@ const LATEST_CONSUMING: u8 = 3;
 #[derive(Debug)]
 struct LatestMarketSlot {
     state: std::sync::atomic::AtomicU8,
-    epoch: AtomicU64,
+    /// `(key generation << 32) | barrier epoch`. Packing both identities into
+    /// the pre-existing word keeps every slot cache-compact while making an
+    /// old queued marker distinguishable after ID/physical-slot reuse.
+    tag: AtomicU64,
     enqueued_ns: AtomicU64,
     event: std::sync::atomic::AtomicPtr<MarketEvent>,
 }
@@ -1575,7 +1644,7 @@ impl Default for LatestMarketSlot {
     fn default() -> Self {
         Self {
             state: std::sync::atomic::AtomicU8::new(LATEST_IDLE),
-            epoch: AtomicU64::new(0),
+            tag: AtomicU64::new(0),
             enqueued_ns: AtomicU64::new(0),
             event: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -1589,7 +1658,12 @@ enum LatestPublish {
 }
 
 impl LatestMarketSlot {
-    fn publish(&self, event: Arc<MarketEvent>, epoch: u64, enqueued_ns: u64) -> LatestPublish {
+    fn publish(
+        &self,
+        event: Arc<MarketEvent>,
+        tag: u64,
+        enqueued_ns: u64,
+    ) -> LatestPublish {
         loop {
             let state = self.state.load(Ordering::Acquire);
             match state {
@@ -1606,7 +1680,7 @@ impl LatestMarketSlot {
                     {
                         continue;
                     }
-                    self.epoch.store(epoch, Ordering::Relaxed);
+                    self.tag.store(tag, Ordering::Relaxed);
                     self.enqueued_ns.store(enqueued_ns, Ordering::Relaxed);
                     let raw = Arc::into_raw(event).cast_mut();
                     // The pointer publication is a production side effect; do
@@ -1618,7 +1692,7 @@ impl LatestMarketSlot {
                     return LatestPublish::MarkerRequired;
                 }
                 LATEST_PENDING => {
-                    if self.epoch.load(Ordering::Acquire) != epoch {
+                    if self.tag.load(Ordering::Relaxed) != tag {
                         return LatestPublish::Direct(event);
                     }
                     if self
@@ -1651,7 +1725,7 @@ impl LatestMarketSlot {
         }
     }
 
-    fn take(&self) -> Option<QueuedMarketPayload> {
+    fn take(&self, expected_tag: u64) -> Option<QueuedMarketPayload> {
         loop {
             match self.state.compare_exchange(
                 LATEST_PENDING,
@@ -1663,6 +1737,15 @@ impl LatestMarketSlot {
                 Err(LATEST_WRITING) => std::hint::spin_loop(),
                 Err(_) => return None,
             }
+        }
+        // Acquiring PENDING synchronizes with the producer's Release store, so
+        // the immutable tag can be read Relaxed after the CAS.
+        if self.tag.load(Ordering::Relaxed) != expected_tag {
+            // The state made an IDLE→PENDING ABA transition while this stale
+            // marker was waiting. Restore the new generation's pending state;
+            // its own marker remains queued behind this one.
+            self.state.store(LATEST_PENDING, Ordering::Release);
+            return None;
         }
         let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
         let enqueued_ns = self.enqueued_ns.load(Ordering::Relaxed);
@@ -1678,7 +1761,7 @@ impl LatestMarketSlot {
         })
     }
 
-    fn discard_if_pending(&self) {
+    fn discard_if_pending(&self, expected_tag: u64) {
         if self
             .state
             .compare_exchange(
@@ -1691,11 +1774,41 @@ impl LatestMarketSlot {
         {
             return;
         }
+        if self.tag.load(Ordering::Relaxed) != expected_tag {
+            self.state.store(LATEST_PENDING, Ordering::Release);
+            return;
+        }
         let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
         self.state.store(LATEST_IDLE, Ordering::Release);
         if !event.is_null() {
             // SAFETY: same ownership transfer as `take`, discarded on failed
             // marker admission.
+            unsafe { drop(Arc::from_raw(event)) };
+        }
+    }
+
+    fn discard_generation_if_pending(&self, expected_generation: u32) {
+        if self
+            .state
+            .compare_exchange(
+                LATEST_PENDING,
+                LATEST_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        if latest_slot_generation(self.tag.load(Ordering::Relaxed)) != expected_generation {
+            self.state.store(LATEST_PENDING, Ordering::Release);
+            return;
+        }
+        let event = self.event.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        self.state.store(LATEST_IDLE, Ordering::Release);
+        if !event.is_null() {
+            // SAFETY: same ownership transfer as `take`, discarded at an
+            // ordered lifecycle retirement boundary.
             unsafe { drop(Arc::from_raw(event)) };
         }
     }
@@ -1754,14 +1867,28 @@ fn latest_market_key(event: &MarketEvent) -> Option<LatestMarketKey> {
     }
 }
 
+#[inline]
+fn latest_slot_tag(generation: u32, epoch: u64) -> u64 {
+    // A queued marker is bounded by the lane capacity and the 5s worker-stall
+    // watchdog, so it cannot survive the 2^32 barrier-epoch wrap needed to
+    // alias this packed tag. A generation wraps only after 2^32 retirements of
+    // the same ID.
+    ((generation as u64) << 32) | epoch as u32 as u64
+}
+
+#[inline]
+fn latest_slot_generation(tag: u64) -> u32 {
+    (tag >> 32) as u32
+}
+
 fn enqueue_market_event(
     lane: &MarketEventLane,
     event: Arc<MarketEvent>,
-    latest_key_id: Option<u16>,
+    latest_key: Option<LatestMarketKeyHandle>,
 ) -> bool {
     let enqueued_ns = market_queue_monotonic_ns();
     let epoch = lane.barrier_epoch.load(Ordering::Relaxed);
-    let Some(key_id) = latest_key_id else {
+    let Some(key) = latest_key else {
         lane.barrier_epoch.fetch_add(1, Ordering::Relaxed);
         return lane
             .tx
@@ -1771,7 +1898,8 @@ fn enqueue_market_event(
             }))
             .is_ok();
     };
-    let slot_id = key_id as usize * LATEST_EPOCH_SLOTS + (epoch as usize % LATEST_EPOCH_SLOTS);
+    let slot_id = key.id as usize * LATEST_EPOCH_SLOTS + (epoch as usize % LATEST_EPOCH_SLOTS);
+    let tag = latest_slot_tag(key.generation, epoch);
     let Some(slot) = lane.latest.slots.get(slot_id) else {
         return lane
             .tx
@@ -1781,7 +1909,7 @@ fn enqueue_market_event(
             }))
             .is_ok();
     };
-    match slot.publish(event, epoch, enqueued_ns) {
+    match slot.publish(event, tag, enqueued_ns) {
         LatestPublish::Replaced => {
             lane.latest.replacements.fetch_add(1, Ordering::Relaxed);
             true
@@ -1789,12 +1917,15 @@ fn enqueue_market_event(
         LatestPublish::MarkerRequired => {
             if lane
                 .tx
-                .try_send(QueuedMarketEvent::Latest(slot_id as u16))
+                .try_send(QueuedMarketEvent::Latest {
+                    slot_id: slot_id as u16,
+                    tag,
+                })
                 .is_ok()
             {
                 true
             } else {
-                slot.discard_if_pending();
+                slot.discard_if_pending(tag);
                 false
             }
         }
@@ -1814,7 +1945,23 @@ fn resolve_market_event(
 ) -> Option<QueuedMarketPayload> {
     match queued {
         QueuedMarketEvent::Direct(payload) => Some(payload),
-        QueuedMarketEvent::Latest(slot_id) => latest.slots.get(slot_id as usize)?.take(),
+        QueuedMarketEvent::Latest { slot_id, tag } => {
+            latest.slots.get(slot_id as usize)?.take(tag)
+        }
+    }
+}
+
+fn retire_latest_market_key(
+    handle: LatestMarketKeyHandle,
+    market_lanes: &[MarketEventLane],
+) {
+    let slot_base = handle.id as usize * LATEST_EPOCH_SLOTS;
+    for lane in market_lanes {
+        for offset in 0..LATEST_EPOCH_SLOTS {
+            if let Some(slot) = lane.latest.slots.get(slot_base + offset) {
+                slot.discard_generation_if_pending(handle.generation);
+            }
+        }
     }
 }
 
@@ -2050,6 +2197,7 @@ fn market_event_metric_kind(event: &MarketEvent) -> &'static str {
         MarketEvent::MarketDataHealth(_) => "market_health",
         MarketEvent::TickSizeChange(_) => "tick_size",
         MarketEvent::EventStart { .. } => "event_start",
+        MarketEvent::EventEnd { .. } => "event_end",
         MarketEvent::Exit => "exit",
     }
 }
@@ -5921,7 +6069,9 @@ impl Engine {
                             MarketEvent::TickSizeChange(tsc) => {
                                 let _ = strategy.on_tick_size_change(tsc);
                             }
-                            MarketEvent::EventStart { .. } | MarketEvent::Exit => {}
+                            MarketEvent::EventStart { .. }
+                            | MarketEvent::EventEnd { .. }
+                            | MarketEvent::Exit => {}
                         }
                     }
                     drained += 1;
@@ -6115,7 +6265,9 @@ impl Engine {
                             MarketEvent::TickSizeChange(tsc) => {
                                 let _ = strategy.on_tick_size_change(tsc);
                             }
-                            MarketEvent::EventStart { .. } | MarketEvent::Exit => {}
+                            MarketEvent::EventStart { .. }
+                            | MarketEvent::EventEnd { .. }
+                            | MarketEvent::Exit => {}
                         }
                     }
                     drained += 1;
@@ -6278,7 +6430,9 @@ impl Engine {
                                             MarketEvent::Disconnected { exchange, reason } => { strategy.on_disconnected(*exchange, reason); Vec::new() }
                                             MarketEvent::MarketDataHealth(health) => strategy.on_market_data_health(health),
                                             MarketEvent::TickSizeChange(tsc) => { strategy.on_tick_size_change(tsc) }
-                                            MarketEvent::EventStart { .. } | MarketEvent::Exit => Vec::new(),
+                                            MarketEvent::EventStart { .. }
+                                            | MarketEvent::EventEnd { .. }
+                                            | MarketEvent::Exit => Vec::new(),
                                         };
                                         // OrderBook events are the sole driver of the
                                         // quote cadence. Optionally restricted to
@@ -6472,10 +6626,10 @@ impl Engine {
                 // Learned Polymarket token_id → instances (from Instrument).
                 let mut token_to_instances: HashMap<SymbolId, RouteMask> =
                     HashMap::with_capacity(64);
-                let mut latest_key_ids: HashMap<LatestMarketKey, u16> =
-                    HashMap::with_capacity(MAX_LATEST_MARKET_KEYS);
+                let mut latest_key_ids = LatestMarketKeyRegistry::default();
                 let mut market_overflow_drops = vec![0u64; instance_ids.len()];
                 let mut market_overflow_log_at = std::time::Instant::now();
+                let mut latest_capacity_fallbacks_reported = 0u64;
                 let mut last_emergency_cancel_attempt_ns = vec![0u64; instance_ids.len()];
                 let supervisor_tick = crossbeam_channel::tick(std::time::Duration::from_millis(100));
                 // instance_id → numeric worker owner. Coids are minted as
@@ -6640,6 +6794,18 @@ impl Engine {
                             }
                         },
                         recv(supervisor_tick) -> _ => {
+                            if latest_key_ids.capacity_fallbacks
+                                != latest_capacity_fallbacks_reported
+                            {
+                                warn!(
+                                    "[market_queue_metric] latest_key_capacity_fallbacks={} active_keys={} capacity={}",
+                                    latest_key_ids.capacity_fallbacks,
+                                    latest_key_ids.key_to_handle.len(),
+                                    MAX_LATEST_MARKET_KEYS,
+                                );
+                                latest_capacity_fallbacks_reported =
+                                    latest_key_ids.capacity_fallbacks;
+                            }
                             let now = elapsed_ns(&supervisor_origin);
                             for idx in 0..worker_heartbeats.len() {
                                 if worker_quarantined[idx].load(Ordering::Acquire) {
@@ -6770,22 +6936,53 @@ impl Engine {
         event: Arc<MarketEvent>,
         sym_to_instances: &HashMap<SymbolId, RouteMask>,
         token_to_instances: &mut HashMap<SymbolId, RouteMask>,
-        latest_key_ids: &mut HashMap<LatestMarketKey, u16>,
+        latest_key_ids: &mut LatestMarketKeyRegistry,
         market_lanes: &[MarketEventLane],
     ) -> RouteMask {
-        let send_to = |mut mask: RouteMask, latest_key_id: Option<u16>| {
+        let send_to = |mut mask: RouteMask, latest_key: Option<LatestMarketKeyHandle>| {
             let mut dropped = 0u64;
             while mask != 0 {
                 let i = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
                 if let Some(lane) = market_lanes.get(i) {
-                    if !enqueue_market_event(lane, Arc::clone(&event), latest_key_id) {
+                    if !enqueue_market_event(lane, Arc::clone(&event), latest_key) {
                         dropped |= 1u64 << i;
                     }
                 }
             }
             dropped
         };
+
+        // EventEnd is an ordered router-control message. The router is the
+        // sole writer of both maps and the free-list. Retire every dynamic
+        // Polymarket token before the following EventStart/new books, discard
+        // pending payloads for the old generation, then make the IDs reusable.
+        if let MarketEvent::EventEnd {
+            exchange: Exchange::Polymarket,
+            retired_symbols,
+            ..
+        } = event.as_ref()
+        {
+            for lane in market_lanes {
+                lane.barrier_epoch.fetch_add(1, Ordering::Relaxed);
+            }
+            for symbol in retired_symbols {
+                let symbol_id = SymbolId::of(symbol);
+                token_to_instances.remove(&symbol_id);
+                for kind in [0, 1] {
+                    let key = LatestMarketKey {
+                        kind,
+                        exchange: Exchange::Polymarket,
+                        symbol: symbol_id,
+                    };
+                    if let Some(handle) = latest_key_ids.remove(&key) {
+                        retire_latest_market_key(handle, market_lanes);
+                        latest_key_ids.release(handle);
+                    }
+                }
+            }
+            return 0;
+        }
 
         // Instrument(BinaryOption) → attribute its token_ids to the owner
         // instance(s) of its slug, then deliver to those owners.
@@ -6856,6 +7053,7 @@ impl Engine {
             MarketEvent::EventStart { symbol, .. } => {
                 sym_to_instances.get(&SymbolId::of(symbol)).copied()
             }
+            MarketEvent::EventEnd { .. } => None,
             MarketEvent::Exit => Some(0),
         };
         let targets = match targets {
@@ -6868,20 +7066,9 @@ impl Engine {
         };
         // Register coverable keys only after routing resolved at least one
         // owner. Unknown dynamic token traffic must not consume fixed slots.
-        let latest_key_id = latest_market_key(event.as_ref()).map(|key| {
-            if let Some(id) = latest_key_ids.get(&key) {
-                return *id;
-            }
-            let id = latest_key_ids.len();
-            assert!(
-                id < MAX_LATEST_MARKET_KEYS,
-                "latest-market key capacity exhausted ({MAX_LATEST_MARKET_KEYS})"
-            );
-            let id = id as u16;
-            latest_key_ids.insert(key, id);
-            id
-        });
-        send_to(targets, latest_key_id)
+        let latest_key = latest_market_key(event.as_ref())
+            .and_then(|key| latest_key_ids.get_or_register(key));
+        send_to(targets, latest_key)
     }
 
     /// Per-instance worker loop (live/paper). Runs ONE
@@ -7143,7 +7330,9 @@ impl Engine {
                             MarketEvent::Disconnected { exchange, reason } => { strategy.on_disconnected(*exchange, reason); Vec::new() }
                             MarketEvent::MarketDataHealth(health) => strategy.on_market_data_health(health),
                             MarketEvent::TickSizeChange(tsc) => strategy.on_tick_size_change(tsc),
-                            MarketEvent::EventStart { .. } | MarketEvent::Exit => Vec::new(),
+                            MarketEvent::EventStart { .. }
+                            | MarketEvent::EventEnd { .. }
+                            | MarketEvent::Exit => Vec::new(),
                         };
                         if let MarketEvent::OrderBook(ob) = event.as_ref() {
                             let venue_ok = !strategy.quote_trigger_binance_ob_only()
@@ -11946,6 +12135,16 @@ mod market_router_tests {
         })
     }
 
+    fn event_end(event_id: &str, tokens: &[&str]) -> MarketEvent {
+        MarketEvent::EventEnd {
+            exchange: Exchange::Polymarket,
+            symbol: "series:btc-up-or-down-5m".into(),
+            event_id: event_id.into(),
+            retired_symbols: tokens.iter().map(|token| (*token).to_string()).collect(),
+            event_end_ns: 1,
+        }
+    }
+
     /// Drain a receiver into a count (non-blocking).
     fn drain(rx: &Receiver<QueuedMarketEvent>) -> usize {
         let mut n = 0;
@@ -12026,8 +12225,12 @@ mod market_router_tests {
         let (lane, rx) = test_market_lane(8);
         let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
         let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
-        assert!(enqueue_market_event(&lane, first, Some(0)));
-        assert!(enqueue_market_event(&lane, Arc::clone(&second), Some(0)));
+        let key = Some(LatestMarketKeyHandle {
+            id: 0,
+            generation: 1,
+        });
+        assert!(enqueue_market_event(&lane, first, key));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second), key));
         assert_eq!(rx.len(), 1, "one latest-only marker per venue/symbol/kind");
         let payload = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&payload.event, &second));
@@ -12039,7 +12242,11 @@ mod market_router_tests {
         let (lane, rx) = test_market_lane(8);
         let first = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
         let second = Arc::new(ob(Exchange::Binance, "BTCUSDT"));
-        assert!(enqueue_market_event(&lane, Arc::clone(&first), Some(0)));
+        let key = Some(LatestMarketKeyHandle {
+            id: 0,
+            generation: 1,
+        });
+        assert!(enqueue_market_event(&lane, Arc::clone(&first), key));
         assert!(enqueue_market_event(
             &lane,
             Arc::new(MarketEvent::Connected {
@@ -12047,7 +12254,7 @@ mod market_router_tests {
             }),
             None,
         ));
-        assert!(enqueue_market_event(&lane, Arc::clone(&second), Some(0)));
+        assert!(enqueue_market_event(&lane, Arc::clone(&second), key));
         assert_eq!(rx.len(), 3);
 
         let before_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
@@ -12172,7 +12379,7 @@ mod market_router_tests {
         let (lane, routed_rx) = test_market_lane(CHANNEL_CAPACITY);
         let sym_to_instances = HashMap::from([(SymbolId::of("BTCUSDT"), 1)]);
         let mut token_to_instances = HashMap::new();
-        let mut latest_key_ids = HashMap::new();
+        let mut latest_key_ids = LatestMarketKeyRegistry::default();
         let mut routed_samples = Vec::with_capacity(EVENTS);
         let mut routed_peak_depth = 0usize;
         let mut routed_overflow = 0u64;
@@ -12267,7 +12474,7 @@ mod market_router_tests {
     fn spot_and_binance_ob_route_to_owning_instance_only() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -12299,7 +12506,7 @@ mod market_router_tests {
     fn full_market_queue_drops_only_that_instance_without_blocking_router() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, _rx0) = test_market_lane(1);
         let (lane1, rx1) = test_market_lane(1);
         let txs = [lane0, lane1];
@@ -12342,7 +12549,7 @@ mod market_router_tests {
     fn polymarket_token_learned_from_instrument_then_routed() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -12396,10 +12603,186 @@ mod market_router_tests {
     }
 
     #[test]
+    fn retired_latest_slot_id_does_not_alias_a_queued_old_marker() {
+        let sym = two_instance_map();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
+        let (lane, rx) = test_market_lane(64);
+        let lanes = [lane];
+
+        let route_instrument = |token: &str,
+                                tok: &mut HashMap<SymbolId, RouteMask>,
+                                latest: &mut LatestMarketKeyRegistry| {
+            Engine::route_market_event(
+                Arc::new(MarketEvent::Instrument(binary_option(
+                    "btc-up-or-down-5m",
+                    &[token],
+                ))),
+                &sym,
+                tok,
+                latest,
+                &lanes,
+            )
+        };
+        let route_book = |token: &str,
+                          tok: &mut HashMap<SymbolId, RouteMask>,
+                          latest: &mut LatestMarketKeyRegistry| {
+            Engine::route_market_event(
+                Arc::new(ob(Exchange::Polymarket, token)),
+                &sym,
+                tok,
+                latest,
+                &lanes,
+            )
+        };
+        let handle_for = |token: &str, latest: &LatestMarketKeyRegistry| {
+            latest.key_to_handle[&LatestMarketKey {
+                kind: 0,
+                exchange: Exchange::Polymarket,
+                symbol: SymbolId::of(token),
+            }]
+        };
+
+        // Keep every marker queued. Two lifecycle barriers wrap the four
+        // epoch slots, so generation 3 deliberately reuses generation 1's
+        // exact physical slot while generation 1's marker is still present.
+        assert_eq!(route_instrument("OLD", &mut tok, &mut latest), 0);
+        assert_eq!(route_book("OLD", &mut tok, &mut latest), 0);
+        let first = handle_for("OLD", &latest);
+        assert_eq!(
+            Engine::route_market_event(
+                Arc::new(event_end("event-1", &["OLD"])),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &lanes,
+            ),
+            0,
+        );
+        assert_eq!(latest.len(), 0);
+        assert!(!tok.contains_key(&SymbolId::of("OLD")));
+
+        assert_eq!(route_instrument("MIDDLE", &mut tok, &mut latest), 0);
+        assert_eq!(route_book("MIDDLE", &mut tok, &mut latest), 0);
+        let second = handle_for("MIDDLE", &latest);
+        assert_eq!(
+            Engine::route_market_event(
+                Arc::new(event_end("event-2", &["MIDDLE"])),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &lanes,
+            ),
+            0,
+        );
+
+        assert_eq!(route_instrument("NEW", &mut tok, &mut latest), 0);
+        assert_eq!(route_book("NEW", &mut tok, &mut latest), 0);
+        let third = handle_for("NEW", &latest);
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.id, third.id);
+        assert!(first.generation < second.generation);
+        assert!(second.generation < third.generation);
+
+        let mut delivered_books = Vec::new();
+        let mut stale_markers = 0;
+        while let Ok(queued) = rx.try_recv() {
+            match resolve_market_event(queued, &lanes[0].latest) {
+                Some(payload) => {
+                    if let MarketEvent::OrderBook(book) = payload.event.as_ref() {
+                        delivered_books.push(book.symbol.clone());
+                    }
+                }
+                None => stale_markers += 1,
+            }
+        }
+        assert_eq!(stale_markers, 2);
+        assert_eq!(delivered_books, vec!["NEW"]);
+    }
+
+    #[test]
+    fn dynamic_polymarket_latest_ids_recycle_beyond_fixed_capacity() {
+        let sym = two_instance_map();
+        let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
+        let (lane, rx) = test_market_lane(8);
+        let lanes = [lane];
+
+        for cycle in 0..MAX_LATEST_MARKET_KEYS * 3 {
+            let token = format!("TOKEN-{cycle}");
+            Engine::route_market_event(
+                Arc::new(MarketEvent::Instrument(binary_option(
+                    "btc-up-or-down-5m",
+                    &[token.as_str()],
+                ))),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &lanes,
+            );
+            assert!(resolve_market_event(rx.try_recv().unwrap(), &lanes[0].latest).is_some());
+
+            for event in [
+                ob(Exchange::Polymarket, &token),
+                quote(Exchange::Polymarket, &token),
+            ] {
+                Engine::route_market_event(
+                    Arc::new(event),
+                    &sym,
+                    &mut tok,
+                    &mut latest,
+                    &lanes,
+                );
+                assert!(
+                    resolve_market_event(rx.try_recv().unwrap(), &lanes[0].latest).is_some()
+                );
+            }
+            assert_eq!(latest.len(), 2);
+
+            Engine::route_market_event(
+                Arc::new(event_end(&format!("event-{cycle}"), &[token.as_str()])),
+                &sym,
+                &mut tok,
+                &mut latest,
+                &lanes,
+            );
+            assert_eq!(latest.len(), 0);
+            assert_eq!(latest.free_ids.len(), MAX_LATEST_MARKET_KEYS);
+            assert!(!tok.contains_key(&SymbolId::of(&token)));
+        }
+
+        assert_eq!(latest.capacity_fallbacks, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exhausted_latest_registry_falls_back_without_aliasing_active_ids() {
+        let mut latest = LatestMarketKeyRegistry::default();
+        for symbol in 0..MAX_LATEST_MARKET_KEYS {
+            assert!(latest
+                .get_or_register(LatestMarketKey {
+                    kind: 0,
+                    exchange: Exchange::Binance,
+                    symbol: SymbolId(symbol as u64, 0),
+                })
+                .is_some());
+        }
+        assert!(latest
+            .get_or_register(LatestMarketKey {
+                kind: 0,
+                exchange: Exchange::Binance,
+                symbol: SymbolId(u64::MAX, 0),
+            })
+            .is_none());
+        assert_eq!(latest.len(), MAX_LATEST_MARKET_KEYS);
+        assert_eq!(latest.capacity_fallbacks, 1);
+    }
+
+    #[test]
     fn unknown_polymarket_series_is_never_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -12422,7 +12805,7 @@ mod market_router_tests {
     fn unknown_polymarket_market_data_is_never_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -12479,7 +12862,7 @@ mod market_router_tests {
     fn lifecycle_and_unknown_spot_symbols_broadcast() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (lane0, rx0) = test_market_lane(64);
         let (lane1, rx1) = test_market_lane(64);
         let txs = [lane0, lane1];
@@ -12937,7 +13320,7 @@ mod market_router_tests {
         let mut sym: HashMap<SymbolId, RouteMask> = HashMap::new();
         sym.insert(SymbolId::of("btcusdt"), 0b1_1111);
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
-        let mut latest = HashMap::new();
+        let mut latest = LatestMarketKeyRegistry::default();
         let (txs, rxs): (Vec<_>, Vec<_>) = (0..5).map(|_| test_market_lane(64)).unzip();
 
         Engine::route_market_event(

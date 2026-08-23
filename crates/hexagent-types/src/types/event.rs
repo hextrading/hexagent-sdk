@@ -55,6 +55,17 @@ pub enum MarketEvent {
         event_id: String,
         event_start_ns: u64,
     },
+    /// Signals that one rotating event has retired and its dynamic market
+    /// symbols will no longer produce authoritative public data. Consumers
+    /// may reclaim symbol-scoped routing/coalescing state before the following
+    /// `EventStart` installs the next event.
+    EventEnd {
+        exchange: Exchange,
+        symbol: String,
+        event_id: String,
+        retired_symbols: Vec<String>,
+        event_end_ns: u64,
+    },
     Exit,
 }
 
@@ -227,6 +238,7 @@ impl MarketEvent {
             | MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
             | MarketEvent::EventStart { .. }
+            | MarketEvent::EventEnd { .. }
             | MarketEvent::Exit => true,
         }
     }
@@ -242,6 +254,7 @@ impl MarketEvent {
             MarketEvent::AssetCtx(ac) => ac.local_timestamp_ns,
             MarketEvent::MarketDataHealth(health) => health.local_timestamp_ns,
             MarketEvent::EventStart { event_start_ns, .. } => *event_start_ns,
+            MarketEvent::EventEnd { event_end_ns, .. } => *event_end_ns,
             MarketEvent::Instrument(_)
             | MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
@@ -279,7 +292,8 @@ impl MarketEvent {
             MarketEvent::MarketDataHealth(health) => health.exchange,
             MarketEvent::Connected { exchange }
             | MarketEvent::Disconnected { exchange, .. }
-            | MarketEvent::EventStart { exchange, .. } => *exchange,
+            | MarketEvent::EventStart { exchange, .. }
+            | MarketEvent::EventEnd { exchange, .. } => *exchange,
             MarketEvent::Exit => Exchange::Binance, // placeholder, never used meaningfully
         }
     }

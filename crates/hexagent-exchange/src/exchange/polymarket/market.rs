@@ -1843,6 +1843,28 @@ impl PolymarketMarket {
                             .remove(self.series[i].series_id.as_deref().unwrap_or_default());
                         self.future_registered_event_ids.remove(&event.id);
 
+                        // Publish retirement before the next EventStart and
+                        // before any new-token book can reach the router. The
+                        // router uses this ordered lifecycle boundary to drop
+                        // old token routes and recycle its fixed latest-value
+                        // key slots without confusing queued old markers with
+                        // the new event.
+                        let retired_symbols: Vec<String> = self.series[i]
+                            .market
+                            .symbols
+                            .iter()
+                            .map(|symbol| symbol.token_id.clone())
+                            .collect();
+                        if !retired_symbols.is_empty() {
+                            self.pending_events.push_back(MarketEvent::EventEnd {
+                                exchange: Exchange::Polymarket,
+                                symbol: self.series[i].name.clone(),
+                                event_id: self.series[i].market.event_id.clone(),
+                                retired_symbols,
+                                event_end_ns: self.series[i].market.end_ns,
+                            });
+                        }
+
                         // Remove old token mappings
                         for sym in &self.series[i].market.symbols {
                             self.token_to_series.remove(&sym.token_id);
@@ -7384,6 +7406,14 @@ mod pick_current_event_tests {
         assert_eq!(market.token_to_series.get("new-down"), Some(&0));
         assert!(matches!(
             market.pending_events.front(),
+            Some(MarketEvent::EventEnd {
+                event_id,
+                retired_symbols,
+                ..
+            }) if event_id == "expired" && retired_symbols == &["old-up"]
+        ));
+        assert!(matches!(
+            market.pending_events.get(1),
             Some(MarketEvent::EventStart { .. })
         ));
         assert!(market
