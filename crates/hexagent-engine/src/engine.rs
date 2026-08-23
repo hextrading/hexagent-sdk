@@ -54,6 +54,52 @@ const POLY_FEED_LOOP_FAIL_FAST_NS: u64 = 10_000_000_000;
 const POLY_ROTATION_GRACE_NS: u64 = 3_000_000_000;
 const POLY_REPLACEMENT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS: u32 = 3;
+const MEMORY_TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn spawn_memory_telemetry(shutdown_token: ShutdownToken) -> Result<thread::JoinHandle<()>> {
+    let shutdown_rx = shutdown_token.subscribe();
+    Ok(thread::Builder::new()
+        .name("memory-telemetry".into())
+        .spawn(move || {
+            crate::os_tune::pin_background("memory-telemetry");
+            loop {
+                match hexagent_runtime::memory::process_memory_stats() {
+                    Ok(process) => {
+                        let allocator = hexagent_runtime::memory::allocator_stats();
+                        let recorder = crate::recorder::recorder_stats();
+                        let replayer = crate::recorder::replayer_stats();
+                        info!(
+                            "[Memory] VmRSS={} VmHWM={} VmLck={} VmSize={} Threads={} Private_Dirty={} Locked={} recorder_rows={} recorder_bytes={} recorder_written_rows={} recorder_written_bytes={} recorder_streams={} replayer_rows={} replayer_capacity={} replayer_loaded_rows={} replayer_streams={} mimalloc_reserved={} mimalloc_committed={}",
+                            process.vm_rss_bytes,
+                            process.vm_hwm_bytes,
+                            process.vm_lck_bytes,
+                            process.vm_size_bytes,
+                            process.threads,
+                            process.private_dirty_bytes,
+                            process.locked_bytes,
+                            recorder.buffered_rows,
+                            recorder.buffered_bytes,
+                            recorder.written_rows,
+                            recorder.written_bytes,
+                            recorder.open_streams,
+                            replayer.buffered_rows,
+                            replayer.buffer_capacity,
+                            replayer.loaded_rows,
+                            replayer.active_streams,
+                            allocator.reserved_bytes,
+                            allocator.committed_bytes,
+                        );
+                    }
+                    Err(error) => warn!("[Memory] process telemetry unavailable: {}", error),
+                }
+
+                match shutdown_rx.recv_timeout(MEMORY_TELEMETRY_INTERVAL) {
+                    Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        })?)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PolymarketSupervisorAction {
@@ -2844,19 +2890,22 @@ impl Engine {
     /// Run with a process-run shutdown token shared by engine-owned and
     /// application-owned background workers (for example latency dumping).
     pub fn run_with_shutdown(&self, shutdown_token: ShutdownToken) -> Result<()> {
-        match self.config.general.mode {
-            RunMode::Live => {
-                let result = self.run_live(shutdown_token.clone());
-                // Also cover startup/pre-flight errors that return before the
-                // normal live join sequence reaches its explicit phases.
-                shutdown_token.request();
-                shutdown_token.finish();
-                result
-            }
+        let memory_telemetry_handle = spawn_memory_telemetry(shutdown_token.clone())?;
+        let result = match self.config.general.mode {
+            RunMode::Live => self.run_live(shutdown_token.clone()),
             RunMode::Record => self.run_record(),
             RunMode::Backtest => self.run_backtest(),
             RunMode::Paper => self.run_paper(),
+        };
+
+        // Also cover startup/pre-flight errors and non-live modes. The memory
+        // worker shares the same process-run token and must never outlive run().
+        shutdown_token.request();
+        shutdown_token.finish();
+        if memory_telemetry_handle.join().is_err() && result.is_ok() {
+            return Err(anyhow::anyhow!("memory telemetry worker panicked"));
         }
+        result
     }
 
     /// Spawn a market data recorder thread. Returns (sender, join handle).
@@ -2892,16 +2941,10 @@ impl Engine {
                 };
                 let mut last_flush = std::time::Instant::now();
                 let flush_interval = std::time::Duration::from_secs(60);
-                // **Checkpoint cadence** (added 2026-05-20): every 5
-                // minutes (clock-aligned to wall time, not elapsed),
-                // close + sidecar-rename current parquet buffers so
-                // their data becomes readable on disk before the
-                // hour's `rotate_buffer` finally closes the canonical
-                // path. Without this, hourly files stay un-footered
-                // (and unreadable to downstream consumers) for up to
-                // 60 minutes. Aligned via `next_checkpoint_unix_secs`
-                // so multiple bot restarts in the same hour still
-                // produce one checkpoint at each :05 / :10 / … mark.
+                // Every 5 minutes, close the current partial fixed-capacity
+                // row group as an immutable shard. The Arrow batch is dropped
+                // immediately; completed data is never retained or rewritten.
+                // Alignment keeps shard boundaries predictable across restarts.
                 const CHECKPOINT_INTERVAL_SECS: u64 = 300;
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3723,8 +3766,7 @@ impl Engine {
                 };
                 let mut last_flush = std::time::Instant::now();
                 let flush_interval = std::time::Duration::from_secs(60);
-                // Same 5-min checkpoint cadence as the live recorder
-                // loop — see comment there for rationale.
+                // Same bounded-shard checkpoint cadence as the live recorder.
                 const CHECKPOINT_INTERVAL_SECS: u64 = 300;
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -12423,6 +12465,8 @@ mod market_router_tests {
             shutdown.clone(),
         )
         .expect("test latency worker starts");
+        let memory_telemetry =
+            spawn_memory_telemetry(shutdown.clone()).expect("test memory worker starts");
         let trade = PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
             "api-key",
             "c2VjcmV0",
@@ -12481,6 +12525,8 @@ mod market_router_tests {
         assert_eq!(shared.join_background_workers(), 2);
         assert_thread_exits(&latency_dump, "latency worker");
         latency_dump.join().unwrap();
+        assert_thread_exits(&memory_telemetry, "memory worker");
+        memory_telemetry.join().unwrap();
     }
 
     #[test]

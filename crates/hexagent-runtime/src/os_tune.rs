@@ -79,6 +79,15 @@ const DEFAULT_PRIO_ASYNC_RT: u8 = 70;
 const DEFAULT_PRIO_STRATEGY: u8 = 60;
 const DEFAULT_PRIO_EXECUTION: u8 = 50;
 
+/// Pages of future strategy stack to fault in before the first quote.  The
+/// default pthread stack is materially larger than this, while 512 KiB covers
+/// the observed strategy call depth with headroom and avoids eagerly making
+/// every process mapping resident.
+#[cfg(target_os = "linux")]
+const STRATEGY_STACK_PRETOUCH_BYTES: usize = 512 * 1024;
+#[cfg(target_os = "linux")]
+const STACK_PRETOUCH_FRAME_BYTES: usize = 32 * 1024;
+
 /// Resolved at startup from `OsTuneConfig`. All fields are concrete
 /// core ids / priorities; optional config entries have been filled in
 /// with legacy defaults.
@@ -731,6 +740,7 @@ pub fn pin_strategy(thread_name: &str) {
     let p = plan();
     pin_current(p.strategy, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
+    pretouch_strategy_stack();
 }
 
 /// Pin a per-instance strategy worker thread (live/paper). Resolves
@@ -745,6 +755,33 @@ pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
         .unwrap_or(p.strategy);
     pin_current(core, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
+    pretouch_strategy_stack();
+}
+
+/// Grow and fault the future portion of the current strategy stack once at
+/// thread startup. `MCL_ONFAULT` then pins these explicitly touched pages;
+/// cold file mappings, recorder buffers and allocator arenas remain pageable.
+fn pretouch_strategy_stack() {
+    #[cfg(target_os = "linux")]
+    {
+        #[inline(never)]
+        fn touch(remaining: usize) {
+            let mut frame = [0_u8; STACK_PRETOUCH_FRAME_BYTES];
+            let page_size = 4096;
+            for offset in (0..frame.len()).step_by(page_size) {
+                // Volatile writes keep every page touch observable in release
+                // builds; keeping `frame` live across recursion forces real
+                // stack growth instead of reusing one frame.
+                unsafe { std::ptr::write_volatile(frame.as_mut_ptr().add(offset), 0) };
+            }
+            if remaining > STACK_PRETOUCH_FRAME_BYTES {
+                touch(remaining - STACK_PRETOUCH_FRAME_BYTES);
+            }
+            std::hint::black_box(&frame);
+        }
+
+        touch(STRATEGY_STACK_PRETOUCH_BYTES);
+    }
 }
 
 /// Pin the authenticated private account-apply worker to its account-specific
@@ -896,8 +933,13 @@ pub fn pin_main_early(thread_name: &str) {
     }
 }
 
-/// Lock all current and future process memory to RAM. Blocks major page
-/// faults that otherwise manifest as multi-ms stalls.
+/// Register current and future process mappings for on-fault locking.
+///
+/// `MCL_ONFAULT` is essential here: eager `MCL_CURRENT | MCL_FUTURE` made cold
+/// Arrow batches, mmap pages and mimalloc arenas permanently resident, so RSS
+/// tracked the process high-water mark over long live runs. Only pages that
+/// are actually touched become resident/locked now; strategy stacks are
+/// explicitly pre-touched by [`pin_strategy`] / [`pin_strategy_instance`].
 ///
 /// Requires `CAP_IPC_LOCK` and a sufficient `RLIMIT_MEMLOCK` ceiling (set
 /// via `LimitMEMLOCK=infinity` in a systemd unit, or `ulimit -l unlimited`).
@@ -905,17 +947,18 @@ pub fn pin_main_early(thread_name: &str) {
 pub fn mlockall_best_effort() {
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+        let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+        let rc = unsafe { libc::mlockall(flags) };
         if rc == 0 {
-            info!("[os_tune] mlockall OK (MCL_CURRENT | MCL_FUTURE)");
+            info!("[os_tune] mlockall OK (MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)");
         } else {
             let errno = std::io::Error::last_os_error();
             warn!(
-                "[os_tune] mlockall failed: {} (need CAP_IPC_LOCK + RLIMIT_MEMLOCK; \
-                 major page faults may produce multi-ms latency spikes)",
+                "[os_tune] MCL_ONFAULT mlockall failed: {} (need Linux >= 4.4, \
+                 CAP_IPC_LOCK + RLIMIT_MEMLOCK; refusing eager whole-process locking)",
                 errno,
             );
-            abort_if_strict(&format!("mlockall: {}", errno));
+            abort_if_strict(&format!("MCL_ONFAULT mlockall: {}", errno));
         }
     }
     #[cfg(not(target_os = "linux"))]

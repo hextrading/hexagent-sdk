@@ -13,7 +13,7 @@ pub use hexagent_types::types;
 pub use hexagent_config::config;
 pub use hexagent_account::account;
 pub use hexagent_exchange::{exchange, recorder};
-pub use hexagent_runtime::{async_rt, latency, latency_record, os_tune, shutdown};
+pub use hexagent_runtime::{async_rt, latency, latency_record, memory, os_tune, shutdown};
 
 pub mod strategy {
     pub use hexagent_strategy::strategy::*;
