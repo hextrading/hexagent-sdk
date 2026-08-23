@@ -6,10 +6,42 @@ use log::{info, warn};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// One bounded in-memory row group per open recorder stream.  At the old
+/// 60-second pack cadence a busy book stream could retain an hour of Arrow
+/// arrays; 8,192 rows keeps the live working set predictable and is still
+/// large enough for efficient Parquet compression.
+const RECORDER_ROW_GROUP_ROWS: usize = 8_192;
+
+static RECORDER_BUFFERED_ROWS: AtomicU64 = AtomicU64::new(0);
+static RECORDER_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
+static RECORDER_WRITTEN_ROWS: AtomicU64 = AtomicU64::new(0);
+static RECORDER_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+static RECORDER_OPEN_STREAMS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecorderStats {
+    pub buffered_rows: u64,
+    pub buffered_bytes: u64,
+    pub written_rows: u64,
+    pub written_bytes: u64,
+    pub open_streams: u64,
+}
+
+pub fn recorder_stats() -> RecorderStats {
+    RecorderStats {
+        buffered_rows: RECORDER_BUFFERED_ROWS.load(Ordering::Acquire),
+        buffered_bytes: RECORDER_BUFFERED_BYTES.load(Ordering::Acquire),
+        written_rows: RECORDER_WRITTEN_ROWS.load(Ordering::Acquire),
+        written_bytes: RECORDER_WRITTEN_BYTES.load(Ordering::Acquire),
+        open_streams: RECORDER_OPEN_STREAMS.load(Ordering::Acquire),
+    }
+}
 
 /// Default writer properties for hexbot-recorded parquets.
 ///
@@ -41,54 +73,43 @@ use crate::types::MarketEvent;
 /// Schema for market event Parquet files.
 fn market_event_schema() -> Schema {
     Schema::new(vec![
-        Field::new("timestamp_ns", DataType::UInt64, false),       // exchange timestamp
+        Field::new("timestamp_ns", DataType::UInt64, false), // exchange timestamp
         Field::new("local_timestamp_ns", DataType::UInt64, false), // local receive timestamp
         Field::new("exchange", DataType::Utf8, false),
-        Field::new("event_type", DataType::Utf8, false),   // "orderbook", "trade", "quote", "instrument", "market_data_health", "tick_size_change"
-        Field::new("symbol", DataType::Utf8, false),        // clob_token_id or symbol
-        Field::new("side", DataType::Utf8, true),            // buy/sell (trades)
+        Field::new("event_type", DataType::Utf8, false), // "orderbook", "trade", "quote", "instrument", "market_data_health", "tick_size_change"
+        Field::new("symbol", DataType::Utf8, false),     // clob_token_id or symbol
+        Field::new("side", DataType::Utf8, true),        // buy/sell (trades)
         Field::new("price", DataType::Float64, true),
         Field::new("quantity", DataType::Float64, true),
-        Field::new("bid_price", DataType::Float64, true),    // quote best bid
-        Field::new("ask_price", DataType::Float64, true),    // quote best ask
+        Field::new("bid_price", DataType::Float64, true), // quote best bid
+        Field::new("ask_price", DataType::Float64, true), // quote best ask
         Field::new("bid_qty", DataType::Float64, true),
         Field::new("ask_qty", DataType::Float64, true),
-        Field::new("bids_json", DataType::Utf8, true),       // full orderbook bids as JSON
-        Field::new("asks_json", DataType::Utf8, true),       // full orderbook asks as JSON
-        Field::new("data_json", DataType::Utf8, true),       // instrument/other data as JSON
+        Field::new("bids_json", DataType::Utf8, true), // full orderbook bids as JSON
+        Field::new("asks_json", DataType::Utf8, true), // full orderbook asks as JSON
+        Field::new("data_json", DataType::Utf8, true), // instrument/other data as JSON
     ])
 }
 
-/// Buffers market events in memory, periodically materialises them into
-/// a `<base>.parquet` file via atomic read-modify-write (Option B from
-/// the 2026-05-20 design discussion).
+/// Buffers one fixed-capacity row group and writes immutable Parquet shards.
 ///
 /// **Lifecycle**:
 ///   1. `push_*` accumulates rows into the columnar Vec fields.
-///   2. `pack_batch()` (called every flush_interval, default 60s) drains
-///      the columnar Vecs into a `RecordBatch` and pushes onto
-///      `archived_batches`. Memory stays bounded by the hour's data.
-///   3. `write_to_disk()` (called on every checkpoint, default every
-///      5 min) rewrites `<path>` from scratch with ALL accumulated
-///      `archived_batches`. Atomic via tmpfile + rename.
-///   4. `close()` does one final `write_to_disk()` then drops state.
-///
-/// **Why rewrite-the-whole-file** (instead of multi-file partials):
-/// parquet's footer placement at file end means a single file can't
-/// be tailed incrementally. Holding all batches in memory + rewriting
-/// on each checkpoint is the only way to keep ONE readable file per
-/// hour. Memory cost ≈ one hour's compressed data (~10–50 MB for
-/// BTC ticks); IO cost ≈ 6.5× single-write (12 rewrites at growing
-/// sizes per hour). See engine.rs recorder loop comment.
+///   2. Reaching [`RECORDER_ROW_GROUP_ROWS`] synchronously closes one
+///      `<base>.part-NNNNNN.parquet` shard on the recorder worker.
+///   3. A checkpoint flushes the partial group and immediately releases its
+///      Arrow arrays. Completed shards are never retained or rewritten.
+///   4. `close()` flushes the final partial group.
 struct ParquetBuffer {
     path: PathBuf,
     schema: Arc<Schema>,
-    /// All batches written so far this hour. Kept in memory; rewritten
-    /// to disk in full on every `write_to_disk()` call.
-    archived_batches: Vec<RecordBatch>,
-    /// Total rows across `archived_batches` + pending columnar Vecs.
+    next_shard_id: u64,
+    /// At most one encoded row group is retained after a disk error so the
+    /// recorder can retry without dropping private/public market evidence.
+    pending_batch: Option<RecordBatch>,
+    /// Total rows durably written across completed shards.
     rows_written: usize,
-    // Columnar buffers — drained into a RecordBatch on `pack_batch()`.
+    // One fixed-capacity columnar row group.
     timestamp_ns: Vec<u64>,
     local_timestamp_ns: Vec<u64>,
     exchange: Vec<String>,
@@ -111,28 +132,35 @@ impl ParquetBuffer {
         Self {
             path,
             schema: Arc::new(market_event_schema()),
-            archived_batches: Vec::new(),
+            next_shard_id: 0,
+            pending_batch: None,
             rows_written: 0,
-            timestamp_ns: Vec::new(),
-            local_timestamp_ns: Vec::new(),
-            exchange: Vec::new(),
-            event_type: Vec::new(),
-            symbol: Vec::new(),
-            side: Vec::new(),
-            price: Vec::new(),
-            quantity: Vec::new(),
-            bid_price: Vec::new(),
-            ask_price: Vec::new(),
-            bid_qty: Vec::new(),
-            ask_qty: Vec::new(),
-            bids_json: Vec::new(),
-            asks_json: Vec::new(),
-            data_json: Vec::new(),
+            timestamp_ns: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            local_timestamp_ns: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            exchange: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            event_type: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            symbol: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            side: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            price: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            quantity: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            bid_price: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            ask_price: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            bid_qty: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            ask_qty: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            bids_json: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            asks_json: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
+            data_json: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
         }
     }
 
-
-    fn push_orderbook(&mut self, ts: u64, local_ts: u64, exchange: &str, symbol: &str, ob: &crate::types::OrderBookSnapshot) {
+    fn push_orderbook(
+        &mut self,
+        ts: u64,
+        local_ts: u64,
+        exchange: &str,
+        symbol: &str,
+        ob: &crate::types::OrderBookSnapshot,
+    ) {
         self.timestamp_ns.push(ts);
         self.local_timestamp_ns.push(local_ts);
         self.exchange.push(exchange.to_string());
@@ -161,7 +189,9 @@ impl ParquetBuffer {
                 // Descending: best bid at start → take first N
                 &ob.bids[..max_depth]
             }
-        } else { &ob.bids };
+        } else {
+            &ob.bids
+        };
         let asks_slice = if ob.asks.len() > max_depth {
             if ob.asks.first().map(|l| l.price) > ob.asks.last().map(|l| l.price) {
                 // Descending: best ask at end → take last N
@@ -170,9 +200,13 @@ impl ParquetBuffer {
                 // Ascending: best ask at start → take first N
                 &ob.asks[..max_depth]
             }
-        } else { &ob.asks };
-        self.bids_json.push(Some(serde_json::to_string(bids_slice).unwrap_or_default()));
-        self.asks_json.push(Some(serde_json::to_string(asks_slice).unwrap_or_default()));
+        } else {
+            &ob.asks
+        };
+        self.bids_json
+            .push(Some(serde_json::to_string(bids_slice).unwrap_or_default()));
+        self.asks_json
+            .push(Some(serde_json::to_string(asks_slice).unwrap_or_default()));
         self.data_json.push(None);
     }
 
@@ -227,7 +261,8 @@ impl ParquetBuffer {
         self.ask_qty.push(None);
         self.bids_json.push(None);
         self.asks_json.push(None);
-        self.data_json.push(Some(serde_json::to_string(event).unwrap_or_default()));
+        self.data_json
+            .push(Some(serde_json::to_string(event).unwrap_or_default()));
     }
 
     fn push_market_data_health(
@@ -258,7 +293,13 @@ impl ParquetBuffer {
     /// Asset-context row (`event_type = "asset_ctx"`): mark px in `price`,
     /// impact bid/ask in `bid_price`/`ask_price`, remaining ctx fields as
     /// compact JSON in `data_json`.
-    fn push_asset_ctx(&mut self, ts: u64, local_ts: u64, exchange: &str, ac: &crate::types::AssetCtxTick) {
+    fn push_asset_ctx(
+        &mut self,
+        ts: u64,
+        local_ts: u64,
+        exchange: &str,
+        ac: &crate::types::AssetCtxTick,
+    ) {
         self.timestamp_ns.push(ts);
         self.local_timestamp_ns.push(local_ts);
         self.exchange.push(exchange.to_string());
@@ -297,7 +338,13 @@ impl ParquetBuffer {
         self.data_json.push(None);
     }
 
-    fn push_tick_size_change(&mut self, ts: u64, local_ts: u64, exchange: &str, tsc: &crate::types::TickSizeChange) {
+    fn push_tick_size_change(
+        &mut self,
+        ts: u64,
+        local_ts: u64,
+        exchange: &str,
+        tsc: &crate::types::TickSizeChange,
+    ) {
         self.timestamp_ns.push(ts);
         self.local_timestamp_ns.push(local_ts);
         self.exchange.push(exchange.to_string());
@@ -315,91 +362,188 @@ impl ParquetBuffer {
         self.data_json.push(None);
     }
 
-    /// Drain the columnar Vecs into a `RecordBatch` and append to
-    /// `archived_batches`. In-memory only — no disk IO. Called on the
-    /// 60s periodic flush from the recorder loop to bound peak Vec
-    /// allocations between rewrites.
-    fn pack_batch(&mut self) -> Result<()> {
+    fn replace_column<T>(column: &mut Vec<T>) -> Vec<T> {
+        std::mem::replace(column, Vec::with_capacity(RECORDER_ROW_GROUP_ROWS))
+    }
+
+    /// Drain the active fixed-capacity columns into one Arrow batch. A fresh
+    /// bounded set of columns is installed before constructing the batch, so
+    /// the stream can never retain more than one raw row group.
+    fn take_batch(&mut self) -> Result<Option<RecordBatch>> {
         if self.timestamp_ns.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let n = self.timestamp_ns.len();
         let batch = RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(std::mem::take(&mut self.timestamp_ns))),
-                Arc::new(UInt64Array::from(std::mem::take(&mut self.local_timestamp_ns))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.exchange))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.event_type))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.symbol))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.side))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.price))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.quantity))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.bid_price))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.ask_price))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.bid_qty))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.ask_qty))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.bids_json))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.asks_json))),
-                Arc::new(StringArray::from(std::mem::take(&mut self.data_json))),
+                Arc::new(UInt64Array::from(Self::replace_column(
+                    &mut self.timestamp_ns,
+                ))),
+                Arc::new(UInt64Array::from(Self::replace_column(
+                    &mut self.local_timestamp_ns,
+                ))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.exchange))),
+                Arc::new(StringArray::from(Self::replace_column(
+                    &mut self.event_type,
+                ))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.symbol))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.side))),
+                Arc::new(Float64Array::from(Self::replace_column(&mut self.price))),
+                Arc::new(Float64Array::from(Self::replace_column(&mut self.quantity))),
+                Arc::new(Float64Array::from(Self::replace_column(
+                    &mut self.bid_price,
+                ))),
+                Arc::new(Float64Array::from(Self::replace_column(
+                    &mut self.ask_price,
+                ))),
+                Arc::new(Float64Array::from(Self::replace_column(&mut self.bid_qty))),
+                Arc::new(Float64Array::from(Self::replace_column(&mut self.ask_qty))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.bids_json))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.asks_json))),
+                Arc::new(StringArray::from(Self::replace_column(&mut self.data_json))),
             ],
         )?;
-        self.archived_batches.push(batch);
-        self.rows_written += n;
+        Ok(Some(batch))
+    }
+
+    fn shard_path(&self, shard_id: u64) -> PathBuf {
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("market");
+        self.path
+            .with_file_name(format!("{stem}.part-{shard_id:06}.parquet"))
+    }
+
+    /// Write and close exactly one immutable Parquet shard, then drop its
+    /// Arrow batch. Existing shard names are skipped so a process restart in
+    /// the same hour appends without overwriting earlier checkpoints.
+    fn write_pending_shards(&mut self) -> Result<()> {
+        loop {
+            if self.pending_batch.is_none() {
+                self.pending_batch = self.take_batch()?;
+            }
+            let Some(batch) = self.pending_batch.as_ref() else {
+                return Ok(());
+            };
+            let row_count = batch.num_rows();
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let shard_path = loop {
+                let candidate = self.shard_path(self.next_shard_id);
+                self.next_shard_id = self.next_shard_id.saturating_add(1);
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
+            let tmp_path = shard_path.with_extension("parquet.tmp");
+            {
+                let file = File::create(&tmp_path)?;
+                let mut writer = ArrowWriter::try_new(
+                    file,
+                    self.schema.clone(),
+                    Some(recorder_writer_properties()),
+                )?;
+                writer.write(batch)?;
+                writer.close()?;
+            }
+            std::fs::rename(&tmp_path, &shard_path)?;
+            let bytes = std::fs::metadata(&shard_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            self.pending_batch = None;
+            self.rows_written = self.rows_written.saturating_add(row_count);
+            RECORDER_WRITTEN_ROWS.fetch_add(row_count as u64, Ordering::AcqRel);
+            RECORDER_WRITTEN_BYTES.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    fn flush_if_full(&mut self) -> Result<()> {
+        if self.timestamp_ns.len() >= RECORDER_ROW_GROUP_ROWS {
+            self.write_pending_shards()?;
+        }
         Ok(())
     }
 
-    /// Materialise the entire hour's data into a single readable
-    /// parquet file at `<path>`. Atomic: writes to `<path>.tmp` then
-    /// `rename` (POSIX-atomic on same filesystem). After this returns
-    /// the file is fully readable by any standard parquet reader —
-    /// the previous file content (if any) is replaced.
-    ///
-    /// Called by the recorder's checkpoint hook (every 5 min) AND by
-    /// `close()` (on hour rotation / shutdown). No-op when nothing has
-    /// been written yet.
-    fn write_to_disk(&mut self) -> Result<()> {
-        // Roll any pending columnar buffer into archived_batches first
-        // so it lands in the file along with the older row groups.
-        self.pack_batch()?;
-        if self.archived_batches.is_empty() {
-            return Ok(());
+    fn prepare_for_row(&mut self) -> Result<()> {
+        if self.timestamp_ns.len() >= RECORDER_ROW_GROUP_ROWS {
+            self.write_pending_shards()?;
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Atomic write via tmpfile + rename.
-        let tmp_path = self.path.with_extension("parquet.tmp");
-        {
-            let file = File::create(&tmp_path)?;
-            let mut writer = ArrowWriter::try_new(
-                file,
-                self.schema.clone(),
-                Some(recorder_writer_properties()),
-            )?;
-            for batch in &self.archived_batches {
-                writer.write(batch)?;
-            }
-            writer.close()?;  // footer landed, file valid
-        }
-        std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
+    }
+
+    fn buffered_rows(&self) -> usize {
+        self.timestamp_ns.len()
+            + self
+                .pending_batch
+                .as_ref()
+                .map(RecordBatch::num_rows)
+                .unwrap_or(0)
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        let string_bytes = self.exchange.iter().map(String::len).sum::<usize>()
+            + self.event_type.iter().map(String::len).sum::<usize>()
+            + self.symbol.iter().map(String::len).sum::<usize>()
+            + self
+                .side
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .bids_json
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .asks_json
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .data_json
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(String::len)
+                .sum::<usize>();
+        let fixed_bytes = self.timestamp_ns.len()
+            * (std::mem::size_of::<u64>() * 2 + std::mem::size_of::<Option<f64>>() * 8);
+        let pending_bytes = self
+            .pending_batch
+            .as_ref()
+            .map(|batch| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|array| array.get_array_memory_size())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        string_bytes
+            .saturating_add(fixed_bytes)
+            .saturating_add(pending_bytes)
     }
 
     /// Final write + log. Called on hour rotation or shutdown. After
     /// this returns the buffer can be dropped — its data is on disk.
     fn close(&mut self) {
-        let had_data = !self.archived_batches.is_empty() || !self.timestamp_ns.is_empty();
-        if let Err(e) = self.write_to_disk() {
-            log::error!("[Recorder] close write_to_disk failed: {}", e);
+        let had_data = !self.timestamp_ns.is_empty();
+        if let Err(e) = self.write_pending_shards() {
+            log::error!("[Recorder] close shard write failed: {}", e);
             return;
         }
-        if had_data && self.rows_written > 0 {
-            info!("[Recorder] Wrote {} rows to {}", self.rows_written, self.path.display());
+        if (had_data || self.rows_written > 0) && self.rows_written > 0 {
+            info!(
+                "[Recorder] Wrote {} rows as bounded shards for {}",
+                self.rows_written,
+                self.path.display()
+            );
         }
-        // Free the archived batches now that they're on disk; the
-        // buffer is about to be dropped by the caller anyway.
-        self.archived_batches.clear();
     }
 }
 
@@ -425,9 +569,14 @@ pub struct MarketRecorder {
     current_event_id: HashMap<String, String>,
     current_event_slug: HashMap<String, String>,
     current_series_slug: HashMap<String, String>,
-    /// Pending series_key per exchange — set by EventStart, consumed by next Instrument.
-    /// Handles multiple series: each EventStart pushes, each Instrument pops.
-    pending_series_keys: HashMap<String, Vec<String>>,
+    /// Exact `(exchange,event_id) -> series_key` lifecycle routing. Matching by
+    /// event id prevents a delayed Instrument from consuming the next series'
+    /// FIFO slot.
+    pending_event_series: HashMap<String, String>,
+    event_to_series: HashMap<String, String>,
+    /// Bounded tombstones reject delayed Instruments after EventEnd/rotation.
+    retired_events: HashSet<String>,
+    retired_event_order: VecDeque<String>,
     total_event_count: u64,
     /// Accumulated bar data for histdata recording, keyed by "{exchange}/{symbol}/{interval}"
     bar_buffers: HashMap<String, Vec<crate::types::BarData>>,
@@ -445,7 +594,10 @@ impl MarketRecorder {
             current_event_id: HashMap::new(),
             current_event_slug: HashMap::new(),
             current_series_slug: HashMap::new(),
-            pending_series_keys: HashMap::new(),
+            pending_event_series: HashMap::new(),
+            event_to_series: HashMap::new(),
+            retired_events: HashSet::new(),
+            retired_event_order: VecDeque::new(),
             total_event_count: 0,
         })
     }
@@ -456,11 +608,101 @@ impl MarketRecorder {
             .or_insert_with(|| ParquetBuffer::new(path))
     }
 
+    fn publish_stats(&self) {
+        let buffered_rows = self
+            .buffers
+            .values()
+            .map(ParquetBuffer::buffered_rows)
+            .sum::<usize>()
+            .saturating_add(self.bar_buffers.values().map(Vec::len).sum::<usize>());
+        let buffered_bytes = self
+            .buffers
+            .values()
+            .map(ParquetBuffer::buffered_bytes)
+            .sum::<usize>()
+            .saturating_add(
+                self.bar_buffers
+                    .values()
+                    .map(|bars| {
+                        bars.len()
+                            .saturating_mul(std::mem::size_of::<crate::types::BarData>())
+                    })
+                    .sum::<usize>(),
+            );
+        RECORDER_BUFFERED_ROWS.store(buffered_rows as u64, Ordering::Release);
+        RECORDER_BUFFERED_BYTES.store(buffered_bytes as u64, Ordering::Release);
+        RECORDER_OPEN_STREAMS.store(self.buffers.len() as u64, Ordering::Release);
+    }
+
+    fn series_slug(symbol: &str) -> &str {
+        symbol.strip_prefix("series:").unwrap_or(symbol)
+    }
+
+    fn event_key(exchange: &str, event_id: &str) -> String {
+        format!("{exchange}\u{1f}{event_id}")
+    }
+
+    fn remember_retired(&mut self, event_key: String) {
+        const RETIRED_EVENT_CAPACITY: usize = 4_096;
+        if self.retired_events.insert(event_key.clone()) {
+            self.retired_event_order.push_back(event_key);
+        }
+        while self.retired_event_order.len() > RETIRED_EVENT_CAPACITY {
+            if let Some(expired) = self.retired_event_order.pop_front() {
+                self.retired_events.remove(&expired);
+            }
+        }
+    }
+
+    fn retire_event_context(&mut self, exchange: &str, event_id: &str, retired_symbols: &[String]) {
+        let event_key = Self::event_key(exchange, event_id);
+        self.pending_event_series.remove(&event_key);
+        let series_key = self.event_to_series.remove(&event_key).or_else(|| {
+            self.current_event_id
+                .iter()
+                .find_map(|(series, current)| (current == event_id).then(|| series.clone()))
+        });
+        if let Some(series_key) = series_key {
+            let slug = self
+                .current_event_slug
+                .get(&series_key)
+                .cloned()
+                .unwrap_or_default();
+            let file_key = format!("{event_id}_{slug}");
+            if let Some(mut buffer) = self.buffers.remove(&file_key) {
+                buffer.close();
+            }
+            self.token_to_file_key.retain(|symbol, mapped| {
+                mapped != &file_key && !retired_symbols.iter().any(|retired| retired == symbol)
+            });
+            if self.current_event_id.get(&series_key).map(String::as_str) == Some(event_id) {
+                self.current_event_id.remove(&series_key);
+                self.current_event_slug.remove(&series_key);
+                self.current_series_slug.remove(&series_key);
+            }
+        } else {
+            self.token_to_file_key
+                .retain(|symbol, _| !retired_symbols.iter().any(|retired| retired == symbol));
+        }
+        self.remember_retired(event_key);
+    }
+
+    fn fallback_series_slug(event_slug: &str) -> String {
+        event_slug
+            .rsplit_once('-')
+            .filter(|(_, suffix)| suffix.parse::<u64>().is_ok())
+            .map(|(prefix, _)| prefix.to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "fallback".to_string())
+    }
+
     /// Build Parquet file path for Polymarket events.
     /// Format: polymarket/{series_slug}/{YYYYMMDD}/{event_slug}-{event_id}.parquet
     fn poly_path(&self, series_slug: &str, event_id: &str, event_slug: &str) -> PathBuf {
         // Extract date from event_slug timestamp (e.g. "btc-updown-5m-1774807800" → 1774807800)
-        let date_str = event_slug.rsplit('-').next()
+        let date_str = event_slug
+            .rsplit('-')
+            .next()
             .and_then(|s| s.parse::<i64>().ok())
             .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
             .map(|dt| dt.format("%Y%m%d").to_string())
@@ -489,12 +731,17 @@ impl MarketRecorder {
     /// Flush and remove old buffers when switching to a new file key.
     /// Compares by prefix (everything before the last `_` = hour bucket).
     fn rotate_buffer(&mut self, new_key: &str) {
-        if self.buffers.contains_key(new_key) { return; }
+        if self.buffers.contains_key(new_key) {
+            return;
+        }
         if let Some(prefix_end) = new_key.rfind('_') {
             let prefix = &new_key[..=prefix_end];
-            let old_keys: Vec<String> = self.buffers.keys()
+            let old_keys: Vec<String> = self
+                .buffers
+                .keys()
                 .filter(|k| k.starts_with(prefix) && *k != new_key)
-                .cloned().collect();
+                .cloned()
+                .collect();
             for old_key in old_keys {
                 if let Some(mut buf) = self.buffers.remove(&old_key) {
                     buf.close();
@@ -528,115 +775,209 @@ impl MarketRecorder {
 
     pub fn write_event(&mut self, event: &MarketEvent) -> Result<()> {
         match event {
-            MarketEvent::EventStart { exchange, symbol, event_id, event_start_ns: _ } => {
+            MarketEvent::EventStart {
+                exchange,
+                symbol,
+                event_id,
+                event_start_ns: _,
+            } => {
                 let ex = exchange.to_string();
-                // Use series slug as part of key to distinguish multiple series on same exchange
-                let series_slug = if symbol.starts_with("series:") {
-                    symbol["series:".len()..].to_string()
-                } else {
-                    symbol.clone()
-                };
-                let series_key = format!("{}_{}", ex, series_slug);
+                let series_slug = Self::series_slug(symbol).to_string();
+                let canonical_series_key = format!("{}_{}", ex, series_slug);
+                let event_key = Self::event_key(&ex, event_id);
+                // If an Instrument legitimately arrived before EventStart,
+                // keep its event-specific fallback context rather than
+                // opening a second file for the same event.
+                let instrument_preceded_start = self.event_to_series.contains_key(&event_key);
+                let series_key = self
+                    .event_to_series
+                    .get(&event_key)
+                    .cloned()
+                    .unwrap_or(canonical_series_key);
 
-                // Flush previous event's buffer if switching events
-                if let Some(old_id) = self.current_event_id.get(&series_key) {
-                    if old_id != event_id {
-                        let old_slug = self.current_event_slug.get(&series_key).cloned().unwrap_or_default();
-                        let old_key = format!("{}_{}", old_id, old_slug);
-                        if let Some(mut buf) = self.buffers.remove(&old_key) {
-                            buf.close();
-                        }
-                        // Remove old token mappings so stale data is discarded
-                        self.token_to_file_key.retain(|_, v| v != &old_key);
+                if let Some(old_id) = self.current_event_id.get(&series_key).cloned() {
+                    if old_id.as_str() != event_id.as_str() {
+                        self.retire_event_context(&ex, &old_id, &[]);
                     }
                 }
-                self.current_event_id.insert(series_key.clone(), event_id.clone());
-                self.current_series_slug.insert(series_key.clone(), series_slug.clone());
-                // Event slug will be overridden by Instrument event's slug
-                self.current_event_slug.insert(series_key.clone(), series_slug);
-                // Push pending series_key for the next Instrument to consume
-                self.pending_series_keys.entry(ex).or_default().push(series_key);
+                self.current_event_id
+                    .insert(series_key.clone(), event_id.clone());
+                self.current_series_slug
+                    .insert(series_key.clone(), series_slug.clone());
+                // Event slug will be overridden by a later Instrument. If the
+                // Instrument arrived first, preserve its full rotating slug so
+                // EventEnd closes the already-open fallback buffer.
+                if !instrument_preceded_start {
+                    self.current_event_slug
+                        .insert(series_key.clone(), series_slug);
+                }
+                self.event_to_series
+                    .insert(event_key.clone(), series_key.clone());
+                self.pending_event_series.insert(event_key, series_key);
             }
             MarketEvent::Instrument(inst) => {
                 let ex = event.exchange().to_string();
                 if let crate::types::Instrument::BinaryOption(bo) = inst {
-                    // Pop the pending series_key set by the preceding EventStart
-                    let series_key = self.pending_series_keys.get_mut(&ex)
-                        .and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) })
-                        .unwrap_or_else(|| ex.clone()); // fallback if no EventStart
+                    let event_key = Self::event_key(&ex, &bo.id);
+                    if self.retired_events.contains(&event_key) {
+                        warn!(
+                            "[Recorder] Ignoring stale Instrument after retirement exchange={} event_id={} slug={}",
+                            ex, bo.id, bo.slug,
+                        );
+                        self.publish_stats();
+                        return Ok(());
+                    }
+                    let series_key = self
+                        .pending_event_series
+                        .remove(&event_key)
+                        .or_else(|| self.event_to_series.get(&event_key).cloned())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}_fallback:{}:{}",
+                                ex,
+                                Self::fallback_series_slug(&bo.slug),
+                                bo.id
+                            )
+                        });
+                    self.event_to_series.insert(event_key, series_key.clone());
 
                     // Use slug from instrument for file naming
                     if !bo.slug.is_empty() {
-                        self.current_event_slug.insert(series_key.clone(), bo.slug.clone());
+                        self.current_event_slug
+                            .insert(series_key.clone(), bo.slug.clone());
                     }
 
-                    // If no EventStart received yet, auto-create event context
+                    // If no EventStart arrived, create an event-scoped fallback
+                    // that cannot leak into the next Instrument.
                     if !self.current_event_id.contains_key(&series_key) {
-                        self.current_event_id.insert(series_key.clone(), bo.id.clone());
+                        self.current_event_id
+                            .insert(series_key.clone(), bo.id.clone());
                         if !self.current_series_slug.contains_key(&series_key) {
-                            self.current_series_slug.insert(series_key.clone(), bo.slug.clone());
+                            self.current_series_slug
+                                .insert(series_key.clone(), Self::fallback_series_slug(&bo.slug));
                         }
                     }
 
                     // Map all token IDs to this event's file key
-                    let eid = self.current_event_id.get(&series_key).cloned().unwrap_or_default();
-                    let slug = self.current_event_slug.get(&series_key).cloned().unwrap_or_default();
-                    let series = self.current_series_slug.get(&series_key).cloned().unwrap_or_default();
+                    let eid = self
+                        .current_event_id
+                        .get(&series_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let slug = self
+                        .current_event_slug
+                        .get(&series_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let series = self
+                        .current_series_slug
+                        .get(&series_key)
+                        .cloned()
+                        .unwrap_or_default();
                     let file_key = format!("{}_{}", eid, slug);
                     for token_id in &bo.clob_token_ids {
-                        self.token_to_file_key.insert(token_id.clone(), file_key.clone());
+                        self.token_to_file_key
+                            .insert(token_id.clone(), file_key.clone());
                     }
                     let path = self.poly_path(&series, &eid, &slug);
                     let buf = self.get_or_create_buffer(&file_key, path);
 
                     // Record instrument event
                     let local_ts = crate::types::now_ns();
+                    buf.prepare_for_row()?;
                     buf.push_instrument(local_ts, local_ts, &ex, event);
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
             MarketEvent::OrderBook(ob) => {
                 let ex = ob.exchange.to_string();
-                if let Some((file_key, path)) = self.resolve_file(&ex, &ob.symbol, ob.local_timestamp_ns) {
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &ob.symbol, ob.local_timestamp_ns)
+                {
                     self.rotate_buffer(&file_key);
-                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
-                    buf.push_orderbook(ob.exchange_timestamp_ns, ob.local_timestamp_ns, &ex, &ob.symbol, ob);
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
+                    buf.push_orderbook(
+                        ob.exchange_timestamp_ns,
+                        ob.local_timestamp_ns,
+                        &ex,
+                        &ob.symbol,
+                        ob,
+                    );
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
             MarketEvent::Trade(t) => {
                 let ex = t.exchange.to_string();
-                if let Some((file_key, path)) = self.resolve_file(&ex, &t.symbol, t.local_timestamp_ns) {
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &t.symbol, t.local_timestamp_ns)
+                {
                     self.rotate_buffer(&file_key);
-                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
                     buf.push_trade(t.exchange_timestamp_ns, t.local_timestamp_ns, &ex, t);
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
             MarketEvent::AssetCtx(ac) => {
                 let ex = ac.exchange.to_string();
-                if let Some((file_key, path)) = self.resolve_file(&ex, &ac.symbol, ac.local_timestamp_ns) {
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &ac.symbol, ac.local_timestamp_ns)
+                {
                     self.rotate_buffer(&file_key);
-                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
                     buf.push_asset_ctx(ac.local_timestamp_ns, ac.local_timestamp_ns, &ex, ac);
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
             MarketEvent::Quote(q) => {
                 let ex = q.exchange.to_string();
-                if let Some((file_key, path)) = self.resolve_file(&ex, &q.symbol, q.local_timestamp_ns) {
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &q.symbol, q.local_timestamp_ns)
+                {
                     self.rotate_buffer(&file_key);
-                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
                     buf.push_quote(q.exchange_timestamp_ns, q.local_timestamp_ns, &ex, q);
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
             MarketEvent::TickSizeChange(tsc) => {
                 let ex = tsc.exchange.to_string();
-                if let Some((file_key, path)) = self.resolve_file(&ex, &tsc.symbol, tsc.local_timestamp_ns) {
+                if let Some((file_key, path)) =
+                    self.resolve_file(&ex, &tsc.symbol, tsc.local_timestamp_ns)
+                {
                     self.rotate_buffer(&file_key);
-                    let buf = self.buffers.entry(file_key).or_insert_with(|| ParquetBuffer::new(path));
-                    buf.push_tick_size_change(tsc.local_timestamp_ns, tsc.local_timestamp_ns, &ex, tsc);
+                    let buf = self
+                        .buffers
+                        .entry(file_key)
+                        .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
+                    buf.push_tick_size_change(
+                        tsc.local_timestamp_ns,
+                        tsc.local_timestamp_ns,
+                        &ex,
+                        tsc,
+                    );
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
@@ -650,12 +991,14 @@ impl MarketRecorder {
                         .buffers
                         .entry(file_key)
                         .or_insert_with(|| ParquetBuffer::new(path));
+                    buf.prepare_for_row()?;
                     buf.push_market_data_health(
                         health.local_timestamp_ns,
                         &ex,
                         &health.symbol,
                         event,
                     );
+                    buf.flush_if_full()?;
                     self.total_event_count += 1;
                 }
             }
@@ -683,10 +1026,16 @@ impl MarketRecorder {
                     }
                 };
                 let sym_lower = sp.symbol.to_lowercase().replace('/', "-");
-                let key = format!("{}_{}_{}", source_dir, sym_lower, sp.local_timestamp_ns / 3_600_000_000_000);
+                let key = format!(
+                    "{}_{}_{}",
+                    source_dir,
+                    sym_lower,
+                    sp.local_timestamp_ns / 3_600_000_000_000
+                );
                 let secs = (sp.local_timestamp_ns / 1_000_000_000) as i64;
                 let hour_secs = secs - (secs % 3600);
-                let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(hour_secs, 0).unwrap_or_default();
+                let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(hour_secs, 0)
+                    .unwrap_or_default();
                 let base = if source_dir.contains('/') {
                     self.output_dir.join("rtds").join(source_dir)
                 } else {
@@ -698,58 +1047,58 @@ impl MarketRecorder {
                     .join(dt.format("%m%d").to_string())
                     .join(format!("{}.parquet", dt.format("%Y%m%d_%H")));
                 self.rotate_buffer(&key);
-                let buf = self.buffers.entry(key).or_insert_with(|| ParquetBuffer::new(path));
+                let buf = self
+                    .buffers
+                    .entry(key)
+                    .or_insert_with(|| ParquetBuffer::new(path));
+                buf.prepare_for_row()?;
                 buf.push_spot_price(sp.timestamp_ns, sp.local_timestamp_ns, sp);
+                buf.flush_if_full()?;
                 self.total_event_count += 1;
+            }
+            MarketEvent::EventEnd {
+                exchange,
+                event_id,
+                retired_symbols,
+                ..
+            } => {
+                self.retire_event_context(&exchange.to_string(), event_id, retired_symbols);
             }
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
-            | MarketEvent::EventEnd { .. }
             | MarketEvent::Exit => {}
         }
 
+        self.publish_stats();
         Ok(())
     }
 
-    /// Periodic memory-bound: drain columnar Vecs into `RecordBatch`es
-    /// held on `ParquetBuffer.archived_batches`. No disk IO. Called
-    /// every 60s by the recorder loop so a slow checkpoint cadence
-    /// can't blow up the per-Vec allocation footprint.
+    /// Periodic memory bound: close every partial shard. The Arrow batch is
+    /// dropped before this method returns; no completed batch remains resident.
     pub fn flush_buffers(&mut self) {
         for buf in self.buffers.values_mut() {
             if !buf.timestamp_ns.is_empty() {
-                if let Err(e) = buf.pack_batch() {
-                    log::error!("[Recorder] Periodic pack_batch error: {}", e);
+                if let Err(e) = buf.write_pending_shards() {
+                    log::error!("[Recorder] Periodic shard write error: {}", e);
                 }
             }
         }
+        self.publish_stats();
     }
 
-    /// **Checkpoint**: rewrite each open buffer's `<base>.parquet` from
-    /// scratch with ALL archived batches accumulated since hour start.
-    /// Atomic via tmpfile + rename — readers see either the previous
-    /// version or the new one, never partial.
-    ///
-    /// One file per hour stays the contract (no sidecar partials).
-    /// Cost: rewrites whole file every 5 min; over an hour that's
-    /// ~6.5× the IO of a single end-of-hour write, but each rewrite
-    /// is sequential streaming write + atomic rename — fine on SSD.
-    /// Memory cost: ~one hour of compressed data per buffer (~10-50 MB
-    /// for BTC tick stream); held until the hour rotates and `close()`
-    /// frees it.
-    ///
-    /// Bar buffers (`bar_buffers`) are not checkpointed here — they
-    /// flush via `flush_bar_buffer` already and consumers don't
-    /// hot-tail them.
+    /// Checkpoint every partial fixed-capacity row group to an immutable shard.
+    /// Completed shards are already durable and are never read or rewritten.
     pub fn checkpoint(&mut self) {
         for buf in self.buffers.values_mut() {
-            if let Err(e) = buf.write_to_disk() {
+            if let Err(e) = buf.write_pending_shards() {
                 log::error!(
-                    "[Recorder] checkpoint write_to_disk failed for {}: {}",
-                    buf.path.display(), e,
+                    "[Recorder] checkpoint shard write failed for {}: {}",
+                    buf.path.display(),
+                    e,
                 );
             }
         }
+        self.publish_stats();
     }
 
     /// Close all buffers and writers (call on shutdown).
@@ -762,6 +1111,7 @@ impl MarketRecorder {
         for key in keys {
             let _ = self.flush_bar_buffer(&key);
         }
+        self.publish_stats();
         Ok(())
     }
 
@@ -780,7 +1130,8 @@ impl MarketRecorder {
         }
         let (exchange_str, symbol, interval) = (parts[0], parts[1], parts[2]);
 
-        let hist_dir = self.output_dir
+        let hist_dir = self
+            .output_dir
             .join("histdata")
             .join(exchange_str)
             .join(symbol)
@@ -789,7 +1140,12 @@ impl MarketRecorder {
         match crate::recorder::hist_reader::save_bars_to_local(&hist_dir, &bars, interval) {
             Ok(()) => {}
             Err(e) => {
-                warn!("[Recorder] Failed to save {} bars for {}: {}", bars.len(), key, e);
+                warn!(
+                    "[Recorder] Failed to save {} bars for {}: {}",
+                    bars.len(),
+                    key,
+                    e
+                );
             }
         }
 
@@ -798,6 +1154,14 @@ impl MarketRecorder {
 
     pub fn event_count(&self) -> u64 {
         self.total_event_count
+    }
+}
+
+impl Drop for MarketRecorder {
+    fn drop(&mut self) {
+        RECORDER_BUFFERED_ROWS.store(0, Ordering::Release);
+        RECORDER_BUFFERED_BYTES.store(0, Ordering::Release);
+        RECORDER_OPEN_STREAMS.store(0, Ordering::Release);
     }
 }
 
@@ -812,6 +1176,33 @@ mod tests {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
 
+    fn binary_option(id: &str, slug: &str, token: &str) -> MarketEvent {
+        MarketEvent::Instrument(crate::types::Instrument::BinaryOption(
+            crate::types::BinaryOption {
+                exchange: crate::types::Exchange::Polymarket,
+                id: id.to_string(),
+                question: String::new(),
+                condition_id: id.to_string(),
+                series_slug: "btc-updown-5m".to_string(),
+                slug: slug.to_string(),
+                clob_token_ids: vec![token.to_string()],
+                outcomes: vec!["Up".to_string()],
+                outcome_prices: vec!["0.5".to_string()],
+                active: true,
+                closed: false,
+                volume: 0.0,
+                liquidity: 0.0,
+                tick_size: 0.01,
+                order_min_size: 1.0,
+                group_item_title: String::new(),
+                event_start_time: String::new(),
+                base_fee: 0,
+                fee_exponent: 0.0,
+                fee_rate: 0.0,
+            },
+        ))
+    }
+
     /// `recorder_writer_properties()` returns SNAPPY compression. Lock
     /// this default — anyone changing it must explicitly update the
     /// test (and the comments document the rationale: ~5× smaller files
@@ -822,8 +1213,11 @@ mod tests {
         // `compression()` takes a column path — we use the default
         // (applies to all columns). Pass an arbitrary column name.
         let comp = props.compression(&parquet::schema::types::ColumnPath::from("any"));
-        assert_eq!(comp, Compression::SNAPPY,
-            "MarketRecorder must default to SNAPPY compression");
+        assert_eq!(
+            comp,
+            Compression::SNAPPY,
+            "MarketRecorder must default to SNAPPY compression"
+        );
     }
 
     /// End-to-end: write a tiny parquet via the recorder's properties,
@@ -838,21 +1232,17 @@ mod tests {
         use std::sync::Arc;
 
         // Tiny 3-row, 1-column parquet.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::UInt64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::UInt64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(UInt64Array::from(vec![1u64, 2, 3])) as ArrayRef],
-        ).expect("batch construction");
+        )
+        .expect("batch construction");
 
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let file = File::create(tmp.path()).expect("create");
-        let mut writer = ArrowWriter::try_new(
-            file,
-            schema,
-            Some(recorder_writer_properties()),
-        ).expect("writer");
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(recorder_writer_properties())).expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
 
@@ -867,7 +1257,9 @@ mod tests {
             assert_eq!(
                 col.compression(),
                 Compression::SNAPPY,
-                "column {} ({:?}) must be SNAPPY-compressed", ci, col.column_path(),
+                "column {} ({:?}) must be SNAPPY-compressed",
+                ci,
+                col.column_path(),
             );
         }
     }
@@ -890,15 +1282,181 @@ mod tests {
 
         assert_eq!(buffer.event_type, vec!["market_data_health"]);
         assert_eq!(buffer.symbol, vec!["up-token"]);
-        let decoded: MarketEvent = serde_json::from_str(
-            buffer.data_json[0].as_deref().expect("health JSON"),
-        )
-        .expect("decode health event");
+        let decoded: MarketEvent =
+            serde_json::from_str(buffer.data_json[0].as_deref().expect("health JSON"))
+                .expect("decode health event");
         let MarketEvent::MarketDataHealth(health) = decoded else {
             panic!("decoded wrong event variant")
         };
         assert_eq!(health.market_id, "condition");
         assert_eq!(health.state, crate::types::MarketDataHealthState::Settling);
         assert!(!health.taker_ready);
+    }
+
+    #[test]
+    fn full_row_group_is_sharded_and_released_before_more_rows_arrive() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let base = tempdir.path().join("quotes.parquet");
+        let mut buffer = ParquetBuffer::new(base);
+        let quote = crate::types::QuoteTick {
+            exchange: crate::types::Exchange::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bid_price: 100.0,
+            bid_qty: 1.0,
+            ask_price: 101.0,
+            ask_qty: 1.0,
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        };
+
+        for index in 0..=RECORDER_ROW_GROUP_ROWS {
+            buffer.prepare_for_row().expect("prepare row");
+            buffer.push_quote(index as u64, index as u64, "binance", &quote);
+            buffer.flush_if_full().expect("flush full group");
+        }
+
+        assert_eq!(buffer.timestamp_ns.len(), 1);
+        assert!(buffer.pending_batch.is_none());
+        assert!(tempdir.path().join("quotes.part-000000.parquet").is_file());
+        buffer.write_pending_shards().expect("checkpoint tail");
+        assert!(buffer.timestamp_ns.is_empty());
+        assert!(buffer.pending_batch.is_none());
+        assert!(tempdir.path().join("quotes.part-000001.parquet").is_file());
+    }
+
+    #[test]
+    fn stale_instrument_cannot_claim_the_next_series_or_shared_fallback() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut recorder = MarketRecorder::new(tempdir.path().to_path_buf()).expect("recorder");
+        let exchange = crate::types::Exchange::Polymarket;
+
+        recorder
+            .write_event(&MarketEvent::EventStart {
+                exchange,
+                symbol: "series:btc-updown-5m".to_string(),
+                event_id: "event-a".to_string(),
+                event_start_ns: 1,
+            })
+            .unwrap();
+        recorder
+            .write_event(&binary_option(
+                "event-a",
+                "btc-updown-5m-1774807800",
+                "token-a",
+            ))
+            .unwrap();
+        assert!(recorder.token_to_file_key.contains_key("token-a"));
+
+        recorder
+            .write_event(&MarketEvent::EventEnd {
+                exchange,
+                symbol: "series:btc-updown-5m".to_string(),
+                event_id: "event-a".to_string(),
+                retired_symbols: vec!["token-a".to_string()],
+                event_end_ns: 2,
+            })
+            .unwrap();
+        recorder
+            .write_event(&MarketEvent::EventStart {
+                exchange,
+                symbol: "series:btc-updown-5m".to_string(),
+                event_id: "event-b".to_string(),
+                event_start_ns: 3,
+            })
+            .unwrap();
+
+        recorder
+            .write_event(&binary_option(
+                "event-a",
+                "btc-updown-5m-1774807800",
+                "stale-token-a",
+            ))
+            .unwrap();
+        assert!(!recorder.token_to_file_key.contains_key("stale-token-a"));
+        assert_eq!(
+            recorder
+                .current_event_id
+                .get("polymarket_btc-updown-5m")
+                .map(String::as_str),
+            Some("event-b")
+        );
+
+        recorder
+            .write_event(&binary_option(
+                "event-b",
+                "btc-updown-5m-1774808100",
+                "token-b",
+            ))
+            .unwrap();
+        recorder
+            .write_event(&binary_option(
+                "event-c",
+                "eth-updown-5m-1774808400",
+                "token-c",
+            ))
+            .unwrap();
+        recorder
+            .write_event(&binary_option(
+                "event-d",
+                "sol-updown-5m-1774808700",
+                "token-d",
+            ))
+            .unwrap();
+
+        assert_ne!(
+            recorder.token_to_file_key.get("token-c"),
+            recorder.token_to_file_key.get("token-d")
+        );
+        assert_ne!(
+            recorder
+                .event_to_series
+                .get(&MarketRecorder::event_key("polymarket", "event-c")),
+            recorder
+                .event_to_series
+                .get(&MarketRecorder::event_key("polymarket", "event-d"))
+        );
+    }
+
+    #[test]
+    fn instrument_before_start_is_closed_by_matching_event_end() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut recorder = MarketRecorder::new(tempdir.path().to_path_buf()).expect("recorder");
+        recorder
+            .write_event(&binary_option(
+                "event-early",
+                "btc-updown-5m-1774809000",
+                "token-early",
+            ))
+            .unwrap();
+        let file_key = recorder
+            .token_to_file_key
+            .get("token-early")
+            .cloned()
+            .expect("early token mapping");
+        assert!(recorder.buffers.contains_key(&file_key));
+
+        recorder
+            .write_event(&MarketEvent::EventStart {
+                exchange: crate::types::Exchange::Polymarket,
+                symbol: "series:btc-updown-5m".to_string(),
+                event_id: "event-early".to_string(),
+                event_start_ns: 1,
+            })
+            .unwrap();
+        recorder
+            .write_event(&MarketEvent::EventEnd {
+                exchange: crate::types::Exchange::Polymarket,
+                symbol: "series:btc-updown-5m".to_string(),
+                event_id: "event-early".to_string(),
+                retired_symbols: vec!["token-early".to_string()],
+                event_end_ns: 2,
+            })
+            .unwrap();
+
+        assert!(!recorder.buffers.contains_key(&file_key));
+        assert!(!recorder.token_to_file_key.contains_key("token-early"));
+        assert!(!recorder
+            .event_to_series
+            .contains_key(&MarketRecorder::event_key("polymarket", "event-early")));
     }
 }

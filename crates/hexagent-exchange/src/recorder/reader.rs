@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use log::{info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::*;
 
@@ -18,24 +19,60 @@ struct ReplayRow {
     event: MarketEvent,
 }
 
-/// Reads Parquet market data files and replays events in order.
-/// Loads files on demand — only one file's data is held in memory at a time.
-pub struct MarketReplayer {
-    /// Sorted list of parquet files to replay.
-    files: Vec<PathBuf>,
-    /// Index of the next file to load.
-    file_cursor: usize,
-    /// Events from the currently loaded file, sorted by local_timestamp_ns.
+const REPLAYER_BATCH_ROWS: usize = 8_192;
+
+static REPLAYER_BUFFERED_ROWS: AtomicU64 = AtomicU64::new(0);
+static REPLAYER_BUFFER_CAPACITY: AtomicU64 = AtomicU64::new(0);
+static REPLAYER_LOADED_ROWS: AtomicU64 = AtomicU64::new(0);
+static REPLAYER_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayerStats {
+    pub buffered_rows: u64,
+    pub buffer_capacity: u64,
+    pub loaded_rows: u64,
+    pub active_streams: u64,
+}
+
+pub fn replayer_stats() -> ReplayerStats {
+    ReplayerStats {
+        buffered_rows: REPLAYER_BUFFERED_ROWS.load(Ordering::Acquire),
+        buffer_capacity: REPLAYER_BUFFER_CAPACITY.load(Ordering::Acquire),
+        loaded_rows: REPLAYER_LOADED_ROWS.load(Ordering::Acquire),
+        active_streams: REPLAYER_ACTIVE_STREAMS.load(Ordering::Acquire),
+    }
+}
+
+struct ReplayBatch {
     rows: Vec<ReplayRow>,
-    /// Cursor within current file's rows.
+}
+
+impl ReplayBatch {
+    fn new(rows: Vec<ReplayRow>) -> Self {
+        REPLAYER_BUFFERED_ROWS.fetch_add(rows.len() as u64, Ordering::AcqRel);
+        REPLAYER_BUFFER_CAPACITY.fetch_add(rows.capacity() as u64, Ordering::AcqRel);
+        Self { rows }
+    }
+}
+
+impl Drop for ReplayBatch {
+    fn drop(&mut self) {
+        REPLAYER_BUFFERED_ROWS.fetch_sub(self.rows.len() as u64, Ordering::AcqRel);
+        REPLAYER_BUFFER_CAPACITY.fetch_sub(self.rows.capacity() as u64, Ordering::AcqRel);
+    }
+}
+
+/// Reads Parquet market data files and replays events in order. The producer
+/// hands Arrow-sized batches directly to a two-batch consumer window; an hour
+/// is never materialised as one `Vec<ReplayRow>`.
+pub struct MarketReplayer {
+    batch_rx: Option<crossbeam_channel::Receiver<ReplayBatch>>,
+    loader_handle: Option<std::thread::JoinHandle<()>>,
+    current_batch: Option<ReplayBatch>,
+    lookahead_batch: Option<ReplayBatch>,
     row_cursor: usize,
-    start_ns: u64,
-    end_ns: u64,
     event_count: u64,
     source: String,
-    loaded_files: usize,
-    loaded_rows: u64,
-    summary_logged: bool,
 }
 
 impl MarketReplayer {
@@ -55,34 +92,53 @@ impl MarketReplayer {
         let all_files = discover_parquet_files(data_dir, exchange, symbol)?;
         let start_secs = start_ns / 1_000_000_000;
         let end_secs = end_ns / 1_000_000_000;
-        let files: Vec<PathBuf> = all_files.into_iter().filter(|f| {
-            match extract_file_timestamp(f) {
+        let files: Vec<PathBuf> = all_files
+            .into_iter()
+            .filter(|f| match extract_file_timestamp(f) {
                 Some((ts, duration)) => {
                     let file_end = ts + duration;
                     file_end > start_secs && ts < end_secs
                 }
                 None => true,
-            }
-        }).collect();
+            })
+            .collect();
 
         if files.is_empty() {
-            return Err(anyhow!("No Parquet files found for {}/{} in time range", exchange, symbol));
+            return Err(anyhow!(
+                "No Parquet files found for {}/{} in time range",
+                exchange,
+                symbol
+            ));
         }
 
-        info!("[Replayer] Found {} Parquet files for {}/{}", files.len(), exchange, symbol);
+        info!(
+            "[Replayer] Found {} Parquet files for {}/{}",
+            files.len(),
+            exchange,
+            symbol
+        );
 
+        let source = format!("{exchange}/{symbol}");
+        let worker_source = source.clone();
+        // Rendezvous handoff: at steady state the replayer owns current +
+        // lookahead and the loader can hold at most one decoded batch while
+        // blocked on send. This is a hard three-batch memory bound.
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(0);
+        let loader_handle = std::thread::Builder::new()
+            .name("market-replay-loader".to_string())
+            .spawn(move || {
+                hexagent_runtime::os_tune::pin_background("market-replay-loader");
+                stream_replay_files(files, start_ns, end_ns, &worker_source, batch_tx);
+            })?;
+        REPLAYER_ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
-            files,
-            file_cursor: 0,
-            rows: Vec::new(),
+            batch_rx: Some(batch_rx),
+            loader_handle: Some(loader_handle),
+            current_batch: None,
+            lookahead_batch: None,
             row_cursor: 0,
-            start_ns,
-            end_ns,
             event_count: 0,
-            source: format!("{exchange}/{symbol}"),
-            loaded_files: 0,
-            loaded_rows: 0,
-            summary_logged: false,
+            source,
         })
     }
 
@@ -187,90 +243,62 @@ impl MarketReplayer {
             loaded_rows,
             path.display(),
         );
+        REPLAYER_LOADED_ROWS.fetch_add(loaded_rows, Ordering::AcqRel);
+        REPLAYER_ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
-            files: Vec::new(),
-            file_cursor: 0,
-            rows,
+            batch_rx: None,
+            loader_handle: None,
+            current_batch: Some(ReplayBatch::new(rows)),
+            lookahead_batch: None,
             row_cursor: 0,
-            start_ns,
-            end_ns,
             event_count: 0,
             source: format!("health-sidecar/{}", path.display()),
-            loaded_files: 1,
-            loaded_rows,
-            summary_logged: false,
         })
     }
 
-    /// Load the next file's events into memory.
-    fn load_next_file(&mut self) -> bool {
-        while self.file_cursor < self.files.len() {
-            let path = &self.files[self.file_cursor];
-            self.file_cursor += 1;
-            match read_parquet_events(path, self.start_ns, self.end_ns) {
-                Ok(mut file_rows) => {
-                    file_rows.sort_by_key(|r| r.local_timestamp_ns);
-                    if !file_rows.is_empty() {
-                        self.loaded_files = self.loaded_files.saturating_add(1);
-                        self.loaded_rows = self.loaded_rows.saturating_add(file_rows.len() as u64);
-                        log::debug!(
-                            "[Replayer] Loaded {} rows from {}",
-                            file_rows.len(),
-                            path.display(),
-                        );
-                        self.rows = file_rows;
-                        self.row_cursor = 0;
-                        return true;
-                    }
-                }
-                Err(e) => {
-                    // Zero-byte / truncated parquet files appear when the
-                    // recorder creates the file but crashes / restarts
-                    // before writing any rows (we saw 3 such files at
-                    // `0514/20260514_04.parquet` for BTC/ETH/SOL on
-                    // 2026-05-14). The size pre-check in
-                    // `read_parquet_events` surfaces these as
-                    // `empty parquet file (...)` so they're easy to grep
-                    // for in production logs.
-                    //
-                    // `warn` (not `info`) because a corrupt / empty file
-                    // is a real recorder pathology that the operator
-                    // should notice; the predictor's warm-up loses that
-                    // hour's training samples even though replay won't
-                    // crash.
-                    let msg = e.to_string();
-                    if msg.starts_with("empty parquet file") {
-                        warn!("[Replayer] Skip empty file {}: {}", path.display(), e);
-                    } else {
-                        info!("[Replayer] Skip {}: {}", path.display(), e);
-                    }
-                }
-            }
+    fn load_next_batch(&mut self) -> bool {
+        self.current_batch = None;
+        self.row_cursor = 0;
+        if let Some(batch) = self.lookahead_batch.take() {
+            self.current_batch = Some(batch);
         }
-        if !self.summary_logged {
-            info!(
-                "[Replayer] Replay source summary source={} candidate_files={} loaded_files={} loaded_rows={}",
-                self.source,
-                self.files.len(),
-                self.loaded_files,
-                self.loaded_rows,
-            );
-            self.summary_logged = true;
+        let Some(rx) = self.batch_rx.as_ref() else {
+            return self.current_batch.is_some();
+        };
+        if self.current_batch.is_none() {
+            self.current_batch = rx.recv().ok();
         }
-        false
+        if self.current_batch.is_some() && self.lookahead_batch.is_none() {
+            self.lookahead_batch = rx.recv().ok();
+        }
+        self.current_batch.is_some()
+    }
+
+    fn unconsumed_rows(&self) -> impl Iterator<Item = &ReplayRow> {
+        self.current_batch
+            .iter()
+            .flat_map(|batch| batch.rows[self.row_cursor..].iter())
+            .chain(
+                self.lookahead_batch
+                    .iter()
+                    .flat_map(|batch| batch.rows.iter()),
+            )
     }
 
     /// Get next event with its recorded local timestamp, optionally simulating inter-event timing.
     pub fn next_event(&mut self) -> Result<Option<(u64, MarketEvent)>> {
-        // If current file exhausted, load next
-        if self.row_cursor >= self.rows.len() {
-            if !self.load_next_file() {
+        let exhausted = self
+            .current_batch
+            .as_ref()
+            .is_none_or(|batch| self.row_cursor >= batch.rows.len());
+        if exhausted {
+            if !self.load_next_batch() {
                 return Ok(None);
             }
         }
 
         // Take ownership of event instead of cloning (avoids heap allocation per event)
-        let row = &mut self.rows[self.row_cursor];
+        let row = &mut self.current_batch.as_mut().unwrap().rows[self.row_cursor];
         let ts = row.local_timestamp_ns;
         let event = std::mem::replace(&mut row.event, MarketEvent::Exit);
         self.row_cursor += 1;
@@ -300,10 +328,10 @@ impl MarketReplayer {
     /// the event stream.
     pub fn peek_orderbook_mid_at(&self, symbol: &str, target_ns: u64) -> Option<f64> {
         const MAX_SCAN: usize = 16384;
-        let end = (self.row_cursor + MAX_SCAN).min(self.rows.len());
-        for i in self.row_cursor..end {
-            let row = &self.rows[i];
-            if row.local_timestamp_ns < target_ns { continue; }
+        for row in self.unconsumed_rows().take(MAX_SCAN) {
+            if row.local_timestamp_ns < target_ns {
+                continue;
+            }
             if let crate::types::MarketEvent::OrderBook(ob) = &row.event {
                 if ob.symbol == symbol {
                     return Some(ob.mid_price());
@@ -323,11 +351,14 @@ impl MarketReplayer {
         &self,
         symbol: &str,
         after_exch_ns: u64,
-    ) -> Option<(u64, Vec<crate::types::PriceLevel>, Vec<crate::types::PriceLevel>)> {
+    ) -> Option<(
+        u64,
+        Vec<crate::types::PriceLevel>,
+        Vec<crate::types::PriceLevel>,
+    )> {
         const MAX_SCAN: usize = 16384;
-        let end = (self.row_cursor + MAX_SCAN).min(self.rows.len());
-        for i in self.row_cursor..end {
-            if let crate::types::MarketEvent::OrderBook(ob) = &self.rows[i].event {
+        for row in self.unconsumed_rows().take(MAX_SCAN) {
+            if let crate::types::MarketEvent::OrderBook(ob) = &row.event {
                 if ob.symbol == symbol && ob.exchange_timestamp_ns > after_exch_ns {
                     return Some((ob.exchange_timestamp_ns, ob.bids.clone(), ob.asks.clone()));
                 }
@@ -343,11 +374,14 @@ impl MarketReplayer {
         &self,
         symbol: &str,
         after_exch_ns: u64,
-    ) -> Option<(u64, &[crate::types::PriceLevel], &[crate::types::PriceLevel])> {
+    ) -> Option<(
+        u64,
+        &[crate::types::PriceLevel],
+        &[crate::types::PriceLevel],
+    )> {
         const MAX_SCAN: usize = 16384;
-        let end = (self.row_cursor + MAX_SCAN).min(self.rows.len());
-        for i in self.row_cursor..end {
-            if let crate::types::MarketEvent::OrderBook(ob) = &self.rows[i].event {
+        for row in self.unconsumed_rows().take(MAX_SCAN) {
+            if let crate::types::MarketEvent::OrderBook(ob) = &row.event {
                 if ob.symbol == symbol && ob.exchange_timestamp_ns > after_exch_ns {
                     return Some((ob.exchange_timestamp_ns, &ob.bids, &ob.asks));
                 }
@@ -365,12 +399,15 @@ impl MarketReplayer {
         symbol: &str,
         after_ns: u64,
         until_ns: u64,
-    ) -> Vec<(u64, Vec<crate::types::PriceLevel>, Vec<crate::types::PriceLevel>)> {
+    ) -> Vec<(
+        u64,
+        Vec<crate::types::PriceLevel>,
+        Vec<crate::types::PriceLevel>,
+    )> {
         const MAX_SCAN: usize = 16384;
-        let end = (self.row_cursor + MAX_SCAN).min(self.rows.len());
         let mut out = Vec::new();
-        for i in self.row_cursor..end {
-            if let crate::types::MarketEvent::OrderBook(ob) = &self.rows[i].event {
+        for row in self.unconsumed_rows().take(MAX_SCAN) {
+            if let crate::types::MarketEvent::OrderBook(ob) = &row.event {
                 if ob.symbol == symbol
                     && ob.exchange_timestamp_ns > after_ns
                     && ob.exchange_timestamp_ns <= until_ns
@@ -383,12 +420,93 @@ impl MarketReplayer {
     }
 }
 
+impl Drop for MarketReplayer {
+    fn drop(&mut self) {
+        // Drop the receiver first so a producer blocked on the two-batch lane
+        // wakes immediately, then release the current decoded batch and join.
+        self.batch_rx = None;
+        self.current_batch = None;
+        self.lookahead_batch = None;
+        if let Some(handle) = self.loader_handle.take() {
+            let _ = handle.join();
+        }
+        REPLAYER_ACTIVE_STREAMS.fetch_sub(1, Ordering::AcqRel);
+        log::debug!(
+            "[Replayer] closed source={} emitted_rows={}",
+            self.source,
+            self.event_count
+        );
+    }
+}
+
+fn stream_replay_files(
+    files: Vec<PathBuf>,
+    start_ns: u64,
+    end_ns: u64,
+    source: &str,
+    batch_tx: crossbeam_channel::Sender<ReplayBatch>,
+) {
+    let candidate_files = files.len();
+    let mut loaded_files = 0_usize;
+    let mut loaded_rows = 0_u64;
+    for path in files {
+        let mut consumer_open = true;
+        let result = stream_parquet_event_batches(&path, start_ns, end_ns, |mut rows| {
+            if rows.is_empty() {
+                return true;
+            }
+            rows.sort_by_key(|row| row.local_timestamp_ns);
+            let count = rows.len() as u64;
+            REPLAYER_LOADED_ROWS.fetch_add(count, Ordering::AcqRel);
+            loaded_rows = loaded_rows.saturating_add(count);
+            log::debug!("[Replayer] Decoded {} rows from {}", count, path.display());
+            consumer_open = batch_tx.send(ReplayBatch::new(rows)).is_ok();
+            consumer_open
+        });
+        match result {
+            Ok(file_rows) => {
+                if file_rows > 0 {
+                    loaded_files = loaded_files.saturating_add(1);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("empty parquet file") {
+                    warn!("[Replayer] Skip empty file {}: {}", path.display(), error);
+                } else {
+                    info!("[Replayer] Skip {}: {}", path.display(), error);
+                }
+            }
+        }
+        if !consumer_open {
+            return;
+        }
+    }
+    info!(
+        "[Replayer] Replay source summary source={} candidate_files={} loaded_files={} loaded_rows={}",
+        source, candidate_files, loaded_files, loaded_rows,
+    );
+}
+
 /// Extract a Unix timestamp (seconds) and duration (seconds) from a parquet filename.
 /// Returns (timestamp, duration_secs).
 /// Handles: "btc-updown-5m-1774868400-321239.parquet" → Some((1774868400, 300))
 ///          "20260330_18.parquet" → Some((1774990800, 3600))
 fn extract_file_timestamp(path: &Path) -> Option<(u64, u64)> {
-    let stem = path.file_stem()?.to_str()?;
+    let raw_stem = path.file_stem()?.to_str()?;
+    // Recorder row-group shards preserve the canonical base name and append
+    // `.part-NNNNNN`; time filtering must use the base rather than interpreting
+    // the shard number as an event id or timestamp.
+    let stem = raw_stem
+        .rsplit_once(".part-")
+        .map(|(base, suffix)| {
+            suffix
+                .chars()
+                .all(|character| character.is_ascii_digit())
+                .then_some(base)
+                .unwrap_or(raw_stem)
+        })
+        .unwrap_or(raw_stem);
     // Try YYYYMMDD_HHMM format (5-minute files)
     if stem.len() == 13 && stem.contains('_') {
         let date_part = &stem[..8];
@@ -416,10 +534,15 @@ fn extract_file_timestamp(path: &Path) -> Option<(u64, u64)> {
             if ts > 1_700_000_000 {
                 // Parse duration from slug: "5m" → 300, "15m" → 900, "1h" → 3600
                 let slug_prefix = if parts.len() >= 3 { parts[2] } else { "" };
-                let duration = slug_prefix.split('-')
+                let duration = slug_prefix
+                    .split('-')
                     .find_map(|p| {
-                        p.strip_suffix('m').and_then(|n| n.parse::<u64>().ok().map(|n| n * 60))
-                            .or_else(|| p.strip_suffix('h').and_then(|n| n.parse::<u64>().ok().map(|n| n * 3600)))
+                        p.strip_suffix('m')
+                            .and_then(|n| n.parse::<u64>().ok().map(|n| n * 60))
+                            .or_else(|| {
+                                p.strip_suffix('h')
+                                    .and_then(|n| n.parse::<u64>().ok().map(|n| n * 3600))
+                            })
                     })
                     .unwrap_or(300); // default 5 min
                 return Some((ts, duration));
@@ -445,7 +568,11 @@ pub fn latest_recorded_ts_ns(data_dir: &Path, exchange: &str, symbol: &str) -> O
         return None;
     }
     // Order by the filename-embedded window end so we probe newest-first.
-    files.sort_by_key(|f| extract_file_timestamp(f).map(|(ts, dur)| ts + dur).unwrap_or(0));
+    files.sort_by_key(|f| {
+        extract_file_timestamp(f)
+            .map(|(ts, dur)| ts + dur)
+            .unwrap_or(0)
+    });
     for path in files.iter().rev().take(3) {
         if let Ok(rows) = read_parquet_events(path, 0, u64::MAX) {
             if let Some(max_ts) = rows.iter().map(|r| r.local_timestamp_ns).max() {
@@ -596,7 +723,11 @@ fn fast_parse_levels(b: &[u8]) -> Option<Vec<PriceLevel>> {
     i = skip_ws(b, i + 1);
     let mut out = Vec::with_capacity(8); // recorder caps depth at 5/side
     if i < n && b[i] == b']' {
-        return if skip_ws(b, i + 1) == n { Some(out) } else { None };
+        return if skip_ws(b, i + 1) == n {
+            Some(out)
+        } else {
+            None
+        };
     }
     loop {
         if i >= n || b[i] != b'{' {
@@ -639,7 +770,12 @@ fn parse_market_event_json(json: Option<&str>) -> Option<MarketEvent> {
     serde_json::from_str::<MarketEvent>(json?).ok()
 }
 
-fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<ReplayRow>> {
+fn stream_parquet_event_batches(
+    path: &Path,
+    start_ns: u64,
+    end_ns: u64,
+    mut emit: impl FnMut(Vec<ReplayRow>) -> bool,
+) -> Result<u64> {
     // Defensive size check before opening the parquet builder.
     // Zero-byte files appear at hour boundaries when the recorder
     // creates the file but crashes / restarts before writing any rows.
@@ -647,53 +783,67 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
     // bytes") but the typed error here surfaces the root cause cleanly
     // — and saves the syscall round-trip to mmap a footer that doesn't
     // exist.
-    let md = std::fs::metadata(path)
-        .map_err(|e| anyhow!("metadata({}): {}", path.display(), e))?;
+    let md = std::fs::metadata(path).map_err(|e| anyhow!("metadata({}): {}", path.display(), e))?;
     if md.len() == 0 {
         return Err(anyhow!("empty parquet file ({})", path.display()));
     }
     let file = std::fs::File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(REPLAYER_BATCH_ROWS);
     let reader = builder.build()?;
 
-    let mut rows = Vec::new();
+    let mut total_rows = 0_u64;
     let mut has_instrument = false;
-    let mut token_ids: Vec<String> = Vec::new();
-    let mut min_ts = u64::MAX;
 
     for batch_result in reader {
         let batch = batch_result?;
         let n = batch.num_rows();
+        let mut rows = Vec::with_capacity(n.min(REPLAYER_BATCH_ROWS));
 
-        let ts_col = batch.column_by_name("timestamp_ns")
+        let ts_col = batch
+            .column_by_name("timestamp_ns")
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let local_ts_col = batch.column_by_name("local_timestamp_ns")
+        let local_ts_col = batch
+            .column_by_name("local_timestamp_ns")
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let exchange_col = batch.column_by_name("exchange")
+        let exchange_col = batch
+            .column_by_name("exchange")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let etype_col = batch.column_by_name("event_type")
+        let etype_col = batch
+            .column_by_name("event_type")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let symbol_col = batch.column_by_name("symbol")
+        let symbol_col = batch
+            .column_by_name("symbol")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let side_col = batch.column_by_name("side")
+        let side_col = batch
+            .column_by_name("side")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let price_col = batch.column_by_name("price")
+        let price_col = batch
+            .column_by_name("price")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let quantity_col = batch.column_by_name("quantity")
+        let quantity_col = batch
+            .column_by_name("quantity")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let bid_price_col = batch.column_by_name("bid_price")
+        let bid_price_col = batch
+            .column_by_name("bid_price")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let ask_price_col = batch.column_by_name("ask_price")
+        let ask_price_col = batch
+            .column_by_name("ask_price")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let bid_qty_col = batch.column_by_name("bid_qty")
+        let bid_qty_col = batch
+            .column_by_name("bid_qty")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let ask_qty_col = batch.column_by_name("ask_qty")
+        let ask_qty_col = batch
+            .column_by_name("ask_qty")
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let bids_json_col = batch.column_by_name("bids_json")
+        let bids_json_col = batch
+            .column_by_name("bids_json")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let asks_json_col = batch.column_by_name("asks_json")
+        let asks_json_col = batch
+            .column_by_name("asks_json")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let data_json_col = batch.column_by_name("data_json")
+        let data_json_col = batch
+            .column_by_name("data_json")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
         let (ts_arr, local_ts_arr, exchange_arr, etype_arr, symbol_arr) =
@@ -755,16 +905,6 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                 }
             };
 
-            // Track token IDs and min timestamp for synthetic instrument
-            if matches!(event_type, "orderbook" | "trade") {
-                if exchange == Exchange::Polymarket && !token_ids.contains(&symbol.to_string()) {
-                    token_ids.push(symbol.to_string());
-                }
-                if local_ts < min_ts {
-                    min_ts = local_ts;
-                }
-            }
-
             let event = match event_type {
                 "orderbook" => {
                     let bids = bids_json_col
@@ -788,7 +928,8 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                 "trade" => {
                     let price = price_col.map(|c| c.value(i)).unwrap_or(0.0);
                     let quantity = quantity_col.map(|c| c.value(i)).unwrap_or(0.0);
-                    let side_str = side_col.and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+                    let side_str =
+                        side_col.and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
                     let side = match side_str {
                         Some("buy") => Side::Buy,
                         _ => Side::Sell,
@@ -805,28 +946,24 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                         local_timestamp_ns: local_ts,
                     })
                 }
-                "quote" => {
-                    MarketEvent::Quote(QuoteTick {
-                        exchange,
-                        symbol: symbol.to_string(),
-                        bid_price: bid_price_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        bid_qty: bid_qty_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        ask_price: ask_price_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        ask_qty: ask_qty_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        exchange_timestamp_ns: exchange_ts,
-                        local_timestamp_ns: local_ts,
-                    })
-                }
-                "tick_size_change" => {
-                    MarketEvent::TickSizeChange(TickSizeChange {
-                        exchange,
-                        symbol: symbol.to_string(),
-                        old_tick_size: quantity_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        new_tick_size: price_col.map(|c| c.value(i)).unwrap_or(0.0),
-                        exchange_timestamp_ns: exchange_ts,
-                        local_timestamp_ns: local_ts,
-                    })
-                }
+                "quote" => MarketEvent::Quote(QuoteTick {
+                    exchange,
+                    symbol: symbol.to_string(),
+                    bid_price: bid_price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    bid_qty: bid_qty_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    ask_price: ask_price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    ask_qty: ask_qty_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    exchange_timestamp_ns: exchange_ts,
+                    local_timestamp_ns: local_ts,
+                }),
+                "tick_size_change" => MarketEvent::TickSizeChange(TickSizeChange {
+                    exchange,
+                    symbol: symbol.to_string(),
+                    old_tick_size: quantity_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    new_tick_size: price_col.map(|c| c.value(i)).unwrap_or(0.0),
+                    exchange_timestamp_ns: exchange_ts,
+                    local_timestamp_ns: local_ts,
+                }),
                 // `spot_price_proxy` is the legacy event_type written
                 // by the recorder for derived/computed spot feeds (e.g.
                 // binance_futures USDTUSD@assetIndex). Both names map
@@ -873,8 +1010,9 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                 "instrument" => {
                     has_instrument = true;
                     // Reconstruct from data_json
-                    let json_str = data_json_col
-                        .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+                    let json_str =
+                        data_json_col
+                            .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
                     if let Some(event) = parse_market_event_json(json_str) {
                         event
                     } else {
@@ -882,8 +1020,9 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                     }
                 }
                 "market_data_health" => {
-                    let json_str = data_json_col
-                        .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+                    let json_str =
+                        data_json_col
+                            .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
                     let Some(event @ MarketEvent::MarketDataHealth(_)) =
                         parse_market_event_json(json_str)
                     else {
@@ -894,7 +1033,14 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
                 _ => continue,
             };
 
-            rows.push(ReplayRow { local_timestamp_ns: local_ts, event });
+            rows.push(ReplayRow {
+                local_timestamp_ns: local_ts,
+                event,
+            });
+        }
+        total_rows = total_rows.saturating_add(rows.len() as u64);
+        if !rows.is_empty() && !emit(rows) {
+            return Ok(total_rows);
         }
     }
 
@@ -902,12 +1048,90 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
         warn!("[Replayer] No instrument in {}", path.display());
     }
 
+    Ok(total_rows)
+}
+
+/// Compatibility helper for narrow metadata probes and tests. Runtime replay
+/// uses [`stream_parquet_event_batches`] directly and never calls this full
+/// collection path.
+fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<ReplayRow>> {
+    let mut rows = Vec::new();
+    stream_parquet_event_batches(path, start_ns, end_ns, |batch| {
+        rows.extend(batch);
+        true
+    })?;
     Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_suffix_keeps_base_time_window() {
+        let hourly = Path::new("20260823_14.part-000042.parquet");
+        let five_minute = Path::new("20260823_1430.part-000007.parquet");
+        let slug = Path::new("btc-updown-5m-1774868400-321239.part-000003.parquet");
+
+        assert_eq!(
+            extract_file_timestamp(hourly).map(|value| value.1),
+            Some(3600)
+        );
+        assert_eq!(
+            extract_file_timestamp(five_minute).map(|value| value.1),
+            Some(300)
+        );
+        assert_eq!(extract_file_timestamp(slug), Some((1_774_868_400, 300)));
+    }
+
+    #[test]
+    fn market_replayer_streams_multiple_shards_through_two_batch_window() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut recorder =
+            crate::recorder::MarketRecorder::new(tempdir.path().to_path_buf()).expect("recorder");
+        let base_ns = 1_774_868_400_u64 * 1_000_000_000;
+        for index in 0..20_000_u64 {
+            recorder
+                .write_event(&MarketEvent::Quote(QuoteTick {
+                    exchange: Exchange::Binance,
+                    symbol: "BTCUSDT".to_string(),
+                    bid_price: 100.0,
+                    bid_qty: 1.0,
+                    ask_price: 101.0,
+                    ask_qty: 1.0,
+                    exchange_timestamp_ns: base_ns + index,
+                    local_timestamp_ns: base_ns + index,
+                }))
+                .expect("record quote");
+        }
+        recorder.flush().expect("flush recorder");
+
+        let start = DateTime::<Utc>::from_timestamp((base_ns / 1_000_000_000) as i64, 0).unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let mut replay = MarketReplayer::new(tempdir.path(), "binance", "BTCUSDT", start, end)
+            .expect("replayer");
+
+        let mut count = 0_u64;
+        let mut previous = 0_u64;
+        while let Some((timestamp, event)) = replay.next_event().expect("next event") {
+            assert!(matches!(event, MarketEvent::Quote(_)));
+            assert!(timestamp >= previous);
+            previous = timestamp;
+            count += 1;
+            let resident_capacity = replay
+                .current_batch
+                .as_ref()
+                .map(|batch| batch.rows.capacity())
+                .unwrap_or(0)
+                + replay
+                    .lookahead_batch
+                    .as_ref()
+                    .map(|batch| batch.rows.capacity())
+                    .unwrap_or(0);
+            assert!(resident_capacity <= REPLAYER_BATCH_ROWS * 2);
+        }
+        assert_eq!(count, 20_000);
+    }
 
     #[test]
     fn market_data_health_json_roundtrips_for_replay() {
@@ -973,23 +1197,31 @@ mod tests {
         let cases = [
             r#"[{"price":0.52,"quantity":100.0},{"price":0.51,"quantity":250.5}]"#,
             r#"[{"price":0.999,"quantity":1.0},{"price":0.001,"quantity":1000000.0}]"#,
-            r#"[{"price":1,"quantity":0}]"#,                 // integer literals
-            r#"[{"price":6.1e-2,"quantity":1.25e3}]"#,        // scientific notation
-            r#"[{"price":-0.0,"quantity":12.5}]"#,            // signed zero
-            r#"[]"#,                                          // empty book side
+            r#"[{"price":1,"quantity":0}]"#, // integer literals
+            r#"[{"price":6.1e-2,"quantity":1.25e3}]"#, // scientific notation
+            r#"[{"price":-0.0,"quantity":12.5}]"#, // signed zero
+            r#"[]"#,                         // empty book side
             r#"[{"price":0.6612345678901234,"quantity":0.1}]"#, // long mantissa (rounding)
-            r#" [ {"price": 0.5 , "quantity": 3.0 } ] "#,     // whitespace → fallback path
-            r#"[{"quantity":3.0,"price":0.5}]"#,              // field order reversed → fallback
-            r#"not json"#,                                    // malformed → empty
-            r#"[{"price":0.5}]"#,                             // missing field → fallback→empty
+            r#" [ {"price": 0.5 , "quantity": 3.0 } ] "#, // whitespace → fallback path
+            r#"[{"quantity":3.0,"price":0.5}]"#, // field order reversed → fallback
+            r#"not json"#,                   // malformed → empty
+            r#"[{"price":0.5}]"#,            // missing field → fallback→empty
         ];
         for c in cases {
             let got = parse_price_levels(c);
             let serde = serde_json::from_str::<Vec<PriceLevel>>(c).unwrap_or_default();
             assert_eq!(got.len(), serde.len(), "len mismatch for {c}");
             for (a, b) in got.iter().zip(serde.iter()) {
-                assert_eq!(a.price.to_bits(), b.price.to_bits(), "price bits differ for {c}");
-                assert_eq!(a.quantity.to_bits(), b.quantity.to_bits(), "qty bits differ for {c}");
+                assert_eq!(
+                    a.price.to_bits(),
+                    b.price.to_bits(),
+                    "price bits differ for {c}"
+                );
+                assert_eq!(
+                    a.quantity.to_bits(),
+                    b.quantity.to_bits(),
+                    "qty bits differ for {c}"
+                );
             }
         }
     }
@@ -999,24 +1231,61 @@ mod tests {
     #[test]
     fn custom_parser_roundtrips_recorder_format() {
         let books: Vec<Vec<PriceLevel>> = vec![
-            vec![PriceLevel { price: 0.523, quantity: 100.0 }, PriceLevel { price: 0.517, quantity: 250.5 }],
-            vec![PriceLevel { price: 0.0001, quantity: 1_000_000.0 }, PriceLevel { price: 0.9999, quantity: 0.01 }],
-            vec![PriceLevel { price: 1.0 / 3.0, quantity: 7.0 / 11.0 }], // non-terminating decimals
+            vec![
+                PriceLevel {
+                    price: 0.523,
+                    quantity: 100.0,
+                },
+                PriceLevel {
+                    price: 0.517,
+                    quantity: 250.5,
+                },
+            ],
+            vec![
+                PriceLevel {
+                    price: 0.0001,
+                    quantity: 1_000_000.0,
+                },
+                PriceLevel {
+                    price: 0.9999,
+                    quantity: 0.01,
+                },
+            ],
+            vec![PriceLevel {
+                price: 1.0 / 3.0,
+                quantity: 7.0 / 11.0,
+            }], // non-terminating decimals
             vec![],
         ];
         for b in &books {
-            let s = serde_json::to_string(b).unwrap();           // recorder's exact output
+            let s = serde_json::to_string(b).unwrap(); // recorder's exact output
             let got = parse_price_levels(&s);
             let serde = serde_json::from_str::<Vec<PriceLevel>>(&s).unwrap_or_default();
             assert_eq!(got.len(), serde.len(), "len mismatch for {s}");
             for (x, y) in got.iter().zip(serde.iter()) {
-                assert_eq!(x.price.to_bits(), y.price.to_bits(), "price bits differ for {s}");
-                assert_eq!(x.quantity.to_bits(), y.quantity.to_bits(), "qty bits differ for {s}");
+                assert_eq!(
+                    x.price.to_bits(),
+                    y.price.to_bits(),
+                    "price bits differ for {s}"
+                );
+                assert_eq!(
+                    x.quantity.to_bits(),
+                    y.quantity.to_bits(),
+                    "qty bits differ for {s}"
+                );
                 // and equal to the ORIGINAL f64 (round-trip)
             }
             for (x, orig) in got.iter().zip(b.iter()) {
-                assert_eq!(x.price.to_bits(), orig.price.to_bits(), "price not round-tripped for {s}");
-                assert_eq!(x.quantity.to_bits(), orig.quantity.to_bits(), "qty not round-tripped for {s}");
+                assert_eq!(
+                    x.price.to_bits(),
+                    orig.price.to_bits(),
+                    "price not round-tripped for {s}"
+                );
+                assert_eq!(
+                    x.quantity.to_bits(),
+                    orig.quantity.to_bits(),
+                    "qty not round-tripped for {s}"
+                );
             }
         }
     }
@@ -1033,7 +1302,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hexbot_empty_pq_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("zero.parquet");
-        std::fs::File::create(&path).unwrap();   // 0 bytes
+        std::fs::File::create(&path).unwrap(); // 0 bytes
         let err = match read_parquet_events(&path, 0, u64::MAX) {
             Err(e) => e,
             Ok(_) => panic!("must error on zero-byte parquet"),
@@ -1041,7 +1310,8 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.starts_with("empty parquet file"),
-            "expected `empty parquet file ...`, got: {}", msg,
+            "expected `empty parquet file ...`, got: {}",
+            msg,
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

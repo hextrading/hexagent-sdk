@@ -15,5 +15,6 @@ pub mod background_jobs;
 pub mod http1_pool;
 pub mod latency;
 pub mod latency_record;
+pub mod memory;
 pub mod os_tune;
 pub mod shutdown;
