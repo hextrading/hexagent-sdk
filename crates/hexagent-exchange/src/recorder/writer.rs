@@ -109,6 +109,9 @@ struct ParquetBuffer {
     pending_batch: Option<RecordBatch>,
     /// Total rows durably written across completed shards.
     rows_written: usize,
+    /// `flush()` and `Drop` may both close a stream during shutdown. Keep the
+    /// final write/log idempotent so a retired stream is finalized once.
+    closed: bool,
     // One fixed-capacity columnar row group.
     timestamp_ns: Vec<u64>,
     local_timestamp_ns: Vec<u64>,
@@ -135,6 +138,7 @@ impl ParquetBuffer {
             next_shard_id: 0,
             pending_batch: None,
             rows_written: 0,
+            closed: false,
             timestamp_ns: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
             local_timestamp_ns: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
             exchange: Vec::with_capacity(RECORDER_ROW_GROUP_ROWS),
@@ -532,6 +536,9 @@ impl ParquetBuffer {
     /// Final write + log. Called on hour rotation or shutdown. After
     /// this returns the buffer can be dropped — its data is on disk.
     fn close(&mut self) {
+        if self.closed {
+            return;
+        }
         let had_data = !self.timestamp_ns.is_empty();
         if let Err(e) = self.write_pending_shards() {
             log::error!("[Recorder] close shard write failed: {}", e);
@@ -544,6 +551,7 @@ impl ParquetBuffer {
                 self.path.display()
             );
         }
+        self.closed = true;
     }
 }
 
@@ -655,36 +663,82 @@ impl MarketRecorder {
     }
 
     fn retire_event_context(&mut self, exchange: &str, event_id: &str, retired_symbols: &[String]) {
-        let event_key = Self::event_key(exchange, event_id);
-        self.pending_event_series.remove(&event_key);
-        let series_key = self.event_to_series.remove(&event_key).or_else(|| {
-            self.current_event_id
-                .iter()
-                .find_map(|(series, current)| (current == event_id).then(|| series.clone()))
-        });
-        if let Some(series_key) = series_key {
+        let lifecycle_event_key = Self::event_key(exchange, event_id);
+        let retired_symbol_set: HashSet<&str> =
+            retired_symbols.iter().map(String::as_str).collect();
+
+        // Gamma EventStart/EventEnd ids identify the parent event while each
+        // BinaryOption carries its child market id. The old exact-id cleanup
+        // therefore missed every pre-registered market stream. Token routing
+        // is the authoritative event-to-stream relation at this boundary:
+        // EventEnd carries all tokens removed from the live subscription.
+        let mut retired_file_keys: HashSet<String> = retired_symbols
+            .iter()
+            .filter_map(|symbol| self.token_to_file_key.get(symbol).cloned())
+            .collect();
+        let mut retired_series_keys = HashSet::new();
+
+        if let Some(series_key) = self.event_to_series.get(&lifecycle_event_key) {
+            retired_series_keys.insert(series_key.clone());
+        }
+        if let Some(series_key) = self.pending_event_series.get(&lifecycle_event_key) {
+            retired_series_keys.insert(series_key.clone());
+        }
+
+        // Resolve every series whose active file is one of the token-routed
+        // retired files. This also finds Instrument-before-EventStart fallback
+        // contexts whose current id is a market id rather than `event_id`.
+        for (series_key, current_id) in &self.current_event_id {
             let slug = self
                 .current_event_slug
-                .get(&series_key)
-                .cloned()
+                .get(series_key)
+                .map(String::as_str)
                 .unwrap_or_default();
-            let file_key = format!("{event_id}_{slug}");
-            if let Some(mut buffer) = self.buffers.remove(&file_key) {
-                buffer.close();
+            let file_key = format!("{current_id}_{slug}");
+            if current_id == event_id || retired_file_keys.contains(&file_key) {
+                retired_series_keys.insert(series_key.clone());
+                retired_file_keys.insert(file_key);
             }
-            self.token_to_file_key.retain(|symbol, mapped| {
-                mapped != &file_key && !retired_symbols.iter().any(|retired| retired == symbol)
-            });
-            if self.current_event_id.get(&series_key).map(String::as_str) == Some(event_id) {
-                self.current_event_id.remove(&series_key);
-                self.current_event_slug.remove(&series_key);
-                self.current_series_slug.remove(&series_key);
-            }
-        } else {
-            self.token_to_file_key
-                .retain(|symbol, _| !retired_symbols.iter().any(|retired| retired == symbol));
         }
-        self.remember_retired(event_key);
+
+        // Tombstone every lifecycle/market alias for the retired streams so a
+        // delayed Instrument cannot recreate a buffer after EventEnd.
+        let mut retired_aliases: Vec<String> = self
+            .event_to_series
+            .iter()
+            .filter_map(|(alias, series_key)| {
+                retired_series_keys
+                    .contains(series_key)
+                    .then(|| alias.clone())
+            })
+            .collect();
+        retired_aliases.push(lifecycle_event_key.clone());
+        retired_aliases.sort_unstable();
+        retired_aliases.dedup();
+
+        self.token_to_file_key.retain(|symbol, mapped| {
+            !retired_symbol_set.contains(symbol.as_str()) && !retired_file_keys.contains(mapped)
+        });
+        self.event_to_series.retain(|alias, series_key| {
+            retired_aliases.binary_search(alias).is_err()
+                && !retired_series_keys.contains(series_key)
+        });
+        self.pending_event_series.retain(|alias, series_key| {
+            retired_aliases.binary_search(alias).is_err()
+                && !retired_series_keys.contains(series_key)
+        });
+        for series_key in &retired_series_keys {
+            self.current_event_id.remove(series_key);
+            self.current_event_slug.remove(series_key);
+            self.current_series_slug.remove(series_key);
+        }
+        for file_key in &retired_file_keys {
+            // ParquetBuffer::Drop performs the final bounded shard write.
+            drop(self.buffers.remove(file_key));
+        }
+        for alias in retired_aliases {
+            self.remember_retired(alias);
+        }
     }
 
     fn fallback_series_slug(event_slug: &str) -> String {
@@ -743,9 +797,8 @@ impl MarketRecorder {
                 .cloned()
                 .collect();
             for old_key in old_keys {
-                if let Some(mut buf) = self.buffers.remove(&old_key) {
-                    buf.close();
-                }
+                // ParquetBuffer::Drop performs the final bounded shard write.
+                drop(self.buffers.remove(&old_key));
             }
         }
     }
@@ -1458,5 +1511,103 @@ mod tests {
         assert!(!recorder
             .event_to_series
             .contains_key(&MarketRecorder::event_key("polymarket", "event-early")));
+    }
+
+    #[test]
+    fn mismatched_event_and_market_ids_stay_bounded_across_long_prefetch_run() {
+        const ROTATIONS: usize = 128;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut recorder = MarketRecorder::new(tempdir.path().to_path_buf()).expect("recorder");
+        let exchange = crate::types::Exchange::Polymarket;
+        let series = "series:btc-updown-5m";
+
+        recorder
+            .write_event(&MarketEvent::EventStart {
+                exchange,
+                symbol: series.to_string(),
+                event_id: "gamma-event-0".to_string(),
+                event_start_ns: 0,
+            })
+            .unwrap();
+        recorder
+            .write_event(&binary_option(
+                "gamma-market-0",
+                "btc-updown-5m-1774809000",
+                "token-0",
+            ))
+            .unwrap();
+        assert_eq!(recorder.buffers.len(), 1);
+
+        for rotation in 0..ROTATIONS {
+            let next = rotation + 1;
+            let next_market_id = format!("gamma-market-{next}");
+            let next_slug = format!("btc-updown-5m-{}", 1_774_809_000 + next as u64 * 300);
+            let next_token = format!("token-{next}");
+
+            // Production registers the next Instrument before EventEnd and
+            // does not include its parent Gamma event id in BinaryOption.
+            recorder
+                .write_event(&binary_option(&next_market_id, &next_slug, &next_token))
+                .unwrap();
+            assert_eq!(
+                recorder.buffers.len(),
+                2,
+                "only current + prefetched streams may be open at rotation {rotation}",
+            );
+
+            recorder
+                .write_event(&MarketEvent::EventEnd {
+                    exchange,
+                    symbol: series.to_string(),
+                    event_id: format!("gamma-event-{rotation}"),
+                    retired_symbols: vec![format!("token-{rotation}")],
+                    event_end_ns: next as u64,
+                })
+                .unwrap();
+            assert_eq!(
+                recorder.buffers.len(),
+                1,
+                "retired stream leaked at rotation {rotation}",
+            );
+            assert!(!recorder
+                .token_to_file_key
+                .contains_key(&format!("token-{rotation}")));
+
+            recorder
+                .write_event(&MarketEvent::EventStart {
+                    exchange,
+                    symbol: series.to_string(),
+                    event_id: format!("gamma-event-{next}"),
+                    event_start_ns: next as u64,
+                })
+                .unwrap();
+            // The feed emits Instrument again at the rotation boundary. It
+            // must reuse the prefetched stream instead of creating a third.
+            recorder
+                .write_event(&binary_option(&next_market_id, &next_slug, &next_token))
+                .unwrap();
+            assert_eq!(recorder.buffers.len(), 1);
+            assert!(recorder.current_event_id.len() <= 2);
+            assert!(recorder.event_to_series.len() <= 2);
+        }
+
+        recorder
+            .write_event(&MarketEvent::EventEnd {
+                exchange,
+                symbol: series.to_string(),
+                event_id: format!("gamma-event-{ROTATIONS}"),
+                retired_symbols: vec![format!("token-{ROTATIONS}")],
+                event_end_ns: ROTATIONS as u64 + 1,
+            })
+            .unwrap();
+
+        assert!(recorder.buffers.is_empty());
+        assert!(recorder.token_to_file_key.is_empty());
+        assert!(recorder.current_event_id.is_empty());
+        assert!(recorder.current_event_slug.is_empty());
+        assert!(recorder.current_series_slug.is_empty());
+        assert!(recorder.pending_event_series.is_empty());
+        assert!(recorder.event_to_series.is_empty());
     }
 }

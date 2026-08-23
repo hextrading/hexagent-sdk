@@ -3,7 +3,7 @@
 //!
 //! Operations are best-effort by default. With `strict_core_isolation=true`,
 //! topology/env conflicts fail startup and Linux affinity, SCHED_FIFO, or
-//! mlockall failures abort the process rather than trading with degraded
+//! selective strategy-stack locking failures abort the process rather than trading with degraded
 //! tail-latency guarantees. On non-Linux platforms (macOS dev machines) the
 //! affinity / real-time calls remain no-ops so the binary compiles and runs
 //! without privileges.
@@ -64,6 +64,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
+
 #[allow(unused_imports)]
 use log::{error, info, warn};
 
@@ -87,6 +90,8 @@ const DEFAULT_PRIO_EXECUTION: u8 = 50;
 const STRATEGY_STACK_PRETOUCH_BYTES: usize = 512 * 1024;
 #[cfg(target_os = "linux")]
 const STACK_PRETOUCH_FRAME_BYTES: usize = 32 * 1024;
+#[cfg(target_os = "linux")]
+const STRATEGY_STACK_LOCK_GUARD_BYTES: usize = 64 * 1024;
 
 /// Resolved at startup from `OsTuneConfig`. All fields are concrete
 /// core ids / priorities; optional config entries have been filled in
@@ -488,6 +493,8 @@ static POLY_EXEC_RR: AtomicUsize = AtomicUsize::new(0);
 static POLY_CANCEL_RR: AtomicUsize = AtomicUsize::new(0);
 static POLY_COMPLETION_RR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_RR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static SELECTIVE_MEMORY_LOCKING: AtomicBool = AtomicBool::new(false);
 
 /// Install the CorePlan resolved from the TOML `[os_tune]` block. Must be
 /// called once at process startup, **before** any thread calls
@@ -740,7 +747,7 @@ pub fn pin_strategy(thread_name: &str) {
     let p = plan();
     pin_current(p.strategy, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
-    pretouch_strategy_stack();
+    lock_and_pretouch_strategy_stack(thread_name);
 }
 
 /// Pin a per-instance strategy worker thread (live/paper). Resolves
@@ -755,12 +762,188 @@ pub fn pin_strategy_instance(thread_name: &str, instance_id: &str) {
         .unwrap_or(p.strategy);
     pin_current(core, thread_name);
     set_fifo(p.fifo_strategy, thread_name);
+    lock_and_pretouch_strategy_stack(thread_name);
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn strategy_stack_lock_range(
+    stack_base: usize,
+    stack_size: usize,
+    stack_pointer: usize,
+    requested_bytes: usize,
+    page_size: usize,
+) -> Option<(usize, usize)> {
+    if stack_size == 0 || requested_bytes == 0 || page_size == 0 {
+        return None;
+    }
+    let stack_end = stack_base.checked_add(stack_size)?;
+    if !(stack_base..stack_end).contains(&stack_pointer) {
+        return None;
+    }
+
+    // pthread stacks grow down on supported Linux targets. Include the page
+    // containing SP and a bounded future region below it, clamped to the
+    // usable stack mapping returned by pthread_getattr_np.
+    let raw_start = stack_pointer
+        .saturating_sub(requested_bytes)
+        .max(stack_base);
+    let start = raw_start
+        .saturating_sub(raw_start % page_size)
+        .max(stack_base);
+    let raw_end = stack_pointer.saturating_add(1).min(stack_end);
+    let end = raw_end
+        .checked_add(page_size - 1)?
+        .checked_div(page_size)?
+        .checked_mul(page_size)?
+        .min(stack_end);
+    (end > start).then_some((start, end - start))
+}
+
+#[cfg(target_os = "linux")]
+fn lock_current_strategy_stack(thread_name: &str) {
+    if !SELECTIVE_MEMORY_LOCKING.load(Ordering::Acquire) {
+        return;
+    }
+
+    let marker = 0_u8;
+    let stack_pointer = std::ptr::addr_of!(marker) as usize;
+    let (stack_base, stack_size) = unsafe {
+        let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+        let get_attr_rc = libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr());
+        if get_attr_rc != 0 {
+            let error = std::io::Error::from_raw_os_error(get_attr_rc);
+            warn!(
+                "[os_tune] inspect strategy stack for '{}' failed: {}",
+                thread_name, error,
+            );
+            abort_if_strict(&format!(
+                "inspect strategy stack for '{}': {}",
+                thread_name, error
+            ));
+            return;
+        }
+
+        let mut stack_addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut stack_size = 0_usize;
+        let get_stack_rc =
+            libc::pthread_attr_getstack(attr.as_ptr(), &mut stack_addr, &mut stack_size);
+        let destroy_rc = libc::pthread_attr_destroy(attr.as_mut_ptr());
+        if get_stack_rc != 0 {
+            let error = std::io::Error::from_raw_os_error(get_stack_rc);
+            warn!(
+                "[os_tune] resolve strategy stack for '{}' failed: {}",
+                thread_name, error,
+            );
+            abort_if_strict(&format!(
+                "resolve strategy stack for '{}': {}",
+                thread_name, error
+            ));
+            return;
+        }
+        if destroy_rc != 0 {
+            warn!(
+                "[os_tune] pthread_attr_destroy for '{}' failed: {}",
+                thread_name,
+                std::io::Error::from_raw_os_error(destroy_rc),
+            );
+        }
+        (stack_addr as usize, stack_size)
+    };
+
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 {
+        page_size as usize
+    } else {
+        4_096
+    };
+    let requested_bytes =
+        STRATEGY_STACK_PRETOUCH_BYTES.saturating_add(STRATEGY_STACK_LOCK_GUARD_BYTES);
+    let Some((lock_start, lock_len)) = strategy_stack_lock_range(
+        stack_base,
+        stack_size,
+        stack_pointer,
+        requested_bytes,
+        page_size,
+    ) else {
+        warn!(
+            "[os_tune] strategy stack range for '{}' is invalid: base=0x{:x} size={} sp=0x{:x}",
+            thread_name, stack_base, stack_size, stack_pointer,
+        );
+        abort_if_strict(&format!(
+            "invalid strategy stack range for '{}'",
+            thread_name
+        ));
+        return;
+    };
+
+    // mlock2(MLOCK_ONFAULT) changes only this explicitly bounded mapping.
+    // Fall back to eager mlock of the same small range on pre-4.4 kernels.
+    let onfault_rc = unsafe {
+        libc::syscall(
+            libc::SYS_mlock2,
+            lock_start as *const libc::c_void,
+            lock_len,
+            libc::MLOCK_ONFAULT,
+        )
+    };
+    let method = if onfault_rc == 0 {
+        Some("mlock2(MLOCK_ONFAULT)")
+    } else {
+        let onfault_error = std::io::Error::last_os_error();
+        if matches!(
+            onfault_error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            let fallback_rc = unsafe { libc::mlock(lock_start as *const libc::c_void, lock_len) };
+            if fallback_rc == 0 {
+                Some("mlock")
+            } else {
+                let fallback_error = std::io::Error::last_os_error();
+                warn!(
+                    "[os_tune] selective strategy stack lock for '{}' failed: onfault={}; fallback={}",
+                    thread_name, onfault_error, fallback_error,
+                );
+                abort_if_strict(&format!(
+                    "selective strategy stack lock for '{}': {}",
+                    thread_name, fallback_error
+                ));
+                None
+            }
+        } else {
+            warn!(
+                "[os_tune] selective strategy stack lock for '{}' failed: {}",
+                thread_name, onfault_error,
+            );
+            abort_if_strict(&format!(
+                "selective strategy stack lock for '{}': {}",
+                thread_name, onfault_error
+            ));
+            None
+        }
+    };
+    if let Some(method) = method {
+        info!(
+            "[os_tune] locked strategy stack '{}' via {}: {} KiB (whole-process heap remains pageable)",
+            thread_name,
+            method,
+            lock_len / 1024,
+        );
+    }
+}
+
+/// Lock the bounded future portion of the current strategy stack and fault it
+/// in once before the event loop. Cold file mappings, recorder buffers and
+/// allocator arenas remain pageable.
+fn lock_and_pretouch_strategy_stack(thread_name: &str) {
+    #[cfg(target_os = "linux")]
+    lock_current_strategy_stack(thread_name);
+    #[cfg(not(target_os = "linux"))]
+    let _ = thread_name;
     pretouch_strategy_stack();
 }
 
 /// Grow and fault the future portion of the current strategy stack once at
-/// thread startup. `MCL_ONFAULT` then pins these explicitly touched pages;
-/// cold file mappings, recorder buffers and allocator arenas remain pageable.
+/// thread startup.
 fn pretouch_strategy_stack() {
     #[cfg(target_os = "linux")]
     {
@@ -933,41 +1116,56 @@ pub fn pin_main_early(thread_name: &str) {
     }
 }
 
-/// Register current and future process mappings for on-fault locking.
+/// Enable bounded locking for strategy-thread stacks.
 ///
-/// `MCL_ONFAULT` is essential here: eager `MCL_CURRENT | MCL_FUTURE` made cold
-/// Arrow batches, mmap pages and mimalloc arenas permanently resident, so RSS
-/// tracked the process high-water mark over long live runs. Only pages that
-/// are actually touched become resident/locked now; strategy stacks are
-/// explicitly pre-touched by [`pin_strategy`] / [`pin_strategy_instance`].
-///
-/// Requires `CAP_IPC_LOCK` and a sufficient `RLIMIT_MEMLOCK` ceiling (set
-/// via `LimitMEMLOCK=infinity` in a systemd unit, or `ulimit -l unlimited`).
-/// Silently degrades to a warning if either is missing.
-pub fn mlockall_best_effort() {
+/// Deliberately does not call `mlockall`: `MCL_FUTURE | MCL_ONFAULT` still
+/// locks every future heap page after its first touch, which makes recorder
+/// batches and allocator high-water arenas permanently resident over a long
+/// run. [`pin_strategy`] and [`pin_strategy_instance`] instead lock and
+/// pre-touch only their own bounded stack ranges.
+pub fn configure_selective_memory_locking() {
     #[cfg(target_os = "linux")]
     {
-        let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
-        let rc = unsafe { libc::mlockall(flags) };
-        if rc == 0 {
-            info!("[os_tune] mlockall OK (MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)");
-        } else {
-            let errno = std::io::Error::last_os_error();
-            warn!(
-                "[os_tune] MCL_ONFAULT mlockall failed: {} (need Linux >= 4.4, \
-                 CAP_IPC_LOCK + RLIMIT_MEMLOCK; refusing eager whole-process locking)",
-                errno,
-            );
-            abort_if_strict(&format!("MCL_ONFAULT mlockall: {}", errno));
-        }
+        SELECTIVE_MEMORY_LOCKING.store(true, Ordering::Release);
+        info!(
+            "[os_tune] selective memory locking enabled: strategy stacks only; \
+             recorder/Arrow/mimalloc/future heap remain pageable"
+        );
     }
     #[cfg(not(target_os = "linux"))]
     {}
 }
 
+/// Backward-compatible entry point. It now enables selective strategy-stack
+/// locking and never registers the whole process with `mlockall`.
+pub fn mlockall_best_effort() {
+    configure_selective_memory_locking();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selective_stack_lock_range_is_page_aligned_and_bounded() {
+        let base = 0x1000;
+        let size = 0x10_000;
+        let (start, len) =
+            strategy_stack_lock_range(base, size, 0xf123, 0x4000, 0x1000).expect("valid range");
+        assert_eq!(start, 0xb000);
+        assert_eq!(len, 0x5000);
+        assert_eq!(start % 0x1000, 0);
+        assert_eq!(len % 0x1000, 0);
+        assert!(start >= base);
+        assert!(start + len <= base + size);
+
+        let (clamped_start, clamped_len) =
+            strategy_stack_lock_range(base, size, 0x1800, 0x4000, 0x1000)
+                .expect("lower-edge range");
+        assert_eq!((clamped_start, clamped_len), (base, 0x1000));
+        assert!(strategy_stack_lock_range(base, size, base + size, 0x4000, 0x1000).is_none());
+        assert!(strategy_stack_lock_range(base, size, 0x1800, 0x4000, 0).is_none());
+    }
 
     fn five_instance_config() -> OsTuneConfig {
         let mut cfg = OsTuneConfig::default();
