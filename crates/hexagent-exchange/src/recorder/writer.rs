@@ -704,6 +704,7 @@ impl MarketRecorder {
             }
             MarketEvent::Connected { .. }
             | MarketEvent::Disconnected { .. }
+            | MarketEvent::EventEnd { .. }
             | MarketEvent::Exit => {}
         }
 
