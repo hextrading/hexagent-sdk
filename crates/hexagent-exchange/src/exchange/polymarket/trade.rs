@@ -2388,6 +2388,9 @@ impl SharedState {
     fn spawn_account_owner_worker(
         shared: &Arc<Self>,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
+        owner_task_rx: crossbeam_channel::Receiver<
+            hexagent_account::account::shared_account::AccountOwnerTask,
+        >,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
     ) -> (
@@ -2395,6 +2398,7 @@ impl SharedState {
         crossbeam_channel::Receiver<()>,
     ) {
         let weak = Arc::downgrade(shared);
+        let owner_account_state = shared.account_state.clone();
         let account_id = shared.account_state.account_id().to_string();
         let shutdown = shared.shutdown_token.clone();
         let shutdown_rx = shutdown.subscribe();
@@ -2406,6 +2410,10 @@ impl SharedState {
                     "polymarket-account-owner",
                     &account_id,
                 );
+                if let Err(error) = owner_account_state.mark_account_owner_thread() {
+                    log::error!("[PolymarketTrade] account owner binding failed: {error}");
+                    return;
+                }
                 // `quanta` calibrates its fast clock on the first recorder
                 // call (about 200 ms on macOS). Pay that one-time cost before
                 // the startup barrier, never on the first private lifecycle.
@@ -2423,6 +2431,10 @@ impl SharedState {
                                 shared.apply_account_lifecycle_job(job);
                                 continue;
                             }
+                            if let Ok(task) = owner_task_rx.try_recv() {
+                                task(&shared.account_state);
+                                continue;
+                            }
                             if let Ok(job) = maintenance_rx.try_recv() {
                                 shared.apply_account_maintenance_job(job);
                                 continue;
@@ -2438,6 +2450,10 @@ impl SharedState {
                     crossbeam_channel::select_biased! {
                         recv(lifecycle_rx) -> job => match job {
                             Ok(job) => shared.apply_account_lifecycle_job(job),
+                            Err(_) => break,
+                        },
+                        recv(owner_task_rx) -> task => match task {
+                            Ok(task) => task(&shared.account_state),
                             Err(_) => break,
                         },
                         recv(maintenance_rx) -> job => match job {
@@ -4564,6 +4580,9 @@ impl PolymarketTrade {
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
         let (account_lifecycle_tx, account_lifecycle_rx) =
             crossbeam_channel::bounded(16_384);
+        let account_owner_task_rx = account_state
+            .bind_account_owner_task_lane()
+            .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
             crossbeam_channel::bounded(ATTEMPT_AUDIT_QUEUE_CAPACITY);
@@ -4623,6 +4642,7 @@ impl PolymarketTrade {
         let (account_owner, account_owner_ready) = SharedState::spawn_account_owner_worker(
             &shared,
             account_lifecycle_rx,
+            account_owner_task_rx,
             account_maintenance_rx,
             settled_gc_rx,
         );
@@ -8286,6 +8306,16 @@ impl PolymarketTrade {
         let resp = match reply {
             Ok(r) => r,
             Err(e) if e.is_submit_unknown_state() => {
+                if matches!(e, HttpErr::Timeout) {
+                    let detail = format!(
+                        "operation=place target={} coid={}",
+                        self.shared.clob_base_url, order.client_order_id,
+                    );
+                    super::network_incident::record(
+                        super::network_incident::NetworkSignal::HttpPlaceTimeout,
+                        &detail,
+                    );
+                }
                 if e.is_http_425() {
                     self.shared.note_http_425_backoff(&order.client_order_id);
                 }
@@ -8775,6 +8805,16 @@ impl PolymarketTrade {
                     }
                 }
                 Err(e) if e.is_unknown_state() => {
+                    if matches!(e, HttpErr::Timeout) {
+                        let detail = format!(
+                            "operation=cancel target={} coid={}",
+                            self.shared.clob_base_url, client_order_id,
+                        );
+                        super::network_incident::record(
+                            super::network_incident::NetworkSignal::HttpCancelTimeout,
+                            &detail,
+                        );
+                    }
                     // 425 falls through here too (per `is_unknown_state`); the
                     // dedup helper suppresses repeats of 425 storms within 5
                     // min. Timeouts / 5xx always WARN.
@@ -8956,6 +8996,17 @@ impl ExchangeTrade for PolymarketTrade {
                 (Some(resp), OrderStatus::CancelUncertain)
             }
             Err(e) if e.is_unknown_state() => {
+                if matches!(e, HttpErr::Timeout) {
+                    let detail = format!(
+                        "operation=cancel_all target={} orders={}",
+                        self.shared.clob_base_url,
+                        coids.len(),
+                    );
+                    super::network_incident::record(
+                        super::network_incident::NetworkSignal::HttpCancelTimeout,
+                        &detail,
+                    );
+                }
                 if matches!(e, HttpErr::Status(425, _)) {
                     for coid in &coids {
                         self.shared.note_http_425_backoff(coid);
@@ -9370,6 +9421,17 @@ impl ExchangeTrade for PolymarketTrade {
                     );
                 }
                 Err(e) if e.is_submit_unknown_state() => {
+                    if matches!(e, HttpErr::Timeout) {
+                        let detail = format!(
+                            "operation=batch_place target={} orders={}",
+                            self.shared.clob_base_url,
+                            chunk_coids.len(),
+                        );
+                        super::network_incident::record(
+                            super::network_incident::NetworkSignal::HttpPlaceTimeout,
+                            &detail,
+                        );
+                    }
                     let is_http_425 = e.is_http_425();
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
@@ -9612,6 +9674,17 @@ impl ExchangeTrade for PolymarketTrade {
                     OrderStatus::CancelUncertain
                 }
                 Err(e) if e.is_unknown_state() => {
+                    if matches!(e, HttpErr::Timeout) {
+                        let detail = format!(
+                            "operation=batch_cancel target={} orders={}",
+                            self.shared.clob_base_url,
+                            client_order_ids.len(),
+                        );
+                        super::network_incident::record(
+                            super::network_incident::NetworkSignal::HttpCancelTimeout,
+                            &detail,
+                        );
+                    }
                     if self.shared.should_warn_unknown_state(&e) {
                         warn!(
                             "[PolymarketTrade] Cancel unknown state ({}) coids={:?} → CancelOrderTimeout",
@@ -10199,6 +10272,17 @@ impl ExchangeTrade for PolymarketTrade {
                         OrderStatus::CancelUncertain
                     }
                     Err(e) if e.is_unknown_state() => {
+                        if matches!(e, HttpErr::Timeout) {
+                            let detail = format!(
+                                "operation=cancel_replace_cancel target={} orders={}",
+                                self.shared.clob_base_url,
+                                cancel_client_order_ids.len(),
+                            );
+                            super::network_incident::record(
+                                super::network_incident::NetworkSignal::HttpCancelTimeout,
+                                &detail,
+                            );
+                        }
                         if self.shared.should_warn_unknown_state(&e) {
                             warn!(
                                 "[PolymarketTrade] Cancel unknown state ({}) coids={:?} → CancelOrderTimeout",
@@ -10470,6 +10554,17 @@ impl ExchangeTrade for PolymarketTrade {
                     );
                 }
                 Err(e) if e.is_submit_unknown_state() => {
+                    if matches!(e, HttpErr::Timeout) {
+                        let detail = format!(
+                            "operation=cancel_replace_place target={} orders={}",
+                            self.shared.clob_base_url,
+                            place_coids.len(),
+                        );
+                        super::network_incident::record(
+                            super::network_incident::NetworkSignal::HttpPlaceTimeout,
+                            &detail,
+                        );
+                    }
                     // Timeout, status-less transport failure, HTTP 5xx, or
                     // 425 — server state is unknown.
                     // Emit NewOrderTimeout with the pre-computed orderID so
