@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use quanta::Instant;
@@ -306,18 +306,32 @@ fn format_line(stage: &str, snapshot: &StageSnapshot) -> String {
     )
 }
 
+static PERIODIC_DUMP_STARTED: AtomicBool = AtomicBool::new(false);
+
 /// Periodically aggregates thread-owned slabs and logs percentile summaries.
-pub fn spawn_periodic_dump(interval: std::time::Duration) {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    if STARTED.set(()).is_err() {
-        return;
+///
+/// The returned handle is joinable and the worker is woken immediately by the
+/// run's unified shutdown token; it no longer survives a failed live runtime.
+pub fn spawn_periodic_dump(
+    interval: std::time::Duration,
+    shutdown: crate::shutdown::ShutdownToken,
+) -> Option<std::thread::JoinHandle<()>> {
+    if PERIODIC_DUMP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
     }
-    std::thread::Builder::new()
+    let shutdown_rx = shutdown.subscribe();
+    match std::thread::Builder::new()
         .name("latency-dump".into())
         .spawn(move || {
             crate::os_tune::pin_background("latency-dump");
             loop {
-                std::thread::sleep(interval);
+                crossbeam_channel::select! {
+                    recv(shutdown_rx) -> _ => break,
+                    recv(crossbeam_channel::after(interval)) -> _ => {}
+                }
                 let dropped = DROPPED_STAGE_REGISTRATIONS.swap(0, Ordering::AcqRel);
                 if dropped > 0 {
                     log::warn!(
@@ -330,13 +344,34 @@ pub fn spawn_periodic_dump(interval: std::time::Duration) {
                     log::info!("{}", format_line(stage, &snapshot));
                 }
             }
+            PERIODIC_DUMP_STARTED.store(false, Ordering::Release);
         })
-        .expect("spawn latency-dump thread");
+    {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            PERIODIC_DUMP_STARTED.store(false, Ordering::Release);
+            panic!("spawn latency-dump thread: {error}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_dump_is_woken_by_unified_shutdown() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let handle = spawn_periodic_dump(std::time::Duration::from_secs(3_600), shutdown.clone())
+            .expect("latency dumper starts once");
+        shutdown.request();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(handle.is_finished(), "latency dumper ignored shutdown token");
+        handle.join().unwrap();
+    }
 
     #[test]
     fn logarithmic_buckets_are_monotonic_and_cover_u64() {

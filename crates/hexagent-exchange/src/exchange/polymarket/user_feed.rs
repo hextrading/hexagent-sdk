@@ -1446,7 +1446,7 @@ enum PrivateApplyCommand {
 /// published.  One cold-account worker is the sole consumer, preserving the
 /// venue order of account/audit/persistence transitions without holding up the
 /// private owner route.
-struct PrivateColdCommand {
+pub(crate) struct PrivateColdCommand {
     events: Vec<PrivateEventDelta>,
     /// Lifecycle identities durably covered when this whole command commits.
     /// They return to the single owner over a bounded advisory ack lane; only
@@ -1455,6 +1455,14 @@ struct PrivateColdCommand {
     recovery_generation: Option<u64>,
     completion: Option<tokio::sync::oneshot::Sender<std::result::Result<usize, String>>>,
     routed_at: crate::latency::Instant,
+    feedback: PrivateColdFeedback,
+}
+
+#[derive(Clone)]
+struct PrivateColdFeedback {
+    ack_tx: crossbeam_channel::Sender<Vec<PrivateRouteIdentity>>,
+    reconnect_generation: Arc<AtomicU64>,
+    reconnect_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -1466,7 +1474,7 @@ struct PrivateApplyLane {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PrivateRouteIdentity {
+pub(crate) enum PrivateRouteIdentity {
     TradeLifecycle { fingerprint: u128, rank: u8 },
 }
 
@@ -2111,6 +2119,42 @@ fn apply_private_cold_batch(
     Ok(applied)
 }
 
+/// Apply one private batch on the account actor. Execution lifecycle and
+/// authenticated private lifecycle therefore share exactly one writer and one
+/// ordered high-priority lane per physical account.
+pub(crate) fn apply_private_cold_command(shared: &SharedState, command: PrivateColdCommand) {
+    let PrivateColdCommand {
+        events,
+        identities,
+        recovery_generation,
+        completion,
+        routed_at,
+        feedback,
+    } = command;
+    crate::latency::record("polymarket.user.fast_route_to_account_owner", routed_at);
+    let result = apply_private_cold_batch(shared, &events, recovery_generation);
+    if let Err(error) = &result {
+        shared.user_feed_health.set_recovering(true);
+        warn!(
+            "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
+            error,
+        );
+        feedback
+            .reconnect_generation
+            .fetch_add(1, Ordering::AcqRel);
+        feedback.reconnect_notify.notify_one();
+    }
+    if result.is_ok()
+        && !identities.is_empty()
+        && feedback.ack_tx.try_send(identities).is_err()
+    {
+        crate::latency::record_ns("polymarket.user.cold_commit_ack_overflow", 1);
+    }
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+}
+
 fn spawn_private_apply_worker(
     shared: Arc<SharedState>,
     update_tx: Sender<OrderUpdate>,
@@ -2118,15 +2162,7 @@ fn spawn_private_apply_worker(
 ) -> Result<(PrivateApplyLane, Vec<std::thread::JoinHandle<()>>)> {
     let (live_tx, live_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
     let (replay_tx, replay_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
-    // Producer: the single owner-fast worker below. Consumer: one cold ledger
-    // worker. Each batch crosses fast routing and cold accounting in the same
-    // serialized order selected by the owner actor (live intentionally retains
-    // priority over replay). Overflow is fail-closed: live forces
-    // reconnect/replay; replay returns an explicit error to its caller. No
-    // private lifecycle is silently dropped.
-    let (cold_tx, cold_rx) =
-        crossbeam_channel::bounded::<PrivateColdCommand>(PRIVATE_APPLY_QUEUE_CAPACITY);
-    // Cold worker -> private owner, SPSC and bounded. Overflow drops only the
+    // Account actor -> private owner, SPSC and bounded. Overflow drops only the
     // duplicate-suppression hint: the owner safely re-enqueues the idempotent
     // event, so no private lifecycle or recovery edge can be lost.
     let (cold_ack_tx, cold_ack_rx) =
@@ -2140,60 +2176,11 @@ fn spawn_private_apply_worker(
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
     let account_id = shared.account_state.account_id().to_string();
-    let cold_shared = Arc::clone(&shared);
-    let cold_reconnect_generation = Arc::clone(&reconnect_generation);
-    let cold_reconnect_notify = Arc::clone(&reconnect_notify);
-    let cold_account_id = account_id.clone();
-    let cold_worker = std::thread::Builder::new()
-        .name(format!("poly-private-cold-{}", cold_account_id))
-        .spawn(move || {
-            crate::os_tune::pin_private_account_cold(
-                "polymarket-private-cold",
-                &cold_account_id,
-            );
-            loop {
-                match cold_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(command) => {
-                        let PrivateColdCommand {
-                            events,
-                            identities,
-                            recovery_generation,
-                            completion,
-                            routed_at,
-                        } = command;
-                        crate::latency::record(
-                            "polymarket.user.fast_route_to_cold_worker",
-                            routed_at,
-                        );
-                        let result =
-                            apply_private_cold_batch(&cold_shared, &events, recovery_generation);
-                        if let Err(error) = &result {
-                            cold_shared.user_feed_health.set_recovering(true);
-                            warn!(
-                                "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
-                                error,
-                            );
-                            cold_reconnect_generation.fetch_add(1, Ordering::AcqRel);
-                            cold_reconnect_notify.notify_one();
-                        }
-                        if result.is_ok()
-                            && !identities.is_empty()
-                            && cold_ack_tx.try_send(identities).is_err()
-                        {
-                            crate::latency::record_ns(
-                                "polymarket.user.cold_commit_ack_overflow",
-                                1,
-                            );
-                        }
-                        if let Some(completion) = completion {
-                            let _ = completion.send(result);
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        })?;
+    let cold_feedback = PrivateColdFeedback {
+        ack_tx: cold_ack_tx,
+        reconnect_generation: Arc::clone(&reconnect_generation),
+        reconnect_notify: Arc::clone(&reconnect_notify),
+    };
     let worker = std::thread::Builder::new()
         .name(format!("poly-private-owner-{}", account_id))
         .spawn(move || {
@@ -2248,8 +2235,9 @@ fn spawn_private_apply_worker(
                                 recovery_generation: None,
                                 completion: None,
                                 routed_at: crate::latency::Instant::now(),
+                                feedback: cold_feedback.clone(),
                             };
-                            if cold_tx.try_send(cold).is_err() {
+                            if shared.enqueue_private_cold(cold).is_err() {
                                 shared.user_feed_health.set_recovering(true);
                                 warn!(
                                     "[PolyUserFeed] cold private-account queue saturated; forcing reconnect/replay"
@@ -2290,8 +2278,9 @@ fn spawn_private_apply_worker(
                                         recovery_generation,
                                         completion: Some(completion),
                                         routed_at: crate::latency::Instant::now(),
+                                        feedback: cold_feedback.clone(),
                                     };
-                                    if let Err(error) = cold_tx.try_send(cold) {
+                                    if let Err(error) = shared.enqueue_private_cold(cold) {
                                         if let PrivateColdCommand {
                                             completion: Some(completion),
                                             ..
@@ -2314,7 +2303,7 @@ fn spawn_private_apply_worker(
                 }
             }
         })?;
-    Ok((lane, vec![worker, cold_worker]))
+    Ok((lane, vec![worker]))
 }
 
 fn parse_user_event_with_health(
