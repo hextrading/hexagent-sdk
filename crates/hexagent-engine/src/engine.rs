@@ -30,6 +30,7 @@ use crate::recorder::{MarketRecorder, MarketReplayer};
 use crate::strategy::Strategy;
 use crate::types::*;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
+use hexagent_runtime::shutdown::ShutdownToken;
 
 const CHANNEL_CAPACITY: usize = 10_000;
 // Four account updates keep fill/cancel feedback responsive while bounding
@@ -2837,8 +2838,21 @@ impl Engine {
     // ── Mode Execution (called from main.rs) ───────────────────────────
 
     pub fn run(&self) -> Result<()> {
+        self.run_with_shutdown(ShutdownToken::new())
+    }
+
+    /// Run with a process-run shutdown token shared by engine-owned and
+    /// application-owned background workers (for example latency dumping).
+    pub fn run_with_shutdown(&self, shutdown_token: ShutdownToken) -> Result<()> {
         match self.config.general.mode {
-            RunMode::Live => self.run_live(),
+            RunMode::Live => {
+                let result = self.run_live(shutdown_token.clone());
+                // Also cover startup/pre-flight errors that return before the
+                // normal live join sequence reaches its explicit phases.
+                shutdown_token.request();
+                shutdown_token.finish();
+                result
+            }
             RunMode::Record => self.run_record(),
             RunMode::Backtest => self.run_backtest(),
             RunMode::Paper => self.run_paper(),
@@ -3071,8 +3085,15 @@ impl Engine {
         Ok(())
     }
 
-    fn run_live(&self) -> Result<()> {
+    fn run_live(&self, shutdown_token: ShutdownToken) -> Result<()> {
         info!("══════════════════════════════════════");
+
+        // Latency aggregation is a live-runtime worker, not a detached
+        // process singleton. It shares the same token and is joined below.
+        let latency_dump_handle = crate::latency::spawn_periodic_dump(
+            std::time::Duration::from_secs(60),
+            shutdown_token.clone(),
+        );
         info!("  Starting LIVE TRADING mode");
         info!("══════════════════════════════════════");
 
@@ -3139,7 +3160,7 @@ impl Engine {
         let (update_tx, update_rx) = bounded::<OrderUpdate>(CHANNEL_CAPACITY);
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = shutdown_token.requested_flag();
         let shutdown_tx = market_tx.clone();
 
         // Periodic flush of the per-request latency CSV on each wall-clock
@@ -3148,13 +3169,16 @@ impl Engine {
         // tiny poll loop is cheap. A dedicated thread keeps flushing
         // independent of probe / trade activity.
         let latency_flush_handle: Option<thread::JoinHandle<()>> = if recording {
-            let sd = shutdown.clone();
+            let shutdown_rx = shutdown_token.subscribe();
             thread::Builder::new()
                 .name("latency-record-flush".into())
                 .spawn(move || {
                     crate::os_tune::pin_background("latency-record-flush");
-                    while !sd.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    loop {
+                        crossbeam_channel::select! {
+                            recv(shutdown_rx) -> _ => break,
+                            recv(crossbeam_channel::after(std::time::Duration::from_secs(2))) -> _ => {}
+                        }
                         crate::latency_record::maybe_flush();
                     }
                 })
@@ -3166,7 +3190,7 @@ impl Engine {
         // Build the per-instance Polymarket SharedState map. The
         // underlying h2 pool is shared across instances; auth, signer,
         // and order-id registry are per-instance (Phase 2a).
-        let poly_states = self.build_poly_shared_states_map();
+        let poly_states = self.build_poly_shared_states_map_with_shutdown(shutdown_token.clone());
         let mut required_poly_instances = Vec::new();
         for strategy in self.config.strategies.iter().filter(|strategy| {
             strategy.enabled
@@ -3246,6 +3270,7 @@ impl Engine {
             poly_states.clone(),
             stale_threshold_handles.clone(),
             shutdown_done_tx,
+            shutdown_token.clone(),
         );
         let user_feed_handle = self.spawn_hex_user_feed(update_tx.clone(), shutdown.clone());
         // Phase 2b: spawn one user_feed per polymarket instance.
@@ -3364,6 +3389,7 @@ impl Engine {
 
         let shutdown_trigger = Self::wait_for_shutdown_or_critical(
             &shutdown,
+            Some(&shutdown_token),
             &shutdown_tx,
             &[("strategy", &strategy_handle), ("execution", &exec_handle)],
         );
@@ -3388,8 +3414,18 @@ impl Engine {
         for h in feed_handles {
             let _ = h.join();
         }
+        // Every producer that can enqueue private lifecycle/account work has
+        // stopped. Let the lossless account/audit actors drain and exit, then
+        // join them before dropping SharedState.
+        shutdown_token.finish();
+        for (_, shared) in Self::dedup_states_by_account(&poly_states) {
+            let _ = shared.join_background_workers();
+        }
         let _ = recorder_handle.join();
         if let Some(h) = latency_flush_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = latency_dump_handle {
             let _ = h.join();
         }
 
@@ -7432,11 +7468,12 @@ impl Engine {
     }
 
     fn wait_for_shutdown(shutdown: &Arc<AtomicBool>, shutdown_tx: &Sender<MarketEvent>) {
-        let _ = Self::wait_for_shutdown_or_critical(shutdown, shutdown_tx, &[]);
+        let _ = Self::wait_for_shutdown_or_critical(shutdown, None, shutdown_tx, &[]);
     }
 
     fn wait_for_shutdown_or_critical(
         shutdown: &Arc<AtomicBool>,
+        shutdown_token: Option<&ShutdownToken>,
         shutdown_tx: &Sender<MarketEvent>,
         critical_threads: &[(&'static str, &thread::JoinHandle<()>)],
     ) -> ShutdownTrigger {
@@ -7495,7 +7532,11 @@ impl Engine {
             ),
         }
 
-        shutdown.store(true, Ordering::Relaxed);
+        if let Some(token) = shutdown_token {
+            token.request();
+        } else {
+            shutdown.store(true, Ordering::Release);
+        }
         if let Err(error) =
             shutdown_tx.send_timeout(MarketEvent::Exit, std::time::Duration::from_secs(1))
         {
@@ -8263,6 +8304,13 @@ impl Engine {
     pub fn build_poly_shared_states_map(
         &self,
     ) -> HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> {
+        self.build_poly_shared_states_map_with_shutdown(ShutdownToken::new())
+    }
+
+    fn build_poly_shared_states_map_with_shutdown(
+        &self,
+        shutdown_token: ShutdownToken,
+    ) -> HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> {
         use crate::config::SecretsFile;
 
         let mut out: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>> =
@@ -8533,7 +8581,7 @@ impl Engine {
                     std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
                 );
             }
-            match PolymarketTrade::new_with_pool_for_startup_query_repair(
+            match PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
                 &creds.api_key,
                 &creds.api_secret,
                 &creds.api_passphrase,
@@ -8553,6 +8601,7 @@ impl Engine {
                     reconnect_rewind_ms: poly_cfg.gap_replay_reconnect_rewind_ms,
                 },
                 ledger_path.as_deref(),
+                shutdown_token.clone(),
             ) {
                 Ok(trade) => {
                     if let Err(error) = register_polymarket_wallet_identity(
@@ -9259,6 +9308,7 @@ impl Engine {
             poly_states,
             stale_threshold_handles,
             shutdown_done_tx,
+            ShutdownToken::new(),
         )
     }
 
@@ -9269,6 +9319,7 @@ impl Engine {
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         shutdown_done_tx: Sender<()>,
+        shutdown_token: ShutdownToken,
     ) -> thread::JoinHandle<()> {
         let config = self.config.clone();
         let hex_max_connections = config
@@ -9290,6 +9341,7 @@ impl Engine {
             .name("execution".into())
             .spawn(move || {
                 crate::os_tune::pin_execution("execution");
+                let execution_shutdown_rx = shutdown_token.subscribe();
                 let hex_cfg = config.exchanges.iter().find(|e| e.name == "hexmarket");
                 let mut instance_pools: HashMap<String, Vec<Sender<(Signal, Sender<OrderUpdate>)>>> = HashMap::new();
 
@@ -9469,7 +9521,7 @@ impl Engine {
                                         signal,
                                         stale_ms,
                                         &done_tx,
-                                        &cancel_tx,
+                                        Some(&cancel_tx),
                                         &utx,
                                     );
                                 }
@@ -9483,7 +9535,6 @@ impl Engine {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_cancel_rx.clone();
                         let done_tx = poly_done_tx.clone();
-                        let cancel_tx = poly_cancel_tx.clone();
                         let wname = format!("poly-cancel-{}", i);
                         let h = thread::Builder::new()
                             .name(wname.clone())
@@ -9495,7 +9546,7 @@ impl Engine {
                                         signal,
                                         stale_ms,
                                         &done_tx,
-                                        &cancel_tx,
+                                        None,
                                         &utx,
                                     );
                                 }
@@ -9512,7 +9563,6 @@ impl Engine {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let rx = poly_reconcile_rx.clone();
                         let done_tx = poly_done_tx.clone();
-                        let cancel_tx = poly_cancel_tx.clone();
                         let wname = format!("poly-reconcile-{}", i);
                         let h = thread::Builder::new()
                             .name(wname.clone())
@@ -9524,7 +9574,7 @@ impl Engine {
                                         signal,
                                         stale_ms,
                                         &done_tx,
-                                        &cancel_tx,
+                                        None,
                                         &utx,
                                     );
                                 }
@@ -9543,6 +9593,7 @@ impl Engine {
                     // the cancel is retained until a slot becomes available.
                     {
                         let stop = poly_stats_stop.clone();
+                        let stats_shutdown_rx = shutdown_token.subscribe();
                         let mut seen_accounts = HashSet::new();
                         let monitoring_accounts: Vec<_> = poly_states.values()
                             .filter_map(|shared| {
@@ -9557,14 +9608,18 @@ impl Engine {
                                 crate::os_tune::pin_background("poly-admission-stats");
                                 let mut prev = HashMap::new();
                                 let mut gap_prev: HashMap<String, (u64, u64)> = HashMap::new();
-                                let mut reservation_lock_prev: HashMap<String, u64> = HashMap::new();
+                                let mut reservation_lock_prev: HashMap<String, u64> =
+                                    HashMap::new();
                                 loop {
                                     let mut slept = 0;
                                     while slept < 30 {
                                         if stop.load(std::sync::atomic::Ordering::Relaxed) {
                                             return;
                                         }
-                                        thread::sleep(std::time::Duration::from_secs(1));
+                                        crossbeam_channel::select! {
+                                            recv(stats_shutdown_rx) -> _ => return,
+                                            recv(crossbeam_channel::after(std::time::Duration::from_secs(1))) -> _ => {}
+                                        }
                                         slept += 1;
                                     }
                                     let by_account = admission_log_snapshot(
@@ -9792,9 +9847,17 @@ impl Engine {
                 let mut round_robins: HashMap<String, usize> = HashMap::new();
                 let mut shutdown_finalized = false;
 
-                while let Ok(routed) = signal_rx.recv() {
-                    let _owner = routed.owner;
-                    let signal = routed.signal;
+                loop {
+                    // The executor has a direct shutdown subscription. A
+                    // dead strategy/router therefore cannot strand it on a
+                    // blocking signal receive or prevent admission teardown.
+                    let signal = crossbeam_channel::select_biased! {
+                        recv(execution_shutdown_rx) -> _ => Signal::BeginShutdown,
+                        recv(signal_rx) -> routed => match routed {
+                            Ok(routed) => routed.signal,
+                            Err(_) => break,
+                        },
+                    };
                     if shutdown_finalized
                         && !matches!(&signal, Signal::BeginShutdown | Signal::Exit)
                     {
@@ -9812,15 +9875,17 @@ impl Engine {
                                 for h in std::mem::take(&mut poly_worker_handles) {
                                     let _ = h.join();
                                 }
-                                // Place workers may enqueue the cancel leg of a
-                                // ReplaceOrder, so close/join the lossless cancel
-                                // lane only after every place worker is gone.
-                                poly_cancel_tx = None;
-                                for h in std::mem::take(&mut poly_cancel_handles) {
-                                    let _ = h.join();
-                                }
+                                // Replace work on the place lane may enqueue a
+                                // cancel leg. Cancel/reconcile workers must not
+                                // retain a sender for the cancel lane they are
+                                // waiting to drain; that self-ownership was the
+                                // old shutdown deadlock.
                                 poly_reconcile_tx = None;
                                 for h in std::mem::take(&mut poly_reconcile_handles) {
+                                    let _ = h.join();
+                                }
+                                poly_cancel_tx = None;
+                                for h in std::mem::take(&mut poly_cancel_handles) {
                                     let _ = h.join();
                                 }
                                 // Drain every fired completion before the
@@ -9983,10 +10048,10 @@ impl Engine {
                 // in-flight dispatch finishes before the executor thread exits.
                 drop(poly_pool_tx.take());
                 for h in poly_worker_handles { let _ = h.join(); }
-                drop(poly_cancel_tx.take());
-                for h in poly_cancel_handles { let _ = h.join(); }
                 drop(poly_reconcile_tx.take());
                 for h in poly_reconcile_handles { let _ = h.join(); }
+                drop(poly_cancel_tx.take());
+                for h in poly_cancel_handles { let _ = h.join(); }
                 // Drain fire-and-track completions after the workers stop.
                 drop(poly_done_tx.take());
                 for h in poly_drainer_handles { let _ = h.join(); }
@@ -10492,7 +10557,7 @@ fn fire_or_execute(
     signal: Signal,
     stale_ms: u64,
     done_tx: &Sender<QueuedPolyCompletion>,
-    cancel_tx: &Sender<(Signal, u64, Sender<OrderUpdate>)>,
+    cancel_tx: Option<&Sender<(Signal, u64, Sender<OrderUpdate>)>>,
     utx: &Sender<OrderUpdate>,
 ) {
     use hexagent_runtime::http1_pool::{acquire, try_acquire, Role};
@@ -10747,9 +10812,11 @@ fn fire_or_execute(
                 instance_id: iid,
                 timestamp_ns,
             };
-            if cancel_tx
-                .send((cancel_signal, stale_ms, utx.clone()))
-                .is_err()
+            if cancel_tx.is_none_or(|cancel_tx| {
+                cancel_tx
+                    .send((cancel_signal, stale_ms, utx.clone()))
+                    .is_err()
+            })
             {
                 let _ = send_executor_update(utx, exec_rejected_cancel(coid, exchange));
             }
@@ -12293,6 +12360,127 @@ mod market_router_tests {
         assert!(!should_spawn_per_instance_strategy_workers(false, 0));
         assert!(!should_spawn_per_instance_strategy_workers(true, 1));
         assert!(!should_spawn_per_instance_strategy_workers(true, 5));
+    }
+
+    fn shutdown_test_engine() -> Engine {
+        let config: Config = toml::from_str("[general]\nmode = 'live'\n").unwrap();
+        Engine::new(config, StrategyRegistry::new())
+    }
+
+    fn assert_thread_exits(handle: &thread::JoinHandle<()>, label: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(handle.is_finished(), "{label} did not exit after shutdown");
+    }
+
+    #[test]
+    fn strategy_panic_and_signal_disconnect_cannot_strand_execution() {
+        let engine = shutdown_test_engine();
+        let shutdown = ShutdownToken::new();
+        let (signal_tx, signal_rx) = bounded(1);
+        let (update_tx, _update_rx) = bounded(1);
+        let (shutdown_done_tx, shutdown_done_rx) = bounded(1);
+        let execution = engine.spawn_execution_thread_with_poly_shutdown(
+            signal_rx,
+            update_tx,
+            HashMap::new(),
+            HashMap::new(),
+            shutdown_done_tx,
+            shutdown.clone(),
+        );
+        let strategy = thread::spawn(|| panic!("injected strategy panic"));
+        assert_thread_exits(&strategy, "injected strategy");
+        assert_eq!(
+            first_finished_critical_thread(&[("strategy", &strategy)]),
+            Some("strategy"),
+        );
+
+        // This is the supervisor action taken by run_live. The executor sees
+        // it directly even though no strategy can forward BeginShutdown.
+        shutdown.request();
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok(),
+            "execution did not finish its coordinated barrier",
+        );
+        drop(signal_tx);
+        assert_thread_exits(&execution, "execution");
+        let _ = strategy.join();
+        execution.join().unwrap();
+        shutdown.finish();
+    }
+
+    #[test]
+    fn strategy_panic_and_channel_disconnect_stop_all_workers() {
+        crate::async_rt::init().expect("test async runtime and admission pools start");
+        let engine = shutdown_test_engine();
+        let shutdown = ShutdownToken::new();
+        let latency_dump = crate::latency::spawn_periodic_dump(
+            std::time::Duration::from_secs(3_600),
+            shutdown.clone(),
+        )
+        .expect("test latency worker starts");
+        let trade = PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            crate::exchange::polymarket::signer::SignatureType::Eoa,
+            crate::exchange::polymarket::trade::ClobVersion::V2,
+            "",
+            "",
+            true,
+            "shutdown-test",
+            "",
+            crate::exchange::polymarket::trade::GapReplayConfig::default(),
+            None,
+            shutdown.clone(),
+        )
+        .unwrap();
+        let shared = trade.shared_state();
+        let mut poly_states = HashMap::new();
+        poly_states.insert("shutdown-test".to_string(), shared.clone());
+        let (signal_tx, signal_rx) = bounded(1);
+        let (update_tx, _update_rx) = bounded(8);
+        let (shutdown_done_tx, _shutdown_done_rx) = bounded(1);
+        let execution = engine.spawn_execution_thread_with_poly_shutdown(
+            signal_rx,
+            update_tx,
+            poly_states,
+            HashMap::new(),
+            shutdown_done_tx,
+            shutdown.clone(),
+        );
+
+        // The strategy owns the last ingress producer. Its panic disconnects
+        // that lane exactly as the live router would; the supervisor then
+        // requests the shared shutdown phase.
+        let strategy = thread::spawn(move || {
+            drop(signal_tx);
+            panic!("injected strategy panic with live account workers");
+        });
+        assert_thread_exits(&strategy, "injected strategy");
+        assert_eq!(
+            first_finished_critical_thread(&[("strategy", &strategy)]),
+            Some("strategy"),
+        );
+        // The disconnected ingress tears down and joins the executor's
+        // admission/dispatch tree without entering the live remote cancel
+        // barrier (which is intentionally unbounded until the venue proves
+        // clean). The common token then stops the remaining run workers.
+        assert_thread_exits(&execution, "execution/admission worker tree");
+        let _ = strategy.join();
+        execution.join().unwrap();
+        shutdown.request();
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 2);
+        assert_thread_exits(&latency_dump, "latency worker");
+        latency_dump.join().unwrap();
     }
 
     #[test]

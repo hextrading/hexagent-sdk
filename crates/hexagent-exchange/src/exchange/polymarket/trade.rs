@@ -19,6 +19,7 @@ use hexagent_account::account::shared_account::{
     measure_deferred_lifecycle_stages, normalize_order_id, OrderOwnership,
 };
 use log::{debug, info, warn};
+use hexagent_runtime::shutdown::{ShutdownPhase, ShutdownToken};
 
 use super::auth::PolyAuth;
 use super::live_position::LivePositionManager;
@@ -1397,6 +1398,8 @@ struct DeferredLifecycleJob {
     client_order_id: String,
     status: OrderStatus,
     enqueued_ns: u64,
+    #[cfg(test)]
+    completion: Option<crossbeam_channel::Sender<u64>>,
 }
 
 #[derive(Debug)]
@@ -1468,11 +1471,16 @@ impl AttemptOrderReplica {
 
 const ATTEMPT_AUDIT_QUEUE_CAPACITY: usize = 4_096;
 
+enum AccountLifecycleJob {
+    StartupBarrier(crossbeam_channel::Sender<()>),
+    PersistOwnership(OrderOwnership),
+    DeferredLifecycle(DeferredLifecycleJob),
+    PrivateCold(super::user_feed::PrivateColdCommand),
+}
+
 #[derive(Debug)]
 enum AccountMaintenanceJob {
-    PersistOwnership(OrderOwnership),
     FilledCleanup(FilledCleanupJob),
-    DeferredLifecycle(DeferredLifecycleJob),
 }
 
 async fn send_and_drain(
@@ -2143,11 +2151,16 @@ pub struct SharedState {
     /// Private account-apply only enqueues the coid; a background worker owns
     /// the readiness check and final teardown.
     account_maintenance_tx: crossbeam_channel::Sender<AccountMaintenanceJob>,
+    /// Lossless, higher-priority lifecycle lane. Both execution replies and
+    /// authenticated private events enter this one account-owned writer.
+    account_lifecycle_tx: crossbeam_channel::Sender<AccountLifecycleJob>,
     /// Multi-producer completion telemetry → one SCHED_OTHER audit worker.
     /// FIFO capacity is [`ATTEMPT_AUDIT_QUEUE_CAPACITY`]; overflow drops only
     /// the audit record and logs loudly, never an account/lifecycle mutation.
     /// This lane has no replay because attempt timing is operational telemetry.
     attempt_audit_tx: crossbeam_channel::Sender<AttemptAuditJob>,
+    shutdown_token: ShutdownToken,
+    background_worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
@@ -2297,36 +2310,6 @@ impl SharedState {
         let _ = self.request_buffers.push(buffer);
     }
 
-    fn spawn_settled_gc_worker(shared: &Arc<Self>, rx: crossbeam_channel::Receiver<()>) {
-        let weak = Arc::downgrade(shared);
-        let _ =
-            std::thread::Builder::new()
-            .name(format!("poly-settled-gc-{}", shared.instance_id))
-            .spawn(move || {
-                crate::os_tune::pin_background("polymarket-settled-gc");
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                        Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                    let Some(shared) = weak.upgrade() else { break };
-                    if !shared.account_state.has_settled_gc_candidates() {
-                        continue;
-                    }
-                    let started = crate::latency::Instant::now();
-                    let (retired_events, retired_live_trades) =
-                        shared.finalize_ready_settled_audit_retirements();
-                    crate::latency::record("polymarket.account.settled_gc", started);
-                    if retired_events > 0 {
-                        debug!(
-                            "[PolySettledGc] account={} retired_events={} retired_live_trades={}",
-                            shared.account_state.account_id(), retired_events, retired_live_trades,
-                        );
-                    }
-                }
-            });
-    }
-
     pub(crate) fn request_settled_gc(&self) {
         if !self.account_state.has_settled_gc_candidates() {
             return;
@@ -2346,88 +2329,176 @@ impl SharedState {
         let _ = self.settled_gc_tx.try_send(());
     }
 
-    fn spawn_account_maintenance_worker(
+    fn apply_account_lifecycle_job(&self, job: AccountLifecycleJob) {
+        match job {
+            AccountLifecycleJob::StartupBarrier(done) => {
+                let _ = done.send(());
+            }
+            AccountLifecycleJob::PersistOwnership(ownership) => {
+                if self
+                    .account_state
+                    .backfill_order_ownership(&ownership)
+                    .is_none()
+                {
+                    self.user_feed_health.set_inventory_uncertain(true);
+                    log::error!(
+                        "[PolymarketTrade] async ownership persistence conflict coid={} oid={}",
+                        ownership.client_order_id,
+                        ownership.order_id,
+                    );
+                }
+            }
+            AccountLifecycleJob::DeferredLifecycle(job) => self.apply_deferred_lifecycle(job),
+            AccountLifecycleJob::PrivateCold(command) => {
+                super::user_feed::apply_private_cold_command(self, command);
+            }
+        }
+    }
+
+    fn apply_account_maintenance_job(&self, job: AccountMaintenanceJob) {
+        match job {
+            AccountMaintenanceJob::FilledCleanup(job) => {
+                crate::latency::record_ns(
+                    "polymarket.user.filled_cleanup_queue",
+                    now_ns().saturating_sub(job.enqueued_ns),
+                );
+                self.finish_filled_order_if_audited(&job.client_order_id);
+            }
+        }
+    }
+
+    fn run_settled_gc_pass(&self) {
+        if !self.account_state.has_settled_gc_candidates() {
+            return;
+        }
+        let started = crate::latency::Instant::now();
+        let (retired_events, retired_live_trades) =
+            self.finalize_ready_settled_audit_retirements();
+        crate::latency::record("polymarket.account.settled_gc", started);
+        if retired_events > 0 {
+            debug!(
+                "[PolySettledGc] account={} retired_events={} retired_live_trades={}",
+                self.account_state.account_id(),
+                retired_events,
+                retired_live_trades,
+            );
+        }
+    }
+
+    fn spawn_account_owner_worker(
         shared: &Arc<Self>,
-        rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
+        lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
+        maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
+        settled_gc_rx: crossbeam_channel::Receiver<()>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        crossbeam_channel::Receiver<()>,
     ) {
         let weak = Arc::downgrade(shared);
         let account_id = shared.account_state.account_id().to_string();
-        let _ = std::thread::Builder::new()
-            .name(format!("poly-account-maint-{}", shared.instance_id))
+        let shutdown = shared.shutdown_token.clone();
+        let shutdown_rx = shutdown.subscribe();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let handle = std::thread::Builder::new()
+            .name(format!("poly-account-owner-{}", shared.instance_id))
             .spawn(move || {
                 crate::os_tune::pin_private_account_cold(
-                    "polymarket-account-maintenance",
+                    "polymarket-account-owner",
                     &account_id,
                 );
-                while let Ok(job) = rx.recv() {
+                // `quanta` calibrates its fast clock on the first recorder
+                // call (about 200 ms on macOS). Pay that one-time cost before
+                // the startup barrier, never on the first private lifecycle.
+                let latency_clock_ready = crate::latency::Instant::now();
+                crate::latency::record("polymarket.account.owner_started", latency_clock_ready);
+                let _ = ready_tx.send(());
+                loop {
                     let Some(shared) = weak.upgrade() else { break };
-                    match job {
-                        AccountMaintenanceJob::FilledCleanup(job) => {
-                            crate::latency::record_ns(
-                                "polymarket.user.filled_cleanup_queue",
-                                now_ns().saturating_sub(job.enqueued_ns),
-                            );
-                            shared.finish_filled_order_if_audited(&job.client_order_id);
-                        }
-                        AccountMaintenanceJob::DeferredLifecycle(job) => {
-                            shared.apply_deferred_lifecycle(job);
-                        }
-                        AccountMaintenanceJob::PersistOwnership(ownership) => {
-                            let mut batch = Vec::with_capacity(64);
-                            batch.push(ownership);
-                            while batch.len() < 256 {
-                                match rx.try_recv() {
-                                    Ok(AccountMaintenanceJob::PersistOwnership(ownership)) => {
-                                        batch.push(ownership);
-                                    }
-                                    Ok(AccountMaintenanceJob::FilledCleanup(job)) => {
-                                        shared.finish_filled_order_if_audited(
-                                            &job.client_order_id,
-                                        );
-                                    }
-                                    Ok(AccountMaintenanceJob::DeferredLifecycle(job)) => {
-                                        shared.apply_deferred_lifecycle(job);
-                                    }
-                                    Err(_) => break,
-                                }
+                    if shutdown.is_finished() {
+                        // Producers are joined. Drain high-priority lifecycle
+                        // first, then one maintenance item, until every bounded
+                        // lane is empty. GC is coalesced and runs last.
+                        loop {
+                            if let Ok(job) = lifecycle_rx.try_recv() {
+                                shared.apply_account_lifecycle_job(job);
+                                continue;
                             }
-                            for ownership in batch {
-                                if shared
-                                    .account_state
-                                    .backfill_order_ownership(&ownership)
-                                    .is_none()
-                                {
-                                    shared.user_feed_health.set_inventory_uncertain(true);
-                                    log::error!(
-                                        "[PolymarketTrade] async ownership persistence conflict coid={} oid={}",
-                                        ownership.client_order_id, ownership.order_id,
-                                    );
-                                }
+                            if let Ok(job) = maintenance_rx.try_recv() {
+                                shared.apply_account_maintenance_job(job);
+                                continue;
                             }
+                            if settled_gc_rx.try_recv().is_ok() {
+                                shared.run_settled_gc_pass();
+                                continue;
+                            }
+                            break;
+                        }
+                        break;
+                    }
+                    crossbeam_channel::select_biased! {
+                        recv(lifecycle_rx) -> job => match job {
+                            Ok(job) => shared.apply_account_lifecycle_job(job),
+                            Err(_) => break,
+                        },
+                        recv(maintenance_rx) -> job => match job {
+                            Ok(job) => shared.apply_account_maintenance_job(job),
+                            Err(_) => break,
+                        },
+                        recv(settled_gc_rx) -> wake => match wake {
+                            Ok(()) => shared.run_settled_gc_pass(),
+                            Err(_) => break,
+                        },
+                        recv(shutdown_rx) -> phase => {
+                            if matches!(phase, Ok(ShutdownPhase::Finished) | Err(_)) {
+                                continue;
+                            }
+                        },
+                        default(std::time::Duration::from_millis(100)) => {
+                            // A certificate may become ready without another
+                            // producer wake. This poll is account-owner local
+                            // and lower priority than both bounded work lanes.
+                            shared.run_settled_gc_pass();
                         }
                     }
                 }
-            });
+            })
+            .expect("spawn Polymarket account owner");
+        (handle, ready_rx)
     }
 
     fn spawn_attempt_audit_worker(
         shared: &Arc<Self>,
         rx: crossbeam_channel::Receiver<AttemptAuditJob>,
-    ) {
+    ) -> std::thread::JoinHandle<()> {
         let weak = Arc::downgrade(shared);
-        let _ = std::thread::Builder::new()
+        let shutdown = shared.shutdown_token.clone();
+        let shutdown_rx = shutdown.subscribe();
+        std::thread::Builder::new()
             .name(format!("poly-attempt-audit-{}", shared.instance_id))
             .spawn(move || {
                 // Audit formatting/export is explicitly lower priority than
                 // lifecycle/account mutation and has its own bounded lane.
                 crate::os_tune::pin_background("polymarket-attempt-audit");
-                while let Ok(job) = rx.recv() {
+                loop {
                     let Some(shared) = weak.upgrade() else {
                         break;
                     };
-                    shared.write_attempt_audit(job);
+                    if shutdown.is_finished() {
+                        while let Ok(job) = rx.try_recv() {
+                            shared.write_attempt_audit(job);
+                        }
+                        break;
+                    }
+                    crossbeam_channel::select_biased! {
+                        recv(rx) -> job => match job {
+                            Ok(job) => shared.write_attempt_audit(job),
+                            Err(_) => break,
+                        },
+                        recv(shutdown_rx) -> _ => continue,
+                    }
                 }
-            });
+            })
+            .expect("spawn Polymarket attempt audit worker")
     }
 
     fn apply_deferred_lifecycle(&self, job: DeferredLifecycleJob) {
@@ -2484,6 +2555,10 @@ impl SharedState {
         );
         crate::latency::record_ns(branch_stage, total_ns.max(1));
         crate::latency::record_ns("polymarket.account.lifecycle_apply", total_ns.max(1));
+        #[cfg(test)]
+        if let Some(completion) = job.completion {
+            let _ = completion.send(now_ns().saturating_sub(job.enqueued_ns));
+        }
     }
 
     fn defer_lifecycle_account_apply(&self, client_order_id: &str, status: OrderStatus) {
@@ -2491,10 +2566,12 @@ impl SharedState {
             client_order_id: client_order_id.to_string(),
             status,
             enqueued_ns: now_ns(),
+            #[cfg(test)]
+            completion: None,
         };
         if let Err(error) = self
-            .account_maintenance_tx
-            .try_send(AccountMaintenanceJob::DeferredLifecycle(job))
+            .account_lifecycle_tx
+            .try_send(AccountLifecycleJob::DeferredLifecycle(job))
         {
             // StrategyAccount still receives the authoritative lifecycle
             // update. Fail the shared monitoring account closed and require
@@ -2507,6 +2584,53 @@ impl SharedState {
                 error,
             );
         }
+    }
+
+    pub(crate) fn enqueue_private_cold(
+        &self,
+        command: super::user_feed::PrivateColdCommand,
+    ) -> std::result::Result<
+        (),
+        crossbeam_channel::TrySendError<super::user_feed::PrivateColdCommand>,
+    > {
+        match self
+            .account_lifecycle_tx
+            .try_send(AccountLifecycleJob::PrivateCold(command))
+        {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(AccountLifecycleJob::PrivateCold(
+                command,
+            ))) => Err(crossbeam_channel::TrySendError::Full(command)),
+            Err(crossbeam_channel::TrySendError::Disconnected(
+                AccountLifecycleJob::PrivateCold(command),
+            )) => Err(crossbeam_channel::TrySendError::Disconnected(command)),
+            Err(_) => unreachable!("private cold command preserves its queue variant"),
+        }
+    }
+
+    /// Join account/audit actors after the run token reaches `Finished`.
+    /// Called once per deduplicated physical account by the live engine.
+    pub fn join_background_workers(&self) -> usize {
+        debug_assert!(
+            self.shutdown_token.is_finished(),
+            "background workers must only join after producer shutdown",
+        );
+        let handles = std::mem::take(
+            &mut *self
+                .background_worker_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let worker_count = handles.len();
+        for handle in handles {
+            if handle.join().is_err() {
+                log::error!(
+                    "[PolymarketTrade] background worker panicked account={}",
+                    self.account_state.account_id(),
+                );
+            }
+        }
+        worker_count
     }
 
     pub(crate) fn request_filled_order_cleanup(&self, client_order_id: &str) {
@@ -2581,8 +2705,8 @@ impl SharedState {
             return Ok(());
         };
         if let Err(error) = self
-            .account_maintenance_tx
-            .try_send(AccountMaintenanceJob::PersistOwnership(ownership))
+            .account_lifecycle_tx
+            .try_send(AccountLifecycleJob::PersistOwnership(ownership))
         {
             // No HTTP request has been dispatched yet. Roll back the local
             // publication and fail the submit closed instead of blocking the
@@ -4184,6 +4308,7 @@ impl PolymarketTrade {
             funder,
             gap_replay,
             account_ledger_path,
+            ShutdownToken::new(),
             false,
         )
     }
@@ -4224,6 +4349,48 @@ impl PolymarketTrade {
             funder,
             gap_replay,
             account_ledger_path,
+            ShutdownToken::new(),
+            true,
+        )
+    }
+
+    /// Live-engine constructor whose account actors share the run-level
+    /// shutdown token with strategy, execution, admission and latency workers.
+    pub fn new_with_pool_for_startup_query_repair_and_shutdown(
+        api_key: &str,
+        api_secret: &str,
+        passphrase: &str,
+        private_key: &str,
+        neg_risk: bool,
+        rate_limit_per_second: u32,
+        sig_type: SignatureType,
+        clob_version: ClobVersion,
+        builder_code: &str,
+        api_url_prefix: &str,
+        use_batch_orders: bool,
+        instance_id: &str,
+        funder: &str,
+        gap_replay: GapReplayConfig,
+        account_ledger_path: Option<&std::path::Path>,
+        shutdown_token: ShutdownToken,
+    ) -> Result<Self> {
+        Self::new_with_pool_inner(
+            api_key,
+            api_secret,
+            passphrase,
+            private_key,
+            neg_risk,
+            rate_limit_per_second,
+            sig_type,
+            clob_version,
+            builder_code,
+            api_url_prefix,
+            use_batch_orders,
+            instance_id,
+            funder,
+            gap_replay,
+            account_ledger_path,
+            shutdown_token,
             true,
         )
     }
@@ -4244,6 +4411,7 @@ impl PolymarketTrade {
         funder: &str,
         gap_replay: GapReplayConfig,
         account_ledger_path: Option<&std::path::Path>,
+        shutdown_token: ShutdownToken,
         startup_query_repair: bool,
     ) -> Result<Self> {
         let signer = OrderSigner::new(private_key, neg_risk, sig_type)?;
@@ -4394,6 +4562,8 @@ impl PolymarketTrade {
         }
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
+        let (account_lifecycle_tx, account_lifecycle_rx) =
+            crossbeam_channel::bounded(16_384);
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
             crossbeam_channel::bounded(ATTEMPT_AUDIT_QUEUE_CAPACITY);
@@ -4445,14 +4615,37 @@ impl PolymarketTrade {
                 pending_delayed_orphans: Mutex::new(HashSet::new()),
                 settled_gc_tx,
                 account_maintenance_tx,
+                account_lifecycle_tx,
                 attempt_audit_tx,
+                shutdown_token,
+                background_worker_handles: Mutex::new(Vec::with_capacity(2)),
             });
-        SharedState::spawn_settled_gc_worker(&shared, settled_gc_rx);
+        let (account_owner, account_owner_ready) = SharedState::spawn_account_owner_worker(
+            &shared,
+            account_lifecycle_rx,
+            account_maintenance_rx,
+            settled_gc_rx,
+        );
+        account_owner_ready
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| anyhow!("Polymarket account owner failed to start: {error}"))?;
+        let (account_owner_barrier_tx, account_owner_barrier_rx) = crossbeam_channel::bounded(1);
+        shared
+            .account_lifecycle_tx
+            .send(AccountLifecycleJob::StartupBarrier(account_owner_barrier_tx))
+            .map_err(|error| anyhow!("Polymarket account owner startup lane closed: {error}"))?;
+        account_owner_barrier_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| anyhow!("Polymarket account owner startup barrier failed: {error}"))?;
         // Resume a durable zero-reference cleanup request without waiting for
         // an unrelated private trade to provide the first wake after restart.
         shared.request_settled_gc();
-        SharedState::spawn_account_maintenance_worker(&shared, account_maintenance_rx);
-        SharedState::spawn_attempt_audit_worker(&shared, attempt_audit_rx);
+        let attempt_audit = SharedState::spawn_attempt_audit_worker(&shared, attempt_audit_rx);
+        shared
+            .background_worker_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([account_owner, attempt_audit]);
         Ok(Self {
             shared,
             owner: api_key.to_string(),
@@ -10372,6 +10565,147 @@ impl ExchangeTrade for PolymarketTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shutdown_test_trade(shutdown: ShutdownToken) -> PolymarketTrade {
+        PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            SignatureType::Eoa,
+            ClobVersion::V2,
+            "",
+            "",
+            true,
+            "shutdown-test",
+            "",
+            GapReplayConfig::default(),
+            None,
+            shutdown,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unified_shutdown_drains_and_joins_account_owner_and_audit_workers() {
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        let shared = trade.shared_state();
+
+        shutdown.request();
+        assert_eq!(
+            shared.background_worker_handles.lock().unwrap().len(),
+            2,
+            "account maintenance/private lifecycle/GC share one actor; audit has one worker",
+        );
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 2);
+        assert!(shared.background_worker_handles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_writer_lifecycle_queue_has_bounded_tail_and_no_overflow() {
+        // One full private-owner scheduling burst. Production ingress applies
+        // backpressure/replay long before an account accumulates thousands of
+        // lifecycle mutations at once.
+        const EVENTS: usize = 128;
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        let shared = trade.shared_state();
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .register_token_fee_config(&["UP".to_string()], 0.0, 1.0)
+            .unwrap();
+        for index in 0..EVENTS {
+            shared
+                .account_state
+                .reserve_order(
+                    "owner",
+                    &format!("owner-{index}"),
+                    &format!("oid-{index}"),
+                    "UP",
+                    Side::Buy,
+                    0.01,
+                    0.01,
+                    0,
+                )
+                .unwrap();
+        }
+
+        // Test setup mutates the account directly and can overlap a pending
+        // background snapshot. Establish the same quiescent edge that live
+        // startup provides before measuring the steady-state owner lane.
+        let drain_started = std::time::Instant::now();
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded(1);
+        shared
+            .account_lifecycle_tx
+            .send(AccountLifecycleJob::StartupBarrier(drain_tx))
+            .unwrap();
+        drain_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("account owner pre-measurement barrier stalled");
+        let pre_measurement_drain_ns = drain_started
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(EVENTS);
+        let mut queue_peak = 0usize;
+        let mut overflow = 0usize;
+        for index in 0..EVENTS {
+            let job = DeferredLifecycleJob {
+                client_order_id: format!("owner-{index}"),
+                status: OrderStatus::Accepted,
+                enqueued_ns: now_ns(),
+                completion: Some(completion_tx.clone()),
+            };
+            if shared
+                .account_lifecycle_tx
+                .try_send(AccountLifecycleJob::DeferredLifecycle(job))
+                .is_err()
+            {
+                overflow += 1;
+            }
+            queue_peak = queue_peak.max(shared.account_lifecycle_tx.len());
+        }
+        drop(completion_tx);
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS - overflow {
+            samples.push(
+                completion_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("single account writer stalled"),
+            );
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let p50 = percentile(1, 2);
+        let p99 = percentile(99, 100);
+        let p999 = percentile(999, 1_000);
+        let max = *samples.last().unwrap();
+        eprintln!(
+            "single-writer lifecycle: n={} pre_measurement_drain_ns={} min_ns={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_peak={} overflow={}",
+            samples.len(), pre_measurement_drain_ns, samples[0], p50, p99, p999, max, queue_peak, overflow,
+        );
+        assert_eq!(overflow, 0);
+        assert!(
+            max < 50_000_000,
+            "steady-state single-writer lifecycle maximum exceeded 50 ms: {max} ns",
+        );
+
+        shutdown.request();
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 2);
+    }
 
     fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
         OrderOwnership {

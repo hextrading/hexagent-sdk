@@ -16,3 +16,4 @@ pub mod http1_pool;
 pub mod latency;
 pub mod latency_record;
 pub mod os_tune;
+pub mod shutdown;
