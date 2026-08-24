@@ -429,16 +429,7 @@ fn fire_full_probe(
     // so the user feed can identify the resting order's placement /
     // cancellation pushes as probe traffic (mute + don't forward) even
     // when the push races ahead of the place response.
-    {
-        let mut ids = shared
-            .probe_order_ids
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if ids.len() >= 64 {
-            ids.pop_front();
-        }
-        ids.push_back(signed.order_hash.clone());
-    }
+    shared.probe_order_ids.insert(&signed.order_hash);
 
     // ── Place leg ──────────────────────────────────────────────────
     // The http layer records this request's latency when active, under

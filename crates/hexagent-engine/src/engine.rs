@@ -25,14 +25,12 @@ use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
 };
-use crate::exchange::{
-    ExchangeMarket, ExchangeTrade, PublicMarketPublisher, PublicMarketReceiver,
-};
+use crate::exchange::{ExchangeMarket, ExchangeTrade, PublicMarketPublisher, PublicMarketReceiver};
 use crate::recorder::{MarketRecorder, MarketReplayer};
-use crate::strategy::Strategy;
+use crate::strategy::{LifecycleEnvelope, LifecycleSource, Strategy};
 use crate::types::*;
-use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 use hexagent_runtime::shutdown::ShutdownToken;
+use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
 // Four account updates keep fill/cancel feedback responsive while bounding
@@ -140,6 +138,7 @@ struct PolymarketWorkerEpoch {
 
 struct PolymarketWorkerSlot {
     current: RwLock<PolymarketWorkerEpoch>,
+    generation: AtomicU64,
 }
 
 impl PolymarketWorkerSlot {
@@ -150,6 +149,7 @@ impl PolymarketWorkerSlot {
                 liveness: Arc::new(PolymarketLiveness::default()),
                 force_clob_runtime_fallback: false,
             }),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -174,15 +174,16 @@ impl PolymarketWorkerSlot {
             force_clob_runtime_fallback: true,
         };
         *current = replacement.clone();
+        // Publish only after the full cold epoch object is installed. Feed
+        // workers use this atomic generation on every frame and never touch
+        // the supervisor's RwLock.
+        self.generation
+            .store(replacement.generation, Ordering::Release);
         Some(replacement)
     }
 
     fn is_current(&self, generation: u64) -> bool {
-        self.current
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .generation
-            == generation
+        self.generation.load(Ordering::Acquire) == generation
     }
 }
 
@@ -1746,12 +1747,7 @@ enum LatestPublish {
 }
 
 impl LatestMarketSlot {
-    fn publish(
-        &self,
-        event: Arc<MarketEvent>,
-        tag: u64,
-        enqueued_ns: u64,
-    ) -> LatestPublish {
+    fn publish(&self, event: Arc<MarketEvent>, tag: u64, enqueued_ns: u64) -> LatestPublish {
         loop {
             let state = self.state.load(Ordering::Acquire);
             match state {
@@ -2046,16 +2042,11 @@ fn resolve_market_event(
 ) -> Option<QueuedMarketPayload> {
     match queued {
         QueuedMarketEvent::Direct(payload) => Some(payload),
-        QueuedMarketEvent::Latest { slot_id, tag } => {
-            latest.slots.get(slot_id as usize)?.take(tag)
-        }
+        QueuedMarketEvent::Latest { slot_id, tag } => latest.slots.get(slot_id as usize)?.take(tag),
     }
 }
 
-fn retire_latest_market_key(
-    handle: LatestMarketKeyHandle,
-    market_lanes: &[MarketEventLane],
-) {
+fn retire_latest_market_key(handle: LatestMarketKeyHandle, market_lanes: &[MarketEventLane]) {
     let slot_base = handle.id as usize * LATEST_EPOCH_SLOTS;
     for lane in market_lanes {
         for offset in 0..LATEST_EPOCH_SLOTS {
@@ -2078,7 +2069,24 @@ fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: us
 struct QueuedOrderUpdate {
     update: OrderUpdate,
     enqueued_at: std::time::Instant,
+    source: LifecycleSource,
 }
+
+#[derive(Debug)]
+struct PendingLifecycleDelivery {
+    owner: usize,
+    queued: QueuedOrderUpdate,
+}
+
+#[derive(Debug)]
+struct LifecycleRouteFailure {
+    owner: Option<usize>,
+    queued: QueuedOrderUpdate,
+    reason: &'static str,
+}
+
+type LifecycleRouteResult =
+    std::result::Result<Option<PendingLifecycleDelivery>, LifecycleRouteFailure>;
 
 struct HistoricalLoadJob {
     epoch: u64,
@@ -3277,8 +3285,7 @@ impl Engine {
             }
         }
 
-        let (market_tx, market_rx) =
-            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) = crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         // Strategy↔executor control traffic must not stall quote processing or
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
@@ -3628,8 +3635,7 @@ impl Engine {
         // back-filled from REST). See `check_warmup_data_freshness`.
         self.check_warmup_data_freshness()?;
 
-        let (market_tx, market_rx) =
-            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) = crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
         let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
@@ -3731,8 +3737,7 @@ impl Engine {
             );
         }
 
-        let (market_tx, market_rx) =
-            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) = crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
 
@@ -4109,18 +4114,14 @@ impl Engine {
         }
         if !bt.market_data_health_replay_path.trim().is_empty() {
             let path = PathBuf::from(bt.market_data_health_replay_path.trim());
-            let replayer = MarketReplayer::from_market_data_health_csv(
-                &path,
-                start_dt,
-                end_dt,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "cannot load market_data_health_replay_path {}: {}",
-                    path.display(),
-                    error,
-                )
-            })?;
+            let replayer = MarketReplayer::from_market_data_health_csv(&path, start_dt, end_dt)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot load market_data_health_replay_path {}: {}",
+                        path.display(),
+                        error,
+                    )
+                })?;
             strat_replayers.push(replayer);
         }
         for (_exchange, symbol) in &replay_sources {
@@ -6886,10 +6887,11 @@ impl Engine {
         for s in strategies.into_iter() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
             let latest = Arc::new(LatestMarketStore::default());
-            // One direct bounded lane per strategy. Private updates must never
-            // block the shared router behind a stalled instance: a full lane is
-            // treated as event loss, quarantines only that owner, and triggers
-            // its fail-closed emergency cancellation path.
+            // One bounded lossless lane per strategy. The router retains the
+            // exact head event when a lane is full and stops consuming both
+            // lifecycle inputs until that event is accepted. Market-data and
+            // supervisor work continue independently while bounded upstream
+            // channels propagate backpressure to their producers.
             let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
             market_lanes.push(MarketEventLane {
                 tx: mtx,
@@ -6987,13 +6989,43 @@ impl Engine {
                 let never_executor_update_rx =
                     crossbeam_channel::never::<RoutedOrderUpdate>();
                 let mut root_private_update_burst = 0usize;
+                let lifecycle_retry_tick =
+                    crossbeam_channel::tick(std::time::Duration::from_micros(50));
+                let never_lifecycle_retry_rx =
+                    crossbeam_channel::never::<std::time::Instant>();
+                let mut pending_lifecycle: Option<PendingLifecycleDelivery> = None;
                 let market_ready_rx = market_rx.ready_receiver().clone();
-                loop {
+                'router: loop {
+                    if let Some(pending) = pending_lifecycle.take() {
+                        match enqueue_lifecycle_delivery(
+                            pending.owner,
+                            pending.queued,
+                            &update_txs,
+                            &worker_quarantined,
+                        ) {
+                            Ok(next) => pending_lifecycle = next,
+                            Err(failure) => {
+                                quarantine_lifecycle_failure(
+                                    &failure,
+                                    &instance_ids,
+                                    &worker_quarantined,
+                                    &signal_tx,
+                                );
+                                break 'router;
+                            }
+                        }
+                    }
+                    let lifecycle_backpressured = pending_lifecycle.is_some();
+                    let selectable_lifecycle_retry_rx = if lifecycle_backpressured {
+                        &lifecycle_retry_tick
+                    } else {
+                        &never_lifecycle_retry_rx
+                    };
                     // Private/order lifecycle is lossless and higher priority
                     // than replaceable market data. Bound the priority burst
                     // so a pathological update storm still permits one public
                     // event, then immediately return to private-first routing.
-                    let selectable_update_rx = if private_update_lane_enabled(
+                    let selectable_update_rx = if !lifecycle_backpressured && private_update_lane_enabled(
                         root_private_update_burst,
                         !market_rx.is_empty(),
                     ) {
@@ -7001,7 +7033,7 @@ impl Engine {
                     } else {
                         &never_root_update_rx
                     };
-                    let selectable_executor_update_rx = if private_update_lane_enabled(
+                    let selectable_executor_update_rx = if !lifecycle_backpressured && private_update_lane_enabled(
                         root_private_update_burst,
                         !market_rx.is_empty(),
                     ) {
@@ -7011,20 +7043,25 @@ impl Engine {
                     };
                     crossbeam_channel::select_biased! {
                         recv(selectable_update_rx) -> msg => match msg {
-                            // Route by coid → numeric owner. Missing ownership
-                            // is unowned and dropped rather than contaminating
-                            // sibling StrategyAccounts.
+                            // Cold compatibility route. Once admitted, the
+                            // numeric owner is carried in the queue envelope.
                             Ok(u) => {
                                 root_private_update_burst =
                                     root_private_update_burst.saturating_add(1);
-                                Self::route_private_update(
+                                match Self::route_private_update(
                                     u,
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
-                                    &instance_ids,
-                                    &signal_tx,
-                                );
+                                ) {
+                                    Ok(next) => pending_lifecycle = next,
+                                    Err(failure) => {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
+                                }
                             }
                             Err(_) => break,
                         },
@@ -7032,14 +7069,20 @@ impl Engine {
                             Ok(routed) => {
                                 root_private_update_burst =
                                     root_private_update_burst.saturating_add(1);
-                                Self::route_executor_update(
+                                match Self::route_executor_update(
                                     routed,
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
-                                    &instance_ids,
-                                    &signal_tx,
-                                );
+                                ) {
+                                    Ok(next) => pending_lifecycle = next,
+                                    Err(failure) => {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
+                                }
                             }
                             Err(_) => break,
                         },
@@ -7138,29 +7181,52 @@ impl Engine {
                                 // enqueued, but select may see this independent
                                 // channel first. Drain the root tail into the
                                 // same lossless per-instance spools.
+                                if let Some(pending) = pending_lifecycle.take() {
+                                    if let Err(failure) = flush_pending_lifecycle(
+                                        pending, &update_txs,
+                                    ) {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
+                                }
                                 while let Ok(u) = update_rx.try_recv() {
-                                    Self::route_private_update(
+                                    let result = Self::route_private_update(
                                         u,
                                         &iid_to_idx,
                                         &update_txs,
                                         &worker_quarantined,
-                                        &instance_ids,
-                                        &signal_tx,
                                     );
+                                    if let Err(failure) = flush_lifecycle_route_result(
+                                        result, &update_txs,
+                                    ) {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
                                 }
                                 while let Ok(routed) = executor_update_rx.try_recv() {
-                                    Self::route_executor_update(
+                                    let result = Self::route_executor_update(
                                         routed,
                                         &iid_to_idx,
                                         &update_txs,
                                         &worker_quarantined,
-                                        &instance_ids,
-                                        &signal_tx,
                                     );
+                                    if let Err(failure) = flush_lifecycle_route_result(
+                                        result, &update_txs,
+                                    ) {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
                                 }
-                                break;
+                                break 'router;
                             }
                         },
+                        recv(selectable_lifecycle_retry_rx) -> _ => {},
                         recv(worker_status_rx) -> msg => {
                             if let Ok((idx, panicked)) = msg {
                                 let reason = if panicked {
@@ -7239,53 +7305,29 @@ impl Engine {
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
-        instance_ids: &[String],
-        signal_tx: &SignalSender,
-    ) {
+    ) -> LifecycleRouteResult {
         if routed.owner == SYSTEM_SIGNAL_OWNER {
             // Account-wide shutdown/recovery operations are not emitted by a
             // strategy instance. Preserve the cold coid recovery route.
-            Self::route_private_update(
+            return Self::route_private_update_with_source(
                 routed.update,
+                LifecycleSource::Execution,
                 iid_to_idx,
                 update_txs,
                 worker_quarantined,
-                instance_ids,
-                signal_tx,
             );
-            return;
         }
         let owner = routed.owner as usize;
-        if owner >= update_txs.len() {
-            error!(
-                "[strategy_router] invalid executor owner={} coid={}",
-                owner, routed.update.client_order_id,
-            );
-            return;
-        }
-        if worker_quarantined[owner].load(Ordering::Acquire) {
-            warn!(
-                "[strategy_router] dropping executor update for quarantined owner instance={} coid={}",
-                instance_ids.get(owner).map(String::as_str).unwrap_or(""),
-                routed.update.client_order_id,
-            );
-            return;
-        }
-        if update_txs[owner]
-            .try_send(QueuedOrderUpdate {
+        enqueue_lifecycle_delivery(
+            owner,
+            QueuedOrderUpdate {
                 update: routed.update,
                 enqueued_at: std::time::Instant::now(),
-            })
-            .is_err()
-        {
-            quarantine_strategy_worker(
-                owner,
-                "executor update queue overflow/disconnect (event loss)",
-                instance_ids,
-                worker_quarantined,
-                signal_tx,
-            );
-        }
+                source: LifecycleSource::Execution,
+            },
+            update_txs,
+            worker_quarantined,
+        )
     }
 
     fn route_private_update(
@@ -7293,15 +7335,29 @@ impl Engine {
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
-        instance_ids: &[String],
-        signal_tx: &SignalSender,
-    ) {
+    ) -> LifecycleRouteResult {
+        Self::route_private_update_with_source(
+            update,
+            LifecycleSource::PrivateFeed,
+            iid_to_idx,
+            update_txs,
+            worker_quarantined,
+        )
+    }
+
+    fn route_private_update_with_source(
+        update: OrderUpdate,
+        source: LifecycleSource,
+        iid_to_idx: &HashMap<String, usize>,
+        update_txs: &[Sender<QueuedOrderUpdate>],
+        worker_quarantined: &[Arc<AtomicBool>],
+    ) -> LifecycleRouteResult {
         // RTT probes reserve/release their synthetic orders directly in the
         // shared monitoring account.  Their executor-style acknowledgements
         // deliberately have no numeric strategy owner and must not enter (or
         // contaminate the latency metrics of) the lossless strategy lane.
         if is_synthetic_probe_update(&update) {
-            return;
+            return Ok(None);
         }
         // Polymarket execution completions and private owner-fast routing stamp
         // OrderUpdate with a local wall-clock timestamp. Reject stale/exchange
@@ -7326,40 +7382,43 @@ impl Engine {
         };
 
         match classify_private_update_route(owner, update_txs.len(), worker_quarantined) {
-            PrivateUpdateRoute::Owner(i) => {
-                let sent = update_txs[i].try_send(QueuedOrderUpdate {
+            PrivateUpdateRoute::Owner(i) => enqueue_lifecycle_delivery(
+                i,
+                QueuedOrderUpdate {
                     update,
                     enqueued_at: std::time::Instant::now(),
-                });
-                if sent.is_err() {
-                    quarantine_strategy_worker(
-                        i,
-                        "private update queue overflow/disconnect (event loss)",
-                        instance_ids,
-                        worker_quarantined,
-                        signal_tx,
-                    );
-                }
-            }
-            PrivateUpdateRoute::DropQuarantined(i) => {
-                warn!(
-                    "[strategy_router] dropping private update for quarantined owner instance={} coid={}",
-                    instance_ids.get(i).map(String::as_str).unwrap_or(""),
-                    update.client_order_id
-                );
-            }
-            PrivateUpdateRoute::DropInvalid(i) => {
-                error!(
-                    "[strategy_router] invalid owner index={} coid={}",
-                    i, update.client_order_id
-                );
-            }
-            PrivateUpdateRoute::Unowned => {
-                error!(
-                    "[strategy_router] dropping private update without numeric owner coid={} status={:?}",
-                    update.client_order_id, update.status,
-                );
-            }
+                    source,
+                },
+                update_txs,
+                worker_quarantined,
+            ),
+            PrivateUpdateRoute::DropQuarantined(i) => Err(LifecycleRouteFailure {
+                owner: Some(i),
+                queued: QueuedOrderUpdate {
+                    update,
+                    enqueued_at: std::time::Instant::now(),
+                    source,
+                },
+                reason: "lifecycle target owner is quarantined",
+            }),
+            PrivateUpdateRoute::DropInvalid(i) => Err(LifecycleRouteFailure {
+                owner: Some(i),
+                queued: QueuedOrderUpdate {
+                    update,
+                    enqueued_at: std::time::Instant::now(),
+                    source,
+                },
+                reason: "invalid lifecycle owner index",
+            }),
+            PrivateUpdateRoute::Unowned => Err(LifecycleRouteFailure {
+                owner: None,
+                queued: QueuedOrderUpdate {
+                    update,
+                    enqueued_at: std::time::Instant::now(),
+                    source,
+                },
+                reason: "lifecycle update has no numeric owner",
+            }),
         }
     }
 
@@ -7514,8 +7573,8 @@ impl Engine {
         }
         // Register coverable keys only after routing resolved at least one
         // owner. Unknown dynamic token traffic must not consume fixed slots.
-        let latest_key = latest_market_key(event.as_ref())
-            .and_then(|key| latest_key_ids.get_or_register(key));
+        let latest_key =
+            latest_market_key(event.as_ref()).and_then(|key| latest_key_ids.get_or_register(key));
         send_to(targets, latest_key)
     }
 
@@ -7557,42 +7616,10 @@ impl Engine {
         let mut private_feed_updates_open = private_lane.is_some();
         let mut private_feed_control_open = private_lane.is_some();
         // File/REST-backed history loading never runs on the strategy owner.
-        // A bounded SPSC worker prepares owned immutable snapshots, then this
-        // strategy thread alone replays them into mutable strategy state.
-        let (hist_job_tx, hist_job_rx) = bounded::<HistoricalLoadJob>(8);
+        // Cold historical reads run on the process-wide bounded background
+        // owner pool; one strategy no longer creates a dedicated mostly-idle
+        // OS thread. Results still return to this sole strategy writer.
         let (hist_result_tx, hist_result_rx) = bounded::<HistoricalLoadResult>(8);
-        let hist_loader_name = format!("strategy-hist-prefetch-{instance_id}");
-        let hist_loader = thread::Builder::new()
-            .name(hist_loader_name.clone())
-            .spawn(move || {
-                crate::os_tune::pin_background(&hist_loader_name);
-                while let Ok(job) = hist_job_rx.recv() {
-                    let mut loaded = Vec::with_capacity(job.requests.len());
-                    for request in job.requests {
-                        let mut bars = Vec::new();
-                        for dir in &data_dirs {
-                            if let Ok(candidate) = crate::recorder::load_hist_bars(dir, &request) {
-                                if !candidate.is_empty() {
-                                    bars = candidate;
-                                    break;
-                                }
-                            }
-                        }
-                        loaded.push((request, Arc::from(bars.into_boxed_slice())));
-                    }
-                    if hist_result_tx
-                        .send(HistoricalLoadResult {
-                            epoch: job.epoch,
-                            ts_event: job.ts_event,
-                            loaded,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .expect("spawn strategy history prefetch worker");
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         crate::latency::prepare_thread_stages(&[
             "strategy.market.queue",
@@ -7611,6 +7638,7 @@ impl Engine {
         let mut last_quote_ns: u64 = 0;
         let mut quote_signal_batch = Vec::with_capacity(32);
         let mut private_update_burst = 0usize;
+        let mut lifecycle_sequence = 0u64;
         let mut historical_epoch = 0u64;
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
@@ -7650,10 +7678,10 @@ impl Engine {
             };
             let selectable_watchdog_rx =
                 if !market_rx.is_empty() && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL {
-                &never_watchdog_rx
-            } else {
-                &watchdog_rx
-            };
+                    &never_watchdog_rx
+                } else {
+                    &watchdog_rx
+                };
             crossbeam_channel::select_biased! {
                 recv(selectable_private_control_rx) -> msg => match msg {
                     Ok(control) => {
@@ -7671,15 +7699,22 @@ impl Engine {
                         private_update_burst = private_update_burst.saturating_add(1);
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
-                        if shutdown_started { continue; }
                         let callback_started = crate::latency::Instant::now();
-                        let signals = strategy.on_order_update_owned(update);
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                        let signals = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
+                            owner: idx as u16,
+                            sequence: lifecycle_sequence,
+                            source: LifecycleSource::PrivateFeed,
+                            update,
+                        });
                         crate::latency::record(
                             "strategy.private_feed.callback",
                             callback_started,
                         );
-                        for sig in signals {
-                            if !emit(sig) { break 'worker; }
+                        if !shutdown_started {
+                            for sig in signals {
+                                if !emit(sig) { break 'worker; }
+                            }
                         }
                     }
                     Err(_) => private_feed_updates_open = false,
@@ -7701,7 +7736,13 @@ impl Engine {
                             queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         );
                         let callback_started = crate::latency::Instant::now();
-                        let signals = strategy.on_order_update_owned(queued.update);
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                        let signals = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
+                            owner: idx as u16,
+                            sequence: lifecycle_sequence,
+                            source: queued.source,
+                            update: queued.update,
+                        });
                         if !shutdown_started {
                             for sig in signals {
                                 if !emit(sig) { break 'worker; }
@@ -7788,9 +7829,31 @@ impl Engine {
                                         ts_event,
                                         requests: hist_reqs,
                                     };
-                                    if hist_job_tx.try_send(job).is_err() {
+                                    let job_data_dirs = data_dirs.clone();
+                                    let job_result_tx = hist_result_tx.clone();
+                                    if hexagent_runtime::background_jobs::try_submit(move || {
+                                        let HistoricalLoadJob { epoch, ts_event, requests } = job;
+                                        let mut loaded = Vec::with_capacity(requests.len());
+                                        for request in requests {
+                                            let mut bars = Vec::new();
+                                            for dir in &job_data_dirs {
+                                                if let Ok(candidate) = crate::recorder::load_hist_bars(dir, &request) {
+                                                    if !candidate.is_empty() {
+                                                        bars = candidate;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            loaded.push((request, Arc::from(bars.into_boxed_slice())));
+                                        }
+                                        let _ = job_result_tx.send(HistoricalLoadResult {
+                                            epoch,
+                                            ts_event,
+                                            loaded,
+                                        });
+                                    }).is_err() {
                                         error!(
-                                            "[Strategy] historical prefetch queue overflow instance={}; quarantining fail-closed",
+                                            "[Strategy] bounded historical owner queue unavailable instance={}; quarantining fail-closed",
                                             instance_id,
                                         );
                                         quarantined.store(true, Ordering::Release);
@@ -7843,16 +7906,29 @@ impl Engine {
                 },
             }
         }
-        drop(hist_job_tx);
         drop(hist_result_rx);
-        let _ = hist_loader.join();
         if !shutdown_started {
             strategy.on_exit();
         }
         // Dispatchers are joined before the router closes market_txs, so all
         // final updates are available here before the report is generated.
+        while let Ok(update) = private_feed_update_rx.try_recv() {
+            lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+            let _ = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
+                owner: idx as u16,
+                sequence: lifecycle_sequence,
+                source: LifecycleSource::PrivateFeed,
+                update,
+            });
+        }
         while let Ok(queued) = update_rx.try_recv() {
-            let _ = strategy.on_order_update(&queued.update);
+            lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+            let _ = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
+                owner: idx as u16,
+                sequence: lifecycle_sequence,
+                source: queued.source,
+                update: queued.update,
+            });
         }
         let _ = strategy.on_shutdown();
     }
@@ -9853,12 +9929,35 @@ impl Engine {
                 // grow process memory without limit or block a strategy owner.
                 let (poly_cancel_tx, poly_cancel_rx) =
                     bounded::<(Signal, u64, ExecutorUpdateSender)>(CHANNEL_CAPACITY);
-                // Reconcile performs synchronous multi-request HTTP. Keep it
-                // off both the place and cancel lanes; bounded admission lets
-                // the strategy receive explicit deferred feedback instead of
-                // building an unbounded orphan backlog.
-                let (poly_reconcile_tx, poly_reconcile_rx) =
-                    bounded::<(Signal, u64, ExecutorUpdateSender)>(CHANNEL_CAPACITY);
+                // Reconcile performs synchronous multi-request HTTP. Each
+                // physical account gets one bounded owner lane; all strategy
+                // instances on that wallet route to the same receiver. This
+                // makes retry/reconcile state single-writer without merging it
+                // into cancel or completion workers (which can hold permits).
+                let mut poly_reconcile_routes = HashMap::<
+                    String,
+                    Sender<(Signal, u64, ExecutorUpdateSender)>,
+                >::new();
+                let mut poly_reconcile_owner_lanes = HashMap::<
+                    String,
+                    Receiver<(Signal, u64, ExecutorUpdateSender)>,
+                >::new();
+                let mut account_reconcile_senders = HashMap::<
+                    String,
+                    Sender<(Signal, u64, ExecutorUpdateSender)>,
+                >::new();
+                for (instance_id, shared) in &poly_states {
+                    let account_id = shared.account_state.account_id().to_string();
+                    let tx = if let Some(tx) = account_reconcile_senders.get(&account_id) {
+                        tx.clone()
+                    } else {
+                        let (tx, rx) = bounded(CHANNEL_CAPACITY);
+                        account_reconcile_senders.insert(account_id.clone(), tx.clone());
+                        poly_reconcile_owner_lanes.insert(account_id, rx);
+                        tx
+                    };
+                    poly_reconcile_routes.insert(instance_id.clone(), tx);
+                }
                 // Fire-and-track completion lane: a worker fires (admission
                 // permit + kickoff on the reserved connection) then hands the
                 // "await reply + book it" closure here; a pool of drainers runs
@@ -9976,16 +10075,15 @@ impl Engine {
                             .unwrap();
                         poly_cancel_handles.push(h);
                     }
-                    // One owner task per account route is sufficient: each
-                    // request already owns a separate Reconcile connection
-                    // permit, and duplicate OS workers only increase lock/map
-                    // contention in cold lifecycle bookkeeping.
-                    let reconcile_worker_n = poly_states.len().max(1);
-                    for i in 0..reconcile_worker_n {
+                    // Exactly one owner worker consumes each physical-account
+                    // lane. Cancel and completion remain separate so a worker
+                    // waiting for a reconcile permit cannot strand the
+                    // completion closure that releases it.
+                    let reconcile_worker_n = poly_reconcile_owner_lanes.len();
+                    for (account_id, rx) in poly_reconcile_owner_lanes.drain() {
                         let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
-                        let rx = poly_reconcile_rx.clone();
                         let done_tx = poly_done_tx.clone();
-                        let wname = format!("poly-reconcile-{}", i);
+                        let wname = format!("poly-reconcile-owner-{}", account_id);
                         let h = thread::Builder::new()
                             .name(wname.clone())
                             .spawn(move || {
@@ -10219,14 +10317,14 @@ impl Engine {
                 }
                 drop(poly_pool_rx); // main loop only sends; workers hold their clones
                 drop(poly_cancel_rx);
-                drop(poly_reconcile_rx);
+                drop(account_reconcile_senders);
                 drop(poly_done_rx); // workers hold their clones of done_tx
                 // Options so Exit can drop senders + join (drain all in-flight
                 // dispatches AND completions) BEFORE the shutdown cancel-all, so
                 // nothing places an order after cancel-all snapshots the book.
                 let mut poly_pool_tx = Some(poly_pool_tx);
                 let mut poly_cancel_tx = Some(poly_cancel_tx);
-                let mut poly_reconcile_tx = Some(poly_reconcile_tx);
+                let mut poly_reconcile_routes = Some(poly_reconcile_routes);
                 let mut poly_done_tx = Some(poly_done_tx);
 
                 // Stale-signal threshold — read from the shared
@@ -10328,7 +10426,7 @@ impl Engine {
                                 // retain a sender for the cancel lane they are
                                 // waiting to drain; that self-ownership was the
                                 // old shutdown deadlock.
-                                poly_reconcile_tx = None;
+                                poly_reconcile_routes = None;
                                 for h in std::mem::take(&mut poly_reconcile_handles) {
                                     let _ = h.join();
                                 }
@@ -10427,7 +10525,10 @@ impl Engine {
                                         }
                                     }
                                     Signal::ReconcilePolymarket { .. } => {
-                                        if let Some(tx) = poly_reconcile_tx.as_ref() {
+                                        if let Some(tx) = poly_reconcile_routes
+                                            .as_ref()
+                                            .and_then(|routes| routes.get(&instance_id))
+                                        {
                                             match tx.try_send(work) {
                                                 Ok(()) => {}
                                                 Err(crossbeam_channel::TrySendError::Full((
@@ -10493,7 +10594,7 @@ impl Engine {
                 // in-flight dispatch finishes before the executor thread exits.
                 drop(poly_pool_tx.take());
                 for h in poly_worker_handles { let _ = h.join(); }
-                drop(poly_reconcile_tx.take());
+                drop(poly_reconcile_routes.take());
                 for h in poly_reconcile_handles { let _ = h.join(); }
                 drop(poly_cancel_tx.take());
                 for h in poly_cancel_handles { let _ = h.join(); }
@@ -10543,6 +10644,100 @@ fn classify_private_update_route(
         Some(i) if quarantined[i].load(Ordering::Acquire) => PrivateUpdateRoute::DropQuarantined(i),
         Some(i) => PrivateUpdateRoute::Owner(i),
         None => PrivateUpdateRoute::Unowned,
+    }
+}
+
+fn enqueue_lifecycle_delivery(
+    owner: usize,
+    queued: QueuedOrderUpdate,
+    update_txs: &[Sender<QueuedOrderUpdate>],
+    quarantined: &[Arc<AtomicBool>],
+) -> LifecycleRouteResult {
+    if owner >= update_txs.len() || owner >= quarantined.len() {
+        return Err(LifecycleRouteFailure {
+            owner: Some(owner),
+            queued,
+            reason: "invalid lifecycle owner index",
+        });
+    }
+    if quarantined[owner].load(Ordering::Acquire) {
+        return Err(LifecycleRouteFailure {
+            owner: Some(owner),
+            queued,
+            reason: "lifecycle target owner is quarantined",
+        });
+    }
+    match update_txs[owner].try_send(queued) {
+        Ok(()) => Ok(None),
+        Err(crossbeam_channel::TrySendError::Full(queued)) => {
+            hexagent_runtime::latency::record_ns("strategy.private_update.backpressure", 1);
+            Ok(Some(PendingLifecycleDelivery { owner, queued }))
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(queued)) => Err(LifecycleRouteFailure {
+            owner: Some(owner),
+            queued,
+            reason: "lifecycle target owner disconnected",
+        }),
+    }
+}
+
+fn flush_lifecycle_route_result(
+    result: LifecycleRouteResult,
+    update_txs: &[Sender<QueuedOrderUpdate>],
+) -> std::result::Result<(), LifecycleRouteFailure> {
+    match result? {
+        None => Ok(()),
+        Some(pending) => flush_pending_lifecycle(pending, update_txs),
+    }
+}
+
+fn flush_pending_lifecycle(
+    pending: PendingLifecycleDelivery,
+    update_txs: &[Sender<QueuedOrderUpdate>],
+) -> std::result::Result<(), LifecycleRouteFailure> {
+    let Some(tx) = update_txs.get(pending.owner) else {
+        return Err(LifecycleRouteFailure {
+            owner: Some(pending.owner),
+            queued: pending.queued,
+            reason: "invalid lifecycle owner index during shutdown drain",
+        });
+    };
+    tx.send(pending.queued)
+        .map_err(|error| LifecycleRouteFailure {
+            owner: Some(pending.owner),
+            queued: error.0,
+            reason: "lifecycle target disconnected during shutdown drain",
+        })
+}
+
+fn quarantine_lifecycle_failure(
+    failure: &LifecycleRouteFailure,
+    instance_ids: &[String],
+    quarantined: &[Arc<AtomicBool>],
+    signal_tx: &SignalSender,
+) {
+    error!(
+        "[strategy_router] lossless lifecycle delivery failed reason={} owner={:?} coid={} status={:?}; stopping router for replay/recovery",
+        failure.reason,
+        failure.owner,
+        failure.queued.update.client_order_id,
+        failure.queued.update.status,
+    );
+    match failure.owner.filter(|owner| *owner < quarantined.len()) {
+        Some(owner) => {
+            quarantine_strategy_worker(owner, failure.reason, instance_ids, quarantined, signal_tx);
+        }
+        None => {
+            for owner in 0..quarantined.len() {
+                quarantine_strategy_worker(
+                    owner,
+                    failure.reason,
+                    instance_ids,
+                    quarantined,
+                    signal_tx,
+                );
+            }
+        }
     }
 }
 
@@ -11273,8 +11468,7 @@ fn fire_or_execute(
                 cancel_tx
                     .send((cancel_signal, stale_ms, utx.clone()))
                     .is_err()
-            })
-            {
+            }) {
                 let _ = send_executor_update(utx, exec_rejected_cancel(coid, exchange));
             }
         }
@@ -13223,13 +13417,7 @@ mod market_router_tests {
         let first = Arc::new(spot("btc/usd"));
 
         assert_eq!(
-            Engine::route_market_event(
-                first,
-                &sym,
-                &mut tok,
-                &mut latest,
-                &txs,
-            ),
+            Engine::route_market_event(first, &sym, &mut tok, &mut latest, &txs,),
             0
         );
         // BTC queue is now full. Routing ETH must remain independent.
@@ -13246,13 +13434,7 @@ mod market_router_tests {
         assert_eq!(drain(&rx1), 1);
         let second = Arc::new(spot("btc/usd"));
         assert_eq!(
-            Engine::route_market_event(
-                Arc::clone(&second),
-                &sym,
-                &mut tok,
-                &mut latest,
-                &txs,
-            ),
+            Engine::route_market_event(Arc::clone(&second), &sym, &mut tok, &mut latest, &txs,),
             0,
             "a full latest-value lane replaces its pending snapshot"
         );
@@ -13327,20 +13509,21 @@ mod market_router_tests {
         let (lane, rx) = test_market_lane(64);
         let lanes = [lane];
 
-        let route_instrument = |token: &str,
-                                tok: &mut HashMap<SymbolId, RouteMask>,
-                                latest: &mut LatestMarketKeyRegistry| {
-            Engine::route_market_event(
-                Arc::new(MarketEvent::Instrument(binary_option(
-                    "btc-up-or-down-5m",
-                    &[token],
-                ))),
-                &sym,
-                tok,
-                latest,
-                &lanes,
-            )
-        };
+        let route_instrument =
+            |token: &str,
+             tok: &mut HashMap<SymbolId, RouteMask>,
+             latest: &mut LatestMarketKeyRegistry| {
+                Engine::route_market_event(
+                    Arc::new(MarketEvent::Instrument(binary_option(
+                        "btc-up-or-down-5m",
+                        &[token],
+                    ))),
+                    &sym,
+                    tok,
+                    latest,
+                    &lanes,
+                )
+            };
         let route_book = |token: &str,
                           tok: &mut HashMap<SymbolId, RouteMask>,
                           latest: &mut LatestMarketKeyRegistry| {
@@ -13443,16 +13626,8 @@ mod market_router_tests {
                 ob(Exchange::Polymarket, &token),
                 quote(Exchange::Polymarket, &token),
             ] {
-                Engine::route_market_event(
-                    Arc::new(event),
-                    &sym,
-                    &mut tok,
-                    &mut latest,
-                    &lanes,
-                );
-                assert!(
-                    resolve_market_event(rx.try_recv().unwrap(), &lanes[0].latest).is_some()
-                );
+                Engine::route_market_event(Arc::new(event), &sym, &mut tok, &mut latest, &lanes);
+                assert!(resolve_market_event(rx.try_recv().unwrap(), &lanes[0].latest).is_some());
             }
             assert_eq!(latest.len(), 2);
 
@@ -13970,13 +14145,11 @@ mod market_router_tests {
     fn executor_update_uses_numeric_owner_without_coid_parsing() {
         let (owner0_tx, owner0_rx) = bounded(4);
         let (owner1_tx, owner1_rx) = bounded(4);
-        let (signal_raw_tx, _signal_raw_rx) = bounded(4);
-        let signal_tx = SignalSender::system(signal_raw_tx);
         let flags = vec![
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ];
-        Engine::route_executor_update(
+        let routed = Engine::route_executor_update(
             RoutedOrderUpdate {
                 owner: 1,
                 // Deliberately not namespaced: string recovery routing would
@@ -14002,14 +14175,81 @@ mod market_router_tests {
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
             &flags,
-            &["zero".into(), "one".into()],
-            &signal_tx,
-        );
+        )
+        .unwrap();
+        assert!(routed.is_none());
         assert!(owner0_rx.try_recv().is_err());
         assert_eq!(
             owner1_rx.try_recv().unwrap().update.client_order_id,
             "opaque-coid",
         );
+    }
+
+    #[test]
+    fn full_lifecycle_lane_retains_exact_event_until_owner_accepts_it() {
+        let (owner_tx, owner_rx) = bounded(1);
+        let flags = vec![Arc::new(AtomicBool::new(false))];
+        let occupied = QueuedOrderUpdate {
+            update: OrderUpdate {
+                client_order_id: "owner-occupied".into(),
+                exchange: Exchange::Hexmarket,
+                symbol: "market".into(),
+                side: Side::Buy,
+                exchange_order_id: None,
+                status: OrderStatus::Pending,
+                liquidity: None,
+                filled_quantity: 0.0,
+                remaining_quantity: 1.0,
+                avg_fill_price: 0.0,
+                timestamp_ns: 1,
+                exchange_event_timestamp_ns: None,
+                trade_id: None,
+                order_audit: None,
+                error: None,
+            },
+            enqueued_at: std::time::Instant::now(),
+            source: LifecycleSource::Execution,
+        };
+        owner_tx.send(occupied).unwrap();
+        let retained = Engine::route_executor_update(
+            RoutedOrderUpdate {
+                owner: 0,
+                update: OrderUpdate {
+                    client_order_id: "opaque-lossless".into(),
+                    exchange: Exchange::Hexmarket,
+                    symbol: "market".into(),
+                    side: Side::Sell,
+                    exchange_order_id: Some("oid-lossless".into()),
+                    status: OrderStatus::Accepted,
+                    liquidity: None,
+                    filled_quantity: 0.0,
+                    remaining_quantity: 2.0,
+                    avg_fill_price: 0.0,
+                    timestamp_ns: 2,
+                    exchange_event_timestamp_ns: None,
+                    trade_id: None,
+                    order_audit: None,
+                    error: None,
+                },
+            },
+            &HashMap::new(),
+            std::slice::from_ref(&owner_tx),
+            &flags,
+        )
+        .unwrap()
+        .expect("full owner lane must retain its exact head event");
+        assert_eq!(
+            owner_rx.recv().unwrap().update.client_order_id,
+            "owner-occupied"
+        );
+        flush_pending_lifecycle(retained, std::slice::from_ref(&owner_tx)).unwrap();
+        let delivered = owner_rx.recv().unwrap();
+        assert_eq!(delivered.update.client_order_id, "opaque-lossless");
+        assert_eq!(
+            delivered.update.exchange_order_id.as_deref(),
+            Some("oid-lossless")
+        );
+        assert_eq!(delivered.source, LifecycleSource::Execution);
     }
 
     #[test]

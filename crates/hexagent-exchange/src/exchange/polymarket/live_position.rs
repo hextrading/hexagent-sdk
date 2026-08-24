@@ -6,7 +6,6 @@
 //! - `confirmed_position()`: only CONFIRMED trades (for sell inventory checks)
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
-use log::debug;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -318,10 +317,10 @@ impl UserFeedHealth {
             .pending
             .contains_key(&key)
             .then(|| RecoveryUpdateAck {
-            health: Arc::clone(self),
-            instance_id: instance_id.to_string(),
-            update: update.clone(),
-        })
+                health: Arc::clone(self),
+                instance_id: instance_id.to_string(),
+                update: update.clone(),
+            })
     }
 
     /// Returns `None` if a newer reconnect superseded this generation;
@@ -401,9 +400,9 @@ impl TradeStatus {
 #[derive(Debug, Clone)]
 pub struct LiveTrade {
     pub trade_id: String,
-    pub asset_id: String,   // token ID
-    pub side: Side,         // Buy or Sell
-    pub size: f64,          // fill quantity
+    pub asset_id: String, // token ID
+    pub side: Side,       // Buy or Sell
+    pub size: f64,        // fill quantity
     pub price: f64,
     pub status: TradeStatus,
     pub is_maker: bool,
@@ -570,13 +569,13 @@ impl LivePositionManager {
         self.trades.insert(
             trade_id.to_string(),
             LiveTrade {
-            trade_id: trade_id.to_string(),
-            asset_id: asset_id.to_string(),
-            side,
-            size,
-            price,
-            status,
-            is_maker,
+                trade_id: trade_id.to_string(),
+                asset_id: asset_id.to_string(),
+                side,
+                size,
+                price,
+                status,
+                is_maker,
             },
         );
 
@@ -584,21 +583,35 @@ impl LivePositionManager {
             // Restored rows are summarized by the account startup log. Per-row
             // lifecycle output here used to dominate cold-start logs.
         } else if log::log_enabled!(log::Level::Debug) {
-            let reason_part = match reason {
-                Some(s) if !s.is_empty() => format!(" reason=\"{}\"", s),
-                _ => String::new(),
-            };
-            if is_new {
-                debug!(
-                "[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
-                trade_id, side, asset_id, size, price, status, is_maker, reason_part
-                );
-            } else {
-                debug!(
-                    "[LivePosition] Trade {} status → {:?}{}",
-                    trade_id, status, reason_part
-                );
-            }
+            let trade_id = trade_id.to_string();
+            let asset_id = asset_id.to_string();
+            let reason = reason.filter(|value| !value.is_empty()).map(str::to_string);
+            let _ = hexagent_runtime::background_jobs::try_submit(move || {
+                let reason_part = reason
+                    .as_deref()
+                    .map(|value| format!(" reason=\"{value}\""))
+                    .unwrap_or_default();
+                if is_new {
+                    log::debug!(
+                        "[LivePosition] Trade {} {} {} {:.2}@{:.4} status={:?} maker={}{}",
+                        trade_id,
+                        side,
+                        asset_id,
+                        size,
+                        price,
+                        status,
+                        is_maker,
+                        reason_part,
+                    );
+                } else {
+                    log::debug!(
+                        "[LivePosition] Trade {} status → {:?}{}",
+                        trade_id,
+                        status,
+                        reason_part,
+                    );
+                }
+            });
         }
 
         true
@@ -729,9 +742,7 @@ mod user_feed_health_tests {
         h.mark_strategy_consumer_ready();
         assert!(h.strategy_consumer_ready());
         assert_eq!(
-            h.take_startup_recovery_updates(generation)
-                .unwrap()
-                .len(),
+            h.take_startup_recovery_updates(generation).unwrap().len(),
             1,
         );
         assert!(h
@@ -768,20 +779,20 @@ mod update_trade_dedup_tests {
     #[test]
     fn advances_dedups_and_blocks_reversal() {
         let mut m = LivePositionManager::new();
-        assert!(upd(&mut m, "t1", TradeStatus::Matched));    // first sighting
-        assert!(!upd(&mut m, "t1", TradeStatus::Matched));   // same → skip (dedup)
-        assert!(upd(&mut m, "t1", TradeStatus::Mined));      // advance
-        assert!(!upd(&mut m, "t1", TradeStatus::Matched));   // earlier → skip (no reversal)
-        assert!(upd(&mut m, "t1", TradeStatus::Confirmed));  // advance to terminal
-        assert!(!upd(&mut m, "t1", TradeStatus::Failed));    // terminal → immutable
+        assert!(upd(&mut m, "t1", TradeStatus::Matched)); // first sighting
+        assert!(!upd(&mut m, "t1", TradeStatus::Matched)); // same → skip (dedup)
+        assert!(upd(&mut m, "t1", TradeStatus::Mined)); // advance
+        assert!(!upd(&mut m, "t1", TradeStatus::Matched)); // earlier → skip (no reversal)
+        assert!(upd(&mut m, "t1", TradeStatus::Confirmed)); // advance to terminal
+        assert!(!upd(&mut m, "t1", TradeStatus::Failed)); // terminal → immutable
     }
 
     #[test]
     fn retrying_always_skipped() {
         let mut m = LivePositionManager::new();
-        assert!(!upd(&mut m, "t1", TradeStatus::Retrying));  // transient, even first sighting
+        assert!(!upd(&mut m, "t1", TradeStatus::Retrying)); // transient, even first sighting
         assert!(upd(&mut m, "t1", TradeStatus::Matched));
-        assert!(!upd(&mut m, "t1", TradeStatus::Retrying));  // still skipped
+        assert!(!upd(&mut m, "t1", TradeStatus::Retrying)); // still skipped
     }
 
     #[test]

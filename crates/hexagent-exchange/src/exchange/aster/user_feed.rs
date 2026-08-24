@@ -170,7 +170,7 @@ async fn user_feed_task(
                             match data.get("e").and_then(|v| v.as_str()).unwrap_or("") {
                                 "ORDER_TRADE_UPDATE" => {
                                     if let Some(u) = parse_order_trade_update(&data) {
-                                        if !publisher.publish(u) { return; }
+                                        if !publisher.publish(u).await { return; }
                                     }
                                 }
                                 "listenKeyExpired" => {

@@ -4,6 +4,24 @@ use crate::types::{
 };
 use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 
+/// Numeric, owner-local lifecycle message delivered by the engine. `sequence`
+/// is assigned by the strategy owner thread after merging private-feed and
+/// execution feedback, so consumers can reject duplicates/out-of-order replay
+/// without parsing a client-order-id namespace.
+#[derive(Debug)]
+pub struct LifecycleEnvelope {
+    pub owner: u16,
+    pub sequence: u64,
+    pub source: LifecycleSource,
+    pub update: OrderUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleSource {
+    PrivateFeed,
+    Execution,
+}
+
 /// Trait for trading strategies.
 pub trait Strategy: Send {
     fn name(&self) -> &str;
@@ -132,6 +150,12 @@ pub trait Strategy: Send {
     /// tables may override it and retain the message's IDs without cloning.
     fn on_order_update_owned(&mut self, update: OrderUpdate) -> Vec<Signal> {
         self.on_order_update(&update)
+    }
+
+    /// Preferred numeric lifecycle hook. The default preserves compatibility
+    /// while strategies migrate from string-key recovery routing.
+    fn on_lifecycle_update_owned(&mut self, envelope: LifecycleEnvelope) -> Vec<Signal> {
+        self.on_order_update_owned(envelope.update)
     }
     fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> {
         Vec::new()

@@ -613,7 +613,7 @@ impl GapReplayTransport {
 /// boundary prevents replayed terminal trades from reaching reconciliation
 /// or inventory accounting again.
 fn record_trade_transition(
-    live_position: &Mutex<LivePositionManager>,
+    live_position: &mut LivePositionManager,
     trade_key: &str,
     status_str: &str,
     asset_id: &str,
@@ -635,7 +635,7 @@ fn record_trade_transition(
     {
         return false;
     }
-    live_position.lock().unwrap().update_trade(
+    live_position.update_trade(
         trade_key, status, asset_id, side, size, price, is_maker, reason,
     )
 }
@@ -882,13 +882,7 @@ fn parse_order_event(
     shared: &SharedState,
 ) -> std::result::Result<Vec<OrderUpdate>, String> {
     let order_id = required_string(data, &["order_id", "orderID", "id"], "order_id")?;
-    if shared
-        .probe_order_ids
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|id| normalize_order_id(id) == normalize_order_id(order_id))
-    {
+    if shared.probe_order_ids.contains(order_id) {
         debug!("[PolyUserFeed] probe order lifecycle push muted: oid={order_id}");
         return Ok(Vec::new());
     }
@@ -1260,6 +1254,7 @@ fn flag_invalid_private_event(data: &serde_json::Value, shared: &SharedState, er
 fn parse_user_event_checked(
     data: &serde_json::Value,
     shared: &SharedState,
+    live_position: &mut LivePositionManager,
 ) -> std::result::Result<Vec<OrderUpdate>, String> {
     let event_type = data
         .get("event_type")
@@ -1270,7 +1265,7 @@ fn parse_user_event_checked(
         "order" => parse_order_event(data, shared),
         "trade" => {
             validate_trade_event(data, shared)?;
-            let updates = parse_user_event_validated(data, shared);
+            let updates = parse_user_event_validated(data, shared, live_position);
             Ok(updates)
         }
         _ => Ok(Vec::new()),
@@ -1328,12 +1323,7 @@ impl PrivateEventDelta {
         else {
             return false;
         };
-        shared
-            .probe_order_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|probe| normalize_order_id(probe) == normalize_order_id(order_id))
+        shared.probe_order_ids.contains(order_id)
     }
 
     fn dedupe_key(&self) -> String {
@@ -1930,12 +1920,7 @@ fn dispatch_private_update(
 ) -> std::result::Result<(), String> {
     if update.client_order_id.is_empty() {
         if let Some(oid) = update.exchange_order_id.as_deref() {
-            let is_probe = shared
-                .probe_order_ids
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .any(|probe| probe == oid);
+            let is_probe = shared.probe_order_ids.contains(oid);
             if is_probe {
                 debug!(
                     "[PolyUserFeed] probe order push muted: {} {:?} oid={}..",
@@ -2044,8 +2029,9 @@ fn route_private_batch(
     })
 }
 
-fn apply_private_cold_batch(
+fn apply_private_cold_batch_owned(
     shared: &SharedState,
+    live_position: &mut LivePositionManager,
     events: &[PrivateEventDelta],
     recovery_generation: Option<u64>,
 ) -> std::result::Result<usize, String> {
@@ -2054,7 +2040,7 @@ fn apply_private_cold_batch(
         let payload = event.payload();
         let is_trade = matches!(event, PrivateEventDelta::Trade(_));
         let account_apply_started = crate::latency::Instant::now();
-        let parsed = parse_user_event_with_health(payload, shared);
+        let parsed = parse_user_event_with_health_owned(payload, shared, live_position);
         crate::latency::record(
             if is_trade {
                 "polymarket.user.account_apply.trade"
@@ -2119,10 +2105,28 @@ fn apply_private_cold_batch(
     Ok(applied)
 }
 
+#[cfg(test)]
+fn apply_private_cold_batch(
+    shared: &SharedState,
+    events: &[PrivateEventDelta],
+    recovery_generation: Option<u64>,
+) -> std::result::Result<usize, String> {
+    shared.with_test_live_position(|live_position| {
+        let result =
+            apply_private_cold_batch_owned(shared, live_position, events, recovery_generation);
+        shared.publish_live_position_watermark(live_position.last_match_time_secs());
+        result
+    })
+}
+
 /// Apply one private batch on the account actor. Execution lifecycle and
 /// authenticated private lifecycle therefore share exactly one writer and one
 /// ordered high-priority lane per physical account.
-pub(crate) fn apply_private_cold_command(shared: &SharedState, command: PrivateColdCommand) {
+pub(crate) fn apply_private_cold_command(
+    shared: &SharedState,
+    live_position: &mut LivePositionManager,
+    command: PrivateColdCommand,
+) {
     let PrivateColdCommand {
         events,
         identities,
@@ -2132,22 +2136,19 @@ pub(crate) fn apply_private_cold_command(shared: &SharedState, command: PrivateC
         feedback,
     } = command;
     crate::latency::record("polymarket.user.fast_route_to_account_owner", routed_at);
-    let result = apply_private_cold_batch(shared, &events, recovery_generation);
+    let result =
+        apply_private_cold_batch_owned(shared, live_position, &events, recovery_generation);
+    shared.publish_live_position_watermark(live_position.last_match_time_secs());
     if let Err(error) = &result {
         shared.user_feed_health.set_recovering(true);
         warn!(
             "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
             error,
         );
-        feedback
-            .reconnect_generation
-            .fetch_add(1, Ordering::AcqRel);
+        feedback.reconnect_generation.fetch_add(1, Ordering::AcqRel);
         feedback.reconnect_notify.notify_one();
     }
-    if result.is_ok()
-        && !identities.is_empty()
-        && feedback.ack_tx.try_send(identities).is_err()
-    {
+    if result.is_ok() && !identities.is_empty() && feedback.ack_tx.try_send(identities).is_err() {
         crate::latency::record_ns("polymarket.user.cold_commit_ack_overflow", 1);
     }
     if let Some(completion) = completion {
@@ -2307,9 +2308,10 @@ fn spawn_private_apply_worker(
     Ok((lane, vec![worker]))
 }
 
-fn parse_user_event_with_health(
+fn parse_user_event_with_health_owned(
     data: &serde_json::Value,
     shared: &SharedState,
+    live_position: &mut LivePositionManager,
 ) -> ParsedPrivateEvent {
     let recognized = data
         .get("event_type")
@@ -2324,7 +2326,7 @@ fn parse_user_event_with_health(
             rejection_reason: None,
         };
     }
-    match parse_user_event_checked(data, shared) {
+    match parse_user_event_checked(data, shared, live_position) {
         Ok(updates) => {
             let anomaly_started = crate::latency::Instant::now();
             resolve_valid_private_event_anomaly(data, shared);
@@ -2346,6 +2348,18 @@ fn parse_user_event_with_health(
             }
         }
     }
+}
+
+#[cfg(test)]
+fn parse_user_event_with_health(
+    data: &serde_json::Value,
+    shared: &SharedState,
+) -> ParsedPrivateEvent {
+    shared.with_test_live_position(|live_position| {
+        let parsed = parse_user_event_with_health_owned(data, shared, live_position);
+        shared.publish_live_position_watermark(live_position.last_match_time_secs());
+        parsed
+    })
 }
 
 fn resolve_valid_private_event_anomaly(data: &serde_json::Value, shared: &SharedState) {
@@ -2397,6 +2411,15 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
 /// Checked parser outcome for terminal order-audit backfill. Callers must not
 /// infer "parser rejected" from an empty update vector: valid lifecycle
 /// duplicates and already-applied records intentionally produce no update.
+pub(crate) fn parse_user_event_diagnosed_owned(
+    data: &serde_json::Value,
+    shared: &SharedState,
+    live_position: &mut LivePositionManager,
+) -> ParsedPrivateEvent {
+    parse_user_event_with_health_owned(data, shared, live_position)
+}
+
+#[cfg(test)]
 pub(crate) fn parse_user_event_diagnosed(
     data: &serde_json::Value,
     shared: &SharedState,
@@ -2404,7 +2427,11 @@ pub(crate) fn parse_user_event_diagnosed(
     parse_user_event_with_health(data, shared)
 }
 
-fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) -> Vec<OrderUpdate> {
+fn parse_user_event_validated(
+    data: &serde_json::Value,
+    shared: &SharedState,
+    live_position: &mut LivePositionManager,
+) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
     let event_type = match data
         .get("event_type")
@@ -2671,11 +2698,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                         match_time.replay_watermark_secs,
                     );
                     if match_time.replay_watermark_secs > 0 {
-                        shared
-                            .live_position
-                            .lock()
-                            .unwrap()
-                            .touch_match_time(match_time.replay_watermark_secs);
+                        live_position.touch_match_time(match_time.replay_watermark_secs);
                     }
                     if transition.owned_noop() {
                         continue;
@@ -2686,7 +2709,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     // replayable after its order mapping arrives later.
                     let live_position_started = crate::latency::Instant::now();
                     let lifecycle_advanced = record_trade_transition(
-                        &shared.live_position,
+                        live_position,
                         &leg_id,
                         status_str,
                         &mo_asset_id,
@@ -2810,11 +2833,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                     match_time.replay_watermark_secs,
                 );
                 if match_time.replay_watermark_secs > 0 {
-                    shared
-                        .live_position
-                        .lock()
-                        .unwrap()
-                        .touch_match_time(match_time.replay_watermark_secs);
+                    live_position.touch_match_time(match_time.replay_watermark_secs);
                 }
                 if transition.owned_noop() {
                     return Vec::new();
@@ -2822,7 +2841,7 @@ fn parse_user_event_validated(data: &serde_json::Value, shared: &SharedState) ->
                 let coid = ownership.client_order_id;
                 let live_position_started = crate::latency::Instant::now();
                 let lifecycle_advanced = record_trade_transition(
-                    &shared.live_position,
+                    live_position,
                     trade_id,
                     status_str,
                     &asset_id,
@@ -3179,15 +3198,12 @@ async fn user_feed_loop(
     // First connect is also treated as "recovering" so the strategy stays
     // paused until the first batch of state (and gap replay) is in.
     shared.user_feed_health.set_recovering(true);
-    {
-        let mut lp = shared.live_position.lock().unwrap();
-        if lp.last_match_time_secs() == 0 {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            lp.touch_match_time(now_secs);
-        }
+    if shared.live_position_last_match_secs() == 0 {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        shared.publish_live_position_watermark(now_secs);
     }
     let reconnect_rewind_secs = shared.gap_replay.reconnect_rewind_ms.div_ceil(1000);
     let account_id = shared.account_state.account_id().to_string();
@@ -3284,8 +3300,7 @@ async fn user_feed_loop(
                         // `?after=T`; the overlap is deduped by trade_id.
                         now_ms.saturating_sub(rewind_ms) / 1000 // rewind (ms) → floor to sec
                     };
-                    let committed_secs =
-                        shared.live_position.lock().unwrap().last_match_time_secs();
+                    let committed_secs = shared.live_position_last_match_secs();
                     let replay_anchor = replay_match_time_anchor(&shared, committed_secs);
                     let after = if replay_anchor > 0 {
                         floor_after.min(replay_anchor.saturating_sub(1))
@@ -3422,7 +3437,7 @@ async fn user_feed_loop(
         // around the disconnect edge isn't skipped by an exact `after=`
         // boundary. Idempotent via the upsert_trade / update_trade status
         // dedup. Covers ALL active markets on this wallet at once.
-        let last_match_time_secs = shared.live_position.lock().unwrap().last_match_time_secs();
+        let last_match_time_secs = shared.live_position_last_match_secs();
         let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         let checkpoint = recovery_checkpoint.get_or_insert_with(|| {
             GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
@@ -3715,7 +3730,7 @@ async fn user_feed_loop(
         // Disconnected
         info!("[PolyUserFeed] Disconnected, will reconcile on reconnect");
         shared.user_feed_health.set_recovering(true);
-        let last_match_time_secs = shared.live_position.lock().unwrap().last_match_time_secs();
+        let last_match_time_secs = shared.live_position_last_match_secs();
         let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
         recovery_checkpoint.get_or_insert_with(|| {
             GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
@@ -3936,11 +3951,7 @@ mod tests {
     #[test]
     fn registered_probe_order_is_filtered_before_private_owner_lane() {
         let shared = test_shared();
-        shared
-            .probe_order_ids
-            .lock()
-            .unwrap()
-            .push_back("0xAbC123".into());
+        shared.probe_order_ids.insert("0xAbC123");
         let probe = PrivateEventDelta::classify(serde_json::json!({
             "event_type": "order",
             "order_id": "0xabc123",
@@ -3961,6 +3972,12 @@ mod tests {
         }))
         .unwrap();
         assert!(!trade.is_registered_probe_order(&shared));
+
+        for index in 0..=64 {
+            shared.probe_order_ids.insert(&format!("0x{index:064x}"));
+        }
+        assert!(!shared.probe_order_ids.contains("0xAbC123"));
+        assert!(shared.probe_order_ids.contains(&format!("0x{:064x}", 64)));
     }
 
     #[test]
@@ -4103,8 +4120,9 @@ mod tests {
     }
 
     fn record(manager: &Mutex<LivePositionManager>, status: &str) -> bool {
+        let mut manager = manager.lock().unwrap();
         record_trade_transition(
-            manager,
+            &mut manager,
             "1651e74c-6358-41d1-b9df-5c5b38bd981e:0xmaker-order",
             status,
             "TOKEN",
@@ -4197,10 +4215,7 @@ mod tests {
             shared.account_state.earliest_unresolved_trade_match_time(),
             Some(123),
         );
-        assert_eq!(
-            shared.live_position.lock().unwrap().last_match_time_secs(),
-            0
-        );
+        assert_eq!(shared.live_position_last_match_secs(), 0);
 
         shared.account_state.rebind_order_id("owner-1", "oid-final");
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
@@ -4213,10 +4228,7 @@ mod tests {
             Some(123),
             "an owned MATCHED trade must keep gap replay pinned until finality",
         );
-        assert_eq!(
-            shared.live_position.lock().unwrap().last_match_time_secs(),
-            123
-        );
+        assert_eq!(shared.live_position_last_match_secs(), 123);
 
         let mut confirmed = event;
         confirmed["status"] = serde_json::json!("CONFIRMED");
@@ -4565,20 +4577,25 @@ mod tests {
                 0,
             )
             .unwrap();
-        shared.track_open_order(
-            "owner-1",
-            super::super::trade::TrackedOrder {
-                symbol: "TOKEN".to_string(),
-                side: Side::Buy,
-                instance_id: "owner".to_string(),
-            },
-        ).unwrap();
+        shared
+            .track_open_order(
+                "owner-1",
+                super::super::trade::TrackedOrder {
+                    symbol: "TOKEN".to_string(),
+                    side: Side::Buy,
+                    instance_id: "owner".to_string(),
+                },
+            )
+            .unwrap();
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
         shared.flush_execution_state_for_test();
 
         shared.remove_order_as("owner-1", OrderStatus::Filled);
         shared.flush_execution_state_for_test();
-        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
+        assert!(shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1"));
         assert_eq!(
             shared
                 .account_state
@@ -4611,12 +4628,18 @@ mod tests {
         );
         assert_eq!(updates.len(), 1);
         let cleanup_deadline = Instant::now() + Duration::from_millis(100);
-        while shared.execution_snapshot().open_orders.contains_key("owner-1")
+        while shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1")
             && Instant::now() < cleanup_deadline
         {
             std::thread::yield_now();
         }
-        assert!(!shared.execution_snapshot().open_orders.contains_key("owner-1"));
+        assert!(!shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1"));
         assert_eq!(
             shared
                 .account_state
@@ -4720,14 +4743,16 @@ mod tests {
             )
             .unwrap();
         shared.register_order_id("owner-1", "oid-1", "TOKEN");
-        shared.track_open_order(
-            "owner-1",
-            super::super::trade::TrackedOrder {
-                symbol: "TOKEN".to_string(),
-                side: Side::Buy,
-                instance_id: "owner".to_string(),
-            },
-        ).unwrap();
+        shared
+            .track_open_order(
+                "owner-1",
+                super::super::trade::TrackedOrder {
+                    symbol: "TOKEN".to_string(),
+                    side: Side::Buy,
+                    instance_id: "owner".to_string(),
+                },
+            )
+            .unwrap();
         shared.flush_execution_state_for_test();
         shared
     }
@@ -4875,7 +4900,10 @@ mod tests {
             0.0
         );
         shared.flush_execution_state_for_test();
-        assert!(!shared.execution_snapshot().open_orders.contains_key("owner-1"));
+        assert!(!shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1"));
 
         let resurrection = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -4895,7 +4923,10 @@ mod tests {
             5.0
         );
         shared.flush_execution_state_for_test();
-        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
+        assert!(shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1"));
 
         let shared = owned_taker_shared(0.5);
         let mut update = serde_json::json!({
@@ -5125,7 +5156,10 @@ mod tests {
         );
         assert!(!shared.account_state.is_uncertain());
         shared.flush_execution_state_for_test();
-        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
+        assert!(shared
+            .execution_snapshot()
+            .open_orders
+            .contains_key("owner-1"));
 
         let stale_placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",

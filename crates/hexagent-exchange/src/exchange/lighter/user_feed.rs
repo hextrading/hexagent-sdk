@@ -147,12 +147,12 @@ async fn user_feed_task(
                                 // only stream incremental updates.
                                 "update/account_all_trades" => {
                                     for u in parse_trades(&data, account_index, &market_symbols) {
-                                        if !publisher.publish(u) { return; }
+                                        if !publisher.publish(u).await { return; }
                                     }
                                 }
                                 "update/account_all_orders" => {
                                     for u in parse_orders(&data, &market_symbols) {
-                                        if !publisher.publish(u) { return; }
+                                        if !publisher.publish(u).await { return; }
                                     }
                                 }
                                 _ => {}

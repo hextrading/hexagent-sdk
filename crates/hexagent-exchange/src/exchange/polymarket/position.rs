@@ -117,9 +117,9 @@ fn position_snapshot_from_rows(resp: &[ApiPosition]) -> Result<PositionSnapshot>
             .insert(
                 p.asset.clone(),
                 Position {
-            quantity: p.size,
-            avg_price: p.avg_price,
-            current_value: p.current_value,
+                    quantity: p.size,
+                    avg_price: p.avg_price,
+                    current_value: p.current_value,
                 },
             )
             .is_some()
@@ -183,9 +183,9 @@ fn authoritative_resolution(
         }
         let winner = token.winner.ok_or_else(|| {
             anyhow!(
-            "closed market {} has no authoritative winner flag for token {}",
-            expected_condition_id,
-            token_id,
+                "closed market {} has no authoritative winner flag for token {}",
+                expected_condition_id,
+                token_id,
             )
         })?;
         if winner {
@@ -253,7 +253,7 @@ impl SettlementLookupState {
         self.entries.insert(
             condition_id.to_string(),
             SettlementLookupEntry::InFlight {
-            lease_until: now + SETTLEMENT_IN_FLIGHT_LEASE,
+                lease_until: now + SETTLEMENT_IN_FLIGHT_LEASE,
             },
         );
         SettlementLookupDecision::Fetch
@@ -380,7 +380,7 @@ fn response_retry_after(response: &reqwest::Response) -> Duration {
     parse_retry_after(
         response
             .headers()
-        .get(reqwest::header::RETRY_AFTER)
+            .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
     )
 }
@@ -395,10 +395,10 @@ async fn fetch_authoritative_resolution(
         .send()
         .await
         .map_err(|error| SettlementFetchError {
-        message: format!("fetch settlement {}: {}", condition_id, error),
-        retry_after: DEFAULT_SETTLEMENT_RETRY,
-        rate_limited: false,
-    })?;
+            message: format!("fetch settlement {}: {}", condition_id, error),
+            retry_after: DEFAULT_SETTLEMENT_RETRY,
+            rate_limited: false,
+        })?;
     let status = response.status();
     if !status.is_success() {
         let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -624,12 +624,38 @@ pub fn fetch_authoritative_settlements_for_conditions(
 }
 
 /// pUSD on Polygon — v2 CLOB collateral (6 decimals).
-pub const PUSD_ADDRESS:   &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+pub const PUSD_ADDRESS: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 
 /// CLOB V2 collateral. The bool remains in the compatibility-shaped strict
 /// fetch API but can no longer select legacy USDC.e.
 pub fn active_collateral_token(_is_v2: bool) -> &'static str {
     PUSD_ADDRESS
+}
+
+fn run_cold_rpc_pair<A, B, FA, FB>(left: FA, right: FB) -> Result<(A, B)>
+where
+    A: Send + 'static,
+    B: Send + 'static,
+    FA: FnOnce() -> Result<A> + Send + 'static,
+    FB: FnOnce() -> Result<B> + Send + 'static,
+{
+    let (left_tx, left_rx) = crossbeam_channel::bounded(1);
+    let (right_tx, right_rx) = crossbeam_channel::bounded(1);
+    hexagent_runtime::cold_rpc_jobs::try_submit(move || {
+        let _ = left_tx.send(left());
+    })
+    .map_err(|error| anyhow::anyhow!("submit cold RPC left job: {error}"))?;
+    hexagent_runtime::cold_rpc_jobs::try_submit(move || {
+        let _ = right_tx.send(right());
+    })
+    .map_err(|error| anyhow::anyhow!("submit cold RPC right job: {error}"))?;
+    let left = left_rx
+        .recv()
+        .map_err(|error| anyhow::anyhow!("cold RPC left owner disconnected: {error}"))??;
+    let right = right_rx
+        .recv()
+        .map_err(|error| anyhow::anyhow!("cold RPC right owner disconnected: {error}"))??;
+    Ok((left, right))
 }
 
 /// Strict account snapshot used by live shared-account reconciliation. Unlike
@@ -643,22 +669,11 @@ pub fn try_fetch_balance_and_positions_versioned(
     let token = active_collateral_token(is_v2);
     let wb = wallet_address.to_string();
     let tok = token.to_string();
-    let t_bal = std::thread::Builder::new()
-        .name("poly-fetch-balance".into())
-        .spawn(move || fetch_balance_for_token(&wb, &tok))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
     let wp = wallet_address.to_string();
-    let t_pos = std::thread::Builder::new()
-        .name("poly-fetch-positions".into())
-        .spawn(move || fetch_positions(&wp))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
-
-    let balance = t_bal
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let positions = t_pos
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    let (balance, positions) = run_cold_rpc_pair(
+        move || fetch_balance_for_token(&wb, &tok),
+        move || fetch_positions(&wp),
+    )?;
     Ok((balance, positions))
 }
 
@@ -671,22 +686,11 @@ pub fn try_fetch_balance_positions_and_settlements_versioned(
     let token = active_collateral_token(is_v2);
     let wb = wallet_address.to_string();
     let tok = token.to_string();
-    let t_bal = std::thread::Builder::new()
-        .name("poly-fetch-balance".into())
-        .spawn(move || fetch_balance_for_token(&wb, &tok))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
     let wp = wallet_address.to_string();
-    let t_pos = std::thread::Builder::new()
-        .name("poly-fetch-positions".into())
-        .spawn(move || fetch_position_snapshot(&wp))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
-
-    let balance = t_bal
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let snapshot = t_pos
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    let (balance, snapshot) = run_cold_rpc_pair(
+        move || fetch_balance_for_token(&wb, &tok),
+        move || fetch_position_snapshot(&wp),
+    )?;
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
 
@@ -700,22 +704,11 @@ pub fn try_fetch_balance_positions_fast_versioned(
     let token = active_collateral_token(is_v2);
     let wb = wallet_address.to_string();
     let tok = token.to_string();
-    let t_bal = std::thread::Builder::new()
-        .name("poly-fetch-balance".into())
-        .spawn(move || fetch_balance_for_token(&wb, &tok))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
     let wp = wallet_address.to_string();
-    let t_pos = std::thread::Builder::new()
-        .name("poly-fetch-positions".into())
-        .spawn(move || fetch_position_snapshot_fast(&wp))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
-
-    let balance = t_bal
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let snapshot = t_pos
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    let (balance, snapshot) = run_cold_rpc_pair(
+        move || fetch_balance_for_token(&wb, &tok),
+        move || fetch_position_snapshot_fast(&wp),
+    )?;
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
 
@@ -730,22 +723,11 @@ pub fn try_fetch_balance_positions_and_settlements_for_conditions_versioned(
     let token = active_collateral_token(is_v2);
     let wb = wallet_address.to_string();
     let tok = token.to_string();
-    let t_bal = std::thread::Builder::new()
-        .name("poly-fetch-balance".into())
-        .spawn(move || fetch_balance_for_token(&wb, &tok))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-balance thread: {error}"))?;
     let wp = wallet_address.to_string();
-    let t_pos = std::thread::Builder::new()
-        .name("poly-fetch-positions".into())
-        .spawn(move || fetch_position_snapshot_with_conditions(&wp, settlement_conditions))
-        .map_err(|error| anyhow::anyhow!("spawn fetch-positions thread: {error}"))?;
-
-    let balance = t_bal
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-balance thread panicked"))??;
-    let snapshot = t_pos
-        .join()
-        .map_err(|_| anyhow::anyhow!("fetch-positions thread panicked"))??;
+    let (balance, snapshot) = run_cold_rpc_pair(
+        move || fetch_balance_for_token(&wb, &tok),
+        move || fetch_position_snapshot_with_conditions(&wp, settlement_conditions),
+    )?;
     Ok((balance, snapshot.positions, snapshot.settled_token_values))
 }
 
@@ -967,9 +949,9 @@ mod tests {
         let resolution = authoritative_resolution(
             "condition",
             ClobMarketResolution {
-            condition_id: "condition".to_string(),
-            closed: true,
-            tokens: vec![
+                condition_id: "condition".to_string(),
+                closed: true,
+                tokens: vec![
                     ClobMarketToken {
                         token_id: "up".to_string(),
                         winner: Some(false),
@@ -978,7 +960,7 @@ mod tests {
                         token_id: "down".to_string(),
                         winner: Some(true),
                     },
-            ],
+                ],
             },
         )
         .unwrap()
@@ -992,9 +974,9 @@ mod tests {
         assert!(authoritative_resolution(
             "condition",
             ClobMarketResolution {
-            condition_id: "condition".to_string(),
-            closed: false,
-            tokens: vec![],
+                condition_id: "condition".to_string(),
+                closed: false,
+                tokens: vec![],
             }
         )
         .unwrap()
@@ -1002,9 +984,9 @@ mod tests {
         assert!(authoritative_resolution(
             "condition",
             ClobMarketResolution {
-            condition_id: "condition".to_string(),
-            closed: true,
-            tokens: vec![
+                condition_id: "condition".to_string(),
+                closed: true,
+                tokens: vec![
                     ClobMarketToken {
                         token_id: "up".to_string(),
                         winner: Some(false)
@@ -1013,7 +995,7 @@ mod tests {
                         token_id: "down".to_string(),
                         winner: Some(false)
                     },
-            ],
+                ],
             }
         )
         .is_err());
