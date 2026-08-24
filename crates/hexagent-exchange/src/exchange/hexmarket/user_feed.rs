@@ -165,7 +165,8 @@ fn parse_user_event(data: &serde_json::Value) -> Option<OrderUpdate> {
 async fn user_ws_task(
     url: String,
     credentials: ApiCredentials,
-    update_tx: Sender<OrderUpdate>,
+    owner: u16,
+    update_tx: Sender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(RECONNECT_MIN_MS, RECONNECT_MAX_MS);
@@ -255,7 +256,7 @@ async fn user_ws_task(
                                     update.filled_quantity, update.remaining_quantity,
                                     update.avg_fill_price,
                                 );
-                                if update_tx.send(update).is_err() {
+                                if update_tx.send(RoutedOrderUpdate { owner, update }).is_err() {
                                     return;
                                 }
                             } else {
@@ -293,14 +294,15 @@ async fn user_ws_task(
 pub fn spawn_user_feed(
     wss_url: &str,
     credentials: ApiCredentials,
-    update_tx: Sender<OrderUpdate>,
+    owner: u16,
+    update_tx: Sender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let url = format!("{}/user", wss_url.trim_end_matches('/'));
 
     // Spawn the async task on the shared runtime and grab its JoinHandle.
     let join_handle = crate::async_rt::handle().spawn(
-        user_ws_task(url, credentials, update_tx, shutdown),
+        user_ws_task(url, credentials, owner, update_tx, shutdown),
     );
 
     // Wrap in a sync thread that awaits the tokio task. Uses the shared
