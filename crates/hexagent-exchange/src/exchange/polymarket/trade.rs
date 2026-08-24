@@ -8251,29 +8251,6 @@ impl PolymarketTrade {
             },
         );
 
-        let sym_short = if order.symbol.len() > 16 {
-            &order.symbol[..16]
-        } else {
-            &order.symbol
-        };
-        // `gen_ns` = strategy on_quote emission time (ns) carried on the
-        // OrderRequest. Pairs this place with its quote for offline
-        // on_quote→dispatch latency analysis (dispatch wall-clock − gen_ns).
-        debug!(
-            "[PolymarketTrade] Submit {} {}... @ {:.3} qty={} coid={} oid={} gen_ns={}",
-            order.side,
-            sym_short,
-            order.price.unwrap_or(0.0),
-            order.quantity,
-            order.client_order_id,
-            &local_oid[..18.min(local_oid.len())],
-            order.timestamp_ns
-        );
-        log::debug!(
-            "[PolymarketTrade] Order body: {}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        );
-
         Ok(PreparedSubmit {
             local_oid,
             body: body_json.freeze(),

@@ -107,7 +107,7 @@ impl LocalBook {
 
 pub struct CoinbaseMarket {
     symbols: Vec<String>,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
 }
 
@@ -136,7 +136,7 @@ fn trade_id_gap(prev: Option<u64>, tid: u64) -> u64 {
 
 async fn coinbase_ws_task(
     symbols: Vec<String>,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -408,7 +408,7 @@ async fn coinbase_ws_task(
 
 impl ExchangeMarket for CoinbaseMarket {
     fn connect(&mut self) -> Result<()> {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs commentary.
         let shutdown = Arc::new(AtomicBool::new(false));

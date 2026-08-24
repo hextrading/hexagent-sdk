@@ -37,7 +37,7 @@ pub struct ChainlinkStreamMarket {
     api_key: String,
     user_secret: String,
     ws_url: String,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
 }
 
@@ -91,7 +91,7 @@ async fn chainlink_stream_ws_task(
     symbols: Vec<String>,
     api_key: String,
     user_secret: String,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -276,7 +276,7 @@ impl ExchangeMarket for ChainlinkStreamMarket {
             ));
         }
 
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs commentary.
         let shutdown = Arc::new(AtomicBool::new(false));

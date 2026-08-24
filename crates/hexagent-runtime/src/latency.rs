@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-pub use quanta::Instant;
+pub use quanta::{Clock, Instant};
 
 const MAX_STAGES: usize = 256;
 const SUB_BUCKETS: usize = 8;
@@ -205,6 +205,64 @@ pub fn prepare_thread_stages(stages: &[&'static str]) {
             let _ = recorder.stage_id(stage);
         }
     });
+}
+
+/// Prewarm every currently-declared Polymarket order-dispatch stage on an
+/// execution or order-runtime thread. Keep this startup-only manifest next to
+/// the recorder so new critical stages have one reviewable registration site.
+pub fn prepare_polymarket_order_stages() {
+    prepare_thread_stages(&[
+        "polymarket.cancel.prep_to_http_dispatch",
+        "polymarket.cancel.completion_queue",
+        "polymarket.cancel.response_classify",
+        "polymarket.cancel.response_handler",
+        "polymarket.order.dispatch_to_lifecycle_done",
+        "polymarket.order.completion_queue",
+        "polymarket.order.prep_to_signed",
+        "polymarket.order.quote_to_prep",
+        "polymarket.order.request_buffer_pool_exhausted",
+        "polymarket.order.reserve_to_http_dispatch",
+        "polymarket.order.response_handler",
+        "polymarket.order.response_parse",
+        "polymarket.order.signed_to_reserve",
+    ]);
+}
+
+/// Prewarm private-feed parsing/routing/application stages. These execute on
+/// the general runtime and account-owner workers, never on quote callbacks.
+pub fn prepare_polymarket_private_stages() {
+    prepare_thread_stages(&[
+        "polymarket.account.lifecycle_apply",
+        "polymarket.account.owner_started",
+        "polymarket.account.settled_gc",
+        "polymarket.gap_replay.http_body",
+        "polymarket.gap_replay.json_decode",
+        "polymarket.user.account_apply",
+        "polymarket.user.account_order_log",
+        "polymarket.user.account_resolve_anomaly",
+        "polymarket.user.cold_commit_ack_overflow",
+        "polymarket.user.cold_committed_skip",
+        "polymarket.user.dispatch",
+        "polymarket.user.event_parse",
+        "polymarket.user.fast_route_to_account_owner",
+        "polymarket.user.frame_total",
+        "polymarket.user.health_apply",
+        "polymarket.user.terminal_high_water",
+        "polymarket.user.trade_replay_anchor_apply",
+        "polymarket.user.validate_route",
+        "polymarket.user.validate_route_dispatch",
+        "polymarket.user.validate_trade_fields",
+        "polymarket.update.producer_to_root_router",
+    ]);
+}
+
+/// Prewarm the dedicated public CLOB reader stages before socket polling.
+pub fn prepare_polymarket_clob_stages() {
+    prepare_thread_stages(&[
+        "market.root_overflow_drop",
+        "polymarket.ws.clob_parse",
+        "polymarket.ws.clob_runtime_scheduler_lag",
+    ]);
 }
 
 /// RAII timing guard for functions with multiple exits.

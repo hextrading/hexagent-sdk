@@ -43,7 +43,7 @@ pub struct HexmarketMarket {
     event_count: usize,
     /// Number of loaded markets
     market_count: usize,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
     pending_events: VecDeque<MarketEvent>,
     /// Timestamp of last heartbeat QuoteTick (nanoseconds).
@@ -322,7 +322,7 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
 async fn hexmarket_ws_task(
     url: String,
     asset_ids: Vec<String>,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -421,7 +421,7 @@ impl ExchangeMarket for HexmarketMarket {
     fn connect(&mut self) -> Result<()> {
         let url = format!("{}/market", self.wss_url.trim_end_matches('/'));
         let asset_ids: Vec<String> = self.outcomes.keys().cloned().collect();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs commentary.
         let shutdown = Arc::new(AtomicBool::new(false));

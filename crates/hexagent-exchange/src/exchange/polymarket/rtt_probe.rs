@@ -284,8 +284,12 @@ pub fn spawn_rtt_probe(
                     // mode there may be NO consumer (e.g. record mode has
                     // no strategy) — the channel is best-effort there, so
                     // a disconnected send is ignored, not fatal.
-                    if sample_tx.send(rtt_ms).is_err() && !all_probe {
-                        break;
+                    match sample_tx.try_send(rtt_ms) {
+                        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) if !all_probe => {
+                            break;
+                        }
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
                     }
                 }
             }

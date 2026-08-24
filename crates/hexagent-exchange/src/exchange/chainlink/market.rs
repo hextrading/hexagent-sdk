@@ -53,7 +53,7 @@ const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct ChainlinkMarket {
     symbols: Vec<String>,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
     pending: VecDeque<MarketEvent>,
 }
@@ -71,7 +71,7 @@ impl ChainlinkMarket {
 
 async fn chainlink_ws_task(
     symbols: Vec<String>,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     // base 0.1s, cap 6.4s → 0.1→0.2→0.4→0.8→1.6→3.2→6.4s (±50% jitter) on
@@ -360,7 +360,7 @@ fn json_f64(value: &serde_json::Value) -> Option<f64> {
 
 impl ExchangeMarket for ChainlinkMarket {
     fn connect(&mut self) -> Result<()> {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs.
         let shutdown = Arc::new(AtomicBool::new(false));

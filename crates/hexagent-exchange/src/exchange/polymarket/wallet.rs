@@ -364,7 +364,10 @@ pub type InventoryReadyReceiver = crossbeam_channel::Receiver<InventoryReady>;
 
 /// Create the per-strategy notification channel used by live maintenance.
 pub fn inventory_ready_channel() -> (InventoryReadySender, InventoryReadyReceiver) {
-    crossbeam_channel::unbounded()
+    // Event seeding confirmations are lossless and low volume. Capacity covers
+    // many rotations while still bounding memory; the background maintenance
+    // worker, never a strategy thread, owns any resulting backpressure.
+    crossbeam_channel::bounded(64)
 }
 
 /// Standard "no wallet credentials" error. Credentials are sourced ONLY
@@ -4259,6 +4262,10 @@ const MAINTENANCE_COALESCE_IDLE: std::time::Duration =
     std::time::Duration::from_millis(250);
 const MAINTENANCE_COALESCE_MAX: std::time::Duration =
     std::time::Duration::from_secs(2);
+/// One account can have only a bounded number of event-boundary operations in
+/// flight. Overflow fails the requesting strategy closed instead of allowing
+/// a slow chain RPC to grow process memory without limit.
+const MAINTENANCE_QUEUE_CAPACITY: usize = 64;
 
 /// Cross-operation account lock. Split/redeem and merge have independent
 /// coalescing queues, but transactions for one wallet must still be strictly
@@ -4291,7 +4298,8 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = queues.lock().unwrap();
     let tx = map.entry(account.clone()).or_insert_with(|| {
-        let (tx, rx) = crossbeam_channel::unbounded::<MaintenanceQueueItem>();
+        let (tx, rx) =
+            crossbeam_channel::bounded::<MaintenanceQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
         let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
         let worker_name = format!("poly-maint-{}", worker_label);
         std::thread::Builder::new()
@@ -4355,8 +4363,30 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
             .expect("Failed to spawn maintenance worker");
         tx
     });
-    if let Err(e) = tx.send((job, done, std::time::Instant::now())) {
-        log::warn!("[Maintenance] enqueue failed (worker gone): {}", e);
+    if let Err(error) = tx.try_send((job, done, std::time::Instant::now())) {
+        let (item, reason) = match error {
+            crossbeam_channel::TrySendError::Full(item) => (
+                item,
+                format!(
+                    "maintenance queue capacity {} exhausted; refusing unbounded chain backlog",
+                    MAINTENANCE_QUEUE_CAPACITY,
+                ),
+            ),
+            crossbeam_channel::TrySendError::Disconnected(item) => {
+                (item, "maintenance worker disconnected".to_string())
+            }
+        };
+        let (job, done, _) = item;
+        if let Some(status) = &job.status {
+            *status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                MaintenanceStatus::SplitFailedOrPending {
+                    reason: reason.clone(),
+                };
+        }
+        if let Some(done) = done {
+            let _ = done.try_send(());
+        }
+        log::warn!("[Maintenance] enqueue rejected account={}: {}", account, reason);
     }
 }
 
@@ -4560,7 +4590,7 @@ pub fn submit_maintenance(job: MaintenanceJob) {
 /// `spawn_maintenance_thread(...).join()` semantics so all log output
 /// appears before the command returns.
 pub fn run_maintenance_blocking(job: MaintenanceJob) {
-    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     enqueue_maintenance(job, Some(done_tx));
     let _ = done_rx.recv();
 }
@@ -4720,7 +4750,8 @@ fn enqueue_merge_maintenance(
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let tx = map.entry(account.clone()).or_insert_with(|| {
-        let (tx, rx) = crossbeam_channel::unbounded::<MergeQueueItem>();
+        let (tx, rx) =
+            crossbeam_channel::bounded::<MergeQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
         let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
         let worker_name = format!("poly-merge-{}", worker_label);
         std::thread::Builder::new()
@@ -4759,8 +4790,29 @@ fn enqueue_merge_maintenance(
             .expect("Failed to spawn merge maintenance worker");
         tx
     });
-    if let Err(error) = tx.send((job, done, std::time::Instant::now())) {
-        log::warn!("[Maintenance] merge enqueue failed (worker gone): {}", error);
+    if let Err(error) = tx.try_send((job, done, std::time::Instant::now())) {
+        let (item, reason) = match error {
+            crossbeam_channel::TrySendError::Full(item) => (
+                item,
+                format!(
+                    "merge queue capacity {} exhausted; refusing unbounded chain backlog",
+                    MAINTENANCE_QUEUE_CAPACITY,
+                ),
+            ),
+            crossbeam_channel::TrySendError::Disconnected(item) => {
+                (item, "merge maintenance worker disconnected".to_string())
+            }
+        };
+        let (job, done, _) = item;
+        if let Some(done) = done {
+            let _ = done.try_send(Err(reason.clone()));
+        }
+        log::warn!(
+            "[Maintenance] merge enqueue rejected account={} condition={}: {}",
+            account,
+            job.condition_id,
+            reason,
+        );
     }
 }
 
