@@ -1680,11 +1680,17 @@ struct AttemptAuditJob {
 }
 
 #[derive(Debug)]
-struct PrivateDiagnosticJob {
-    trade_id: String,
-    tx_hash: String,
-    maker_legs: usize,
-    enqueued_ns: u64,
+enum PrivateDiagnosticJob {
+    FailedTradeWithoutReason {
+        trade_id: String,
+        tx_hash: String,
+        maker_legs: usize,
+        enqueued_ns: u64,
+    },
+    ColdApplyFailure {
+        detail: String,
+        enqueued_ns: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -3475,16 +3481,31 @@ impl SharedState {
             AuditJob::Attempt(job) => self.write_attempt_audit(job),
             AuditJob::Lifecycle(job) => self.write_lifecycle_trace(lifecycle_traces, job),
             AuditJob::PrivateDiagnostic(job) => {
+                let enqueued_ns = match &job {
+                    PrivateDiagnosticJob::FailedTradeWithoutReason { enqueued_ns, .. }
+                    | PrivateDiagnosticJob::ColdApplyFailure { enqueued_ns, .. } => *enqueued_ns,
+                };
                 crate::latency::record_ns(
                     "polymarket.account.private_diagnostic_queue",
-                    now_ns().saturating_sub(job.enqueued_ns),
+                    now_ns().saturating_sub(enqueued_ns),
                 );
-                log::warn!(
-                    "[PolyUserFeed] FAILED venue trade {} carries no known reason field (tx_hash={}, maker_legs={}); account-scoped reversals remain enabled",
-                    job.trade_id,
-                    job.tx_hash,
-                    job.maker_legs,
-                );
+                match job {
+                    PrivateDiagnosticJob::FailedTradeWithoutReason {
+                        trade_id,
+                        tx_hash,
+                        maker_legs,
+                        ..
+                    } => log::warn!(
+                        "[PolyUserFeed] FAILED venue trade {} carries no known reason field (tx_hash={}, maker_legs={}); account-scoped reversals remain enabled",
+                        trade_id,
+                        tx_hash,
+                        maker_legs,
+                    ),
+                    PrivateDiagnosticJob::ColdApplyFailure { detail, .. } => log::warn!(
+                        "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
+                        detail,
+                    ),
+                }
             }
         }
     }
@@ -3495,10 +3516,24 @@ impl SharedState {
         tx_hash: &str,
         maker_legs: usize,
     ) {
-        let job = PrivateDiagnosticJob {
+        let job = PrivateDiagnosticJob::FailedTradeWithoutReason {
             trade_id: trade_id.to_string(),
             tx_hash: tx_hash.to_string(),
             maker_legs,
+            enqueued_ns: now_ns(),
+        };
+        if self
+            .attempt_audit_tx
+            .try_send(AuditJob::PrivateDiagnostic(job))
+            .is_err()
+        {
+            crate::latency::record_ns("polymarket.private_diagnostic_overflow", 1);
+        }
+    }
+
+    pub(crate) fn enqueue_private_apply_failure_diagnostic(&self, detail: &str) {
+        let job = PrivateDiagnosticJob::ColdApplyFailure {
+            detail: detail.to_string(),
             enqueued_ns: now_ns(),
         };
         if self
