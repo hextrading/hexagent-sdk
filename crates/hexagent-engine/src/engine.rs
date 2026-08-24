@@ -11278,9 +11278,7 @@ fn dispatch_poly_signal_to_connection_owner(
             }
         }
         Signal::BatchNewOrders {
-            exchange,
-            orders,
-            ..
+            exchange, orders, ..
         } if exchange == Exchange::Polymarket => {
             for order in orders {
                 let place = PolyConnectionCommand::Place {
@@ -13939,9 +13937,7 @@ mod market_router_tests {
                 exchange: Exchange::Polymarket,
                 market_id: "market".into(),
                 cancel_client_order_ids: vec!["old-coid".into()].into_iter().collect(),
-                place_orders: vec![order_req("new-coid", "zhu-03")]
-                    .into_iter()
-                    .collect(),
+                place_orders: vec![order_req("new-coid", "zhu-03")].into_iter().collect(),
                 timestamp_ns: 42,
                 instance_id: "zhu-03".into(),
             },
@@ -13963,6 +13959,53 @@ mod market_router_tests {
         assert_eq!(rejected.owner, 3);
         assert_eq!(rejected.update.client_order_id, "new-coid");
         assert_eq!(rejected.update.status, OrderStatus::ExecutorRejected);
+    }
+
+    #[test]
+    fn batch_replace_uses_only_typed_physical_connection_lanes() {
+        let (fast_tx, fast_rx) = bounded(4);
+        let (cancel_tx, cancel_rx) = bounded(4);
+        let (raw_update_tx, update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 2,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            fast: vec![fast_tx],
+            cancel: vec![cancel_tx],
+            ..Default::default()
+        };
+        dispatch_poly_signal_to_connection_owner(
+            Signal::ReplaceOrder {
+                exchange: Exchange::Polymarket,
+                market_id: "market".into(),
+                cancel_client_order_ids: vec!["old-a".into(), "old-b".into()].into_iter().collect(),
+                place_orders: vec![order_req("new-a", "zhu-03"), order_req("new-b", "zhu-03")]
+                    .into_iter()
+                    .collect(),
+                timestamp_ns: 42,
+                instance_id: "zhu-03".into(),
+            },
+            150,
+            update_tx,
+            &mut routes,
+        );
+
+        for expected in ["new-a", "new-b"] {
+            assert!(matches!(
+                fast_rx.try_recv().unwrap(),
+                PolyConnectionCommand::Place { order, .. }
+                    if order.client_order_id == expected
+            ));
+        }
+        for expected in ["old-a", "old-b"] {
+            assert!(matches!(
+                cancel_rx.try_recv().unwrap(),
+                PolyConnectionCommand::Cancel { client_order_id, .. }
+                    if client_order_id == expected
+            ));
+        }
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[test]

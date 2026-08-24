@@ -2166,10 +2166,7 @@ pub(crate) fn apply_private_cold_command(
     shared.publish_live_position_watermark(live_position.last_match_time_secs());
     if let Err(error) = &result {
         shared.user_feed_health.set_recovering(true);
-        warn!(
-            "[PolyUserFeed] cold private-account apply failed; forcing reconnect/replay: {}",
-            error,
-        );
+        shared.enqueue_private_apply_failure_diagnostic(error);
         feedback.reconnect_generation.fetch_add(1, Ordering::AcqRel);
         feedback.reconnect_notify.notify_one();
     }
