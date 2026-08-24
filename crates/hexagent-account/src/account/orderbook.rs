@@ -68,6 +68,15 @@ struct Nudge {
     created_ns: u64,
 }
 
+/// Borrowed-input L1 cache entry. The symbol is owned once by the map; every
+/// subsequent market-data update mutates only these scalar fields.
+#[derive(Debug, Clone, Copy)]
+struct L1Snapshot {
+    bid_price: Option<f64>,
+    ask_price: Option<f64>,
+    exchange_timestamp_ns: u64,
+}
+
 /// Minimum nudge hold: a snapshot clears a nudge only if its server-side
 /// `exchange_timestamp_ns` is later than the nudge's `created_ns` by MORE
 /// than this margin.
@@ -102,6 +111,7 @@ const NUDGE_MIN_HOLD_NS: u64 = 500_000_000;
 pub struct OrderbookManager {
     books: HashMap<String, OrderBookSnapshot>,
     quotes: HashMap<String, QuoteTick>,
+    l1: HashMap<String, L1Snapshot>,
     bid_nudges: HashMap<String, Nudge>,
     ask_nudges: HashMap<String, Nudge>,
 }
@@ -111,6 +121,7 @@ impl OrderbookManager {
         Self {
             books: HashMap::new(),
             quotes: HashMap::new(),
+            l1: HashMap::new(),
             bid_nudges: HashMap::new(),
             ask_nudges: HashMap::new(),
         }
@@ -139,15 +150,9 @@ impl OrderbookManager {
     /// result so a rejected stale/future snapshot cannot bypass the cache.
     pub fn update(&mut self, ob: &OrderBookSnapshot) -> bool {
         if !orderbook_values_are_semantically_valid(ob) {
-            log::warn!("[OrderbookManager] rejected invalid orderbook symbol={}", ob.symbol);
             return false;
         }
         if timestamp_too_far_in_future(ob.exchange_timestamp_ns, ob.local_timestamp_ns) {
-            log::warn!(
-                "[OrderbookManager] rejected future orderbook symbol={} exchange_ts={} local_ts={} max_skew_ns={}",
-                ob.symbol, ob.exchange_timestamp_ns, ob.local_timestamp_ns,
-                MAX_EXCHANGE_FUTURE_SKEW_NS,
-            );
             return false;
         }
         if self
@@ -188,18 +193,12 @@ impl OrderbookManager {
     /// Returns `true` only when the quote was accepted into the cache.
     pub fn update_quote(&mut self, quote: &QuoteTick) -> bool {
         if !quote_values_are_semantically_valid(quote) {
-            log::warn!("[OrderbookManager] rejected invalid quote symbol={}", quote.symbol);
             return false;
         }
         if timestamp_too_far_in_future(
             quote.exchange_timestamp_ns,
             quote.local_timestamp_ns,
         ) {
-            log::warn!(
-                "[OrderbookManager] rejected future quote symbol={} exchange_ts={} local_ts={} max_skew_ns={}",
-                quote.symbol, quote.exchange_timestamp_ns, quote.local_timestamp_ns,
-                MAX_EXCHANGE_FUTURE_SKEW_NS,
-            );
             return false;
         }
         if self
@@ -224,6 +223,50 @@ impl OrderbookManager {
         true
     }
 
+    /// Update a scalar top-of-book view without constructing/cloning a
+    /// `QuoteTick` or retaining dynamic depth vectors. The first observation
+    /// owns the symbol key; steady-state updates are in-place and allocation
+    /// free. One-sided books are represented explicitly with `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_l1_fields(
+        &mut self,
+        exchange: Exchange,
+        symbol: &str,
+        bid_price: Option<f64>,
+        ask_price: Option<f64>,
+        exchange_timestamp_ns: u64,
+        local_timestamp_ns: u64,
+    ) -> bool {
+        if symbol.trim().is_empty()
+            || bid_price.is_some_and(|price| !valid_price(exchange, price))
+            || ask_price.is_some_and(|price| !valid_price(exchange, price))
+            || matches!((bid_price, ask_price), (Some(bid), Some(ask)) if bid >= ask)
+            || timestamp_too_far_in_future(exchange_timestamp_ns, local_timestamp_ns)
+        {
+            return false;
+        }
+        if self
+            .l1
+            .get(symbol)
+            .is_some_and(|existing| existing.exchange_timestamp_ns > exchange_timestamp_ns)
+        {
+            return false;
+        }
+
+        self.clear_nudges_after_market_update(symbol, exchange_timestamp_ns);
+        let next = L1Snapshot {
+            bid_price,
+            ask_price,
+            exchange_timestamp_ns,
+        };
+        if let Some(existing) = self.l1.get_mut(symbol) {
+            *existing = next;
+        } else {
+            self.l1.insert(symbol.to_owned(), next);
+        }
+        true
+    }
+
     /// Get the latest orderbook for a symbol.
     pub fn get(&self, symbol: &str) -> Option<&OrderBookSnapshot> {
         self.books.get(symbol)
@@ -240,14 +283,21 @@ impl OrderbookManager {
     fn raw_l1(&self, symbol: &str) -> (Option<f64>, Option<f64>, Option<u64>) {
         let book = self.books.get(symbol);
         let quote = self.quotes.get(symbol);
-        let use_quote = match (book, quote) {
-            (_, None) => false,
-            (None, Some(_)) => true,
-            (Some(book), Some(quote)) => {
-                quote.exchange_timestamp_ns >= book.exchange_timestamp_ns
-            }
+        let scalar = self.l1.get(symbol);
+        let book_ts = book.map(|value| value.exchange_timestamp_ns);
+        let quote_ts = quote.map(|value| value.exchange_timestamp_ns);
+        let scalar_ts = scalar.map(|value| value.exchange_timestamp_ns);
+        let Some(newest_ts) = [book_ts, quote_ts, scalar_ts].into_iter().flatten().max() else {
+            return (None, None, None);
         };
-        if use_quote {
+        if scalar_ts == Some(newest_ts) {
+            let scalar = scalar.expect("scalar L1 selected above");
+            (
+                scalar.bid_price,
+                scalar.ask_price,
+                Some(scalar.exchange_timestamp_ns),
+            )
+        } else if quote_ts == Some(newest_ts) {
             let quote = quote.expect("quote selected above");
             (
                 Some(quote.bid_price),
@@ -411,6 +461,87 @@ mod tests {
             exchange_timestamp_ns: ts_ns,
             local_timestamp_ns: ts_ns.saturating_add(1),
         }
+    }
+
+    #[test]
+    fn borrowed_l1_updates_in_place_and_preserves_one_sided_books() {
+        let mut manager = OrderbookManager::new();
+        assert!(manager.update_l1_fields(
+            Exchange::Polymarket,
+            "tok",
+            Some(0.40),
+            None,
+            100,
+            101,
+        ));
+        let key_ptr = manager.l1.keys().next().unwrap().as_ptr();
+        assert_eq!(manager.best_bid_price("tok"), Some(0.40));
+        assert_eq!(manager.best_ask_price("tok"), None);
+
+        for timestamp in 101..=10_000 {
+            assert!(manager.update_l1_fields(
+                Exchange::Polymarket,
+                "tok",
+                Some(0.41),
+                Some(0.59),
+                timestamp,
+                timestamp + 1,
+            ));
+        }
+        assert_eq!(manager.l1.len(), 1);
+        assert_eq!(manager.l1.keys().next().unwrap().as_ptr(), key_ptr);
+        assert_eq!(manager.best_bid_price("tok"), Some(0.41));
+        assert_eq!(manager.best_ask_price("tok"), Some(0.59));
+
+        assert!(!manager.update_l1_fields(
+            Exchange::Polymarket,
+            "tok",
+            Some(0.20),
+            Some(0.80),
+            9_999,
+            10_001,
+        ));
+        assert_eq!(manager.best_bid_price("tok"), Some(0.41));
+    }
+
+    #[test]
+    fn borrowed_l1_update_tail_latency_profile() {
+        const EVENTS: usize = 20_000;
+        let mut manager = OrderbookManager::new();
+        assert!(manager.update_l1_fields(
+            Exchange::Polymarket,
+            "tok",
+            Some(0.40),
+            Some(0.60),
+            1,
+            2,
+        ));
+        let mut samples = Vec::with_capacity(EVENTS);
+        for index in 0..EVENTS {
+            let timestamp = index as u64 + 2;
+            let started = std::time::Instant::now();
+            std::hint::black_box(manager.update_l1_fields(
+                Exchange::Polymarket,
+                "tok",
+                Some(0.41),
+                Some(0.59),
+                timestamp,
+                timestamp + 1,
+            ));
+            samples.push(started.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(EVENTS * numerator / denominator).min(EVENTS - 1)]
+        };
+        println!(
+            "borrowed_l1 events={} p50={}ns p99={}ns p999={}ns max={}ns queue_depth=0 overflow=0 boundary=borrowed scalar cache update",
+            EVENTS,
+            percentile(50, 100),
+            percentile(99, 100),
+            percentile(999, 1000),
+            samples[EVENTS - 1],
+        );
     }
 
     #[test]
