@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
@@ -1336,40 +1336,6 @@ fn instance_owned_open_coids(
     coids
 }
 
-/// Sliding-window rate limiter.
-struct RateLimiter {
-    max_per_second: u32,
-    timestamps: std::collections::VecDeque<Instant>,
-}
-
-impl RateLimiter {
-    fn new(max_per_second: u32) -> Self {
-        Self {
-            max_per_second,
-            timestamps: std::collections::VecDeque::new(),
-        }
-    }
-
-    fn check(&mut self) -> bool {
-        let now = Instant::now();
-        let cutoff = now - Duration::from_secs(1);
-        while self
-            .timestamps
-            .front()
-            .map(|t| *t < cutoff)
-            .unwrap_or(false)
-        {
-            self.timestamps.pop_front();
-        }
-        if (self.timestamps.len() as u32) < self.max_per_second {
-            self.timestamps.push_back(now);
-            true
-        } else {
-            false
-        }
-    }
-}
-
 // ─── Async HTTP dispatch ────────────────────────────────────────────
 // All Polymarket REST calls run on the dedicated order-I/O runtime
 // (`async_rt::order_handle()`) via the shared `reqwest::Client`
@@ -2039,7 +2005,7 @@ pub struct SharedState {
     pub user_feed_health: std::sync::Arc<super::live_position::UserFeedHealth>,
     /// User-feed gap-replay cadence / rewind tuning (from config).
     pub gap_replay: GapReplayConfig,
-    rate_limiter: Mutex<RateLimiter>,
+    rate_limiter: crate::exchange::AtomicRateLimiter,
     /// Per-INSTANCE balance-error backoff deadlines (wall-clock ns), keyed
     /// by the placing `instance_id`. A future deadline means that instance's
     /// `submit_order` / `batch_submit_orders` / `batch_update_orders`
@@ -2049,7 +2015,7 @@ pub struct SharedState {
     /// Per-instance (not account-wide) so one strategy hitting `not enough
     /// balance` never pauses a shared-wallet sibling's submits. Absent or
     /// past = not in backoff.
-    pub(crate) balance_backoff_until_ns: Mutex<HashMap<String, u64>>,
+    pub(crate) balance_backoff_until_ns: ArcSwap<HashMap<String, u64>>,
     /// Account-wide policy backoff after the CLOB explicitly responds
     /// `trading is disabled`. Unlike an ordinary 5xx this is a definitive
     /// rejection, so no orphan is created. The short circuit also prevents
@@ -2066,7 +2032,7 @@ pub struct SharedState {
     /// balance backoff, this is PER-TOKEN: only the bad token is gated, other
     /// events quote normally. `token → (consecutive_strikes, block_until_ns)`;
     /// cleared on any accepted order for the token.
-    pub(crate) invalid_token_backoff: Mutex<HashMap<String, (u32, u64)>>,
+    pub(crate) invalid_token_backoff: ArcSwap<HashMap<String, (u32, u64)>>,
     /// Wall-clock ns until which HTTP 425 "service not ready" backpressure
     /// WARNs are suppressed across BOTH cancel and place paths. Set to
     /// `now + 5min` on the first 425 of each window; subsequent 425s are
@@ -3599,7 +3565,7 @@ impl SharedState {
     }
 
     fn check_rate_limit(&self) -> bool {
-        self.rate_limiter.lock().unwrap().check()
+        self.rate_limiter.try_acquire()
     }
 
     /// Duration of the suppression window triggered by a `not enough
@@ -3623,7 +3589,7 @@ impl SharedState {
     /// window. Per-instance: a sibling's backoff never gates this caller.
     #[inline]
     pub(crate) fn in_balance_backoff(&self, instance_id: &str) -> bool {
-        let map = self.balance_backoff_until_ns.lock().unwrap();
+        let map = self.balance_backoff_until_ns.load();
         match map.get(instance_id) {
             Some(&until) => crate::types::now_ns() < until,
             None => false,
@@ -3637,10 +3603,20 @@ impl SharedState {
     /// edge, not on every subsequent reject during the same window.
     pub(crate) fn record_balance_error(&self, instance_id: &str) -> bool {
         let now = crate::types::now_ns();
-        let mut map = self.balance_backoff_until_ns.lock().unwrap();
-        let prev = map.insert(instance_id.to_string(), now + Self::BALANCE_BACKOFF_NS);
-        // Edge = no prior deadline, or the prior one already expired.
-        prev.map_or(true, |p| p < now)
+        let transitioned = std::sync::atomic::AtomicBool::new(false);
+        self.balance_backoff_until_ns.rcu(|current| {
+            let mut next = (**current).clone();
+            let previous = next.insert(
+                instance_id.to_string(),
+                now.saturating_add(Self::BALANCE_BACKOFF_NS),
+            );
+            transitioned.store(
+                previous.is_none_or(|deadline| deadline < now),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            next
+        });
+        transitioned.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Policy rejections normally persist for more than a quote tick. Keep
@@ -3697,8 +3673,7 @@ impl SharedState {
     pub(crate) fn in_invalid_token_backoff(&self, token: &str) -> bool {
         let now = crate::types::now_ns();
         self.invalid_token_backoff
-            .lock()
-            .unwrap()
+            .load()
             .get(token)
             .is_some_and(|(_, until)| *until > now)
     }
@@ -3709,27 +3684,40 @@ impl SharedState {
     /// caller logs exactly once per window.
     pub(crate) fn record_invalid_token(&self, token: &str) -> bool {
         let now = crate::types::now_ns();
-        let mut map = self.invalid_token_backoff.lock().unwrap();
-        let e = map.entry(token.to_string()).or_insert((0, 0));
-        e.0 = e.0.saturating_add(1);
-        if e.0 < Self::INVALID_TOKEN_STRIKES {
-            return false;
-        }
-        let was_active = e.1 > now;
-        e.1 = now + Self::INVALID_TOKEN_BACKOFF_NS;
-        !was_active
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        self.invalid_token_backoff.rcu(|current| {
+            let mut next = (**current).clone();
+            let entry = next.entry(token.to_string()).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            if entry.0 >= Self::INVALID_TOKEN_STRIKES {
+                let was_active = entry.1 > now;
+                entry.1 = now.saturating_add(Self::INVALID_TOKEN_BACKOFF_NS);
+                armed.store(!was_active, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                armed.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            next
+        });
+        armed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Clear a token's invalid-token state — an order for it was accepted, so
     /// it's registered and tradeable again.
     pub(crate) fn clear_invalid_token(&self, token: &str) {
-        let mut map = self.invalid_token_backoff.lock().unwrap();
-        if map.remove(token).is_some() && map.len() > 256 {
-            // Opportunistic prune: drop long-expired entries so a long-lived
-            // process doesn't accumulate one row per ever-invalid token.
-            let now = crate::types::now_ns();
-            map.retain(|_, (_, until)| *until > now);
-        }
+        let now = crate::types::now_ns();
+        self.invalid_token_backoff.rcu(|current| {
+            if !current.contains_key(token) {
+                return Arc::clone(current);
+            }
+            let mut next = (**current).clone();
+            next.remove(token);
+            if next.len() > 256 {
+                // Opportunistic prune: drop long-expired entries so a
+                // long-lived process stays bounded by active failures.
+                next.retain(|_, (_, until)| *until > now);
+            }
+            Arc::new(next)
+        });
     }
 
     /// Should the calling site emit its WARN for an `unknown_state` HTTP
@@ -4608,10 +4596,12 @@ impl PolymarketTrade {
                 live_position: Mutex::new(LivePositionManager::from_restored(recovered_trades)),
                 user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
                 gap_replay,
-                rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second.max(1))),
-                balance_backoff_until_ns: Mutex::new(HashMap::new()),
+                rate_limiter: crate::exchange::AtomicRateLimiter::new(
+                    rate_limit_per_second.max(1),
+                ),
+                balance_backoff_until_ns: ArcSwap::from_pointee(HashMap::new()),
                 trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
-                invalid_token_backoff: Mutex::new(HashMap::new()),
+                invalid_token_backoff: ArcSwap::from_pointee(HashMap::new()),
                 http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
                 http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
                 http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),

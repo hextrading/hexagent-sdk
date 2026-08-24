@@ -4,7 +4,6 @@ use log::{info, warn};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,49 +26,6 @@ struct TrackedOrder {
     side: Side,
 }
 
-/// Per-wallet rate limiter: tracks request timestamps in a sliding window.
-struct RateLimiter {
-    /// Max requests per second
-    limit: u32,
-    /// Timestamps of recent requests (epoch millis)
-    timestamps: VecDeque<u64>,
-}
-
-impl RateLimiter {
-    fn new(limit: u32) -> Self {
-        Self {
-            limit,
-            timestamps: VecDeque::new(),
-        }
-    }
-
-    /// Check if a request is allowed. If yes, record it and return true.
-    /// If no, return false (rate limit exceeded).
-    fn try_acquire(&mut self) -> bool {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let window_start = now_ms.saturating_sub(1000);
-
-        // Remove timestamps older than 1 second
-        while let Some(&ts) = self.timestamps.front() {
-            if ts < window_start {
-                self.timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        if self.timestamps.len() < self.limit as usize {
-            self.timestamps.push_back(now_ms);
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Shared state for HexmarketTrade — can be used across threads.
 struct SharedState {
     open_orders: Mutex<HashMap<String, TrackedOrder>>,
@@ -80,7 +36,7 @@ struct SharedState {
     pubkey: Option<String>,
     credentials: Option<super::sdk::ApiCredentials>,
     /// Per-wallet rate limiter (shared across all workers of same instance)
-    rate_limiter: Mutex<RateLimiter>,
+    rate_limiter: crate::exchange::AtomicRateLimiter,
 }
 
 /// HexMarket live order executor.
@@ -128,7 +84,7 @@ impl HexmarketTrade {
             api_url_prefix: api_url_prefix.to_string(),
             pubkey,
             credentials,
-            rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second)),
+            rate_limiter: crate::exchange::AtomicRateLimiter::new(rate_limit_per_second),
         });
 
         Self { shared, client }
@@ -150,11 +106,13 @@ impl HexmarketTrade {
 
     /// Check rate limit. Returns Err with rejection reason if limit exceeded.
     fn check_rate_limit(&self) -> Result<()> {
-        let mut rl = self.shared.rate_limiter.lock().unwrap();
-        if rl.try_acquire() {
+        if self.shared.rate_limiter.try_acquire() {
             Ok(())
         } else {
-            Err(anyhow!("Rate limit exceeded ({}/s per wallet)", rl.limit))
+            Err(anyhow!(
+                "Rate limit exceeded ({}/s per wallet)",
+                self.shared.rate_limiter.max_per_second(),
+            ))
         }
     }
 

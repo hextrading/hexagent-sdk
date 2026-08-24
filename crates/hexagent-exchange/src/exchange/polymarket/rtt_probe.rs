@@ -48,8 +48,9 @@
 //! Place probe needs a real `clob_token_id` to address. The strategy
 //! (or, in RECORD mode, the recorder loop) stashes the current event's
 //! **high-priced side** token id into a shared
-//! `Arc<Mutex<Option<String>>>` and refreshes it as the book moves,
-//! clearing it on settlement. When `None` (no active event in this
+//! atomic immutable snapshot and refreshes it as the book moves,
+//! clearing it on settlement. Probe reads never lock the strategy
+//! thread. When `None` (no active event in this
 //! series), the place probe is skipped — no fallback (cold start and
 //! inter-event gaps push zero samples until the next event).
 //!
@@ -86,9 +87,10 @@
 //! (typically 1500–2000 ms via `async_rt::current_fast_timeout`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use crossbeam_channel::Sender;
 use log::{debug, info, warn};
 
@@ -156,7 +158,35 @@ fn warn_probe_place_rejected(code: u16, body: &str) {
 /// Probe reads on every place cycle; the writer (strategy or recorder)
 /// sets it at event start and refreshes it as the book moves, clearing
 /// it on settlement.
-pub type ActiveTokenHandle = Arc<Mutex<Option<String>>>;
+#[derive(Clone)]
+pub struct ActiveTokenHandle {
+    value: Arc<ArcSwapOption<String>>,
+}
+
+impl ActiveTokenHandle {
+    pub fn new(initial: Option<String>) -> Self {
+        Self {
+            value: Arc::new(ArcSwapOption::from(initial.map(Arc::new))),
+        }
+    }
+
+    /// Publish the current probe token with one atomic pointer swap. Token
+    /// rotation is control-plane work; periodic probe reads never contend
+    /// with the strategy's market-data callback.
+    pub fn store(&self, value: Option<String>) {
+        self.value.store(value.map(Arc::new));
+    }
+
+    pub fn load(&self) -> Option<Arc<String>> {
+        self.value.load_full()
+    }
+}
+
+impl Default for ActiveTokenHandle {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 /// Choose which side of a binary Up/Down market the probe should target
 /// so its deep `BUY @ FULL_PROBE_PRICE` rests far below the book.
@@ -317,7 +347,7 @@ fn fire_full_probe(
     active_token: &ActiveTokenHandle,
     instance_id: &str,
 ) -> Option<f64> {
-    let token = active_token.lock().ok()?.clone()?;
+    let token = active_token.load()?;
     if token.is_empty() {
         return None;
     }
@@ -494,7 +524,25 @@ fn fire_full_probe(
     Some(place_rtt)
 }
 
-// Silence unused-warning for Mutex on platforms that re-export it
-// only when active_token is constructed by the engine.
-#[allow(dead_code)]
-fn _mutex_keep_in_scope(_: &Mutex<Option<String>>) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_token_handle_publishes_latest_immutable_snapshot() {
+        let writer = ActiveTokenHandle::new(None);
+        let reader = writer.clone();
+        assert!(reader.load().is_none());
+
+        writer.store(Some("UP".to_string()));
+        let retained = reader.load().unwrap();
+        assert_eq!(retained.as_str(), "UP");
+
+        writer.store(Some("DOWN".to_string()));
+        assert_eq!(retained.as_str(), "UP", "published snapshots are immutable");
+        assert_eq!(reader.load().unwrap().as_str(), "DOWN");
+
+        writer.store(None);
+        assert!(reader.load().is_none());
+    }
+}
