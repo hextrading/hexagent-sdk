@@ -25,7 +25,9 @@ use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
 };
-use crate::exchange::{ExchangeMarket, ExchangeTrade};
+use crate::exchange::{
+    ExchangeMarket, ExchangeTrade, PublicMarketPublisher, PublicMarketReceiver,
+};
 use crate::recorder::{MarketRecorder, MarketReplayer};
 use crate::strategy::Strategy;
 use crate::types::*;
@@ -304,7 +306,7 @@ fn assess_polymarket_liveness(
 }
 
 fn send_feed_event_with_timeout(
-    tx: &Sender<MarketEvent>,
+    tx: &PublicMarketPublisher,
     event: MarketEvent,
     _timeout: std::time::Duration,
 ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
@@ -331,7 +333,7 @@ fn spawn_polymarket_supervisor(
     worker_slot: Arc<PolymarketWorkerSlot>,
     rebuild_tx: Sender<PolymarketWorkerRebuild>,
     readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
-    market_tx: Sender<MarketEvent>,
+    market_tx: PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
@@ -460,7 +462,7 @@ fn spawn_polymarket_supervisor(
 
 fn spawn_polymarket_feed_worker(
     cfg: ExchangeConfig,
-    tx: Sender<MarketEvent>,
+    tx: PublicMarketPublisher,
     sim_tx: Option<Sender<MarketEvent>>,
     shutdown: Arc<AtomicBool>,
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
@@ -790,7 +792,7 @@ fn spawn_polymarket_feed_worker(
 
 fn spawn_polymarket_feed_manager(
     cfg: ExchangeConfig,
-    tx: Sender<MarketEvent>,
+    tx: PublicMarketPublisher,
     sim_tx: Option<Sender<MarketEvent>>,
     shutdown: Arc<AtomicBool>,
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
@@ -1047,8 +1049,8 @@ mod polymarket_supervisor_tests {
 
     #[test]
     fn dispatch_publish_is_nonblocking_and_phase_is_observable() {
-        let (tx, _rx) = bounded(1);
-        tx.send(MarketEvent::Exit).unwrap();
+        let (tx, _rx) = crate::exchange::market_event_channel(1);
+        crate::exchange::publish_market_event(&tx, MarketEvent::Exit).unwrap();
         let started = std::time::Instant::now();
         assert!(matches!(
             send_feed_event_with_timeout(
@@ -3275,7 +3277,8 @@ impl Engine {
             }
         }
 
-        let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) =
+            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         // Strategy↔executor control traffic must not stall quote processing or
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
@@ -3480,8 +3483,8 @@ impl Engine {
                 // prevents a paused strategy from accumulating stale probes.
                 let (tx, rx) = crossbeam_channel::bounded::<f64>(64);
                 let enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let active_token: crate::exchange::polymarket::rtt_probe::ActiveTokenHandle =
-                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let active_token =
+                    crate::exchange::polymarket::rtt_probe::ActiveTokenHandle::new(None);
                 match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe(
                     ps,
                     enable.clone(),
@@ -3625,7 +3628,8 @@ impl Engine {
         // back-filled from REST). See `check_warmup_data_freshness`.
         self.check_warmup_data_freshness()?;
 
-        let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) =
+            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         let (sim_feed_tx, sim_feed_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
         let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
         let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
@@ -3727,7 +3731,8 @@ impl Engine {
             );
         }
 
-        let (market_tx, market_rx) = bounded::<MarketEvent>(CHANNEL_CAPACITY);
+        let (market_tx, market_rx) =
+            crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
 
@@ -3735,8 +3740,8 @@ impl Engine {
         // series → one current event). Populated from the feed's
         // Instrument events inside the recorder loop (no strategy runs in
         // RECORD mode, so there's nothing else to set it).
-        let probe_active_token: crate::exchange::polymarket::rtt_probe::ActiveTokenHandle =
-            Arc::new(std::sync::Mutex::new(None));
+        let probe_active_token =
+            crate::exchange::polymarket::rtt_probe::ActiveTokenHandle::new(None);
 
         let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
 
@@ -3963,7 +3968,7 @@ impl Engine {
                                         let chosen = crate::exchange::polymarket::rtt_probe::pick_probe_side(
                                             up, probe_up_ask, down, probe_down_ask,
                                         ).to_string();
-                                        if let Ok(mut g) = tok.lock() { *g = Some(chosen); }
+                                        tok.store(Some(chosen));
                                     }
                                 }
                             }
@@ -4204,8 +4209,8 @@ impl Engine {
             (secs * 1e9) as u64
         };
         let mut last_bt_probe_emit_sim_ns: u64 = 0;
-        let bt_probe_active_token: crate::exchange::polymarket::rtt_probe::ActiveTokenHandle =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let bt_probe_active_token =
+            crate::exchange::polymarket::rtt_probe::ActiveTokenHandle::new(None);
         let bt_probe_map: HashMap<
             String,
             (
@@ -6130,7 +6135,7 @@ impl Engine {
 
     fn spawn_strategy_thread(
         &self,
-        market_rx: Receiver<MarketEvent>,
+        market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<OrderUpdate>,
         mut executor_update_rx: Option<Receiver<RoutedOrderUpdate>>,
@@ -6635,10 +6640,12 @@ impl Engine {
 
                 let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
                 let mut quote_signal_batch = Vec::with_capacity(32);
+                let market_ready_rx = market_rx.ready_receiver().clone();
 
                 loop {
                     crossbeam_channel::select! {
-                        recv(market_rx) -> msg => {
+                        recv(market_ready_rx) -> _ready => {
+                            let msg = market_rx.try_recv();
                             match msg {
                                 Ok(MarketEvent::Exit) => {
                                     info!("[Strategy] Exit event received");
@@ -6784,7 +6791,8 @@ impl Engine {
                                         }
                                     }
                                 }
-                                Err(_) => break,
+                                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                             }
                         }
                         recv(update_rx) -> msg => {
@@ -6830,7 +6838,7 @@ impl Engine {
     fn spawn_per_instance_strategy_threads(
         &self,
         strategies: Vec<Box<dyn Strategy>>,
-        market_rx: Receiver<MarketEvent>,
+        market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<OrderUpdate>,
         executor_update_rx: Option<Receiver<RoutedOrderUpdate>>,
@@ -6979,6 +6987,7 @@ impl Engine {
                 let never_executor_update_rx =
                     crossbeam_channel::never::<RoutedOrderUpdate>();
                 let mut root_private_update_burst = 0usize;
+                let market_ready_rx = market_rx.ready_receiver().clone();
                 loop {
                     // Private/order lifecycle is lossless and higher priority
                     // than replaceable market data. Bound the priority burst
@@ -7034,7 +7043,7 @@ impl Engine {
                             }
                             Err(_) => break,
                         },
-                        recv(market_rx) -> msg => match msg {
+                        recv(market_ready_rx) -> _ready => match market_rx.try_recv() {
                             Ok(MarketEvent::Exit) => {
                                 if shutdown_in_progress { continue; }
                                 forward_recorder_event(
@@ -7120,7 +7129,8 @@ impl Engine {
                                     market_overflow_log_at = std::time::Instant::now();
                                 }
                             }
-                            Err(_) => break,
+                            Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                         },
                         recv(shutdown_done_rx) -> _ => {
                             if shutdown_in_progress {
@@ -7847,14 +7857,14 @@ impl Engine {
         let _ = strategy.on_shutdown();
     }
 
-    fn wait_for_shutdown(shutdown: &Arc<AtomicBool>, shutdown_tx: &Sender<MarketEvent>) {
+    fn wait_for_shutdown(shutdown: &Arc<AtomicBool>, shutdown_tx: &PublicMarketPublisher) {
         let _ = Self::wait_for_shutdown_or_critical(shutdown, None, shutdown_tx, &[]);
     }
 
     fn wait_for_shutdown_or_critical(
         shutdown: &Arc<AtomicBool>,
         shutdown_token: Option<&ShutdownToken>,
-        shutdown_tx: &Sender<MarketEvent>,
+        shutdown_tx: &PublicMarketPublisher,
         critical_threads: &[(&'static str, &thread::JoinHandle<()>)],
     ) -> ShutdownTrigger {
         use signal_hook::consts::{SIGINT, SIGTERM};
@@ -7918,7 +7928,7 @@ impl Engine {
             shutdown.store(true, Ordering::Release);
         }
         if let Err(error) =
-            shutdown_tx.send_timeout(MarketEvent::Exit, std::time::Duration::from_secs(1))
+            shutdown_tx.send_ordered_timeout(MarketEvent::Exit, std::time::Duration::from_secs(1))
         {
             warn!("Shutdown: could not enqueue strategy Exit event: {error}");
         }
@@ -7984,7 +7994,7 @@ impl Engine {
     /// Alias for paper mode: spawn feeds with sim_feed_tx for Polymarket.
     pub fn spawn_exchange_feeds_paper(
         &self,
-        market_tx: Sender<MarketEvent>,
+        market_tx: PublicMarketPublisher,
         sim_feed_tx: Option<Sender<MarketEvent>>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {
@@ -7993,7 +8003,7 @@ impl Engine {
 
     pub fn spawn_exchange_feeds(
         &self,
-        market_tx: Sender<MarketEvent>,
+        market_tx: PublicMarketPublisher,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {
         self.spawn_exchange_feeds_inner(market_tx, None, shutdown)
@@ -8001,7 +8011,7 @@ impl Engine {
 
     fn spawn_exchange_feeds_inner(
         &self,
-        market_tx: Sender<MarketEvent>,
+        market_tx: PublicMarketPublisher,
         sim_feed_tx: Option<Sender<MarketEvent>>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {

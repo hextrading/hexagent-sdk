@@ -32,7 +32,6 @@ const GAMMA_EVENT_CACHE_TTL: Duration = Duration::from_secs(120);
 const GAMMA_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const ROTATION_GAMMA_ATTEMPTS: u32 = 2;
 const ROTATION_REFRESH_TIMEOUT_NS: u64 = 15_000_000_000;
-const ENGINE_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// Absorb short CLOB frame bursts without closing the TCP receive window while
 /// the single-threaded parser processes the preceding frame. Linux doubles
 /// the requested value for bookkeeping, so metrics normally report 16 MiB.
@@ -1694,7 +1693,7 @@ pub struct PolymarketMarket {
     /// RTDS subscriptions (parsed during subscribe, spawned as task in connect).
     rtds_subscriptions: Vec<RtdsSubscription>,
     /// Sender for RTDS task to push SpotPrice events directly to engine.
-    rtds_tx: Option<crossbeam_channel::Sender<MarketEvent>>,
+    rtds_tx: Option<crate::exchange::PublicMarketPublisher>,
     /// Shared shutdown flag for RTDS task.
     rtds_shutdown: Arc<AtomicBool>,
     /// A rotation wave may complete one series a few milliseconds before its
@@ -1753,7 +1752,7 @@ impl PolymarketMarket {
     /// Set the engine's market_tx and shutdown flag so RTDS task can send events directly.
     pub fn set_market_tx(
         &mut self,
-        tx: crossbeam_channel::Sender<MarketEvent>,
+        tx: crate::exchange::PublicMarketPublisher,
         shutdown: Arc<AtomicBool>,
     ) {
         self.rtds_tx = Some(tx);
@@ -4686,7 +4685,7 @@ async fn clob_ws_task(
 /// Auto-reconnects with backoff.
 async fn rtds_task(
     subscriptions: Vec<RtdsSubscription>,
-    tx: crossbeam_channel::Sender<MarketEvent>,
+    tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(100, 30_000);
@@ -4722,7 +4721,7 @@ async fn rtds_task(
 
 async fn rtds_connect_and_run(
     subscriptions: &[RtdsSubscription],
-    tx: &crossbeam_channel::Sender<MarketEvent>,
+    tx: &crate::exchange::PublicMarketPublisher,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     info!("[RTDS] Connecting to {}", POLYMARKET_RTDS_URL);
@@ -4924,11 +4923,9 @@ async fn rtds_connect_and_run(
                             timestamp_ns: server_ts_ms * 1_000_000,
                             local_timestamp_ns: now_ns(),
                         });
-                        tx.send_timeout(event, ENGINE_CHANNEL_SEND_TIMEOUT)
+                        crate::exchange::publish_market_event(tx, event)
                             .map_err(|error| anyhow!(
-                                "RTDS engine channel blocked for {}ms: {}",
-                                ENGINE_CHANNEL_SEND_TIMEOUT.as_millis(),
-                                error,
+                                "RTDS engine market mailbox disconnected: {}", error,
                             ))?;
                     }
                     _ => {}
