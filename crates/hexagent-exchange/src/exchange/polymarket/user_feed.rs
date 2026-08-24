@@ -5288,6 +5288,7 @@ mod tests {
             parse_user_event(&cancellation, &shared)[0].status,
             OrderStatus::Cancelled
         );
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5296,7 +5297,6 @@ mod tests {
                 .reserved_cash,
             0.0
         );
-        shared.flush_execution_state_for_test();
         assert!(!shared
             .execution_snapshot()
             .open_orders
@@ -5311,6 +5311,7 @@ mod tests {
             parse_user_event(&resurrection, &shared)[0].status,
             OrderStatus::Accepted,
         );
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5319,7 +5320,6 @@ mod tests {
                 .reserved_cash,
             5.0
         );
-        shared.flush_execution_state_for_test();
         assert!(shared
             .execution_snapshot()
             .open_orders
@@ -5336,6 +5336,7 @@ mod tests {
             parse_user_event(&update, &shared)[0].status,
             OrderStatus::PartiallyFilled
         );
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5350,6 +5351,7 @@ mod tests {
             parse_user_event(&update, &shared)[0].status,
             OrderStatus::Filled
         );
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5381,6 +5383,7 @@ mod tests {
             parse_user_event(&partial, &shared)[0].status,
             OrderStatus::PartiallyFilled
         );
+        shared.flush_execution_state_for_test();
 
         let placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -5388,6 +5391,7 @@ mod tests {
             "original_size": "10", "size_matched": "0",
         });
         assert!(parse_user_event(&placement, &shared).is_empty());
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared.account_state.order("owner-1").unwrap().status,
             OrderStatus::PartiallyFilled,
@@ -5405,6 +5409,7 @@ mod tests {
         });
         let updates = parse_user_event(&cancellation, &shared);
         assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5424,6 +5429,7 @@ mod tests {
         let mut trade = valid_taker_event();
         trade["size"] = serde_json::json!("4");
         assert_eq!(parse_user_event(&trade, &shared).len(), 1);
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5536,6 +5542,7 @@ mod tests {
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, OrderStatus::Failed);
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared
                 .account_state
@@ -5564,6 +5571,7 @@ mod tests {
             "original_size": "10", "size_matched": "0",
         });
         assert_eq!(parse_user_event(&stale_placement, &shared).len(), 1);
+        shared.flush_execution_state_for_test();
         assert_eq!(
             shared.account_state.order("owner-1").unwrap().status,
             OrderStatus::Accepted

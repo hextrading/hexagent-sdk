@@ -4914,7 +4914,11 @@ impl SharedAccount {
             })
     }
 
-    /// Transfer a cold mutation to the account writer and wait for its result.
+    /// Transfer a compatibility-only cold mutation to the account writer and
+    /// wait for its result. Admission is non-blocking: a saturated owner lane
+    /// fails immediately so this shim can never sleep while trying to enter a
+    /// strategy-critical queue. New runtime paths must use the typed
+    /// `SharedAccountHandle::submit_*` receivers and poll completion instead.
     /// The direct path exists only before the runtime binds the owner lane
     /// (CLI/startup/tests); once bound, no non-owner thread may execute it.
     fn request_account_owner<T, F>(&self, build: F) -> Result<T, String>
@@ -4924,10 +4928,10 @@ impl SharedAccount {
     {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.account_owner_task_tx
-            .send_timeout(build(reply_tx), ACCOUNT_OWNER_REQUEST_TIMEOUT)
+            .try_send(build(reply_tx))
             .map_err(|error| {
                 format!(
-                    "account {} owner task enqueue timed out: {error}",
+                    "account {} owner task enqueue unavailable: {error}",
                     self.account_id,
                 )
             })?;

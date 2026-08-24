@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
-use log::{info, warn};
+use log::{debug, warn};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::sdk::auth::{build_order_message, ed25519_sign};
 use super::sdk::{
@@ -26,9 +26,18 @@ struct TrackedOrder {
     side: Side,
 }
 
-/// Shared state for HexmarketTrade — can be used across threads.
+#[inline]
+fn emit_fixed_update(out: &mut OrderUpdateBatch, update: OrderUpdate) -> Result<()> {
+    push_order_update(out, update).map_err(|overflow| {
+        anyhow!(
+            "Hexmarket fixed lifecycle output exhausted at coid {}",
+            overflow.update.client_order_id
+        )
+    })
+}
+
+/// Immutable/authentication state shared by physical connection owners.
 struct SharedState {
-    open_orders: Mutex<HashMap<String, TrackedOrder>>,
     nonce: AtomicU64,
     signing_key: Option<SigningKey>,
     api_url_prefix: String,
@@ -41,11 +50,13 @@ struct SharedState {
 
 /// HexMarket live order executor.
 ///
-/// Thread-safe: can be cloned to create parallel workers.
-/// Each clone shares open_orders + nonce + signing_key, but has its own HexClient (HTTP connection).
+/// Each clone is one physical-connection owner with its own HTTP client and
+/// open-order table. The dispatcher must keep one market/account shard sticky
+/// to the same clone; no request worker shares mutable order identity state.
 pub struct HexmarketTrade {
     shared: Arc<SharedState>,
     client: HexClient,
+    open_orders: HashMap<String, TrackedOrder>,
 }
 
 impl HexmarketTrade {
@@ -87,7 +98,6 @@ impl HexmarketTrade {
         };
 
         let shared = Arc::new(SharedState {
-            open_orders: Mutex::new(HashMap::new()),
             nonce: AtomicU64::new(now_ms),
             signing_key,
             api_url_prefix: api_url_prefix.to_string(),
@@ -96,7 +106,11 @@ impl HexmarketTrade {
             rate_limiter: crate::exchange::AtomicRateLimiter::new(rate_limit_per_second),
         });
 
-        Self { shared, client }
+        Self {
+            shared,
+            client,
+            open_orders: HashMap::new(),
+        }
     }
 
     /// Create a parallel worker clone with its own HTTP client but shared state.
@@ -110,6 +124,7 @@ impl HexmarketTrade {
         Self {
             shared: Arc::clone(&self.shared),
             client,
+            open_orders: HashMap::new(),
         }
     }
 
@@ -229,18 +244,18 @@ impl ExchangeTrade for HexmarketTrade {
         let params = self.build_order_params(order)?;
         let coid = &order.client_order_id;
 
-        info!(
+        debug!(
             "[HexmarketTrade] Submit {} {} @ {} qty={} coid={}",
             order.symbol, params.side, params.price, params.quantity, coid,
         );
 
         match self.client.place_order(&params) {
             Ok(resp) => {
-                info!(
+                debug!(
                     "[HexmarketTrade] Accepted: coid={} oid={}",
                     coid, resp.order_id
                 );
-                self.shared.open_orders.lock().unwrap().insert(
+                self.open_orders.insert(
                     coid.clone(),
                     TrackedOrder {
                         exchange_order_id: Some(resp.order_id.clone()),
@@ -299,20 +314,15 @@ impl ExchangeTrade for HexmarketTrade {
         self.check_rate_limit()?;
 
         // Remove from local tracking if present (may not be tracked if synced from server)
-        let tracked = self
-            .shared
-            .open_orders
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        let tracked = self.open_orders.remove(client_order_id);
 
-        info!(
+        debug!(
             "[HexmarketTrade] Cancel coid={} on {:?}",
             client_order_id, exchange
         );
 
         match self.client.cancel_order_by_client_id(client_order_id) {
-            Ok(resp) => info!("[HexmarketTrade] Cancelled: oid={}", resp.order_id),
+            Ok(resp) => debug!("[HexmarketTrade] Cancelled: oid={}", resp.order_id),
             Err(e) => warn!(
                 "[HexmarketTrade] Cancel failed coid={}: {}",
                 client_order_id,
@@ -343,16 +353,30 @@ impl ExchangeTrade for HexmarketTrade {
         })
     }
 
-    fn cancel_all(&mut self, exchange: Exchange, _symbol: &str) -> Result<Vec<OrderUpdate>> {
+    fn cancel_all(&mut self, exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>> {
+        let mut updates = Vec::new();
+        self.cancel_all_with(exchange, symbol, &mut |update| {
+            updates.push(update);
+            true
+        })?;
+        Ok(updates)
+    }
+
+    fn cancel_all_with(
+        &mut self,
+        exchange: Exchange,
+        _symbol: &str,
+        emit: &mut dyn FnMut(OrderUpdate) -> bool,
+    ) -> Result<()> {
         self.check_rate_limit()?;
-        let open_count = self.shared.open_orders.lock().unwrap().len();
-        info!(
+        let open_count = self.open_orders.len();
+        debug!(
             "[HexmarketTrade] Cancel all on {:?} ({} open)",
             exchange, open_count
         );
 
         match self.client.cancel_all_orders(None, None) {
-            Ok(resp) => info!(
+            Ok(resp) => debug!(
                 "[HexmarketTrade] cancel_all: {} cancelled",
                 resp.cancelled_count
             ),
@@ -363,13 +387,9 @@ impl ExchangeTrade for HexmarketTrade {
         }
 
         let now = now_ns();
-        let updates = self
-            .shared
-            .open_orders
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(coid, t)| OrderUpdate {
+        let mut delivery_open = true;
+        for (coid, t) in self.open_orders.drain() {
+            let update = OrderUpdate {
                 order_slot: Default::default(),
                 client_order_id: coid,
                 exchange: Exchange::Hexmarket,
@@ -386,10 +406,13 @@ impl ExchangeTrade for HexmarketTrade {
                 trade_id: None,
                 order_audit: None,
                 error: None,
-            })
-            .collect();
+            };
+            if delivery_open {
+                delivery_open = emit(update);
+            }
+        }
 
-        Ok(updates)
+        Ok(())
     }
 
     fn batch_submit_orders(
@@ -397,12 +420,22 @@ impl ExchangeTrade for HexmarketTrade {
         market_id: &str,
         orders: &[OrderRequest],
     ) -> Result<Vec<OrderUpdate>> {
+        let mut out = OrderUpdateBatch::new();
+        self.batch_submit_orders_into(market_id, orders, &mut out)?;
+        Ok(out.into_iter().collect())
+    }
+
+    fn batch_submit_orders_into(
+        &mut self,
+        market_id: &str,
+        orders: &[OrderRequest],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
         if let Err(e) = self.check_rate_limit() {
             warn!("[HexmarketTrade] RATE LIMITED batch place: {}", e);
             let now = now_ns();
-            return Ok(orders
-                .iter()
-                .map(|o| OrderUpdate {
+            for o in orders {
+                emit_fixed_update(out, OrderUpdate {
                     order_slot: Default::default(),
                     client_order_id: o.client_order_id.clone(),
                     exchange: Exchange::Hexmarket,
@@ -419,15 +452,18 @@ impl ExchangeTrade for HexmarketTrade {
                     trade_id: None,
                     order_audit: None,
                     error: None,
-                })
-                .collect());
+                })?;
+            }
+            return Ok(());
         }
-        let mut params_list: Vec<PlaceOrderParams> = Vec::new();
+        let mut params_list = arrayvec::ArrayVec::<PlaceOrderParams, ORDER_BATCH_CAPACITY>::new();
         for order in orders {
-            params_list.push(self.build_order_params(order)?);
+            params_list
+                .try_push(self.build_order_params(order)?)
+                .map_err(|_| anyhow!("Hexmarket place batch exceeds fixed capacity"))?;
         }
 
-        info!(
+        debug!(
             "[HexmarketTrade] Batch place {} orders for market {}",
             params_list.len(),
             market_id
@@ -436,8 +472,7 @@ impl ExchangeTrade for HexmarketTrade {
         match self.client.batch_place_orders(market_id, &params_list) {
             Ok(resp) => {
                 let now = now_ns();
-                let mut updates = Vec::new();
-                let mut open = self.shared.open_orders.lock().unwrap();
+                let open = &mut self.open_orders;
 
                 for (i, result) in resp.results.iter().enumerate() {
                     let order = &orders[i];
@@ -447,7 +482,7 @@ impl ExchangeTrade for HexmarketTrade {
                             "[HexmarketTrade] Batch[{}] REJECTED coid={}: {}",
                             i, coid, err
                         );
-                        updates.push(OrderUpdate {
+                        emit_fixed_update(out, OrderUpdate {
                             order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Hexmarket,
@@ -464,10 +499,10 @@ impl ExchangeTrade for HexmarketTrade {
                             trade_id: None,
                             order_audit: None,
                             error: None,
-                        });
+                        })?;
                     } else {
                         let oid = result.order_id.clone();
-                        info!(
+                        debug!(
                             "[HexmarketTrade] Batch[{}] OK coid={} oid={:?}",
                             i, coid, oid
                         );
@@ -479,7 +514,7 @@ impl ExchangeTrade for HexmarketTrade {
                                 side: order.side,
                             },
                         );
-                        updates.push(OrderUpdate {
+                        emit_fixed_update(out, OrderUpdate {
                             order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Hexmarket,
@@ -496,53 +531,68 @@ impl ExchangeTrade for HexmarketTrade {
                             trade_id: None,
                             order_audit: None,
                             error: None,
-                        });
+                        })?;
                     }
                 }
-                Ok(updates)
+                Ok(())
             }
             Err(e) => {
                 warn!(
                     "[HexmarketTrade] Batch place FAILED: {}, fallback",
                     Self::format_sdk_error(e)
                 );
-                let mut updates = Vec::new();
                 for order in orders {
-                    updates.push(self.submit_order(order)?);
+                    emit_fixed_update(out, self.submit_order(order)?)?;
                 }
-                Ok(updates)
+                Ok(())
             }
         }
     }
 
     fn batch_cancel_orders(
         &mut self,
-        _exchange: Exchange,
+        exchange: Exchange,
         market_id: &str,
         client_order_ids: &[String],
     ) -> Result<Vec<OrderUpdate>> {
+        let mut out = OrderUpdateBatch::new();
+        self.batch_cancel_orders_into(exchange, market_id, client_order_ids, &mut out)?;
+        Ok(out.into_iter().collect())
+    }
+
+    fn batch_cancel_orders_into(
+        &mut self,
+        _exchange: Exchange,
+        market_id: &str,
+        client_order_ids: &[String],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
         self.check_rate_limit()?;
         if client_order_ids.is_empty() {
-            return Ok(vec![]);
+            return Ok(());
         }
 
         // Remove from local tracking if present; proceed with API cancel regardless
-        let mut to_cancel: Vec<(String, Option<TrackedOrder>)> = Vec::new();
+        let mut to_cancel =
+            arrayvec::ArrayVec::<(String, Option<TrackedOrder>), ORDER_BATCH_CAPACITY>::new();
         {
-            let mut open = self.shared.open_orders.lock().unwrap();
+            let open = &mut self.open_orders;
             for coid in client_order_ids {
                 let tracked = open.remove(coid);
-                to_cancel.push((coid.clone(), tracked));
+                to_cancel
+                    .try_push((coid.clone(), tracked))
+                    .map_err(|_| anyhow!("Hexmarket cancel batch exceeds fixed capacity"))?;
             }
         }
 
-        info!(
+        debug!(
             "[HexmarketTrade] Batch cancel {} orders for market {}",
             to_cancel.len(),
             market_id
         );
 
-        let coid_refs: Vec<&str> = to_cancel.iter().map(|(coid, _)| coid.as_str()).collect();
+        let coid_refs: arrayvec::ArrayVec<&str, ORDER_BATCH_CAPACITY> =
+            to_cancel.iter().map(|(coid, _)| coid.as_str()).collect();
         match self.client.batch_cancel_orders(market_id, &[], &coid_refs) {
             Ok(resp) => {
                 for r in &resp.results {
@@ -559,11 +609,11 @@ impl ExchangeTrade for HexmarketTrade {
                 Self::format_sdk_error(e)
             ),
         }
+        drop(coid_refs);
 
         let now = now_ns();
-        Ok(to_cancel
-            .into_iter()
-            .map(|(coid, t)| OrderUpdate {
+        for (coid, t) in to_cancel {
+            emit_fixed_update(out, OrderUpdate {
                 order_slot: Default::default(),
                 client_order_id: coid,
                 exchange: Exchange::Hexmarket,
@@ -580,52 +630,77 @@ impl ExchangeTrade for HexmarketTrade {
                 trade_id: None,
                 order_audit: None,
                 error: None,
-            })
-            .collect())
+            })?;
+        }
+        Ok(())
     }
 
     fn batch_update_orders(
+        &mut self,
+        exchange: Exchange,
+        market_id: &str,
+        cancel_client_order_ids: &[String],
+        place_orders: &[OrderRequest],
+    ) -> Result<Vec<OrderUpdate>> {
+        let mut out = OrderUpdateBatch::new();
+        self.batch_update_orders_into(
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            &mut out,
+        )?;
+        Ok(out.into_iter().collect())
+    }
+
+    fn batch_update_orders_into(
         &mut self,
         _exchange: Exchange,
         market_id: &str,
         cancel_client_order_ids: &[String],
         place_orders: &[OrderRequest],
-    ) -> Result<Vec<OrderUpdate>> {
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
         self.check_rate_limit()?;
         // Remove from local tracking; proceed regardless of whether tracked locally
-        let mut cancel_tracked: Vec<(String, Option<TrackedOrder>)> = Vec::new();
+        let mut cancel_tracked =
+            arrayvec::ArrayVec::<(String, Option<TrackedOrder>), ORDER_BATCH_CAPACITY>::new();
         {
-            let mut open = self.shared.open_orders.lock().unwrap();
+            let open = &mut self.open_orders;
             for coid in cancel_client_order_ids {
                 let tracked = open.remove(coid);
-                cancel_tracked.push((coid.clone(), tracked));
+                cancel_tracked
+                    .try_push((coid.clone(), tracked))
+                    .map_err(|_| anyhow!("Hexmarket update cancel batch exceeds fixed capacity"))?;
             }
         }
 
-        let mut params_list: Vec<PlaceOrderParams> = Vec::new();
+        let mut params_list = arrayvec::ArrayVec::<PlaceOrderParams, ORDER_BATCH_CAPACITY>::new();
         for order in place_orders {
-            params_list.push(self.build_order_params(order)?);
+            params_list
+                .try_push(self.build_order_params(order)?)
+                .map_err(|_| anyhow!("Hexmarket update place batch exceeds fixed capacity"))?;
         }
 
-        let cancel_refs: Vec<&str> = cancel_tracked
+        let cancel_refs: arrayvec::ArrayVec<&str, ORDER_BATCH_CAPACITY> = cancel_tracked
             .iter()
             .map(|(coid, _)| coid.as_str())
             .collect();
 
-        info!(
+        debug!(
             "[HexmarketTrade] Batch update market {}: cancel={} place={}",
             market_id,
             cancel_refs.len(),
             params_list.len()
         );
 
-        match self
+        let response = self
             .client
-            .batch_update_orders(market_id, &[], &params_list, Some(&cancel_refs))
-        {
+            .batch_update_orders(market_id, &[], &params_list, Some(&cancel_refs));
+        drop(cancel_refs);
+        match response {
             Ok(resp) => {
                 let now = now_ns();
-                let mut updates = Vec::new();
 
                 for r in &resp.cancel_results {
                     if let Some(ref err) = r.error {
@@ -636,7 +711,7 @@ impl ExchangeTrade for HexmarketTrade {
                     }
                 }
                 for (coid, t) in &cancel_tracked {
-                    updates.push(OrderUpdate {
+                    emit_fixed_update(out, OrderUpdate {
                         order_slot: Default::default(),
                         client_order_id: coid.clone(),
                         exchange: Exchange::Hexmarket,
@@ -653,10 +728,10 @@ impl ExchangeTrade for HexmarketTrade {
                         trade_id: None,
                         order_audit: None,
                         error: None,
-                    });
+                    })?;
                 }
 
-                let mut open = self.shared.open_orders.lock().unwrap();
+                let open = &mut self.open_orders;
                 for (i, result) in resp.place_results.iter().enumerate() {
                     let order = &place_orders[i];
                     let coid = &order.client_order_id;
@@ -665,7 +740,7 @@ impl ExchangeTrade for HexmarketTrade {
                             "[HexmarketTrade] Update place[{}] REJECTED coid={}: {}",
                             i, coid, err
                         );
-                        updates.push(OrderUpdate {
+                        emit_fixed_update(out, OrderUpdate {
                             order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Hexmarket,
@@ -682,7 +757,7 @@ impl ExchangeTrade for HexmarketTrade {
                             trade_id: None,
                             order_audit: None,
                             error: None,
-                        });
+                        })?;
                     } else {
                         let oid = result.order_id.clone();
                         open.insert(
@@ -693,7 +768,7 @@ impl ExchangeTrade for HexmarketTrade {
                                 side: order.side,
                             },
                         );
-                        updates.push(OrderUpdate {
+                        emit_fixed_update(out, OrderUpdate {
                             order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Hexmarket,
@@ -710,10 +785,10 @@ impl ExchangeTrade for HexmarketTrade {
                             trade_id: None,
                             order_audit: None,
                             error: None,
-                        });
+                        })?;
                     }
                 }
-                Ok(updates)
+                Ok(())
             }
             Err(e) => {
                 warn!(
@@ -721,25 +796,25 @@ impl ExchangeTrade for HexmarketTrade {
                     Self::format_sdk_error(e)
                 );
                 {
-                    let mut open = self.shared.open_orders.lock().unwrap();
+                    let open = &mut self.open_orders;
                     for (coid, tracked) in cancel_tracked {
                         if let Some(t) = tracked {
                             open.insert(coid, t);
                         }
                     }
                 }
-                let mut updates = Vec::new();
                 if !cancel_client_order_ids.is_empty() {
-                    updates.extend(self.batch_cancel_orders(
+                    self.batch_cancel_orders_into(
                         Exchange::Hexmarket,
                         market_id,
                         cancel_client_order_ids,
-                    )?);
+                        out,
+                    )?;
                 }
                 if !place_orders.is_empty() {
-                    updates.extend(self.batch_submit_orders(market_id, place_orders)?);
+                    self.batch_submit_orders_into(market_id, place_orders, out)?;
                 }
-                Ok(updates)
+                Ok(())
             }
         }
     }
