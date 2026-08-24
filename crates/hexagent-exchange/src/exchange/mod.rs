@@ -18,13 +18,119 @@ pub mod pyth;
 pub mod sim;
 pub mod sim_v2;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::types::MarketEvent;
 use crate::types::{Exchange, OrderRequest, OrderUpdate};
 use anyhow::Result;
+
+/// Capacity of the parser-task -> synchronous feed-owner lane used by public
+/// market adapters. The producer never blocks: replaceable observations are
+/// overwritten oldest-first on overflow and ordered events force the feed
+/// generation to reconnect. This bounds stale backlog and memory independently
+/// per venue.
+pub const PUBLIC_MARKET_ADAPTER_LANE_CAPACITY: usize = 4096;
+const PUBLIC_MARKET_ORDERED_BURST: u8 = 8;
+
+#[inline]
+fn replaceable_market_event(event: &MarketEvent) -> bool {
+    matches!(
+        event,
+        MarketEvent::OrderBook(_)
+            | MarketEvent::Quote(_)
+            | MarketEvent::SpotPrice(_)
+            | MarketEvent::AssetCtx(_)
+    )
+}
+
+/// Multi-producer half of one venue adapter's public-data mailbox.
+///
+/// Ordered events use a bounded FIFO and fail the feed generation when full.
+/// Replaceable observations use a fixed lock-free overwrite-oldest queue, so
+/// parser tasks preserve freshness without blocking or growing the heap.
+#[derive(Clone)]
+pub(crate) struct PublicMarketPublisher {
+    ordered: crossbeam_channel::Sender<MarketEvent>,
+    latest: Arc<crossbeam_queue::ArrayQueue<MarketEvent>>,
+    consumer_alive: Arc<AtomicBool>,
+}
+
+/// Single-consumer half owned by the synchronous venue feed thread. Ordered
+/// traffic has priority, bounded to a short burst so current snapshots cannot
+/// starve during a sustained public-trade stream.
+pub(crate) struct PublicMarketReceiver {
+    ordered: crossbeam_channel::Receiver<MarketEvent>,
+    latest: Arc<crossbeam_queue::ArrayQueue<MarketEvent>>,
+    consumer_alive: Arc<AtomicBool>,
+    ordered_burst: AtomicU8,
+}
+
+impl PublicMarketReceiver {
+    pub(crate) fn try_recv(
+        &self,
+    ) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
+        if self.ordered_burst.load(Ordering::Relaxed) >= PUBLIC_MARKET_ORDERED_BURST {
+            if let Some(event) = self.latest.pop() {
+                self.ordered_burst.store(0, Ordering::Relaxed);
+                return Ok(event);
+            }
+        }
+        match self.ordered.try_recv() {
+            Ok(event) => {
+                if self.ordered_burst.load(Ordering::Relaxed) < PUBLIC_MARKET_ORDERED_BURST {
+                    self.ordered_burst.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(event)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                if let Some(event) = self.latest.pop() {
+                    self.ordered_burst.store(0, Ordering::Relaxed);
+                    Ok(event)
+                } else {
+                    Err(crossbeam_channel::TryRecvError::Empty)
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                if let Some(event) = self.latest.pop() {
+                    self.ordered_burst.store(0, Ordering::Relaxed);
+                    Ok(event)
+                } else {
+                    Err(crossbeam_channel::TryRecvError::Disconnected)
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PublicMarketReceiver {
+    fn drop(&mut self) {
+        self.consumer_alive.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn public_market_channel() -> (PublicMarketPublisher, PublicMarketReceiver) {
+    let (ordered_tx, ordered_rx) =
+        crossbeam_channel::bounded(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY);
+    let latest = Arc::new(crossbeam_queue::ArrayQueue::new(
+        PUBLIC_MARKET_ADAPTER_LANE_CAPACITY,
+    ));
+    let consumer_alive = Arc::new(AtomicBool::new(true));
+    (
+        PublicMarketPublisher {
+            ordered: ordered_tx,
+            latest: Arc::clone(&latest),
+            consumer_alive: Arc::clone(&consumer_alive),
+        },
+        PublicMarketReceiver {
+            ordered: ordered_rx,
+            latest,
+            consumer_alive,
+            ordered_burst: AtomicU8::new(0),
+        },
+    )
+}
 
 /// Fixed capacity of a venue-private order/fill lane owned by one strategy
 /// worker. The producer is one authenticated user-feed task; the consumer is
@@ -135,6 +241,70 @@ pub(crate) fn private_update_lane(
 
 static PUBLIC_MARKET_OVERFLOW_DROPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PUBLIC_MARKET_OVERFLOW_REPLACEMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub trait MarketEventPublisher {
+    fn try_publish(
+        &self,
+        event: MarketEvent,
+    ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>>;
+}
+
+impl<T: MarketEventPublisher + ?Sized> MarketEventPublisher for &T {
+    fn try_publish(
+        &self,
+        event: MarketEvent,
+    ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
+        (**self).try_publish(event)
+    }
+}
+
+impl MarketEventPublisher for crossbeam_channel::Sender<MarketEvent> {
+    fn try_publish(
+        &self,
+        event: MarketEvent,
+    ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
+        match self.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(event)) => {
+                if replaceable_market_event(&event) {
+                    PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+                    hexagent_runtime::latency::record_ns("market.root_overflow_drop", 1);
+                    Ok(())
+                } else {
+                    Err(crossbeam_channel::SendError(event))
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(event)) => {
+                Err(crossbeam_channel::SendError(event))
+            }
+        }
+    }
+}
+
+impl MarketEventPublisher for PublicMarketPublisher {
+    fn try_publish(
+        &self,
+        event: MarketEvent,
+    ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
+        if !self.consumer_alive.load(Ordering::Acquire) {
+            return Err(crossbeam_channel::SendError(event));
+        }
+        if replaceable_market_event(&event) {
+            if self.latest.force_push(event).is_some() {
+                PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        self.ordered.try_send(event).map_err(|error| match error {
+            crossbeam_channel::TrySendError::Full(event)
+            | crossbeam_channel::TrySendError::Disconnected(event) => {
+                crossbeam_channel::SendError(event)
+            }
+        })
+    }
+}
 
 /// Publish parsed public data without ever parking an async socket/parser task
 /// behind the synchronous root router. Quote/book/latest-value observations
@@ -142,35 +312,19 @@ static PUBLIC_MARKET_OVERFLOW_DROPS: std::sync::atomic::AtomicU64 =
 /// loss. Trades, bars, lifecycle, instrument and health messages are ordered:
 /// a full lane returns an error so the producing feed fails closed/reconnects
 /// instead of silently losing a non-replaceable transition.
-pub fn publish_market_event(
-    tx: &crossbeam_channel::Sender<MarketEvent>,
+pub fn publish_market_event<P: MarketEventPublisher + ?Sized>(
+    tx: &P,
     event: MarketEvent,
 ) -> Result<(), crossbeam_channel::SendError<MarketEvent>> {
-    match tx.try_send(event) {
-        Ok(()) => Ok(()),
-        Err(crossbeam_channel::TrySendError::Full(event)) => {
-            if matches!(
-                event,
-                MarketEvent::OrderBook(_)
-                    | MarketEvent::Quote(_)
-                    | MarketEvent::SpotPrice(_)
-                    | MarketEvent::AssetCtx(_)
-            ) {
-                PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
-                hexagent_runtime::latency::record_ns("market.root_overflow_drop", 1);
-                Ok(())
-            } else {
-                Err(crossbeam_channel::SendError(event))
-            }
-        }
-        Err(crossbeam_channel::TrySendError::Disconnected(event)) => {
-            Err(crossbeam_channel::SendError(event))
-        }
-    }
+    tx.try_publish(event)
 }
 
 pub fn public_market_overflow_drops() -> u64 {
     PUBLIC_MARKET_OVERFLOW_DROPS.load(Ordering::Relaxed)
+}
+
+pub fn public_market_overflow_replacements() -> u64 {
+    PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.load(Ordering::Relaxed)
 }
 
 /// Heartbeat cadence for the Polymarket CLOB feed. Each tick sends both its
@@ -616,6 +770,162 @@ mod tests {
         )
         .is_err());
         assert_eq!(rx.len(), 1);
+    }
+
+    #[test]
+    fn adapter_mailbox_overwrites_oldest_replaceable_observation() {
+        let (publisher, receiver) = public_market_channel();
+        let before = public_market_overflow_replacements();
+        for sequence in 0..=PUBLIC_MARKET_ADAPTER_LANE_CAPACITY {
+            publish_market_event(
+                &publisher,
+                MarketEvent::SpotPrice(crate::types::SpotPrice {
+                    source: "test".into(),
+                    symbol: "btc/usd".into(),
+                    price: sequence as f64,
+                    timestamp_ns: sequence as u64,
+                    local_timestamp_ns: sequence as u64,
+                }),
+            )
+            .unwrap();
+        }
+        assert!(public_market_overflow_replacements() > before);
+
+        let mut timestamps = Vec::with_capacity(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY);
+        while let Ok(MarketEvent::SpotPrice(spot)) = receiver.try_recv() {
+            timestamps.push(spot.timestamp_ns);
+        }
+        assert_eq!(timestamps.len(), PUBLIC_MARKET_ADAPTER_LANE_CAPACITY);
+        assert_eq!(timestamps.first(), Some(&1));
+        assert_eq!(
+            timestamps.last(),
+            Some(&(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY as u64)),
+        );
+    }
+
+    #[test]
+    fn adapter_mailbox_prioritizes_ordered_control_over_snapshot() {
+        let (publisher, receiver) = public_market_channel();
+        publish_market_event(
+            &publisher,
+            MarketEvent::SpotPrice(crate::types::SpotPrice {
+                source: "test".into(),
+                symbol: "btc/usd".into(),
+                price: 1.0,
+                timestamp_ns: 1,
+                local_timestamp_ns: 1,
+            }),
+        )
+        .unwrap();
+        publish_market_event(
+            &publisher,
+            MarketEvent::Connected {
+                exchange: Exchange::Binance,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(MarketEvent::Connected {
+                exchange: Exchange::Binance
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(MarketEvent::SpotPrice(_))
+        ));
+    }
+
+    #[test]
+    fn adapter_mailbox_bounds_snapshot_starvation_during_ordered_burst() {
+        let (publisher, receiver) = public_market_channel();
+        for _ in 0..(PUBLIC_MARKET_ORDERED_BURST as usize + 4) {
+            publish_market_event(
+                &publisher,
+                MarketEvent::Connected {
+                    exchange: Exchange::Binance,
+                },
+            )
+            .unwrap();
+        }
+        publish_market_event(
+            &publisher,
+            MarketEvent::SpotPrice(crate::types::SpotPrice {
+                source: "test".into(),
+                symbol: "btc/usd".into(),
+                price: 1.0,
+                timestamp_ns: 1,
+                local_timestamp_ns: 1,
+            }),
+        )
+        .unwrap();
+
+        for _ in 0..PUBLIC_MARKET_ORDERED_BURST {
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(MarketEvent::Connected { .. })
+            ));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(MarketEvent::SpotPrice(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual public-mailbox latency benchmark; run with --release --ignored"]
+    fn adapter_mailbox_publish_latency_benchmark() {
+        const EVENTS: usize = 100_000;
+        let events: Vec<MarketEvent> = (0..EVENTS)
+            .map(|sequence| {
+                MarketEvent::SpotPrice(crate::types::SpotPrice {
+                    source: "benchmark".into(),
+                    symbol: "btc/usd".into(),
+                    price: sequence as f64,
+                    timestamp_ns: sequence as u64,
+                    local_timestamp_ns: sequence as u64,
+                })
+            })
+            .collect();
+        let (publisher, receiver) = public_market_channel();
+        let consumer = std::thread::spawn(move || {
+            let mut consumed = 0usize;
+            loop {
+                match receiver.try_recv() {
+                    Ok(_) => consumed += 1,
+                    Err(crossbeam_channel::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            }
+            consumed
+        });
+        let replacements_before = public_market_overflow_replacements();
+        let mut samples = Vec::with_capacity(EVENTS);
+        let mut peak_depth = 0usize;
+        for event in events {
+            let started = std::time::Instant::now();
+            publish_market_event(&publisher, event).unwrap();
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            peak_depth = peak_depth.max(publisher.latest.len() + publisher.ordered.len());
+        }
+        drop(publisher);
+        let consumed = consumer.join().unwrap();
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[((samples.len() - 1) * numerator) / denominator]
+        };
+        println!(
+            "adapter_mailbox events={} boundary=prebuilt_event_publish_entry_to_return unit=ns consumed={} p50={} p99={} p999={} max={} peak_depth={} replacements={}",
+            EVENTS,
+            consumed,
+            percentile(50, 100),
+            percentile(99, 100),
+            percentile(999, 1000),
+            samples[samples.len() - 1],
+            peak_depth,
+            public_market_overflow_replacements().saturating_sub(replacements_before),
+        );
+        assert!(consumed > 0);
     }
 
     #[test]

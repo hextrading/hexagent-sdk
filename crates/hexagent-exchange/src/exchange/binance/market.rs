@@ -181,7 +181,7 @@ fn update_silent_cycle_counter(
 
 pub struct BinanceMarket {
     symbols: Vec<String>,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
     api_key: String,
     /// If true, connect to futures endpoint (fstream.binance.com) for asset index streams.
@@ -690,9 +690,9 @@ type KlineGapState = HashMap<String, u64>;
 /// REST call uses `spawn_blocking` so the blocking HTTP I/O doesn't
 /// stall the async runtime (we're on a `current_thread` runtime as
 /// of 2026-05 — `block_in_place` is unavailable).
-async fn dispatch_event(
+async fn dispatch_event<P: crate::exchange::MarketEventPublisher + ?Sized>(
     event: MarketEvent,
-    event_tx: &crossbeam_channel::Sender<MarketEvent>,
+    event_tx: &P,
     gap_state: &mut KlineGapState,
     data_dir: Option<&PathBuf>,
 ) -> bool {
@@ -823,7 +823,7 @@ async fn binance_ws_task(
     url: String,
     futures: bool,
     symbol_hint: String,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
     data_dir: Option<PathBuf>,
     rest_base: String,
@@ -1025,8 +1025,8 @@ async fn binance_ws_task(
 
 impl ExchangeMarket for BinanceMarket {
     fn connect(&mut self) -> Result<()> {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
-        self.event_rx = Some(event_rx.clone());
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
+        self.event_rx = Some(event_rx);
         // Per-task shutdown: each connect() creates a FRESH Arc rather
         // than reusing the struct field. Old tasks (still draining a
         // previous connection — possibly hung in `read.next()` waiting

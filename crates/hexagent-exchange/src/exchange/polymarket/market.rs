@@ -716,17 +716,26 @@ struct RestFutureEventCandidate {
 /// deliberately a channel rather than another cache poll: discovery wakes the
 /// feed on its next 1 ms loop and registers the future instrument before the
 /// current event expires.
-static REST_FUTURE_EVENT_SUBSCRIBERS: OnceLock<
-    Mutex<Vec<crossbeam_channel::Sender<RestFutureEventCandidate>>>,
-> = OnceLock::new();
+struct RestFutureEventSubscriber {
+    tx: crossbeam_channel::Sender<RestFutureEventCandidate>,
+    replace_rx: crossbeam_channel::Receiver<RestFutureEventCandidate>,
+}
+
+static REST_FUTURE_EVENT_SUBSCRIBERS: OnceLock<Mutex<Vec<RestFutureEventSubscriber>>> =
+    OnceLock::new();
 
 fn subscribe_rest_future_events() -> crossbeam_channel::Receiver<RestFutureEventCandidate> {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    // Discovery is replaceable state. A slow adapter needs only the newest
+    // candidate; one-slot mailboxes bound memory and publisher latency.
+    let (tx, rx) = crossbeam_channel::bounded(1);
     REST_FUTURE_EVENT_SUBSCRIBERS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(tx);
+        .push(RestFutureEventSubscriber {
+            tx,
+            replace_rx: rx.clone(),
+        });
     rx
 }
 
@@ -741,7 +750,14 @@ fn publish_rest_future_event(series_id: &str, event: &PolymarketEvent) {
     subscribers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .retain(|subscriber| subscriber.send(candidate.clone()).is_ok());
+        .retain(|subscriber| match subscriber.tx.try_send(candidate.clone()) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(candidate)) => {
+                let _ = subscriber.replace_rx.try_recv();
+                subscriber.tx.try_send(candidate).is_ok()
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        });
 }
 
 fn gamma_event_cache() -> &'static Mutex<HashMap<String, CachedGammaEvent>> {
@@ -1506,7 +1522,6 @@ fn clob_monotonic_now_ns() -> u64 {
 // reconstructed from a later snapshot.
 const CLOB_CRITICAL_EVENT_CAPACITY: usize = 2_048;
 const CLOB_REPLACEABLE_EVENT_CAPACITY: usize = 8_192;
-const CLOB_CRITICAL_SEND_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[derive(Clone)]
 struct ClobEventSender {
@@ -1559,9 +1574,8 @@ impl ClobEventSender {
     }
 
     /// Returns false only when the consumer is gone or the lossless lane
-    /// cannot make progress within its explicit backpressure budget. The CLOB
-    /// task then reconnects and re-seeds books instead of silently losing an
-    /// ordered event.
+    /// is saturated. The CLOB task then reconnects and re-seeds books instead
+    /// of blocking the socket reader or silently losing an ordered event.
     fn send(&self, event: MarketEvent) -> bool {
         let replaceable = Self::is_replaceable(&event);
         let event = ClobEventEnvelope {
@@ -1569,10 +1583,7 @@ impl ClobEventSender {
             event,
         };
         if !replaceable {
-            return match self
-                .critical_tx
-                .send_timeout(event, CLOB_CRITICAL_SEND_TIMEOUT)
-            {
+            return match self.critical_tx.try_send(event) {
                 Ok(()) => true,
                 Err(_) => {
                     self.critical_overflows.fetch_add(1, Ordering::Relaxed);
@@ -1673,7 +1684,7 @@ pub struct PolymarketMarket {
     /// Events parsed by the async WS task land here; `next_event()` drains.
     event_rx: Option<ClobEventReceiver>,
     /// Control channel to the async WS task (Resubscribe / Shutdown).
-    ws_ctrl_tx: Option<tokio::sync::mpsc::UnboundedSender<WsCtrl>>,
+    ws_ctrl_tx: Option<tokio::sync::mpsc::Sender<WsCtrl>>,
     /// Shared shutdown flag — shared between the main CLOB task and RTDS task.
     ws_shutdown: Arc<AtomicBool>,
     /// Persists across engine-level disconnect/connect cycles. Once any CLOB
@@ -1814,7 +1825,7 @@ impl PolymarketMarket {
         self.clob_runtime_fallback = true;
         self.ws_shutdown.store(true, Ordering::Relaxed);
         if let Some(tx) = self.ws_ctrl_tx.take() {
-            let _ = tx.send(WsCtrl::Shutdown);
+            let _ = tx.try_send(WsCtrl::Shutdown);
         }
         if let Some(abort) = self.clob_task_abort.take() {
             abort.abort();
@@ -1912,7 +1923,15 @@ impl PolymarketMarket {
     fn resubscribe_ws(&self) {
         if let Some(tx) = &self.ws_ctrl_tx {
             let subscription = self.current_clob_subscription();
-            let _ = tx.send(WsCtrl::Resubscribe(subscription));
+            if tx.try_send(WsCtrl::Resubscribe(subscription)).is_err() {
+                // A stale resubscription must never win merely because the
+                // bounded control lane is full. Fail this generation closed;
+                // the supervisor will rebuild it from the current state.
+                self.ws_shutdown.store(true, Ordering::Release);
+                if let Some(abort) = &self.clob_task_abort {
+                    abort.abort();
+                }
+            }
         }
     }
 
@@ -3431,7 +3450,7 @@ async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookF
 fn request_clob_book_repairs(
     tokens: Vec<String>,
     in_flight: &mut HashSet<String>,
-    tx: &tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
+    tx: &tokio::sync::mpsc::Sender<ClobBookRepairResult>,
 ) {
     for token in tokens {
         if !in_flight.insert(token.clone()) {
@@ -3443,7 +3462,7 @@ fn request_clob_book_repairs(
         // stop frame reads and the runtime's own watchdog timers together.
         crate::async_rt::handle().spawn(async move {
             let result = fetch_authoritative_clob_book(&token).await;
-            let _ = tx.send(ClobBookRepairResult { token, result });
+            let _ = tx.send(ClobBookRepairResult { token, result }).await;
         });
     }
 }
@@ -3452,7 +3471,7 @@ fn request_clob_book_repair_after(
     token: String,
     delay: Duration,
     in_flight: &mut HashSet<String>,
-    tx: &tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
+    tx: &tokio::sync::mpsc::Sender<ClobBookRepairResult>,
 ) {
     if !in_flight.insert(token.clone()) {
         return;
@@ -3461,7 +3480,7 @@ fn request_clob_book_repair_after(
     crate::async_rt::handle().spawn(async move {
         tokio::time::sleep(delay).await;
         let result = fetch_authoritative_clob_book(&token).await;
-        let _ = tx.send(ClobBookRepairResult { token, result });
+        let _ = tx.send(ClobBookRepairResult { token, result }).await;
     });
 }
 
@@ -3585,8 +3604,8 @@ fn promote_clob_standby(
     subscription: &ClobSubscription,
     health: &mut WsHealth,
     books: &mut ClobLocalBooks,
-    repair_tx: &mut tokio::sync::mpsc::UnboundedSender<ClobBookRepairResult>,
-    repair_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClobBookRepairResult>,
+    repair_tx: &mut tokio::sync::mpsc::Sender<ClobBookRepairResult>,
+    repair_rx: &mut tokio::sync::mpsc::Receiver<ClobBookRepairResult>,
     repairs_in_flight: &mut HashSet<String>,
     repair_superseded_attempts: &mut HashMap<String, u8>,
     liveness: &PolymarketLiveness,
@@ -3625,8 +3644,7 @@ fn promote_clob_standby(
     // applied. Fail closed, discard the derived books, and reseed every token
     // from an authoritative full snapshot before READY is emitted again.
     reset_clob_books_for_failover(books, subscription, now);
-    let (new_repair_tx, new_repair_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
+    let (new_repair_tx, new_repair_rx) = tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
     *repair_tx = new_repair_tx;
     *repair_rx = new_repair_rx;
     repairs_in_flight.clear();
@@ -3664,7 +3682,7 @@ fn promote_clob_standby(
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
     event_tx: ClobEventSender,
-    mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<WsCtrl>,
+    mut ctrl_rx: tokio::sync::mpsc::Receiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
     subscribed_once: Arc<AtomicBool>,
     liveness: Arc<PolymarketLiveness>,
@@ -3768,7 +3786,7 @@ async fn clob_ws_task(
         let mut health = WsHealth::new(connected_at);
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
         let (repair_tx, mut repair_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ClobBookRepairResult>();
+            tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
         let mut repair_tx = repair_tx;
         let mut repairs_in_flight = HashSet::new();
         let mut repair_superseded_attempts: HashMap<String, u8> = HashMap::new();
@@ -6851,7 +6869,7 @@ impl ExchangeMarket for PolymarketMarket {
         let clob_subscription = self.current_clob_subscription();
         let clob_token_count = clob_subscription.tokens.len();
         let (event_tx, event_rx) = clob_event_lanes();
-        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<WsCtrl>();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<WsCtrl>(16);
         self.event_rx = Some(event_rx);
         self.ws_ctrl_tx = Some(ctrl_tx);
 
@@ -7119,7 +7137,7 @@ impl ExchangeMarket for PolymarketMarket {
     fn disconnect(&mut self) {
         self.ws_shutdown.store(true, Ordering::Relaxed);
         if let Some(tx) = self.ws_ctrl_tx.take() {
-            let _ = tx.send(WsCtrl::Shutdown);
+            let _ = tx.try_send(WsCtrl::Shutdown);
         }
         if let Some(abort) = self.clob_task_abort.take() {
             abort.abort();
@@ -8069,7 +8087,7 @@ mod pick_current_event_tests {
         let mut market = PolymarketMarket::new();
         market.series.push(expired_series("btc", "old-btc", btc_rx));
         market.series.push(expired_series("eth", "old-eth", eth_rx));
-        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(16);
         market.ws_ctrl_tx = Some(ctrl_tx);
 
         market.check_rotation().unwrap();

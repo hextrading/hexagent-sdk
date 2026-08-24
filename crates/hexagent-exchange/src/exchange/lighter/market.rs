@@ -28,7 +28,7 @@ pub struct LighterMarket {
     symbols: Vec<String>,
     ws_url: String,
     meta: LighterMeta,
-    event_rx: Option<crossbeam_channel::Receiver<MarketEvent>>,
+    event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
 }
 
@@ -114,7 +114,7 @@ fn channel_market_id(channel: &str) -> Option<i16> {
 async fn lighter_ws_task(
     market_ids: HashMap<i16, String>, // market_id → symbol
     ws_url: String,
-    event_tx: crossbeam_channel::Sender<MarketEvent>,
+    event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -310,7 +310,7 @@ async fn lighter_ws_task(
 
 impl super::super::ExchangeMarket for LighterMarket {
     fn connect(&mut self) -> Result<()> {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
+        let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         let shutdown = Arc::new(AtomicBool::new(false));
         self.ws_shutdown = shutdown.clone();

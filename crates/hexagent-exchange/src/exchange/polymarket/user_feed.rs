@@ -2188,6 +2188,7 @@ fn spawn_private_apply_worker(
                 "polymarket-private-owner",
                 &account_id,
             );
+            crate::latency::prepare_polymarket_private_stages();
             let mut route_dedupe = PrivateRouteDedupe::new();
             let mut cold_committed = PrivateRouteDedupe::new();
             while !shutdown.load(Ordering::Relaxed) {
