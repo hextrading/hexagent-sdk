@@ -36,8 +36,10 @@ use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 const CHANNEL_CAPACITY: usize = 10_000;
 const POLY_FAST_OWNER_QUEUE_CAPACITY: usize = 1;
 const POLY_CANCEL_OWNER_QUEUE_CAPACITY: usize = 256;
+const POLY_SAFETY_CANCEL_OWNER_QUEUE_CAPACITY: usize = 64;
 const POLY_RECONCILE_OWNER_QUEUE_CAPACITY: usize = 32;
 const POLY_CANCEL_OUTBOX_CAPACITY: usize = 4_096;
+const POLY_SAFETY_CANCEL_OUTBOX_CAPACITY: usize = 1_024;
 const POLY_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
 // Four account updates keep fill/cancel feedback responsive while bounding
 // the time an already-enqueued market trigger can sit behind the biased lane.
@@ -2395,6 +2397,32 @@ fn emit_strategy_signal(
     }
 }
 
+fn handle_signal_batch_overflow(
+    overflow: SignalBatchOverflow,
+    signal_tx: &SignalSender,
+    quarantined: &AtomicBool,
+    instance_id: &str,
+) {
+    quarantined.store(true, Ordering::Release);
+    error!(
+        "[strategy_worker] instance={} fixed signal batch overflow capacity={}; quarantining fail-closed",
+        instance_id,
+        SIGNAL_BATCH_CAPACITY,
+    );
+    let emergency = emergency_cancel_for_signal(
+        &overflow.signal,
+        instance_id,
+        "fixed callback signal batch overflow",
+    );
+    if let Err(error) = signal_tx.try_send_emergency(emergency) {
+        error!(
+            "[strategy_worker] instance={} emergency control lane unavailable after fixed batch overflow: {}",
+            instance_id,
+            error,
+        );
+    }
+}
+
 /// Exact identity of one historical-bars input snapshot.
 ///
 /// This deliberately contains only raw-data coordinates. Two strategies with
@@ -4618,7 +4646,7 @@ impl Engine {
         }
 
         let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
-        let mut quote_signal_batch = Vec::with_capacity(32);
+        let mut quote_signal_batch = SignalBatch::new();
 
         // Per-instance USDC + per-event split shares (carried over from the removed v1 sim's wallet
         // seeding). split_amount_usdc → shares of each token credited at event.
@@ -5198,8 +5226,20 @@ impl Engine {
                     strat_clock_ns = strat_clock_ns.max(update.timestamp_ns);
                     set_sim_clock(update.timestamp_ns);
                     for strategy in strategies.iter_mut() {
-                        for sig in strategy.on_order_update(&update) {
-                            sim.submit(&sig, update.timestamp_ns);
+                        match strategy.on_order_update(&update) {
+                            Ok(signals) => {
+                                for sig in signals {
+                                    sim.submit(&sig, update.timestamp_ns);
+                                }
+                            }
+                            Err(overflow) => {
+                                let emergency = emergency_cancel_for_signal(
+                                    &overflow.signal,
+                                    strategy.instance_id(),
+                                    "fixed lifecycle signal batch overflow",
+                                );
+                                sim.submit(&emergency, update.timestamp_ns);
+                            }
                         }
                     }
                 }
@@ -5339,7 +5379,18 @@ impl Engine {
                             if fire {
                                 last_quote_ns[i] = ts;
                                 quote_signal_batch.clear();
-                                strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                if let Err(overflow) =
+                                    strategy.on_quote_into(ts, &mut quote_signal_batch)
+                                {
+                                    quote_signal_batch.clear();
+                                    let emergency = emergency_cancel_for_signal(
+                                        &overflow.signal,
+                                        strategy.instance_id(),
+                                        "fixed callback signal batch overflow",
+                                    );
+                                    sim.submit(&emergency, strat_clock_ns);
+                                    continue;
+                                }
                                 stamp_quote_trigger(&mut quote_signal_batch, ob, false);
                                 for sig in quote_signal_batch.drain(..) {
                                     sim.submit(&sig, strat_clock_ns);
@@ -6704,7 +6755,7 @@ impl Engine {
                 crate::os_tune::pin_strategy("strategy");
 
                 let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
-                let mut quote_signal_batch = Vec::with_capacity(32);
+                let mut quote_signal_batch = SignalBatch::new();
                 let market_ready_rx = market_rx.ready_receiver().clone();
 
                 loop {
@@ -6855,7 +6906,20 @@ impl Engine {
                                                 if fire {
                                                     last_quote_ns[i] = ts;
                                                     quote_signal_batch.clear();
-                                                    strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                                    if let Err(overflow) = strategy
+                                                        .on_quote_into(ts, &mut quote_signal_batch)
+                                                    {
+                                                        quote_signal_batch.clear();
+                                                        let emergency = emergency_cancel_for_signal(
+                                                            &overflow.signal,
+                                                            strategy.instance_id(),
+                                                            "fixed callback signal batch overflow",
+                                                        );
+                                                        if signal_tx.send(emergency).is_err() {
+                                                            return;
+                                                        }
+                                                        continue;
+                                                    }
                                                     stamp_quote_trigger(&mut quote_signal_batch, ob, true);
                                                     for sig in quote_signal_batch.drain(..) {
                                                         if signal_tx.send(sig).is_err() { return; }
@@ -6877,8 +6941,20 @@ impl Engine {
                                 Ok(update) => {
                                     let owner = update.owner;
                                     let deliver = |s: &mut Box<dyn Strategy>| {
-                                        for sig in s.on_order_update(&update.update) {
-                                            if signal_tx.send(sig).is_err() { return; }
+                                        match s.on_order_update(&update.update) {
+                                            Ok(signals) => {
+                                                for sig in signals {
+                                                    if signal_tx.send(sig).is_err() { return; }
+                                                }
+                                            }
+                                            Err(overflow) => {
+                                                let emergency = emergency_cancel_for_signal(
+                                                    &overflow.signal,
+                                                    s.instance_id(),
+                                                    "fixed lifecycle signal batch overflow",
+                                                );
+                                                let _ = signal_tx.send(emergency);
+                                            }
                                         }
                                     };
                                     if owner == SYSTEM_SIGNAL_OWNER {
@@ -7725,8 +7801,8 @@ impl Engine {
             emit_strategy_signal(sig, &signal_tx, &quarantined, instance_id)
         };
         let mut last_quote_ns: u64 = 0;
-        let mut quote_signal_batch = Vec::with_capacity(32);
-        let mut callback_signal_batch = Vec::with_capacity(32);
+        let mut quote_signal_batch = SignalBatch::new();
+        let mut callback_signal_batch = SignalBatch::new();
         let mut private_update_burst = 0usize;
         let mut lifecycle_sequence = 0u64;
         let mut historical_epoch = 0u64;
@@ -7779,7 +7855,18 @@ impl Engine {
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if shutdown_started { continue; }
                         callback_signal_batch.clear();
-                        strategy.on_private_feed_control_into(control, &mut callback_signal_batch);
+                        if let Err(overflow) = strategy
+                            .on_private_feed_control_into(control, &mut callback_signal_batch)
+                        {
+                            callback_signal_batch.clear();
+                            handle_signal_batch_overflow(
+                                overflow,
+                                &signal_tx,
+                                &quarantined,
+                                instance_id,
+                            );
+                            break 'worker;
+                        }
                         for sig in callback_signal_batch.drain(..) {
                             if !emit(sig) { break 'worker; }
                         }
@@ -7794,13 +7881,25 @@ impl Engine {
                         let callback_started = crate::latency::Instant::now();
                         lifecycle_sequence = lifecycle_sequence.saturating_add(1);
                         callback_signal_batch.clear();
-                        strategy.on_lifecycle_update_owned_into(LifecycleEnvelope {
-                            owner: idx as u16,
-                            order_slot: update.order_slot,
-                            sequence: lifecycle_sequence,
-                            source: LifecycleSource::PrivateFeed,
-                            update,
-                        }, &mut callback_signal_batch);
+                        if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
+                            LifecycleEnvelope {
+                                owner: idx as u16,
+                                order_slot: update.order_slot,
+                                sequence: lifecycle_sequence,
+                                source: LifecycleSource::PrivateFeed,
+                                update,
+                            },
+                            &mut callback_signal_batch,
+                        ) {
+                            callback_signal_batch.clear();
+                            handle_signal_batch_overflow(
+                                overflow,
+                                &signal_tx,
+                                &quarantined,
+                                instance_id,
+                            );
+                            break 'worker;
+                        }
                         crate::latency::record(
                             "strategy.private_feed.callback",
                             callback_started,
@@ -7832,13 +7931,25 @@ impl Engine {
                         let callback_started = crate::latency::Instant::now();
                         lifecycle_sequence = lifecycle_sequence.saturating_add(1);
                         callback_signal_batch.clear();
-                        strategy.on_lifecycle_update_owned_into(LifecycleEnvelope {
-                            owner: idx as u16,
-                            order_slot: queued.update.order_slot,
-                            sequence: lifecycle_sequence,
-                            source: queued.source,
-                            update: queued.update,
-                        }, &mut callback_signal_batch);
+                        if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
+                            LifecycleEnvelope {
+                                owner: idx as u16,
+                                order_slot: queued.update.order_slot,
+                                sequence: lifecycle_sequence,
+                                source: queued.source,
+                                update: queued.update,
+                            },
+                            &mut callback_signal_batch,
+                        ) {
+                            callback_signal_batch.clear();
+                            handle_signal_batch_overflow(
+                                overflow,
+                                &signal_tx,
+                                &quarantined,
+                                instance_id,
+                            );
+                            break 'worker;
+                        }
                         if !shutdown_started {
                             for sig in callback_signal_batch.drain(..) {
                                 if !emit(sig) { break 'worker; }
@@ -7879,10 +7990,19 @@ impl Engine {
                     if shutdown_started { continue; }
                     let callback_started = crate::latency::Instant::now();
                     callback_signal_batch.clear();
-                    strategy.on_watchdog_into(
+                    if let Err(overflow) = strategy.on_watchdog_into(
                         crate::types::now_ns(),
                         &mut callback_signal_batch,
-                    );
+                    ) {
+                        callback_signal_batch.clear();
+                        handle_signal_batch_overflow(
+                            overflow,
+                            &signal_tx,
+                            &quarantined,
+                            instance_id,
+                        );
+                        break 'worker;
+                    }
                     for sig in callback_signal_batch.drain(..) {
                         if !emit(sig) { break 'worker; }
                     }
@@ -7913,13 +8033,31 @@ impl Engine {
                         let event = queued.event;
                         let callback_started = crate::latency::Instant::now();
                         callback_signal_batch.clear();
-                        match event.as_ref() {
-                            MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
-                            MarketEvent::Trade(t) => strategy.on_trade_tick(t),
-                            MarketEvent::Quote(q) => strategy.on_quote_tick(q),
-                            MarketEvent::Bar(b) => strategy.on_bar(b),
-                            MarketEvent::SpotPrice(sp) => strategy.on_spot_price(sp),
-                            MarketEvent::AssetCtx(ac) => strategy.on_asset_ctx(ac),
+                        let callback_result = match event.as_ref() {
+                            MarketEvent::OrderBook(ob) => {
+                                strategy.on_orderbook(ob);
+                                Ok(())
+                            }
+                            MarketEvent::Trade(t) => {
+                                strategy.on_trade_tick(t);
+                                Ok(())
+                            }
+                            MarketEvent::Quote(q) => {
+                                strategy.on_quote_tick(q);
+                                Ok(())
+                            }
+                            MarketEvent::Bar(b) => {
+                                strategy.on_bar(b);
+                                Ok(())
+                            }
+                            MarketEvent::SpotPrice(sp) => {
+                                strategy.on_spot_price(sp);
+                                Ok(())
+                            }
+                            MarketEvent::AssetCtx(ac) => {
+                                strategy.on_asset_ctx(ac);
+                                Ok(())
+                            }
                             MarketEvent::Instrument(inst) => {
                                 strategy.on_instrument(inst);
                                 let ts_event = event.timestamp_ns();
@@ -7962,9 +8100,16 @@ impl Engine {
                                         break 'worker;
                                     }
                                 }
+                                Ok(())
                             }
-                            MarketEvent::Connected { exchange } => strategy.on_connected(*exchange),
-                            MarketEvent::Disconnected { exchange, reason } => strategy.on_disconnected(*exchange, reason),
+                            MarketEvent::Connected { exchange } => {
+                                strategy.on_connected(*exchange);
+                                Ok(())
+                            }
+                            MarketEvent::Disconnected { exchange, reason } => {
+                                strategy.on_disconnected(*exchange, reason);
+                                Ok(())
+                            }
                             MarketEvent::MarketDataHealth(health) => strategy.on_market_data_health_into(
                                 health,
                                 &mut callback_signal_batch,
@@ -7975,7 +8120,17 @@ impl Engine {
                             ),
                             MarketEvent::EventStart { .. }
                             | MarketEvent::EventEnd { .. }
-                            | MarketEvent::Exit => {}
+                            | MarketEvent::Exit => Ok(()),
+                        };
+                        if let Err(overflow) = callback_result {
+                            callback_signal_batch.clear();
+                            handle_signal_batch_overflow(
+                                overflow,
+                                &signal_tx,
+                                &quarantined,
+                                instance_id,
+                            );
+                            break 'worker;
                         }
                         if let MarketEvent::OrderBook(ob) = event.as_ref() {
                             let venue_ok = !strategy.quote_trigger_binance_ob_only()
@@ -7996,7 +8151,18 @@ impl Engine {
                                 if fire {
                                     last_quote_ns = ts;
                                     quote_signal_batch.clear();
-                                    strategy.on_quote_into(ts, &mut quote_signal_batch);
+                                    if let Err(overflow) =
+                                        strategy.on_quote_into(ts, &mut quote_signal_batch)
+                                    {
+                                        quote_signal_batch.clear();
+                                        handle_signal_batch_overflow(
+                                            overflow,
+                                            &signal_tx,
+                                            &quarantined,
+                                            instance_id,
+                                        );
+                                        break 'worker;
+                                    }
                                     stamp_quote_trigger(&mut quote_signal_batch, ob, true);
                                     for sig in quote_signal_batch.drain(..) {
                                         if !emit(sig) { break 'worker; }
@@ -8019,10 +8185,11 @@ impl Engine {
         }
         // Dispatchers are joined before the router closes market_txs, so all
         // final updates are available here before the report is generated.
+        let mut shutdown_lifecycle_overflow = false;
         while let Ok(update) = private_feed_update_rx.try_recv() {
             lifecycle_sequence = lifecycle_sequence.saturating_add(1);
             callback_signal_batch.clear();
-            strategy.on_lifecycle_update_owned_into(
+            if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
                 LifecycleEnvelope {
                     owner: idx as u16,
                     order_slot: update.order_slot,
@@ -8031,21 +8198,32 @@ impl Engine {
                     update,
                 },
                 &mut callback_signal_batch,
-            );
+            ) {
+                callback_signal_batch.clear();
+                handle_signal_batch_overflow(overflow, &signal_tx, &quarantined, instance_id);
+                shutdown_lifecycle_overflow = true;
+                break;
+            }
         }
-        while let Ok(queued) = update_rx.try_recv() {
-            lifecycle_sequence = lifecycle_sequence.saturating_add(1);
-            callback_signal_batch.clear();
-            strategy.on_lifecycle_update_owned_into(
-                LifecycleEnvelope {
-                    owner: idx as u16,
-                    order_slot: queued.update.order_slot,
-                    sequence: lifecycle_sequence,
-                    source: queued.source,
-                    update: queued.update,
-                },
-                &mut callback_signal_batch,
-            );
+        if !shutdown_lifecycle_overflow {
+            while let Ok(queued) = update_rx.try_recv() {
+                lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                callback_signal_batch.clear();
+                if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
+                    LifecycleEnvelope {
+                        owner: idx as u16,
+                        order_slot: queued.update.order_slot,
+                        sequence: lifecycle_sequence,
+                        source: queued.source,
+                        update: queued.update,
+                    },
+                    &mut callback_signal_batch,
+                ) {
+                    callback_signal_batch.clear();
+                    handle_signal_batch_overflow(overflow, &signal_tx, &quarantined, instance_id);
+                    break;
+                }
+            }
         }
         let _ = strategy.on_shutdown();
     }
@@ -10113,8 +10291,12 @@ impl Engine {
                     let manifest =
                         hexagent_runtime::http1_pool::account_execution_slot_manifest();
                     for (account_id, role, slot) in manifest {
+                        let safety_cancel_slot = role == Role::Cancel && slot == 0;
                         let capacity = match role {
                             Role::Fast => POLY_FAST_OWNER_QUEUE_CAPACITY,
+                            Role::Cancel if safety_cancel_slot => {
+                                POLY_SAFETY_CANCEL_OWNER_QUEUE_CAPACITY
+                            }
                             Role::Cancel => POLY_CANCEL_OWNER_QUEUE_CAPACITY,
                             Role::Reconcile => POLY_RECONCILE_OWNER_QUEUE_CAPACITY,
                             Role::Query | Role::GapReplay => continue,
@@ -10136,6 +10318,7 @@ impl Engine {
                             .or_default();
                         match role {
                             Role::Fast => routes.fast.push(tx),
+                            Role::Cancel if safety_cancel_slot => routes.safety_cancel.push(tx),
                             Role::Cancel => routes.cancel.push(tx),
                             Role::Reconcile => routes.reconcile.push(tx),
                             Role::Query | Role::GapReplay => unreachable!(),
@@ -10143,6 +10326,9 @@ impl Engine {
                         let router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let thread_name = match role {
                             Role::Fast => format!("poly-exec-{account_id}-{slot}"),
+                            Role::Cancel if safety_cancel_slot => {
+                                format!("poly-safety-cancel-{account_id}-{slot}")
+                            }
                             Role::Cancel => format!("poly-cancel-{account_id}-{slot}"),
                             Role::Reconcile => {
                                 format!("poly-reconcile-owner-{account_id}-{slot}")
@@ -10424,6 +10610,7 @@ impl Engine {
                 loop {
                     if let Some(routes_by_account) = poly_connection_routes.as_mut() {
                         for routes in routes_by_account.values_mut() {
+                            flush_poly_safety_cancel_outbox(routes);
                             flush_poly_cancel_outbox(routes);
                         }
                     }
@@ -10563,12 +10750,14 @@ impl Engine {
                                     .as_mut()
                                     .and_then(|routes| routes.get_mut(account_id))
                                 {
-                                    dispatch_poly_signal_to_connection_owner(
+                                    if !dispatch_poly_signal_to_connection_owner(
                                         signal,
                                         stale_threshold_ms,
                                         update_sender.clone(),
                                         routes,
-                                    );
+                                    ) {
+                                        break;
+                                    }
                                 } else {
                                     warn!(
                                         "[Executor] no physical connection owner for account={} instance={}",
@@ -10974,6 +11163,14 @@ enum PolyConnectionCommand {
         update_tx: ExecutorUpdateSender,
         enqueued_at: std::time::Instant,
     },
+    /// Emergency/account-wide cancellation. This command is accepted only by
+    /// the connection slot reserved for the safety lane and never waits
+    /// behind ordinary order-specific cancellation or completion work.
+    SafetyCancel {
+        signal: Signal,
+        update_tx: ExecutorUpdateSender,
+        enqueued_at: std::time::Instant,
+    },
     /// Low-frequency batch/control compatibility path.  It is still owned by
     /// a role actor, while the venue adapter is migrated to accept an exact
     /// owner client for every batch variant.
@@ -11007,14 +11204,20 @@ enum PolyTypedCompletion {
 struct PolyAccountConnectionRoutes {
     fast: Vec<Sender<PolyConnectionCommand>>,
     cancel: Vec<Sender<PolyConnectionCommand>>,
+    safety_cancel: Vec<Sender<PolyConnectionCommand>>,
     reconcile: Vec<Sender<PolyConnectionCommand>>,
     fast_rr: usize,
     cancel_rr: usize,
+    safety_cancel_rr: usize,
     reconcile_rr: usize,
     /// Lossless, account-local pending cancels. The root execution router only
     /// appends/flushes this fixed-capacity outbox; it never waits for a
     /// connection-owner permit lane.
     cancel_outbox: VecDeque<PolyConnectionCommand>,
+    /// Independent lossless retention for emergency cancels. Saturation is
+    /// reported as typed CancelUncertain feedback so retry/fail-closed state is
+    /// visible to the owning strategy; it is never silently discarded.
+    safety_cancel_outbox: VecDeque<PolyConnectionCommand>,
 }
 
 impl Default for PolyAccountConnectionRoutes {
@@ -11022,11 +11225,14 @@ impl Default for PolyAccountConnectionRoutes {
         Self {
             fast: Vec::new(),
             cancel: Vec::new(),
+            safety_cancel: Vec::new(),
             reconcile: Vec::new(),
             fast_rr: 0,
             cancel_rr: 0,
+            safety_cancel_rr: 0,
             reconcile_rr: 0,
             cancel_outbox: VecDeque::with_capacity(POLY_CANCEL_OUTBOX_CAPACITY),
+            safety_cancel_outbox: VecDeque::with_capacity(POLY_SAFETY_CANCEL_OUTBOX_CAPACITY),
         }
     }
 }
@@ -11058,10 +11264,79 @@ fn flush_poly_cancel_outbox(routes: &mut PolyAccountConnectionRoutes) {
     }
 }
 
+fn try_send_poly_safety_owner(
+    routes: &mut PolyAccountConnectionRoutes,
+    mut command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    if routes.safety_cancel.is_empty() {
+        return Err(command);
+    }
+    let start = routes.safety_cancel_rr % routes.safety_cancel.len();
+    for offset in 0..routes.safety_cancel.len() {
+        let index = (start + offset) % routes.safety_cancel.len();
+        match routes.safety_cancel[index].try_send(command) {
+            Ok(()) => {
+                routes.safety_cancel_rr = index.wrapping_add(1);
+                return Ok(());
+            }
+            Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+            Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+        }
+    }
+    Err(command)
+}
+
+fn flush_poly_safety_cancel_outbox(routes: &mut PolyAccountConnectionRoutes) {
+    while let Some(command) = routes.safety_cancel_outbox.pop_front() {
+        match try_send_poly_safety_owner(routes, command) {
+            Ok(()) => {}
+            Err(command) => {
+                routes.safety_cancel_outbox.push_front(command);
+                break;
+            }
+        }
+    }
+}
+
+fn send_poly_safety_cancel_lossless(
+    routes: &mut PolyAccountConnectionRoutes,
+    command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    flush_poly_safety_cancel_outbox(routes);
+    let command = if routes.safety_cancel_outbox.is_empty() {
+        match try_send_poly_safety_owner(routes, command) {
+            Ok(()) => return Ok(()),
+            Err(command) => command,
+        }
+    } else {
+        command
+    };
+    if routes.safety_cancel_outbox.len() >= POLY_SAFETY_CANCEL_OUTBOX_CAPACITY {
+        return Err(command);
+    }
+    routes.safety_cancel_outbox.push_back(command);
+    hexagent_runtime::latency::record_ns("polymarket.safety_cancel.account_outbox", 1);
+    Ok(())
+}
+
 fn drain_poly_cancel_outbox_for_shutdown(
     routes: &mut PolyAccountConnectionRoutes,
 ) -> Result<(), usize> {
     use hexagent_runtime::http1_pool::Role;
+    while let Some(command) = routes.safety_cancel_outbox.pop_front() {
+        let Some(lane) = routes
+            .safety_cancel
+            .get(routes.safety_cancel_rr % routes.safety_cancel.len().max(1))
+        else {
+            routes.safety_cancel_outbox.push_front(command);
+            return Err(routes.safety_cancel_outbox.len() + routes.cancel_outbox.len());
+        };
+        if let Err(error) = lane.send(command) {
+            routes.safety_cancel_outbox.push_front(error.0);
+            return Err(routes.safety_cancel_outbox.len() + routes.cancel_outbox.len());
+        }
+        routes.safety_cancel_rr = routes.safety_cancel_rr.wrapping_add(1);
+    }
     while let Some(command) = routes.cancel_outbox.pop_front() {
         let (lanes, rr) = routes.lanes_mut(Role::Cancel);
         let Some(lane) = lanes.get(*rr % lanes.len().max(1)) else {
@@ -11309,6 +11584,22 @@ fn run_poly_connection_owner(
                     }
                 }
             }
+            PolyConnectionCommand::SafetyCancel {
+                signal,
+                update_tx,
+                enqueued_at,
+            } => {
+                debug_assert_eq!(role, Role::Cancel);
+                crate::latency::record_ns(
+                    "polymarket.safety_cancel.connection_owner_queue",
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                for update in execute_safety_cancel_signal(&mut router, signal, &permit) {
+                    if send_executor_update(&update_tx, update).is_err() {
+                        break;
+                    }
+                }
+            }
             PolyConnectionCommand::Fallback {
                 signal,
                 stale_ms,
@@ -11328,6 +11619,187 @@ fn run_poly_connection_owner(
         }
     }
     drop(permit);
+}
+
+fn safety_cancel_uncertain(signal: &Signal, detail: impl Into<String>) -> OrderUpdate {
+    let instance_id = extract_instance_id(signal);
+    let symbol = match signal {
+        Signal::CancelAll { symbol, .. } => symbol.clone(),
+        Signal::PolymarketCancelAllOrders { market, .. } => market.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    OrderUpdate {
+        order_slot: OrderSlot::UNASSIGNED,
+        client_order_id: instance_id,
+        exchange: Exchange::Polymarket,
+        symbol,
+        side: Side::Buy,
+        exchange_order_id: None,
+        status: OrderStatus::CancelUncertain,
+        liquidity: None,
+        filled_quantity: 0.0,
+        remaining_quantity: 0.0,
+        avg_fill_price: 0.0,
+        timestamp_ns: now_ns(),
+        exchange_event_timestamp_ns: None,
+        trade_id: None,
+        order_audit: None,
+        error: Some(detail.into()),
+    }
+}
+
+fn control_lane_rejected(signal: &Signal, detail: impl Into<String>) -> OrderUpdate {
+    let symbol = match signal {
+        Signal::RetainPolymarketEventAudit { condition_id, .. }
+        | Signal::RetirePolymarketEventAudit { condition_id, .. } => condition_id.clone(),
+        _ => String::new(),
+    };
+    OrderUpdate {
+        order_slot: OrderSlot::UNASSIGNED,
+        client_order_id: extract_instance_id(signal),
+        exchange: Exchange::Polymarket,
+        symbol,
+        side: Side::Buy,
+        exchange_order_id: None,
+        status: OrderStatus::ExecutorRejected,
+        liquidity: None,
+        filled_quantity: 0.0,
+        remaining_quantity: 0.0,
+        avg_fill_price: 0.0,
+        timestamp_ns: now_ns(),
+        exchange_event_timestamp_ns: None,
+        trade_id: None,
+        order_audit: None,
+        error: Some(detail.into()),
+    }
+}
+
+fn execute_safety_cancel_signal(
+    executor: &mut LiveRouter,
+    signal: Signal,
+    permit: &hexagent_runtime::http1_pool::Permit,
+) -> Vec<OrderUpdate> {
+    let instance_id = extract_instance_id(&signal);
+    match signal {
+        Signal::CancelAll {
+            exchange: Exchange::Polymarket,
+            ..
+        } => match executor.poly_route_mut(&instance_id) {
+            Ok(route) if instance_id.is_empty() => {
+                route.cancel_all_orders_on(permit);
+                Vec::new()
+            }
+            Ok(route) => route
+                .cancel_instance_orders_on(permit)
+                .unwrap_or_else(|error| {
+                    vec![safety_cancel_uncertain(
+                        &Signal::CancelAll {
+                            exchange: Exchange::Polymarket,
+                            symbol: String::new(),
+                            instance_id: instance_id.clone(),
+                            timestamp_ns: now_ns(),
+                        },
+                        error.to_string(),
+                    )]
+                }),
+            Err(error) => vec![safety_cancel_uncertain(
+                &Signal::CancelAll {
+                    exchange: Exchange::Polymarket,
+                    symbol: String::new(),
+                    instance_id,
+                    timestamp_ns: now_ns(),
+                },
+                error.to_string(),
+            )],
+        },
+        Signal::PolymarketCancelAllOrders {
+            reason,
+            market,
+            asset_ids,
+            instance_id,
+        } => {
+            let route = match executor.poly_route_mut(&instance_id) {
+                Ok(route) => route,
+                Err(error) => {
+                    return vec![safety_cancel_uncertain(
+                        &Signal::PolymarketCancelAllOrders {
+                            reason,
+                            market,
+                            asset_ids,
+                            instance_id,
+                        },
+                        error.to_string(),
+                    )];
+                }
+            };
+            match market {
+                Some(condition_id) => {
+                    let routine = is_routine_expiry_cancel(&reason, true);
+                    let result = route.cancel_market_orders_until_final_on(
+                        &condition_id,
+                        &asset_ids,
+                        routine,
+                        permit,
+                    );
+                    let mut updates = result.updates;
+                    let (status, error) = if result.confirmed {
+                        (
+                            OrderStatus::Cancelled,
+                            POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED.to_string(),
+                        )
+                    } else {
+                        (
+                            OrderStatus::CancelUncertain,
+                            format!(
+                                "{}: {}",
+                                POLYMARKET_MARKET_CANCEL_FINALITY_PENDING, result.detail,
+                            ),
+                        )
+                    };
+                    updates.push(OrderUpdate {
+                        order_slot: OrderSlot::UNASSIGNED,
+                        client_order_id: instance_id,
+                        exchange: Exchange::Polymarket,
+                        symbol: condition_id,
+                        side: Side::Buy,
+                        exchange_order_id: None,
+                        status,
+                        liquidity: None,
+                        filled_quantity: 0.0,
+                        remaining_quantity: 0.0,
+                        avg_fill_price: 0.0,
+                        timestamp_ns: now_ns(),
+                        exchange_event_timestamp_ns: None,
+                        trade_id: None,
+                        order_audit: None,
+                        error: Some(error),
+                    });
+                    updates
+                }
+                None if instance_id.is_empty() => {
+                    route.cancel_all_orders_on(permit);
+                    Vec::new()
+                }
+                None => route
+                    .cancel_instance_orders_on(permit)
+                    .unwrap_or_else(|error| {
+                        vec![safety_cancel_uncertain(
+                            &Signal::PolymarketCancelAllOrders {
+                                reason,
+                                market: None,
+                                asset_ids,
+                                instance_id,
+                            },
+                            error.to_string(),
+                        )]
+                    }),
+            }
+        }
+        other => vec![safety_cancel_uncertain(
+            &other,
+            "unsupported command on safety-cancel lane",
+        )],
+    }
 }
 
 /// Stamp the actual executor-producer boundary immediately before publishing
@@ -11504,7 +11976,7 @@ fn dispatch_poly_signal_to_connection_owner(
     stale_ms: u64,
     update_tx: ExecutorUpdateSender,
     routes: &mut PolyAccountConnectionRoutes,
-) {
+) -> bool {
     use hexagent_runtime::http1_pool::Role;
     let instance_id = extract_instance_id(&signal);
     log_executor_receive(&signal);
@@ -11520,7 +11992,9 @@ fn dispatch_poly_signal_to_connection_owner(
             if let Err(PolyConnectionCommand::Place { order, .. }) =
                 try_send_poly_owner(routes, Role::Fast, command)
             {
-                let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
+                if send_executor_update(&update_tx, exec_rejected_place(&order)).is_err() {
+                    return false;
+                }
             }
         }
         Signal::CancelOrder {
@@ -11541,10 +12015,11 @@ fn dispatch_poly_signal_to_connection_owner(
                 client_order_id, ..
             }) = send_poly_owner_lossless(routes, Role::Cancel, command)
             {
-                let _ = send_executor_update(
-                    &update_tx,
-                    exec_rejected_cancel(client_order_id, exchange),
-                );
+                if send_executor_update(&update_tx, exec_rejected_cancel(client_order_id, exchange))
+                    .is_err()
+                {
+                    return false;
+                }
             }
         }
         Signal::BatchNewOrders {
@@ -11562,7 +12037,7 @@ fn dispatch_poly_signal_to_connection_owner(
                     try_send_poly_owner(routes, Role::Fast, place)
                 {
                     if send_executor_update(&update_tx, exec_rejected_place(&order)).is_err() {
-                        break;
+                        return false;
                     }
                 }
             }
@@ -11592,7 +12067,7 @@ fn dispatch_poly_signal_to_connection_owner(
                     )
                     .is_err()
                     {
-                        break;
+                        return false;
                     }
                 }
             }
@@ -11627,7 +12102,7 @@ fn dispatch_poly_signal_to_connection_owner(
                     try_send_poly_owner(routes, Role::Fast, place)
                 {
                     if send_executor_update(&update_tx, exec_rejected_place(&order)).is_err() {
-                        break;
+                        return false;
                     }
                 }
             }
@@ -11650,7 +12125,7 @@ fn dispatch_poly_signal_to_connection_owner(
                     )
                     .is_err()
                     {
-                        break;
+                        return false;
                     }
                 }
             }
@@ -11683,8 +12158,30 @@ fn dispatch_poly_signal_to_connection_owner(
                     &pending_trade_ids,
                 ) {
                     if send_executor_update(&update_tx, update).is_err() {
-                        break;
+                        return false;
                     }
+                }
+            }
+        }
+        safety @ Signal::PolymarketCancelAllOrders { .. }
+        | safety @ Signal::CancelAll {
+            exchange: Exchange::Polymarket,
+            ..
+        } => {
+            let command = PolyConnectionCommand::SafetyCancel {
+                signal: safety,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            if let Err(PolyConnectionCommand::SafetyCancel { signal, .. }) =
+                send_poly_safety_cancel_lossless(routes, command)
+            {
+                let update = safety_cancel_uncertain(
+                    &signal,
+                    "bounded safety-cancel outbox unavailable; retry required",
+                );
+                if send_executor_update(&update_tx, update).is_err() {
+                    return false;
                 }
             }
         }
@@ -11692,12 +12189,23 @@ fn dispatch_poly_signal_to_connection_owner(
             let command = PolyConnectionCommand::Fallback {
                 signal: control,
                 stale_ms,
-                update_tx,
+                update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
-            let _ = send_poly_owner_lossless(routes, Role::Cancel, command);
+            if let Err(PolyConnectionCommand::Fallback { signal, .. }) =
+                send_poly_owner_lossless(routes, Role::Cancel, command)
+            {
+                let update = control_lane_rejected(
+                    &signal,
+                    "bounded compatibility-control outbox unavailable; retry required",
+                );
+                if send_executor_update(&update_tx, update).is_err() {
+                    return false;
+                }
+            }
         }
     }
+    true
 }
 
 fn execute_fallback_signal(
@@ -14276,6 +14784,177 @@ mod market_router_tests {
             PolyConnectionCommand::Cancel { client_order_id, .. } if client_order_id == "second"
         ));
         assert!(routes.cancel_outbox.is_empty());
+    }
+
+    #[test]
+    fn safety_cancel_uses_its_independent_physical_lane() {
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let (safety_tx, safety_rx) = bounded(1);
+        let (raw_update_tx, update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 9,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            cancel: vec![cancel_tx],
+            safety_cancel: vec![safety_tx],
+            ..Default::default()
+        };
+
+        dispatch_poly_signal_to_connection_owner(
+            Signal::PolymarketCancelAllOrders {
+                reason: "risk-off".into(),
+                market: None,
+                asset_ids: Vec::new(),
+                instance_id: "zhu-03".into(),
+            },
+            150,
+            update_tx,
+            &mut routes,
+        );
+
+        assert!(cancel_rx.try_recv().is_err());
+        assert!(matches!(
+            safety_rx.try_recv().unwrap(),
+            PolyConnectionCommand::SafetyCancel {
+                signal: Signal::PolymarketCancelAllOrders { instance_id, .. },
+                ..
+            } if instance_id == "zhu-03"
+        ));
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn safety_cancel_outbox_saturation_returns_typed_retry_feedback() {
+        let (safety_tx, _safety_rx) = bounded(1);
+        let (raw_update_tx, update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 10,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            safety_cancel: vec![safety_tx.clone()],
+            ..Default::default()
+        };
+        safety_tx
+            .try_send(PolyConnectionCommand::SafetyCancel {
+                signal: Signal::PolymarketCancelAllOrders {
+                    reason: "occupied".into(),
+                    market: None,
+                    asset_ids: Vec::new(),
+                    instance_id: "zhu-03".into(),
+                },
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            })
+            .unwrap();
+        for index in 0..POLY_SAFETY_CANCEL_OUTBOX_CAPACITY {
+            let command = PolyConnectionCommand::SafetyCancel {
+                signal: Signal::PolymarketCancelAllOrders {
+                    reason: index.to_string(),
+                    market: None,
+                    asset_ids: Vec::new(),
+                    instance_id: "zhu-03".into(),
+                },
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            assert!(send_poly_safety_cancel_lossless(&mut routes, command).is_ok());
+        }
+        dispatch_poly_signal_to_connection_owner(
+            Signal::PolymarketCancelAllOrders {
+                reason: "must-not-disappear".into(),
+                market: Some("condition".into()),
+                asset_ids: vec!["up".into(), "down".into()],
+                instance_id: "zhu-03".into(),
+            },
+            150,
+            update_tx,
+            &mut routes,
+        );
+
+        let feedback = update_rx.try_recv().unwrap();
+        assert_eq!(feedback.owner, 10);
+        assert_eq!(feedback.update.status, OrderStatus::CancelUncertain);
+        assert_eq!(feedback.update.symbol, "condition");
+        assert!(feedback
+            .update
+            .error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("retry required")));
+    }
+
+    #[test]
+    fn compatibility_fallback_saturation_returns_typed_retry_feedback() {
+        let (cancel_tx, _cancel_rx) = bounded(1);
+        let (raw_update_tx, update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 11,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            cancel: vec![cancel_tx.clone()],
+            ..Default::default()
+        };
+        cancel_tx
+            .try_send(PolyConnectionCommand::Fallback {
+                signal: Signal::Exit,
+                stale_ms: 0,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            })
+            .unwrap();
+        for _ in 0..POLY_CANCEL_OUTBOX_CAPACITY {
+            let command = PolyConnectionCommand::Fallback {
+                signal: Signal::Exit,
+                stale_ms: 0,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            assert!(send_poly_owner_lossless(
+                &mut routes,
+                hexagent_runtime::http1_pool::Role::Cancel,
+                command,
+            )
+            .is_ok());
+        }
+
+        dispatch_poly_signal_to_connection_owner(
+            Signal::RetainPolymarketEventAudit {
+                condition_id: "condition".into(),
+                asset_ids: vec!["up".into(), "down".into()],
+                instance_id: "zhu-03".into(),
+            },
+            150,
+            update_tx.clone(),
+            &mut routes,
+        );
+
+        let feedback = update_rx.try_recv().unwrap();
+        assert_eq!(feedback.owner, 11);
+        assert_eq!(feedback.update.status, OrderStatus::ExecutorRejected);
+        assert_eq!(feedback.update.client_order_id, "zhu-03");
+        assert_eq!(feedback.update.symbol, "condition");
+        assert!(feedback
+            .update
+            .error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("retry required")));
+
+        drop(update_rx);
+        assert!(
+            !dispatch_poly_signal_to_connection_owner(
+                Signal::RetainPolymarketEventAudit {
+                    condition_id: "second-condition".into(),
+                    asset_ids: Vec::new(),
+                    instance_id: "zhu-03".into(),
+                },
+                150,
+                update_tx,
+                &mut routes,
+            ),
+            "a disconnected typed-feedback lane must stop the executor owner",
+        );
     }
 
     #[test]

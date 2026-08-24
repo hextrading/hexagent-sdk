@@ -785,11 +785,11 @@ fn classify_private_trade_role(
             // particular, never perform that cold lookup for a maker event:
             // its top-level taker order normally belongs to another account.
             let owned_order = if has_owned_maker_leg {
-                shared.lookup_runtime_order_ownership(order_id)
+                shared.has_runtime_order_ownership(order_id)
             } else {
-                shared.lookup_order_ownership(order_id)
+                shared.lookup_order_ownership(order_id).is_some()
             };
-            owned_order.is_some()
+            owned_order
                 || (!has_owned_maker_leg
                     && trade_id
                         .and_then(|trade_key| {

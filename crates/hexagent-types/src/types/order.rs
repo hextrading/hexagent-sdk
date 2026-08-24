@@ -175,34 +175,66 @@ impl fmt::Display for QuoteTriggerSource {
     }
 }
 
-/// Owner-local, numeric order routing slot. Zero-based values address a fixed
-/// strategy table directly; `UNASSIGNED` marks legacy/private sources that
-/// have not yet published a numeric identity and must fail closed or use a
-/// cold-path reconciliation lookup.
+/// Owner-local, numeric order routing slot. The low 16 bits address a fixed
+/// strategy table and the high 16 bits identify that index's current
+/// generation. Carrying both values across execution/private boundaries
+/// prevents a delayed lifecycle update from mutating a newly reused slot.
+///
+/// Generation zero is reserved for cold/legacy compatibility. New live orders
+/// must use [`OrderSlot::with_generation`]. `UNASSIGNED` marks sources that
+/// have not published a numeric identity and must fail closed or use a cold
+/// reconciliation lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct OrderSlot(u16);
+pub struct OrderSlot(u32);
 
 impl OrderSlot {
-    pub const UNASSIGNED: Self = Self(u16::MAX);
+    const INDEX_MASK: u32 = u16::MAX as u32;
+    pub const UNASSIGNED: Self = Self(u32::MAX);
 
+    /// Constructs a generation-zero compatibility slot. Runtime order
+    /// allocation must use [`Self::with_generation`] instead.
     #[inline]
     pub const fn new(index: u16) -> Self {
-        Self(index)
+        Self(index as u32)
     }
 
     #[inline]
-    pub const fn index(self) -> Option<usize> {
-        if self.0 == u16::MAX {
-            None
+    pub const fn with_generation(index: u16, generation: u16) -> Self {
+        if index == u16::MAX || generation == 0 {
+            Self::UNASSIGNED
         } else {
-            Some(self.0 as usize)
+            Self(((generation as u32) << 16) | index as u32)
         }
     }
 
     #[inline]
+    pub const fn index(self) -> Option<usize> {
+        let index = (self.0 & Self::INDEX_MASK) as u16;
+        if self.0 == u32::MAX || index == u16::MAX {
+            None
+        } else {
+            Some(index as usize)
+        }
+    }
+
+    #[inline]
+    pub const fn generation(self) -> Option<u16> {
+        if self.0 == u32::MAX {
+            None
+        } else {
+            Some((self.0 >> 16) as u16)
+        }
+    }
+
+    #[inline]
+    pub const fn is_legacy(self) -> bool {
+        matches!(self.generation(), Some(0))
+    }
+
+    #[inline]
     pub const fn is_assigned(self) -> bool {
-        self.0 != u16::MAX
+        self.index().is_some()
     }
 }
 
@@ -446,14 +478,30 @@ mod tests {
             0.5,
             10.0,
         );
-        request.order_slot = OrderSlot::new(37);
+        request.order_slot = OrderSlot::with_generation(37, 9);
         let encoded = serde_json::to_value(&request).unwrap();
         let restored: OrderRequest = serde_json::from_value(encoded).unwrap();
-        assert_eq!(restored.order_slot, OrderSlot::new(37));
+        assert_eq!(restored.order_slot, OrderSlot::with_generation(37, 9));
+        assert_eq!(restored.order_slot.index(), Some(37));
+        assert_eq!(restored.order_slot.generation(), Some(9));
 
         let mut legacy = serde_json::to_value(request).unwrap();
         legacy.as_object_mut().unwrap().remove("order_slot");
         let restored: OrderRequest = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.order_slot, OrderSlot::UNASSIGNED);
+    }
+
+    #[test]
+    fn generation_zero_is_legacy_only_and_invalid_live_values_fail_closed() {
+        let legacy = OrderSlot::new(12);
+        assert_eq!(legacy.index(), Some(12));
+        assert_eq!(legacy.generation(), Some(0));
+        assert!(legacy.is_legacy());
+
+        assert_eq!(OrderSlot::with_generation(12, 0), OrderSlot::UNASSIGNED);
+        assert_eq!(
+            OrderSlot::with_generation(u16::MAX, 7),
+            OrderSlot::UNASSIGNED
+        );
     }
 }

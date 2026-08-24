@@ -1055,8 +1055,8 @@ pub struct AccountMonitoringSnapshot {
     pub persistence_generation_lag: u64,
     pub persistence_pending_jobs: usize,
     pub persistence_pending_high_water: usize,
-    /// Settled-history deletion is routed to the owning strategy threads.
-    /// These counters make a missing/stalled owner mailbox distinguishable
+    /// Settled-history deletion is routed to dedicated cold owner tasks.
+    /// These counters make a missing/stalled cold mailbox distinguishable
     /// from persistence or account-lock latency.
     pub settled_gc_candidates: usize,
     pub settled_gc_inflight_requests: usize,
@@ -1111,25 +1111,48 @@ struct SettledGcDeleteRequest {
     enqueued_at: crate::latency::Instant,
 }
 
-/// A bounded mailbox owned and polled by exactly one strategy thread. It is
-/// deliberately not `Clone`: moving it into the strategy object documents the
-/// single consumer, while the shared account retains only the sender route.
+/// Internal bounded mailbox owned and polled by exactly one cold owner. It is
+/// deliberately not `Clone`; external workers receive only the sealed
+/// [`SettledGcOwnerState`] capability.
 #[derive(Debug)]
-pub struct SettledGcOwnerMailbox {
+struct SettledGcOwnerMailbox {
     account_id: String,
     instance_id: String,
     registration_id: u64,
     request_rx: crossbeam_channel::Receiver<SettledGcDeleteRequest>,
     /// A request already removed from the bounded lane but unable to acquire
-    /// every cold account lock without waiting.  The strategy thread retries
-    /// it on a later watchdog turn; it never blocks behind a control writer
-    /// and the coordinator never observes a false completion.
+    /// every cold account lock without waiting. The cold owner retries it on a
+    /// later turn; it never blocks behind a control writer and the coordinator
+    /// never observes a false completion.
     pending_request: Option<SettledGcDeleteRequest>,
     completion_tx: crossbeam_channel::Sender<SettledGcCompletionCertificate>,
     pending_completion: Option<SettledGcCompletionCertificate>,
     completion_queue_high_water: Arc<AtomicUsize>,
     completion_queue_overflows: Arc<AtomicU64>,
     certificates_completed: Arc<AtomicU64>,
+}
+
+/// Narrow, non-cloneable GC mutation capability. The account reference is
+/// private so a strategy/cold worker that receives this state cannot invoke
+/// unrelated `SharedAccount` mutation APIs.
+#[derive(Debug)]
+pub struct SettledGcOwnerState {
+    account: Arc<SharedAccount>,
+    mailbox: SettledGcOwnerMailbox,
+}
+
+impl SettledGcOwnerState {
+    pub fn instance_id(&self) -> &str {
+        self.mailbox.instance_id()
+    }
+
+    pub fn request_depth(&self) -> usize {
+        self.mailbox.request_depth()
+    }
+
+    pub fn poll_once(&mut self) -> Result<Option<SettledGcCompletionCertificate>, String> {
+        self.mailbox.poll_once(&self.account)
+    }
 }
 
 #[derive(Debug)]
@@ -1177,11 +1200,11 @@ struct SettledGcCoordinator {
 }
 
 impl SettledGcOwnerMailbox {
-    pub fn instance_id(&self) -> &str {
+    fn instance_id(&self) -> &str {
         &self.instance_id
     }
 
-    pub fn request_depth(&self) -> usize {
+    fn request_depth(&self) -> usize {
         self.request_rx.len() + usize::from(self.pending_request.is_some())
     }
 
@@ -1205,11 +1228,11 @@ impl SettledGcOwnerMailbox {
         }
     }
 
-    /// Process at most one bounded request on the calling strategy thread.
+    /// Process at most one bounded request on the calling cold owner task.
     /// `Ok(None)` means the mailbox was idle or its lossless completion was
     /// still backpressured; callers should simply poll again on a later
     /// watchdog turn.
-    pub fn poll_once(
+    fn poll_once(
         &mut self,
         account: &SharedAccount,
     ) -> Result<Option<SettledGcCompletionCertificate>, String> {
@@ -7651,10 +7674,10 @@ impl SharedAccount {
         Ok(())
     }
 
-    /// Register the bounded settled-history request lane consumed by this
-    /// instance's strategy thread. Re-registration replaces the route with a
-    /// new generation; certificates from an old worker are then ignored.
-    pub fn register_settled_gc_owner(
+    /// Register the internal settled-history request lane consumed by this
+    /// instance's cold owner. Re-registration replaces the route with a new
+    /// generation; certificates from an old owner are then ignored.
+    fn register_settled_gc_owner(
         &self,
         instance_id: &str,
     ) -> Result<SettledGcOwnerMailbox, String> {
@@ -7703,6 +7726,18 @@ impl SharedAccount {
         })
     }
 
+    /// Register a settled-history owner and seal the full account capability
+    /// behind a narrow, non-cloneable state object for a dedicated cold task.
+    pub fn register_settled_gc_cold_owner(
+        self: &Arc<Self>,
+        instance_id: &str,
+    ) -> Result<SettledGcOwnerState, String> {
+        Ok(SettledGcOwnerState {
+            account: Arc::clone(self),
+            mailbox: self.register_settled_gc_owner(instance_id)?,
+        })
+    }
+
     /// Advance the retry epoch after a private/lifecycle edge can have made a
     /// previously protected row terminal. The exchange's coalesced GC wakeup
     /// calls this before notifying the coordinator thread.
@@ -7713,7 +7748,7 @@ impl SharedAccount {
 
     /// Drive one non-blocking GC coordinator turn. This method never locks an
     /// owner lifecycle: it dispatches bounded requests and consumes the
-    /// certificates produced asynchronously by strategy threads. The final
+    /// certificates produced asynchronously by cold owner tasks. The final
     /// account-global commit is allowed only when every current owner has a
     /// certificate whose reservation/trade epochs are still current.
     pub fn finalize_ready_settled_audit_retirements(&self) -> Vec<HashSet<String>> {
@@ -14030,14 +14065,14 @@ impl SharedAccount {
 
     /// Execute exactly one bounded deletion request. This private entry point
     /// is reachable only through [`SettledGcOwnerMailbox::poll_once`], making
-    /// the caller the instance strategy thread instead of the GC coordinator.
+    /// the caller the instance cold owner instead of the GC coordinator.
     fn process_settled_gc_delete_request(
         &self,
         request: SettledGcDeleteRequest,
     ) -> Result<SettledGcDeleteAttempt, String> {
         // Hold the route generation read guard for the whole deletion turn.
         // Re-registration takes the write side, so once it returns an old
-        // strategy mailbox can no longer mutate the replacement owner's
+        // stale cold mailbox can no longer mutate the replacement owner's
         // lifecycle even if it still held a previously queued request.
         let route_wait_started = crate::latency::Instant::now();
         let owner_routes = match self.settled_gc_owner_routes.try_read() {
@@ -14061,7 +14096,7 @@ impl SharedAccount {
                 request.instance_id, request.registration_id,
             ));
         }
-        // Never park the strategy thread behind a 20-80 ms aggregate account
+        // Never park the cold owner behind a 20-80 ms aggregate account
         // publication.  Retain the already-consumed request in the mailbox and
         // retry on a later watchdog turn when every lock can be acquired
         // immediately.  Once acquired, the existing all-or-nothing lock order
