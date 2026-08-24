@@ -660,6 +660,15 @@ impl OrderManager {
         self.orders.keys().cloned().collect()
     }
 
+    /// Visit every tracked client-order identity without materializing a
+    /// temporary collection. The strategy thread remains the sole owner; the
+    /// borrowed identity cannot escape the callback.
+    pub fn visit_tracked_coids(&self, mut visit: impl FnMut(&str)) {
+        for coid in self.orders.keys() {
+            visit(coid);
+        }
+    }
+
     /// Request cancellation for every Submitted/Active order on `side`.
     /// Active orders emit immediately and become `Cancelling`; Submitted
     /// orders park a cancel intent until their first exchange result, avoiding
@@ -1059,6 +1068,23 @@ mod tests {
             }],
             1,
         );
+    }
+
+    #[test]
+    fn tracked_coid_visitor_borrows_every_identity_without_materializing() {
+        let mut manager = om();
+        manager.inject_open_order("coid-a".into(), Side::Buy, 0.4, 5.0);
+        manager.inject_open_order("coid-b".into(), Side::Sell, 0.6, 5.0);
+        let mut count = 0usize;
+        let mut saw_a = false;
+        let mut saw_b = false;
+        manager.visit_tracked_coids(|coid| {
+            count += 1;
+            saw_a |= coid == "coid-a";
+            saw_b |= coid == "coid-b";
+        });
+        assert_eq!(count, 2);
+        assert!(saw_a && saw_b);
     }
     fn upd(coid: &str, side: Side, status: OrderStatus) -> OrderUpdate {
         OrderUpdate {
