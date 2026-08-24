@@ -652,6 +652,7 @@ mod user_feed_health_tests {
             trade_id: Some("trade-1".to_string()),
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -935,6 +936,7 @@ mod update_trade_dedup_tests {
                 quantity: 1.0,
                 price: 0.5,
                 status: "MATCHED".to_string(),
+                order_slot: Default::default(),
             },
             booked: true,
             usdc_fee: 0.0,

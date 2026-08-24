@@ -275,6 +275,7 @@ fn parse_trades(
                 trade_id: tid,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             });
         }
     }
@@ -349,6 +350,7 @@ fn parse_orders(
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             });
         }
     }

@@ -1,8 +1,38 @@
 use serde::{Deserialize, Serialize};
+use arrayvec::ArrayVec;
 
 use super::instrument::Instrument;
-use super::market::{AssetCtxTick, BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange, TradeTick};
+use super::market::{
+    AssetCtxTick, BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange,
+    TradeTick,
+};
 use super::order::OrderRequest;
+
+/// Hard upper bound for one exchange batch. Keeping the payload inline makes
+/// the strategy-to-execution handoff allocation-free after the strings owned
+/// by the individual orders have been constructed.
+pub const ORDER_BATCH_CAPACITY: usize = 16;
+
+/// Fixed-capacity place payload used by all batch/replace signals.
+pub type OrderBatch = ArrayVec<OrderRequest, ORDER_BATCH_CAPACITY>;
+
+/// Fixed-capacity client-order-id payload used by cancel/update signals.
+pub type OrderIdBatch = ArrayVec<String, ORDER_BATCH_CAPACITY>;
+
+#[cfg(test)]
+mod fixed_batch_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_order_id_batch_rejects_capacity_plus_one() {
+        let mut batch = OrderIdBatch::new();
+        for index in 0..ORDER_BATCH_CAPACITY {
+            batch.try_push(index.to_string()).unwrap();
+        }
+        assert_eq!(batch.len(), ORDER_BATCH_CAPACITY);
+        assert!(batch.try_push("overflow".to_string()).is_err());
+    }
+}
 
 /// Condition-scoped public market-data health.  Unlike `Connected` /
 /// `Disconnected`, this does not describe the whole exchange transport: one
@@ -31,9 +61,7 @@ pub struct MarketDataHealth {
 }
 
 /// Events flowing from market data sources to the strategy engine
-#[derive(
-    Debug, Clone, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MarketEvent {
     OrderBook(OrderBookSnapshot),
     Trade(TradeTick),
@@ -46,8 +74,13 @@ pub enum MarketEvent {
     AssetCtx(AssetCtxTick),
     Instrument(Instrument),
     MarketDataHealth(MarketDataHealth),
-    Connected { exchange: Exchange },
-    Disconnected { exchange: Exchange, reason: String },
+    Connected {
+        exchange: Exchange,
+    },
+    Disconnected {
+        exchange: Exchange,
+        reason: String,
+    },
     /// Signals the start of a new event for continuous recording (e.g. Polymarket series rotation).
     EventStart {
         exchange: Exchange,
@@ -93,7 +126,7 @@ pub enum Signal {
     BatchNewOrders {
         exchange: Exchange,
         market_id: String,
-        orders: Vec<OrderRequest>,
+        orders: OrderBatch,
         /// Strategy instance ID for routing to the correct per-account
         /// LiveRouter / SharedState. Set explicitly even though the
         /// per-`OrderRequest` field carries the same value, so the
@@ -106,7 +139,7 @@ pub enum Signal {
     BatchCancelOrders {
         exchange: Exchange,
         market_id: String,
-        client_order_ids: Vec<String>,
+        client_order_ids: OrderIdBatch,
         instance_id: String,
         timestamp_ns: u64,
     },
@@ -114,8 +147,8 @@ pub enum Signal {
     BatchUpdateOrders {
         exchange: Exchange,
         market_id: String,
-        cancel_client_order_ids: Vec<String>,
-        place_orders: Vec<OrderRequest>,
+        cancel_client_order_ids: OrderIdBatch,
+        place_orders: OrderBatch,
         timestamp_ns: u64,
         /// Strategy instance ID — see [`Signal::BatchNewOrders.instance_id`].
         instance_id: String,
@@ -129,8 +162,8 @@ pub enum Signal {
     ReplaceOrder {
         exchange: Exchange,
         market_id: String,
-        cancel_client_order_ids: Vec<String>,
-        place_orders: Vec<OrderRequest>,
+        cancel_client_order_ids: OrderIdBatch,
+        place_orders: OrderBatch,
         timestamp_ns: u64,
         instance_id: String,
     },
@@ -219,20 +252,49 @@ impl MarketEvent {
     /// though JSON numbers cannot encode them.
     pub fn has_finite_market_values(&self) -> bool {
         match self {
-            MarketEvent::OrderBook(ob) => ob.bids.iter().chain(ob.asks.iter())
+            MarketEvent::OrderBook(ob) => ob
+                .bids
+                .iter()
+                .chain(ob.asks.iter())
                 .all(|level| level.price.is_finite() && level.quantity.is_finite()),
             MarketEvent::Trade(trade) => trade.price.is_finite() && trade.quantity.is_finite(),
-            MarketEvent::Quote(quote) => [quote.bid_price, quote.bid_qty, quote.ask_price, quote.ask_qty]
-                .into_iter().all(f64::is_finite),
-            MarketEvent::Bar(bar) => [bar.open, bar.high, bar.low, bar.close, bar.volume,
-                bar.taker_buy_base, bar.quote_volume].into_iter().all(f64::is_finite),
+            MarketEvent::Quote(quote) => [
+                quote.bid_price,
+                quote.bid_qty,
+                quote.ask_price,
+                quote.ask_qty,
+            ]
+            .into_iter()
+            .all(f64::is_finite),
+            MarketEvent::Bar(bar) => [
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.taker_buy_base,
+                bar.quote_volume,
+            ]
+            .into_iter()
+            .all(f64::is_finite),
             MarketEvent::TickSizeChange(change) => {
                 change.old_tick_size.is_finite() && change.new_tick_size.is_finite()
             }
             MarketEvent::SpotPrice(spot) => spot.price.is_finite(),
-            MarketEvent::AssetCtx(ctx) => [ctx.mark_px, ctx.oracle_px, ctx.mid_px, ctx.funding,
-                ctx.open_interest, ctx.premium, ctx.impact_bid_px, ctx.impact_ask_px,
-                ctx.day_ntl_vlm, ctx.prev_day_px].into_iter().all(f64::is_finite),
+            MarketEvent::AssetCtx(ctx) => [
+                ctx.mark_px,
+                ctx.oracle_px,
+                ctx.mid_px,
+                ctx.funding,
+                ctx.open_interest,
+                ctx.premium,
+                ctx.impact_bid_px,
+                ctx.impact_ask_px,
+                ctx.day_ntl_vlm,
+                ctx.prev_day_px,
+            ]
+            .into_iter()
+            .all(f64::is_finite),
             MarketEvent::Instrument(_)
             | MarketEvent::MarketDataHealth(_)
             | MarketEvent::Connected { .. }
@@ -309,8 +371,14 @@ mod tests {
         let orderbook = MarketEvent::OrderBook(OrderBookSnapshot {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
-            bids: vec![PriceLevel { price: f64::NAN, quantity: 1.0 }],
-            asks: vec![PriceLevel { price: 100.0, quantity: 1.0 }],
+            bids: vec![PriceLevel {
+                price: f64::NAN,
+                quantity: 1.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 100.0,
+                quantity: 1.0,
+            }],
             exchange_timestamp_ns: 1,
             local_timestamp_ns: 1,
         });

@@ -6,8 +6,8 @@ use anyhow::{anyhow, Result};
 
 use super::auth::PolyAuth;
 use super::deploy_wallet::{
-    self, check_deployed, derive_safe_address, parse_private_key,
-    address_to_bytes32, u256_bytes, to_checksum_address,
+    self, address_to_bytes32, check_deployed, derive_safe_address, parse_private_key,
+    to_checksum_address, u256_bytes,
 };
 use super::signer::{derive_eth_address_from_key, parse_signature_type, SignatureType};
 
@@ -53,10 +53,15 @@ pub(crate) fn read_gas_via_signer_wallet_flag() -> bool {
         Some("config/live_polymaker.toml".to_string()),
     ];
     for p in paths.iter().flatten() {
-        let Ok(text) = std::fs::read_to_string(p) else { continue; };
-        let Ok(val) = text.parse::<toml::Value>() else { continue; };
+        let Ok(text) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let Ok(val) = text.parse::<toml::Value>() else {
+            continue;
+        };
         // Canonical location: `[general].gas_via_signer_wallet`.
-        if let Some(b) = val.get("general")
+        if let Some(b) = val
+            .get("general")
             .and_then(|g| g.get("gas_via_signer_wallet"))
             .and_then(|v| v.as_bool())
         {
@@ -67,16 +72,17 @@ pub(crate) fn read_gas_via_signer_wallet_flag() -> bool {
         if let Some(arr) = val.get("strategies").and_then(|v| v.as_array()) {
             for s in arr {
                 let is_poly = s.get("name").and_then(|v| v.as_str()) == Some("polymaker");
-                if !is_poly { continue; }
+                if !is_poly {
+                    continue;
+                }
                 let params = s.get("params");
                 let flag = params
                     .and_then(|p| p.get("gas_via_signer_wallet"))
                     .and_then(|v| v.as_bool());
                 // Some configs nest the param directly under the
                 // [[strategies]] entry rather than under `params`.
-                let flag = flag.or_else(|| {
-                    s.get("gas_via_signer_wallet").and_then(|v| v.as_bool())
-                });
+                let flag =
+                    flag.or_else(|| s.get("gas_via_signer_wallet").and_then(|v| v.as_bool()));
                 if let Some(b) = flag {
                     return b;
                 }
@@ -106,7 +112,9 @@ fn relayer_http(
         if let Some(b) = body {
             req = req.header("Content-Type", "application/json").body(b);
         }
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| anyhow!("{} failed: {}", url, e))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -135,38 +143,37 @@ fn user_clob_delete(
         if let Some(b) = body {
             req = req.header("Content-Type", "application/json").body(b);
         }
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| anyhow!("DELETE {} failed: {}", url, e))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(anyhow!("DELETE {} failed ({}): {}", url, status, text));
         }
-        serde_json::from_str(&text)
-            .map_err(|e| anyhow!("parse {}: {} (body={})", url, e, text))
+        serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} (body={})", url, e, text))
     })
 }
 
 /// User-auth CLOB GET (POLY_API_KEY / POLY_ADDRESS / POLY_SIGNATURE ...).
-fn user_clob_get(
-    url: String,
-    headers: super::auth::AuthHeaders,
-) -> Result<serde_json::Value> {
+fn user_clob_get(url: String, headers: super::auth::AuthHeaders) -> Result<serde_json::Value> {
     let client = crate::async_rt::http_client();
     crate::async_rt::block_on_runtime(async move {
         let mut req = client.get(&url);
         for (k, v) in headers.as_pairs() {
             req = req.header(k, v);
         }
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| anyhow!("GET {} failed: {}", url, e))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(anyhow!("GET {} failed ({}): {}", url, status, text));
         }
-        serde_json::from_str(&text)
-            .map_err(|e| anyhow!("parse {}: {} (body={})", url, e, text))
+        serde_json::from_str(&text).map_err(|e| anyhow!("parse {}: {} (body={})", url, e, text))
     })
 }
 
@@ -174,17 +181,16 @@ fn user_clob_get(
 /// return an empty / non-JSON body on success (e.g. `/balance-allowance/update`,
 /// which 200s with no body). Returns `Ok(())` on 2xx, `Err` with the body
 /// otherwise.
-fn user_clob_get_ok(
-    url: String,
-    headers: super::auth::AuthHeaders,
-) -> Result<()> {
+fn user_clob_get_ok(url: String, headers: super::auth::AuthHeaders) -> Result<()> {
     let client = crate::async_rt::http_client();
     crate::async_rt::block_on_runtime(async move {
         let mut req = client.get(&url);
         for (k, v) in headers.as_pairs() {
             req = req.header(k, v);
         }
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| anyhow!("GET {} failed: {}", url, e))?;
         let status = resp.status();
         if status.is_success() {
@@ -255,7 +261,10 @@ impl WalletInfo {
     /// Safe `execTransaction` machinery (which an EOA can't use).
     pub fn is_eoa(&self) -> bool {
         self.deposit_wallet_active().is_none()
-            && matches!(parse_signature_type(&self.signature_type), SignatureType::Eoa)
+            && matches!(
+                parse_signature_type(&self.signature_type),
+                SignatureType::Eoa
+            )
     }
 
     /// The address that actually holds funds + positions for this account:
@@ -439,10 +448,18 @@ fn load_wallet_from(
         ));
     }
 
-    let builder_auth = PolyAuth::new(&builder_key, &builder_secret, &builder_passphrase, &signer_address)?;
+    let builder_auth = PolyAuth::new(
+        &builder_key,
+        &builder_secret,
+        &builder_passphrase,
+        &signer_address,
+    )?;
 
     Ok(WalletInfo {
-        signer_address, safe_address, signing_key, builder_auth,
+        signer_address,
+        safe_address,
+        signing_key,
+        builder_auth,
         signature_type: signature_type.to_string(),
         deposit_wallet: deposit_wallet.to_string(),
     })
@@ -460,8 +477,9 @@ struct AccountWalletCreds {
     funder: String,
 }
 
-static ACCOUNT_WALLETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, AccountWalletCreds>>> =
-    std::sync::OnceLock::new();
+static ACCOUNT_WALLETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, AccountWalletCreds>>,
+> = std::sync::OnceLock::new();
 
 /// Register an account's split/redeem creds so the maintenance thread
 /// can resolve the RIGHT wallet under multi-account live (no global-env
@@ -475,7 +493,8 @@ pub fn register_account_wallet(
     if account_id.is_empty() {
         return;
     }
-    let map = ACCOUNT_WALLETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map =
+        ACCOUNT_WALLETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().unwrap().insert(
         account_id.to_string(),
         AccountWalletCreds {
@@ -549,7 +568,10 @@ fn fetch_pusd_balance(safe_address: &str) -> f64 {
 fn print_stablecoin_balances(safe_address: &str) {
     let pusd = fetch_pusd_balance(safe_address);
     let usdce = fetch_usdce_balance(safe_address);
-    println!("{:<6} balance: {:>12.6}   (v2 collateral — used for trading)", "pUSD", pusd);
+    println!(
+        "{:<6} balance: {:>12.6}   (v2 collateral — used for trading)",
+        "pUSD", pusd
+    );
     if usdce.abs() < 0.000001 {
         println!("{:<6} balance: {:>12.6}", "USDC.e", usdce);
     } else {
@@ -590,14 +612,27 @@ fn fetch_erc20_balance_6dec(token: &str, owner: &str) -> f64 {
 /// `balance 0`).
 pub(crate) fn fetch_pol_balance(address: &str) -> Result<f64> {
     let params = serde_json::json!([address, "latest"]);
-    let v = super::onchain_tx::rpc_call("eth_getBalance", params)
-        .map_err(|e| anyhow!("eth_getBalance({}) failed: {}", &address[..10.min(address.len())], e))?;
+    let v = super::onchain_tx::rpc_call("eth_getBalance", params).map_err(|e| {
+        anyhow!(
+            "eth_getBalance({}) failed: {}",
+            &address[..10.min(address.len())],
+            e
+        )
+    })?;
     let Some(result) = v.get("result").and_then(|r| r.as_str()) else {
-        return Err(anyhow!("eth_getBalance({}): no result field ({})",
-            &address[..10.min(address.len())], v));
+        return Err(anyhow!(
+            "eth_getBalance({}): no result field ({})",
+            &address[..10.min(address.len())],
+            v
+        ));
     };
-    let hex_str = result.strip_prefix("0x").unwrap_or(result).trim_start_matches('0');
-    if hex_str.is_empty() { return Ok(0.0); }
+    let hex_str = result
+        .strip_prefix("0x")
+        .unwrap_or(result)
+        .trim_start_matches('0');
+    if hex_str.is_empty() {
+        return Ok(0.0);
+    }
     let wei = u128::from_str_radix(hex_str, 16)
         .map_err(|e| anyhow!("eth_getBalance: parse hex '{}': {}", result, e))?;
     Ok(wei as f64 / 1e18)
@@ -614,7 +649,12 @@ pub fn run_deposit() -> Result<()> {
     println!();
     let primary = wallet.primary_address().to_string();
     println!("Signer (EOA):  {}", wallet.signer_address);
-    println!("{} ({}): {}", "Trading wallet", wallet.wallet_kind(), primary);
+    println!(
+        "{} ({}): {}",
+        "Trading wallet",
+        wallet.wallet_kind(),
+        primary
+    );
 
     // Check deployment
     print!("Status:        ");
@@ -688,9 +728,9 @@ pub fn run_withdraw() -> Result<()> {
     let token_choice = token_str.trim();
 
     match token_choice {
-        "1" | "pusd-usdce" => run_withdraw_pusd_to_asset(
-            &wallet, pusd_balance, USDCE_ADDRESS, "USDC.e",
-        ),
+        "1" | "pusd-usdce" => {
+            run_withdraw_pusd_to_asset(&wallet, pusd_balance, USDCE_ADDRESS, "USDC.e")
+        }
         "2" | "pusd" | "pUSD" | "PUSD" => {
             run_withdraw_erc20(&wallet, PUSD_ADDRESS, "pUSD", pusd_balance)
         }
@@ -752,7 +792,10 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     let recipient = recipient.trim().to_string();
     let rc = recipient.strip_prefix("0x").unwrap_or(&recipient);
     if rc.len() != 40 || !rc.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("recipient must be 0x + 40 hex chars, got '{}'", recipient));
+        return Err(anyhow!(
+            "recipient must be 0x + 40 hex chars, got '{}'",
+            recipient
+        ));
     }
 
     println!("Amount ({}, or 'all' for {:.6}):", label, bal);
@@ -772,7 +815,12 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     }
 
     println!();
-    println!("Confirm: transfer {:.6} {} → {}", amount_wei as f64 / 1_000_000.0, label, recipient);
+    println!(
+        "Confirm: transfer {:.6} {} → {}",
+        amount_wei as f64 / 1_000_000.0,
+        label,
+        recipient
+    );
     print!("Type 'yes' to proceed: ");
     std::io::stdout().flush()?;
     let mut confirm = String::new();
@@ -782,10 +830,21 @@ fn run_withdraw_dw(wallet: &WalletInfo, dw: &str) -> Result<()> {
     }
 
     super::deposit_wallet::dw_transfer_erc20(
-        &wallet.signing_key, &wallet.signer_address, dw, &wallet.builder_auth,
-        token, &recipient, amount_wei, /*dry_run=*/ false,
+        &wallet.signing_key,
+        &wallet.signer_address,
+        dw,
+        &wallet.builder_auth,
+        token,
+        &recipient,
+        amount_wei,
+        /*dry_run=*/ false,
     )?;
-    println!("✅ transferred {:.6} {} → {}", amount_wei as f64 / 1_000_000.0, label, recipient);
+    println!(
+        "✅ transferred {:.6} {} → {}",
+        amount_wei as f64 / 1_000_000.0,
+        label,
+        recipient
+    );
     Ok(())
 }
 
@@ -807,7 +866,10 @@ fn run_withdraw_dw_offramp(
 
     // Recipient for the unwrapped backing asset.
     println!();
-    println!("Enter recipient address (0x...) to receive {}:", underlying_label);
+    println!(
+        "Enter recipient address (0x...) to receive {}:",
+        underlying_label
+    );
     print!("> ");
     std::io::stdout().flush()?;
     let mut recipient = String::new();
@@ -815,11 +877,17 @@ fn run_withdraw_dw_offramp(
     let recipient = recipient.trim().to_string();
     let rc = recipient.strip_prefix("0x").unwrap_or(&recipient);
     if rc.len() != 40 || !rc.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!("recipient must be 0x + 40 hex chars, got '{}'", recipient));
+        return Err(anyhow!(
+            "recipient must be 0x + 40 hex chars, got '{}'",
+            recipient
+        ));
     }
 
     // Amount of pUSD to unwrap (== backing asset received, 1:1).
-    println!("Amount of pUSD to unwrap & withdraw (or 'all' for {:.6}):", pusd_balance);
+    println!(
+        "Amount of pUSD to unwrap & withdraw (or 'all' for {:.6}):",
+        pusd_balance
+    );
     print!("> ");
     std::io::stdout().flush()?;
     let mut amt = String::new();
@@ -828,13 +896,17 @@ fn run_withdraw_dw_offramp(
     let amount: f64 = if amt.eq_ignore_ascii_case("all") {
         pusd_balance
     } else {
-        amt.parse().map_err(|_| anyhow!("Invalid amount '{}'", amt))?
+        amt.parse()
+            .map_err(|_| anyhow!("Invalid amount '{}'", amt))?
     };
     if amount <= 0.0 {
         return Err(anyhow!("Amount must be positive"));
     }
     if amount > pusd_balance {
-        return Err(anyhow!("Insufficient balance. Available: {:.6} pUSD", pusd_balance));
+        return Err(anyhow!(
+            "Insufficient balance. Available: {:.6} pUSD",
+            pusd_balance
+        ));
     }
     let amount_wei = (amount * 1_000_000.0).round() as u128;
     if amount_wei == 0 {
@@ -843,10 +915,19 @@ fn run_withdraw_dw_offramp(
 
     // Plan + confirm.
     println!();
-    println!("Plan — unwrap {:.6} pUSD → {}, then withdraw to {} (one WALLET batch):", amount, underlying_label, recipient);
+    println!(
+        "Plan — unwrap {:.6} pUSD → {}, then withdraw to {} (one WALLET batch):",
+        amount, underlying_label, recipient
+    );
     println!("  1. pUSD.approve(Offramp {}, ∞)", OFFRAMP_ADDRESS);
-    println!("  2. Offramp.unwrap({}, DW, {:.6})", underlying_label, amount);
-    println!("  3. {}.transfer({}, {:.6})", underlying_label, recipient, amount);
+    println!(
+        "  2. Offramp.unwrap({}, DW, {:.6})",
+        underlying_label, amount
+    );
+    println!(
+        "  3. {}.transfer({}, {:.6})",
+        underlying_label, recipient, amount
+    );
     println!("  Gas: Polymarket relayer (gasless)");
     println!();
     println!("⚠  Money-op on the deposit wallet — Offramp-unwrap is unproven on the DW path; test a small amount first.");
@@ -859,16 +940,28 @@ fn run_withdraw_dw_offramp(
     }
 
     super::deposit_wallet::dw_offramp_withdraw(
-        &wallet.signing_key, &wallet.signer_address, dw, &wallet.builder_auth,
-        underlying, &recipient, amount_wei, /*dry_run=*/ false,
+        &wallet.signing_key,
+        &wallet.signer_address,
+        dw,
+        &wallet.builder_auth,
+        underlying,
+        &recipient,
+        amount_wei,
+        /*dry_run=*/ false,
     )?;
 
     println!();
-    println!("✅ Withdrawal complete — {:.6} {} sent to {}", amount, underlying_label, recipient);
+    println!(
+        "✅ Withdrawal complete — {:.6} {} sent to {}",
+        amount, underlying_label, recipient
+    );
     let new_pusd = fetch_pusd_balance(dw);
     let new_underlying = fetch_erc20_balance_6dec(underlying, dw);
     println!("  pUSD   balance: {:.6}  (deposit wallet)", new_pusd);
-    println!("  {:<6} balance: {:.6}  (deposit wallet)", underlying_label, new_underlying);
+    println!(
+        "  {:<6} balance: {:.6}  (deposit wallet)",
+        underlying_label, new_underlying
+    );
     Ok(())
 }
 
@@ -876,7 +969,12 @@ fn run_withdraw_dw_offramp(
 /// both pUSD (v2 collateral) and USDC.e (legacy) — both are 6-decimal
 /// ERC-20s moved with identical `transfer(to,amount)` calldata; only the
 /// token contract address and display label differ.
-fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balance: f64) -> Result<()> {
+fn run_withdraw_erc20(
+    wallet: &WalletInfo,
+    token_addr: &str,
+    label: &str,
+    balance: f64,
+) -> Result<()> {
     if balance <= 0.0 {
         println!("No {} to withdraw.", label);
         return Ok(());
@@ -892,7 +990,9 @@ fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balanc
     let recipient = recipient.trim();
 
     if !recipient.starts_with("0x") || recipient.len() != 42 {
-        return Err(anyhow!("Invalid address format. Expected 0x + 40 hex chars."));
+        return Err(anyhow!(
+            "Invalid address format. Expected 0x + 40 hex chars."
+        ));
     }
 
     // Prompt for amount
@@ -901,14 +1001,20 @@ fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balanc
     std::io::stdout().flush()?;
     let mut amount_str = String::new();
     std::io::stdin().read_line(&mut amount_str)?;
-    let amount: f64 = amount_str.trim().parse()
+    let amount: f64 = amount_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow!("Invalid amount"))?;
 
     if amount <= 0.0 {
         return Err(anyhow!("Amount must be positive"));
     }
     if amount > balance {
-        return Err(anyhow!("Insufficient balance. Available: {:.6} {}", balance, label));
+        return Err(anyhow!(
+            "Insufficient balance. Available: {:.6} {}",
+            balance,
+            label
+        ));
     }
 
     // Confirm
@@ -937,9 +1043,12 @@ fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balanc
     std::io::stdout().flush()?;
 
     let (tx_id, initial_state) = submit_safe_tx_with_id(
-        &wallet.builder_auth, &wallet.signing_key,
-        &wallet.signer_address, &wallet.safe_address,
-        &token_addr.to_lowercase(), &calldata,
+        &wallet.builder_auth,
+        &wallet.signing_key,
+        &wallet.signer_address,
+        &wallet.safe_address,
+        &token_addr.to_lowercase(),
+        &calldata,
         false, // withdraw CLI always uses relayer (gasless)
     )?;
 
@@ -950,7 +1059,8 @@ fn run_withdraw_erc20(wallet: &WalletInfo, token_addr: &str, label: &str, balanc
     // Poll for confirmation
     println!("Waiting for confirmation...");
     let mut last_state = initial_state;
-    for _ in 0..60 { // max 60 * 5s = 5 minutes
+    for _ in 0..60 {
+        // max 60 * 5s = 5 minutes
         std::thread::sleep(std::time::Duration::from_secs(5));
 
         let (state, tx_hash) = poll_transaction(&wallet.builder_auth, &tx_id)?;
@@ -1001,14 +1111,19 @@ fn run_withdraw_pusd_to_asset(
 
     // Recipient
     println!();
-    println!("Enter recipient address (0x...) to receive {}:", underlying_label);
+    println!(
+        "Enter recipient address (0x...) to receive {}:",
+        underlying_label
+    );
     print!("> ");
     std::io::stdout().flush()?;
     let mut recipient = String::new();
     std::io::stdin().read_line(&mut recipient)?;
     let recipient = recipient.trim().to_string();
     if !recipient.starts_with("0x") || recipient.len() != 42 {
-        return Err(anyhow!("Invalid address format. Expected 0x + 40 hex chars."));
+        return Err(anyhow!(
+            "Invalid address format. Expected 0x + 40 hex chars."
+        ));
     }
 
     // Amount (pUSD and both backing assets are 1:1, all 6-decimal).
@@ -1017,13 +1132,18 @@ fn run_withdraw_pusd_to_asset(
     std::io::stdout().flush()?;
     let mut amount_str = String::new();
     std::io::stdin().read_line(&mut amount_str)?;
-    let amount: f64 = amount_str.trim().parse()
+    let amount: f64 = amount_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow!("Invalid amount"))?;
     if amount <= 0.0 {
         return Err(anyhow!("Amount must be positive"));
     }
     if amount > pusd_balance {
-        return Err(anyhow!("Insufficient balance. Available: {:.6} pUSD", pusd_balance));
+        return Err(anyhow!(
+            "Insufficient balance. Available: {:.6} pUSD",
+            pusd_balance
+        ));
     }
     let amount_wei = (amount * 1_000_000.0).round() as u128;
 
@@ -1033,14 +1153,23 @@ fn run_withdraw_pusd_to_asset(
 
     // Plan + confirm.
     println!();
-    println!("Plan — unwrap {:.6} pUSD → {}, then withdraw to {}:", amount, underlying_label, recipient);
+    println!(
+        "Plan — unwrap {:.6} pUSD → {}, then withdraw to {}:",
+        amount, underlying_label, recipient
+    );
     if needs_approve {
         println!("  1. pUSD.approve(Offramp {}, ∞)", OFFRAMP_ADDRESS);
     } else {
         println!("  1. (approve SKIPPED — pUSD→Offramp allowance already sufficient)");
     }
-    println!("  2. Offramp.unwrap({}, Safe, {:.6})", underlying_label, amount);
-    println!("  3. {}.transfer({}, {:.6})", underlying_label, recipient, amount);
+    println!(
+        "  2. Offramp.unwrap({}, Safe, {:.6})",
+        underlying_label, amount
+    );
+    println!(
+        "  3. {}.transfer({}, {:.6})",
+        underlying_label, recipient, amount
+    );
     println!("  Gas: Polymarket relayer (gasless)");
     println!("Confirm? (y/n):");
     print!("> ");
@@ -1056,28 +1185,46 @@ fn run_withdraw_pusd_to_asset(
     // Step 1: approve pUSD → Offramp (one-time, unlimited).
     if needs_approve {
         let calldata = build_approve_calldata(OFFRAMP_ADDRESS, &U256_MAX_BYTES);
-        relayer_submit_and_confirm(wallet, PUSD_ADDRESS, &calldata,
-            "Step 1/3 approve pUSD→Offramp (∞)")?;
+        relayer_submit_and_confirm(
+            wallet,
+            PUSD_ADDRESS,
+            &calldata,
+            "Step 1/3 approve pUSD→Offramp (∞)",
+        )?;
     } else {
         println!("  Step 1/3 approve — SKIPPED (allowance already sufficient)");
     }
 
     // Step 2: unwrap pUSD into the selected backing asset in the Safe.
     let unwrap_calldata = build_unwrap_calldata(underlying, &wallet.safe_address, amount_wei);
-    relayer_submit_and_confirm(wallet, OFFRAMP_ADDRESS, &unwrap_calldata,
-        &format!("Step 2/3 unwrap pUSD→{}", underlying_label))?;
+    relayer_submit_and_confirm(
+        wallet,
+        OFFRAMP_ADDRESS,
+        &unwrap_calldata,
+        &format!("Step 2/3 unwrap pUSD→{}", underlying_label),
+    )?;
 
     // Step 3: send the unwrapped asset to the recipient.
     let transfer_calldata = build_transfer_calldata(&recipient, amount_wei);
-    relayer_submit_and_confirm(wallet, underlying, &transfer_calldata,
-        &format!("Step 3/3 withdraw {} → recipient", underlying_label))?;
+    relayer_submit_and_confirm(
+        wallet,
+        underlying,
+        &transfer_calldata,
+        &format!("Step 3/3 withdraw {} → recipient", underlying_label),
+    )?;
 
     println!();
-    println!("Withdrawal complete — {:.6} {} sent to {}", amount, underlying_label, recipient);
+    println!(
+        "Withdrawal complete — {:.6} {} sent to {}",
+        amount, underlying_label, recipient
+    );
     let new_pusd = fetch_pusd_balance(&wallet.safe_address);
     let new_underlying = fetch_erc20_balance_6dec(underlying, &wallet.safe_address);
     println!("  pUSD   balance: {:.6}  (Safe)", new_pusd);
-    println!("  {:<6} balance: {:.6}  (Safe)", underlying_label, new_underlying);
+    println!(
+        "  {:<6} balance: {:.6}  (Safe)",
+        underlying_label, new_underlying
+    );
     Ok(())
 }
 
@@ -1092,8 +1239,13 @@ fn fetch_allowance_6dec(token: &str, owner: &str, spender: &str) -> u128 {
     let calldata = format!("0x{}", hex::encode(&data));
     match deploy_wallet::eth_call(token, &calldata) {
         Some(result) => {
-            let hex_str = result.strip_prefix("0x").unwrap_or(&result).trim_start_matches('0');
-            if hex_str.is_empty() { return 0; }
+            let hex_str = result
+                .strip_prefix("0x")
+                .unwrap_or(&result)
+                .trim_start_matches('0');
+            if hex_str.is_empty() {
+                return 0;
+            }
             u128::from_str_radix(hex_str, 16).unwrap_or(u128::MAX)
         }
         None => 0,
@@ -1134,18 +1286,27 @@ fn build_transfer_calldata(to: &str, amount_wei: u128) -> String {
 /// Submit one Safe `execTransaction` through the gasless relayer and block
 /// until it reaches a terminal state. `Ok` on STATE_CONFIRMED; `Err` on
 /// FAILED/INVALID or a 5-minute confirmation timeout.
-fn relayer_submit_and_confirm(wallet: &WalletInfo, to: &str, calldata: &str, step: &str) -> Result<()> {
+fn relayer_submit_and_confirm(
+    wallet: &WalletInfo,
+    to: &str,
+    calldata: &str,
+    step: &str,
+) -> Result<()> {
     print!("  {} … ", step);
     std::io::stdout().flush()?;
     let (tx_id, initial_state) = submit_safe_tx_with_id(
-        &wallet.builder_auth, &wallet.signing_key,
-        &wallet.signer_address, &wallet.safe_address,
-        &to.to_lowercase(), calldata,
+        &wallet.builder_auth,
+        &wallet.signing_key,
+        &wallet.signer_address,
+        &wallet.safe_address,
+        &to.to_lowercase(),
+        calldata,
         false, // relayer (gasless)
     )?;
     println!("submitted (id={}, {})", tx_id, initial_state);
     let mut last_state = initial_state;
-    for _ in 0..60 { // 60 × 5 s = 5 min
+    for _ in 0..60 {
+        // 60 × 5 s = 5 min
         std::thread::sleep(std::time::Duration::from_secs(5));
         let (state, tx_hash) = poll_transaction(&wallet.builder_auth, &tx_id)?;
         if state != last_state {
@@ -1165,7 +1326,10 @@ fn relayer_submit_and_confirm(wallet: &WalletInfo, to: &str, calldata: &str, ste
             _ => continue,
         }
     }
-    Err(anyhow!("{}: timed out waiting for confirmation (check PolygonScan)", step))
+    Err(anyhow!(
+        "{}: timed out waiting for confirmation (check PolygonScan)",
+        step
+    ))
 }
 
 /// POL withdraw: Safe sends native POL to recipient via execTransaction
@@ -1196,8 +1360,10 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
 
     // Prompt for recipient (default to signer EOA — the common case).
     println!();
-    println!("Enter recipient address (0x...) [default: signer EOA {}]:",
-             wallet.signer_address);
+    println!(
+        "Enter recipient address (0x...) [default: signer EOA {}]:",
+        wallet.signer_address
+    );
     print!("> ");
     std::io::stdout().flush()?;
     let mut recipient = String::new();
@@ -1207,7 +1373,9 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
         wallet.signer_address.as_str()
     } else {
         if !recipient.starts_with("0x") || recipient.len() != 42 {
-            return Err(anyhow!("Invalid address format. Expected 0x + 40 hex chars."));
+            return Err(anyhow!(
+                "Invalid address format. Expected 0x + 40 hex chars."
+            ));
         }
         recipient
     };
@@ -1225,14 +1393,19 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
     let amount: f64 = if amount_input.eq_ignore_ascii_case("all") {
         (balance - 0.001).max(0.0)
     } else {
-        amount_input.parse().map_err(|_| anyhow!("Invalid amount"))?
+        amount_input
+            .parse()
+            .map_err(|_| anyhow!("Invalid amount"))?
     };
 
     if amount <= 0.0 {
         return Err(anyhow!("Amount must be positive"));
     }
     if amount > balance {
-        return Err(anyhow!("Insufficient balance. Available: {:.6} POL", balance));
+        return Err(anyhow!(
+            "Insufficient balance. Available: {:.6} POL",
+            balance
+        ));
     }
 
     // Confirm
@@ -1260,7 +1433,7 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
         &wallet.signer_address,
         &wallet.safe_address,
         recipient,
-        "0x",            // empty inner calldata
+        "0x", // empty inner calldata
         amount_wei,
     )?;
     println!("submitted.");
@@ -1269,31 +1442,29 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
 
     // Poll on-chain receipt for confirmation. ~4-8s typical on Polygon.
     println!("Waiting for confirmation...");
-    for i in 0..30 {  // max 30 × 2s = 60s
+    for i in 0..30 {
+        // max 30 × 2s = 60s
         std::thread::sleep(std::time::Duration::from_secs(2));
         match super::onchain_tx::poll_onchain_tx(&tx_hash) {
-            Ok((state, _)) => {
-                match state.as_str() {
-                    "CONFIRMED" => {
-                        println!();
-                        println!("Withdrawal confirmed!");
-                        let new_balance = fetch_pol_balance(&wallet.safe_address)
-                            .unwrap_or(0.0);
-                        println!("  New Safe POL balance: {:.6}", new_balance);
-                        return Ok(());
-                    }
-                    "STATE_FAILED" => {
-                        return Err(anyhow!("Tx reverted on-chain: {}", tx_hash));
-                    }
-                    _ => {
-                        if i % 5 == 4 {
-                            print!(".");
-                            std::io::stdout().flush()?;
-                        }
-                        continue;
-                    }
+            Ok((state, _)) => match state.as_str() {
+                "CONFIRMED" => {
+                    println!();
+                    println!("Withdrawal confirmed!");
+                    let new_balance = fetch_pol_balance(&wallet.safe_address).unwrap_or(0.0);
+                    println!("  New Safe POL balance: {:.6}", new_balance);
+                    return Ok(());
                 }
-            }
+                "STATE_FAILED" => {
+                    return Err(anyhow!("Tx reverted on-chain: {}", tx_hash));
+                }
+                _ => {
+                    if i % 5 == 4 {
+                        print!(".");
+                        std::io::stdout().flush()?;
+                    }
+                    continue;
+                }
+            },
             Err(e) => {
                 eprintln!("\n  poll error (will retry): {}", e);
                 continue;
@@ -1315,17 +1486,19 @@ fn run_withdraw_pol(wallet: &WalletInfo, balance: f64) -> Result<()> {
 /// tx hash, and `poll_transaction` routes the poll to the chain instead
 /// of the relayer's `/transaction?id=...` endpoint.
 pub(crate) fn submit_safe_tx_with_id(
-    auth: &PolyAuth, key: &k256::ecdsa::SigningKey,
-    signer: &str, safe: &str, to: &str, data: &str,
+    auth: &PolyAuth,
+    key: &k256::ecdsa::SigningKey,
+    signer: &str,
+    safe: &str,
+    to: &str,
+    data: &str,
     gas_via_signer: bool,
 ) -> Result<(String, String)> {
     if gas_via_signer {
         // On-chain path: EOA-paid execTransaction broadcast.
         // Returned `tx_hash` is the Polygon tx hash; state starts as
         // "PENDING" and resolves via `poll_transaction`.
-        let tx_hash = super::onchain_tx::submit_safe_tx_onchain(
-            key, signer, safe, to, data,
-        )?;
+        let tx_hash = super::onchain_tx::submit_safe_tx_onchain(key, signer, safe, to, data)?;
         return Ok((tx_hash, "PENDING".to_string()));
     }
     // Legacy gasless-relayer path.
@@ -1354,7 +1527,8 @@ pub(crate) fn submit_safe_tx_with_id(
     struct_buf.extend_from_slice(&u256_bytes(nonce as u128));
     let struct_hash = deploy_wallet::keccak256(&struct_buf);
 
-    let domain_type_hash = deploy_wallet::keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
+    let domain_type_hash =
+        deploy_wallet::keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
     let _ = domain_type_hash; // domain_sep already computed
     let signature = sign_safe_tx(&domain_sep, &struct_hash, key)?;
 
@@ -1382,8 +1556,16 @@ pub(crate) fn submit_safe_tx_with_id(
     let headers = auth.sign_request("POST", "/submit", &body_str);
     let url = format!("{}/submit", RELAYER_URL);
     let json = relayer_http(reqwest::Method::POST, url, headers, Some(body_str))?;
-    let tx_id = json.get("transactionID").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let state = json.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let tx_id = json
+        .get("transactionID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let state = json
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok((tx_id, state))
 }
 
@@ -1401,7 +1583,8 @@ fn get_onchain_safe_nonce(safe_address: &str) -> u64 {
 }
 
 fn build_safe_tx_domain(safe_address: &str) -> [u8; 32] {
-    let type_hash = deploy_wallet::keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
+    let type_hash =
+        deploy_wallet::keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&type_hash);
     buf.extend_from_slice(&u256_bytes(137)); // Polygon chainId
@@ -1409,7 +1592,11 @@ fn build_safe_tx_domain(safe_address: &str) -> [u8; 32] {
     deploy_wallet::keccak256(&buf)
 }
 
-fn sign_safe_tx(domain_sep: &[u8; 32], struct_hash: &[u8; 32], key: &k256::ecdsa::SigningKey) -> Result<String> {
+fn sign_safe_tx(
+    domain_sep: &[u8; 32],
+    struct_hash: &[u8; 32],
+    key: &k256::ecdsa::SigningKey,
+) -> Result<String> {
     // EIP-712 digest
     let mut buf = Vec::with_capacity(2 + 32 + 32);
     buf.push(0x19);
@@ -1424,7 +1611,8 @@ fn sign_safe_tx(domain_sep: &[u8; 32], struct_hash: &[u8; 32], key: &k256::ecdsa
     eth_msg.extend_from_slice(&eip712_hash);
     let digest = deploy_wallet::keccak256(&eth_msg);
 
-    let (sig, recid) = key.sign_prehash_recoverable(&digest)
+    let (sig, recid) = key
+        .sign_prehash_recoverable(&digest)
         .map_err(|e| anyhow!("Signing failed: {}", e))?;
     let mut sig_bytes = [0u8; 65];
     sig_bytes[..64].copy_from_slice(&sig.to_bytes());
@@ -1451,9 +1639,21 @@ pub(crate) fn poll_transaction(auth: &PolyAuth, tx_id: &str) -> Result<(String, 
     } else {
         json
     };
-    let state = entry.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let tx_hash = entry.get("transactionHash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let error_msg = entry.get("errorMsg").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let state = entry
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tx_hash = entry
+        .get("transactionHash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let error_msg = entry
+        .get("errorMsg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if !error_msg.is_empty() && state == "STATE_FAILED" {
         return Err(anyhow!("Transaction failed: {}", error_msg));
     }
@@ -1518,7 +1718,8 @@ pub(crate) fn read_clob_v2_flag() -> bool {
         // No readable config → assume the modern default (v2).
         Err(_) => return true,
     };
-    cfg.exchanges.iter()
+    cfg.exchanges
+        .iter()
         .find(|e| e.name == "polymarket")
         .map(|p| is_v2_from_str(&p.clob_version))
         .unwrap_or(true)
@@ -1531,7 +1732,11 @@ pub(crate) fn read_clob_v2_flag() -> bool {
 ///   v2 neg-risk: → (NegRiskCtfCollateralAdapter, pUSD)
 pub(crate) fn ctf_target(is_v2: bool, neg_risk: bool) -> (&'static str, &'static str) {
     let _ = is_v2;
-    let target = if neg_risk { NEG_RISK_CTF_COLLATERAL_ADAPTER_V2 } else { CTF_COLLATERAL_ADAPTER_V2 };
+    let target = if neg_risk {
+        NEG_RISK_CTF_COLLATERAL_ADAPTER_V2
+    } else {
+        CTF_COLLATERAL_ADAPTER_V2
+    };
     (target, PUSD_ADDRESS)
 }
 // redeemPositions(address,bytes32,bytes32,uint256[]) selector
@@ -1546,7 +1751,7 @@ const REDEEM_SELECTOR: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
 //    DIFFERENT positionIds — so on-chain balanceOf MUST be computed from the
 //    active collateral, never matched against the data-api asset id.
 const GET_COLLECTION_ID_SELECTOR: [u8; 4] = [0x85, 0x62, 0x96, 0xf7]; // getCollectionId(bytes32,bytes32,uint256)
-const GET_POSITION_ID_SELECTOR:   [u8; 4] = [0x39, 0xdd, 0x75, 0x30]; // getPositionId(address,bytes32)
+const GET_POSITION_ID_SELECTOR: [u8; 4] = [0x39, 0xdd, 0x75, 0x30]; // getPositionId(address,bytes32)
 const ERC1155_BALANCE_OF_SELECTOR: [u8; 4] = [0x00, 0xfd, 0xd5, 0x8e]; // balanceOf(address,uint256)
 const ERC1155_BALANCE_OF_BATCH_SELECTOR: [u8; 4] = [0x4e, 0x12, 0x73, 0xf4]; // balanceOfBatch(address[],uint256[])
 
@@ -1607,8 +1812,11 @@ fn ctf_position_id(condition_id: &str, index_set: u64, collateral: &str) -> Opti
     data.extend_from_slice(&cid_padded);
     data.extend_from_slice(&u256_bytes(index_set as u128));
     let collection = deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data)))?;
-    let collection_bytes = hex::decode(collection.strip_prefix("0x").unwrap_or(&collection)).ok()?;
-    if collection_bytes.len() < 32 { return None; }
+    let collection_bytes =
+        hex::decode(collection.strip_prefix("0x").unwrap_or(&collection)).ok()?;
+    if collection_bytes.len() < 32 {
+        return None;
+    }
 
     // getPositionId(collateral, collectionId)
     let mut data = Vec::with_capacity(4 + 32 * 2);
@@ -1653,7 +1861,9 @@ fn ctf_erc1155_balance_checked(owner: &str, position_id_hex: &str) -> Result<f64
         .ok_or_else(|| anyhow::anyhow!("CTF balanceOf RPC failed for `{position_id_hex}`"))?;
     let h = result.strip_prefix("0x").unwrap_or(&result);
     let trimmed = h.trim_start_matches('0');
-    if trimmed.is_empty() { return Ok(0.0); }
+    if trimmed.is_empty() {
+        return Ok(0.0);
+    }
     let raw = u128::from_str_radix(trimmed, 16)
         .map_err(|error| anyhow::anyhow!("invalid CTF balanceOf result `{result}`: {error}"))?;
     Ok(raw as f64 / 1_000_000.0)
@@ -1681,11 +1891,10 @@ pub fn ctf_outcome_token_balances_checked(
 /// call. Shared accounts commonly cover several assets and adjacent events;
 /// batching keeps a complete snapshot at one Polygon RPC request regardless
 /// of that scope size.
-pub fn ctf_token_balances_batch_checked(
-    owner: &str,
-    token_ids: &[String],
-) -> Result<Vec<f64>> {
-    if token_ids.is_empty() { return Ok(Vec::new()); }
+pub fn ctf_token_balances_batch_checked(owner: &str, token_ids: &[String]) -> Result<Vec<f64>> {
+    if token_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let count = token_ids.len();
     let owners_offset = 64_u128;
     let ids_offset = owners_offset + 32 + 32 * count as u128;
@@ -1711,7 +1920,9 @@ fn decode_balance_of_batch_result(result: &str, expected: usize) -> Result<Vec<f
         .map_err(|error| anyhow::anyhow!("invalid CTF balanceOfBatch result: {error}"))?;
     let read_usize = |word: &[u8]| -> Result<usize> {
         if word.len() != 32 || word[..24].iter().any(|byte| *byte != 0) {
-            return Err(anyhow::anyhow!("balanceOfBatch offset/length exceeds usize"));
+            return Err(anyhow::anyhow!(
+                "balanceOfBatch offset/length exceeds usize"
+            ));
         }
         Ok(u64::from_be_bytes(word[24..32].try_into().unwrap()) as usize)
     };
@@ -1729,7 +1940,8 @@ fn decode_balance_of_batch_result(result: &str, expected: usize) -> Result<Vec<f
         ));
     }
     let values_start = offset + 32;
-    let values_end = values_start.checked_add(count.saturating_mul(32))
+    let values_end = values_start
+        .checked_add(count.saturating_mul(32))
         .ok_or_else(|| anyhow::anyhow!("CTF balanceOfBatch result length overflow"))?;
     if values_end > bytes.len() {
         return Err(anyhow::anyhow!("short CTF balanceOfBatch values"));
@@ -1756,11 +1968,7 @@ fn decode_balance_of_batch_result(result: &str, expected: usize) -> Result<Vec<f
 /// event's `clob_token_ids` and read 0 — which makes the strategy believe it
 /// is flat and quote only the buy side. Costs ~6 eth_calls (2 view calls per
 /// leg + balanceOf), so call it off the strategy thread.
-pub fn ctf_event_outcome_balances(
-    owner: &str,
-    condition_id: &str,
-    is_v2: bool,
-) -> (f64, f64) {
+pub fn ctf_event_outcome_balances(owner: &str, condition_id: &str, is_v2: bool) -> (f64, f64) {
     // CLOB outcome tokens are USDC.e-collateralized in BOTH v1 (direct) and v2
     // (v2 mints them via the CtfCollateralAdapter); pUSD is only the cash leg,
     // so the position id-space is always USDC.e.
@@ -1786,8 +1994,8 @@ pub fn run_positions() -> Result<()> {
     // the global `--account <id>` / `--instance <id>` flags — and their
     // *values* — are stripped first; otherwise `hexbot positions --account
     // zhu02` would mistake the account id `zhu02` for the config path.
-    let positional: Option<String> = crate::exchange::polymarket::cli_account::cli_args()
-        .find(|a| !a.starts_with('-'));
+    let positional: Option<String> =
+        crate::exchange::polymarket::cli_account::cli_args().find(|a| !a.starts_with('-'));
     let config_path = crate::exchange::polymarket::cli_account::config_path()
         .or(positional)
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
@@ -1801,7 +2009,9 @@ pub fn run_positions() -> Result<()> {
     let safe_address = to_checksum_address(&derive_safe_address(&signer_address));
 
     // POLY_1271 holds funds + positions in the deposit wallet, not the Safe.
-    let sig_type = std::env::var("POLY_SIGNATURE_TYPE").unwrap_or_default().to_ascii_lowercase();
+    let sig_type = std::env::var("POLY_SIGNATURE_TYPE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let is_dw = sig_type == "poly_1271" || sig_type == "deposit_wallet";
     let (wallet_addr, wallet_label) = if is_dw {
         let dw = super::deposit_wallet::resolve_deposit_wallet(&signer_address)
@@ -1826,7 +2036,10 @@ pub fn run_positions() -> Result<()> {
     let balance = pusd;
 
     // Fetch positions
-    let url = format!("{}/positions?user={}&sizeThreshold=0&limit=500", DATA_API_BASE, wallet_addr);
+    let url = format!(
+        "{}/positions?user={}&sizeThreshold=0&limit=500",
+        DATA_API_BASE, wallet_addr
+    );
     let mut positions: Vec<PositionRecord> = match crate::async_rt::blocking_get_text(&url) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(e) => {
@@ -1844,7 +2057,8 @@ pub fn run_positions() -> Result<()> {
     // rows land next to each other and consecutive runs produce stable
     // diffable output. Tiebreaker on outcome keeps Up before Down.
     positions.sort_by(|a, b| {
-        a.event_slug.to_ascii_lowercase()
+        a.event_slug
+            .to_ascii_lowercase()
             .cmp(&b.event_slug.to_ascii_lowercase())
             .then_with(|| a.outcome.cmp(&b.outcome))
     });
@@ -1855,9 +2069,17 @@ pub fn run_positions() -> Result<()> {
     // Print header — widths sized for 5-decimal values. Size = the data-api
     // `/positions` size (the open feed we enumerate); no CLOB / on-chain reads.
     let slug_w = 32;
-    println!("{:<50} {:<slug$} {:>8} {:>11} {:>9} {:>12} {:>5}",
-        "Market", "Event Slug", "Outcome", "Size", "CurPx", "Value", "Redm",
-        slug = slug_w);
+    println!(
+        "{:<50} {:<slug$} {:>8} {:>11} {:>9} {:>12} {:>5}",
+        "Market",
+        "Event Slug",
+        "Outcome",
+        "Size",
+        "CurPx",
+        "Value",
+        "Redm",
+        slug = slug_w
+    );
     let sep_w = 50 + 1 + slug_w + 1 + 8 + 1 + 11 + 1 + 9 + 1 + 12 + 1 + 5;
     println!("{}", "-".repeat(sep_w));
 
@@ -1869,7 +2091,11 @@ pub fn run_positions() -> Result<()> {
     // feed and are no longer scanned/printed here; use `hexbot redeem` to find
     // and claim still-held winning legs.
     for p in &positions {
-        let title = if p.title.len() > 48 { format!("{}...", &p.title[..45]) } else { p.title.clone() };
+        let title = if p.title.len() > 48 {
+            format!("{}...", &p.title[..45])
+        } else {
+            p.title.clone()
+        };
         let slug = if p.event_slug.chars().count() > slug_w {
             let take = slug_w.saturating_sub(1);
             let head: String = p.event_slug.chars().take(take).collect();
@@ -1882,9 +2108,17 @@ pub fn run_positions() -> Result<()> {
 
         let cur = round5(p.cur_price);
         let val = round5(size * p.cur_price);
-        println!("{:<50} {:<slug$} {:>8} {:>11.5} {:>9.5} {:>12.4} {:>5}",
-            title, slug, p.outcome, size, cur, val, redeem,
-            slug = slug_w);
+        println!(
+            "{:<50} {:<slug$} {:>8} {:>11.5} {:>9.5} {:>12.4} {:>5}",
+            title,
+            slug,
+            p.outcome,
+            size,
+            cur,
+            val,
+            redeem,
+            slug = slug_w
+        );
         total_value += val;
     }
 
@@ -1892,13 +2126,22 @@ pub fn run_positions() -> Result<()> {
     let balance = round5(balance);
 
     println!("{}", "-".repeat(sep_w));
-    println!("{:<50} {:<slug$} {:>8} {:>11} {:>9} {:>12.4}",
-        format!("Total ({} positions)", positions.len()), "", "", "", "", total_value,
-        slug = slug_w);
+    println!(
+        "{:<50} {:<slug$} {:>8} {:>11} {:>9} {:>12.4}",
+        format!("Total ({} positions)", positions.len()),
+        "",
+        "",
+        "",
+        "",
+        total_value,
+        slug = slug_w
+    );
     println!();
     println!(
         "Total balance: {:.4} USD (pUSD {:.4} + positions {:.4})",
-        balance + total_value, pusd, total_value,
+        balance + total_value,
+        pusd,
+        total_value,
     );
     // Size = the data-api `/positions` size; Value = Size × CurPx.
     println!("(Size = data-api /positions size)");
@@ -1922,7 +2165,9 @@ fn dec_to_bytes32(dec: &str) -> Option<[u8; 32]> {
             *b = (v & 0xff) as u8;
             carry = v >> 8;
         }
-        if carry != 0 { return None; } // > 256 bits
+        if carry != 0 {
+            return None;
+        } // > 256 bits
     }
     Some(bytes)
 }
@@ -1930,8 +2175,15 @@ fn dec_to_bytes32(dec: &str) -> Option<[u8; 32]> {
 /// Parse a 0x-hex uint256 into a 32-byte big-endian array.
 fn hex_to_bytes32(s: &str) -> Option<[u8; 32]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
-    let raw = hex::decode(if h.len() % 2 == 1 { format!("0{}", h) } else { h.to_string() }).ok()?;
-    if raw.len() > 32 { return None; }
+    let raw = hex::decode(if h.len() % 2 == 1 {
+        format!("0{}", h)
+    } else {
+        h.to_string()
+    })
+    .ok()?;
+    if raw.len() > 32 {
+        return None;
+    }
     let mut out = [0u8; 32];
     out[32 - raw.len()..].copy_from_slice(&raw);
     Some(out)
@@ -1939,7 +2191,9 @@ fn hex_to_bytes32(s: &str) -> Option<[u8; 32]> {
 
 /// Render a 32-byte big-endian uint256 as a decimal string.
 fn bytes32_to_dec(b: &[u8; 32]) -> String {
-    if b.iter().all(|&x| x == 0) { return "0".to_string(); }
+    if b.iter().all(|&x| x == 0) {
+        return "0".to_string();
+    }
     let mut n = *b;
     let mut digits = Vec::new();
     while !n.iter().all(|&x| x == 0) {
@@ -1968,7 +2222,10 @@ pub fn run_token_check() -> Result<()> {
     // RPC: respect an explicit POLYGON_RPC env (operator-set); only fall back to
     // loading the config's [polygon] section when it's unset, so a one-off CLI
     // run can resolve RPC. No wallet creds needed — these are pure view calls.
-    if std::env::var("POLYGON_RPC").map(|v| v.is_empty()).unwrap_or(true) {
+    if std::env::var("POLYGON_RPC")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
         if let Some(p) = crate::exchange::polymarket::cli_account::config_path() {
             let _ = crate::config::Config::load(std::path::Path::new(&p));
         }
@@ -1982,10 +2239,21 @@ pub fn run_token_check() -> Result<()> {
     let mut positional: Vec<String> = Vec::new();
     let mut skip_next = false;
     for a in &cargs {
-        if skip_next { skip_next = false; continue; }
-        if a == "--wallet" { skip_next = true; continue; }
-        if let Some(w) = a.strip_prefix("--wallet=") { wallet = w.to_string(); continue; }
-        if a.starts_with('-') { continue; }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--wallet" {
+            skip_next = true;
+            continue;
+        }
+        if let Some(w) = a.strip_prefix("--wallet=") {
+            wallet = w.to_string();
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
         positional.push(a.clone());
     }
     // (re-scan for the `--wallet <value>` form since the loop above skipped it)
@@ -2007,7 +2275,9 @@ pub fn run_token_check() -> Result<()> {
     println!("conditionId : {}", cid);
     println!("pUSD (v2)   : {}", PUSD_ADDRESS);
     println!("USDC.e (v1) : {}", USDCE_ADDRESS);
-    if !wallet.is_empty() { println!("wallet      : {}", wallet); }
+    if !wallet.is_empty() {
+        println!("wallet      : {}", wallet);
+    }
     println!();
 
     let legs: [(&str, u64, &str); 2] = [
@@ -2015,7 +2285,9 @@ pub fn run_token_check() -> Result<()> {
         ("Down (indexSet 2)", 2, down_tok.as_str()),
     ];
     for (label, index_set, provided) in legs {
-        if provided.is_empty() { continue; }
+        if provided.is_empty() {
+            continue;
+        }
         println!("── {} ──", label);
         println!("  CLOB token_id : {}", provided);
         let provided_b = dec_to_bytes32(provided);
@@ -2036,11 +2308,18 @@ pub fn run_token_check() -> Result<()> {
                     } else {
                         format!("  | DW balanceOf={:.4}", ctf_erc1155_balance(&wallet, &hex))
                     };
-                    println!("  {} positionId: {}  {}{}",
-                        cname, dec, if matched { "← MATCH ✓" } else { "" }, bal);
+                    println!(
+                        "  {} positionId: {}  {}{}",
+                        cname,
+                        dec,
+                        if matched { "← MATCH ✓" } else { "" },
+                        bal
+                    );
                 }
                 None => println!(
-                    "  {} positionId: <eth_call failed — check POLYGON_RPC / config>", cname),
+                    "  {} positionId: <eth_call failed — check POLYGON_RPC / config>",
+                    cname
+                ),
             }
         }
         println!();
@@ -2067,7 +2346,10 @@ pub fn run_token_check() -> Result<()> {
 /// on-chain ghost gate + closed scan in `run_redeem_all`; that path is separate
 /// and unchanged.)
 fn prompt_redeemable_from_dataapi(addr: &str) -> Result<Vec<String>> {
-    let url = format!("{}/positions?user={}&sizeThreshold=0&limit=500", DATA_API_BASE, addr);
+    let url = format!(
+        "{}/positions?user={}&sizeThreshold=0&limit=500",
+        DATA_API_BASE, addr
+    );
     let positions: Vec<PositionRecord> = match crate::async_rt::blocking_get_text(&url) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(e) => return Err(anyhow!("Failed to fetch positions: {}", e)),
@@ -2093,19 +2375,37 @@ fn prompt_redeemable_from_dataapi(addr: &str) -> Result<Vec<String>> {
 
     // Numbered table.
     println!("Redeemable positions:");
-    println!("{:>3}  {:<48} {:>8} {:>8} {:>10}", "#", "Market", "Outcome", "Size", "Value");
+    println!(
+        "{:>3}  {:<48} {:>8} {:>8} {:>10}",
+        "#", "Market", "Outcome", "Size", "Value"
+    );
     println!("{}", "-".repeat(83));
     let mut total_value = 0.0;
     for (idx, cid) in condition_ids.iter().enumerate() {
         for (j, p) in grouped[cid].iter().enumerate() {
-            let title = if p.title.len() > 46 { format!("{}...", &p.title[..43]) } else { p.title.clone() };
-            let num = if j == 0 { format!("{}", idx + 1) } else { String::new() };
-            println!("{:>3}  {:<48} {:>8} {:>8.2} {:>10.4}", num, title, p.outcome, p.size, p.current_value);
+            let title = if p.title.len() > 46 {
+                format!("{}...", &p.title[..43])
+            } else {
+                p.title.clone()
+            };
+            let num = if j == 0 {
+                format!("{}", idx + 1)
+            } else {
+                String::new()
+            };
+            println!(
+                "{:>3}  {:<48} {:>8} {:>8.2} {:>10.4}",
+                num, title, p.outcome, p.size, p.current_value
+            );
             total_value += p.current_value;
         }
     }
     println!("{}", "-".repeat(83));
-    println!("     Total: {:.4} USDC ({} conditions)", total_value, condition_ids.len());
+    println!(
+        "     Total: {:.4} USDC ({} conditions)",
+        total_value,
+        condition_ids.len()
+    );
     println!();
 
     // Prompt for selection.
@@ -2123,7 +2423,8 @@ fn prompt_redeemable_from_dataapi(addr: &str) -> Result<Vec<String>> {
     let selected_indices: Vec<usize> = if input.eq_ignore_ascii_case("a") {
         (0..condition_ids.len()).collect()
     } else {
-        input.split(',')
+        input
+            .split(',')
             .filter_map(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1 && n <= condition_ids.len())
             .map(|n| n - 1)
@@ -2134,7 +2435,10 @@ fn prompt_redeemable_from_dataapi(addr: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    Ok(selected_indices.iter().map(|&i| condition_ids[i].clone()).collect())
+    Ok(selected_indices
+        .iter()
+        .map(|&i| condition_ids[i].clone())
+        .collect())
 }
 
 pub fn run_redeem() -> Result<()> {
@@ -2156,12 +2460,24 @@ pub fn run_redeem() -> Result<()> {
         println!("Redeeming {} condition(s)...", selected_cids.len());
         for (i, cid) in selected_cids.iter().enumerate() {
             let cid_short: String = cid.chars().take(16).collect();
-            print!("  [{}/{}] Redeeming {}... ", i + 1, selected_cids.len(), cid_short);
+            print!(
+                "  [{}/{}] Redeeming {}... ",
+                i + 1,
+                selected_cids.len(),
+                cid_short
+            );
             std::io::stdout().flush()?;
             match super::deposit_wallet::dw_redeem(
-                &wallet.signing_key, &wallet.signer_address, &dw, &wallet.builder_auth, cid,
+                &wallet.signing_key,
+                &wallet.signer_address,
+                &dw,
+                &wallet.builder_auth,
+                cid,
             ) {
-                Ok(tx) => println!("done. tx: https://polygonscan.com/tx/{}", tx.trim_start_matches("0x")),
+                Ok(tx) => println!(
+                    "done. tx: https://polygonscan.com/tx/{}",
+                    tx.trim_start_matches("0x")
+                ),
                 Err(e) => println!("FAILED: {}", e),
             }
         }
@@ -2178,8 +2494,15 @@ pub fn run_redeem() -> Result<()> {
 
     println!("=== Polymarket Redeem ===");
     println!("Wallet:   {}", wallet.safe_address);
-    println!("CLOB:     {} ({})", if is_v2 { "v2" } else { "v1" },
-        if is_v2 { "pUSD via CtfCollateralAdapter" } else { "USDC.e via CTF" });
+    println!(
+        "CLOB:     {} ({})",
+        if is_v2 { "v2" } else { "v1" },
+        if is_v2 {
+            "pUSD via CtfCollateralAdapter"
+        } else {
+            "USDC.e via CTF"
+        }
+    );
     println!("Target:   {}", target_contract);
     println!(
         "Gas payer: {}",
@@ -2203,12 +2526,18 @@ pub fn run_redeem() -> Result<()> {
     // Execute redeem for selected conditionIds
     for (i, cid) in selected_cids.iter().enumerate() {
         let cid_short = if cid.len() > 16 { &cid[..16] } else { cid };
-        print!("  [{}/{}] Redeeming {}... ", i + 1, selected_cids.len(), cid_short);
+        print!(
+            "  [{}/{}] Redeeming {}... ",
+            i + 1,
+            selected_cids.len(),
+            cid_short
+        );
         std::io::stdout().flush()?;
 
         // Build redeemPositions calldata
         // redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
-        let condition_bytes = hex::decode(cid.strip_prefix("0x").unwrap_or(cid)).unwrap_or_default();
+        let condition_bytes =
+            hex::decode(cid.strip_prefix("0x").unwrap_or(cid)).unwrap_or_default();
         let mut cid_padded = [0u8; 32];
         let start = 32 - condition_bytes.len().min(32);
         cid_padded[start..].copy_from_slice(&condition_bytes[..condition_bytes.len().min(32)]);
@@ -2217,18 +2546,21 @@ pub fn run_redeem() -> Result<()> {
         let mut calldata = Vec::with_capacity(4 + 32 * 7);
         calldata.extend_from_slice(&REDEEM_SELECTOR);
         calldata.extend_from_slice(&address_to_bytes32(collateral_token)); // collateralToken (pUSD in v2)
-        calldata.extend_from_slice(&[0u8; 32]);                             // parentCollectionId = 0
-        calldata.extend_from_slice(&cid_padded);                            // conditionId
-        calldata.extend_from_slice(&u256_bytes(128));                        // offset to indexSets array (4 * 32 = 128)
-        calldata.extend_from_slice(&u256_bytes(2));                          // array length = 2
-        calldata.extend_from_slice(&u256_bytes(1));                          // indexSets[0] = 1
-        calldata.extend_from_slice(&u256_bytes(2));                          // indexSets[1] = 2
+        calldata.extend_from_slice(&[0u8; 32]); // parentCollectionId = 0
+        calldata.extend_from_slice(&cid_padded); // conditionId
+        calldata.extend_from_slice(&u256_bytes(128)); // offset to indexSets array (4 * 32 = 128)
+        calldata.extend_from_slice(&u256_bytes(2)); // array length = 2
+        calldata.extend_from_slice(&u256_bytes(1)); // indexSets[0] = 1
+        calldata.extend_from_slice(&u256_bytes(2)); // indexSets[1] = 2
         let data_hex = format!("0x{}", hex::encode(&calldata));
 
         match submit_safe_tx_with_id(
-            &wallet.builder_auth, &wallet.signing_key,
-            &wallet.signer_address, &wallet.safe_address,
-            target_contract, &data_hex,
+            &wallet.builder_auth,
+            &wallet.signing_key,
+            &wallet.signer_address,
+            &wallet.safe_address,
+            target_contract,
+            &data_hex,
             gas_via_signer,
         ) {
             Ok((tx_id, _state)) => {
@@ -2256,9 +2588,16 @@ pub fn run_redeem() -> Result<()> {
                 }
                 // For on-chain path, tx_id itself IS the tx hash; fall back
                 // to it when the relayer path didn't populate tx_hash yet.
-                let link_hash = if tx_hash.is_empty() { tx_id.clone() } else { tx_hash.clone() };
+                let link_hash = if tx_hash.is_empty() {
+                    tx_id.clone()
+                } else {
+                    tx_hash.clone()
+                };
                 if final_state.contains("CONFIRMED") || final_state.contains("MINED") {
-                    println!("done. tx: https://polygonscan.com/tx/{}", link_hash.trim_start_matches("0x"));
+                    println!(
+                        "done. tx: https://polygonscan.com/tx/{}",
+                        link_hash.trim_start_matches("0x")
+                    );
                 } else if final_state.contains("FAILED") {
                     println!("FAILED.");
                 } else {
@@ -2337,8 +2676,18 @@ fn balance_allowance_update_one(
     // don't require JSON (a strict parse here logged a spurious EOF "failure"
     // even though the cache refresh succeeded).
     match user_clob_get_ok(url, headers) {
-        Ok(()) => log::info!("[BalanceSync] {} {} synced (sig_type={})", asset_type, label, sig_type),
-        Err(e) => log::warn!("[BalanceSync] {} {} update failed: {}", asset_type, label, e),
+        Ok(()) => log::info!(
+            "[BalanceSync] {} {} synced (sig_type={})",
+            asset_type,
+            label,
+            sig_type
+        ),
+        Err(e) => log::warn!(
+            "[BalanceSync] {} {} update failed: {}",
+            asset_type,
+            label,
+            e
+        ),
     }
 }
 
@@ -2368,42 +2717,76 @@ pub fn sync_balance_allowance_for_event(instance_id: &str, up_token_id: &str, do
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
     let cfg = match crate::config::Config::load(std::path::Path::new(&cfg_path)) {
         Ok(c) => c,
-        Err(e) => { log::warn!("[BalanceSync] skipped (config load: {})", e); return; }
+        Err(e) => {
+            log::warn!("[BalanceSync] skipped (config load: {})", e);
+            return;
+        }
     };
     let secrets_path = crate::config::SecretsFile::resolve_path_with_override(
-        std::path::Path::new(&cfg_path), &cfg.general.secrets_file,
+        std::path::Path::new(&cfg_path),
+        &cfg.general.secrets_file,
     );
     let secrets = match crate::config::SecretsFile::load(&secrets_path) {
         Ok(s) => s,
-        Err(e) => { log::warn!("[BalanceSync] skipped (secrets load: {})", e); return; }
+        Err(e) => {
+            log::warn!("[BalanceSync] skipped (secrets load: {})", e);
+            return;
+        }
     };
     // Balance/allowance is an account-level resource: resolve this instance's
     // `account_id` (falls back to instance_id when unset, i.e. the legacy
     // one-wallet-per-strategy path) and key creds by it. Under multi-account
     // live the secrets blocks are `[poly.<account_id>]`, so looking up by
     // instance_id (e.g. `btc01`) misses and silently skips the sync.
-    let account_id = cfg.strategies.iter()
+    let account_id = cfg
+        .strategies
+        .iter()
         .find(|sc| sc.instance_id == instance_id)
         .map(|sc| sc.account_id().to_string())
         .unwrap_or_else(|| instance_id.to_string());
     let creds = match secrets.poly_for(&account_id) {
         Ok(c) => c,
-        Err(e) => { log::warn!("[BalanceSync] skipped (no creds for account {} (instance {}): {})", account_id, instance_id, e); return; }
+        Err(e) => {
+            log::warn!(
+                "[BalanceSync] skipped (no creds for account {} (instance {}): {})",
+                account_id,
+                instance_id,
+                e
+            );
+            return;
+        }
     };
     if creds.api_key.is_empty() || creds.api_secret.is_empty() {
-        log::warn!("[BalanceSync] skipped — account {} (instance {}) has no CLOB L2 creds", account_id, instance_id);
+        log::warn!(
+            "[BalanceSync] skipped — account {} (instance {}) has no CLOB L2 creds",
+            account_id,
+            instance_id
+        );
         return;
     }
     let signer = match parse_private_key(&creds.private_key) {
         Ok(k) => to_checksum_address(&derive_eth_address_from_key(&k)),
-        Err(e) => { log::warn!("[BalanceSync] skipped (key parse: {})", e); return; }
+        Err(e) => {
+            log::warn!("[BalanceSync] skipped (key parse: {})", e);
+            return;
+        }
     };
-    let auth = match PolyAuth::new(&creds.api_key, &creds.api_secret, &creds.api_passphrase, &signer) {
+    let auth = match PolyAuth::new(
+        &creds.api_key,
+        &creds.api_secret,
+        &creds.api_passphrase,
+        &signer,
+    ) {
         Ok(a) => a,
-        Err(e) => { log::warn!("[BalanceSync] skipped (auth: {})", e); return; }
+        Err(e) => {
+            log::warn!("[BalanceSync] skipped (auth: {})", e);
+            return;
+        }
     };
     let sig_num = poly_signature_type_num(&creds.signature_type);
-    let base = cfg.exchanges.iter()
+    let base = cfg
+        .exchanges
+        .iter()
         .find(|e| e.name == "polymarket")
         .map(|p| p.api_url_prefix.clone())
         .filter(|s| !s.is_empty())
@@ -2451,7 +2834,8 @@ struct OpenOrder {
 /// against v1-vs-v2 schema drift on timestamps / decimals that are
 /// sometimes stringified and sometimes raw.
 fn de_string_or_number<'de, D>(de: D) -> Result<String, D::Error>
-where D: serde::Deserializer<'de>
+where
+    D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
     let v = serde_json::Value::deserialize(de)?;
@@ -2473,7 +2857,11 @@ fn format_created_at(s: &str) -> String {
         }
     }
     // String ISO → trim to 16 chars.
-    if s.len() >= 16 { s[..16].to_string() } else { s.to_string() }
+    if s.len() >= 16 {
+        s[..16].to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// `hexbot active_orders` — live-order listing, config-aware:
@@ -2498,22 +2886,32 @@ pub fn run_active_orders() -> Result<()> {
         let mut iter = crate::exchange::polymarket::cli_account::cli_args();
         while let Some(a) = iter.next() {
             match a.as_str() {
-                "--host" => { host_override = iter.next(); }
-                "--debug" | "-v" => { debug_flag = true; }
+                "--host" => {
+                    host_override = iter.next();
+                }
+                "--debug" | "-v" => {
+                    debug_flag = true;
+                }
                 _ => positional.push(a),
             }
         }
     }
-    let config_path = positional.into_iter().next()
+    let config_path = positional
+        .into_iter()
+        .next()
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
     let poly_cfg = crate::config::Config::load(std::path::Path::new(&config_path))
         .ok()
         .and_then(|c| c.exchanges.into_iter().find(|e| e.name == "polymarket"));
 
-    let clob_version = poly_cfg.as_ref()
-        .map(|p| p.clob_version.clone()).unwrap_or_default();
-    let configured_url = poly_cfg.as_ref()
-        .map(|p| p.api_url_prefix.clone()).unwrap_or_default();
+    let clob_version = poly_cfg
+        .as_ref()
+        .map(|p| p.clob_version.clone())
+        .unwrap_or_default();
+    let configured_url = poly_cfg
+        .as_ref()
+        .map(|p| p.api_url_prefix.clone())
+        .unwrap_or_default();
 
     // v2 default: only explicit "v1"/"1" → v1; empty/missing → v2.
     let clob_display: &str = match clob_version.as_str() {
@@ -2534,14 +2932,22 @@ pub fn run_active_orders() -> Result<()> {
         .filter(|s| !s.is_empty())
         .cloned()
         .unwrap_or_else(|| {
-            if !configured_url.is_empty() { configured_url } else { CLOB_URL.to_string() }
+            if !configured_url.is_empty() {
+                configured_url
+            } else {
+                CLOB_URL.to_string()
+            }
         });
 
     println!("=== Polymarket Active Orders ===");
     println!("Config:  {}", config_path);
     println!("CLOB:    {}", clob_display);
-    print!  ("API URL: {}", base_url);
-    if host_override.is_some() { println!("  (via --host override)"); } else { println!(); }
+    print!("API URL: {}", base_url);
+    if host_override.is_some() {
+        println!("  (via --host override)");
+    } else {
+        println!();
+    }
     println!();
 
     // `--debug` flag dumps the raw JSON response — useful when our
@@ -2551,8 +2957,9 @@ pub fn run_active_orders() -> Result<()> {
 
     // Paginate /data/orders from the resolved host.
     let mut all_orders: Vec<OpenOrder> = Vec::new();
-    let mut total_raw = 0usize;       // everything the server sent us
-    let mut status_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total_raw = 0usize; // everything the server sent us
+    let mut status_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut cursor = String::new();
     loop {
         let path = if cursor.is_empty() {
@@ -2566,14 +2973,21 @@ pub fn run_active_orders() -> Result<()> {
 
         if debug {
             println!("── Raw response (debug) ───────────────────────");
-            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{:?}", json)));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{:?}", json))
+            );
             println!();
         }
 
         if let Some(data) = json.get("data").and_then(|v| v.as_array()) {
             total_raw += data.len();
             for item in data {
-                let status_raw = item.get("status").and_then(|v| v.as_str()).unwrap_or("<none>").to_string();
+                let status_raw = item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>")
+                    .to_string();
                 *status_counts.entry(status_raw.clone()).or_insert(0) += 1;
                 if let Ok(order) = serde_json::from_value::<OpenOrder>(item.clone()) {
                     // Accept any non-terminal status. Empirically v1 uses
@@ -2582,8 +2996,12 @@ pub fn run_active_orders() -> Result<()> {
                     // real open orders.
                     let terminal = matches!(
                         order.status.to_ascii_uppercase().as_str(),
-                        "MATCHED" | "MATCHED_NOT_BROADCASTED" | "CANCELED" | "CANCELLED"
-                            | "FILLED" | "REJECTED"
+                        "MATCHED"
+                            | "MATCHED_NOT_BROADCASTED"
+                            | "CANCELED"
+                            | "CANCELLED"
+                            | "FILLED"
+                            | "REJECTED"
                     );
                     if !terminal {
                         all_orders.push(order);
@@ -2593,11 +3011,19 @@ pub fn run_active_orders() -> Result<()> {
                 }
             }
         } else if debug {
-            println!("⚠  response has no `data` array — top-level keys: {:?}",
-                json.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
+            println!(
+                "⚠  response has no `data` array — top-level keys: {:?}",
+                json.as_object()
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            );
         }
-        let next = json.get("next_cursor").and_then(|v| v.as_str()).unwrap_or("");
-        if next.is_empty() || next == "LTE=" { break; }
+        let next = json
+            .get("next_cursor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if next.is_empty() || next == "LTE=" {
+            break;
+        }
         cursor = next.to_string();
     }
 
@@ -2625,7 +3051,8 @@ pub fn run_active_orders() -> Result<()> {
     }
 
     // Group by market (condition_id) and resolve titles.
-    let mut market_titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut market_titles: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut grouped: Vec<String> = Vec::new();
     for o in &all_orders {
         if !market_titles.contains_key(&o.market) {
@@ -2637,13 +3064,23 @@ pub fn run_active_orders() -> Result<()> {
     let mut total_orders = 0usize;
     let mut total_notional = 0.0_f64;
     for (gi, market_id) in grouped.iter().enumerate() {
-        if gi > 0 { println!(); }
-        let title = market_titles.get(market_id).map(|s| s.as_str()).unwrap_or("Unknown");
-        let orders: Vec<&OpenOrder> = all_orders.iter().filter(|o| o.market == *market_id).collect();
+        if gi > 0 {
+            println!();
+        }
+        let title = market_titles
+            .get(market_id)
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown");
+        let orders: Vec<&OpenOrder> = all_orders
+            .iter()
+            .filter(|o| o.market == *market_id)
+            .collect();
 
         println!("  {} ({})", title, &market_id[..16.min(market_id.len())]);
-        println!("  {:>4}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>8}  {:<16}",
-            "Side", "Outcome", "Price", "Size", "Matched", "Rem.Not.", "Type", "Created");
+        println!(
+            "  {:>4}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>8}  {:<16}",
+            "Side", "Outcome", "Price", "Size", "Matched", "Rem.Not.", "Type", "Created"
+        );
         println!("  {}", "-".repeat(94));
 
         // One order = one row for the numeric fields + one line above
@@ -2651,16 +3088,20 @@ pub fn run_active_orders() -> Result<()> {
         // copy-paste it directly without reassembling from a truncated
         // prefix. Keeps the numeric table narrow/readable.
         for (ix, o) in orders.iter().enumerate() {
-            let size:    f64 = o.original_size.parse().unwrap_or(0.0);
+            let size: f64 = o.original_size.parse().unwrap_or(0.0);
             let matched: f64 = o.size_matched.parse().unwrap_or(0.0);
-            let price:   f64 = o.price.parse().unwrap_or(0.0);
+            let price: f64 = o.price.parse().unwrap_or(0.0);
             let remaining_notional = (size - matched).max(0.0) * price;
             let created = format_created_at(&o.created_at);
 
-            if ix > 0 { println!(); }
+            if ix > 0 {
+                println!();
+            }
             println!("  OrderID: {}", o.id);
-            println!("  {:>4}  {:>8}  {:>8.4}  {:>10.2}  {:>10.2}  {:>10.4}  {:>8}  {:<16}",
-                o.side, o.outcome, price, size, matched, remaining_notional, o.order_type, created);
+            println!(
+                "  {:>4}  {:>8}  {:>8.4}  {:>10.2}  {:>10.2}  {:>10.4}  {:>8}  {:<16}",
+                o.side, o.outcome, price, size, matched, remaining_notional, o.order_type, created
+            );
             total_notional += remaining_notional;
         }
         total_orders += orders.len();
@@ -2669,7 +3110,9 @@ pub fn run_active_orders() -> Result<()> {
     println!();
     println!(
         "Total: {} active orders across {} markets — notional (remaining, bids) ≈ {:.4}",
-        total_orders, grouped.len(), total_notional,
+        total_orders,
+        grouped.len(),
+        total_notional,
     );
     println!();
     println!("Cancel: `hexbot cancel_order <OrderID>`   or   `hexbot cancel_order --all`");
@@ -2705,28 +3148,38 @@ pub fn run_cancel_order() -> Result<()> {
         .collect();
     let cancel_all = crate::exchange::polymarket::cli_account::cli_args().any(|a| a == "--all");
 
-    let order_id = if cancel_all { None } else {
-        Some(positional.first().cloned().ok_or_else(|| anyhow!(
-            "missing orderID. Usage:\n\
+    let order_id = if cancel_all {
+        None
+    } else {
+        Some(positional.first().cloned().ok_or_else(|| {
+            anyhow!(
+                "missing orderID. Usage:\n\
              \thexbot cancel_order <orderID>\n\
              \thexbot cancel_order --all\n\
              \n\
              Get the orderID column from `hexbot active_orders`."
-        ))?)
+            )
+        })?)
     };
     // Config path: next positional after the orderID (or first
     // positional if --all). Default live_polymaker.toml.
     let cfg_skip = if cancel_all { 0 } else { 1 };
-    let config_path = positional.into_iter().nth(cfg_skip)
+    let config_path = positional
+        .into_iter()
+        .nth(cfg_skip)
         .unwrap_or_else(|| "config/live_polymaker.toml".to_string());
 
     let poly_cfg = crate::config::Config::load(std::path::Path::new(&config_path))
         .ok()
         .and_then(|c| c.exchanges.into_iter().find(|e| e.name == "polymarket"));
-    let clob_version = poly_cfg.as_ref()
-        .map(|p| p.clob_version.clone()).unwrap_or_default();
-    let configured_url = poly_cfg.as_ref()
-        .map(|p| p.api_url_prefix.clone()).unwrap_or_default();
+    let clob_version = poly_cfg
+        .as_ref()
+        .map(|p| p.clob_version.clone())
+        .unwrap_or_default();
+    let configured_url = poly_cfg
+        .as_ref()
+        .map(|p| p.api_url_prefix.clone())
+        .unwrap_or_default();
     // v2 default: only explicit "v1"/"1" → v1; empty/missing → v2.
     let clob_display: &str = match clob_version.as_str() {
         s if s.eq_ignore_ascii_case("v1") || s == "1" => "v1",
@@ -2771,7 +3224,11 @@ pub fn run_cancel_order() -> Result<()> {
     let resp = user_clob_delete(
         url,
         headers,
-        if body_str.is_empty() { None } else { Some(body_str) },
+        if body_str.is_empty() {
+            None
+        } else {
+            Some(body_str)
+        },
     )?;
 
     // Render response — common shape is {canceled: [...], not_canceled: {...}}
@@ -2779,7 +3236,7 @@ pub fn run_cancel_order() -> Result<()> {
     let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
 
     let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
-    let nc_n       = not_canceled.map(|o| o.len()).unwrap_or(0);
+    let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
 
     println!("── Response ──────────────────────────────────────");
     println!("Canceled:     {}", canceled_n);
@@ -2802,7 +3259,10 @@ pub fn run_cancel_order() -> Result<()> {
     if canceled_n == 0 && nc_n == 0 {
         // Schema mismatch — dump raw JSON so operator can inspect
         println!("(Unrecognised response shape — raw JSON:)");
-        println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -2833,8 +3293,8 @@ pub fn run_cancel_orders() -> Result<()> {
         let mut iter = crate::exchange::polymarket::cli_account::cli_args();
         while let Some(a) = iter.next() {
             match a.as_str() {
-                "--file"   => file_path     = iter.next(),
-                "--host"   => host_override = iter.next(),
+                "--file" => file_path = iter.next(),
+                "--host" => host_override = iter.next(),
                 "-h" | "--help" => {
                     eprintln!(
                         "Usage: hexbot cancel_orders <id1> <id2> ...\n\
@@ -2856,7 +3316,9 @@ pub fn run_cancel_orders() -> Result<()> {
         let content = std::fs::read_to_string(p).map_err(|e| anyhow!("read {}: {}", p, e))?;
         for line in content.lines() {
             let l = line.trim();
-            if l.is_empty() || l.starts_with('#') { continue; }
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
             // Accept `OrderID: 0x...` prefix so output of `active_orders`
             // can be piped in directly after a `grep OrderID: | awk '{print $2}'`.
             let id = l.strip_prefix("OrderID:").unwrap_or(l).trim().to_string();
@@ -2878,7 +3340,10 @@ pub fn run_cancel_orders() -> Result<()> {
     }
     for id in &ids {
         if !id.starts_with("0x") || id.len() != 66 {
-            println!("⚠  OrderID `{}` looks malformed (expected 0x + 64 hex); sending anyway", id);
+            println!(
+                "⚠  OrderID `{}` looks malformed (expected 0x + 64 hex); sending anyway",
+                id
+            );
         }
     }
 
@@ -2888,33 +3353,48 @@ pub fn run_cancel_orders() -> Result<()> {
     let poly_cfg = crate::config::Config::load(std::path::Path::new(&config_path))
         .ok()
         .and_then(|c| c.exchanges.into_iter().find(|e| e.name == "polymarket"));
-    let clob_version = poly_cfg.as_ref()
-        .map(|p| p.clob_version.clone()).unwrap_or_default();
-    let configured_url = poly_cfg.as_ref()
-        .map(|p| p.api_url_prefix.clone()).unwrap_or_default();
+    let clob_version = poly_cfg
+        .as_ref()
+        .map(|p| p.clob_version.clone())
+        .unwrap_or_default();
+    let configured_url = poly_cfg
+        .as_ref()
+        .map(|p| p.api_url_prefix.clone())
+        .unwrap_or_default();
     // v2 default: only explicit "v1"/"1" → v1; empty/missing → v2.
     let clob_display: &str = match clob_version.as_str() {
         s if s.eq_ignore_ascii_case("v1") || s == "1" => "v1",
         "v2" | "V2" | "2" | "" => "v2",
         s => s,
     };
-    let base_url = host_override.clone()
+    let base_url = host_override
+        .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            if !configured_url.is_empty() { configured_url } else { CLOB_URL.to_string() }
+            if !configured_url.is_empty() {
+                configured_url
+            } else {
+                CLOB_URL.to_string()
+            }
         });
 
     println!("=== Polymarket Cancel Orders (batch) ===");
     println!("Config:  {}", config_path);
     println!("CLOB:    {}", clob_display);
     print!("API URL: {}", base_url);
-    if host_override.is_some() { println!("  (via --host override)"); } else { println!(); }
+    if host_override.is_some() {
+        println!("  (via --host override)");
+    } else {
+        println!();
+    }
     println!("Orders:  {}", ids.len());
     println!();
 
     // DELETE /orders with body = JSON array of ID strings.
     let body = serde_json::Value::Array(
-        ids.iter().map(|s| serde_json::Value::String(s.clone())).collect()
+        ids.iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
     );
     let body_str = serde_json::to_string(&body)?;
     let headers = auth.sign_request("DELETE", "/orders", &body_str);
@@ -2922,10 +3402,10 @@ pub fn run_cancel_orders() -> Result<()> {
     let resp = user_clob_delete(url, headers, Some(body_str))?;
 
     // Standard response shape: { canceled: [..], not_canceled: {..} }
-    let canceled    = resp.get("canceled").and_then(|v| v.as_array());
-    let not_canceled= resp.get("not_canceled").and_then(|v| v.as_object());
-    let canceled_n  = canceled.map(|a| a.len()).unwrap_or(0);
-    let nc_n        = not_canceled.map(|o| o.len()).unwrap_or(0);
+    let canceled = resp.get("canceled").and_then(|v| v.as_array());
+    let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
+    let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
+    let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
 
     println!("── Response ──────────────────────────────────────");
     println!("Canceled:     {}", canceled_n);
@@ -2947,7 +3427,10 @@ pub fn run_cancel_orders() -> Result<()> {
     }
     if canceled_n == 0 && nc_n == 0 {
         println!("(Unrecognised response shape — raw JSON:)");
-        println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -2962,7 +3445,8 @@ pub fn run_cancel_orders() -> Result<()> {
 /// `match_time` ascending.
 ///
 /// Returns `(funder_address, instrument, trades)`.
-fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<serde_json::Value>)> {
+fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<serde_json::Value>)>
+{
     println!("Enter event slug:");
     print!("> ");
     std::io::stdout().flush()?;
@@ -2977,7 +3461,9 @@ fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<
     // Fetch event and build BinaryOption from the first active market
     // (fall back to the first market if none are marked active).
     let event = super::market::fetch_event_by_slug_with_log(&slug, false)?;
-    let chosen = event.markets.iter()
+    let chosen = event
+        .markets
+        .iter()
         .find(|m| m.active && !m.closed)
         .cloned()
         .or_else(|| event.markets.first().cloned())
@@ -3017,8 +3503,16 @@ fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<
         let (page, next) = if let Some(arr) = json.as_array() {
             (arr.clone(), String::new())
         } else {
-            let data = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let next = json.get("next_cursor").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let data = json
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let next = json
+                .get("next_cursor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             (data, next)
         };
 
@@ -3032,11 +3526,21 @@ fn prompt_and_fetch_trades() -> Result<(String, crate::types::BinaryOption, Vec<
 
     // Sort by match_time ascending (oldest first).
     all_trades.sort_by(|a, b| {
-        let ta = a.get("match_time")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
+        let ta = a
+            .get("match_time")
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
             .unwrap_or(0);
-        let tb = b.get("match_time")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
+        let tb = b
+            .get("match_time")
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
             .unwrap_or(0);
         ta.cmp(&tb)
     });
@@ -3058,15 +3562,30 @@ pub fn run_raw_trades() -> Result<()> {
 /// fee schedule directly from the `BinaryOption` built in `prompt_and_fetch_trades`.
 #[allow(dead_code)]
 fn fetch_market_fee_schedule(condition_id: &str) -> (f64, f64) {
-    let url = format!("{}/markets?condition_id={}&limit=1", GAMMA_API_BASE, condition_id);
+    let url = format!(
+        "{}/markets?condition_id={}&limit=1",
+        GAMMA_API_BASE, condition_id
+    );
     let json = unauth_get_json(&url);
-    let m = json.as_array().and_then(|a| a.first()).cloned().unwrap_or_default();
+    let m = json
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_default();
     let fs = m.get("feeSchedule").cloned().unwrap_or_default();
-    let rate = fs.get("rate")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    let rate = fs
+        .get("rate")
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.0);
-    let exp = fs.get("exponent")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    let exp = fs
+        .get("exponent")
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.0);
     (rate, exp)
 }
@@ -3095,8 +3614,11 @@ pub fn run_trades(verbose: bool) -> Result<()> {
         for trade in &raw_trades {
             println!("{}", serde_json::to_string(trade)?);
         }
-        println!("--- end raw ({} record{}) ---", raw_trades.len(),
-            if raw_trades.len() == 1 { "" } else { "s" });
+        println!(
+            "--- end raw ({} record{}) ---",
+            raw_trades.len(),
+            if raw_trades.len() == 1 { "" } else { "s" }
+        );
         println!();
     }
     let funder_lc = funder.to_lowercase();
@@ -3124,7 +3646,10 @@ pub fn run_trades(verbose: bool) -> Result<()> {
     let round5 = |x: f64| (x * 100_000.0).round() / 100_000.0;
 
     for trade in &raw_trades {
-        let top_maker = trade.get("maker_address").and_then(|v| v.as_str()).unwrap_or("");
+        let top_maker = trade
+            .get("maker_address")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let status = get_str(trade, "status");
         let trade_id = get_str(trade, "id");
         let last_update = get_str(trade, "last_update");
@@ -3144,11 +3669,20 @@ pub fn run_trades(verbose: bool) -> Result<()> {
             let pp = (price.clamp(0.0, 1.0) * (1.0 - price.clamp(0.0, 1.0))).max(0.0);
             let fee_notional = if fee_rate > 0.0 && size > 0.0 {
                 size * fee_rate * pp.powf(fee_exponent)
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             let (usdc_fee_raw, shares_fee_raw) = match side_raw.to_ascii_uppercase().as_str() {
-                "BUY"  => (0.0, if price > 0.0 { fee_notional / price } else { 0.0 }),
+                "BUY" => (
+                    0.0,
+                    if price > 0.0 {
+                        fee_notional / price
+                    } else {
+                        0.0
+                    },
+                ),
                 "SELL" => (fee_notional, 0.0),
-                _      => (0.0, 0.0),
+                _ => (0.0, 0.0),
             };
             let usdc_fee = round5(usdc_fee_raw);
             let shares_fee = round5(shares_fee_raw);
@@ -3175,11 +3709,15 @@ pub fn run_trades(verbose: bool) -> Result<()> {
         } else {
             // User is a MAKER: pull matching entries from maker_orders. Makers pay no fee.
             let empty: Vec<serde_json::Value> = Vec::new();
-            let makers = trade.get("maker_orders")
+            let makers = trade
+                .get("maker_orders")
                 .and_then(|v| v.as_array())
                 .unwrap_or(&empty);
             for mo in makers {
-                let mo_addr = mo.get("maker_address").and_then(|v| v.as_str()).unwrap_or("");
+                let mo_addr = mo
+                    .get("maker_address")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !mo_addr.eq_ignore_ascii_case(&funder_lc) {
                     continue;
                 }
@@ -3214,8 +3752,8 @@ pub fn run_trades(verbose: bool) -> Result<()> {
     }
 
     let tid_w = 36;
-    let ct_w = 19;  // "YYYY-MM-DD HH:MM:SS" (trade match_time)
-    let ts_w = 19;  // "YYYY-MM-DD HH:MM:SS" (last_update)
+    let ct_w = 19; // "YYYY-MM-DD HH:MM:SS" (trade match_time)
+    let ts_w = 19; // "YYYY-MM-DD HH:MM:SS" (last_update)
     let role_w = 5;
     let side_w = 4;
     let outcome_w = 8;
@@ -3230,8 +3768,29 @@ pub fn run_trades(verbose: bool) -> Result<()> {
     // recent orders without overwhelming the table width. The full
     // hash is available via `hexbot trades -v` (raw JSON dump).
     let oid_w = 20;
-    let total_w = tid_w + 2 + ct_w + 2 + ts_w + 2 + role_w + 2 + side_w + 2 + outcome_w + 2
-        + price_w + 2 + size_w + 2 + ufee_w + 2 + sfee_w + 2 + status_w + 2 + oid_w;
+    let total_w = tid_w
+        + 2
+        + ct_w
+        + 2
+        + ts_w
+        + 2
+        + role_w
+        + 2
+        + side_w
+        + 2
+        + outcome_w
+        + 2
+        + price_w
+        + 2
+        + size_w
+        + 2
+        + ufee_w
+        + 2
+        + sfee_w
+        + 2
+        + status_w
+        + 2
+        + oid_w;
 
     println!(
         "{:<tid$}  {:<ct$}  {:<ts$}  {:<role$}  {:<side$}  {:<outcome$}  {:>price$}  {:>size$}  {:>ufee$}  {:>sfee$}  {:<status$}  {:<oid$}",
@@ -3258,7 +3817,9 @@ pub fn run_trades(verbose: bool) -> Result<()> {
         }
     };
     let truncate = |s: &str, w: usize| -> String {
-        if s.chars().count() <= w { s.to_string() } else {
+        if s.chars().count() <= w {
+            s.to_string()
+        } else {
             let take = w.saturating_sub(1);
             let head: String = s.chars().take(take).collect();
             format!("{}…", head)
@@ -3271,25 +3832,27 @@ pub fn run_trades(verbose: bool) -> Result<()> {
             serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
             _ => 0,
         };
-        if secs == 0 { return String::new(); }
+        if secs == 0 {
+            return String::new();
+        }
         chrono::DateTime::from_timestamp(secs, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default()
     };
 
     for rec in &parsed {
-        let tid     = stringify(&rec["trade_id"]);
-        let ct      = format_ts(&rec["match_time"]);
-        let ts      = format_ts(&rec["last_update"]);
-        let role    = stringify(&rec["role"]);
-        let side    = stringify(&rec["side"]);
+        let tid = stringify(&rec["trade_id"]);
+        let ct = format_ts(&rec["match_time"]);
+        let ts = format_ts(&rec["last_update"]);
+        let role = stringify(&rec["role"]);
+        let side = stringify(&rec["side"]);
         let outcome = stringify(&rec["outcome"]);
-        let price   = parse_f(&rec["price"]);
-        let size    = parse_f(&rec["size"]);
-        let ufee    = parse_f(&rec["usdc_fee"]);
-        let sfee    = parse_f(&rec["shares_fee"]);
-        let status  = stringify(&rec["status"]);
-        let oid     = stringify(&rec["order_id"]);
+        let price = parse_f(&rec["price"]);
+        let size = parse_f(&rec["size"]);
+        let ufee = parse_f(&rec["usdc_fee"]);
+        let sfee = parse_f(&rec["shares_fee"]);
+        let status = stringify(&rec["status"]);
+        let oid = stringify(&rec["order_id"]);
 
         println!(
             "{:<tid$}  {:<ct$}  {:<ts$}  {:<role$}  {:<side$}  {:<outcome$}  {:>price$.4}  {:>size$.5}  {:>ufee$.5}  {:>sfee$.5}  {:<status$}  {:<oid$}",
@@ -3316,13 +3879,20 @@ pub fn run_trades(verbose: bool) -> Result<()> {
     // Cumulative position summary by outcome (net = BUY - SELL), with total fees.
     // Preserve first-seen order of outcomes for stable, readable output.
     #[derive(Default, Clone, Copy)]
-    struct OutcomeAgg { buy: f64, sell: f64, usdc_fee: f64, shares_fee: f64 }
+    struct OutcomeAgg {
+        buy: f64,
+        sell: f64,
+        usdc_fee: f64,
+        shares_fee: f64,
+    }
     let mut outcome_order: Vec<String> = Vec::new();
     let mut by_outcome: std::collections::HashMap<String, OutcomeAgg> =
         std::collections::HashMap::new();
     for rec in &parsed {
         let outcome = stringify(&rec["outcome"]);
-        if outcome.is_empty() { continue; }
+        if outcome.is_empty() {
+            continue;
+        }
         let side = stringify(&rec["side"]).to_ascii_uppercase();
         let size = parse_f(&rec["size"]);
         let ufee = parse_f(&rec["usdc_fee"]);
@@ -3357,12 +3927,18 @@ pub fn run_trades(verbose: bool) -> Result<()> {
 
 /// Fetch event/market title from Gamma API by condition_id.
 fn fetch_market_title(condition_id: &str) -> String {
-    let url = format!("https://gamma-api.polymarket.com/markets?condition_id={}&limit=1", condition_id);
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?condition_id={}&limit=1",
+        condition_id
+    );
     let json = unauth_get_json(&url);
     if let Some(arr) = json.as_array() {
         if let Some(m) = arr.first() {
-            return m.get("question").and_then(|v| v.as_str())
-                .unwrap_or("Unknown").to_string();
+            return m
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
         }
     }
     "Unknown".to_string()
@@ -3420,11 +3996,10 @@ impl RedeemResult {
     }
 }
 
-fn record_confirmed_redeem_legs(
-    result: &mut RedeemResult,
-    legs: Option<&Vec<&PositionRecord>>,
-) {
-    let Some(legs) = legs else { return; };
+fn record_confirmed_redeem_legs(result: &mut RedeemResult, legs: Option<&Vec<&PositionRecord>>) {
+    let Some(legs) = legs else {
+        return;
+    };
     for position in legs {
         if !position.asset.is_empty() && position.size > 0.0 {
             result.confirmed_legs.push((
@@ -3453,12 +4028,18 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
     log::info!(
         "[Maintenance] Redeem target: {} ({}, collateral={})",
         target_contract,
-        if is_v2 { "v2 CtfCollateralAdapter" } else { "v1 CTF" },
+        if is_v2 {
+            "v2 CtfCollateralAdapter"
+        } else {
+            "v1 CTF"
+        },
         collateral_token,
     );
     log::info!("[Maintenance] Step 1/2: Redeem matured positions");
     // POLY_1271 holds positions in the deposit wallet, not the Safe.
-    let redeem_addr = wallet.deposit_wallet_active().unwrap_or(&wallet.safe_address);
+    let redeem_addr = wallet
+        .deposit_wallet_active()
+        .unwrap_or(&wallet.safe_address);
     let url = format!(
         "{}/positions?user={}&sizeThreshold=0&limit=500",
         DATA_API_BASE, redeem_addr,
@@ -3527,32 +4108,50 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
 
     // ── Pre-redeem listing (mirrors `hexbot redeem` CLI table) ──
     let mut total_value = 0.0;
-    log::info!("[Maintenance] Found {} redeemable condition(s):", condition_ids.len());
+    log::info!(
+        "[Maintenance] Found {} redeemable condition(s):",
+        condition_ids.len()
+    );
     log::info!(
         "[Maintenance]   {:>3}  {:<46} {:>8} {:>8} {:>10}",
-        "#", "Market", "Outcome", "Size", "Value",
+        "#",
+        "Market",
+        "Outcome",
+        "Size",
+        "Value",
     );
     for (idx, cid) in condition_ids.iter().enumerate() {
         // Closed-scan cids have no open-feed legs in `grouped` — already logged
         // above; skip the per-leg table rows (and don't panic on the index).
-        let Some(legs) = grouped.get(cid) else { continue };
+        let Some(legs) = grouped.get(cid) else {
+            continue;
+        };
         for (j, p) in legs.iter().enumerate() {
             let title = if p.title.len() > 44 {
                 format!("{}...", &p.title[..41])
             } else {
                 p.title.clone()
             };
-            let num = if j == 0 { format!("{}", idx + 1) } else { String::new() };
+            let num = if j == 0 {
+                format!("{}", idx + 1)
+            } else {
+                String::new()
+            };
             log::info!(
                 "[Maintenance]   {:>3}  {:<46} {:>8} {:>8.2} {:>10.4}",
-                num, title, p.outcome, p.size, p.current_value,
+                num,
+                title,
+                p.outcome,
+                p.size,
+                p.current_value,
             );
             total_value += p.current_value;
         }
     }
     log::info!(
         "[Maintenance]   Total: {:.4} USDC across {} condition(s)",
-        total_value, condition_ids.len(),
+        total_value,
+        condition_ids.len(),
     );
 
     for (i, cid) in condition_ids.iter().enumerate() {
@@ -3561,15 +4160,21 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
         // POLY_1271: redeem FROM the deposit wallet via WALLET batch.
         if let Some(dw) = wallet.deposit_wallet_active() {
             match super::deposit_wallet::dw_redeem(
-                &wallet.signing_key, &wallet.signer_address, dw,
-                &wallet.builder_auth, cid,
+                &wallet.signing_key,
+                &wallet.signer_address,
+                dw,
+                &wallet.builder_auth,
+                cid,
             ) {
                 Ok(tx) => {
                     result.confirmed += 1;
                     record_confirmed_redeem_legs(&mut result, grouped.get(cid));
                     log::info!(
                         "[Maintenance] DW redeem [{}/{}] cid={} done tx={}",
-                        i + 1, condition_ids.len(), cid_short, tx,
+                        i + 1,
+                        condition_ids.len(),
+                        cid_short,
+                        tx,
                     );
                 }
                 Err(e) => {
@@ -3591,12 +4196,12 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
         let mut calldata = Vec::with_capacity(4 + 32 * 7);
         calldata.extend_from_slice(&REDEEM_SELECTOR);
         calldata.extend_from_slice(&address_to_bytes32(collateral_token));
-        calldata.extend_from_slice(&[0u8; 32]);    // parentCollectionId = 0
-        calldata.extend_from_slice(&cid_padded);   // conditionId
+        calldata.extend_from_slice(&[0u8; 32]); // parentCollectionId = 0
+        calldata.extend_from_slice(&cid_padded); // conditionId
         calldata.extend_from_slice(&u256_bytes(128)); // offset to indexSets
-        calldata.extend_from_slice(&u256_bytes(2));   // length = 2
-        calldata.extend_from_slice(&u256_bytes(1));   // indexSets[0] = 1
-        calldata.extend_from_slice(&u256_bytes(2));   // indexSets[1] = 2
+        calldata.extend_from_slice(&u256_bytes(2)); // length = 2
+        calldata.extend_from_slice(&u256_bytes(1)); // indexSets[0] = 1
+        calldata.extend_from_slice(&u256_bytes(2)); // indexSets[1] = 2
         let data_hex = format!("0x{}", hex::encode(&calldata));
 
         // Submit. Dispatch by account kind:
@@ -3635,9 +4240,12 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
             }
         } else {
             match submit_safe_tx_with_id(
-                &wallet.builder_auth, &wallet.signing_key,
-                &wallet.signer_address, &wallet.safe_address,
-                target_contract, &data_hex,
+                &wallet.builder_auth,
+                &wallet.signing_key,
+                &wallet.signer_address,
+                &wallet.safe_address,
+                target_contract,
+                &data_hex,
                 gas_via_signer,
             ) {
                 Ok(pair) => Ok(pair),
@@ -3655,11 +4263,17 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
                         Ok((s, h)) => {
                             final_state = s.clone();
                             tx_hash = h;
-                            if s.contains("CONFIRMED") || s.contains("MINED") || s.contains("FAILED") {
+                            if s.contains("CONFIRMED")
+                                || s.contains("MINED")
+                                || s.contains("FAILED")
+                            {
                                 break;
                             }
                         }
-                        Err(e) => { log::warn!("[Maintenance] Redeem poll error: {}", e); break; }
+                        Err(e) => {
+                            log::warn!("[Maintenance] Redeem poll error: {}", e);
+                            break;
+                        }
                     }
                 }
                 if final_state.contains("CONFIRMED") || final_state.contains("MINED") {
@@ -3667,18 +4281,25 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
                     record_confirmed_redeem_legs(&mut result, grouped.get(cid));
                     log::info!(
                         "[Maintenance] Redeem [{}/{}] cid={} done tx=0x{}",
-                        i + 1, condition_ids.len(), cid_short, tx_hash.trim_start_matches("0x"),
+                        i + 1,
+                        condition_ids.len(),
+                        cid_short,
+                        tx_hash.trim_start_matches("0x"),
                     );
                 } else {
                     result.pending_timeout += 1;
                     if result.first_failure.is_none() {
                         result.first_failure = Some(format!(
-                            "cid={} pending_timeout final_state={}", cid_short, final_state,
+                            "cid={} pending_timeout final_state={}",
+                            cid_short, final_state,
                         ));
                     }
                     log::warn!(
                         "[Maintenance] Redeem [{}/{}] cid={} final_state={}",
-                        i + 1, condition_ids.len(), cid_short, final_state,
+                        i + 1,
+                        condition_ids.len(),
+                        cid_short,
+                        final_state,
                     );
                 }
             }
@@ -3687,7 +4308,11 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
                 if result.first_failure.is_none() {
                     result.first_failure = Some(format!("cid={} submit_failed: {}", cid_short, e));
                 }
-                log::warn!("[Maintenance] Redeem submit failed cid={}: {}", cid_short, e);
+                log::warn!(
+                    "[Maintenance] Redeem submit failed cid={}: {}",
+                    cid_short,
+                    e
+                );
             }
         }
     }
@@ -3728,7 +4353,10 @@ fn recover_pending_maintenance_operations(
         MaintenanceOperationKind, MaintenanceOperationStatus,
     };
 
-    for operation in account.pending_maintenance_operations() {
+    let pending = account
+        .try_pending_maintenance_operations()
+        .map_err(|error| format!("retryable account-owner maintenance snapshot: {error}"))?;
+    for operation in pending {
         let tx_id = if let Some(tx_id) = operation.tx_id.clone() {
             tx_id
         } else if operation.kind == MaintenanceOperationKind::Split {
@@ -3737,31 +4365,44 @@ fn recover_pending_maintenance_operations(
                     "operation {} was durably reserved without a tx id and is not a DW split",
                     operation.operation_id,
                 );
-                account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+                account
+                    .mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
                 return Err(reason);
             };
             let total: f64 = operation.allocations.values().copied().sum();
             let amount_wei = (total * 1_000_000.0).round().max(0.0) as u128;
             let recovered = super::deposit_wallet::recover_dw_split_job_id(
-                &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
-                &operation.condition_id, amount_wei, &operation.operation_id,
-            ).map_err(|error| format!(
-                "query DW split job for operation {}: {error}", operation.operation_id,
-            ))?;
+                &wallet.builder_auth,
+                &wallet.signer_address,
+                deposit_wallet,
+                &operation.condition_id,
+                amount_wei,
+                &operation.operation_id,
+            )
+            .map_err(|error| {
+                format!(
+                    "query DW split job for operation {}: {error}",
+                    operation.operation_id,
+                )
+            })?;
             let Some(tx_id) = recovered else {
                 let reason = format!(
                     "operation {} has no persisted tx id and no exact relayer job or on-chain DW split event matched",
                     operation.operation_id,
                 );
-                account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
+                account
+                    .mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
                 return Err(reason);
             };
-            account.mark_maintenance_operation_submitted(&operation.operation_id, &tx_id)
+            account
+                .mark_maintenance_operation_submitted(&operation.operation_id, &tx_id)
                 .and_then(|_| account.flush_persistence(std::time::Duration::from_secs(2)))
-                .map_err(|error| format!(
-                    "persist recovered DW job {} for operation {}: {error}",
-                    tx_id, operation.operation_id,
-                ))?;
+                .map_err(|error| {
+                    format!(
+                        "persist recovered DW job {} for operation {}: {error}",
+                        tx_id, operation.operation_id,
+                    )
+                })?;
             log::warn!(
                 "[Maintenance] recovered missing DW finality id operation={} tx={} by exact operation fingerprint",
                 operation.operation_id, tx_id,
@@ -3785,13 +4426,19 @@ fn recover_pending_maintenance_operations(
                 account.flush_persistence(std::time::Duration::from_secs(2))?;
                 log::warn!(
                     "[Maintenance] recovered {} {:?} tx={} as FAILED: {}",
-                    operation.operation_id, operation.kind, tx_id, error,
+                    operation.operation_id,
+                    operation.kind,
+                    tx_id,
+                    error,
                 );
                 continue;
             }
-            Err(error) => return Err(format!(
-                "poll recovered operation {}: {error}", operation.operation_id,
-            )),
+            Err(error) => {
+                return Err(format!(
+                    "poll recovered operation {}: {error}",
+                    operation.operation_id,
+                ))
+            }
         };
         if state.contains("CONFIRMED") {
             account
@@ -3827,8 +4474,7 @@ fn recover_pending_maintenance_operations(
         }
         let reason = format!(
             "recovered operation {} tx={} remains state={state}",
-            operation.operation_id,
-            tx_id,
+            operation.operation_id, tx_id,
         );
         if operation.status != MaintenanceOperationStatus::Uncertain {
             account.mark_maintenance_operation_uncertain(&operation.operation_id, reason.clone());
@@ -3861,7 +4507,10 @@ pub fn recover_registered_account_maintenance_operations(
             account_id,
         );
     }
-    let pending = account.pending_maintenance_operations().len();
+    let pending = account
+        .try_pending_maintenance_operations()
+        .map_err(|error| anyhow!("retryable account-owner maintenance snapshot: {error}"))?
+        .len();
     if pending == 0 {
         return Ok(repaired_blockers);
     }
@@ -3883,10 +4532,16 @@ fn run_split_one(
     amount_usdc: f64,
     min_safety_balance_usdc: f64,
     gas_via_signer: bool,
-    journal: Option<(&hexagent_account::account::shared_account::SharedAccount, &str)>,
+    journal: Option<(
+        &hexagent_account::account::shared_account::SharedAccount,
+        &str,
+    )>,
 ) -> SplitOutcome {
     if amount_usdc <= 0.0 {
-        log::info!("[Maintenance] Split disabled (amount_usdc={}).", amount_usdc);
+        log::info!(
+            "[Maintenance] Split disabled (amount_usdc={}).",
+            amount_usdc
+        );
         return SplitOutcome::Skipped(format!("amount_usdc={}", amount_usdc));
     }
 
@@ -3901,10 +4556,14 @@ fn run_split_one(
             log::warn!(
                 "[Maintenance] [ALERT] DW split skipped: pUSD {:.4} on {} < floor {:.4} \
                  (requested {:.4}) — next event PROBE until topped up.",
-                balance, &dw[..10.min(dw.len())], effective_floor, amount_usdc,
+                balance,
+                &dw[..10.min(dw.len())],
+                effective_floor,
+                amount_usdc,
             );
             return SplitOutcome::Skipped(format!(
-                "DW pUSD {:.4} < floor {:.4}", balance, effective_floor
+                "DW pUSD {:.4} < floor {:.4}",
+                balance, effective_floor
             ));
         }
         let amount_wei: u128 = (amount_usdc * 1_000_000.0).round().max(0.0) as u128;
@@ -3913,26 +4572,38 @@ fn run_split_one(
         }
         log::info!(
             "[Maintenance] DW split: cid={} amount_usdc={:.4} (pUSD={:.4}) via WALLET batch",
-            cid_short, amount_usdc, balance,
+            cid_short,
+            amount_usdc,
+            balance,
         );
         let mut accepted_tx_id = None;
         let result = super::deposit_wallet::dw_split(
-            &wallet.signing_key, &wallet.signer_address, dw,
-            &wallet.builder_auth, condition_id, amount_wei,
+            &wallet.signing_key,
+            &wallet.signer_address,
+            dw,
+            &wallet.builder_auth,
+            condition_id,
+            amount_wei,
             |tx_id| {
                 accepted_tx_id = Some(tx_id.to_string());
                 let Some((account, operation_id)) = journal else {
                     return Ok(());
                 };
-                account.mark_maintenance_operation_submitted(operation_id, tx_id)
+                account
+                    .mark_maintenance_operation_submitted(operation_id, tx_id)
                     .map_err(anyhow::Error::msg)?;
-                account.flush_persistence(std::time::Duration::from_secs(2))
+                account
+                    .flush_persistence(std::time::Duration::from_secs(2))
                     .map_err(anyhow::Error::msg)
             },
         );
         return match result {
             Ok(tx) => {
-                log::info!("[Maintenance] DW split confirmed cid={} tx={}", cid_short, tx);
+                log::info!(
+                    "[Maintenance] DW split confirmed cid={} tx={}",
+                    cid_short,
+                    tx
+                );
                 SplitOutcome::Confirmed
             }
             Err(error) if accepted_tx_id.is_some() => {
@@ -3946,9 +4617,14 @@ fn run_split_one(
                 }
                 log::warn!(
                     "[Maintenance] DW split accepted but not committed cid={} tx={}: {}",
-                    cid_short, tx_id, error,
+                    cid_short,
+                    tx_id,
+                    error,
                 );
-                SplitOutcome::PendingTimeout { reason: error.to_string(), tx_id }
+                SplitOutcome::PendingTimeout {
+                    reason: error.to_string(),
+                    tx_id,
+                }
             }
             Err(e) => {
                 log::warn!("[Maintenance] DW split failed cid={}: {}", cid_short, e);
@@ -3963,7 +4639,11 @@ fn run_split_one(
     log::info!(
         "[Maintenance] Split target: {} ({}, collateral={})",
         target_contract,
-        if is_v2 { "v2 CtfCollateralAdapter" } else { "v1 CTF" },
+        if is_v2 {
+            "v2 CtfCollateralAdapter"
+        } else {
+            "v1 CTF"
+        },
         collateral_token,
     );
 
@@ -4027,9 +4707,11 @@ fn run_split_one(
                 "[ALERT] Split skipped: {} balance {:.4} on safe {} below safety floor {:.4} \
                  (requested split {:.4} — chain would succeed but operator threshold tripped, \
                  forcing next event PROBE until wallet is topped up)",
-                token_name, balance,
+                token_name,
+                balance,
                 &wallet.safe_address[..10.min(wallet.safe_address.len())],
-                min_safety_balance_usdc, amount_usdc,
+                min_safety_balance_usdc,
+                amount_usdc,
             )
         };
         log::warn!("[Maintenance] {}", alert);
@@ -4046,33 +4728,33 @@ fn run_split_one(
         return SplitOutcome::Skipped("amount_wei=0".to_string());
     }
 
-    let cid_bytes = hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id))
-        .unwrap_or_default();
+    let cid_bytes =
+        hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id)).unwrap_or_default();
     let mut cid_padded = [0u8; 32];
     let start = 32 - cid_bytes.len().min(32);
     cid_padded[start..].copy_from_slice(&cid_bytes[..cid_bytes.len().min(32)]);
 
     // splitPosition(address,bytes32,bytes32,uint256[],uint256)
     //  head = 5 slots (160 bytes); partition tail = 3 slots (96 bytes)
-    let selector = compute_selector(
-        "splitPosition(address,bytes32,bytes32,uint256[],uint256)",
-    );
+    let selector = compute_selector("splitPosition(address,bytes32,bytes32,uint256[],uint256)");
     let mut calldata = Vec::with_capacity(4 + 32 * 8);
     calldata.extend_from_slice(&selector);
-    calldata.extend_from_slice(&address_to_bytes32(collateral_token));   // collateralToken (pUSD in v2)
-    calldata.extend_from_slice(&[0u8; 32]);                               // parentCollectionId = 0
-    calldata.extend_from_slice(&cid_padded);                              // conditionId
-    calldata.extend_from_slice(&u256_bytes(160));                         // offset to partition (5*32)
-    calldata.extend_from_slice(&u256_bytes(amount_wei));                  // amount (USDC wei; 6-dec)
-    calldata.extend_from_slice(&u256_bytes(2));                           // partition.length = 2
-    calldata.extend_from_slice(&u256_bytes(1));                           // partition[0] = 1 (Up)
-    calldata.extend_from_slice(&u256_bytes(2));                           // partition[1] = 2 (Down)
+    calldata.extend_from_slice(&address_to_bytes32(collateral_token)); // collateralToken (pUSD in v2)
+    calldata.extend_from_slice(&[0u8; 32]); // parentCollectionId = 0
+    calldata.extend_from_slice(&cid_padded); // conditionId
+    calldata.extend_from_slice(&u256_bytes(160)); // offset to partition (5*32)
+    calldata.extend_from_slice(&u256_bytes(amount_wei)); // amount (USDC wei; 6-dec)
+    calldata.extend_from_slice(&u256_bytes(2)); // partition.length = 2
+    calldata.extend_from_slice(&u256_bytes(1)); // partition[0] = 1 (Up)
+    calldata.extend_from_slice(&u256_bytes(2)); // partition[1] = 2 (Down)
     let data_hex = format!("0x{}", hex::encode(&calldata));
 
     let cid_short: String = condition_id.chars().take(16).collect();
     log::info!(
         "[Maintenance] Split request: cid={} amount_usdc={:.4} (balance={:.4})",
-        cid_short, amount_usdc, balance,
+        cid_short,
+        amount_usdc,
+        balance,
     );
 
     // EOA (signatureType=0) splits by calling `target_contract` DIRECTLY
@@ -4104,9 +4786,12 @@ fn run_split_one(
         }
     } else {
         match submit_safe_tx_with_id(
-            &wallet.builder_auth, &wallet.signing_key,
-            &wallet.signer_address, &wallet.safe_address,
-            target_contract, &data_hex,
+            &wallet.builder_auth,
+            &wallet.signing_key,
+            &wallet.signer_address,
+            &wallet.safe_address,
+            target_contract,
+            &data_hex,
             gas_via_signer,
         ) {
             Ok(pair) => Ok(pair),
@@ -4119,10 +4804,7 @@ fn run_split_one(
             if let Some((account, operation_id)) = journal {
                 let persisted = account
                     .mark_maintenance_operation_submitted(operation_id, &tx_id)
-                    .and_then(|_| {
-                        account
-                            .flush_persistence(std::time::Duration::from_secs(2))
-                    });
+                    .and_then(|_| account.flush_persistence(std::time::Duration::from_secs(2)));
                 if let Err(error) = persisted {
                     account.mark_maintenance_operation_uncertain(
                         operation_id,
@@ -4146,19 +4828,24 @@ fn run_split_one(
                             break;
                         }
                     }
-                    Err(e) => { log::warn!("[Maintenance] Split poll error: {}", e); break; }
+                    Err(e) => {
+                        log::warn!("[Maintenance] Split poll error: {}", e);
+                        break;
+                    }
                 }
             }
             if final_state.contains("CONFIRMED") || final_state.contains("MINED") {
                 log::info!(
                     "[Maintenance] Split cid={} done tx=0x{}",
-                    cid_short, tx_hash.trim_start_matches("0x"),
+                    cid_short,
+                    tx_hash.trim_start_matches("0x"),
                 );
                 SplitOutcome::Confirmed
             } else {
                 log::warn!(
                     "[Maintenance] Split cid={} final_state={}",
-                    cid_short, final_state,
+                    cid_short,
+                    final_state,
                 );
                 SplitOutcome::PendingTimeout {
                     reason: format!("final_state={}", final_state),
@@ -4236,9 +4923,8 @@ pub struct MaintenanceJob {
     pub instance_id: String,
     /// Shared account ledger used to reserve per-instance cash and apply the
     /// confirmed aggregate split back to the exact virtual owners.
-    pub account_state: Option<std::sync::Arc<
-        hexagent_account::account::shared_account::SharedAccount,
-    >>,
+    pub account_state:
+        Option<std::sync::Arc<hexagent_account::account::shared_account::SharedAccount>>,
 }
 
 // ── Global maintenance executor ──
@@ -4255,13 +4941,13 @@ type MaintenanceQueueItem = (
 );
 
 static MAINTENANCE_QUEUES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>,
+    >,
 > = std::sync::OnceLock::new();
 
-const MAINTENANCE_COALESCE_IDLE: std::time::Duration =
-    std::time::Duration::from_millis(250);
-const MAINTENANCE_COALESCE_MAX: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const MAINTENANCE_COALESCE_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+const MAINTENANCE_COALESCE_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// One account can have only a bounded number of event-boundary operations in
 /// flight. Overflow fails the requesting strategy closed instead of allowing
 /// a slow chain RPC to grow process memory without limit.
@@ -4278,7 +4964,9 @@ static ACCOUNT_MAINTENANCE_LOCKS: std::sync::OnceLock<
 fn account_maintenance_lock(account_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     let locks = ACCOUNT_MAINTENANCE_LOCKS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(account_id.to_string())
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
         .clone()
@@ -4294,13 +4982,17 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         *s.lock().unwrap() = MaintenanceStatus::Running;
     }
     let account = job.account_id.clone();
-    let queues = MAINTENANCE_QUEUES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let queues =
+        MAINTENANCE_QUEUES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = queues.lock().unwrap();
     let tx = map.entry(account.clone()).or_insert_with(|| {
         let (tx, rx) =
             crossbeam_channel::bounded::<MaintenanceQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
-        let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        let worker_label = if account.is_empty() {
+            "env".to_string()
+        } else {
+            account.clone()
+        };
         let worker_name = format!("poly-maint-{}", worker_label);
         std::thread::Builder::new()
             .name(worker_name.clone())
@@ -4320,8 +5012,8 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
                     let mut burst = vec![first];
                     let burst_started = std::time::Instant::now();
                     while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
-                        let remaining = MAINTENANCE_COALESCE_MAX
-                            .saturating_sub(burst_started.elapsed());
+                        let remaining =
+                            MAINTENANCE_COALESCE_MAX.saturating_sub(burst_started.elapsed());
                         match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
                             Ok(next) => burst.push(next),
                             Err(_) => break,
@@ -4336,13 +5028,16 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
                         }
                         let before = burst.len();
                         burst.extend(rx.try_iter());
-                        if burst.len() == before { break; }
+                        if burst.len() == before {
+                            break;
+                        }
                     }
                     let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
                     for item in burst {
-                        if let Some(group) = groups.iter_mut().find(|group| {
-                            maintenance_jobs_share_target(&group[0].0, &item.0)
-                        }) {
+                        if let Some(group) = groups
+                            .iter_mut()
+                            .find(|group| maintenance_jobs_share_target(&group[0].0, &item.0))
+                        {
                             group.push(item);
                         } else {
                             groups.push(vec![item]);
@@ -4352,7 +5047,9 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
                     for mut group in groups {
                         let wants_redeem = group.iter().any(|item| item.0.redeem_enabled);
                         if redeem_claimed {
-                            for item in &mut group { item.0.redeem_enabled = false; }
+                            for item in &mut group {
+                                item.0.redeem_enabled = false;
+                            }
                         } else if wants_redeem {
                             redeem_claimed = true;
                         }
@@ -4378,7 +5075,9 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         };
         let (job, done, _) = item;
         if let Some(status) = &job.status {
-            *status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            *status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 MaintenanceStatus::SplitFailedOrPending {
                     reason: reason.clone(),
                 };
@@ -4386,7 +5085,11 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         if let Some(done) = done {
             let _ = done.try_send(());
         }
-        log::warn!("[Maintenance] enqueue rejected account={}: {}", account, reason);
+        log::warn!(
+            "[Maintenance] enqueue rejected account={}: {}",
+            account,
+            reason
+        );
     }
 }
 
@@ -4444,10 +5147,16 @@ fn unix_now_secs() -> u64 {
 }
 
 fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
-    if job.split_target_condition_id.as_deref().is_some_and(|cid| !cid.is_empty()) {
+    if job
+        .split_target_condition_id
+        .as_deref()
+        .is_some_and(|cid| !cid.is_empty())
+    {
         return;
     }
-    let Some(series_id) = job.split_series_id.as_deref() else { return; };
+    let Some(series_id) = job.split_series_id.as_deref() else {
+        return;
+    };
     match cached_maintenance_split_target(
         series_id,
         job.split_end_date_min_secs,
@@ -4508,10 +5217,15 @@ fn cached_maintenance_split_target(
         expected_duration_secs,
     );
     let (cache, ready) = MAINTENANCE_TARGET_CACHE.get_or_init(|| {
-        (std::sync::Mutex::new(std::collections::HashMap::new()), std::sync::Condvar::new())
+        (
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+            std::sync::Condvar::new(),
+        )
     });
     loop {
-        let mut entries = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         entries.retain(|_, entry| match entry {
             MaintenanceTargetCacheEntry::Fetching => true,
             MaintenanceTargetCacheEntry::Ready { fetched_at, target } => {
@@ -4526,7 +5240,11 @@ fn cached_maintenance_split_target(
         match entries.get(&key) {
             Some(MaintenanceTargetCacheEntry::Ready { target, .. }) => return Ok(target.clone()),
             Some(MaintenanceTargetCacheEntry::Fetching) => {
-                drop(ready.wait(entries).unwrap_or_else(|poisoned| poisoned.into_inner()));
+                drop(
+                    ready
+                        .wait(entries)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
                 continue;
             }
             None => {
@@ -4547,29 +5265,36 @@ fn cached_maintenance_split_target(
         }
         _ => super::market::fetch_next_event(series_id, end_date_min_secs),
     }
-        .map_err(|error| error.to_string())
-        .map(|event| {
-            event.and_then(|event| {
-                event.markets.first()
-                    .filter(|market| !market.condition_id.is_empty())
-                    .map(|market| ResolvedMaintenanceTarget {
-                        condition_id: market.condition_id.clone(),
-                        token_ids: market.clob_token_ids.clone(),
-                        execute_before_secs: chrono::DateTime::parse_from_rfc3339(
-                            &market.event_start_time,
-                        )
-                        .ok()
-                        .and_then(|start| u64::try_from(start.timestamp()).ok()),
-                    })
-            })
-        });
-    let mut entries = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    .map_err(|error| error.to_string())
+    .map(|event| {
+        event.and_then(|event| {
+            event
+                .markets
+                .first()
+                .filter(|market| !market.condition_id.is_empty())
+                .map(|market| ResolvedMaintenanceTarget {
+                    condition_id: market.condition_id.clone(),
+                    token_ids: market.clob_token_ids.clone(),
+                    execute_before_secs: chrono::DateTime::parse_from_rfc3339(
+                        &market.event_start_time,
+                    )
+                    .ok()
+                    .and_then(|start| u64::try_from(start.timestamp()).ok()),
+                })
+        })
+    });
+    let mut entries = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match &fetched {
         Ok(target) => {
-            entries.insert(key, MaintenanceTargetCacheEntry::Ready {
-                fetched_at: std::time::Instant::now(),
-                target: target.clone(),
-            });
+            entries.insert(
+                key,
+                MaintenanceTargetCacheEntry::Ready {
+                    fetched_at: std::time::Instant::now(),
+                    target: target.clone(),
+                },
+            );
         }
         Err(_) => {
             entries.remove(&key);
@@ -4600,7 +5325,9 @@ pub fn run_maintenance_blocking(job: MaintenanceJob) {
 /// status. Body is unchanged from the former `spawn_maintenance_thread`
 /// closure (now driven by the executor instead of a per-call thread).
 fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
-    if items.is_empty() { return; }
+    if items.is_empty() {
+        return;
+    }
     for (item, _, enqueued_at) in &items {
         if let Some(account) = &item.account_state {
             account.record_maintenance_queue_wait(enqueued_at.elapsed());
@@ -4608,8 +5335,7 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     }
     let (mut job, first_done, _) = items.remove(0);
     let mut done = vec![first_done];
-    let mut statuses: Vec<MaintenanceStatusHandle> =
-        job.status.iter().cloned().collect();
+    let mut statuses: Vec<MaintenanceStatusHandle> = job.status.iter().cloned().collect();
     let mut inventory_ready_subscribers: Vec<(String, f64, InventoryReadySender)> = job
         .inventory_ready_tx
         .take()
@@ -4622,7 +5348,8 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     }
     for (sibling, sibling_done, _) in items {
         job.split_amount_usdc += sibling.split_amount_usdc;
-        job.split_end_date_min_secs = job.split_end_date_min_secs
+        job.split_end_date_min_secs = job
+            .split_end_date_min_secs
             .max(sibling.split_end_date_min_secs);
         job.split_execute_before_secs = match (
             job.split_execute_before_secs,
@@ -4632,17 +5359,21 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
             (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
             (None, None) => None,
         };
-        job.min_safety_balance_usdc = job.min_safety_balance_usdc
+        job.min_safety_balance_usdc = job
+            .min_safety_balance_usdc
             .max(sibling.min_safety_balance_usdc);
         job.redeem_enabled |= sibling.redeem_enabled;
         if job.account_state.is_none() {
             job.account_state = sibling.account_state.clone();
         }
         if !sibling.instance_id.is_empty() && sibling.split_amount_usdc > 0.0 {
-            *allocations.entry(sibling.instance_id.clone()).or_insert(0.0) +=
-                sibling.split_amount_usdc;
+            *allocations
+                .entry(sibling.instance_id.clone())
+                .or_insert(0.0) += sibling.split_amount_usdc;
         }
-        if let Some(status) = sibling.status { statuses.push(status); }
+        if let Some(status) = sibling.status {
+            statuses.push(status);
+        }
         if let Some(sender) = sibling.inventory_ready_tx {
             inventory_ready_subscribers.push((
                 sibling.instance_id.clone(),
@@ -4667,14 +5398,18 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     let ready_condition_id = job.split_target_condition_id.clone();
     let ready_token_ids = job.split_target_token_ids.clone();
     run_maintenance_job(job, allocations);
-    let terminal = statuses.first()
+    let terminal = statuses
+        .first()
         .map(|status| status.lock().unwrap().clone());
     if let Some(ref terminal) = terminal {
         for status in statuses.iter().skip(1) {
             *status.lock().unwrap() = terminal.clone();
         }
     }
-    if terminal.as_ref().is_some_and(MaintenanceStatus::produced_seed_inventory) {
+    if terminal
+        .as_ref()
+        .is_some_and(MaintenanceStatus::produced_seed_inventory)
+    {
         if let Some(condition_id) = ready_condition_id.filter(|condition| !condition.is_empty()) {
             for (instance_id, amount_usdc, sender) in inventory_ready_subscribers {
                 let notification = InventoryReady {
@@ -4718,9 +5453,8 @@ pub struct MergeMaintenanceJob {
     pub dry_run: bool,
     pub account_id: String,
     pub instance_id: String,
-    pub account_state: Option<std::sync::Arc<
-        hexagent_account::account::shared_account::SharedAccount,
-    >>,
+    pub account_state:
+        Option<std::sync::Arc<hexagent_account::account::shared_account::SharedAccount>>,
 }
 
 type MergeQueueItem = (
@@ -4748,11 +5482,16 @@ fn enqueue_merge_maintenance(
     let account = job.account_id.clone();
     let queues = MERGE_MAINTENANCE_QUEUES
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut map = queues
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tx = map.entry(account.clone()).or_insert_with(|| {
-        let (tx, rx) =
-            crossbeam_channel::bounded::<MergeQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
-        let worker_label = if account.is_empty() { "env".to_string() } else { account.clone() };
+        let (tx, rx) = crossbeam_channel::bounded::<MergeQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
+        let worker_label = if account.is_empty() {
+            "env".to_string()
+        } else {
+            account.clone()
+        };
         let worker_name = format!("poly-merge-{}", worker_label);
         std::thread::Builder::new()
             .name(worker_name.clone())
@@ -4765,8 +5504,8 @@ fn enqueue_merge_maintenance(
                     let mut burst = vec![first];
                     let burst_started = std::time::Instant::now();
                     while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
-                        let remaining = MAINTENANCE_COALESCE_MAX
-                            .saturating_sub(burst_started.elapsed());
+                        let remaining =
+                            MAINTENANCE_COALESCE_MAX.saturating_sub(burst_started.elapsed());
                         match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
                             Ok(next) => burst.push(next),
                             Err(_) => break,
@@ -4774,9 +5513,10 @@ fn enqueue_merge_maintenance(
                     }
                     let mut groups: Vec<Vec<MergeQueueItem>> = Vec::new();
                     for item in burst {
-                        if let Some(group) = groups.iter_mut().find(|group| {
-                            merge_jobs_share_target(&group[0].0, &item.0)
-                        }) {
+                        if let Some(group) = groups
+                            .iter_mut()
+                            .find(|group| merge_jobs_share_target(&group[0].0, &item.0))
+                        {
                             group.push(item);
                         } else {
                             groups.push(vec![item]);
@@ -4825,7 +5565,8 @@ pub fn submit_merge_maintenance(job: MergeMaintenanceJob) {
 pub fn run_merge_maintenance_blocking(job: MergeMaintenanceJob) -> Result<()> {
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     enqueue_merge_maintenance(job, Some(done_tx));
-    done_rx.recv()
+    done_rx
+        .recv()
         .map_err(|error| anyhow!("merge maintenance worker stopped: {}", error))?
         .map_err(anyhow::Error::msg)
 }
@@ -4839,7 +5580,9 @@ enum MergeOutcome {
 }
 
 fn run_merge_maintenance_group(mut items: Vec<MergeQueueItem>) {
-    if items.is_empty() { return; }
+    if items.is_empty() {
+        return;
+    }
     for (item, _, enqueued_at) in &items {
         if let Some(account) = &item.account_state {
             account.record_maintenance_queue_wait(enqueued_at.elapsed());
@@ -4863,7 +5606,10 @@ fn run_merge_maintenance_group(mut items: Vec<MergeQueueItem>) {
     }
     log::info!(
         "[Maintenance] Coalesced merge: account={} cid={} total={} allocations={:?}",
-        job.account_id, job.condition_id, job.amount_usdc, allocations,
+        job.account_id,
+        job.condition_id,
+        job.amount_usdc,
+        allocations,
     );
     let account_lock = account_maintenance_lock(&job.account_id);
     let _operation_guard = account_lock
@@ -4886,10 +5632,16 @@ fn run_merge_maintenance_job(
         return Err("merge requires condition_id and both outcome token ids".to_string());
     }
     if !job.amount_usdc.is_finite() || job.amount_usdc <= 0.0 {
-        return Err(format!("merge amount must be positive, got {}", job.amount_usdc));
+        return Err(format!(
+            "merge amount must be positive, got {}",
+            job.amount_usdc
+        ));
     }
     if !job.dry_run && (job.instance_id.is_empty() || job.account_state.is_none()) {
-        return Err("live merge requires explicit instance ownership and a shared-account ledger".to_string());
+        return Err(
+            "live merge requires explicit instance ownership and a shared-account ledger"
+                .to_string(),
+        );
     }
     let wallet = load_wallet_for_account(&job.account_id)
         .map_err(|error| format!("load_wallet: {error}"))?;
@@ -4913,7 +5665,11 @@ fn run_merge_maintenance_job(
         }
     }
     let journal = (!job.dry_run)
-        .then(|| job.account_state.as_deref().map(|account| (account, operation_id.as_str())))
+        .then(|| {
+            job.account_state
+                .as_deref()
+                .map(|account| (account, operation_id.as_str()))
+        })
         .flatten();
     let outcome = run_merge_one(
         &wallet,
@@ -4935,7 +5691,8 @@ fn run_merge_maintenance_job(
                         ),
                     );
                     return Err(format!(
-                        "on-chain merge confirmed but virtual attribution failed: {}", error,
+                        "on-chain merge confirmed but virtual attribution failed: {}",
+                        error,
                     ));
                 }
                 if let Err(error) = account.flush_persistence(std::time::Duration::from_secs(2)) {
@@ -4944,7 +5701,8 @@ fn run_merge_maintenance_job(
                         job.condition_id, error,
                     ));
                     return Err(format!(
-                        "on-chain merge confirmed but ledger persistence failed: {}", error,
+                        "on-chain merge confirmed but ledger persistence failed: {}",
+                        error,
                     ));
                 }
             }
@@ -4953,13 +5711,9 @@ fn run_merge_maintenance_job(
         MergeOutcome::DryRun => Ok(()),
         MergeOutcome::SubmitFailed(reason) => {
             if let Some(account) = job.account_state.as_ref() {
-                account.fail_maintenance_operation(
-                    &operation_id,
-                    format!("submit failed: {reason}"),
-                );
-                if let Err(error) =
-                    account.flush_persistence(std::time::Duration::from_secs(2))
-                {
+                account
+                    .fail_maintenance_operation(&operation_id, format!("submit failed: {reason}"));
+                if let Err(error) = account.flush_persistence(std::time::Duration::from_secs(2)) {
                     account.mark_uncertain_with_reason(format!(
                         "merge reservation release persistence failed cid={}: {}",
                         job.condition_id, error,
@@ -4993,7 +5747,10 @@ fn run_merge_one(
     amount_usdc: f64,
     gas_via_signer: bool,
     dry_run: bool,
-    journal: Option<(&hexagent_account::account::shared_account::SharedAccount, &str)>,
+    journal: Option<(
+        &hexagent_account::account::shared_account::SharedAccount,
+        &str,
+    )>,
 ) -> MergeOutcome {
     let amount_wei = (amount_usdc * 1_000_000.0).round().max(0.0) as u128;
     if amount_wei == 0 {
@@ -5019,9 +5776,12 @@ fn run_merge_one(
     let (target_contract, collateral_token) = ctf_target(is_v2, false);
     let cid_bytes = match hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id)) {
         Ok(bytes) if bytes.len() <= 32 => bytes,
-        Ok(bytes) => return MergeOutcome::SubmitFailed(format!(
-            "condition_id is {} bytes, expected at most 32", bytes.len(),
-        )),
+        Ok(bytes) => {
+            return MergeOutcome::SubmitFailed(format!(
+                "condition_id is {} bytes, expected at most 32",
+                bytes.len(),
+            ))
+        }
         Err(error) => return MergeOutcome::SubmitFailed(format!("condition_id hex: {}", error)),
     };
     let mut cid_padded = [0u8; 32];
@@ -5039,7 +5799,10 @@ fn run_merge_one(
     let data_hex = format!("0x{}", hex::encode(calldata));
     log::info!(
         "[Maintenance] Merge request cid={} amount={} target={} dry_run={}",
-        condition_id, amount_usdc, target_contract, dry_run,
+        condition_id,
+        amount_usdc,
+        target_contract,
+        dry_run,
     );
     if dry_run {
         println!("to:   {}", target_contract);
@@ -5053,7 +5816,9 @@ fn run_merge_one(
             &wallet.signer_address,
             target_contract,
             &data_hex,
-        ).map(|tx| (tx, "PENDING".to_string())).map_err(|error| error.to_string())
+        )
+        .map(|tx| (tx, "PENDING".to_string()))
+        .map_err(|error| error.to_string())
     } else if gas_via_signer {
         super::onchain_tx::broadcast_with_escalation(
             &wallet.signing_key,
@@ -5061,7 +5826,9 @@ fn run_merge_one(
             &wallet.safe_address,
             target_contract,
             &data_hex,
-        ).map(|tx| (tx, "PENDING".to_string())).map_err(|error| error.to_string())
+        )
+        .map(|tx| (tx, "PENDING".to_string()))
+        .map_err(|error| error.to_string())
     } else {
         submit_safe_tx_with_id(
             &wallet.builder_auth,
@@ -5071,7 +5838,8 @@ fn run_merge_one(
             target_contract,
             &data_hex,
             false,
-        ).map_err(|error| error.to_string())
+        )
+        .map_err(|error| error.to_string())
     };
     let (tx_id, initial_state) = match submitted {
         Ok(value) => value,
@@ -5126,8 +5894,13 @@ fn run_merge_one(
 /// tokens use the USDC.e collateral id-space in both v1 and v2.
 pub(crate) fn ctf_outcome_token_ids(condition_id: &str) -> Result<(String, String)> {
     let derive = |index_set| -> Result<String> {
-        let position = ctf_position_id(condition_id, index_set, USDCE_ADDRESS)
-            .ok_or_else(|| anyhow!("failed to derive outcome token id for indexSet={}", index_set))?;
+        let position =
+            ctf_position_id(condition_id, index_set, USDCE_ADDRESS).ok_or_else(|| {
+                anyhow!(
+                    "failed to derive outcome token id for indexSet={}",
+                    index_set
+                )
+            })?;
         let bytes = ctf_position_id_bytes(&position)?;
         Ok(bytes32_to_dec(&bytes))
     };
@@ -5157,120 +5930,119 @@ fn run_maintenance_job(
         account_state,
     } = job;
     {
-            // Write `Running` immediately so the strategy can distinguish
-            // "spawn requested but thread hasn't started yet" from
-            // "in-progress" — the gap is normally <1ms but worth being
-            // explicit about.
-            if let Some(ref s) = status {
-                *s.lock().unwrap() = MaintenanceStatus::Running;
-            }
+        // Write `Running` immediately so the strategy can distinguish
+        // "spawn requested but thread hasn't started yet" from
+        // "in-progress" — the gap is normally <1ms but worth being
+        // explicit about.
+        if let Some(ref s) = status {
+            *s.lock().unwrap() = MaintenanceStatus::Running;
+        }
 
-            if let Err(reason) = validate_maintenance_split_target(
-                split_target_condition_id.as_deref(),
-                &split_target_token_ids,
-                split_execute_before_secs,
-                unix_now_secs(),
-            ) {
-                log::warn!("[Maintenance] Split rejected before execution: {}", reason);
-                if let Some(s) = status {
-                    *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending { reason };
-                }
-                return;
+        if let Err(reason) = validate_maintenance_split_target(
+            split_target_condition_id.as_deref(),
+            &split_target_token_ids,
+            split_execute_before_secs,
+            unix_now_secs(),
+        ) {
+            log::warn!("[Maintenance] Split rejected before execution: {}", reason);
+            if let Some(s) = status {
+                *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending { reason };
             }
+            return;
+        }
 
-            log::info!(
+        log::info!(
                 "[Maintenance] Starting: series_id={:?} split_amount_usdc={} gas_via_signer={} redeem_enabled={}",
                 split_series_id, split_amount_usdc, gas_via_signer, redeem_enabled,
             );
-            let wallet = match load_wallet_for_account(&account_id) {
-                Ok(w) => w,
-                Err(e) => {
-                    log::warn!("[Maintenance] load_wallet failed: {}", e);
-                    if let Some(s) = status.as_ref() {
-                        *s.lock().unwrap() = MaintenanceStatus::RedeemFailed {
-                            reason: format!("load_wallet: {}", e),
-                        };
-                    }
-                    return;
+        let wallet = match load_wallet_for_account(&account_id) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("[Maintenance] load_wallet failed: {}", e);
+                if let Some(s) = status.as_ref() {
+                    *s.lock().unwrap() = MaintenanceStatus::RedeemFailed {
+                        reason: format!("load_wallet: {}", e),
+                    };
                 }
-            };
-            if let Some(account) = account_state.as_ref() {
-                if let Err(error) = recover_pending_maintenance_operations(&wallet, account) {
-                    log::warn!(
-                        "[Maintenance] account={} has unresolved prior operation: {}",
-                        account_id,
-                        error,
-                    );
-                    if let Some(s) = status {
-                        *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending {
-                            reason: format!("maintenance recovery: {error}"),
-                        };
-                    }
-                    return;
-                }
+                return;
             }
-
-            // ── Step 1: redeem matured positions ──
-            // Gated by `redeem_enabled`. When off, redeem is skipped (no
-            // on-chain ops) and treated as healthy — `RedeemResult::default()`
-            // reports attempted=0 → `all_ok()` is true — so the split-seed
-            // step proceeds and the final status isn't degraded. Normal live
-            // redemption is handled by the platform; the explicit CLI remains
-            // an exceptional recovery tool.
-            let mut redeem_result = if redeem_enabled {
-                run_redeem_all(&wallet, gas_via_signer)
-            } else {
-                log::info!(
-                    "[Maintenance] Step 1/2: Redeem SKIPPED (redeem_enabled=false); \
-                     split-seed still runs and platform redemption is expected."
+        };
+        if let Some(account) = account_state.as_ref() {
+            if let Err(error) = recover_pending_maintenance_operations(&wallet, account) {
+                log::warn!(
+                    "[Maintenance] account={} has unresolved prior operation: {}",
+                    account_id,
+                    error,
                 );
-                RedeemResult::default()
-            };
-            if !redeem_result.confirmed_legs.is_empty() {
-                if let Some(account) = account_state.as_ref() {
-                    if let Err(error) = account.apply_redeemed_legs(&redeem_result.confirmed_legs) {
-                        log::error!(
+                if let Some(s) = status {
+                    *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending {
+                        reason: format!("maintenance recovery: {error}"),
+                    };
+                }
+                return;
+            }
+        }
+
+        // ── Step 1: redeem matured positions ──
+        // Gated by `redeem_enabled`. When off, redeem is skipped (no
+        // on-chain ops) and treated as healthy — `RedeemResult::default()`
+        // reports attempted=0 → `all_ok()` is true — so the split-seed
+        // step proceeds and the final status isn't degraded. Normal live
+        // redemption is handled by the platform; the explicit CLI remains
+        // an exceptional recovery tool.
+        let mut redeem_result = if redeem_enabled {
+            run_redeem_all(&wallet, gas_via_signer)
+        } else {
+            log::info!(
+                "[Maintenance] Step 1/2: Redeem SKIPPED (redeem_enabled=false); \
+                     split-seed still runs and platform redemption is expected."
+            );
+            RedeemResult::default()
+        };
+        if !redeem_result.confirmed_legs.is_empty() {
+            if let Some(account) = account_state.as_ref() {
+                if let Err(error) = account.apply_redeemed_legs(&redeem_result.confirmed_legs) {
+                    log::error!(
                             "[Maintenance] Redeem confirmed but virtual attribution failed account={}: {}",
                             account_id, error,
                         );
-                        account.mark_uncertain_with_reason(format!(
-                            "confirmed maintenance redeem attribution failed: {error}"
-                        ));
-                        if redeem_result.first_failure.is_none() {
-                            redeem_result.first_failure = Some(format!(
-                                "virtual redeem attribution: {error}"
-                            ));
-                        }
+                    account.mark_uncertain_with_reason(format!(
+                        "confirmed maintenance redeem attribution failed: {error}"
+                    ));
+                    if redeem_result.first_failure.is_none() {
+                        redeem_result.first_failure =
+                            Some(format!("virtual redeem attribution: {error}"));
                     }
                 }
             }
-            let redeem_ok = redeem_result.all_ok();
+        }
+        let redeem_ok = redeem_result.all_ok();
 
-            // ── Step 2: use the exact event resolved before coalescing ──
-            log::info!("[Maintenance] Step 2/2: Split seed inventory for next event");
-            let next_market = split_target_condition_id
-                .filter(|condition_id| !condition_id.is_empty())
-                .map(|condition_id| (condition_id, split_target_token_ids));
+        // ── Step 2: use the exact event resolved before coalescing ──
+        log::info!("[Maintenance] Step 2/2: Split seed inventory for next event");
+        let next_market = split_target_condition_id
+            .filter(|condition_id| !condition_id.is_empty())
+            .map(|condition_id| (condition_id, split_target_token_ids));
 
-            // ── Step 3: split seed inventory ──
-            // Split is the GATING step for whether the next event has
-            // seed inventory. Even if redeem failed, a healthy split
-            // means trading is viable for the next event (the failed
-            // redeem just leaves stale shares we can pick up later).
-            let split_outcome = if let Some((cid, token_ids)) = next_market {
-                if split_amount_usdc > 0.0 {
-                    if let Err(reason) = validate_maintenance_split_target(
-                        Some(&cid),
-                        &token_ids,
-                        split_execute_before_secs,
-                        unix_now_secs(),
-                    ) {
-                        log::warn!(
-                            "[Maintenance] Split rejected immediately before admission: {}",
-                            reason,
-                        );
-                        Some(SplitOutcome::Skipped(reason))
-                    } else {
+        // ── Step 3: split seed inventory ──
+        // Split is the GATING step for whether the next event has
+        // seed inventory. Even if redeem failed, a healthy split
+        // means trading is viable for the next event (the failed
+        // redeem just leaves stale shares we can pick up later).
+        let split_outcome = if let Some((cid, token_ids)) = next_market {
+            if split_amount_usdc > 0.0 {
+                if let Err(reason) = validate_maintenance_split_target(
+                    Some(&cid),
+                    &token_ids,
+                    split_execute_before_secs,
+                    unix_now_secs(),
+                ) {
+                    log::warn!(
+                        "[Maintenance] Split rejected immediately before admission: {}",
+                        reason,
+                    );
+                    Some(SplitOutcome::Skipped(reason))
+                } else {
                     let token_pair = token_ids.first().zip(token_ids.get(1));
                     let operation_id = next_maintenance_operation_id("split", &account_id, &cid);
                     let reservation = account_state
@@ -5305,10 +6077,15 @@ fn run_maintenance_job(
                             .filter(|_| !split_allocations.is_empty())
                             .map(|account| (account, operation_id.as_str()));
                         let mut outcome = run_split_one(
-                            &wallet, &cid, split_amount_usdc,
-                            min_safety_balance_usdc, gas_via_signer, journal,
+                            &wallet,
+                            &cid,
+                            split_amount_usdc,
+                            min_safety_balance_usdc,
+                            gas_via_signer,
+                            journal,
                         );
-                        if let Some(account) = account_state.as_ref()
+                        if let Some(account) = account_state
+                            .as_ref()
                             .filter(|_| !split_allocations.is_empty())
                         {
                             let allocation_error = if matches!(outcome, SplitOutcome::Confirmed) {
@@ -5348,96 +6125,121 @@ fn run_maintenance_job(
                                         "confirmed maintenance split attribution failed cid={cid}: {error}"
                                     ),
                                 );
-                                account.mark_maintenance_operation_uncertain(
-                                    &operation_id,
-                                    format!("on-chain confirmed; virtual allocation uncertain: {error}"),
-                                );
-                                outcome = SplitOutcome::PendingTimeout {
-                                    reason: format!(
+                                let (tx_id, snapshot_failure) = account
+                                    .try_pending_maintenance_operations()
+                                    .map(|operations| {
+                                        (
+                                            operations
+                                                .into_iter()
+                                                .find(|operation| {
+                                                    operation.operation_id == operation_id
+                                                })
+                                                .and_then(|operation| operation.tx_id)
+                                                .unwrap_or_default(),
+                                            None,
+                                        )
+                                    })
+                                    .unwrap_or_else(|snapshot_error| {
+                                        (
+                                            String::new(),
+                                            Some(format!(
+                                                "retryable account-owner maintenance snapshot: {snapshot_error}"
+                                            )),
+                                        )
+                                    });
+                                let reason = match snapshot_failure {
+                                    Some(snapshot_failure) => format!(
+                                        "on-chain confirmed; virtual allocation uncertain: {error}; {snapshot_failure}"
+                                    ),
+                                    None => format!(
                                         "on-chain confirmed; virtual allocation uncertain: {error}"
                                     ),
-                                    tx_id: account
-                                        .pending_maintenance_operations()
-                                        .into_iter()
-                                        .find(|operation| operation.operation_id == operation_id)
-                                        .and_then(|operation| operation.tx_id)
-                                        .unwrap_or_default(),
                                 };
+                                account.mark_maintenance_operation_uncertain(
+                                    &operation_id,
+                                    reason.clone(),
+                                );
+                                outcome = SplitOutcome::PendingTimeout { reason, tx_id };
                             }
                             let _ = account.flush_persistence(std::time::Duration::from_secs(2));
                         }
                         Some(outcome)
                     }
-                    }
-                } else {
-                    log::info!("[Maintenance] Split skipped: split_amount_usdc={}.", split_amount_usdc);
-                    Some(SplitOutcome::Skipped(format!("amount_usdc={}", split_amount_usdc)))
                 }
             } else {
-                None
-            };
-
-            // ── Final status update ──
-            // Priority of failure signals (worst first):
-            //   1. Split actually failed → critical, gate must PROBE
-            //   2. Split pending timeout → critical, gate must PROBE
-            //   3. Redeem failed but split OK → degraded but tradeable
-            //   4. Everything clean → Succeeded
-            let final_status = match &split_outcome {
-                Some(SplitOutcome::Confirmed) => {
-                    if redeem_ok {
-                        MaintenanceStatus::Succeeded
-                    } else {
-                        // Split OK, but redeem had problems — seed
-                        // inventory exists so we can still trade.
-                        // Surface the redeem failure for ops visibility.
-                        log::warn!(
-                            "[Maintenance] Redeem partially failed ({}) but split confirmed — \
-                             treating as Succeeded for next-event tradeability",
-                            redeem_result.summary(),
-                        );
-                        MaintenanceStatus::Succeeded
-                    }
-                }
-                Some(SplitOutcome::PendingTimeout { reason, .. }) => {
-                    MaintenanceStatus::SplitFailedOrPending {
-                        reason: format!("split pending timeout: {}", reason),
-                    }
-                }
-                Some(SplitOutcome::SubmitFailed(reason)) => {
-                    MaintenanceStatus::SplitFailedOrPending {
-                        reason: format!("split submit failed: {}", reason),
-                    }
-                }
-                Some(SplitOutcome::Skipped(reason)) => {
-                    // Split deliberately skipped (no series_id, no
-                    // balance, etc.). Caller may still want to trade
-                    // — but seed inventory is missing. Conservative:
-                    // treat as needing PROBE.
-                    MaintenanceStatus::SplitFailedOrPending {
-                        reason: format!("split skipped: {}", reason),
-                    }
-                }
-                None => {
-                    // No next event found — nothing to split for.
-                    // If redeem ran ok and there's just no next event,
-                    // we're idle; treat as Skipped (gate will keep its
-                    // own state).
-                    MaintenanceStatus::Skipped {
-                        reason: "no next event found".to_string(),
-                    }
-                }
-            };
-
-            if let Some(s) = status {
                 log::info!(
-                    "[Maintenance] Complete. status={} redeem={{{}}}",
-                    final_status.label(), redeem_result.summary(),
+                    "[Maintenance] Split skipped: split_amount_usdc={}.",
+                    split_amount_usdc
                 );
-                *s.lock().unwrap() = final_status;
-            } else {
-                log::info!("[Maintenance] Complete.");
+                Some(SplitOutcome::Skipped(format!(
+                    "amount_usdc={}",
+                    split_amount_usdc
+                )))
             }
+        } else {
+            None
+        };
+
+        // ── Final status update ──
+        // Priority of failure signals (worst first):
+        //   1. Split actually failed → critical, gate must PROBE
+        //   2. Split pending timeout → critical, gate must PROBE
+        //   3. Redeem failed but split OK → degraded but tradeable
+        //   4. Everything clean → Succeeded
+        let final_status = match &split_outcome {
+            Some(SplitOutcome::Confirmed) => {
+                if redeem_ok {
+                    MaintenanceStatus::Succeeded
+                } else {
+                    // Split OK, but redeem had problems — seed
+                    // inventory exists so we can still trade.
+                    // Surface the redeem failure for ops visibility.
+                    log::warn!(
+                        "[Maintenance] Redeem partially failed ({}) but split confirmed — \
+                             treating as Succeeded for next-event tradeability",
+                        redeem_result.summary(),
+                    );
+                    MaintenanceStatus::Succeeded
+                }
+            }
+            Some(SplitOutcome::PendingTimeout { reason, .. }) => {
+                MaintenanceStatus::SplitFailedOrPending {
+                    reason: format!("split pending timeout: {}", reason),
+                }
+            }
+            Some(SplitOutcome::SubmitFailed(reason)) => MaintenanceStatus::SplitFailedOrPending {
+                reason: format!("split submit failed: {}", reason),
+            },
+            Some(SplitOutcome::Skipped(reason)) => {
+                // Split deliberately skipped (no series_id, no
+                // balance, etc.). Caller may still want to trade
+                // — but seed inventory is missing. Conservative:
+                // treat as needing PROBE.
+                MaintenanceStatus::SplitFailedOrPending {
+                    reason: format!("split skipped: {}", reason),
+                }
+            }
+            None => {
+                // No next event found — nothing to split for.
+                // If redeem ran ok and there's just no next event,
+                // we're idle; treat as Skipped (gate will keep its
+                // own state).
+                MaintenanceStatus::Skipped {
+                    reason: "no next event found".to_string(),
+                }
+            }
+        };
+
+        if let Some(s) = status {
+            log::info!(
+                "[Maintenance] Complete. status={} redeem={{{}}}",
+                final_status.label(),
+                redeem_result.summary(),
+            );
+            *s.lock().unwrap() = final_status;
+        } else {
+            log::info!("[Maintenance] Complete.");
+        }
     }
 }
 
@@ -5473,7 +6275,8 @@ pub fn run_split() -> Result<()> {
         return Ok(());
     }
     let series_slug = &args[0];
-    let amount_usdc: f64 = args[1].parse()
+    let amount_usdc: f64 = args[1]
+        .parse()
         .map_err(|e| anyhow!("Invalid amount '{}': {}", args[1], e))?;
 
     let is_v2 = read_clob_v2_flag();
@@ -5482,9 +6285,15 @@ pub fn run_split() -> Result<()> {
     println!("=== Polymarket Split (test trigger) ===");
     println!("Series slug : {}", series_slug);
     println!("Split amount: {} USDC", amount_usdc);
-    println!("CLOB        : {} ({})",
+    println!(
+        "CLOB        : {} ({})",
         if is_v2 { "v2" } else { "v1" },
-        if is_v2 { "pUSD via CtfCollateralAdapter" } else { "USDC.e via CTF" });
+        if is_v2 {
+            "pUSD via CtfCollateralAdapter"
+        } else {
+            "USDC.e via CTF"
+        }
+    );
     println!("Target      : {}", target_contract);
     println!("Collateral  : {}", collateral_token);
     println!();
@@ -5499,13 +6308,13 @@ pub fn run_split() -> Result<()> {
     // → 300s). Fall back to 300s if the slug has no recognizable suffix;
     // this still excludes the current event in typical 5-minute-cycle
     // series.
-    let duration_secs = super::market::parse_slug_duration_secs(series_slug)
-        .unwrap_or(300);
+    let duration_secs = super::market::parse_slug_duration_secs(series_slug).unwrap_or(300);
     println!("Parsed event duration = {}s", duration_secs);
     println!();
 
     let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     // end_date_min = now + event_duration. The current event's end_date is
     // in [now, now + duration), so it's reliably excluded; the next event
     // (start ≥ current end, end = current end + duration) passes the
@@ -5555,7 +6364,6 @@ pub fn run_split() -> Result<()> {
     println!("=== Maintenance complete ===");
     Ok(())
 }
-
 
 #[cfg(test)]
 mod maintenance_status_tests {
@@ -5607,7 +6415,10 @@ mod maintenance_status_tests {
         assert!(!maintenance_jobs_share_target(&event_a_early, &event_b));
         let mut wrong_tokens = maintenance_job(Some("event-a"), 100);
         wrong_tokens.split_target_token_ids = vec!["up-other".into(), "down-a".into()];
-        assert!(!maintenance_jobs_share_target(&event_a_early, &wrong_tokens));
+        assert!(!maintenance_jobs_share_target(
+            &event_a_early,
+            &wrong_tokens
+        ));
 
         let unresolved_early = maintenance_job(None, 100);
         let unresolved_late = maintenance_job(None, 200);
@@ -5620,10 +6431,8 @@ mod maintenance_status_tests {
     #[test]
     fn maintenance_split_target_rejects_expiry_and_malformed_tokens() {
         let tokens = vec!["up".to_string(), "down".to_string()];
-        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(101), 100)
-            .is_ok());
-        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(100), 100)
-            .is_err());
+        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(101), 100).is_ok());
+        assert!(validate_maintenance_split_target(Some("cid"), &tokens, Some(100), 100).is_err());
         assert!(validate_maintenance_split_target(
             Some("cid"),
             &["same".to_string(), "same".to_string()],
@@ -5683,12 +6492,18 @@ mod maintenance_status_tests {
 
         assert!(!MaintenanceStatus::NotStarted.produced_seed_inventory());
         assert!(!MaintenanceStatus::Running.produced_seed_inventory());
-        assert!(!MaintenanceStatus::RedeemFailed { reason: "x".to_string() }
-            .produced_seed_inventory());
-        assert!(!MaintenanceStatus::SplitFailedOrPending { reason: "x".to_string() }
-            .produced_seed_inventory());
-        assert!(!MaintenanceStatus::Skipped { reason: "x".to_string() }
-            .produced_seed_inventory());
+        assert!(!MaintenanceStatus::RedeemFailed {
+            reason: "x".to_string()
+        }
+        .produced_seed_inventory());
+        assert!(!MaintenanceStatus::SplitFailedOrPending {
+            reason: "x".to_string()
+        }
+        .produced_seed_inventory());
+        assert!(!MaintenanceStatus::Skipped {
+            reason: "x".to_string()
+        }
+        .produced_seed_inventory());
     }
 
     #[test]
@@ -5698,12 +6513,27 @@ mod maintenance_status_tests {
         assert_eq!(MaintenanceStatus::NotStarted.label(), "NotStarted");
         assert_eq!(MaintenanceStatus::Running.label(), "Running");
         assert_eq!(MaintenanceStatus::Succeeded.label(), "Succeeded");
-        assert_eq!(MaintenanceStatus::RedeemFailed { reason: String::new() }.label(),
-            "RedeemFailed");
-        assert_eq!(MaintenanceStatus::SplitFailedOrPending { reason: String::new() }.label(),
-            "SplitFailedOrPending");
-        assert_eq!(MaintenanceStatus::Skipped { reason: String::new() }.label(),
-            "Skipped");
+        assert_eq!(
+            MaintenanceStatus::RedeemFailed {
+                reason: String::new()
+            }
+            .label(),
+            "RedeemFailed"
+        );
+        assert_eq!(
+            MaintenanceStatus::SplitFailedOrPending {
+                reason: String::new()
+            }
+            .label(),
+            "SplitFailedOrPending"
+        );
+        assert_eq!(
+            MaintenanceStatus::Skipped {
+                reason: String::new()
+            }
+            .label(),
+            "Skipped"
+        );
     }
 
     #[test]
@@ -5749,11 +6579,18 @@ mod maintenance_status_tests {
         // excludes these variants).
         for blocking in [
             MaintenanceStatus::Running,
-            MaintenanceStatus::RedeemFailed { reason: String::new() },
-            MaintenanceStatus::SplitFailedOrPending { reason: String::new() },
+            MaintenanceStatus::RedeemFailed {
+                reason: String::new(),
+            },
+            MaintenanceStatus::SplitFailedOrPending {
+                reason: String::new(),
+            },
         ] {
-            assert!(!blocking.produced_seed_inventory(),
-                "{:?} must NOT pass produced_seed_inventory check", blocking);
+            assert!(
+                !blocking.produced_seed_inventory(),
+                "{:?} must NOT pass produced_seed_inventory check",
+                blocking
+            );
         }
     }
 }

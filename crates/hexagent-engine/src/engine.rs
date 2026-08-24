@@ -21,6 +21,7 @@ use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::lighter::LighterTrade;
+use crate::exchange::polymarket::trade::{PendingCancel, PendingSubmit};
 use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
@@ -33,6 +34,9 @@ use hexagent_runtime::shutdown::ShutdownToken;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 const CHANNEL_CAPACITY: usize = 10_000;
+const POLY_FAST_OWNER_QUEUE_CAPACITY: usize = 1;
+const POLY_CANCEL_OWNER_QUEUE_CAPACITY: usize = 256;
+const POLY_RECONCILE_OWNER_QUEUE_CAPACITY: usize = 32;
 // Four account updates keep fill/cancel feedback responsive while bounding
 // the time an already-enqueued market trigger can sit behind the biased lane.
 // At the private-apply target (<=1 ms p95), 32 permitted a 32 ms quote stall.
@@ -7703,6 +7707,7 @@ impl Engine {
                         lifecycle_sequence = lifecycle_sequence.saturating_add(1);
                         let signals = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
                             owner: idx as u16,
+                            order_slot: update.order_slot,
                             sequence: lifecycle_sequence,
                             source: LifecycleSource::PrivateFeed,
                             update,
@@ -7739,6 +7744,7 @@ impl Engine {
                         lifecycle_sequence = lifecycle_sequence.saturating_add(1);
                         let signals = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
                             owner: idx as u16,
+                            order_slot: queued.update.order_slot,
                             sequence: lifecycle_sequence,
                             source: queued.source,
                             update: queued.update,
@@ -7916,6 +7922,7 @@ impl Engine {
             lifecycle_sequence = lifecycle_sequence.saturating_add(1);
             let _ = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
                 owner: idx as u16,
+                order_slot: update.order_slot,
                 sequence: lifecycle_sequence,
                 source: LifecycleSource::PrivateFeed,
                 update,
@@ -7925,6 +7932,7 @@ impl Engine {
             lifecycle_sequence = lifecycle_sequence.saturating_add(1);
             let _ = strategy.on_lifecycle_update_owned(LifecycleEnvelope {
                 owner: idx as u16,
+                order_slot: queued.update.order_slot,
                 sequence: lifecycle_sequence,
                 source: queued.source,
                 update: queued.update,
@@ -9900,82 +9908,15 @@ impl Engine {
                 // auth/signer.
                 let mut fallback = LiveRouter::new_with_poly_map(&config, &poly_states);
 
-                // Plan A — pipeline Polymarket order dispatch across a pool of
-                // worker threads. The strategy enqueues BatchUpdateOrders /
-                // place / cancel signals; previously this executor thread ran
-                // each one INLINE, blocking on the HTTP drain (~RTT, up to the
-                // 2s timeout) before pulling the next signal — so one slow
-                // dispatch stalled the whole queue and signals aged past the
-                // 150ms stale threshold ("Signal stale" storms under load).
-                //
-                // Now N workers pull from ONE shared (MPMC) channel: a free
-                // worker grabs the next signal, so a busy/slow worker only
-                // costs 1/N of throughput (no head-of-line block). Each worker
-                // builds its own LiveRouter via `new_with_poly_map`, which
-                // shares each instance's `Arc<SharedState>` (via `from_shared`)
-                // — so order tracking (open_orders / coid maps) stays
-                // consistent across workers, guarded by SharedState's existing
-                // mutexes. The HTTP client is shared too → h2 multiplexes the
-                // concurrent dispatches. Per-token cancel→place ordering is
-                // preserved WITHIN a signal (serial_replace_dispatch); across
-                // signals it's intentionally not serialised.
-                let poly_worker_n = config.exchanges.iter()
-                    .find(|e| e.name == "polymarket")
-                    .map(|e| e.executor_workers).unwrap_or(8).max(1);
-                let (poly_pool_tx, poly_pool_rx) =
-                    bounded::<(Signal, u64, ExecutorUpdateSender)>(CHANNEL_CAPACITY);
-                // Must-complete cancel work owns a bounded lossless lane. A
-                // full lane backpressures only the execution actor; it cannot
-                // grow process memory without limit or block a strategy owner.
-                let (poly_cancel_tx, poly_cancel_rx) =
-                    bounded::<(Signal, u64, ExecutorUpdateSender)>(CHANNEL_CAPACITY);
-                // Reconcile performs synchronous multi-request HTTP. Each
-                // physical account gets one bounded owner lane; all strategy
-                // instances on that wallet route to the same receiver. This
-                // makes retry/reconcile state single-writer without merging it
-                // into cancel or completion workers (which can hold permits).
-                let mut poly_reconcile_routes = HashMap::<
+                // Bind every Fast/Cancel/Reconcile physical slot before
+                // accepting a signal.  One SPSC-style bounded lane and one
+                // long-lived task own the client, health generation, attempt
+                // trace, request and typed completion for that exact slot.
+                let mut poly_connection_routes = HashMap::<
                     String,
-                    Sender<(Signal, u64, ExecutorUpdateSender)>,
+                    PolyAccountConnectionRoutes,
                 >::new();
-                let mut poly_reconcile_owner_lanes = HashMap::<
-                    String,
-                    Receiver<(Signal, u64, ExecutorUpdateSender)>,
-                >::new();
-                let mut account_reconcile_senders = HashMap::<
-                    String,
-                    Sender<(Signal, u64, ExecutorUpdateSender)>,
-                >::new();
-                for (instance_id, shared) in &poly_states {
-                    let account_id = shared.account_state.account_id().to_string();
-                    let tx = if let Some(tx) = account_reconcile_senders.get(&account_id) {
-                        tx.clone()
-                    } else {
-                        let (tx, rx) = bounded(CHANNEL_CAPACITY);
-                        account_reconcile_senders.insert(account_id.clone(), tx.clone());
-                        poly_reconcile_owner_lanes.insert(account_id, rx);
-                        tx
-                    };
-                    poly_reconcile_routes.insert(instance_id.clone(), tx);
-                }
-                // Fire-and-track completion lane: a worker fires (admission
-                // permit + kickoff on the reserved connection) then hands the
-                // "await reply + book it" closure here; a pool of drainers runs
-                // them so no worker `block_on`s the RTT. The permit is captured
-                // by the closure and released when it completes.
-                // Fired completions are bounded by held HTTP permits. Mirror
-                // that physical ceiling in the queue as an explicit invariant
-                // rather than relying on an unbounded container.
-                let completion_capacity =
-                    hexagent_runtime::http1_pool::total_account_order_capacity()
-                        .saturating_add(4)
-                        .max(4);
-                let (poly_done_tx, poly_done_rx) =
-                    bounded::<QueuedPolyCompletion>(completion_capacity);
-                let mut poly_worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-                let mut poly_cancel_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-                let mut poly_reconcile_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-                let mut poly_drainer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_connection_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 // Admission-control observability (component 7): a stop flag +
                 // handle for the periodic stats daemon, set/joined at shutdown.
                 let poly_stats_stop =
@@ -9991,121 +9932,63 @@ impl Engine {
                             "[Executor] account admission pools are unavailable; hot-path requests will be shed",
                         );
                     }
-                    // One completion worker per possible in-flight fired
-                    // place/cancel attempt. This is derived from the real
-                    // account pool (Fast=4, Cancel=4 per account), without the
-                    // old fixed +4 oversubscription.
-                    let n_drainers =
-                        hexagent_runtime::http1_pool::total_account_order_capacity().max(1);
-                    for i in 0..n_drainers {
-                        let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
-                        let rx = poly_done_rx.clone();
-                        let dname = format!("poly-done-{}", i);
+                    use hexagent_runtime::http1_pool::Role;
+                    let manifest =
+                        hexagent_runtime::http1_pool::account_execution_slot_manifest();
+                    for (account_id, role, slot) in manifest {
+                        let capacity = match role {
+                            Role::Fast => POLY_FAST_OWNER_QUEUE_CAPACITY,
+                            Role::Cancel => POLY_CANCEL_OWNER_QUEUE_CAPACITY,
+                            Role::Reconcile => POLY_RECONCILE_OWNER_QUEUE_CAPACITY,
+                            Role::Query | Role::GapReplay => continue,
+                        };
+                        let permit = hexagent_runtime::http1_pool::take_account_execution_slot(
+                            &account_id,
+                            role,
+                            slot,
+                        )
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "failed to bind Polymarket physical owner account={} role={:?} slot={}",
+                                account_id, role, slot,
+                            )
+                        });
+                        let (tx, rx) = bounded::<PolyConnectionCommand>(capacity);
+                        let routes = poly_connection_routes
+                            .entry(account_id.clone())
+                            .or_default();
+                        match role {
+                            Role::Fast => routes.fast.push(tx),
+                            Role::Cancel => routes.cancel.push(tx),
+                            Role::Reconcile => routes.reconcile.push(tx),
+                            Role::Query | Role::GapReplay => unreachable!(),
+                        }
+                        let router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let thread_name = match role {
+                            Role::Fast => format!("poly-exec-{account_id}-{slot}"),
+                            Role::Cancel => format!("poly-cancel-{account_id}-{slot}"),
+                            Role::Reconcile => {
+                                format!("poly-reconcile-owner-{account_id}-{slot}")
+                            }
+                            Role::Query | Role::GapReplay => unreachable!(),
+                        };
                         let h = thread::Builder::new()
-                            .name(dname.clone())
+                            .name(thread_name.clone())
                             .spawn(move || {
-                                crate::os_tune::pin_execution(&dname);
-                                crate::latency::prepare_polymarket_order_stages();
-                                while let Ok(queued) = rx.recv() {
-                                    let queue_stage = if queued.kind == "cancel" {
-                                        "polymarket.cancel.completion_queue"
-                                    } else {
-                                        "polymarket.order.completion_queue"
-                                    };
-                                    crate::latency::record_ns(
-                                        queue_stage,
-                                        queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                                    );
-                                    for update in (queued.complete)(&mut router) {
-                                        if send_executor_update(&queued.update_tx, update).is_err() { break; }
-                                    }
+                                if role == Role::Reconcile {
+                                    crate::os_tune::pin_background(&thread_name);
+                                } else {
+                                    crate::os_tune::pin_execution(&thread_name);
                                 }
+                                run_poly_connection_owner(router, permit, role, rx);
                             })
                             .unwrap();
-                        poly_drainer_handles.push(h);
+                        poly_connection_handles.push(h);
                     }
-                    for i in 0..poly_worker_n {
-                        let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
-                        let rx = poly_pool_rx.clone();
-                        let done_tx = poly_done_tx.clone();
-                        let cancel_tx = poly_cancel_tx.clone();
-                        let wname = format!("poly-exec-{}", i);
-                        let h = thread::Builder::new()
-                            .name(wname.clone())
-                            .spawn(move || {
-                                crate::os_tune::pin_execution(&wname);
-                                crate::latency::prepare_polymarket_order_stages();
-                                while let Ok((signal, stale_ms, utx)) = rx.recv() {
-                                    fire_or_execute(
-                                        &mut worker,
-                                        signal,
-                                        stale_ms,
-                                        &done_tx,
-                                        Some(&cancel_tx),
-                                        &utx,
-                                    );
-                                }
-                            })
-                            .unwrap();
-                        poly_worker_handles.push(h);
-                    }
-                    let cancel_worker_n =
-                        hexagent_runtime::http1_pool::total_account_cancel_capacity().max(1);
-                    for i in 0..cancel_worker_n {
-                        let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
-                        let rx = poly_cancel_rx.clone();
-                        let done_tx = poly_done_tx.clone();
-                        let wname = format!("poly-cancel-{}", i);
-                        let h = thread::Builder::new()
-                            .name(wname.clone())
-                            .spawn(move || {
-                                crate::os_tune::pin_execution(&wname);
-                                crate::latency::prepare_polymarket_order_stages();
-                                while let Ok((signal, stale_ms, utx)) = rx.recv() {
-                                    fire_or_execute(
-                                        &mut worker,
-                                        signal,
-                                        stale_ms,
-                                        &done_tx,
-                                        None,
-                                        &utx,
-                                    );
-                                }
-                            })
-                            .unwrap();
-                        poly_cancel_handles.push(h);
-                    }
-                    // Exactly one owner worker consumes each physical-account
-                    // lane. Cancel and completion remain separate so a worker
-                    // waiting for a reconcile permit cannot strand the
-                    // completion closure that releases it.
-                    let reconcile_worker_n = poly_reconcile_owner_lanes.len();
-                    for (account_id, rx) in poly_reconcile_owner_lanes.drain() {
-                        let mut worker = LiveRouter::new_with_poly_map(&config, &poly_states);
-                        let done_tx = poly_done_tx.clone();
-                        let wname = format!("poly-reconcile-owner-{}", account_id);
-                        let h = thread::Builder::new()
-                            .name(wname.clone())
-                            .spawn(move || {
-                                crate::os_tune::pin_background(&wname);
-                                crate::latency::prepare_polymarket_order_stages();
-                                while let Ok((signal, stale_ms, utx)) = rx.recv() {
-                                    fire_or_execute(
-                                        &mut worker,
-                                        signal,
-                                        stale_ms,
-                                        &done_tx,
-                                        None,
-                                        &utx,
-                                    );
-                                }
-                            })
-                            .unwrap();
-                        poly_reconcile_handles.push(h);
-                    }
+                    let owner_count = poly_connection_handles.len();
                     info!(
-                        "[Executor] Polymarket dispatch pools: place={} cancel={} reconcile={} completion={}",
-                        poly_worker_n, cancel_worker_n, reconcile_worker_n, n_drainers
+                        "[Executor] Polymarket physical connection owners: accounts={} owners={}",
+                        poly_connection_routes.len(), owner_count,
                     );
                     // Admission-control observability daemon: every 30 s log the
                     // per-(account,role) delta — acquires/skips, retained cancel
@@ -10315,17 +10198,10 @@ impl Engine {
                         poly_stats_handle = Some(h);
                     }
                 }
-                drop(poly_pool_rx); // main loop only sends; workers hold their clones
-                drop(poly_cancel_rx);
-                drop(account_reconcile_senders);
-                drop(poly_done_rx); // workers hold their clones of done_tx
-                // Options so Exit can drop senders + join (drain all in-flight
-                // dispatches AND completions) BEFORE the shutdown cancel-all, so
-                // nothing places an order after cancel-all snapshots the book.
-                let mut poly_pool_tx = Some(poly_pool_tx);
-                let mut poly_cancel_tx = Some(poly_cancel_tx);
-                let mut poly_reconcile_routes = Some(poly_reconcile_routes);
-                let mut poly_done_tx = Some(poly_done_tx);
+                // Dropping this routing manifest closes every physical-owner
+                // lane. Joining the owners drains both request and typed
+                // completion before shutdown cancel-all snapshots the book.
+                let mut poly_connection_routes = Some(poly_connection_routes);
 
                 // Stale-signal threshold — read from the shared
                 // `Arc<AtomicU64>` handle on every signal arrival (Relaxed
@@ -10414,30 +10290,8 @@ impl Engine {
                         Signal::BeginShutdown | Signal::Exit => {
                             let terminal = matches!(&signal, Signal::Exit);
                             if !shutdown_finalized {
-                                // Stop the dispatch pool first: drop the sender
-                                // and join all in-flight/queued work before
-                                // cancel-all can snapshot the remote book.
-                                poly_pool_tx = None;
-                                for h in std::mem::take(&mut poly_worker_handles) {
-                                    let _ = h.join();
-                                }
-                                // Replace work on the place lane may enqueue a
-                                // cancel leg. Cancel/reconcile workers must not
-                                // retain a sender for the cancel lane they are
-                                // waiting to drain; that self-ownership was the
-                                // old shutdown deadlock.
-                                poly_reconcile_routes = None;
-                                for h in std::mem::take(&mut poly_reconcile_handles) {
-                                    let _ = h.join();
-                                }
-                                poly_cancel_tx = None;
-                                for h in std::mem::take(&mut poly_cancel_handles) {
-                                    let _ = h.join();
-                                }
-                                // Drain every fired completion before the
-                                // account-wide cancellation barrier.
-                                poly_done_tx = None;
-                                for h in std::mem::take(&mut poly_drainer_handles) {
+                                poly_connection_routes = None;
+                                for h in std::mem::take(&mut poly_connection_handles) {
                                     let _ = h.join();
                                 }
                                 poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10500,82 +10354,30 @@ impl Engine {
                                 .get(&instance_id)
                                 .map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
                                 .unwrap_or(150);
-                            // Plan A: Polymarket signals for a known instance go
-                            // to the pipelined worker pool; everything else
-                            // (binance, unknown iid, or pool disabled) runs
-                            // inline on this thread as before.
-                            if poly_states.contains_key(&instance_id) && poly_pool_tx.is_some() {
-                                let work = (signal, stale_threshold_ms, update_sender.clone());
-                                match &work.0 {
-                                    Signal::CancelOrder {
-                                        exchange: Exchange::Polymarket,
-                                        ..
-                                    }
-                                    | Signal::CancelAll {
-                                        exchange: Exchange::Polymarket,
-                                        ..
-                                    }
-                                    | Signal::BatchCancelOrders {
-                                        exchange: Exchange::Polymarket,
-                                        ..
-                                    }
-                                    | Signal::PolymarketCancelAllOrders { .. } => {
-                                        if let Some(tx) = poly_cancel_tx.as_ref() {
-                                            let _ = tx.send(work);
-                                        }
-                                    }
-                                    Signal::ReconcilePolymarket { .. } => {
-                                        if let Some(tx) = poly_reconcile_routes
-                                            .as_ref()
-                                            .and_then(|routes| routes.get(&instance_id))
-                                        {
-                                            match tx.try_send(work) {
-                                                Ok(()) => {}
-                                                Err(crossbeam_channel::TrySendError::Full((
-                                                    signal,
-                                                    _,
-                                                    utx,
-                                                )))
-                                                | Err(crossbeam_channel::TrySendError::Disconnected((
-                                                    signal,
-                                                    _,
-                                                    utx,
-                                                ))) => defer_reconcile_signal(signal, &utx),
-                                            }
-                                        }
-                                    }
-                                    Signal::NewOrder(_)
-                                    | Signal::BatchNewOrders { .. }
-                                    | Signal::BatchUpdateOrders { .. }
-                                    | Signal::ReplaceOrder { .. } => {
-                                        match poly_pool_tx.as_ref().unwrap().try_send(work) {
-                                            Ok(()) => {}
-                                            Err(crossbeam_channel::TrySendError::Full((
-                                                signal,
-                                                stale_ms,
-                                                utx,
-                                            )))
-                                            | Err(crossbeam_channel::TrySendError::Disconnected((
-                                                signal,
-                                                stale_ms,
-                                                utx,
-                                            ))) => shed_saturated_place_signal(
-                                                signal,
-                                                stale_ms,
-                                                poly_cancel_tx
-                                                    .as_ref()
-                                                    .expect("cancel lane active with place lane"),
-                                                &utx,
-                                            ),
-                                        }
-                                    }
-                                    _ => {
-                                        // Lifecycle/audit control messages are
-                                        // low-volume and lossless. Reuse the
-                                        // bounded must-complete lane so place
-                                        // pressure cannot grow process memory.
-                                        if let Some(tx) = poly_cancel_tx.as_ref() {
-                                            let _ = tx.send(work);
+                            if let Some(shared) = poly_states.get(&instance_id) {
+                                let account_id = shared.account_state.account_id();
+                                if let Some(routes) = poly_connection_routes
+                                    .as_mut()
+                                    .and_then(|routes| routes.get_mut(account_id))
+                                {
+                                    dispatch_poly_signal_to_connection_owner(
+                                        signal,
+                                        stale_threshold_ms,
+                                        update_sender.clone(),
+                                        routes,
+                                    );
+                                } else {
+                                    warn!(
+                                        "[Executor] no physical connection owner for account={} instance={}",
+                                        account_id, instance_id,
+                                    );
+                                    for update in execute_fallback_signal(
+                                        &mut fallback,
+                                        signal,
+                                        stale_threshold_ms,
+                                    ) {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
                                         }
                                     }
                                 }
@@ -10589,18 +10391,10 @@ impl Engine {
                     }
                 }
 
-                // Drain the dispatch pool (no-op if Exit already did it):
-                // dropping the sender ends each worker's recv loop; join so any
-                // in-flight dispatch finishes before the executor thread exits.
-                drop(poly_pool_tx.take());
-                for h in poly_worker_handles { let _ = h.join(); }
-                drop(poly_reconcile_routes.take());
-                for h in poly_reconcile_handles { let _ = h.join(); }
-                drop(poly_cancel_tx.take());
-                for h in poly_cancel_handles { let _ = h.join(); }
-                // Drain fire-and-track completions after the workers stop.
-                drop(poly_done_tx.take());
-                for h in poly_drainer_handles { let _ = h.join(); }
+                drop(poly_connection_routes.take());
+                for h in poly_connection_handles {
+                    let _ = h.join();
+                }
                 poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
                 info!("[Executor] Thread stopped");
@@ -10860,6 +10654,7 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
             Err(e) => {
                 error!("[Executor] Submit error: {}", e);
                 vec![OrderUpdate {
+                    order_slot: order.order_slot,
                     client_order_id: order.client_order_id,
                     exchange: order.exchange,
                     symbol: order.symbol,
@@ -10935,16 +10730,335 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
     }
 }
 
-/// A fired request's completion: run on a drainer thread, it awaits the
-/// reply and books it, returning the resulting update(s). It captures the
-/// admission permit, so the reserved connection is released when this runs.
-type PolyCompletionFn = Box<dyn FnOnce(&mut LiveRouter) -> Vec<OrderUpdate> + Send>;
+/// Typed business commands accepted by one physical Polymarket connection
+/// owner.  The owner retains its exact admission slot for its whole lifetime,
+/// so a command never migrates to an arbitrary worker or completion drainer.
+enum PolyConnectionCommand {
+    Place {
+        instance_id: String,
+        order: OrderRequest,
+        stale_ms: u64,
+        update_tx: ExecutorUpdateSender,
+        enqueued_at: std::time::Instant,
+    },
+    Cancel {
+        instance_id: String,
+        exchange: Exchange,
+        client_order_id: String,
+        timestamp_ns: u64,
+        update_tx: ExecutorUpdateSender,
+        enqueued_at: std::time::Instant,
+    },
+    Reconcile {
+        instance_id: String,
+        pending_places: Vec<(String, String, Side, f64, Option<String>)>,
+        pending_cancels: Vec<(String, String)>,
+        pending_trade_ids: Vec<String>,
+        update_tx: ExecutorUpdateSender,
+        enqueued_at: std::time::Instant,
+    },
+    /// Low-frequency batch/control compatibility path.  It is still owned by
+    /// a role actor, while the venue adapter is migrated to accept an exact
+    /// owner client for every batch variant.
+    Fallback {
+        signal: Signal,
+        stale_ms: u64,
+        update_tx: ExecutorUpdateSender,
+        enqueued_at: std::time::Instant,
+    },
+}
 
-struct QueuedPolyCompletion {
-    complete: PolyCompletionFn,
-    update_tx: ExecutorUpdateSender,
-    kind: &'static str,
-    enqueued_at: std::time::Instant,
+/// A fired request remains a concrete enum value on the same owner stack.
+/// This replaces the heap-allocated `FnOnce` completion and makes permit,
+/// order and pending-reply ownership statically visible.
+enum PolyTypedCompletion {
+    Place {
+        instance_id: String,
+        order: OrderRequest,
+        pending: PendingSubmit,
+        update_tx: ExecutorUpdateSender,
+    },
+    Cancel {
+        instance_id: String,
+        exchange: Exchange,
+        client_order_id: String,
+        pending: PendingCancel,
+        update_tx: ExecutorUpdateSender,
+    },
+}
+
+#[derive(Default)]
+struct PolyAccountConnectionRoutes {
+    fast: Vec<Sender<PolyConnectionCommand>>,
+    cancel: Vec<Sender<PolyConnectionCommand>>,
+    reconcile: Vec<Sender<PolyConnectionCommand>>,
+    fast_rr: usize,
+    cancel_rr: usize,
+    reconcile_rr: usize,
+}
+
+impl PolyAccountConnectionRoutes {
+    fn lanes_mut(
+        &mut self,
+        role: hexagent_runtime::http1_pool::Role,
+    ) -> (&[Sender<PolyConnectionCommand>], &mut usize) {
+        use hexagent_runtime::http1_pool::Role;
+        match role {
+            Role::Fast => (&self.fast, &mut self.fast_rr),
+            Role::Cancel => (&self.cancel, &mut self.cancel_rr),
+            Role::Reconcile => (&self.reconcile, &mut self.reconcile_rr),
+            Role::Query | Role::GapReplay => (&[], &mut self.fast_rr),
+        }
+    }
+}
+
+fn try_send_poly_owner(
+    routes: &mut PolyAccountConnectionRoutes,
+    role: hexagent_runtime::http1_pool::Role,
+    mut command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    let (lanes, rr) = routes.lanes_mut(role);
+    if lanes.is_empty() {
+        return Err(command);
+    }
+    let start = *rr % lanes.len();
+    for offset in 0..lanes.len() {
+        let index = (start + offset) % lanes.len();
+        match lanes[index].try_send(command) {
+            Ok(()) => {
+                *rr = index.wrapping_add(1);
+                return Ok(());
+            }
+            Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+            Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+        }
+    }
+    Err(command)
+}
+
+fn send_poly_owner_lossless(
+    routes: &mut PolyAccountConnectionRoutes,
+    role: hexagent_runtime::http1_pool::Role,
+    command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    let command = match try_send_poly_owner(routes, role, command) {
+        Ok(()) => return Ok(()),
+        Err(command) => command,
+    };
+    let (lanes, rr) = routes.lanes_mut(role);
+    let Some(lane) = lanes.get(*rr % lanes.len().max(1)) else {
+        return Err(command);
+    };
+    match lane.send(command) {
+        Ok(()) => {
+            *rr = rr.wrapping_add(1);
+            Ok(())
+        }
+        Err(error) => Err(error.0),
+    }
+}
+
+fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCompletion) {
+    match completion {
+        PolyTypedCompletion::Place {
+            instance_id,
+            order,
+            pending,
+            update_tx,
+        } => {
+            let update = match router.poly_route_mut(&instance_id) {
+                Ok(route) => route.complete_submit(&order, pending),
+                Err(error) => {
+                    error!("[Executor] Polymarket place completion route error: {error}");
+                    exec_rejected_place(&order)
+                }
+            };
+            let _ = send_executor_update(&update_tx, update);
+        }
+        PolyTypedCompletion::Cancel {
+            instance_id,
+            exchange,
+            client_order_id,
+            pending,
+            update_tx,
+        } => {
+            let update = match router.poly_route_mut(&instance_id) {
+                Ok(route) => route.complete_cancel(exchange, &client_order_id, pending),
+                Err(error) => {
+                    error!("[Executor] Polymarket cancel completion route error: {error}");
+                    exec_rejected_cancel(client_order_id, exchange)
+                }
+            };
+            let _ = send_executor_update(&update_tx, update);
+        }
+    }
+}
+
+fn run_poly_connection_owner(
+    mut router: LiveRouter,
+    permit: hexagent_runtime::http1_pool::Permit,
+    role: hexagent_runtime::http1_pool::Role,
+    rx: Receiver<PolyConnectionCommand>,
+) {
+    use hexagent_runtime::http1_pool::Role;
+    crate::latency::prepare_polymarket_order_stages();
+    while let Ok(command) = rx.recv() {
+        match command {
+            PolyConnectionCommand::Place {
+                instance_id,
+                order,
+                stale_ms,
+                update_tx,
+                enqueued_at,
+            } => {
+                debug_assert_eq!(role, Role::Fast);
+                crate::latency::record_ns(
+                    "polymarket.order.connection_owner_queue",
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                if order.timestamp_ns > 0 {
+                    crate::latency::record_ns(
+                        if order.post_only {
+                            "polymarket.order.post_only.quote_age_at_dispatch"
+                        } else {
+                            "polymarket.order.quote_age_at_dispatch"
+                        },
+                        now_ns().saturating_sub(order.timestamp_ns),
+                    );
+                }
+                if order.quote_trigger_local_timestamp_ns > 0 {
+                    crate::latency::record_ns(
+                        "polymarket.order.trigger_age_at_dispatch",
+                        now_ns().saturating_sub(order.quote_trigger_local_timestamp_ns),
+                    );
+                }
+                let stale = |timestamp_ns: u64| {
+                    timestamp_ns != 0
+                        && stale_ms != 0
+                        && now_ns().saturating_sub(timestamp_ns) / 1_000_000 > stale_ms
+                };
+                if stale(order.timestamp_ns) || stale(order.quote_trigger_local_timestamp_ns) {
+                    let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
+                    continue;
+                }
+                let client = permit.current_pooled_client();
+                let pending = match router.poly_route_mut(&instance_id) {
+                    Ok(route) => route.submit_fire(&order, client),
+                    Err(error) => {
+                        error!("[Executor] Polymarket place owner route error: {error}");
+                        let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
+                        continue;
+                    }
+                };
+                match pending {
+                    Ok(pending) => finish_poly_typed_completion(
+                        &mut router,
+                        PolyTypedCompletion::Place {
+                            instance_id,
+                            order,
+                            pending,
+                            update_tx,
+                        },
+                    ),
+                    Err(update) => {
+                        let _ = send_executor_update(&update_tx, update);
+                    }
+                }
+            }
+            PolyConnectionCommand::Cancel {
+                instance_id,
+                exchange,
+                client_order_id,
+                timestamp_ns,
+                update_tx,
+                enqueued_at,
+            } => {
+                debug_assert_eq!(role, Role::Cancel);
+                crate::latency::record_ns(
+                    "polymarket.cancel.connection_owner_queue",
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                let client = permit.current_pooled_client();
+                let pending = match router.poly_route_mut(&instance_id) {
+                    Ok(route) => {
+                        route.set_gen_ns_hint(timestamp_ns);
+                        route.cancel_fire(&client_order_id, client)
+                    }
+                    Err(error) => {
+                        error!("[Executor] Polymarket cancel owner route error: {error}");
+                        let _ = send_executor_update(
+                            &update_tx,
+                            exec_rejected_cancel(client_order_id, exchange),
+                        );
+                        continue;
+                    }
+                };
+                finish_poly_typed_completion(
+                    &mut router,
+                    PolyTypedCompletion::Cancel {
+                        instance_id,
+                        exchange,
+                        client_order_id,
+                        pending,
+                        update_tx,
+                    },
+                );
+            }
+            PolyConnectionCommand::Reconcile {
+                instance_id,
+                pending_places,
+                pending_cancels,
+                pending_trade_ids,
+                update_tx,
+                enqueued_at,
+            } => {
+                debug_assert_eq!(role, Role::Reconcile);
+                crate::latency::record_ns(
+                    "polymarket.reconcile.connection_owner_queue",
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                let updates = match router.poly_route_mut(&instance_id) {
+                    Ok(route) => route.reconcile_orphans_on(
+                        &permit,
+                        &pending_places,
+                        &pending_cancels,
+                        &pending_trade_ids,
+                    ),
+                    Err(error) => {
+                        error!("[Executor] Polymarket reconcile owner route error: {error}");
+                        reconcile_deferred_updates(
+                            &instance_id,
+                            &pending_places,
+                            &pending_cancels,
+                            &pending_trade_ids,
+                        )
+                    }
+                };
+                for update in updates {
+                    if send_executor_update(&update_tx, update).is_err() {
+                        break;
+                    }
+                }
+            }
+            PolyConnectionCommand::Fallback {
+                signal,
+                stale_ms,
+                update_tx,
+                enqueued_at,
+            } => {
+                crate::latency::record_ns(
+                    "polymarket.control.connection_owner_queue",
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                for update in execute_fallback_signal(&mut router, signal, stale_ms) {
+                    if send_executor_update(&update_tx, update).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(permit);
 }
 
 /// Stamp the actual executor-producer boundary immediately before publishing
@@ -10982,6 +11096,7 @@ fn send_root_private_update(
 /// stale / pre-flight). Free-fn twin of the closure in `execute_fallback_signal`.
 fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
     OrderUpdate {
+        order_slot: order.order_slot,
         client_order_id: order.client_order_id.clone(),
         exchange: order.exchange,
         symbol: order.symbol.clone(),
@@ -11004,6 +11119,7 @@ fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
 /// is unknown. Ordinary pool saturation is retained and never reaches here.
 fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
     OrderUpdate {
+        order_slot: Default::default(),
         client_order_id: coid,
         exchange,
         symbol: String::new(),
@@ -11038,6 +11154,7 @@ fn reconcile_deferred_updates(
             continue;
         }
         updates.push(OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: coid.clone(),
             exchange: Exchange::Polymarket,
             symbol: symbol.clone(),
@@ -11060,6 +11177,7 @@ fn reconcile_deferred_updates(
             continue;
         }
         updates.push(OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: coid.clone(),
             exchange: Exchange::Polymarket,
             symbol: String::new(),
@@ -11090,6 +11208,7 @@ fn reconcile_deferred_updates(
             continue;
         }
         updates.push(OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: synthetic_coid.clone(),
             exchange: Exchange::Polymarket,
             symbol: String::new(),
@@ -11110,187 +11229,28 @@ fn reconcile_deferred_updates(
     updates
 }
 
-/// Shed only place work when the bounded hot lane is saturated. Any cancel
-/// half of a combined update is converted to a lossless cancel-lane job, while
-/// each unsent place gets an explicit ExecutorRejected update so its account
-/// reservation is released by the normal lifecycle path.
-fn shed_saturated_place_signal(
+fn dispatch_poly_signal_to_connection_owner(
     signal: Signal,
     stale_ms: u64,
-    cancel_tx: &Sender<(Signal, u64, ExecutorUpdateSender)>,
-    utx: &ExecutorUpdateSender,
+    update_tx: ExecutorUpdateSender,
+    routes: &mut PolyAccountConnectionRoutes,
 ) {
-    let (places, cancel) = match signal {
-        Signal::NewOrder(order) => (vec![order], None),
-        Signal::BatchNewOrders { orders, .. } => (orders, None),
-        Signal::ReplaceOrder {
-            exchange,
-            market_id,
-            cancel_client_order_ids,
-            place_orders,
-            timestamp_ns,
-            instance_id,
-        }
-        | Signal::BatchUpdateOrders {
-            exchange,
-            market_id,
-            cancel_client_order_ids,
-            place_orders,
-            timestamp_ns,
-            instance_id,
-        } => {
-            let cancel = (!cancel_client_order_ids.is_empty()).then(|| Signal::BatchCancelOrders {
-                exchange,
-                market_id,
-                client_order_ids: cancel_client_order_ids,
-                instance_id,
-                timestamp_ns,
-            });
-            (place_orders, cancel)
-        }
-        other => {
-            // The dispatcher only calls this helper for place-bearing signals.
-            // Preserve a future control variant losslessly if classification
-            // and the Signal enum temporarily drift apart.
-            let _ = cancel_tx.send((other, stale_ms, utx.clone()));
-            return;
-        }
-    };
-    if let Some(cancel) = cancel {
-        let _ = cancel_tx.send((cancel, stale_ms, utx.clone()));
-    }
-    warn!(
-        "[Executor] Polymarket place lane saturated; shedding {} unsent place(s), cancels retained",
-        places.len(),
-    );
-    for order in places {
-        if send_executor_update(utx, exec_rejected_place(&order)).is_err() {
-            break;
-        }
-    }
-}
-
-fn defer_reconcile_signal(signal: Signal, utx: &ExecutorUpdateSender) {
-    let iid = extract_instance_id(&signal);
-    let Signal::ReconcilePolymarket {
-        pending_places,
-        pending_cancels,
-        pending_trade_ids,
-        ..
-    } = signal
-    else {
-        return;
-    };
-    warn!(
-        "[Executor] Polymarket reconcile lane saturated iid={}; returning deferred feedback",
-        iid,
-    );
-    for update in
-        reconcile_deferred_updates(&iid, &pending_places, &pending_cancels, &pending_trade_ids)
-    {
-        if send_executor_update(utx, update).is_err() {
-            break;
-        }
-    }
-}
-
-/// Fire-and-track + admission dispatch for the hot single-leg Polymarket
-/// paths (place / cancel / 1×1 replace). Maps instance→account, acquires an
-/// account-pool permit, fires on the reserved connection WITHOUT blocking, and hands the
-/// reply-completion closure to a drainer. Placement may be skipped when stale
-/// or saturated; cancellation is retained and woken by permit release.
-/// Everything else (batch, reconcile, cancel-all, non-poly, empty/unknown
-/// instance) falls through to the synchronous `execute_fallback_signal`.
-fn fire_or_execute(
-    worker: &mut LiveRouter,
-    signal: Signal,
-    stale_ms: u64,
-    done_tx: &Sender<QueuedPolyCompletion>,
-    cancel_tx: Option<&Sender<(Signal, u64, ExecutorUpdateSender)>>,
-    utx: &ExecutorUpdateSender,
-) {
-    use hexagent_runtime::http1_pool::{acquire, try_acquire, Role};
-    // Same stale semantics as the sync path's `is_stale`.
-    let is_stale =
-        |ts: u64| ts != 0 && stale_ms != 0 && now_ns().saturating_sub(ts) / 1_000_000 > stale_ms;
-    let iid = extract_instance_id(&signal);
+    use hexagent_runtime::http1_pool::Role;
+    let instance_id = extract_instance_id(&signal);
     log_executor_receive(&signal);
-
     match signal {
-        Signal::NewOrder(order)
-            if order.exchange == Exchange::Polymarket && !order.instance_id.is_empty() =>
-        {
-            if order.timestamp_ns > 0 {
-                crate::latency::record_ns(
-                    if order.post_only {
-                        "polymarket.order.post_only.quote_age_at_dispatch"
-                    } else {
-                        "polymarket.order.quote_age_at_dispatch"
-                    },
-                    now_ns().saturating_sub(order.timestamp_ns),
-                );
-            }
-            if order.quote_trigger_local_timestamp_ns > 0 {
-                crate::latency::record_ns(
-                    "polymarket.order.trigger_age_at_dispatch",
-                    now_ns().saturating_sub(order.quote_trigger_local_timestamp_ns),
-                );
-            }
-            // `timestamp_ns` only proves the strategy emitted recently. Also
-            // reject a freshly-emitted order computed from a market trigger
-            // that sat stale in a scheduler/callback queue.
-            if is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns) {
-                let _ = send_executor_update(utx, exec_rejected_place(&order));
-                return;
-            }
-            match try_acquire(&iid, Role::Fast) {
-                None => {
-                    let _ = send_executor_update(utx, exec_rejected_place(&order));
-                    // skip = hold
-                }
-                Some(permit) => {
-                    let client = permit.pooled_client();
-                    let route = match worker.poly_route_mut(&iid) {
-                        Ok(route) => route,
-                        Err(error) => {
-                            error!("[Executor] Polymarket place route error: {}", error);
-                            drop(permit);
-                            let _ = send_executor_update(utx, exec_rejected_place(&order));
-                            return;
-                        }
-                    };
-                    match route.submit_fire(&order, client) {
-                        Ok(pending) => {
-                            let iid2 = iid;
-                            let f: PolyCompletionFn = Box::new(move |r| {
-                                let route = match r.poly_route_mut(&iid2) {
-                                    Ok(route) => route,
-                                    Err(error) => {
-                                        error!(
-                                            "[Executor] Polymarket completion route error: {}",
-                                            error
-                                        );
-                                        drop(permit);
-                                        return vec![exec_rejected_place(&order)];
-                                    }
-                                };
-                                let u = route.complete_submit(&order, pending);
-                                drop(permit); // release the reserved connection
-                                vec![u]
-                            });
-                            let _ = done_tx.send(QueuedPolyCompletion {
-                                complete: f,
-                                update_tx: utx.clone(),
-                                kind: "place",
-                                enqueued_at: std::time::Instant::now(),
-                            });
-                        }
-                        Err(update) => {
-                            drop(permit); // pre-flight reject: nothing sent
-                            let _ = send_executor_update(utx, update);
-                        }
-                    }
-                }
+        Signal::NewOrder(order) if order.exchange == Exchange::Polymarket => {
+            let command = PolyConnectionCommand::Place {
+                instance_id,
+                order,
+                stale_ms,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            if let Err(PolyConnectionCommand::Place { order, .. }) =
+                try_send_poly_owner(routes, Role::Fast, command)
+            {
+                let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
             }
         }
         Signal::CancelOrder {
@@ -11298,245 +11258,176 @@ fn fire_or_execute(
             client_order_id,
             timestamp_ns,
             ..
-        } if exchange == Exchange::Polymarket && !iid.is_empty() => {
-            // A cancel is monotonic while the order is live: unlike a place,
-            // age does not make it unsafe. Retain it across temporary pool
-            // saturation and wake on permit release instead of reverting the
-            // order to Active for a quote-tick retry.
-            let wait_started = std::time::Instant::now();
-            match acquire(&iid, Role::Cancel) {
-                None => {
-                    // Unknown instance/role is permanent; ordinary saturation
-                    // never reaches this branch.
-                    let _ =
-                        send_executor_update(utx, exec_rejected_cancel(client_order_id, exchange));
-                }
-                Some(permit) => {
-                    let wait = wait_started.elapsed();
-                    if wait >= std::time::Duration::from_millis(1) {
-                        info!(
-                            "[Executor] retained cancel acquired iid={} coid={} wait_ms={:.3}",
-                            iid,
-                            client_order_id,
-                            wait.as_secs_f64() * 1000.0,
-                        );
+        } if exchange == Exchange::Polymarket => {
+            let command = PolyConnectionCommand::Cancel {
+                instance_id,
+                exchange,
+                client_order_id,
+                timestamp_ns,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            if let Err(PolyConnectionCommand::Cancel {
+                client_order_id, ..
+            }) = send_poly_owner_lossless(routes, Role::Cancel, command)
+            {
+                let _ = send_executor_update(
+                    &update_tx,
+                    exec_rejected_cancel(client_order_id, exchange),
+                );
+            }
+        }
+        Signal::BatchNewOrders {
+            exchange,
+            orders,
+            ..
+        } if exchange == Exchange::Polymarket => {
+            for order in orders {
+                let place = PolyConnectionCommand::Place {
+                    instance_id: instance_id.clone(),
+                    order,
+                    stale_ms,
+                    update_tx: update_tx.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                };
+                if let Err(PolyConnectionCommand::Place { order, .. }) =
+                    try_send_poly_owner(routes, Role::Fast, place)
+                {
+                    if send_executor_update(&update_tx, exec_rejected_place(&order)).is_err() {
+                        break;
                     }
-                    let client = permit.pooled_client();
-                    let route = match worker.poly_route_mut(&iid) {
-                        Ok(route) => route,
-                        Err(error) => {
-                            error!("[Executor] Polymarket cancel route error: {}", error);
-                            drop(permit);
-                            let _ = send_executor_update(
-                                utx,
-                                exec_rejected_cancel(client_order_id, exchange),
-                            );
-                            return;
-                        }
-                    };
-                    route.set_gen_ns_hint(timestamp_ns);
-                    let pending = route.cancel_fire(&client_order_id, client);
-                    let iid2 = iid;
-                    let f: PolyCompletionFn = Box::new(move |r| {
-                        let route = match r.poly_route_mut(&iid2) {
-                            Ok(route) => route,
-                            Err(error) => {
-                                error!(
-                                    "[Executor] Polymarket cancel completion route error: {}",
-                                    error
-                                );
-                                drop(permit);
-                                return vec![exec_rejected_cancel(client_order_id, exchange)];
-                            }
-                        };
-                        let u = route.complete_cancel(exchange, &client_order_id, pending);
-                        drop(permit);
-                        vec![u]
-                    });
-                    let _ = done_tx.send(QueuedPolyCompletion {
-                        complete: f,
-                        update_tx: utx.clone(),
-                        kind: "cancel",
-                        enqueued_at: std::time::Instant::now(),
-                    });
                 }
             }
         }
-        Signal::ReplaceOrder {
+        Signal::BatchCancelOrders {
+            exchange,
+            client_order_ids,
+            timestamp_ns,
+            ..
+        } if exchange == Exchange::Polymarket => {
+            for client_order_id in client_order_ids {
+                let cancel = PolyConnectionCommand::Cancel {
+                    instance_id: instance_id.clone(),
+                    exchange,
+                    client_order_id,
+                    timestamp_ns,
+                    update_tx: update_tx.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                };
+                if let Err(PolyConnectionCommand::Cancel {
+                    client_order_id, ..
+                }) = send_poly_owner_lossless(routes, Role::Cancel, cancel)
+                {
+                    if send_executor_update(
+                        &update_tx,
+                        exec_rejected_cancel(client_order_id, exchange),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Signal::BatchUpdateOrders {
             exchange,
             cancel_client_order_ids,
             place_orders,
             timestamp_ns,
             ..
-        } if exchange == Exchange::Polymarket
-            && !iid.is_empty()
-            && cancel_client_order_ids.len() == 1
-            && place_orders.len() == 1 =>
-        {
-            let coid = cancel_client_order_ids.into_iter().next().unwrap();
-            let place = place_orders.into_iter().next().unwrap();
-            if place.timestamp_ns > 0 {
-                crate::latency::record_ns(
-                    if place.post_only {
-                        "polymarket.order.post_only.quote_age_at_dispatch"
-                    } else {
-                        "polymarket.order.quote_age_at_dispatch"
-                    },
-                    now_ns().saturating_sub(place.timestamp_ns),
-                );
-            }
-            if place.quote_trigger_local_timestamp_ns > 0 {
-                crate::latency::record_ns(
-                    "polymarket.order.trigger_age_at_dispatch",
-                    now_ns().saturating_sub(place.quote_trigger_local_timestamp_ns),
-                );
-            }
-            // ReplaceOrder is emitted only for a strictly more-aggressive
-            // replacement. Admit/fire the place leg independently BEFORE a
-            // potentially saturated retained-cancel wait, so Cancel-pool
-            // pressure cannot serialize or stale an otherwise-free Fast leg.
-            // Account admission still requires enough physical + virtual funds
-            // for both old and new reservations at the same time.
-            if is_stale(timestamp_ns) || is_stale(place.quote_trigger_local_timestamp_ns) {
-                let _ = send_executor_update(utx, exec_rejected_place(&place));
-            } else {
-                match try_acquire(&iid, Role::Fast) {
-                    None => {
-                        let _ = send_executor_update(utx, exec_rejected_place(&place));
-                    }
-                    Some(ppermit) => {
-                        let pclient = ppermit.pooled_client();
-                        let route = match worker.poly_route_mut(&iid) {
-                            Ok(route) => route,
-                            Err(error) => {
-                                error!(
-                                    "[Executor] Polymarket replace-place route error: {}",
-                                    error
-                                );
-                                drop(ppermit);
-                                let _ = send_executor_update(utx, exec_rejected_place(&place));
-                                let _ =
-                                    send_executor_update(utx, exec_rejected_cancel(coid, exchange));
-                                return;
-                            }
-                        };
-                        match route.submit_fire(&place, pclient) {
-                            Ok(pending) => {
-                                let iid_p = iid.clone();
-                                let pf: PolyCompletionFn = Box::new(move |r| {
-                                    let route = match r.poly_route_mut(&iid_p) {
-                                        Ok(route) => route,
-                                        Err(error) => {
-                                            error!(
-                                                "[Executor] Polymarket replace-place completion route error: {}",
-                                                error
-                                            );
-                                            drop(ppermit);
-                                            return vec![exec_rejected_place(&place)];
-                                        }
-                                    };
-                                    let u = route.complete_submit(&place, pending);
-                                    drop(ppermit);
-                                    vec![u]
-                                });
-                                let _ = done_tx.send(QueuedPolyCompletion {
-                                    complete: pf,
-                                    update_tx: utx.clone(),
-                                    kind: "place",
-                                    enqueued_at: std::time::Instant::now(),
-                                });
-                            }
-                            Err(update) => {
-                                drop(ppermit);
-                                let _ = send_executor_update(utx, update);
-                            }
-                        }
+        }
+        | Signal::ReplaceOrder {
+            exchange,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            ..
+        } if exchange == Exchange::Polymarket => {
+            // Places must be offered to their non-blocking physical lanes
+            // before any retained cancel can wait for lossless capacity. This
+            // preserves concurrent replace dispatch without allowing cancel
+            // backpressure to occupy the execution router ahead of Fast.
+            for order in place_orders {
+                let place = PolyConnectionCommand::Place {
+                    instance_id: instance_id.clone(),
+                    order,
+                    stale_ms,
+                    update_tx: update_tx.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                };
+                if let Err(PolyConnectionCommand::Place { order, .. }) =
+                    try_send_poly_owner(routes, Role::Fast, place)
+                {
+                    if send_executor_update(&update_tx, exec_rejected_place(&order)).is_err() {
+                        break;
                     }
                 }
             }
-
-            // Cancel remains monotonic and lossless, but its permit wait must
-            // never occupy this place worker. The dedicated cancel lane owns
-            // both waiting and fire/track completion for the split leg.
-            let cancel_signal = Signal::CancelOrder {
-                exchange,
-                client_order_id: coid.clone(),
-                instance_id: iid,
-                timestamp_ns,
-            };
-            if cancel_tx.is_none_or(|cancel_tx| {
-                cancel_tx
-                    .send((cancel_signal, stale_ms, utx.clone()))
+            for client_order_id in cancel_client_order_ids {
+                let cancel = PolyConnectionCommand::Cancel {
+                    instance_id: instance_id.clone(),
+                    exchange,
+                    client_order_id,
+                    timestamp_ns,
+                    update_tx: update_tx.clone(),
+                    enqueued_at: std::time::Instant::now(),
+                };
+                if let Err(PolyConnectionCommand::Cancel {
+                    client_order_id, ..
+                }) = send_poly_owner_lossless(routes, Role::Cancel, cancel)
+                {
+                    if send_executor_update(
+                        &update_tx,
+                        exec_rejected_cancel(client_order_id, exchange),
+                    )
                     .is_err()
-            }) {
-                let _ = send_executor_update(utx, exec_rejected_cancel(coid, exchange));
+                    {
+                        break;
+                    }
+                }
             }
         }
-        // Reconcile: concurrency gate on the dedicated per-account Reconcile
-        // pool (NOT full fire-track). The permit's exact client is threaded
-        // through every order GET, so this is both admission control and a real
-        // connection reservation. When none are free, return explicit
-        // admission feedback so the strategy rolls back the in-flight/backoff
-        // state it committed before emitting. Gating on the Reconcile pool
-        // (disjoint from Fast/Cancel) means it never steals hot-path capacity.
         Signal::ReconcilePolymarket {
             pending_places,
             pending_cancels,
             pending_trade_ids,
             ..
-        } if !iid.is_empty() => match try_acquire(&iid, Role::Reconcile) {
-            None => {
+        } => {
+            let command = PolyConnectionCommand::Reconcile {
+                instance_id: instance_id.clone(),
+                pending_places,
+                pending_cancels,
+                pending_trade_ids,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            if let Err(PolyConnectionCommand::Reconcile {
+                pending_places,
+                pending_cancels,
+                pending_trade_ids,
+                ..
+            }) = try_send_poly_owner(routes, Role::Reconcile, command)
+            {
                 for update in reconcile_deferred_updates(
-                    &iid,
+                    &instance_id,
                     &pending_places,
                     &pending_cancels,
                     &pending_trade_ids,
                 ) {
-                    if send_executor_update(utx, update).is_err() {
+                    if send_executor_update(&update_tx, update).is_err() {
                         break;
                     }
                 }
             }
-            Some(permit) => {
-                let updates = match worker.poly_route_mut(&iid) {
-                    Ok(route) => route.reconcile_orphans_on(
-                        &permit,
-                        &pending_places,
-                        &pending_cancels,
-                        &pending_trade_ids,
-                    ),
-                    Err(error) => {
-                        error!("[Executor] Polymarket reconcile route error: {}", error);
-                        reconcile_deferred_updates(
-                            &iid,
-                            &pending_places,
-                            &pending_cancels,
-                            &pending_trade_ids,
-                        )
-                    }
-                };
-                for update in updates {
-                    if send_executor_update(utx, update).is_err() {
-                        break;
-                    }
-                }
-            }
-        },
-        // Batch / cancel-all / non-poly / empty-iid → synchronous fallback.
-        // polymaker's only batch signals are BatchCancelOrders (a leg pulling
-        // >1 accumulated/orphan order with no replace — the `live_count >= 2`
-        // "cancel-stale-don't-place" cleanup) and the rare BatchNewOrders (a
-        // leg seeding both tokens from cold). Both are low-volume edge/cleanup
-        // paths (~6/hr live), NOT the hot reprice churn — that is ReplaceOrder
-        // 1×1 (leg carries a single token in steady state), already fire-
-        // tracked above. Their HTTP internals best-effort borrow account slots
-        // and spill to the fixed global fallback-order pool when saturated.
-        other => {
-            for update in execute_fallback_signal(worker, other, stale_ms) {
-                if send_executor_update(utx, update).is_err() {
-                    break;
-                }
-            }
+        }
+        control => {
+            let command = PolyConnectionCommand::Fallback {
+                signal: control,
+                stale_ms,
+                update_tx,
+                enqueued_at: std::time::Instant::now(),
+            };
+            let _ = send_poly_owner_lossless(routes, Role::Cancel, command);
         }
     }
 }
@@ -11549,6 +11440,7 @@ fn execute_fallback_signal(
     // Build an ExecutorRejected OrderUpdate for a placement we didn't even send.
     let build_exec_rejected_place = |order: &OrderRequest| -> OrderUpdate {
         OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: order.exchange,
             symbol: order.symbol.clone(),
@@ -11610,6 +11502,7 @@ fn execute_fallback_signal(
                 Err(e) => {
                     error!("[Executor] Submit error: {}", e);
                     vec![OrderUpdate {
+                        order_slot: order.order_slot,
                         client_order_id: order.client_order_id,
                         exchange: order.exchange,
                         symbol: order.symbol,
@@ -11851,6 +11744,7 @@ fn execute_fallback_signal(
                         instance_id, error,
                     );
                     return vec![OrderUpdate {
+                        order_slot: Default::default(),
                         client_order_id: instance_id,
                         exchange: Exchange::Polymarket,
                         symbol: market.unwrap_or_default(),
@@ -11910,6 +11804,7 @@ fn execute_fallback_signal(
                         )
                     };
                     updates.push(OrderUpdate {
+                        order_slot: Default::default(),
                         client_order_id: instance_id.clone(),
                         exchange: Exchange::Polymarket,
                         symbol: cid,
@@ -13813,6 +13708,7 @@ mod market_router_tests {
 
     fn order_req(coid: &str, instance_id: &str) -> OrderRequest {
         OrderRequest {
+            order_slot: Default::default(),
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
             symbol: "TOK".into(),
@@ -13840,7 +13736,7 @@ mod market_router_tests {
             Signal::BatchNewOrders {
                 exchange: Exchange::Polymarket,
                 market_id: "market".into(),
-                orders: vec![order_req("batch", "btc")],
+                orders: vec![order_req("batch", "btc")].into_iter().collect(),
                 instance_id: "btc".into(),
             },
         ];
@@ -14018,35 +13914,50 @@ mod market_router_tests {
 
     #[test]
     fn saturated_replace_sheds_place_but_retains_cancel_lane_work() {
+        let (fast_tx, _fast_rx) = bounded(1);
         let (cancel_tx, cancel_rx) = bounded(8);
         let (raw_update_tx, update_rx) = bounded(8);
         let update_tx = ExecutorUpdateSender {
             owner: 3,
             tx: raw_update_tx,
         };
-        shed_saturated_place_signal(
+        assert!(fast_tx
+            .try_send(PolyConnectionCommand::Fallback {
+                signal: Signal::Exit,
+                stale_ms: 0,
+                update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            })
+            .is_ok());
+        let mut routes = PolyAccountConnectionRoutes {
+            fast: vec![fast_tx],
+            cancel: vec![cancel_tx],
+            ..Default::default()
+        };
+        dispatch_poly_signal_to_connection_owner(
             Signal::ReplaceOrder {
                 exchange: Exchange::Polymarket,
                 market_id: "market".into(),
-                cancel_client_order_ids: vec!["old-coid".into()],
-                place_orders: vec![order_req("new-coid", "zhu-03")],
+                cancel_client_order_ids: vec!["old-coid".into()].into_iter().collect(),
+                place_orders: vec![order_req("new-coid", "zhu-03")]
+                    .into_iter()
+                    .collect(),
                 timestamp_ns: 42,
                 instance_id: "zhu-03".into(),
             },
             150,
-            &cancel_tx,
-            &update_tx,
+            update_tx,
+            &mut routes,
         );
 
-        let (cancel, stale_ms, _) = cancel_rx.try_recv().unwrap();
-        assert_eq!(stale_ms, 150);
+        let cancel = cancel_rx.try_recv().unwrap();
         assert!(matches!(
             cancel,
-            Signal::BatchCancelOrders {
-                client_order_ids,
+            PolyConnectionCommand::Cancel {
+                client_order_id,
                 instance_id,
                 ..
-            } if client_order_ids == vec!["old-coid"] && instance_id == "zhu-03"
+            } if client_order_id == "old-coid" && instance_id == "zhu-03"
         ));
         let rejected = update_rx.try_recv().unwrap();
         assert_eq!(rejected.owner, 3);
@@ -14155,6 +14066,7 @@ mod market_router_tests {
                 // Deliberately not namespaced: string recovery routing would
                 // reject this update as unowned.
                 update: OrderUpdate {
+                    order_slot: Default::default(),
                     client_order_id: "opaque-coid".into(),
                     exchange: Exchange::Hexmarket,
                     symbol: "market".into(),
@@ -14191,6 +14103,7 @@ mod market_router_tests {
         let flags = vec![Arc::new(AtomicBool::new(false))];
         let occupied = QueuedOrderUpdate {
             update: OrderUpdate {
+                order_slot: Default::default(),
                 client_order_id: "owner-occupied".into(),
                 exchange: Exchange::Hexmarket,
                 symbol: "market".into(),
@@ -14215,6 +14128,7 @@ mod market_router_tests {
             RoutedOrderUpdate {
                 owner: 0,
                 update: OrderUpdate {
+                    order_slot: Default::default(),
                     client_order_id: "opaque-lossless".into(),
                     exchange: Exchange::Hexmarket,
                     symbol: "market".into(),
@@ -14255,6 +14169,7 @@ mod market_router_tests {
     #[test]
     fn polymarket_rtt_probe_updates_are_not_strategy_private_events() {
         let probe = OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: "probe:btc01:0xabc".into(),
             exchange: Exchange::Polymarket,
             symbol: "UP".into(),

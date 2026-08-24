@@ -271,6 +271,7 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
             trade_id: tid,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         });
     }
 
@@ -298,6 +299,7 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
         trade_id: None,
         order_audit: None,
         error: None,
+        order_slot: Default::default(),
     })
 }
 

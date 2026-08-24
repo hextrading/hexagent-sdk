@@ -24,15 +24,13 @@ use log::{debug, warn};
 use serde::Deserialize;
 
 use crate::async_rt;
-use crate::types::{
-    Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side,
-};
+use crate::types::{Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side};
 
 use super::auth::LighterAuth;
 use super::info::{fetch_next_nonce, LighterMeta};
 use super::signer::{
-    CreateOrderParams, SignedTx, ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET,
-    TIF_GOOD_TILL_TIME, TIF_IMMEDIATE_OR_CANCEL, TIF_POST_ONLY,
+    CreateOrderParams, SignedTx, ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET, TIF_GOOD_TILL_TIME,
+    TIF_IMMEDIATE_OR_CANCEL, TIF_POST_ONLY,
 };
 
 /// Tx deadline: how far in the future `ExpiredAt` (ms) is set.
@@ -165,7 +163,10 @@ impl LighterTrade {
 /// (low 48 bits of the hex digits; must be ≥ 1). Non-UUID ids hash to the
 /// same range so cancels stay consistent for any id shape.
 fn coid_to_index(client_order_id: &str) -> i64 {
-    let hex: String = client_order_id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let hex: String = client_order_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
     let v = if hex.len() >= 12 {
         i64::from_str_radix(&hex[hex.len() - 12..], 16).unwrap_or(0)
     } else {
@@ -193,21 +194,33 @@ impl super::super::ExchangeTrade for LighterTrade {
         let is_market = order.order_type == OrderType::Market;
         let price = match order.price {
             Some(p) => p,
-            None if is_market => self.market_price(&symbol, market_id, order.side, MARKET_SLIPPAGE)?,
+            None if is_market => {
+                self.market_price(&symbol, market_id, order.side, MARKET_SLIPPAGE)?
+            }
             None => return Err(anyhow!("lighter: limit order without price")),
         };
 
         let (order_type, tif, order_expiry) = match order.order_type {
             OrderType::Market => (ORDER_TYPE_MARKET, TIF_IMMEDIATE_OR_CANCEL, 0),
             OrderType::Fak | OrderType::Fok => (ORDER_TYPE_LIMIT, TIF_IMMEDIATE_OR_CANCEL, 0),
-            OrderType::LimitMaker => {
-                (ORDER_TYPE_LIMIT, TIF_POST_ONLY, Self::now_ms() + ORDER_EXPIRY_MS)
-            }
+            OrderType::LimitMaker => (
+                ORDER_TYPE_LIMIT,
+                TIF_POST_ONLY,
+                Self::now_ms() + ORDER_EXPIRY_MS,
+            ),
             OrderType::Limit => {
                 if order.post_only {
-                    (ORDER_TYPE_LIMIT, TIF_POST_ONLY, Self::now_ms() + ORDER_EXPIRY_MS)
+                    (
+                        ORDER_TYPE_LIMIT,
+                        TIF_POST_ONLY,
+                        Self::now_ms() + ORDER_EXPIRY_MS,
+                    )
                 } else {
-                    (ORDER_TYPE_LIMIT, TIF_GOOD_TILL_TIME, Self::now_ms() + ORDER_EXPIRY_MS)
+                    (
+                        ORDER_TYPE_LIMIT,
+                        TIF_GOOD_TILL_TIME,
+                        Self::now_ms() + ORDER_EXPIRY_MS,
+                    )
                 }
             }
         };
@@ -235,11 +248,16 @@ impl super::super::ExchangeTrade for LighterTrade {
             .insert(order.client_order_id.clone(), (market_id, coi));
         debug!(
             "[Lighter] placed coi={} {} {:?} px={} qty={} tx_hash={}",
-            coi, symbol, order.side, price, order.quantity,
+            coi,
+            symbol,
+            order.side,
+            price,
+            order.quantity,
             resp.tx_hash.as_deref().unwrap_or(&tx.tx_hash),
         );
 
         Ok(OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: Exchange::Lighter,
             symbol,
@@ -265,7 +283,10 @@ impl super::super::ExchangeTrade for LighterTrade {
         let (market_id, coi) = match self.coid_index.get(client_order_id).copied() {
             Some(v) => v,
             None => {
-                debug!("[Lighter] cancel for unknown coid {} — no-op", client_order_id);
+                debug!(
+                    "[Lighter] cancel for unknown coid {} — no-op",
+                    client_order_id
+                );
                 return Ok(cancel_update(client_order_id, true, None));
             }
         };
@@ -305,7 +326,11 @@ impl super::super::ExchangeTrade for LighterTrade {
         let mut new_cois = Vec::new();
         for o in place_orders {
             let u = self.submit_order(o)?;
-            if let Some(coi) = u.exchange_order_id.as_ref().and_then(|s| s.parse::<i64>().ok()) {
+            if let Some(coi) = u
+                .exchange_order_id
+                .as_ref()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
                 new_cois.push(coi);
             }
             updates.push(u);
@@ -356,10 +381,7 @@ impl super::super::ExchangeTrade for LighterTrade {
         self.send_tx(&tx)?;
         let coids: Vec<String> = self.coid_index.keys().cloned().collect();
         self.coid_index.clear();
-        Ok(coids
-            .iter()
-            .map(|c| cancel_update(c, true, None))
-            .collect())
+        Ok(coids.iter().map(|c| cancel_update(c, true, None)).collect())
     }
 
     fn name(&self) -> &str {
@@ -369,12 +391,17 @@ impl super::super::ExchangeTrade for LighterTrade {
 
 fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderUpdate {
     OrderUpdate {
+        order_slot: Default::default(),
         client_order_id: client_order_id.to_string(),
         exchange: Exchange::Lighter,
         symbol: String::new(),
         side: Side::Buy, // not meaningful for a cancel ack
         exchange_order_id: None,
-        status: if ok { OrderStatus::Cancelled } else { OrderStatus::Rejected },
+        status: if ok {
+            OrderStatus::Cancelled
+        } else {
+            OrderStatus::Rejected
+        },
         liquidity: None,
         filled_quantity: 0.0,
         remaining_quantity: 0.0,

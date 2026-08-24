@@ -114,6 +114,7 @@ fn parse_user_event(data: &serde_json::Value) -> Option<OrderUpdate> {
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             })
         }
         "order_cancelled" | "order_cancel" => {
@@ -153,6 +154,7 @@ fn parse_user_event(data: &serde_json::Value) -> Option<OrderUpdate> {
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             })
         }
         _ => None,

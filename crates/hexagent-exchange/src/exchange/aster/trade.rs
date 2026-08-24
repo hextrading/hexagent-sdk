@@ -13,9 +13,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, warn};
 use serde::Deserialize;
 
-use crate::types::{
-    Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side,
-};
+use crate::types::{Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side};
 
 use super::auth::AsterAuth;
 use super::info::{http_request_async, http_request_role, AsterMeta};
@@ -55,7 +53,13 @@ impl AsterTrade {
     /// traffic never queues behind anything slower). Returns the raw body
     /// text on 2xx; the caller parses. Aster rejections come back as non-2xx
     /// with `{"code":-XXXX,"msg":"…"}` — surfaced in the error string.
-    fn send_signed(&self, role: Role, method: &str, endpoint: &str, params: Vec<(&str, String)>) -> Result<String> {
+    fn send_signed(
+        &self,
+        role: Role,
+        method: &str,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String> {
         let query = signed_query(&self.auth, params)?;
         let url = format!("{}?{}", self.auth.fapi_url(endpoint), query);
         http_request_role(role, method, &url)
@@ -69,7 +73,11 @@ impl AsterTrade {
             .rules(symbol)
             .map(|r| (r.tick_size, r.price_precision))
             .unwrap_or((0.0, 2));
-        let snapped = if tick > 0.0 { (px / tick).round() * tick } else { px };
+        let snapped = if tick > 0.0 {
+            (px / tick).round() * tick
+        } else {
+            px
+        };
         trim_decimal(&format!("{:.*}", prec as usize, snapped))
     }
 
@@ -81,17 +89,19 @@ impl AsterTrade {
             .rules(symbol)
             .map(|r| (r.step_size, r.quantity_precision))
             .unwrap_or((0.0, 3));
-        let snapped = if step > 0.0 { (qty / step).floor() * step } else { qty };
+        let snapped = if step > 0.0 {
+            (qty / step).floor() * step
+        } else {
+            qty
+        };
         trim_decimal(&format!("{:.*}", prec as usize, snapped))
     }
 
     /// Wire params for `POST /fapi/v3/order`.
     fn order_params(&self, order: &OrderRequest) -> Result<Vec<(&'static str, String)>> {
         let symbol = order.symbol.clone();
-        let mut params: Vec<(&'static str, String)> = vec![
-            ("symbol", symbol.clone()),
-            ("side", order.side.to_string()),
-        ];
+        let mut params: Vec<(&'static str, String)> =
+            vec![("symbol", symbol.clone()), ("side", order.side.to_string())];
         if order.order_type == OrderType::Market {
             params.push(("type", "MARKET".to_string()));
         } else {
@@ -145,7 +155,8 @@ fn parse_place_result(order: &OrderRequest, result: Result<String>) -> Result<Or
 impl super::super::ExchangeTrade for AsterTrade {
     fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
         let params = self.order_params(order)?;
-        self.coid_symbol.insert(order.client_order_id.clone(), order.symbol.clone());
+        self.coid_symbol
+            .insert(order.client_order_id.clone(), order.symbol.clone());
         let result = self.send_signed(Role::Fast, "POST", "order", params);
         parse_place_result(order, result)
     }
@@ -156,7 +167,10 @@ impl super::super::ExchangeTrade for AsterTrade {
         let symbol = match self.coid_symbol.get(client_order_id).cloned() {
             Some(s) => s,
             None => {
-                debug!("[Aster] cancel for unknown coid {} — no-op", client_order_id);
+                debug!(
+                    "[Aster] cancel for unknown coid {} — no-op",
+                    client_order_id
+                );
                 return Ok(cancel_update(client_order_id, true, None));
             }
         };
@@ -174,7 +188,11 @@ impl super::super::ExchangeTrade for AsterTrade {
                 if text.contains("-2011") {
                     Ok(cancel_update(client_order_id, true, None))
                 } else {
-                    Ok(cancel_update(client_order_id, false, extract_api_error(&text)))
+                    Ok(cancel_update(
+                        client_order_id,
+                        false,
+                        extract_api_error(&text),
+                    ))
                 }
             }
         }
@@ -210,7 +228,8 @@ impl super::super::ExchangeTrade for AsterTrade {
             let params = self.order_params(o)?;
             let query = signed_query(&self.auth, params)?;
             let url = format!("{}?{}", self.auth.fapi_url("order"), query);
-            self.coid_symbol.insert(o.client_order_id.clone(), o.symbol.clone());
+            self.coid_symbol
+                .insert(o.client_order_id.clone(), o.symbol.clone());
             prepared.push(url);
         }
         let results: Vec<Result<String>> = crate::async_rt::block_on_runtime(async move {
@@ -226,7 +245,11 @@ impl super::super::ExchangeTrade for AsterTrade {
         for (o, result) in place_orders.iter().zip(results) {
             let u = parse_place_result(o, result)?;
             if u.status == OrderStatus::Accepted || u.status == OrderStatus::PartiallyFilled {
-                if let Some(oid) = u.exchange_order_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(oid) = u
+                    .exchange_order_id
+                    .as_ref()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     new_oids.push(oid);
                 }
             }
@@ -238,14 +261,20 @@ impl super::super::ExchangeTrade for AsterTrade {
         for chunk in prev.chunks(10) {
             let id_list = format!(
                 "[{}]",
-                chunk.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(",")
+                chunk
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
-            let params: Vec<(&str, String)> = vec![
-                ("symbol", symbol.clone()),
-                ("orderIdList", id_list),
-            ];
+            let params: Vec<(&str, String)> =
+                vec![("symbol", symbol.clone()), ("orderIdList", id_list)];
             if let Err(e) = self.send_signed(Role::Cancel, "DELETE", "batchOrders", params) {
-                warn!("[Aster] replace cancel of {} prev oids failed: {}", chunk.len(), e);
+                warn!(
+                    "[Aster] replace cancel of {} prev oids failed: {}",
+                    chunk.len(),
+                    e
+                );
             }
         }
 
@@ -258,9 +287,14 @@ impl super::super::ExchangeTrade for AsterTrade {
 
     fn cancel_all(&mut self, _exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>> {
         self.prev_oids.remove(symbol); // authoritative sweep supersedes tracked oids
-        // Snapshot open orders first so we can ack their coids after the sweep.
+                                       // Snapshot open orders first so we can ack their coids after the sweep.
         let open: Vec<OpenOrder> = match self
-            .send_signed(Role::Query, "GET", "openOrders", vec![("symbol", symbol.to_string())])
+            .send_signed(
+                Role::Query,
+                "GET",
+                "openOrders",
+                vec![("symbol", symbol.to_string())],
+            )
             .and_then(|t| serde_json::from_str(&t).map_err(|e| anyhow!("parse openOrders: {}", e)))
         {
             Ok(v) => v,
@@ -321,19 +355,29 @@ impl OrderResponse {
             "PARTIALLY_FILLED" => (OrderStatus::PartiallyFilled, None),
             "FILLED" => (OrderStatus::Filled, None),
             "CANCELED" => (OrderStatus::Cancelled, None),
-            "REJECTED" => (OrderStatus::Rejected, Some("rejected by exchange".to_string())),
+            "REJECTED" => (
+                OrderStatus::Rejected,
+                Some("rejected by exchange".to_string()),
+            ),
             // EXPIRED on a placement = GTX would cross, or IOC/FOK remainder
             // cancelled. With fills → partial; without → effectively a reject.
             "EXPIRED" => {
                 if filled > 0.0 {
                     (OrderStatus::PartiallyFilled, None)
                 } else {
-                    (OrderStatus::Rejected, Some("EXPIRED (post-only cross / IOC no-fill)".to_string()))
+                    (
+                        OrderStatus::Rejected,
+                        Some("EXPIRED (post-only cross / IOC no-fill)".to_string()),
+                    )
                 }
             }
-            other => (OrderStatus::Rejected, Some(format!("unknown status {}", other))),
+            other => (
+                OrderStatus::Rejected,
+                Some(format!("unknown status {}", other)),
+            ),
         };
         OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: Exchange::Aster,
             symbol: order.symbol.clone(),
@@ -356,7 +400,9 @@ impl OrderResponse {
 /// Pull the `{"code":…,"msg":"…"}` payload out of an HTTP-error string, if
 /// present. Returns the whole `msg` (with code prefix) for the reject text.
 fn extract_api_error(text: &str) -> Option<String> {
-    let start = text.find(r#"{"code""#).or_else(|| text.find(r#"{ "code""#))?;
+    let start = text
+        .find(r#"{"code""#)
+        .or_else(|| text.find(r#"{ "code""#))?;
     let json = &text[start..];
     let end = json.find('}')? + 1;
     #[derive(Deserialize)]
@@ -371,6 +417,7 @@ fn extract_api_error(text: &str) -> Option<String> {
 
 fn reject_update(order: &OrderRequest, error: String) -> OrderUpdate {
     OrderUpdate {
+        order_slot: order.order_slot,
         client_order_id: order.client_order_id.clone(),
         exchange: Exchange::Aster,
         symbol: order.symbol.clone(),
@@ -391,12 +438,17 @@ fn reject_update(order: &OrderRequest, error: String) -> OrderUpdate {
 
 fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderUpdate {
     OrderUpdate {
+        order_slot: Default::default(),
         client_order_id: client_order_id.to_string(),
         exchange: Exchange::Aster,
         symbol: String::new(),
         side: Side::Buy, // not meaningful for a cancel ack
         exchange_order_id: None,
-        status: if ok { OrderStatus::Cancelled } else { OrderStatus::Rejected },
+        status: if ok {
+            OrderStatus::Cancelled
+        } else {
+            OrderStatus::Rejected
+        },
         liquidity: None,
         filled_quantity: 0.0,
         remaining_quantity: 0.0,
@@ -436,7 +488,11 @@ fn tif_for(order_type: OrderType, post_only: bool) -> String {
 fn trim_decimal(s: &str) -> String {
     if s.contains('.') {
         let t = s.trim_end_matches('0').trim_end_matches('.');
-        if t.is_empty() || t == "-" { "0".to_string() } else { t.to_string() }
+        if t.is_empty() || t == "-" {
+            "0".to_string()
+        } else {
+            t.to_string()
+        }
     } else {
         s.to_string()
     }

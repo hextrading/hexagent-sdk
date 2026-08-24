@@ -92,6 +92,7 @@ mod tests {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         })
     }
 

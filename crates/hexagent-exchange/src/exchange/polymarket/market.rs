@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, Stream, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -2866,7 +2866,7 @@ impl ClobBurstMetrics {
         self.finish_window(now);
         let event_queue_depth = event_queue.len();
         let (critical_overflows, replaceable_evictions) = event_queue.overflow_totals();
-        info!(
+        debug!(
             "[clob_1s_metric] lane_role={} lane_id={} peer={:?} subscription_tokens={} window_ms={} frames={} frame_bytes={} max_frame_bytes={} peak_100ms_frames={} peak_100ms_frame_bytes={} peak_100ms_max_frame_bytes={} kernel_unread_latest={} kernel_unread_max={} kernel_unread_samples={} kernel_unread_errors={} socket_probe_max_us={} socket_poll_calls={} socket_poll_gap_samples={} socket_poll_gap_max_us={} socket_poll_gap_over_20ms={} decoded_frame_queue_mode=inline decoded_frame_queue_depth=0 decoded_frame_queue_capacity=0 event_queue_mode=bounded_tiered event_queue_critical_capacity={} event_queue_replaceable_capacity={} event_queue_depth={} event_queue_high_water_30s={} event_queue_critical_overflows_total={} event_queue_replaceable_evictions_total={} parse_apply_max_us_30s={} read_handler_max_us_30s={} forward_max_us_30s={} event_send_max_us_30s={} event_send_over_1ms_30s={} loop_scheduler_max_us_30s={} runtime_scheduler_max_us_30s={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_rcv_ssthresh={} tcp_rcv_wscale={} tcp_total_retrans={} so_rcvbuf={}",
             lane_role,
             lane_id,

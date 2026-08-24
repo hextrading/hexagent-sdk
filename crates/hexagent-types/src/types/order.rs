@@ -6,8 +6,7 @@ use super::market::{Exchange, Side};
 /// Marker attached to a terminal `OrderUpdate` produced by an explicit orphan
 /// reconciliation GET. Consumers use it to distinguish a fresh server audit
 /// from a possibly delayed private-stream lifecycle update.
-pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str =
-    "orphan_reconcile_authoritative_terminal";
+pub const ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL: &str = "orphan_reconcile_authoritative_terminal";
 
 /// Marker attached to an `ExecutorRejected` update when the dedicated
 /// Polymarket reconcile pool had no free permit and therefore sent no HTTP
@@ -20,8 +19,7 @@ pub const ORPHAN_RECONCILE_DEFERRED: &str = "orphan_reconcile_deferred";
 /// GET has an executor-owned backoff. The strategy mirrors this deadline so
 /// it does not mark the coid in-flight and then wait its unrelated 4.5-second
 /// lost-callback TTL. Optional diagnostic fields follow after `;`.
-pub const ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX: &str =
-    "orphan_reconcile_retry_after_ms=";
+pub const ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX: &str = "orphan_reconcile_retry_after_ms=";
 
 pub fn orphan_reconcile_retry_after_ms(error: Option<&str>) -> Option<u64> {
     error?
@@ -46,7 +44,9 @@ pub const POLYMARKET_MARKET_CANCEL_FINALITY_CONFIRMED: &str =
 pub const POLYMARKET_MARKET_CANCEL_FINALITY_PENDING: &str =
     "polymarket_market_cancel_finality_pending";
 
-fn default_true_fn() -> bool { true }
+fn default_true_fn() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod orphan_reconcile_diagnostic_tests {
@@ -66,9 +66,7 @@ mod orphan_reconcile_diagnostic_tests {
 }
 
 /// Order type
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderType {
     Market,
@@ -86,9 +84,7 @@ pub enum OrderType {
 }
 
 /// Whether the fill was maker or taker.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liquidity {
     Maker,
@@ -96,9 +92,7 @@ pub enum Liquidity {
 }
 
 /// Order lifecycle status
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     Pending,
@@ -181,11 +175,49 @@ impl fmt::Display for QuoteTriggerSource {
     }
 }
 
+/// Owner-local, numeric order routing slot. Zero-based values address a fixed
+/// strategy table directly; `UNASSIGNED` marks legacy/private sources that
+/// have not yet published a numeric identity and must fail closed or use a
+/// cold-path reconciliation lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrderSlot(u16);
+
+impl OrderSlot {
+    pub const UNASSIGNED: Self = Self(u16::MAX);
+
+    #[inline]
+    pub const fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    #[inline]
+    pub const fn index(self) -> Option<usize> {
+        if self.0 == u16::MAX {
+            None
+        } else {
+            Some(self.0 as usize)
+        }
+    }
+
+    #[inline]
+    pub const fn is_assigned(self) -> bool {
+        self.0 != u16::MAX
+    }
+}
+
+impl Default for OrderSlot {
+    fn default() -> Self {
+        Self::UNASSIGNED
+    }
+}
+
 /// Request to place a new order
-#[derive(
-    Debug, Clone, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
+    /// Fixed owner-local routing identity, echoed by execution and lifecycle.
+    #[serde(default)]
+    pub order_slot: OrderSlot,
     pub client_order_id: String,
     pub exchange: Exchange,
     pub symbol: String,
@@ -252,10 +284,13 @@ pub struct AuthoritativeOrderAudit {
 }
 
 /// Update on an existing order
-#[derive(
-    Debug, Clone, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderUpdate {
+    /// Fixed owner-local routing identity copied from the originating request.
+    /// Authenticated private events may be unassigned until replay/reconcile
+    /// resolves them outside the quote path.
+    #[serde(default)]
+    pub order_slot: OrderSlot,
     pub client_order_id: String,
     pub exchange: Exchange,
     pub symbol: String,
@@ -316,6 +351,7 @@ impl OrderRequest {
         quantity: f64,
     ) -> Self {
         Self {
+            order_slot: OrderSlot::UNASSIGNED,
             client_order_id: uuid::Uuid::new_v4().to_string(),
             exchange,
             symbol,
@@ -336,13 +372,9 @@ impl OrderRequest {
         }
     }
 
-    pub fn new_market(
-        exchange: Exchange,
-        symbol: String,
-        side: Side,
-        quantity: f64,
-    ) -> Self {
+    pub fn new_market(exchange: Exchange, symbol: String, side: Side, quantity: f64) -> Self {
         Self {
+            order_slot: OrderSlot::UNASSIGNED,
             client_order_id: uuid::Uuid::new_v4().to_string(),
             exchange,
             symbol,
@@ -389,5 +421,25 @@ mod tests {
         assert_eq!(restored.quote_trigger_local_timestamp_ns, 0);
         assert!(restored.quote_event_id.is_empty());
         assert!(restored.quote_trigger_source.is_unknown());
+    }
+
+    #[test]
+    fn numeric_order_slot_round_trips_and_defaults_unassigned() {
+        let mut request = OrderRequest::new_limit(
+            Exchange::Polymarket,
+            "token".to_string(),
+            Side::Buy,
+            0.5,
+            10.0,
+        );
+        request.order_slot = OrderSlot::new(37);
+        let encoded = serde_json::to_value(&request).unwrap();
+        let restored: OrderRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.order_slot, OrderSlot::new(37));
+
+        let mut legacy = serde_json::to_value(request).unwrap();
+        legacy.as_object_mut().unwrap().remove("order_slot");
+        let restored: OrderRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.order_slot, OrderSlot::UNASSIGNED);
     }
 }

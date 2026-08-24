@@ -108,7 +108,7 @@ fn keep_warm_tick(full_sweep: Duration, n_slots: usize) -> Duration {
 
 /// Request roles. Fast, Cancel, Reconcile, and GapReplay have physically
 /// isolated account pools. Query is process-global.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Role {
     /// POST /order, /orders — hot-path placements.
     Fast,
@@ -1569,6 +1569,40 @@ fn build_account_pool_registry(
 /// True once account-level admission has been configured.
 pub fn account_pools_ready() -> bool {
     ACCOUNT_POOLS.get().is_some()
+}
+
+/// Fixed physical connection slots that must be owned by the execution
+/// actors.  The manifest is sorted so startup binds every slot
+/// deterministically before any business request can borrow it.
+pub fn account_execution_slot_manifest() -> Vec<(String, Role, usize)> {
+    let Some(registry) = ACCOUNT_POOLS.get() else {
+        return Vec::new();
+    };
+    let mut account_ids: Vec<&String> = registry.by_account.keys().collect();
+    account_ids.sort();
+    let mut manifest = Vec::new();
+    for account_id in account_ids {
+        let pools = &registry.by_account[account_id];
+        for role in [Role::Fast, Role::Cancel, Role::Reconcile] {
+            let slots = pools
+                .role(role)
+                .expect("execution role must have an account pool")
+                .slots
+                .len();
+            manifest.extend((0..slots).map(|slot| (account_id.clone(), role, slot)));
+        }
+    }
+    manifest
+}
+
+/// Bind one exact physical slot to its long-lived execution owner.  This is a
+/// startup-only ownership transfer: callers retain the returned permit for the
+/// actor lifetime and use `current_pooled_client()` for each sequential
+/// request.  Taking the same slot twice fails closed.
+pub fn take_account_execution_slot(account_id: &str, role: Role, slot: usize) -> Option<Permit> {
+    account_by_id(account_id)?
+        .role(role)?
+        .try_acquire_slot(slot)
 }
 
 fn account_for_instance(instance: &str) -> Option<&'static AccountPools> {

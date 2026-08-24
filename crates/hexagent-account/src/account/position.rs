@@ -1055,6 +1055,7 @@ mod tests {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -1110,6 +1111,7 @@ mod tests {
                     quantity: 2.0,
                     price: 0.4,
                     status: "CONFIRMED".into(),
+                    order_slot: Default::default(),
                 },
                 booked: true,
                 usdc_fee: 0.0,
@@ -1457,6 +1459,7 @@ mod tests {
                 trade_key: "restored".into(), client_order_id: "a-1".into(),
                 order_id: "oid-1".into(), token_id: "TOKEN".into(),
                 side: Side::Buy, quantity: 5.0, price: 0.4, status: "MATCHED".into(),
+                order_slot: Default::default(),
             },
             booked: true, usdc_fee: 0.0, shares_fee: 0.0,
             virtual_fee_booked: true, is_maker: true,

@@ -1286,6 +1286,7 @@ fn format_order_brief(o: &OrderRequest) -> String {
 /// Tracked order for state reconciliation.
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedOrder {
+    pub order_slot: OrderSlot,
     pub symbol: String,
     pub side: Side,
     /// Strategy instance that placed this order. Multiple instances may
@@ -1679,6 +1680,14 @@ struct AttemptAuditJob {
 }
 
 #[derive(Debug)]
+struct PrivateDiagnosticJob {
+    trade_id: String,
+    tx_hash: String,
+    maker_legs: usize,
+    enqueued_ns: u64,
+}
+
+#[derive(Debug)]
 enum LifecycleTraceJob {
     Register {
         client_order_id: String,
@@ -1710,6 +1719,7 @@ enum LifecycleTraceJob {
 enum AuditJob {
     Attempt(AttemptAuditJob),
     Lifecycle(LifecycleTraceJob),
+    PrivateDiagnostic(PrivateDiagnosticJob),
 }
 
 /// Order-level inputs required to replay a live placement in sim_v2.
@@ -2806,6 +2816,7 @@ impl SharedState {
         &self,
         execution: &mut ExecutionStateOwner,
         live_position: &mut LivePositionManager,
+        private_replay: &mut super::user_feed::PrivateReplayOwner,
         job: AccountLifecycleJob,
     ) {
         match job {
@@ -2864,13 +2875,19 @@ impl SharedState {
             }
             AccountLifecycleJob::DeferredLifecycle(job) => self.apply_deferred_lifecycle(job),
             AccountLifecycleJob::PrivateCold(command) => {
-                super::user_feed::apply_private_cold_command(self, live_position, command);
+                super::user_feed::apply_private_cold_command(
+                    self,
+                    live_position,
+                    private_replay,
+                    command,
+                );
             }
             AccountLifecycleJob::DiagnosePrivate { record, completion } => {
                 let parsed = super::user_feed::parse_user_event_diagnosed_owned(
                     &record,
                     self,
                     live_position,
+                    private_replay,
                 );
                 self.publish_live_position_watermark(live_position.last_match_time_secs());
                 let _ = completion.send(parsed);
@@ -2918,7 +2935,7 @@ impl SharedState {
         initial_live_position: LivePositionManager,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
         owner_task_rx: crossbeam_channel::Receiver<
-            hexagent_account::account::shared_account::AccountOwnerTask,
+            hexagent_account::account::shared_account::AccountOwnerCommand,
         >,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
@@ -2934,6 +2951,7 @@ impl SharedState {
             .spawn(move || {
                 let mut execution = ExecutionStateOwner::new(initial_execution_state);
                 let mut live_position = initial_live_position;
+                let mut private_replay = super::user_feed::PrivateReplayOwner::new();
                 crate::os_tune::pin_private_account_cold("polymarket-account-owner", &account_id);
                 if let Err(error) = owner_account_state.mark_account_owner_thread() {
                     log::error!("[PolymarketTrade] account owner binding failed: {error}");
@@ -2956,12 +2974,13 @@ impl SharedState {
                                 shared.apply_account_lifecycle_job(
                                     &mut execution,
                                     &mut live_position,
+                                    &mut private_replay,
                                     job,
                                 );
                                 continue;
                             }
-                            if let Ok(task) = owner_task_rx.try_recv() {
-                                task(&shared.account_state);
+                            if let Ok(command) = owner_task_rx.try_recv() {
+                                command.execute(&shared.account_state);
                                 continue;
                             }
                             if let Ok(job) = maintenance_rx.try_recv() {
@@ -2981,12 +3000,13 @@ impl SharedState {
                             Ok(job) => shared.apply_account_lifecycle_job(
                                 &mut execution,
                                 &mut live_position,
+                                &mut private_replay,
                                 job,
                             ),
                             Err(_) => break,
                         },
-                        recv(owner_task_rx) -> task => match task {
-                            Ok(task) => task(&shared.account_state),
+                        recv(owner_task_rx) -> command => match command {
+                            Ok(command) => command.execute(&shared.account_state),
                             Err(_) => break,
                         },
                         recv(maintenance_rx) -> job => match job {
@@ -3454,6 +3474,39 @@ impl SharedState {
         match job {
             AuditJob::Attempt(job) => self.write_attempt_audit(job),
             AuditJob::Lifecycle(job) => self.write_lifecycle_trace(lifecycle_traces, job),
+            AuditJob::PrivateDiagnostic(job) => {
+                crate::latency::record_ns(
+                    "polymarket.account.private_diagnostic_queue",
+                    now_ns().saturating_sub(job.enqueued_ns),
+                );
+                log::warn!(
+                    "[PolyUserFeed] FAILED venue trade {} carries no known reason field (tx_hash={}, maker_legs={}); account-scoped reversals remain enabled",
+                    job.trade_id,
+                    job.tx_hash,
+                    job.maker_legs,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn enqueue_private_diagnostic(
+        &self,
+        trade_id: &str,
+        tx_hash: &str,
+        maker_legs: usize,
+    ) {
+        let job = PrivateDiagnosticJob {
+            trade_id: trade_id.to_string(),
+            tx_hash: tx_hash.to_string(),
+            maker_legs,
+            enqueued_ns: now_ns(),
+        };
+        if self
+            .attempt_audit_tx
+            .try_send(AuditJob::PrivateDiagnostic(job))
+            .is_err()
+        {
+            crate::latency::record_ns("polymarket.private_diagnostic_overflow", 1);
         }
     }
 
@@ -3957,6 +4010,7 @@ impl SharedState {
     pub(crate) fn mark_order_live(
         &self,
         client_order_id: &str,
+        order_slot: OrderSlot,
         symbol: &str,
         side: Side,
         instance_id: &str,
@@ -3969,6 +4023,7 @@ impl SharedState {
         let job = AccountLifecycleJob::MarkLive {
             client_order_id: client_order_id.to_string(),
             tracked: TrackedOrder {
+                order_slot,
                 symbol: symbol.to_string(),
                 side,
                 instance_id: instance_id.to_string(),
@@ -5232,6 +5287,7 @@ impl PolymarketTrade {
                 recovered_open.insert(
                     order.client_order_id.clone(),
                     TrackedOrder {
+                        order_slot: Default::default(),
                         symbol: order.token_id.clone(),
                         side: order.side,
                         instance_id: order.instance_id.clone(),
@@ -5783,6 +5839,7 @@ impl PolymarketTrade {
                         0.0
                     };
                     let ownership = OrderOwnership {
+                        order_slot: Default::default(),
                         account_id: self.shared.account_state.account_id().to_string(),
                         instance_id: instance_id.clone(),
                         client_order_id: client_order_id.to_string(),
@@ -5837,6 +5894,7 @@ impl PolymarketTrade {
                     if let Err(error) = self.shared.track_open_order(
                         &client_order_id,
                         TrackedOrder {
+                            order_slot: Default::default(),
                             symbol: identity.asset_id,
                             side: identity.side,
                             instance_id,
@@ -6289,6 +6347,7 @@ impl PolymarketTrade {
             reason,
         );
         OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -6324,6 +6383,7 @@ impl PolymarketTrade {
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(ownership.filled_quantity);
         OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -6400,6 +6460,7 @@ impl PolymarketTrade {
             missing.evidence,
         );
         Some(OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: missing.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: missing.tracked.symbol.clone(),
@@ -6453,6 +6514,7 @@ impl PolymarketTrade {
                     coid,
                     (
                         TrackedOrder {
+                            order_slot: Default::default(),
                             symbol: order.token_id,
                             side: order.side,
                             instance_id: order.instance_id,
@@ -6572,6 +6634,7 @@ impl PolymarketTrade {
                         .shared
                         .mark_order_live(
                             &coid,
+                            tracked.order_slot,
                             &tracked.symbol,
                             tracked.side,
                             &tracked.instance_id,
@@ -6658,6 +6721,7 @@ impl PolymarketTrade {
                 .account_state
                 .resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(&order_id)));
             updates.push(OrderUpdate {
+                order_slot: Default::default(),
                 client_order_id: coid,
                 exchange: Exchange::Polymarket,
                 symbol: tracked.symbol,
@@ -6848,6 +6912,7 @@ impl PolymarketTrade {
                         missing.evidence,
                     );
                     emit_update(OrderUpdate {
+                        order_slot: Default::default(),
                         client_order_id: missing.client_order_id.clone(),
                         exchange: Exchange::Polymarket,
                         symbol: missing.tracked.symbol.clone(),
@@ -7490,6 +7555,7 @@ impl PolymarketTrade {
         // that reads it on Filled / PartiallyFilled.
         let rejected_price = order.price.unwrap_or(0.0);
         OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: order.symbol.clone(),
@@ -7541,6 +7607,7 @@ impl PolymarketTrade {
     /// `DELETE /order/{orderID}` without any salt/price matching.
     fn make_timeout_place(order: &OrderRequest, order_hash: Option<&str>) -> OrderUpdate {
         OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: order.symbol.clone(),
@@ -7587,6 +7654,7 @@ impl PolymarketTrade {
         status: OrderStatus,
     ) -> OrderUpdate {
         OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: coid.to_string(),
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
@@ -7719,6 +7787,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
+                            order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -7807,13 +7876,26 @@ impl PolymarketTrade {
                         };
                         let status = self
                             .shared
-                            .mark_order_live(coid, symbol, *side, &ownership.instance_id, candidate)
+                            .mark_order_live(
+                                coid,
+                                self.shared
+                                    .execution_snapshot()
+                                    .open_orders
+                                    .get(coid)
+                                    .map(|tracked| tracked.order_slot)
+                                    .unwrap_or_default(),
+                                symbol,
+                                *side,
+                                &ownership.instance_id,
+                                candidate,
+                            )
                             .unwrap_or(candidate);
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → LIVE status={:?} size_matched={}",
                             coid, oid, status, effective_size_matched,
                         );
                         updates.push(OrderUpdate {
+                            order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -7864,6 +7946,7 @@ impl PolymarketTrade {
                             coid, oid,
                         );
                         updates.push(OrderUpdate {
+                            order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -7942,6 +8025,7 @@ impl PolymarketTrade {
                             coid, oid, matched,
                         );
                         updates.push(OrderUpdate {
+                            order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -7990,6 +8074,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
+                            order_slot: Default::default(),
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -8284,6 +8369,7 @@ impl PolymarketTrade {
                 .map(|t| (t.symbol, t.side))
                 .unwrap_or_else(|| (String::new(), Side::Buy));
             updates.push(OrderUpdate {
+                order_slot: Default::default(),
                 client_order_id: coid.clone(),
                 exchange: Exchange::Polymarket,
                 symbol,
@@ -8486,6 +8572,7 @@ impl PolymarketTrade {
 /// re-querying internal maps after the recv races.
 pub(crate) struct CancelCtx {
     pub local_oid: Option<String>,
+    pub order_slot: OrderSlot,
     pub symbol: String,
     pub side: Side,
 }
@@ -8781,7 +8868,7 @@ impl PolymarketTrade {
         }
         self.shared
             .account_state
-            .prepare_order_ownership(
+            .prepare_order_ownership_in_slot(
                 &self.instance_id,
                 &order.client_order_id,
                 local_oid,
@@ -8790,6 +8877,7 @@ impl PolymarketTrade {
                 order.quantity,
                 order.price.unwrap_or(0.0),
                 order.fee_rate_bps,
+                order.order_slot,
             )
             .map(Some)
             .map_err(|error| {
@@ -8890,6 +8978,7 @@ impl PolymarketTrade {
         if let Err(error) = self.shared.track_open_order(
             &order.client_order_id,
             TrackedOrder {
+                order_slot: order.order_slot,
                 symbol: order.symbol.clone(),
                 side: order.side,
                 instance_id: self.instance_id.clone(),
@@ -9062,6 +9151,7 @@ impl PolymarketTrade {
             let effective_ack_status = if legacy_trace {
                 self.shared.mark_order_live(
                     &order.client_order_id,
+                    order.order_slot,
                     &order.symbol,
                     order.side,
                     &self.instance_id,
@@ -9159,6 +9249,7 @@ impl PolymarketTrade {
             );
 
             OrderUpdate {
+                order_slot: order.order_slot,
                 client_order_id: order.client_order_id.clone(),
                 exchange: Exchange::Polymarket,
                 symbol: order.symbol.clone(),
@@ -9269,11 +9360,12 @@ impl PolymarketTrade {
         let execution = self.shared.execution_snapshot();
         let order_id = execution.coid_to_oid.get(client_order_id).cloned();
         let tracked = execution.open_orders.get(client_order_id).cloned();
-        let (symbol, side) = tracked
-            .map(|t| (t.symbol, t.side))
-            .unwrap_or_else(|| (String::new(), Side::Buy));
+        let (order_slot, symbol, side) = tracked
+            .map(|t| (t.order_slot, t.symbol, t.side))
+            .unwrap_or_else(|| (OrderSlot::UNASSIGNED, String::new(), Side::Buy));
         let ctx = CancelCtx {
             local_oid: order_id.clone(),
+            order_slot,
             symbol,
             side,
         };
@@ -9339,6 +9431,7 @@ impl PolymarketTrade {
         let update = (|| {
             let CancelCtx {
                 local_oid,
+                order_slot,
                 symbol,
                 side,
             } = ctx;
@@ -9466,8 +9559,9 @@ impl PolymarketTrade {
                         .defer_lifecycle_account_apply(client_order_id, status);
                     status
                 };
-                let update =
+                let mut update =
                     Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, effective);
+                update.order_slot = order_slot;
                 crate::latency::record(
                     "polymarket.cancel.response_account_apply",
                     account_apply_started,
@@ -9497,6 +9591,7 @@ impl PolymarketTrade {
             };
 
             let update = OrderUpdate {
+                order_slot,
                 client_order_id: client_order_id.to_string(),
                 exchange,
                 symbol,
@@ -9686,6 +9781,7 @@ impl ExchangeTrade for PolymarketTrade {
                 self.shared.remove_order_as(coid, status);
             }
             updates.push(OrderUpdate {
+                order_slot: Default::default(),
                 client_order_id: coid.clone(),
                 exchange,
                 symbol: symbol.to_string(),
@@ -9831,6 +9927,7 @@ impl ExchangeTrade for PolymarketTrade {
                         if let Err(error) = self.shared.track_open_order(
                             &o.client_order_id,
                             TrackedOrder {
+                                order_slot: o.order_slot,
                                 symbol: o.symbol.clone(),
                                 side: o.side,
                                 instance_id: self.instance_id.clone(),
@@ -9963,6 +10060,7 @@ impl ExchangeTrade for PolymarketTrade {
                             accepted_coids.push(order.client_order_id.clone());
                             effective_ack_status = self.shared.mark_order_live(
                                 &order.client_order_id,
+                                order.order_slot,
                                 &order.symbol,
                                 order.side,
                                 &self.instance_id,
@@ -10011,6 +10109,7 @@ impl ExchangeTrade for PolymarketTrade {
                         // lifecycle shard merely to decorate the ACK.
                         let effective_remaining = order.quantity;
                         all_updates.push(OrderUpdate {
+                            order_slot: order.order_slot,
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: order.symbol.clone(),
@@ -10353,6 +10452,7 @@ impl ExchangeTrade for PolymarketTrade {
                     self.shared.remove_order_as(coid, outcome);
                 }
                 updates.push(OrderUpdate {
+                    order_slot: Default::default(),
                     client_order_id: coid.clone(),
                     exchange,
                     symbol: tracked
@@ -10388,6 +10488,7 @@ impl ExchangeTrade for PolymarketTrade {
                 .get(coid)
                 .cloned();
             updates.push(OrderUpdate {
+                order_slot: Default::default(),
                 client_order_id: coid.clone(),
                 exchange,
                 symbol: tracked
@@ -10684,6 +10785,7 @@ impl ExchangeTrade for PolymarketTrade {
                     if let Err(error) = self.shared.track_open_order(
                         &o.client_order_id,
                         TrackedOrder {
+                            order_slot: o.order_slot,
                             symbol: o.symbol.clone(),
                             side: o.side,
                             instance_id: self.instance_id.clone(),
@@ -10976,6 +11078,7 @@ impl ExchangeTrade for PolymarketTrade {
                     self.shared.remove_order_as(coid, outcome);
                 }
                 updates.push(OrderUpdate {
+                    order_slot: Default::default(),
                     client_order_id: coid.clone(),
                     exchange,
                     symbol: tracked
@@ -11068,6 +11171,7 @@ impl ExchangeTrade for PolymarketTrade {
                             accepted_coids.push(order.client_order_id.clone());
                             effective_ack_status = self.shared.mark_order_live(
                                 &order.client_order_id,
+                                order.order_slot,
                                 &order.symbol,
                                 order.side,
                                 &self.instance_id,
@@ -11162,6 +11266,7 @@ impl ExchangeTrade for PolymarketTrade {
                         };
                         let effective_remaining = order.quantity;
                         updates.push(OrderUpdate {
+                            order_slot: order.order_slot,
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: order.symbol.clone(),
@@ -11453,6 +11558,7 @@ mod tests {
             let command = ExecutionStateCommand::BenchmarkPublishOpen {
                 client_order_id: format!("benchmark-{index}"),
                 tracked: TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: format!("token-{index}"),
                     side: Side::Buy,
                     instance_id: "benchmark-owner".to_string(),
@@ -11515,6 +11621,7 @@ mod tests {
             AccountLifecycleJob::ExecutionState(ExecutionStateCommand::TrackOpen {
                 client_order_id: "bounded-coid".to_string(),
                 tracked: TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "TOKEN".to_string(),
                     side: Side::Buy,
                     instance_id: "owner".to_string(),
@@ -11538,6 +11645,7 @@ mod tests {
 
     fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
         OrderOwnership {
+            order_slot: Default::default(),
             account_id: "acct".into(),
             instance_id: "maker".into(),
             client_order_id: client_order_id.into(),
@@ -11666,6 +11774,7 @@ mod tests {
     #[test]
     fn recovery_terminal_update_hands_authoritative_audit_to_strategy_first() {
         let ownership = OrderOwnership {
+            order_slot: Default::default(),
             account_id: "acct".into(),
             instance_id: "maker".into(),
             client_order_id: "maker-1".into(),
@@ -12793,6 +12902,7 @@ mod tests {
             (
                 "a-2".to_string(),
                 TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "TOK".into(),
                     side: Side::Buy,
                     instance_id: "a".into(),
@@ -12801,6 +12911,7 @@ mod tests {
             (
                 "b-1".to_string(),
                 TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "TOK".into(),
                     side: Side::Sell,
                     instance_id: "b".into(),
@@ -12809,6 +12920,7 @@ mod tests {
             (
                 "a-1".to_string(),
                 TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "OTHER".into(),
                     side: Side::Sell,
                     instance_id: "a".into(),

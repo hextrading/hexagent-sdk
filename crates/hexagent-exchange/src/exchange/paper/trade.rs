@@ -35,6 +35,7 @@ impl ExchangeTrade for PaperTrade {
 
         // Simulate immediate fill
         let update = OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: order.exchange,
             symbol: order.symbol.clone(),
@@ -62,6 +63,7 @@ impl ExchangeTrade for PaperTrade {
     fn cancel_order(&mut self, exchange: Exchange, client_order_id: &str) -> Result<OrderUpdate> {
         let order = self.orders.remove(client_order_id);
         Ok(OrderUpdate {
+            order_slot: Default::default(),
             client_order_id: client_order_id.to_string(),
             exchange,
             symbol: order.map(|o| o.symbol).unwrap_or_default(),
