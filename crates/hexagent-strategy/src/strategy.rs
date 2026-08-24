@@ -40,6 +40,13 @@ pub trait Strategy: Send {
         ""
     }
 
+    /// Static latency stages this strategy may record on its owner thread.
+    /// The engine resolves them before entering the event loop so first-live
+    /// observations never touch the process-global stage registry.
+    fn latency_stages(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Stable market-data symbols this instance subscribes to, used by
     /// the live/paper per-instance market router to fan each event only
     /// to the instances that want it (so e.g. a BTC instance's Binance
@@ -292,6 +299,23 @@ pub trait Strategy: Send {
     fn set_per_event_prev_p_override(&mut self, _prev_p_ms: Option<f64>) {}
 }
 
+thread_local! {
+    static STRATEGY_SPAN: std::cell::RefCell<Option<(String, tracing::Span)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Construct the calling strategy owner's tracing span before it enters its
+/// event loop. Every later callback reuses this span without allocating or
+/// registering tracing metadata on the quote path.
+pub fn prepare_strategy_span(instance_id: &str) {
+    STRATEGY_SPAN.with(|slot| {
+        *slot.borrow_mut() = Some((
+            instance_id.to_string(),
+            tracing::info_span!("strat", iid = %instance_id),
+        ));
+    });
+}
+
 /// Enter a tracing span tagged with the strategy's `instance_id` so
 /// every `log::info!` / `tracing::info!` emitted while the closure
 /// runs is annotated `strat{iid=<id>}` in the formatted output.
@@ -301,7 +325,19 @@ pub trait Strategy: Send {
 /// instance without touching every log macro in the strategy code.
 #[inline]
 pub fn dispatch_in_span<S: Strategy + ?Sized, R>(s: &mut S, f: impl FnOnce(&mut S) -> R) -> R {
-    let span = tracing::info_span!("strat", iid = %s.instance_id());
-    let _g = span.enter();
-    f(s)
+    STRATEGY_SPAN.with(|slot| {
+        let slot = slot.borrow();
+        if let Some((instance_id, span)) = slot.as_ref() {
+            if instance_id == s.instance_id() {
+                let _guard = span.enter();
+                return f(s);
+            }
+        }
+        drop(slot);
+        // Startup/CLI compatibility path. Live strategy workers always call
+        // `prepare_strategy_span` before their first callback.
+        let span = tracing::info_span!("strat", iid = %s.instance_id());
+        let _guard = span.enter();
+        f(s)
+    })
 }

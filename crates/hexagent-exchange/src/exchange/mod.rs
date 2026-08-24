@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::types::MarketEvent;
-use crate::types::{Exchange, OrderRequest, OrderUpdate};
+use crate::types::{
+    extend_order_update_batch, Exchange, OrderRequest, OrderUpdate, OrderUpdateBatch,
+};
 use anyhow::Result;
 
 /// Capacity of the parser-task -> synchronous feed-owner lane used by public
@@ -774,6 +776,24 @@ pub trait ExchangeTrade: Send {
     /// Cancel all orders for a symbol on an exchange
     fn cancel_all(&mut self, exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>>;
 
+    /// Fixed-capacity cancel-all output. Adapters should override this method
+    /// when their native implementation can emit directly; the compatibility
+    /// default contains the legacy allocation outside the caller's reusable
+    /// owner scratch and reports overflow instead of truncating lifecycle.
+    fn cancel_all_into(
+        &mut self,
+        exchange: Exchange,
+        symbol: &str,
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
+        extend_order_update_batch(out, self.cancel_all(exchange, symbol)?).map_err(|overflow| {
+            anyhow::anyhow!(
+                "fixed cancel-all lifecycle batch overflow at coid {}",
+                overflow.update.client_order_id
+            )
+        })
+    }
+
     /// Batch submit orders for the same market (default: submit one by one)
     fn batch_submit_orders(
         &mut self,
@@ -785,6 +805,24 @@ pub trait ExchangeTrade: Send {
             updates.push(self.submit_order(order)?);
         }
         Ok(updates)
+    }
+
+    /// Fixed-capacity place-batch output. The compatibility default preserves
+    /// a venue's existing native batch override; adapters can remove its
+    /// temporary `Vec` by emitting directly into `out`.
+    fn batch_submit_orders_into(
+        &mut self,
+        _market_id: &str,
+        orders: &[OrderRequest],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
+        extend_order_update_batch(out, self.batch_submit_orders(_market_id, orders)?)
+            .map_err(|overflow| {
+                anyhow::anyhow!(
+                    "fixed place lifecycle batch overflow at coid {}",
+                    overflow.update.client_order_id
+                )
+            })
     }
 
     /// Batch cancel orders for the same market (default: cancel one by one)
@@ -799,6 +837,26 @@ pub trait ExchangeTrade: Send {
             updates.push(self.cancel_order(exchange, id)?);
         }
         Ok(updates)
+    }
+
+    /// Fixed-capacity cancel-batch output; see [`Self::batch_submit_orders_into`].
+    fn batch_cancel_orders_into(
+        &mut self,
+        exchange: Exchange,
+        _market_id: &str,
+        client_order_ids: &[String],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
+        extend_order_update_batch(
+            out,
+            self.batch_cancel_orders(exchange, _market_id, client_order_ids)?,
+        )
+        .map_err(|overflow| {
+            anyhow::anyhow!(
+                "fixed cancel lifecycle batch overflow at coid {}",
+                overflow.update.client_order_id
+            )
+        })
     }
 
     /// Batch update: cancel + place in a single request (default: cancel then place separately)
@@ -823,6 +881,32 @@ pub trait ExchangeTrade: Send {
         Ok(updates)
     }
 
+    /// Fixed-capacity batch update used by physical connection owners.
+    fn batch_update_orders_into(
+        &mut self,
+        exchange: Exchange,
+        market_id: &str,
+        cancel_client_order_ids: &[String],
+        place_orders: &[OrderRequest],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
+        extend_order_update_batch(
+            out,
+            self.batch_update_orders(
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
+            )?,
+        )
+        .map_err(|overflow| {
+            anyhow::anyhow!(
+                "fixed update lifecycle batch overflow at coid {}",
+                overflow.update.client_order_id
+            )
+        })
+    }
+
     /// Replace order(s) — a reprice dispatched as one operation, parallel to
     /// `submit_order` (place) and `cancel_order` (cancel). The default
     /// delegates to `batch_update_orders`; for Polymarket that is the fully
@@ -837,6 +921,33 @@ pub trait ExchangeTrade: Send {
         place_orders: &[OrderRequest],
     ) -> Result<Vec<OrderUpdate>> {
         self.batch_update_orders(exchange, market_id, cancel_client_order_ids, place_orders)
+    }
+
+    /// Fixed-capacity replace peer. Native adapters can preserve their
+    /// concurrent cancel/place semantics by overriding this method.
+    fn replace_order_into(
+        &mut self,
+        exchange: Exchange,
+        market_id: &str,
+        cancel_client_order_ids: &[String],
+        place_orders: &[OrderRequest],
+        out: &mut OrderUpdateBatch,
+    ) -> Result<()> {
+        extend_order_update_batch(
+            out,
+            self.replace_order(
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+                place_orders,
+            )?,
+        )
+        .map_err(|overflow| {
+            anyhow::anyhow!(
+                "fixed replace lifecycle batch overflow at coid {}",
+                overflow.update.client_order_id
+            )
+        })
     }
 
     /// Name of this executor
