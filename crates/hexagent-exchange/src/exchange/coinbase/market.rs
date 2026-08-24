@@ -32,11 +32,15 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(30);
 struct OrdF64(f64);
 impl Eq for OrdF64 {}
 impl PartialOrd for OrdF64 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for OrdF64 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -50,7 +54,11 @@ struct LocalBook {
 
 impl LocalBook {
     fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), ready: false }
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            ready: false,
+        }
     }
 
     fn clear(&mut self) {
@@ -60,7 +68,11 @@ impl LocalBook {
     }
 
     fn update(&mut self, side: &str, price: f64, qty: f64) {
-        let map = if side == "buy" { &mut self.bids } else { &mut self.asks };
+        let map = if side == "buy" {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
         if qty == 0.0 {
             map.remove(&OrdF64(price));
         } else {
@@ -70,13 +82,24 @@ impl LocalBook {
 
     /// Top N bids (highest first) and asks (lowest first).
     fn snapshot(&self, depth: usize) -> (Vec<PriceLevel>, Vec<PriceLevel>) {
-        let bids: Vec<PriceLevel> = self.bids.iter().rev()
+        let bids: Vec<PriceLevel> = self
+            .bids
+            .iter()
+            .rev()
             .take(depth)
-            .map(|(p, q)| PriceLevel { price: p.0, quantity: *q })
+            .map(|(p, q)| PriceLevel {
+                price: p.0,
+                quantity: *q,
+            })
             .collect();
-        let asks: Vec<PriceLevel> = self.asks.iter()
+        let asks: Vec<PriceLevel> = self
+            .asks
+            .iter()
             .take(depth)
-            .map(|(p, q)| PriceLevel { price: p.0, quantity: *q })
+            .map(|(p, q)| PriceLevel {
+                price: p.0,
+                quantity: *q,
+            })
             .collect();
         (bids, asks)
     }
@@ -119,14 +142,20 @@ async fn coinbase_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Coinbase] Connecting to {}", COINBASE_WS_URL);
         let stream = match tokio_tungstenite::connect_async(COINBASE_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Coinbase] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Coinbase] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -151,7 +180,8 @@ async fn coinbase_ws_task(
         }
         info!("[Coinbase] Connected, subscribed to {:?}", symbols);
 
-        let mut books: std::collections::HashMap<String, LocalBook> = std::collections::HashMap::new();
+        let mut books: std::collections::HashMap<String, LocalBook> =
+            std::collections::HashMap::new();
         for s in &symbols {
             books.insert(s.clone(), LocalBook::new());
         }
@@ -162,8 +192,10 @@ async fn coinbase_ws_task(
         // loss via the matches `trade_id` (dense +1 per trade per product)
         // and the heartbeat `last_trade_id`. A gap implies level2 updates
         // may have been dropped too → break to reconnect → re-snapshot.
-        let mut last_trade_id: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        let mut hb_prev_trade_id: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut last_trade_id: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut hb_prev_trade_id: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -244,7 +276,7 @@ async fn coinbase_ws_task(
                                     exchange_timestamp_ns: exchange_ts,
                                     local_timestamp_ns: now_ns(),
                                 });
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 continue;
                             }
 
@@ -306,7 +338,7 @@ async fn coinbase_ws_task(
                                     exchange_timestamp_ns: now_ns(),
                                     local_timestamp_ns: now_ns(),
                                 });
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 continue;
                             }
 
@@ -346,7 +378,7 @@ async fn coinbase_ws_task(
                                     exchange_timestamp_ns: exchange_ts,
                                     local_timestamp_ns: now_ns(),
                                 });
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                             }
                         }
                         Message::Ping(payload) => {
@@ -360,10 +392,14 @@ async fn coinbase_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -389,7 +425,10 @@ impl ExchangeMarket for CoinbaseMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -405,7 +444,9 @@ impl ExchangeMarket for CoinbaseMarket {
         info!("[Coinbase] Disconnected");
     }
 
-    fn name(&self) -> &str { "coinbase" }
+    fn name(&self) -> &str {
+        "coinbase"
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +472,6 @@ mod gap_tests {
     #[test]
     fn duplicate_or_out_of_order_is_not_a_gap() {
         assert_eq!(trade_id_gap(Some(100), 100), 0); // duplicate
-        assert_eq!(trade_id_gap(Some(100), 99), 0);  // reorder (won't happen on Coinbase, but safe)
+        assert_eq!(trade_id_gap(Some(100), 99), 0); // reorder (won't happen on Coinbase, but safe)
     }
 }

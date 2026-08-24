@@ -11,7 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use hexagent_exchange::exchange::hyperliquid::{auth::HlAuth, info, HyperliquidMarket, HyperliquidTrade};
+use hexagent_exchange::exchange::hyperliquid::{
+    auth::HlAuth, info, HyperliquidMarket, HyperliquidTrade,
+};
 use hexagent_exchange::exchange::{ExchangeMarket, ExchangeTrade};
 use hexagent_exchange::types::{Exchange, MarketEvent, OrderRequest, OrderType, Side};
 
@@ -55,10 +57,17 @@ fn testnet_market_feed() {
     // Generate a couple of public trades on our own account so the trades feed
     // has something to deliver even if testnet is quiet.
     let mut tr = build_trade();
-    let b = info::fetch_l2_book(&HlAuth::new(&creds().1, &creds().0, "testnet", "", "").unwrap().info_url(), COIN).unwrap();
+    let b = info::fetch_l2_book(
+        &HlAuth::new(&creds().1, &creds().0, "testnet", "", "")
+            .unwrap()
+            .info_url(),
+        COIN,
+    )
+    .unwrap();
     let ask = b.levels[1].first().unwrap().px.parse::<f64>().unwrap();
     let _ = tr.submit_order(&ioc(Side::Buy, ask * 1.02)); // fill → trade
-    let mut mkt_sell = OrderRequest::new_market(Exchange::Hyperliquid, COIN.to_string(), Side::Sell, SZ);
+    let mut mkt_sell =
+        OrderRequest::new_market(Exchange::Hyperliquid, COIN.to_string(), Side::Sell, SZ);
     mkt_sell.instance_id = "feedtest".to_string();
     let _ = tr.submit_order(&mkt_sell); // flatten → trade
 
@@ -87,28 +96,38 @@ fn testnet_market_feed() {
 fn testnet_user_feed() {
     let _ = hexagent_exchange::async_rt::init();
     let (account, _key) = creds();
-    let (rx, _shutdown) =
-        hexagent_exchange::exchange::hyperliquid::user_feed::spawn_user_feed(WS, &account);
+    let lane = hexagent_exchange::exchange::hyperliquid::user_feed::spawn_user_feed(WS, &account);
+    let rx = lane.updates.clone();
     std::thread::sleep(Duration::from_secs(2)); // connect + snapshot
     while rx.try_recv().is_ok() {} // drain snapshot
 
     let mut tr = build_trade();
-    let info_url = HlAuth::new(&creds().1, &account, "testnet", "", "").unwrap().info_url();
+    let info_url = HlAuth::new(&creds().1, &account, "testnet", "", "")
+        .unwrap()
+        .info_url();
     let b = info::fetch_l2_book(&info_url, COIN).unwrap();
     let bid = b.levels[0].first().unwrap().px.parse::<f64>().unwrap();
     let ask = b.levels[1].first().unwrap().px.parse::<f64>().unwrap();
 
     // Resting post-only → orderUpdates "open" (status push, no fill).
-    let mut rest = OrderRequest::new_limit(Exchange::Hyperliquid, COIN.to_string(), Side::Buy, bid * 0.99, SZ);
+    let mut rest = OrderRequest::new_limit(
+        Exchange::Hyperliquid,
+        COIN.to_string(),
+        Side::Buy,
+        bid * 0.99,
+        SZ,
+    );
     rest.order_type = OrderType::LimitMaker;
     rest.instance_id = "feedtest".to_string();
     tr.submit_order(&rest).expect("rest submit");
     // IOC fill → userFills (fill push) + orderUpdates "filled".
-    tr.submit_order(&ioc(Side::Buy, ask * 1.02)).expect("ioc submit");
+    tr.submit_order(&ioc(Side::Buy, ask * 1.02))
+        .expect("ioc submit");
     // Cancel resting → orderUpdates "canceled".
     let _ = tr.cancel_order(Exchange::Hyperliquid, &rest.client_order_id);
     // Market sell to flatten the IOC buy.
-    let mut mkt_sell = OrderRequest::new_market(Exchange::Hyperliquid, COIN.to_string(), Side::Sell, SZ);
+    let mut mkt_sell =
+        OrderRequest::new_market(Exchange::Hyperliquid, COIN.to_string(), Side::Sell, SZ);
     mkt_sell.instance_id = "feedtest".to_string();
     tr.submit_order(&mkt_sell).expect("market submit");
 
@@ -118,16 +137,25 @@ fn testnet_user_feed() {
         while let Ok(u) = rx.try_recv() {
             if u.trade_id.is_some() {
                 fills += 1;
-                println!("[user feed] FILL side={:?} sz={} @ {}", u.side, u.filled_quantity, u.avg_fill_price);
+                println!(
+                    "[user feed] FILL side={:?} sz={} @ {}",
+                    u.side, u.filled_quantity, u.avg_fill_price
+                );
             } else {
                 statuses += 1;
-                println!("[user feed] ORDER-STATUS {:?} coid={} oid={:?}", u.status, u.client_order_id, u.exchange_order_id);
+                println!(
+                    "[user feed] ORDER-STATUS {:?} coid={} oid={:?}",
+                    u.status, u.client_order_id, u.exchange_order_id
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = tr.cancel_all(Exchange::Hyperliquid, COIN);
-    println!("[user feed] fills(userFills)={} order-status(orderUpdates)={}", fills, statuses);
+    println!(
+        "[user feed] fills(userFills)={} order-status(orderUpdates)={}",
+        fills, statuses
+    );
     assert!(fills > 0, "userFills fill push must arrive");
     assert!(statuses > 0, "orderUpdates order-status push must arrive");
     println!("USER FEED OK (fill pushes + order-status pushes)");

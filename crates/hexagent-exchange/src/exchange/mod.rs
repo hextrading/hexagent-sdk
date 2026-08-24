@@ -7,22 +7,171 @@ pub mod coinbase;
 pub mod gate;
 pub mod hexmarket;
 pub mod hyperliquid;
+pub mod kraken;
 pub mod kucoin;
 pub mod lighter;
 pub mod mexc;
-pub mod kraken;
 pub mod okx;
+pub mod paper;
 pub mod polymarket;
 pub mod pyth;
-pub mod paper;
 pub mod sim;
 pub mod sim_v2;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::types::MarketEvent;
 use crate::types::{Exchange, OrderRequest, OrderUpdate};
 use anyhow::Result;
+
+/// Fixed capacity of a venue-private order/fill lane owned by one strategy
+/// worker. The producer is one authenticated user-feed task; the consumer is
+/// the strategy owner thread. Updates are FIFO and never replaceable.
+pub const PRIVATE_UPDATE_LANE_CAPACITY: usize = 4096;
+
+/// Replaceable control state for a [`PrivateUpdateLane`]. Connectivity changes
+/// are informational. `Overflow` is terminal for the current feed generation:
+/// at least one non-replayable lifecycle event could not be admitted, so the
+/// strategy owner must fail closed until an authoritative reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateFeedControl {
+    Connected(Exchange),
+    Disconnected(Exchange),
+    Overflow(Exchange),
+}
+
+/// Consumer half of a bounded private-event lane.
+///
+/// Ownership and recovery semantics:
+/// - one async authenticated feed task publishes FIFO `OrderUpdate`s;
+/// - exactly one strategy thread consumes and mutates its private account;
+/// - `updates` is lossless while capacity is available and never blocks Tokio;
+/// - on capacity exhaustion the producer publishes `Overflow`, stops, and the
+///   owner must cancel/fail closed because these venues have no gap replay;
+/// - dropping the lane requests feed shutdown.
+pub struct PrivateUpdateLane {
+    pub updates: crossbeam_channel::Receiver<OrderUpdate>,
+    pub control: crossbeam_channel::Receiver<PrivateFeedControl>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl PrivateUpdateLane {
+    pub fn shutdown_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+}
+
+impl Drop for PrivateUpdateLane {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Producer half retained only by the authenticated feed task. The control
+/// receiver clone lets the sole producer replace stale connectivity notices so
+/// an overflow notice can always occupy the one-slot latest-value mailbox.
+pub(crate) struct PrivateUpdatePublisher {
+    exchange: Exchange,
+    updates: crossbeam_channel::Sender<OrderUpdate>,
+    control: crossbeam_channel::Sender<PrivateFeedControl>,
+    control_replace: crossbeam_channel::Receiver<PrivateFeedControl>,
+}
+
+impl PrivateUpdatePublisher {
+    pub(crate) fn publish(&self, update: OrderUpdate) -> bool {
+        match self.updates.try_send(update) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.publish_control(PrivateFeedControl::Overflow(self.exchange));
+                false
+            }
+        }
+    }
+
+    pub(crate) fn connected(&self) {
+        self.publish_control(PrivateFeedControl::Connected(self.exchange));
+    }
+
+    pub(crate) fn disconnected(&self) {
+        self.publish_control(PrivateFeedControl::Disconnected(self.exchange));
+    }
+
+    fn publish_control(&self, control: PrivateFeedControl) {
+        match self.control.try_send(control) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            Err(crossbeam_channel::TrySendError::Full(control)) => {
+                let _ = self.control_replace.try_recv();
+                let _ = self.control.try_send(control);
+            }
+        }
+    }
+}
+
+pub(crate) fn private_update_lane(
+    exchange: Exchange,
+) -> (PrivateUpdatePublisher, PrivateUpdateLane) {
+    let (update_tx, update_rx) = crossbeam_channel::bounded(PRIVATE_UPDATE_LANE_CAPACITY);
+    // Connectivity is replaceable latest state. Overflow replaces an older
+    // connectivity notification and makes this generation terminal.
+    let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    (
+        PrivateUpdatePublisher {
+            exchange,
+            updates: update_tx,
+            control: control_tx,
+            control_replace: control_rx.clone(),
+        },
+        PrivateUpdateLane {
+            updates: update_rx,
+            control: control_rx,
+            shutdown,
+        },
+    )
+}
+
+static PUBLIC_MARKET_OVERFLOW_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Publish parsed public data without ever parking an async socket/parser task
+/// behind the synchronous root router. Quote/book/latest-value observations
+/// are replaceable; capacity exhaustion drops this observation and records the
+/// loss. Trades, bars, lifecycle, instrument and health messages are ordered:
+/// a full lane returns an error so the producing feed fails closed/reconnects
+/// instead of silently losing a non-replaceable transition.
+pub fn publish_market_event(
+    tx: &crossbeam_channel::Sender<MarketEvent>,
+    event: MarketEvent,
+) -> Result<(), crossbeam_channel::SendError<MarketEvent>> {
+    match tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(crossbeam_channel::TrySendError::Full(event)) => {
+            if matches!(
+                event,
+                MarketEvent::OrderBook(_)
+                    | MarketEvent::Quote(_)
+                    | MarketEvent::SpotPrice(_)
+                    | MarketEvent::AssetCtx(_)
+            ) {
+                PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+                hexagent_runtime::latency::record_ns("market.root_overflow_drop", 1);
+                Ok(())
+            } else {
+                Err(crossbeam_channel::SendError(event))
+            }
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(event)) => {
+            Err(crossbeam_channel::SendError(event))
+        }
+    }
+}
+
+pub fn public_market_overflow_drops() -> u64 {
+    PUBLIC_MARKET_OVERFLOW_DROPS.load(Ordering::Relaxed)
+}
 
 /// Heartbeat cadence for the Polymarket CLOB feed. Each tick sends both its
 /// application-level text heartbeat and a WebSocket protocol Ping frame.
@@ -74,8 +223,7 @@ pub(crate) async fn ws_send<S>(
 ) -> std::result::Result<(), String>
 where
     S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
-    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error:
-        std::fmt::Display,
+    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error: std::fmt::Display,
 {
     ws_send_within(sink, msg, WS_SEND_TIMEOUT).await
 }
@@ -89,8 +237,7 @@ pub(crate) async fn ws_send_within<S>(
 ) -> std::result::Result<(), String>
 where
     S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
-    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error:
-        std::fmt::Display,
+    <S as futures_util::Sink<tokio_tungstenite::tungstenite::Message>>::Error: std::fmt::Display,
 {
     match tokio::time::timeout(bound, sink.send(msg)).await {
         Ok(Ok(())) => Ok(()),
@@ -224,7 +371,11 @@ pub struct ReconnectBackoff {
 
 impl ReconnectBackoff {
     pub fn new(base_ms: u64, max_ms: u64) -> Self {
-        Self { base_ms, max_ms, attempt: 0 }
+        Self {
+            base_ms,
+            max_ms,
+            attempt: 0,
+        }
     }
 
     /// Reset attempt counter (call on successful connection).
@@ -294,7 +445,9 @@ pub trait ExchangeMarket: Send {
     /// avoid futile reconnect storms when the feed is intentionally idle
     /// (e.g. Polymarket has no currently-trading event in the series).
     /// Default `true` preserves prior behavior for all other exchanges.
-    fn has_active_subscription(&self) -> bool { true }
+    fn has_active_subscription(&self) -> bool {
+        true
+    }
 }
 
 /// Trait for order execution backends.
@@ -309,7 +462,11 @@ pub trait ExchangeTrade: Send {
     fn cancel_all(&mut self, exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>>;
 
     /// Batch submit orders for the same market (default: submit one by one)
-    fn batch_submit_orders(&mut self, _market_id: &str, orders: &[OrderRequest]) -> Result<Vec<OrderUpdate>> {
+    fn batch_submit_orders(
+        &mut self,
+        _market_id: &str,
+        orders: &[OrderRequest],
+    ) -> Result<Vec<OrderUpdate>> {
         let mut updates = Vec::new();
         for order in orders {
             updates.push(self.submit_order(order)?);
@@ -318,7 +475,12 @@ pub trait ExchangeTrade: Send {
     }
 
     /// Batch cancel orders for the same market (default: cancel one by one)
-    fn batch_cancel_orders(&mut self, exchange: Exchange, _market_id: &str, client_order_ids: &[String]) -> Result<Vec<OrderUpdate>> {
+    fn batch_cancel_orders(
+        &mut self,
+        exchange: Exchange,
+        _market_id: &str,
+        client_order_ids: &[String],
+    ) -> Result<Vec<OrderUpdate>> {
         let mut updates = Vec::new();
         for id in client_order_ids {
             updates.push(self.cancel_order(exchange, id)?);
@@ -336,7 +498,11 @@ pub trait ExchangeTrade: Send {
     ) -> Result<Vec<OrderUpdate>> {
         let mut updates = Vec::new();
         if !cancel_client_order_ids.is_empty() {
-            updates.extend(self.batch_cancel_orders(exchange, market_id, cancel_client_order_ids)?);
+            updates.extend(self.batch_cancel_orders(
+                exchange,
+                market_id,
+                cancel_client_order_ids,
+            )?);
         }
         if !place_orders.is_empty() {
             updates.extend(self.batch_submit_orders(market_id, place_orders)?);
@@ -367,6 +533,90 @@ pub trait ExchangeTrade: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_update(sequence: usize) -> OrderUpdate {
+        OrderUpdate {
+            client_order_id: format!("private-{sequence}"),
+            exchange: Exchange::Hyperliquid,
+            symbol: "BTC".into(),
+            side: crate::types::Side::Buy,
+            exchange_order_id: None,
+            status: crate::types::OrderStatus::Filled,
+            liquidity: None,
+            filled_quantity: 1.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 1.0,
+            timestamp_ns: sequence as u64,
+            exchange_event_timestamp_ns: None,
+            trade_id: Some(format!("trade-{sequence}")),
+            order_audit: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn private_lane_is_fifo_and_overflow_is_terminal_control_state() {
+        let (publisher, lane) = private_update_lane(Exchange::Hyperliquid);
+        publisher.connected();
+        for sequence in 0..PRIVATE_UPDATE_LANE_CAPACITY {
+            assert!(publisher.publish(private_update(sequence)));
+        }
+        assert!(!publisher.publish(private_update(PRIVATE_UPDATE_LANE_CAPACITY)));
+        assert_eq!(
+            lane.control.try_recv(),
+            Ok(PrivateFeedControl::Overflow(Exchange::Hyperliquid)),
+        );
+        for sequence in 0..PRIVATE_UPDATE_LANE_CAPACITY {
+            assert_eq!(
+                lane.updates.try_recv().unwrap().client_order_id,
+                format!("private-{sequence}"),
+            );
+        }
+        assert!(lane.updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_private_lane_requests_feed_shutdown() {
+        let (_publisher, lane) = private_update_lane(Exchange::Aster);
+        let shutdown = lane.shutdown_token();
+        assert!(!shutdown.load(Ordering::Acquire));
+        drop(lane);
+        assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn public_market_publish_never_blocks_and_lifecycle_fails_closed() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.try_send(MarketEvent::SpotPrice(crate::types::SpotPrice {
+            source: "test".into(),
+            symbol: "btc/usd".into(),
+            price: 1.0,
+            timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        }))
+        .unwrap();
+        let before = public_market_overflow_drops();
+        assert!(publish_market_event(
+            &tx,
+            MarketEvent::SpotPrice(crate::types::SpotPrice {
+                source: "test".into(),
+                symbol: "btc/usd".into(),
+                price: 2.0,
+                timestamp_ns: 2,
+                local_timestamp_ns: 2,
+            }),
+        )
+        .is_ok());
+        assert!(public_market_overflow_drops() > before);
+        assert!(publish_market_event(
+            &tx,
+            MarketEvent::Connected {
+                exchange: Exchange::Binance,
+            },
+        )
+        .is_err());
+        assert_eq!(rx.len(), 1);
+    }
 
     #[test]
     fn rtds_text_heartbeat_uses_lowercase_ping_every_five_seconds() {
@@ -408,7 +658,9 @@ mod tests {
 
         health.record_usable_book(now);
         assert!(!health.usable_book_is_stale(now, Duration::from_secs(2)));
-        assert!(health.clob_summary(now).contains("last_usable_book=0.0s_ago"));
+        assert!(health
+            .clob_summary(now)
+            .contains("last_usable_book=0.0s_ago"));
     }
 
     /// A sink whose flush never completes must not be able to hold the task
@@ -429,16 +681,25 @@ mod tests {
         struct NeverFlushes;
         impl Sink<Message> for NeverFlushes {
             type Error = std::io::Error;
-            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }
             fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
                 Ok(())
             }
-            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
                 Poll::Pending
             }
-            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
                 Poll::Pending
             }
         }

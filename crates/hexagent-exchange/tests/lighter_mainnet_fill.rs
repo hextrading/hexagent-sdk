@@ -32,8 +32,14 @@ const SZ: f64 = 0.0002; // ~$13 notional — just above the $10 min_quote
 fn creds() -> (String, i64, u8) {
     (
         std::env::var("LIGHTER_TEST_KEY").expect("set LIGHTER_TEST_KEY"),
-        std::env::var("LIGHTER_TEST_ACCOUNT").expect("set LIGHTER_TEST_ACCOUNT").parse().unwrap(),
-        std::env::var("LIGHTER_TEST_APIKEY").expect("set LIGHTER_TEST_APIKEY").parse().unwrap(),
+        std::env::var("LIGHTER_TEST_ACCOUNT")
+            .expect("set LIGHTER_TEST_ACCOUNT")
+            .parse()
+            .unwrap(),
+        std::env::var("LIGHTER_TEST_APIKEY")
+            .expect("set LIGHTER_TEST_APIKEY")
+            .parse()
+            .unwrap(),
     )
 }
 
@@ -68,14 +74,21 @@ fn mainnet_fill_and_pushes() {
     let _ = hexagent_exchange::async_rt::init();
     let net = Network::from_str("mainnet");
 
-    let auth = LighterAuth::new(&key, account_index, api_key_index, "mainnet", "", "").expect("auth");
+    let auth =
+        LighterAuth::new(&key, account_index, api_key_index, "mainnet", "", "").expect("auth");
     let rest = auth.rest_base();
     let ws = auth.ws_url();
     let meta = info::fetch_meta(&rest).expect("orderBookDetails");
 
     let bal = position::fetch_balance(&rest, account_index).expect("balance");
-    println!("[mainnet] balance available={} collateral={}", bal.available_balance, bal.collateral);
-    assert!(bal.available_balance > 1.0, "need ~1 USDC free margin for 0.0002 BTC");
+    println!(
+        "[mainnet] balance available={} collateral={}",
+        bal.available_balance, bal.collateral
+    );
+    assert!(
+        bal.available_balance > 1.0,
+        "need ~1 USDC free margin for 0.0002 BTC"
+    );
 
     // ── user feed: account_all_trades (fills) + account_all_orders (status) ──
     let signer = Arc::new(
@@ -83,7 +96,8 @@ fn mainnet_fill_and_pushes() {
     );
     let mut market_symbols = HashMap::new();
     market_symbols.insert(MARKET_ID, SYMBOL.to_string());
-    let (rx, _sd) = user_feed::spawn_user_feed(&ws, signer, market_symbols);
+    let lane = user_feed::spawn_user_feed(&ws, signer, market_symbols);
+    let rx = lane.updates.clone();
     std::thread::sleep(Duration::from_secs(2));
     while rx.try_recv().is_ok() {} // drain any initial state
 
@@ -92,7 +106,13 @@ fn mainnet_fill_and_pushes() {
     println!("[mainnet] book bid={} ask={}", bid, ask);
 
     // 1) resting post-only far below → account_all_orders "open" status push.
-    let mut rest_o = OrderRequest::new_limit(Exchange::Lighter, SYMBOL.to_string(), Side::Buy, bid * 0.90, SZ);
+    let mut rest_o = OrderRequest::new_limit(
+        Exchange::Lighter,
+        SYMBOL.to_string(),
+        Side::Buy,
+        bid * 0.90,
+        SZ,
+    );
     rest_o.order_type = OrderType::LimitMaker;
     rest_o.post_only = true;
     rest_o.instance_id = "mainfill".to_string();
@@ -100,12 +120,21 @@ fn mainnet_fill_and_pushes() {
     println!("[mainnet] place resting post-only -> {:?}", u.status);
 
     // 2) IOC buy crossing the ask → FILL (account_all_trades + orders "filled").
-    let mut ioc = OrderRequest::new_limit(Exchange::Lighter, SYMBOL.to_string(), Side::Buy, ask * 1.005, SZ);
+    let mut ioc = OrderRequest::new_limit(
+        Exchange::Lighter,
+        SYMBOL.to_string(),
+        Side::Buy,
+        ask * 1.005,
+        SZ,
+    );
     ioc.order_type = OrderType::Fak;
     ioc.post_only = false;
     ioc.instance_id = "mainfill".to_string();
     let u = tr.submit_order(&ioc).expect("ioc buy");
-    println!("[mainnet] IOC buy -> {:?} (fills arrive async on the feed)", u.status);
+    println!(
+        "[mainnet] IOC buy -> {:?} (fills arrive async on the feed)",
+        u.status
+    );
 
     // 3) cancel the resting order → account_all_orders "canceled" status push.
     let _ = tr.cancel_order(Exchange::Lighter, &rest_o.client_order_id);
@@ -113,7 +142,13 @@ fn mainnet_fill_and_pushes() {
     // 4) reduce-only IOC sell → flatten the long we just opened.
     std::thread::sleep(Duration::from_millis(1500)); // let the buy settle into a position
     let (bid2, _) = top_of_book(&rest);
-    let mut flat = OrderRequest::new_limit(Exchange::Lighter, SYMBOL.to_string(), Side::Sell, bid2 * 0.995, SZ);
+    let mut flat = OrderRequest::new_limit(
+        Exchange::Lighter,
+        SYMBOL.to_string(),
+        Side::Sell,
+        bid2 * 0.995,
+        SZ,
+    );
     flat.order_type = OrderType::Fak;
     flat.post_only = false;
     flat.reduce_only = true;
@@ -159,11 +194,28 @@ fn mainnet_fill_and_pushes() {
     if let Ok(pos) = position::fetch_positions(&rest, account_index) {
         if let Some(p) = pos.get(SYMBOL) {
             if p.quantity.abs() > 1e-9 {
-                let side = if p.quantity > 0.0 { Side::Sell } else { Side::Buy };
+                let side = if p.quantity > 0.0 {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
                 let (b, a) = top_of_book(&rest);
-                let px = if side == Side::Sell { b * 0.99 } else { a * 1.01 };
-                println!("[mainnet] residual {:.6} — closing reduce-only {:?}", p.quantity, side);
-                let mut c = OrderRequest::new_limit(Exchange::Lighter, SYMBOL.to_string(), side, px, p.quantity.abs());
+                let px = if side == Side::Sell {
+                    b * 0.99
+                } else {
+                    a * 1.01
+                };
+                println!(
+                    "[mainnet] residual {:.6} — closing reduce-only {:?}",
+                    p.quantity, side
+                );
+                let mut c = OrderRequest::new_limit(
+                    Exchange::Lighter,
+                    SYMBOL.to_string(),
+                    side,
+                    px,
+                    p.quantity.abs(),
+                );
                 c.order_type = OrderType::Fak;
                 c.post_only = false;
                 c.reduce_only = true;
@@ -182,6 +234,9 @@ fn mainnet_fill_and_pushes() {
         fills, statuses, buy_fill, sell_fill
     );
     assert!(fills > 0, "account_all_trades fill push must arrive");
-    assert!(statuses > 0, "account_all_orders order-status push must arrive");
+    assert!(
+        statuses > 0,
+        "account_all_orders order-status push must arrive"
+    );
     println!("MAINNET FILL + PUSHES OK");
 }

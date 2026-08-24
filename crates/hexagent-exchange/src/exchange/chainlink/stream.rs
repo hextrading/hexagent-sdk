@@ -15,7 +15,7 @@ use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use log::{info, warn};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,7 +48,11 @@ impl ChainlinkStreamMarket {
             symbols: Vec::new(),
             api_key: api_key.to_string(),
             user_secret: user_secret.to_string(),
-            ws_url: if ws_url.is_empty() { DEFAULT_WS_URL.to_string() } else { ws_url.to_string() },
+            ws_url: if ws_url.is_empty() {
+                DEFAULT_WS_URL.to_string()
+            } else {
+                ws_url.to_string()
+            },
             event_rx: None,
             ws_shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -68,7 +72,10 @@ fn auth_headers(
         .to_string();
 
     let body_hash = hex::encode(Sha256::digest(b""));
-    let signing_string = format!("{} {} {} {} {}", method, path, body_hash, api_key, timestamp);
+    let signing_string = format!(
+        "{} {} {} {} {}",
+        method, path, body_hash, api_key, timestamp
+    );
 
     let mut mac = Hmac::<Sha256>::new_from_slice(user_secret.as_bytes())
         .map_err(|e| anyhow!("HMAC key error: {}", e))?;
@@ -90,7 +97,9 @@ async fn chainlink_stream_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         let feed_ids_param = feed_ids.join(",");
         let path = format!("{}?feedIDs={}", WS_PATH, feed_ids_param);
@@ -98,7 +107,8 @@ async fn chainlink_stream_ws_task(
 
         info!("[ChainlinkStream] Connecting to {}", full_url);
 
-        let (auth, timestamp, signature) = match auth_headers(&api_key, &user_secret, "GET", &path) {
+        let (auth, timestamp, signature) = match auth_headers(&api_key, &user_secret, "GET", &path)
+        {
             Ok(v) => v,
             Err(e) => {
                 warn!("[ChainlinkStream] auth build failed: {}", e);
@@ -107,7 +117,11 @@ async fn chainlink_stream_ws_task(
                 continue;
             }
         };
-        info!("[ChainlinkStream] Auth: api_key_len={}, ts={}", api_key.len(), timestamp);
+        info!(
+            "[ChainlinkStream] Auth: api_key_len={}, ts={}",
+            api_key.len(),
+            timestamp
+        );
 
         let mut request: Request<()> = match full_url.as_str().into_client_request() {
             Ok(r) => r,
@@ -120,26 +134,47 @@ async fn chainlink_stream_ws_task(
         };
         let headers = request.headers_mut();
         match auth.parse() {
-            Ok(v) => { headers.insert("Authorization", v); }
-            Err(e) => { warn!("[ChainlinkStream] bad auth header: {}", e); continue; }
+            Ok(v) => {
+                headers.insert("Authorization", v);
+            }
+            Err(e) => {
+                warn!("[ChainlinkStream] bad auth header: {}", e);
+                continue;
+            }
         }
         match timestamp.parse() {
-            Ok(v) => { headers.insert("X-Authorization-Timestamp", v); }
-            Err(e) => { warn!("[ChainlinkStream] bad ts header: {}", e); continue; }
+            Ok(v) => {
+                headers.insert("X-Authorization-Timestamp", v);
+            }
+            Err(e) => {
+                warn!("[ChainlinkStream] bad ts header: {}", e);
+                continue;
+            }
         }
         match signature.parse() {
-            Ok(v) => { headers.insert("X-Authorization-Signature-SHA256", v); }
-            Err(e) => { warn!("[ChainlinkStream] bad sig header: {}", e); continue; }
+            Ok(v) => {
+                headers.insert("X-Authorization-Signature-SHA256", v);
+            }
+            Err(e) => {
+                warn!("[ChainlinkStream] bad sig header: {}", e);
+                continue;
+            }
         }
 
         let (stream, response) = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(request),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 let delay = backoff.next_delay();
-                warn!("[ChainlinkStream] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[ChainlinkStream] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -159,7 +194,11 @@ async fn chainlink_stream_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        info!("[ChainlinkStream] Connected, streaming {} feeds: {:?}", feed_ids.len(), symbols);
+        info!(
+            "[ChainlinkStream] Connected, streaming {} feeds: {:?}",
+            feed_ids.len(),
+            symbols
+        );
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         ping_interval.tick().await;
@@ -207,15 +246,19 @@ async fn chainlink_stream_ws_task(
                     };
                     if let Some(data) = parsed {
                         if let Some(event) = parse_report(&data, &feed_ids, &symbols) {
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -228,7 +271,9 @@ impl ExchangeMarket for ChainlinkStreamMarket {
             return Err(anyhow!("No feed IDs configured"));
         }
         if self.api_key.is_empty() || self.user_secret.is_empty() {
-            return Err(anyhow!("Chainlink Data Streams requires api_key and api_secret"));
+            return Err(anyhow!(
+                "Chainlink Data Streams requires api_key and api_secret"
+            ));
         }
 
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<MarketEvent>();
@@ -267,7 +312,10 @@ impl ExchangeMarket for ChainlinkStreamMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -283,7 +331,9 @@ impl ExchangeMarket for ChainlinkStreamMarket {
         info!("[ChainlinkStream] Disconnected");
     }
 
-    fn name(&self) -> &str { "chainlink" }
+    fn name(&self) -> &str {
+        "chainlink"
+    }
 }
 
 /// Parse a Data Streams report message and extract benchmark_price.
@@ -294,7 +344,8 @@ fn parse_report(
 ) -> Option<MarketEvent> {
     let report = data.get("report")?;
     let feed_id = report.get("feedID").and_then(|v| v.as_str())?;
-    let observations_ts = report.get("observationsTimestamp")
+    let observations_ts = report
+        .get("observationsTimestamp")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let full_report_hex = report.get("fullReport").and_then(|v| v.as_str())?;
@@ -302,15 +353,23 @@ fn parse_report(
     let price = match ChainlinkStreamMarket::decode_benchmark_price(full_report_hex) {
         Ok(p) => p,
         Err(e) => {
-            warn!("[ChainlinkStream] Failed to decode report: {} (hex_len={}, keys={:?})",
-                e, full_report_hex.len(), report.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+            warn!(
+                "[ChainlinkStream] Failed to decode report: {} (hex_len={}, keys={:?})",
+                e,
+                full_report_hex.len(),
+                report.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
             return None;
         }
     };
 
-    if price <= 0.0 { return None; }
+    if price <= 0.0 {
+        return None;
+    }
 
-    let symbol = feed_ids.iter().zip(symbols.iter())
+    let symbol = feed_ids
+        .iter()
+        .zip(symbols.iter())
         .find(|(fid, _)| fid.eq_ignore_ascii_case(feed_id))
         .map(|(_, label)| label.clone())
         .unwrap_or_else(|| feed_id.to_string());
@@ -341,7 +400,9 @@ impl ChainlinkStreamMarket {
     ///   [7]  bid (int192)
     ///   [8]  ask (int192)
     pub(crate) fn decode_benchmark_price(full_report_hex: &str) -> Result<f64> {
-        let hex_str = full_report_hex.strip_prefix("0x").unwrap_or(full_report_hex);
+        let hex_str = full_report_hex
+            .strip_prefix("0x")
+            .unwrap_or(full_report_hex);
         let bytes = hex::decode(hex_str)?;
 
         if bytes.len() < 3 * 32 + 64 {
@@ -350,14 +411,21 @@ impl ChainlinkStreamMarket {
 
         let offset = read_uint256_as_usize(&bytes, 96);
         if offset + 32 > bytes.len() {
-            return Err(anyhow!("Report blob offset out of bounds (total={}, offset={})",
-                bytes.len(), offset));
+            return Err(anyhow!(
+                "Report blob offset out of bounds (total={}, offset={})",
+                bytes.len(),
+                offset
+            ));
         }
         let blob_len = read_uint256_as_usize(&bytes, offset);
         let blob_start = offset + 32;
         if blob_start + blob_len > bytes.len() {
-            return Err(anyhow!("Report blob data out of bounds (total={}, blob_start={}, blob_len={})",
-                bytes.len(), blob_start, blob_len));
+            return Err(anyhow!(
+                "Report blob data out of bounds (total={}, blob_start={}, blob_len={})",
+                bytes.len(),
+                blob_start,
+                blob_len
+            ));
         }
 
         let bp_offset = blob_start + 6 * 32;
@@ -384,9 +452,15 @@ pub fn fetch_price_at_timestamp(
     timestamp_secs: u64,
 ) -> Result<f64> {
     let rest_url = "https://api.dataengine.chain.link";
-    let path = format!("/api/v1/reports?feedID={}&timestamp={}", feed_id, timestamp_secs);
+    let path = format!(
+        "/api/v1/reports?feedID={}&timestamp={}",
+        feed_id, timestamp_secs
+    );
 
-    let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis().to_string();
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .to_string();
     let body_hash = hex::encode(Sha256::digest(b""));
     let signing_string = format!("GET {} {} {} {}", path, body_hash, api_key, ts_ms);
     let mut mac = Hmac::<Sha256>::new_from_slice(api_secret.as_bytes())
@@ -424,9 +498,11 @@ pub fn fetch_price_at_timestamp(
 /// spot report when the caller requested a 30-second TWAP feed.
 fn decode_rest_price_response(body: &str, expected_feed_id: &str) -> Result<f64> {
     let body: serde_json::Value = serde_json::from_str(&body)?;
-    let report = body.get("report")
+    let report = body
+        .get("report")
         .ok_or_else(|| anyhow!("No 'report' in response"))?;
-    let returned_feed_id = report.get("feedID")
+    let returned_feed_id = report
+        .get("feedID")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("No 'feedID' in report"))?;
     if !returned_feed_id.eq_ignore_ascii_case(expected_feed_id) {
@@ -436,7 +512,8 @@ fn decode_rest_price_response(body: &str, expected_feed_id: &str) -> Result<f64>
             returned_feed_id,
         ));
     }
-    let full_report = report.get("fullReport")
+    let full_report = report
+        .get("fullReport")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("No 'fullReport' in report"))?;
 
@@ -450,7 +527,9 @@ mod rest_response_tests {
     #[test]
     fn rejects_a_report_from_a_different_feed() {
         let body = r#"{"report":{"feedID":"0xraw","fullReport":"0x00"}}"#;
-        let error = decode_rest_price_response(body, "0xtwap").unwrap_err().to_string();
+        let error = decode_rest_price_response(body, "0xtwap")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("feed mismatch"), "error={error}");
         assert!(error.contains("0xtwap"), "error={error}");
         assert!(error.contains("0xraw"), "error={error}");
@@ -459,7 +538,9 @@ mod rest_response_tests {
     #[test]
     fn feed_id_validation_is_case_insensitive() {
         let body = r#"{"report":{"feedID":"0xABCD","fullReport":"0x00"}}"#;
-        let error = decode_rest_price_response(body, "0xabcd").unwrap_err().to_string();
+        let error = decode_rest_price_response(body, "0xabcd")
+            .unwrap_err()
+            .to_string();
         assert!(!error.contains("feed mismatch"), "error={error}");
         assert!(error.contains("Report too short"), "error={error}");
     }
@@ -467,7 +548,9 @@ mod rest_response_tests {
     #[test]
     fn rejects_a_report_without_feed_id() {
         let body = r#"{"report":{"fullReport":"0x00"}}"#;
-        let error = decode_rest_price_response(body, "0xtwap").unwrap_err().to_string();
+        let error = decode_rest_price_response(body, "0xtwap")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("No 'feedID'"), "error={error}");
     }
 }

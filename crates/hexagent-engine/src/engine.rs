@@ -1413,13 +1413,13 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
                     order.client_order_id,
                     order.instance_id,
                     order.quote_event_id,
-                order.symbol,
-                order.side,
-                order.quote_trigger_source,
-                order.quote_trigger_exchange_timestamp_ns,
-                order.quote_trigger_local_timestamp_ns,
-                order.timestamp_ns,
-                stage_ns,
+                    order.symbol,
+                    order.side,
+                    order.quote_trigger_source,
+                    order.quote_trigger_exchange_timestamp_ns,
+                    order.quote_trigger_local_timestamp_ns,
+                    order.timestamp_ns,
+                    stage_ns,
                     lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
                     lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
                     lifecycle_delta_ms(stage_ns, order.timestamp_ns),
@@ -1488,13 +1488,13 @@ fn log_executor_receive(signal: &Signal) {
                 order.client_order_id,
                 order.instance_id,
                 order.quote_event_id,
-            order.symbol,
-            order.side,
-            order.quote_trigger_source,
-            order.quote_trigger_exchange_timestamp_ns,
-            order.quote_trigger_local_timestamp_ns,
-            order.timestamp_ns,
-            stage_ns,
+                order.symbol,
+                order.side,
+                order.quote_trigger_source,
+                order.quote_trigger_exchange_timestamp_ns,
+                order.quote_trigger_local_timestamp_ns,
+                order.timestamp_ns,
+                stage_ns,
                 lifecycle_delta_ms(stage_ns, order.quote_trigger_exchange_timestamp_ns),
                 lifecycle_delta_ms(stage_ns, order.quote_trigger_local_timestamp_ns),
                 lifecycle_delta_ms(stage_ns, order.timestamp_ns),
@@ -2091,8 +2091,41 @@ impl SignalSender {
             owner: u16::try_from(owner).expect("strategy owner index exceeds u16"),
             tx,
             owner_lanes: None,
-            arbiter_control_tx: None,
+            arbiter_control_tx: self.arbiter_control_tx.clone(),
         }
+    }
+
+    fn try_send(
+        &self,
+        signal: Signal,
+    ) -> Result<(), crossbeam_channel::TrySendError<RoutedSignal>> {
+        let barrier = self.owner == SYSTEM_SIGNAL_OWNER
+            && matches!(signal, Signal::BeginShutdown | Signal::Exit);
+        let tx = if barrier {
+            self.arbiter_control_tx.as_ref().unwrap_or(&self.tx)
+        } else {
+            &self.tx
+        };
+        tx.try_send(RoutedSignal {
+            owner: self.owner,
+            signal,
+        })
+    }
+
+    /// Exceptional fail-closed path. The arbiter drains already-admitted
+    /// owner commands first, then forwards this cancel through its independent
+    /// control lane. Calling strategy threads never wait for capacity.
+    fn try_send_emergency(
+        &self,
+        signal: Signal,
+    ) -> Result<(), crossbeam_channel::TrySendError<RoutedSignal>> {
+        self.arbiter_control_tx
+            .as_ref()
+            .unwrap_or(&self.tx)
+            .try_send(RoutedSignal {
+                owner: self.owner,
+                signal,
+            })
     }
 
     fn send(&self, signal: Signal) -> Result<(), crossbeam_channel::SendError<RoutedSignal>> {
@@ -2107,27 +2140,6 @@ impl SignalSender {
             owner: self.owner,
             signal,
         })
-    }
-
-    fn send_timeout(
-        &self,
-        signal: Signal,
-        timeout: std::time::Duration,
-    ) -> Result<(), crossbeam_channel::SendTimeoutError<RoutedSignal>> {
-        let barrier = self.owner == SYSTEM_SIGNAL_OWNER
-            && matches!(signal, Signal::BeginShutdown | Signal::Exit);
-        let tx = if barrier {
-            self.arbiter_control_tx.as_ref().unwrap_or(&self.tx)
-        } else {
-            &self.tx
-        };
-        tx.send_timeout(
-            RoutedSignal {
-                owner: self.owner,
-                signal,
-            },
-            timeout,
-        )
     }
 }
 
@@ -2193,62 +2205,6 @@ fn spawn_strategy_signal_arbiter(
     )
 }
 
-#[derive(Debug, Default)]
-struct StrategyCallbackLatencyBucket {
-    queue_samples: u64,
-    queue_total_us: u128,
-    queue_max_us: u64,
-    callback_samples: u64,
-    callback_total_us: u128,
-    callback_max_us: u64,
-}
-
-impl StrategyCallbackLatencyBucket {
-    fn record_queue(&mut self, elapsed_us: u64) {
-        self.queue_samples = self.queue_samples.saturating_add(1);
-        self.queue_total_us = self.queue_total_us.saturating_add(elapsed_us as u128);
-        self.queue_max_us = self.queue_max_us.max(elapsed_us);
-    }
-
-    fn record_callback(&mut self, elapsed: std::time::Duration) {
-        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
-        self.callback_samples = self.callback_samples.saturating_add(1);
-        self.callback_total_us = self.callback_total_us.saturating_add(elapsed_us as u128);
-        self.callback_max_us = self.callback_max_us.max(elapsed_us);
-    }
-}
-
-fn market_event_metric_kind(event: &MarketEvent) -> &'static str {
-    match event {
-        MarketEvent::OrderBook(book) => match book.exchange {
-            Exchange::Binance => "orderbook_binance",
-            Exchange::Polymarket => "orderbook_polymarket",
-            _ => "orderbook_other",
-        },
-        MarketEvent::Trade(trade) => match trade.exchange {
-            Exchange::Binance => "trade_binance",
-            Exchange::Polymarket => "trade_polymarket",
-            _ => "trade_other",
-        },
-        MarketEvent::Quote(quote) => match quote.exchange {
-            Exchange::Binance => "quote_binance",
-            Exchange::Polymarket => "quote_polymarket",
-            _ => "quote_other",
-        },
-        MarketEvent::Bar(_) => "bar",
-        MarketEvent::SpotPrice(_) => "spot_price",
-        MarketEvent::AssetCtx(_) => "asset_ctx",
-        MarketEvent::Instrument(_) => "instrument",
-        MarketEvent::Connected { .. } => "connected",
-        MarketEvent::Disconnected { .. } => "disconnected",
-        MarketEvent::MarketDataHealth(_) => "market_health",
-        MarketEvent::TickSizeChange(_) => "tick_size",
-        MarketEvent::EventStart { .. } => "event_start",
-        MarketEvent::EventEnd { .. } => "event_end",
-        MarketEvent::Exit => "exit",
-    }
-}
-
 fn quarantine_strategy_worker(
     idx: usize,
     reason: &str,
@@ -2283,14 +2239,86 @@ fn enqueue_emergency_instance_cancel(
         asset_ids: Vec::new(),
         instance_id: instance_id.to_string(),
     };
-    if let Err(error) = signal_tx
-        .with_owner(idx)
-        .send_timeout(cancel, std::time::Duration::from_millis(500))
-    {
-        error!("[strategy_supervisor] failed to enqueue emergency instance cancel for worker index={idx}: {error}");
+    if let Err(error) = signal_tx.with_owner(idx).try_send_emergency(cancel) {
+        error!(
+            "[strategy_supervisor] failed to enqueue emergency instance cancel for worker index={idx}: {error}"
+        );
         return false;
     }
     true
+}
+
+fn emergency_cancel_for_signal(signal: &Signal, instance_id: &str, reason: &str) -> Signal {
+    let exchange = match signal {
+        Signal::NewOrder(order) => Some(order.exchange),
+        Signal::CancelOrder { exchange, .. }
+        | Signal::CancelAll { exchange, .. }
+        | Signal::BatchNewOrders { exchange, .. }
+        | Signal::BatchCancelOrders { exchange, .. }
+        | Signal::BatchUpdateOrders { exchange, .. }
+        | Signal::ReplaceOrder { exchange, .. } => Some(*exchange),
+        Signal::ReconcilePolymarket { .. }
+        | Signal::PolymarketCancelAllOrders { .. }
+        | Signal::RetainPolymarketEventAudit { .. }
+        | Signal::RetirePolymarketEventAudit { .. } => Some(Exchange::Polymarket),
+        Signal::BeginShutdown | Signal::Exit => None,
+    };
+    if exchange == Some(Exchange::Polymarket) {
+        Signal::PolymarketCancelAllOrders {
+            reason: format!("instance `{instance_id}` signal lane failed closed: {reason}"),
+            market: None,
+            asset_ids: Vec::new(),
+            instance_id: instance_id.to_string(),
+        }
+    } else {
+        Signal::CancelAll {
+            exchange: exchange.unwrap_or(Exchange::Polymarket),
+            symbol: String::new(),
+            instance_id: instance_id.to_string(),
+            timestamp_ns: crate::types::now_ns(),
+        }
+    }
+}
+
+fn emit_strategy_signal(
+    signal: Signal,
+    signal_tx: &SignalSender,
+    quarantined: &AtomicBool,
+    instance_id: &str,
+) -> bool {
+    if quarantined.load(Ordering::Acquire) {
+        return false;
+    }
+    match signal_tx.try_send(signal) {
+        Ok(()) => true,
+        Err(crossbeam_channel::TrySendError::Full(routed)) => {
+            quarantined.store(true, Ordering::Release);
+            error!(
+                "[strategy_worker] instance={} signal lane overflow; quarantining fail-closed",
+                instance_id,
+            );
+            let emergency = emergency_cancel_for_signal(
+                &routed.signal,
+                instance_id,
+                "bounded owner lane overflow",
+            );
+            if let Err(error) = signal_tx.try_send_emergency(emergency) {
+                error!(
+                    "[strategy_worker] instance={} emergency control lane unavailable: {}",
+                    instance_id, error,
+                );
+            }
+            false
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(routed)) => {
+            quarantined.store(true, Ordering::Release);
+            error!(
+                "[strategy_worker] instance={} signal lane disconnected while emitting {:?}",
+                instance_id, routed.signal,
+            );
+            false
+        }
+    }
 }
 
 /// Exact identity of one historical-bars input snapshot.
@@ -2517,7 +2545,10 @@ fn forward_recorder_shared(
                         .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                 {
-                    warn!("[Recorder] live queue saturated; dropped_events_total={} action=preserve_strategy_latency", dropped);
+                    warn!(
+                        "[Recorder] live queue saturated; dropped_events_total={} action=preserve_strategy_latency",
+                        dropped
+                    );
                 }
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
@@ -3684,7 +3715,10 @@ impl Engine {
                     id.clone(),
                 ) {
                     Ok(h) => {
-                        info!("[Engine] rtt_probe started for instance_id={} interval={:.1}s all_probe=true", id, interval_secs);
+                        info!(
+                            "[Engine] rtt_probe started for instance_id={} interval={:.1}s all_probe=true",
+                            id, interval_secs
+                        );
                         probe_handles.push(h);
                     }
                     Err(e) => warn!(
@@ -4583,8 +4617,14 @@ impl Engine {
                 };
                 info!(
                     "[Backtest v2] RTT calibrated: place p50/p95/p99={:.0}/{:.0}/{:.0}ms  cancel={:.0}/{:.0}/{:.0}ms  ρ_place={:?}  client_timeout={}ms",
-                    cal.place.p50_ms, cal.place.p95_ms, cal.place.p99_ms,
-                    cal.cancel.p50_ms, cal.cancel.p95_ms, cal.cancel.p99_ms, cal.place.rho_lag1, ct,
+                    cal.place.p50_ms,
+                    cal.place.p95_ms,
+                    cal.place.p99_ms,
+                    cal.cancel.p50_ms,
+                    cal.cancel.p95_ms,
+                    cal.cancel.p99_ms,
+                    cal.place.rho_lag1,
+                    ct,
                 );
                 (
                     (cal.place.p50_ms, cal.place.p95_ms, cal.place.p99_ms),
@@ -4639,9 +4679,18 @@ impl Engine {
                 Ok(data) if data.place.n() > 0 && data.cancel.n() > 0 => {
                     info!(
                         "[Backtest v2] RTT record-replay from {}: {} csv file(s), place n={} (epoch_ms [{}..{}]), cancel n={}; params abs_tol={}ms tod_tol={}s tod_bucket={}s fallback={}, ρ={:.3} ρ_cross={:.3}",
-                        dir.display(), data.n_files, data.place.n(),
-                        data.place.min_epoch_ms(), data.place.max_epoch_ms(), data.cancel.n(),
-                        params.abs_tol_ms, params.tod_tol_secs, bucket_secs, params.fallback.as_str(), lat_rho, lat_cross,
+                        dir.display(),
+                        data.n_files,
+                        data.place.n(),
+                        data.place.min_epoch_ms(),
+                        data.place.max_epoch_ms(),
+                        data.cancel.n(),
+                        params.abs_tol_ms,
+                        params.tod_tol_secs,
+                        bucket_secs,
+                        params.fallback.as_str(),
+                        lat_rho,
+                        lat_cross,
                     );
                     if bt.sim_v2_dynamic_taker_windows {
                         let table = data.place.causal_rolling_event_quantile(
@@ -4657,7 +4706,8 @@ impl Engine {
                             });
                         info!(
                             "[Backtest v2] dynamic taker windows: {} causal event states, lookback={} events, event_q={:.2}, cap={:.0}ms, ref={:.3}ms, race_elasticity={:.3}, comp_elasticity={:.3}, multiplier=[{:.2},{:.2}], state_range=[{:.1},{:.1}]ms",
-                            table.len(), bt.sim_v2_dynamic_window_rtt_lookback_events,
+                            table.len(),
+                            bt.sim_v2_dynamic_window_rtt_lookback_events,
                             bt.sim_v2_dynamic_window_rtt_quantile,
                             bt.sim_v2_dynamic_window_rtt_cap_ms,
                             bt.sim_v2_dynamic_window_rtt_ref_ms,
@@ -4665,7 +4715,8 @@ impl Engine {
                             bt.sim_v2_dynamic_comp_rtt_elasticity,
                             bt.sim_v2_dynamic_window_min_mult,
                             bt.sim_v2_dynamic_window_max_mult,
-                            min_state, max_state,
+                            min_state,
+                            max_state,
                         );
                         dynamic_window_rtt_by_event = Some(table);
                     }
@@ -4684,8 +4735,12 @@ impl Engine {
                     )
                 }
                 Ok(data) => {
-                    warn!("[Backtest v2] record-replay dir {} has an empty side (place {}, cancel {}) → static knobs",
-                        dir.display(), data.place.n(), data.cancel.n());
+                    warn!(
+                        "[Backtest v2] record-replay dir {} has an empty side (place {}, cancel {}) → static knobs",
+                        dir.display(),
+                        data.place.n(),
+                        data.cancel.n()
+                    );
                     (None, None)
                 }
                 Err(e) => {
@@ -4723,14 +4778,18 @@ impl Engine {
              -> Option<LatencyProfile> {
                 let n_pop = hourly.iter().filter(|h| h.is_some()).count();
                 if n_pop < HOURLY_MIN_HOURS {
-                    info!("[Backtest v2] {} hourly: only {} populated UTC-hour bucket(s) (<{}) → pooled empirical CDF",
-                        side, n_pop, HOURLY_MIN_HOURS);
+                    info!(
+                        "[Backtest v2] {} hourly: only {} populated UTC-hour bucket(s) (<{}) → pooled empirical CDF",
+                        side, n_pop, HOURLY_MIN_HOURS
+                    );
                     return None;
                 }
                 let anchors: [Option<EmpiricalAnchors>; 24] =
                     std::array::from_fn(|h| hourly[h].as_ref().map(to_anchors));
-                info!("[Backtest v2] {} hourly-empirical RTT: {} populated UTC-hour buckets (ρ={:.3})",
-                    side, n_pop, lat_rho);
+                info!(
+                    "[Backtest v2] {} hourly-empirical RTT: {} populated UTC-hour buckets (ρ={:.3})",
+                    side, n_pop, lat_rho
+                );
                 Some(LatencyProfile::HourlyEmpirical {
                     hourly: Box::new(anchors),
                     fallback: to_anchors(pooled),
@@ -4745,7 +4804,9 @@ impl Engine {
             (None, None)
         };
         if bt.sim_v2_dynamic_taker_windows && !is_record_dir {
-            warn!("[Backtest v2] dynamic taker windows require sim_latency_calibrate_from to be a latency-record directory; using fixed windows");
+            warn!(
+                "[Backtest v2] dynamic taker windows require sim_latency_calibrate_from to be a latency-record directory; using fixed windows"
+            );
         }
 
         // ── Per-event RTT table (sim_rtt_mode="exact"): per-event live RTT
@@ -4769,8 +4830,12 @@ impl Engine {
                 Ok(t) if !t.is_empty() => {
                     let n_place = t.values().filter(|e| e.place_p50_ms.is_some()).count();
                     let n_seg = t.values().filter(|e| e.has_segmented_place()).count();
-                    info!("[Backtest v2] per-event RTT (sim_rtt_mode=exact): {} events, {} with place quantiles, {} segmented",
-                            t.len(), n_place, n_seg);
+                    info!(
+                        "[Backtest v2] per-event RTT (sim_rtt_mode=exact): {} events, {} with place quantiles, {} segmented",
+                        t.len(),
+                        n_place,
+                        n_seg
+                    );
                     Some(t)
                 }
                 Ok(_) => {
@@ -4809,7 +4874,10 @@ impl Engine {
                     .collect();
                 match crate::exchange::sim::per_event_rtt::extract_taker_overhead(&paths) {
                     Ok(Some((a, b, c))) => {
-                        info!("[Backtest v2] taker overhead auto-calibrated from log: p50/p95/p99={:.0}/{:.0}/{:.0} ms", a, b, c);
+                        info!(
+                            "[Backtest v2] taker overhead auto-calibrated from log: p50/p95/p99={:.0}/{:.0}/{:.0} ms",
+                            a, b, c
+                        );
                         (a, b, c)
                     }
                     Ok(None) => {
@@ -4835,7 +4903,9 @@ impl Engine {
         let dynamic_taker_overhead_by_event = if bt.sim_v2_dynamic_taker_overhead {
             let source = bt.sim_v2_taker_overhead_calibrate_from.trim();
             if source.is_empty() {
-                warn!("[Backtest v2] dynamic taker overhead enabled without sim_v2_taker_overhead_calibrate_from; using fixed anchors");
+                warn!(
+                    "[Backtest v2] dynamic taker overhead enabled without sim_v2_taker_overhead_calibrate_from; using fixed anchors"
+                );
                 None
             } else {
                 let paths: Vec<String> = source
@@ -4853,11 +4923,14 @@ impl Engine {
                     base,
                 ) {
                     Ok(t) if !t.is_empty() => {
-                        info!("[Backtest v2] dynamic taker overhead: {} causal events, iid={}, lookback={}, min_samples={}, blend={:.2}",
-                            t.len(), bt.sim_v2_taker_overhead_instance_id,
+                        info!(
+                            "[Backtest v2] dynamic taker overhead: {} causal events, iid={}, lookback={}, min_samples={}, blend={:.2}",
+                            t.len(),
+                            bt.sim_v2_taker_overhead_instance_id,
                             bt.sim_v2_dynamic_taker_overhead_lookback_events,
                             bt.sim_v2_dynamic_taker_overhead_min_samples,
-                            bt.sim_v2_dynamic_taker_overhead_blend);
+                            bt.sim_v2_dynamic_taker_overhead_blend
+                        );
                         Some(t)
                     }
                     Ok(_) => {
@@ -4867,7 +4940,10 @@ impl Engine {
                         None
                     }
                     Err(e) => {
-                        warn!("[Backtest v2] dynamic taker overhead extract failed ({}); using fixed anchors", e);
+                        warn!(
+                            "[Backtest v2] dynamic taker overhead extract failed ({}); using fixed anchors",
+                            e
+                        );
                         None
                     }
                 }
@@ -5206,9 +5282,19 @@ impl Engine {
             taker_fills, maker_fills, rejects
         );
         let (rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short) = sim.reject_breakdown();
-        info!("  Sim v2:   reject reasons: taker_buy={} taker_sell={} rest_buy={} rest_sell={} (rest_sell short Σ={:.0} shares, mean={:.1})",
-            rj_tb, rj_ts, rj_rb, rj_rs, rj_rs_short,
-            if rj_rs > 0 { rj_rs_short / rj_rs as f64 } else { 0.0 });
+        info!(
+            "  Sim v2:   reject reasons: taker_buy={} taker_sell={} rest_buy={} rest_sell={} (rest_sell short Σ={:.0} shares, mean={:.1})",
+            rj_tb,
+            rj_ts,
+            rj_rb,
+            rj_rs,
+            rj_rs_short,
+            if rj_rs > 0 {
+                rj_rs_short / rj_rs as f64
+            } else {
+                0.0
+            }
+        );
         let (self_clean_n, self_clean_qty) = sim.replay_self_taker_stats();
         info!(
             "  Sim v2:   replay self-depth taker cleaning: sweeps={} removed_depth={:.4}",
@@ -5225,8 +5311,13 @@ impl Engine {
                         .get("init_balance")
                         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                         .unwrap_or(0.0);
-                    info!("  Sim v2:   gating-wallet USDC [{}]: final={:.2} (seeded={:.2}, net={:.2}) — settlement-aware (split cost debited at seed, payouts credited at retire); net ≈ in-flight seed float, NOT a bleed",
-                        s.instance_id, bal, seed, bal - seed);
+                    info!(
+                        "  Sim v2:   gating-wallet USDC [{}]: final={:.2} (seeded={:.2}, net={:.2}) — settlement-aware (split cost debited at seed, payouts credited at retire); net ≈ in-flight seed float, NOT a bleed",
+                        s.instance_id,
+                        bal,
+                        seed,
+                        bal - seed
+                    );
                 }
             }
         }
@@ -5267,7 +5358,12 @@ impl Engine {
             );
         }
         let (mean_age_ms, over1s, mean_life_ms) = sim.fill_timing_stats();
-        info!("  Sim v2:   maker fill-age mean={:.0}ms  >1s={:.1}%  | removed-order lifetime mean={:.0}ms", mean_age_ms, 100.0 * over1s, mean_life_ms);
+        info!(
+            "  Sim v2:   maker fill-age mean={:.0}ms  >1s={:.1}%  | removed-order lifetime mean={:.0}ms",
+            mean_age_ms,
+            100.0 * over1s,
+            mean_life_ms
+        );
         let (race_infl, race_plc, race_ratio, taker_capped, taker_capped_zero) = sim.race_stats();
         if race_plc > 0 {
             info!(
@@ -5289,7 +5385,10 @@ impl Engine {
         }
         let adv_adv = sim.adverse_advanced();
         if adv_adv > 0 {
-            info!("  Sim v2:   adverse-sel tilt advanced queue on {} resyncs (cancel-attribution ahead_frac→1 on adverse mid moves)", adv_adv);
+            info!(
+                "  Sim v2:   adverse-sel tilt advanced queue on {} resyncs (cancel-attribution ahead_frac→1 on adverse mid moves)",
+                adv_adv
+            );
         }
         let (own_positioned, own_initial, own_cancel_n, own_cancel_qty) =
             sim.own_queue_position_stats();
@@ -5314,11 +5413,17 @@ impl Engine {
         }
         let bt_fills = sim.book_through_fills();
         if bt_fills > 0 {
-            info!("  Sim v2:   book-through adverse fills: {} (resting orders the contra swept through → picked off)", bt_fills);
+            info!(
+                "  Sim v2:   book-through adverse fills: {} (resting orders the contra swept through → picked off)",
+                bt_fills
+            );
         }
         let depletion_fills = sim.unexplained_depletion_fills();
         if depletion_fills > 0 {
-            info!("  Sim v2:   unexplained-depletion maker fills: {} (residual L2 shrinkage treated as hidden execution)", depletion_fills);
+            info!(
+                "  Sim v2:   unexplained-depletion maker fills: {} (residual L2 shrinkage treated as hidden execution)",
+                depletion_fills
+            );
         }
         let (residual_orders, residual_qty) = sim.inferred_maker_residual_stats();
         if residual_orders > 0 {
@@ -5329,7 +5434,10 @@ impl Engine {
         }
         let hc = sim.fill_haircuts();
         if hc > 0 {
-            info!("  Sim v2:   forward-markout haircuts: {} favorable maker fills downweighted (markout → live −0.75c)", hc);
+            info!(
+                "  Sim v2:   forward-markout haircuts: {} favorable maker fills downweighted (markout → live −0.75c)",
+                hc
+            );
         }
         let (book_hc_n, book_hc_qty, book_hc_cost) = sim.book_fill_markout_stats();
         if book_hc_n > 0 {
@@ -5339,10 +5447,30 @@ impl Engine {
             );
         }
         let (mq, tv) = sim.depth_distributions();
-        info!("  Sim v2:   maker q_init (shares ahead at placement) n={:.0} mean={:.1} | p10={:.0} p25={:.0} p50={:.0} p75={:.0} p90={:.0} p99={:.0} | zero-queue={:.1}%",
-            mq[0], mq[1], mq[2], mq[3], mq[4], mq[5], mq[6], mq[7], 100.0 * mq[8]);
-        info!("  Sim v2:   taker avail-vol (fillable within limit at match) n={:.0} mean={:.1} | p10={:.0} p25={:.0} p50={:.0} p75={:.0} p90={:.0} p99={:.0} | zero={:.1}%",
-            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7], 100.0 * tv[8]);
+        info!(
+            "  Sim v2:   maker q_init (shares ahead at placement) n={:.0} mean={:.1} | p10={:.0} p25={:.0} p50={:.0} p75={:.0} p90={:.0} p99={:.0} | zero-queue={:.1}%",
+            mq[0],
+            mq[1],
+            mq[2],
+            mq[3],
+            mq[4],
+            mq[5],
+            mq[6],
+            mq[7],
+            100.0 * mq[8]
+        );
+        info!(
+            "  Sim v2:   taker avail-vol (fillable within limit at match) n={:.0} mean={:.1} | p10={:.0} p25={:.0} p50={:.0} p75={:.0} p90={:.0} p99={:.0} | zero={:.1}%",
+            tv[0],
+            tv[1],
+            tv[2],
+            tv[3],
+            tv[4],
+            tv[5],
+            tv[6],
+            tv[7],
+            100.0 * tv[8]
+        );
         let pb = sim.placement_buckets();
         let ptot: u64 = pb.iter().map(|b| b[0]).sum::<u64>().max(1);
         let pnames = [
@@ -5367,35 +5495,57 @@ impl Engine {
             );
         }
         let (q0_extra, q0_best) = sim.q0_fallback_split();
-        info!("  Sim v2:     q_init=0 resolved by: extrapolation(beyond-window)={} | best-level rule(in-window gap)={}",
-            q0_extra, q0_best);
+        info!(
+            "  Sim v2:     q_init=0 resolved by: extrapolation(beyond-window)={} | best-level rule(in-window gap)={}",
+            q0_extra, q0_best
+        );
         if let Some((n, mean, min, max)) = sim.dynamic_deep_queue_stats() {
-            info!("  Sim v2:   dynamic deep-queue extrapolations={} mean decay={:.3} range=[{:.3},{:.3}]",
-                n, mean, min, max);
+            info!(
+                "  Sim v2:   dynamic deep-queue extrapolations={} mean decay={:.3} range=[{:.3},{:.3}]",
+                n, mean, min, max
+            );
         }
         let (tcc, tccz, tc_mean) = sim.taker_comp_stats();
         if tcc > 0 {
             let zpct = 100.0 * tccz as f64 / tcc as f64;
-            info!("  Sim v2:   taker trade-flow competition capped {} fills ({} to ~0 = full miss, {:.1}%) | mean competing vol={:.1}",
-                tcc, tccz, zpct, tc_mean);
+            info!(
+                "  Sim v2:   taker trade-flow competition capped {} fills ({} to ~0 = full miss, {:.1}%) | mean competing vol={:.1}",
+                tcc, tccz, zpct, tc_mean
+            );
         }
         if let Some((n, mean_rtt, mean_race, mean_comp, min_mult, max_mult)) =
             sim.dynamic_window_stats()
         {
-            info!("  Sim v2:   dynamic taker windows events={} | RTT state mean={:.2}ms | race mean={:.0}ms comp mean={:.0}ms | multiplier range=[{:.3},{:.3}]",
-                n, mean_rtt, mean_race, mean_comp, min_mult, max_mult);
+            info!(
+                "  Sim v2:   dynamic taker windows events={} | RTT state mean={:.2}ms | race mean={:.0}ms comp mean={:.0}ms | multiplier range=[{:.3},{:.3}]",
+                n, mean_rtt, mean_race, mean_comp, min_mult, max_mult
+            );
         }
         if let Some((n, p50, p95, p99)) = sim.dynamic_taker_overhead_stats() {
-            info!("[Backtest v2] dynamic taker overhead applied: n={} mean p50/p95/p99={:.1}/{:.1}/{:.1} ms",
-                n, p50, p95, p99);
+            info!(
+                "[Backtest v2] dynamic taker overhead applied: n={} mean p50/p95/p99={:.1}/{:.1}/{:.1} ms",
+                n, p50, p95, p99
+            );
         }
         if let Some(s) = sim.dynamic_markout_stats() {
-            info!("  Sim v2:   dynamic markout state n={:.0} mean={:.2} {} p50/p75/p90/p99={:.2}/{:.2}/{:.2}/{:.2} | vn mean={:.3} range=[{:.3},{:.3}]",
-                s[0], s[1], sim.dynamic_markout_state_unit(), s[2], s[3], s[4], s[5], s[6], s[7], s[8]);
+            info!(
+                "  Sim v2:   dynamic markout state n={:.0} mean={:.2} {} p50/p75/p90/p99={:.2}/{:.2}/{:.2}/{:.2} | vn mean={:.3} range=[{:.3},{:.3}]",
+                s[0],
+                s[1],
+                sim.dynamic_markout_state_unit(),
+                s[2],
+                s[3],
+                s[4],
+                s[5],
+                s[6],
+                s[7],
+                s[8]
+            );
         }
         if bt.sim_v2_fill_audit {
             for a in sim.fill_audit_rows() {
-                info!("  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} passive_place_n={} passive_place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} passive_rest_n={} passive_rest_qty={:.4} maker_rest_s={:.6} maker_rest_qty_s={:.6} passive_rest_s={:.6} passive_rest_qty_s={:.6} maker_cancel_n={} maker_cancel_qty={:.4} maker_fill_order_n={} maker_open_n={} passive_cancel_n={} passive_cancel_qty={:.4} passive_fill_order_n={} passive_fill_qty={:.4} passive_open_n={} maker_q_init_sum={:.4} maker_own_q_init_sum={:.4} maker_own_cancel_queue_advance_qty={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_book_markout_qty={:.4} maker_book_markout_cost_usdc={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_replay_self_depth_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
+                info!(
+                    "  Sim v2 fill audit event: slug={} iid={} place_n={} place_qty={:.4} passive_place_n={} passive_place_qty={:.4} cancel_before_place_n={} cancel_before_place_qty={:.4} stale_order_n={} stale_order_qty={:.4} po_reject_n={} po_reject_qty={:.4} maker_rest_n={} maker_rest_qty={:.4} passive_rest_n={} passive_rest_qty={:.4} maker_rest_s={:.6} maker_rest_qty_s={:.6} passive_rest_s={:.6} passive_rest_qty_s={:.6} maker_cancel_n={} maker_cancel_qty={:.4} maker_fill_order_n={} maker_open_n={} passive_cancel_n={} passive_cancel_qty={:.4} passive_fill_order_n={} passive_fill_qty={:.4} passive_open_n={} maker_q_init_sum={:.4} maker_own_q_init_sum={:.4} maker_own_cancel_queue_advance_qty={:.4} maker_race_added_q={:.4} maker_replay_self_depth_credit={:.4} maker_trade_match_n={} maker_trade_qty={:.4} maker_queue_drained_qty={:.4} maker_candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} maker_depletion_observed_qty={:.4} maker_depletion_exec_qty={:.4} maker_depletion_cancel_advance_qty={:.4} maker_depletion_candidate_qty={:.4} maker_depletion_budget_suppressed_qty={:.4} maker_depletion_fill_qty={:.4} maker_book_markout_qty={:.4} maker_book_markout_cost_usdc={:.4} maker_fill_qty={:.4} stale_trade_match_n={} stale_trade_candidate_qty={:.4} taker_candidate_n={} taker_requested_qty={:.4} taker_available_qty={:.4} taker_replay_self_depth_qty={:.4} taker_race_suppressed_qty={:.4} taker_comp_suppressed_qty={:.4} taker_zero_n={} taker_fill_qty={:.4}",
                     a.slug,
                     a.iid,
                     a.place_orders,
@@ -5457,7 +5607,8 @@ impl Engine {
                 );
             }
             for a in sim.maker_order_audit_rows() {
-                info!("  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} inferred_residual_floor={:.6} inferred_residual_suppressed_qty={:.6} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
+                info!(
+                    "  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} inferred_residual_floor={:.6} inferred_residual_suppressed_qty={:.6} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
                     a.slug,
                     a.iid,
                     a.coid,
@@ -6030,8 +6181,12 @@ impl Engine {
                     chrono::Utc::now()
                 };
                 let start = end - chrono::TimeDelta::seconds((warmup_hours * 3600.0) as i64);
-                info!("[Strategy] Prediction warm-up: loading {:.1}h of history for {} sources (end={})",
-                    warmup_hours, warmup_sources.len(), end.format("%Y-%m-%d %H:%M"));
+                info!(
+                    "[Strategy] Prediction warm-up: loading {:.1}h of history for {} sources (end={})",
+                    warmup_hours,
+                    warmup_sources.len(),
+                    end.format("%Y-%m-%d %H:%M")
+                );
                 // Tell strategies we're entering warm-up so they can suppress
                 // per-hour retrains while samples stream in.
                 for s in &mut strategies {
@@ -6614,7 +6769,14 @@ impl Engine {
         let mut instance_ids: Vec<String> = Vec::with_capacity(strategies.len());
         for (i, s) in strategies.iter().enumerate() {
             instance_ids.push(s.instance_id().to_string());
-            for sym in s.subscribed_symbols() {
+            let subscriptions = s.subscribed_symbols();
+            if subscriptions.is_empty() {
+                warn!(
+                    "[strategy_router] instance={} has no explicit subscriptions; symbol-scoped market data will be dropped",
+                    s.instance_id(),
+                );
+            }
+            for sym in subscriptions {
                 *sym_to_instances.entry(SymbolId::of(&sym)).or_default() |= 1u64 << i;
             }
         }
@@ -6986,8 +7148,11 @@ impl Engine {
                 }
             }
             PrivateUpdateRoute::DropQuarantined(i) => {
-                warn!("[strategy_router] dropping private update for quarantined owner instance={} coid={}",
-                    instance_ids.get(i).map(String::as_str).unwrap_or(""), update.client_order_id);
+                warn!(
+                    "[strategy_router] dropping private update for quarantined owner instance={} coid={}",
+                    instance_ids.get(i).map(String::as_str).unwrap_or(""),
+                    update.client_order_id
+                );
             }
             PrivateUpdateRoute::DropInvalid(i) => {
                 error!(
@@ -7005,10 +7170,9 @@ impl Engine {
     }
 
     /// Route ONE market event to the subscribing instances' channels.
-    /// Known symbol → those instances. Unknown stable spot symbols retain the
-    /// legacy broadcast fallback, but unknown dynamic Polymarket token ids are
-    /// dropped: broadcasting them contaminates per-instance PM activity and can
-    /// fill unrelated workers' bounded market queues. Learns Polymarket
+    /// Known symbol → those instances. Every unknown symbol is dropped:
+    /// broadcasting it contaminates per-instance state and can fill unrelated
+    /// workers' bounded market queues. Learns Polymarket
     /// token_id → instance from `Instrument(BinaryOption)`.
     fn route_market_event(
         event: Arc<MarketEvent>,
@@ -7085,63 +7249,75 @@ impl Engine {
             }
         }
 
-        let targets: Option<RouteMask> = match event.as_ref() {
+        let all_instances = match market_lanes.len() {
+            64 => u64::MAX,
+            len => (1u64 << len) - 1,
+        };
+        let targets: RouteMask = match event.as_ref() {
             // Lifecycle / spot-instrument → all instances.
-            MarketEvent::Connected { .. }
-            | MarketEvent::Disconnected { .. }
-            | MarketEvent::Instrument(_) => None,
+            MarketEvent::Connected { .. } | MarketEvent::Disconnected { .. } => all_instances,
+            MarketEvent::Instrument(Instrument::Spot(spot)) => sym_to_instances
+                .get(&SymbolId::of(&spot.symbol))
+                .copied()
+                .unwrap_or_default(),
             // Polymarket market data keyed by dynamic token_id.
-            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => Some(
-                token_to_instances
-                    .get(&SymbolId::of(&ob.symbol))
-                    .copied()
-                    .unwrap_or_default(),
-            ),
-            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => Some(
-                token_to_instances
-                    .get(&SymbolId::of(&t.symbol))
-                    .copied()
-                    .unwrap_or_default(),
-            ),
-            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => Some(
-                token_to_instances
-                    .get(&SymbolId::of(&q.symbol))
-                    .copied()
-                    .unwrap_or_default(),
-            ),
-            MarketEvent::TickSizeChange(tsc) => Some(
-                token_to_instances
-                    .get(&SymbolId::of(&tsc.symbol))
-                    .copied()
-                    .unwrap_or_default(),
-            ),
+            MarketEvent::OrderBook(ob) if ob.exchange == Exchange::Polymarket => token_to_instances
+                .get(&SymbolId::of(&ob.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::Trade(t) if t.exchange == Exchange::Polymarket => token_to_instances
+                .get(&SymbolId::of(&t.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::Quote(q) if q.exchange == Exchange::Polymarket => token_to_instances
+                .get(&SymbolId::of(&q.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::TickSizeChange(tsc) => token_to_instances
+                .get(&SymbolId::of(&tsc.symbol))
+                .copied()
+                .or_else(|| sym_to_instances.get(&SymbolId::of(&tsc.symbol)).copied())
+                .unwrap_or_default(),
             // Spot venues keyed by stable symbol.
-            MarketEvent::OrderBook(ob) => sym_to_instances.get(&SymbolId::of(&ob.symbol)).copied(),
-            MarketEvent::Trade(t) => sym_to_instances.get(&SymbolId::of(&t.symbol)).copied(),
-            MarketEvent::Quote(q) => sym_to_instances.get(&SymbolId::of(&q.symbol)).copied(),
-            MarketEvent::Bar(b) => sym_to_instances.get(&SymbolId::of(&b.symbol)).copied(),
-            MarketEvent::SpotPrice(sp) => sym_to_instances.get(&SymbolId::of(&sp.symbol)).copied(),
-            MarketEvent::AssetCtx(ac) => sym_to_instances.get(&SymbolId::of(&ac.symbol)).copied(),
-            MarketEvent::MarketDataHealth(health) => Some(
-                token_to_instances
-                    .get(&SymbolId::of(&health.symbol))
-                    .copied()
-                    .unwrap_or_default(),
-            ),
-            MarketEvent::EventStart { symbol, .. } => {
-                sym_to_instances.get(&SymbolId::of(symbol)).copied()
-            }
-            MarketEvent::EventEnd { .. } => None,
-            MarketEvent::Exit => Some(0),
+            MarketEvent::OrderBook(ob) => sym_to_instances
+                .get(&SymbolId::of(&ob.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::Trade(t) => sym_to_instances
+                .get(&SymbolId::of(&t.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::Quote(q) => sym_to_instances
+                .get(&SymbolId::of(&q.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::Bar(b) => sym_to_instances
+                .get(&SymbolId::of(&b.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::SpotPrice(sp) => sym_to_instances
+                .get(&SymbolId::of(&sp.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::AssetCtx(ac) => sym_to_instances
+                .get(&SymbolId::of(&ac.symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::MarketDataHealth(health) => token_to_instances
+                .get(&SymbolId::of(&health.symbol))
+                .copied()
+                .or_else(|| sym_to_instances.get(&SymbolId::of(&health.symbol)).copied())
+                .unwrap_or_default(),
+            MarketEvent::EventStart { symbol, .. } => sym_to_instances
+                .get(&SymbolId::of(symbol))
+                .copied()
+                .unwrap_or_default(),
+            MarketEvent::EventEnd { .. } | MarketEvent::Exit => 0,
+            MarketEvent::Instrument(Instrument::BinaryOption(_)) => unreachable!(),
         };
-        let targets = match targets {
-            Some(0) => return 0, // Exit handled by caller; empty = drop
-            Some(mask) => mask,
-            None => match market_lanes.len() {
-                64 => u64::MAX,
-                len => (1u64 << len) - 1,
-            },
-        };
+        if targets == 0 {
+            return 0;
+        }
         // Register coverable keys only after routing resolved at least one
         // owner. Unknown dynamic token traffic must not consume fixed slots.
         let latest_key = latest_market_key(event.as_ref())
@@ -7171,6 +7347,21 @@ impl Engine {
         shutdown_ack_tx: Sender<usize>,
         clock_origin: Arc<std::time::Instant>,
     ) {
+        // Optional venue-authenticated private feed. The lane is transferred at
+        // startup and consumed only by this strategy owner. Its FIFO updates and
+        // one-slot replaceable control state are selected before public market
+        // data, so fills do not depend on quote cadence.
+        let private_lane = strategy.take_private_update_lane();
+        let private_feed_update_rx = private_lane
+            .as_ref()
+            .map(|lane| lane.updates.clone())
+            .unwrap_or_else(crossbeam_channel::never);
+        let private_feed_control_rx = private_lane
+            .as_ref()
+            .map(|lane| lane.control.clone())
+            .unwrap_or_else(crossbeam_channel::never);
+        let mut private_feed_updates_open = private_lane.is_some();
+        let mut private_feed_control_open = private_lane.is_some();
         // File/REST-backed history loading never runs on the strategy owner.
         // A bounded SPSC worker prepares owned immutable snapshots, then this
         // strategy thread alone replays them into mutable strategy state.
@@ -7209,32 +7400,33 @@ impl Engine {
             })
             .expect("spawn strategy history prefetch worker");
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
+        crate::latency::prepare_thread_stages(&[
+            "strategy.market.queue",
+            "strategy.market.callback",
+            "strategy.private_update.queue",
+            "strategy.private_update.callback",
+            "strategy.watchdog.callback",
+            "strategy.private_feed.callback",
+        ]);
         // The sender is permanently tagged with this worker's numeric owner.
+        // Normal traffic is non-blocking; overflow quarantines only this owner
+        // and submits an emergency cancel on the independent control lane.
         let emit = |sig: Signal| -> bool {
-            if quarantined.load(Ordering::Acquire) {
-                return false;
-            }
-            signal_tx.send(sig).is_ok()
+            emit_strategy_signal(sig, &signal_tx, &quarantined, instance_id)
         };
         let mut last_quote_ns: u64 = 0;
         let mut quote_signal_batch = Vec::with_capacity(32);
-        let mut queue_window_started = std::time::Instant::now();
-        let mut queue_samples = 0u64;
-        let mut queue_total_us = 0u128;
-        let mut queue_max_us = 0u64;
-        let mut callback_metrics = HashMap::<&'static str, StrategyCallbackLatencyBucket>::new();
-        let mut update_queue_window_started = std::time::Instant::now();
-        let mut update_queue_samples = 0u64;
-        let mut update_queue_total_us = 0u128;
-        let mut update_queue_max_us = 0u64;
         let mut private_update_burst = 0usize;
         let mut historical_epoch = 0u64;
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         let never_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
+        let never_private_update_rx = crossbeam_channel::never::<OrderUpdate>();
+        let never_private_control_rx =
+            crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
         let never_watchdog_rx = crossbeam_channel::never::<std::time::Instant>();
         let mut last_watchdog_run = std::time::Instant::now();
-        loop {
+        'worker: loop {
             if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
                 strategy.on_exit();
                 shutdown_started = true;
@@ -7250,6 +7442,18 @@ impl Engine {
                 } else {
                     &update_rx
                 };
+            let selectable_private_update_rx = if private_feed_updates_open
+                && private_update_lane_enabled(private_update_burst, !market_rx.is_empty())
+            {
+                &private_feed_update_rx
+            } else {
+                &never_private_update_rx
+            };
+            let selectable_private_control_rx = if private_feed_control_open {
+                &private_feed_control_rx
+            } else {
+                &never_private_control_rx
+            };
             let selectable_watchdog_rx =
                 if !market_rx.is_empty() && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL {
                 &never_watchdog_rx
@@ -7257,6 +7461,35 @@ impl Engine {
                 &watchdog_rx
             };
             crossbeam_channel::select_biased! {
+                recv(selectable_private_control_rx) -> msg => match msg {
+                    Ok(control) => {
+                        if quarantined.load(Ordering::Acquire) { break 'worker; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                        if shutdown_started { continue; }
+                        for sig in strategy.on_private_feed_control(control) {
+                            if !emit(sig) { break 'worker; }
+                        }
+                    }
+                    Err(_) => private_feed_control_open = false,
+                },
+                recv(selectable_private_update_rx) -> msg => match msg {
+                    Ok(update) => {
+                        private_update_burst = private_update_burst.saturating_add(1);
+                        if quarantined.load(Ordering::Acquire) { break 'worker; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                        if shutdown_started { continue; }
+                        let callback_started = crate::latency::Instant::now();
+                        let signals = strategy.on_order_update_owned(update);
+                        crate::latency::record(
+                            "strategy.private_feed.callback",
+                            callback_started,
+                        );
+                        for sig in signals {
+                            if !emit(sig) { break 'worker; }
+                        }
+                    }
+                    Err(_) => private_feed_updates_open = false,
+                },
                 recv(selectable_update_rx) -> msg => match msg {
                     Ok(queued) => {
                         if queued.update.exchange == Exchange::Polymarket {
@@ -7267,45 +7500,23 @@ impl Engine {
                             );
                         }
                         private_update_burst = private_update_burst.saturating_add(1);
-                        if quarantined.load(Ordering::Acquire) { return; }
+                        if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
-                        let queue_last_us = queued.enqueued_at.elapsed().as_micros()
-                            .min(u64::MAX as u128) as u64;
-                        update_queue_samples = update_queue_samples.saturating_add(1);
-                        update_queue_total_us = update_queue_total_us
-                            .saturating_add(queue_last_us as u128);
-                        update_queue_max_us = update_queue_max_us.max(queue_last_us);
-                        if update_queue_window_started.elapsed()
-                            >= std::time::Duration::from_secs(30)
-                        {
-                            let avg_us = update_queue_total_us as f64
-                                / update_queue_samples.max(1) as f64;
-                            info!(
-                                "[private_update_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} capacity={}",
-                                instance_id,
-                                update_queue_samples,
-                                queue_last_us,
-                                avg_us,
-                                update_queue_max_us,
-                                update_rx.len(),
-                                CHANNEL_CAPACITY,
-                            );
-                            update_queue_window_started = std::time::Instant::now();
-                            update_queue_samples = 0;
-                            update_queue_total_us = 0;
-                            update_queue_max_us = 0;
-                        }
-                        let callback_started = std::time::Instant::now();
-                        let signals = strategy.on_order_update(&queued.update);
+                        crate::latency::record_ns(
+                            "strategy.private_update.queue",
+                            queued.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        );
+                        let callback_started = crate::latency::Instant::now();
+                        let signals = strategy.on_order_update_owned(queued.update);
                         if !shutdown_started {
                             for sig in signals {
-                                if !emit(sig) { return; }
+                                if !emit(sig) { break 'worker; }
                             }
                         }
-                        callback_metrics
-                            .entry("private_order_update")
-                            .or_default()
-                            .record_callback(callback_started.elapsed());
+                        crate::latency::record(
+                            "strategy.private_update.callback",
+                            callback_started,
+                        );
                     }
                     Err(_) => break,
                 },
@@ -7332,17 +7543,14 @@ impl Engine {
                     Err(_) => break,
                 },
                 recv(selectable_watchdog_rx) -> _ => {
-                    if quarantined.load(Ordering::Acquire) { return; }
+                    if quarantined.load(Ordering::Acquire) { break 'worker; }
                     heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                     if shutdown_started { continue; }
-                    let callback_started = std::time::Instant::now();
+                    let callback_started = crate::latency::Instant::now();
                     for sig in strategy.on_watchdog(crate::types::now_ns()) {
-                        if !emit(sig) { return; }
+                        if !emit(sig) { break 'worker; }
                     }
-                    callback_metrics
-                        .entry("watchdog")
-                        .or_default()
-                        .record_callback(callback_started.elapsed());
+                    crate::latency::record("strategy.watchdog.callback", callback_started);
                     last_watchdog_run = std::time::Instant::now();
                 },
                 recv(market_rx) -> msg => match msg {
@@ -7359,22 +7567,15 @@ impl Engine {
                         }
                         break;
                         }
-                        if quarantined.load(Ordering::Acquire) { return; }
+                        if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if shutdown_started { continue; }
-                        let queue_last_us = market_queue_monotonic_ns()
-                            .saturating_sub(queued.enqueued_ns)
-                            / 1_000;
-                        let event_kind = market_event_metric_kind(queued.event.as_ref());
-                        queue_samples = queue_samples.saturating_add(1);
-                        queue_total_us = queue_total_us.saturating_add(queue_last_us as u128);
-                        queue_max_us = queue_max_us.max(queue_last_us);
-                        callback_metrics
-                            .entry(event_kind)
-                            .or_default()
-                            .record_queue(queue_last_us);
+                        crate::latency::record_ns(
+                            "strategy.market.queue",
+                            market_queue_monotonic_ns().saturating_sub(queued.enqueued_ns),
+                        );
                         let event = queued.event;
-                        let callback_started = std::time::Instant::now();
+                        let callback_started = crate::latency::Instant::now();
                         let signals = match event.as_ref() {
                             MarketEvent::OrderBook(ob) => { strategy.on_orderbook(ob); Vec::new() }
                             MarketEvent::Trade(t) => { strategy.on_trade_tick(t); Vec::new() }
@@ -7399,7 +7600,7 @@ impl Engine {
                                             instance_id,
                                         );
                                         quarantined.store(true, Ordering::Release);
-                                        return;
+                                        break 'worker;
                                     }
                                 }
                                 Vec::new()
@@ -7434,62 +7635,15 @@ impl Engine {
                                     strategy.on_quote_into(ts, &mut quote_signal_batch);
                                     stamp_quote_trigger(&mut quote_signal_batch, ob, true);
                                     for sig in quote_signal_batch.drain(..) {
-                                        if !emit(sig) { return; }
+                                        if !emit(sig) { break 'worker; }
                                     }
                                 }
                             }
                         }
                         for sig in signals {
-                            if !emit(sig) { return; }
+                            if !emit(sig) { break 'worker; }
                         }
-                        callback_metrics
-                            .entry(event_kind)
-                            .or_default()
-                            .record_callback(callback_started.elapsed());
-                        if queue_window_started.elapsed() >= std::time::Duration::from_secs(30) {
-                            let avg_us = if queue_samples == 0 {
-                                0.0
-                            } else {
-                                queue_total_us as f64 / queue_samples as f64
-                            };
-                            info!(
-                                "[market_queue_metric] instance={} samples={} last_us={} avg_us={:.1} max_us={} depth={} latest_replaced={}",
-                                instance_id,
-                                queue_samples,
-                                queue_last_us,
-                                avg_us,
-                                queue_max_us,
-                                market_rx.len(),
-                                latest_market.replacements.swap(0, Ordering::Relaxed),
-                            );
-                            let mut kinds = callback_metrics.keys().copied().collect::<Vec<_>>();
-                            kinds.sort_unstable();
-                            for kind in kinds {
-                                let Some(metric) = callback_metrics.get(kind) else {
-                                    continue;
-                                };
-                                let queue_avg_us = metric.queue_total_us as f64
-                                    / metric.queue_samples.max(1) as f64;
-                                let callback_avg_us = metric.callback_total_us as f64
-                                    / metric.callback_samples.max(1) as f64;
-                                info!(
-                                    "[strategy_event_metric] instance={} kind={} queue_samples={} queue_avg_us={:.1} queue_max_us={} callback_samples={} callback_avg_us={:.1} callback_max_us={}",
-                                    instance_id,
-                                    kind,
-                                    metric.queue_samples,
-                                    queue_avg_us,
-                                    metric.queue_max_us,
-                                    metric.callback_samples,
-                                    callback_avg_us,
-                                    metric.callback_max_us,
-                                );
-                            }
-                            callback_metrics.clear();
-                            queue_window_started = std::time::Instant::now();
-                            queue_samples = 0;
-                            queue_total_us = 0;
-                            queue_max_us = 0;
-                        }
+                        crate::latency::record("strategy.market.callback", callback_started);
                     }
                     Err(_) => break,
                 },
@@ -8620,7 +8774,9 @@ impl Engine {
                     account_ledger_display_path(path).display(),
                     poly_cfg.account_ledger_require_existing,
                     ledger_status == RequiredAccountLedgerStatus::BootstrapMissing,
-                    std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+                    std::fs::metadata(path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
                 );
             }
             match PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
@@ -9046,8 +9202,7 @@ impl Engine {
                 Ok(h) => {
                     info!(
                         "[Engine] Polymarket user feed started for account_id={} (lead instance_id={})",
-                        account_id,
-                        id,
+                        account_id, id,
                     );
                     handles.push(h);
                 }
@@ -9378,6 +9533,27 @@ impl Engine {
             .iter()
             .map(|s| self.registry.capabilities(&s.name).needs_hex_workers)
             .collect();
+        // Same enabled-strategy order used to allocate owner lanes and build
+        // strategy workers. Numeric ownership is authoritative at execution;
+        // embedded string IDs are validated but no longer select an account.
+        let mut active_owner_index = 0usize;
+        let owner_instance_ids: Vec<String> = config
+            .strategies
+            .iter()
+            .filter_map(|strategy| {
+                if !strategy.enabled {
+                    return None;
+                }
+                let owner_index = active_owner_index;
+                active_owner_index += 1;
+                let instance_id = if strategy.instance_id.trim().is_empty() {
+                    format!("{}_{owner_index}", strategy.name)
+                } else {
+                    strategy.instance_id.clone()
+                };
+                Some(instance_id)
+            })
+            .collect();
 
         thread::Builder::new()
             .name("execution".into())
@@ -9393,11 +9569,14 @@ impl Engine {
                     if !hex_worker_flags[idx] || !strategy_cfg.enabled {
                         continue;
                     }
-                    let instance_id = if strategy_cfg.instance_id.is_empty() {
-                        format!("hexmaker_{}", idx)
-                    } else {
-                        strategy_cfg.instance_id.clone()
-                    };
+                    let owner = config.strategies[..idx]
+                        .iter()
+                        .filter(|strategy| strategy.enabled)
+                        .count();
+                    let instance_id = owner_instance_ids
+                        .get(owner)
+                        .cloned()
+                        .unwrap_or_else(|| strategy_cfg.instance_id.clone());
 
                     let pk = strategy_cfg.params.get("private_key")
                         .and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -9893,13 +10072,34 @@ impl Engine {
                     // The executor has a direct shutdown subscription. A
                     // dead strategy/router therefore cannot strand it on a
                     // blocking signal receive or prevent admission teardown.
-                    let signal = crossbeam_channel::select_biased! {
-                        recv(execution_shutdown_rx) -> _ => Signal::BeginShutdown,
+                    let routed = crossbeam_channel::select_biased! {
+                        recv(execution_shutdown_rx) -> _ => RoutedSignal {
+                            owner: SYSTEM_SIGNAL_OWNER,
+                            signal: Signal::BeginShutdown,
+                        },
                         recv(signal_rx) -> routed => match routed {
-                            Ok(routed) => routed.signal,
+                            Ok(routed) => routed,
                             Err(_) => break,
                         },
                     };
+                    let embedded_instance_id = extract_instance_id(&routed.signal);
+                    let numeric_instance_id = (routed.owner != SYSTEM_SIGNAL_OWNER)
+                        .then(|| owner_instance_ids.get(routed.owner as usize))
+                        .flatten()
+                        .filter(|instance_id| !instance_id.is_empty());
+                    if let Some(expected) = numeric_instance_id {
+                        assert!(
+                            embedded_instance_id.is_empty() || embedded_instance_id == *expected,
+                            "signal owner mismatch: owner={} expected_instance={} embedded_instance={}",
+                            routed.owner,
+                            expected,
+                            embedded_instance_id,
+                        );
+                    }
+                    let instance_id = numeric_instance_id
+                        .cloned()
+                        .unwrap_or(embedded_instance_id);
+                    let signal = routed.signal;
                     if shutdown_finalized
                         && !matches!(&signal, Signal::BeginShutdown | Signal::Exit)
                     {
@@ -9966,25 +10166,23 @@ impl Engine {
                         | Signal::BatchCancelOrders { exchange: Exchange::Hexmarket, .. }
                         | Signal::CancelAll { exchange: Exchange::Hexmarket, .. }
                         | Signal::CancelOrder { exchange: Exchange::Hexmarket, .. } => {
-                            let inst_id = extract_instance_id(&signal);
-                            if let Some(pool) = instance_pools.get(&inst_id) {
-                                let rr = round_robins.entry(inst_id).or_insert(0);
+                            if let Some(pool) = instance_pools.get(&instance_id) {
+                                let rr = round_robins.entry(instance_id.clone()).or_insert(0);
                                 let idx = *rr % pool.len();
                                 *rr += 1;
                                 let _ = pool[idx].send((signal, update_tx.clone()));
                             } else {
-                                warn!("[Executor] Unknown instance '{}', dropping signal", inst_id);
+                                warn!("[Executor] Unknown instance '{}', dropping signal", instance_id);
                             }
                         }
                         Signal::NewOrder(order) if order.exchange == Exchange::Hexmarket => {
-                            let inst_id = order.instance_id.clone();
-                            if let Some(pool) = instance_pools.get(&inst_id) {
-                                let rr = round_robins.entry(inst_id).or_insert(0);
+                            if let Some(pool) = instance_pools.get(&instance_id) {
+                                let rr = round_robins.entry(instance_id.clone()).or_insert(0);
                                 let idx = *rr % pool.len();
                                 *rr += 1;
                                 let _ = pool[idx].send((signal, update_tx.clone()));
                             } else {
-                                warn!("[Executor] Unknown instance '{}', dropping signal", inst_id);
+                                warn!("[Executor] Unknown instance '{}', dropping signal", instance_id);
                             }
                         }
                         _ => {
@@ -9994,16 +10192,15 @@ impl Engine {
                             // isn't in the map — e.g. non-polymaker
                             // exchanges or paper/BT shims that pass
                             // an empty map.
-                            let iid = extract_instance_id(&signal);
                             let stale_threshold_ms = stale_threshold_handles
-                                .get(&iid)
+                                .get(&instance_id)
                                 .map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
                                 .unwrap_or(150);
                             // Plan A: Polymarket signals for a known instance go
                             // to the pipelined worker pool; everything else
                             // (binance, unknown iid, or pool disabled) runs
                             // inline on this thread as before.
-                            if poly_states.contains_key(&iid) && poly_pool_tx.is_some() {
+                            if poly_states.contains_key(&instance_id) && poly_pool_tx.is_some() {
                                 let work = (signal, stale_threshold_ms, update_tx.clone());
                                 match &work.0 {
                                     Signal::CancelOrder {
@@ -10820,7 +11017,10 @@ fn fire_or_execute(
                                     let route = match r.poly_route_mut(&iid_p) {
                                         Ok(route) => route,
                                         Err(error) => {
-                                            error!("[Executor] Polymarket replace-place completion route error: {}", error);
+                                            error!(
+                                                "[Executor] Polymarket replace-place completion route error: {}",
+                                                error
+                                            );
                                             drop(ppermit);
                                             return vec![exec_rejected_place(&place)];
                                         }
@@ -11123,7 +11323,8 @@ fn execute_fallback_signal(
             if is_stale(timestamp_ns) || has_stale_trigger(&place_orders) {
                 warn!(
                     "[Executor] Signal stale, retaining {} BatchUpdateOrders cancels and dropping {} places",
-                    cancel_client_order_ids.len(), place_orders.len(),
+                    cancel_client_order_ids.len(),
+                    place_orders.len(),
                 );
                 let mut out = if exchange == Exchange::Polymarket {
                     executor.poly_route_mut(&instance_id).and_then(|route| {
@@ -11174,7 +11375,8 @@ fn execute_fallback_signal(
             if is_stale(timestamp_ns) || has_stale_trigger(&place_orders) {
                 warn!(
                     "[Executor] Signal stale, retaining {} ReplaceOrder cancels and dropping {} places",
-                    cancel_client_order_ids.len(), place_orders.len(),
+                    cancel_client_order_ids.len(),
+                    place_orders.len(),
                 );
                 let mut out = if exchange == Exchange::Polymarket {
                     executor.poly_route_mut(&instance_id).and_then(|route| {
@@ -11269,9 +11471,21 @@ fn execute_fallback_signal(
                 Some(cid) => {
                     let routine_expiry_cancel = is_routine_expiry_cancel(&reason, true);
                     if routine_expiry_cancel {
-                        info!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                        info!(
+                            "[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}",
+                            cid,
+                            asset_ids.len(),
+                            instance_id,
+                            reason
+                        );
                     } else {
-                        warn!("[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}", cid, asset_ids.len(), instance_id, reason);
+                        warn!(
+                            "[Executor] PolymarketCancelAllOrders market={} ({} tokens, instance_id={}): reason={}",
+                            cid,
+                            asset_ids.len(),
+                            instance_id,
+                            reason
+                        );
                     }
                     let result = route.cancel_market_orders_until_final(
                         &cid,
@@ -11513,7 +11727,10 @@ impl LiveRouter {
                                 }
                             },
                             Err(e) => {
-                                error!("[Hyperliquid] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                error!(
+                                    "[Hyperliquid] auth build failed (account_id={}), venue disabled: {}",
+                                    acct, e
+                                );
                                 None
                             }
                         },
@@ -11581,19 +11798,28 @@ impl LiveRouter {
                                     ) {
                                         Ok(meta) => {
                                             info!(
-                                        "[Aster] executor ready (account_id={}, network={}, user={}, signer={})",
-                                        acct, ax.network, auth.user_address, auth.signer_address,
-                                    );
+                                                "[Aster] executor ready (account_id={}, network={}, user={}, signer={})",
+                                                acct,
+                                                ax.network,
+                                                auth.user_address,
+                                                auth.signer_address,
+                                            );
                                             Some(AsterTrade::new(auth, meta, &acct))
                                         }
                                         Err(e) => {
-                                            error!("[Aster] exchangeInfo fetch failed, venue disabled: {}", e);
+                                            error!(
+                                                "[Aster] exchangeInfo fetch failed, venue disabled: {}",
+                                                e
+                                            );
                                             None
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    error!("[Aster] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                    error!(
+                                        "[Aster] auth build failed (account_id={}), venue disabled: {}",
+                                        acct, e
+                                    );
                                     None
                                 }
                             }
@@ -11651,19 +11877,28 @@ impl LiveRouter {
                                 {
                                     Ok(meta) => {
                                         info!(
-                                        "[Lighter] executor ready (account_id={}, network={}, account_index={}, api_key_index={})",
-                                        acct, lt.network, auth.account_index(), auth.api_key_index(),
-                                    );
+                                            "[Lighter] executor ready (account_id={}, network={}, account_index={}, api_key_index={})",
+                                            acct,
+                                            lt.network,
+                                            auth.account_index(),
+                                            auth.api_key_index(),
+                                        );
                                         Some(LighterTrade::new(auth, meta, &acct))
                                     }
                                     Err(e) => {
-                                        error!("[Lighter] orderBookDetails fetch failed, venue disabled: {}", e);
+                                        error!(
+                                            "[Lighter] orderBookDetails fetch failed, venue disabled: {}",
+                                            e
+                                        );
                                         None
                                     }
                                 }
                             }
                             Err(e) => {
-                                error!("[Lighter] auth build failed (account_id={}), venue disabled: {}", acct, e);
+                                error!(
+                                    "[Lighter] auth build failed (account_id={}), venue disabled: {}",
+                                    acct, e
+                                );
                                 None
                             }
                         },
@@ -12696,11 +12931,7 @@ mod market_router_tests {
         let measured = percentiles(samples);
         println!(
             "instance_signal_arbiter events={EVENTS} boundary=owner_lane_send_to_root_dequeue unit=ns p50={} p99={} p999={} max={} owner_peak_depth={} owner_overflow=0 root_peak_depth=1 root_overflow=0",
-            measured.0,
-            measured.1,
-            measured.2,
-            measured.3,
-            peak_depth,
+            measured.0, measured.1, measured.2, measured.3, peak_depth,
         );
     }
 
@@ -13093,7 +13324,7 @@ mod market_router_tests {
     }
 
     #[test]
-    fn lifecycle_and_unknown_spot_symbols_broadcast() {
+    fn lifecycle_broadcasts_but_unknown_spot_symbols_are_dropped() {
         let sym = two_instance_map();
         let mut tok: HashMap<SymbolId, RouteMask> = HashMap::new();
         let mut latest = LatestMarketKeyRegistry::default();
@@ -13111,7 +13342,7 @@ mod market_router_tests {
             &mut latest,
             &txs,
         );
-        // Unknown spot symbol → broadcast (never dropped).
+        // Unknown market data is fail-closed and never broadcast.
         Engine::route_market_event(
             Arc::new(spot("dogeusdt")),
             &sym,
@@ -13120,8 +13351,37 @@ mod market_router_tests {
             &txs,
         );
 
-        assert_eq!(drain(&rx0), 2);
-        assert_eq!(drain(&rx1), 2);
+        assert_eq!(drain(&rx0), 1);
+        assert_eq!(drain(&rx1), 1);
+    }
+
+    #[test]
+    fn full_owner_signal_lane_quarantines_without_blocking_and_uses_control_lane() {
+        let (root_tx, _root_rx) = bounded::<RoutedSignal>(1);
+        let (owner_tx, owner_rx) = bounded::<RoutedSignal>(1);
+        let (control_tx, control_rx) = bounded::<RoutedSignal>(1);
+        let system = SignalSender::system_with_owner_lanes(root_tx, vec![owner_tx], control_tx);
+        let owner = system.with_owner(0);
+        let quarantined = AtomicBool::new(false);
+
+        assert!(owner
+            .try_send(Signal::NewOrder(order_req("instance-0-1", "instance-0")))
+            .is_ok());
+        assert!(!emit_strategy_signal(
+            Signal::NewOrder(order_req("instance-0-2", "instance-0")),
+            &owner,
+            &quarantined,
+            "instance-0",
+        ));
+        assert!(quarantined.load(Ordering::Acquire));
+        assert_eq!(owner_rx.len(), 1, "already-admitted work remains ordered");
+        let emergency = control_rx.try_recv().unwrap();
+        assert_eq!(emergency.owner, 0);
+        assert!(matches!(
+            emergency.signal,
+            Signal::PolymarketCancelAllOrders { market: None, ref instance_id, .. }
+                if instance_id == "instance-0"
+        ));
     }
 
     fn order_req(coid: &str, instance_id: &str) -> OrderRequest {

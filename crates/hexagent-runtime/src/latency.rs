@@ -123,16 +123,21 @@ impl ThreadRecorder {
 
     #[inline]
     fn record(&mut self, stage: &'static str, ns: u64) {
-        let stage_id = match self.stage_ids.get(stage) {
+        let stage_id = self.stage_id(stage);
+        if let Some(stage_id) = stage_id {
+            self.telemetry.record(stage_id, ns);
+        }
+    }
+
+    #[inline]
+    fn stage_id(&mut self, stage: &'static str) -> Option<usize> {
+        match self.stage_ids.get(stage) {
             Some(id) => *id,
             None => {
                 let id = stages().id(stage);
                 self.stage_ids.insert(stage, id);
                 id
             }
-        };
-        if let Some(stage_id) = stage_id {
-            self.telemetry.record(stage_id, ns);
         }
     }
 }
@@ -186,6 +191,19 @@ pub fn record_ns(stage: &'static str, ns: u64) {
         let mut slot = slot.borrow_mut();
         let recorder = slot.get_or_insert_with(ThreadRecorder::new);
         recorder.record(stage, ns);
+    });
+}
+
+/// Allocate the calling thread's fixed telemetry slab and resolve all stage
+/// IDs before it enters a latency-sensitive loop. Subsequent `record_ns` calls
+/// for these stages are lock-free and allocation-free.
+pub fn prepare_thread_stages(stages: &[&'static str]) {
+    THREAD_RECORDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let recorder = slot.get_or_insert_with(ThreadRecorder::new);
+        for stage in stages {
+            let _ = recorder.stage_id(stage);
+        }
     });
 }
 
@@ -369,7 +387,10 @@ mod tests {
         while !handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert!(handle.is_finished(), "latency dumper ignored shutdown token");
+        assert!(
+            handle.is_finished(),
+            "latency dumper ignored shutdown token"
+        );
         handle.join().unwrap();
     }
 

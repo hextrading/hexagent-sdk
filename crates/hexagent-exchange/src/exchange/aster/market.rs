@@ -64,7 +64,10 @@ fn parse_levels(arr: Option<&serde_json::Value>) -> Vec<PriceLevel> {
                     let pair = lvl.as_array()?;
                     let px: f64 = pair.first()?.as_str()?.parse().ok()?;
                     let sz: f64 = pair.get(1)?.as_str()?.parse().ok()?;
-                    Some(PriceLevel { price: px, quantity: sz })
+                    Some(PriceLevel {
+                        price: px,
+                        quantity: sz,
+                    })
                 })
                 .collect()
         })
@@ -102,7 +105,11 @@ async fn aster_ws_task(
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Aster] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Aster] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -115,11 +122,19 @@ async fn aster_ws_task(
             let read_result = tokio::time::timeout(STALE_THRESHOLD, read.next()).await;
             let msg = match read_result {
                 Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(e))) => { warn!("[Aster] WS read error: {}", e); break; }
-                Ok(None) => { warn!("[Aster] WS closed"); break; }
+                Ok(Some(Err(e))) => {
+                    warn!("[Aster] WS read error: {}", e);
+                    break;
+                }
+                Ok(None) => {
+                    warn!("[Aster] WS closed");
+                    break;
+                }
                 Err(_elapsed) => {
-                    warn!("[Aster] No message for {:.0}s (stall watchdog) — reconnecting",
-                        STALE_THRESHOLD.as_secs_f64());
+                    warn!(
+                        "[Aster] No message for {:.0}s (stall watchdog) — reconnecting",
+                        STALE_THRESHOLD.as_secs_f64()
+                    );
                     break;
                 }
             };
@@ -135,12 +150,21 @@ async fn aster_ws_task(
                     let event_type = payload.get("e").and_then(|v| v.as_str()).unwrap_or("");
                     match event_type {
                         "depthUpdate" => {
-                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let symbol = payload
+                                .get("s")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let bids = parse_levels(payload.get("b"));
                             let asks = parse_levels(payload.get("a"));
-                            if bids.is_empty() || asks.is_empty() { continue; }
-                            let ts = payload.get("E").and_then(|v| v.as_u64())
-                                .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+                            if bids.is_empty() || asks.is_empty() {
+                                continue;
+                            }
+                            let ts = payload
+                                .get("E")
+                                .and_then(|v| v.as_u64())
+                                .map(|ms| ms * 1_000_000)
+                                .unwrap_or_else(now_ns);
                             let event = MarketEvent::OrderBook(OrderBookSnapshot {
                                 exchange: Exchange::Aster,
                                 symbol,
@@ -149,22 +173,39 @@ async fn aster_ws_task(
                                 exchange_timestamp_ns: ts,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() {
+                                return;
+                            }
                         }
                         "aggTrade" => {
-                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let price: f64 = payload.get("p").and_then(|v| v.as_str())
-                                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                            let quantity: f64 = payload.get("q").and_then(|v| v.as_str())
-                                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                            if price <= 0.0 { continue; }
+                            let symbol = payload
+                                .get("s")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let price: f64 = payload
+                                .get("p")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            let quantity: f64 = payload
+                                .get("q")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            if price <= 0.0 {
+                                continue;
+                            }
                             // `m` = buyer is maker → aggressor was the SELLER.
                             let side = match payload.get("m").and_then(|v| v.as_bool()) {
                                 Some(true) => Side::Sell,
                                 _ => Side::Buy,
                             };
-                            let ts = payload.get("T").and_then(|v| v.as_u64())
-                                .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+                            let ts = payload
+                                .get("T")
+                                .and_then(|v| v.as_u64())
+                                .map(|ms| ms * 1_000_000)
+                                .unwrap_or_else(now_ns);
                             let event = MarketEvent::Trade(TradeTick {
                                 exchange: Exchange::Aster,
                                 symbol,
@@ -175,15 +216,29 @@ async fn aster_ws_task(
                                 exchange_timestamp_ns: ts,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() {
+                                return;
+                            }
                         }
                         "markPriceUpdate" => {
-                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let price: f64 = payload.get("p").and_then(|v| v.as_str())
-                                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                            if price <= 0.0 { continue; }
-                            let ts = payload.get("E").and_then(|v| v.as_u64())
-                                .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+                            let symbol = payload
+                                .get("s")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let price: f64 = payload
+                                .get("p")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            if price <= 0.0 {
+                                continue;
+                            }
+                            let ts = payload
+                                .get("E")
+                                .and_then(|v| v.as_u64())
+                                .map(|ms| ms * 1_000_000)
+                                .unwrap_or_else(now_ns);
                             let event = MarketEvent::SpotPrice(SpotPrice {
                                 source: "aster_mark".to_string(),
                                 symbol,
@@ -191,7 +246,9 @@ async fn aster_ws_task(
                                 timestamp_ns: ts,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() {
+                                return;
+                            }
                         }
                         _ => {}
                     }
@@ -205,10 +262,14 @@ async fn aster_ws_task(
                 }
                 _ => {}
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -237,7 +298,10 @@ impl super::super::ExchangeMarket for AsterMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),

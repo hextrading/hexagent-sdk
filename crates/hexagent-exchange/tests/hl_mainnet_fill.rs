@@ -37,10 +37,16 @@ fn mainnet_fill_and_pushes() {
     let meta = info::fetch_meta(&info_url).expect("meta");
     let mut tr = HyperliquidTrade::new(auth.clone(), meta, "mainfill");
 
-    let bal = hexagent_exchange::exchange::hyperliquid::fetch_balance(&info_url, &auth.account_address).unwrap();
+    let bal =
+        hexagent_exchange::exchange::hyperliquid::fetch_balance(&info_url, &auth.account_address)
+            .unwrap();
     println!("[mainnet] balance USDC={:.4}", bal);
 
-    let (rx, _sd) = hexagent_exchange::exchange::hyperliquid::user_feed::spawn_user_feed(WS, &auth.account_address);
+    let lane = hexagent_exchange::exchange::hyperliquid::user_feed::spawn_user_feed(
+        WS,
+        &auth.account_address,
+    );
+    let rx = lane.updates.clone();
     std::thread::sleep(Duration::from_secs(2));
     while rx.try_recv().is_ok() {} // drain snapshot
 
@@ -50,26 +56,44 @@ fn mainnet_fill_and_pushes() {
     println!("[mainnet] book bid={} ask={}", bid, ask);
 
     // Resting post-only far below → orderUpdates "open" (status push, no fill).
-    let mut rest = OrderRequest::new_limit(Exchange::Hyperliquid, COIN.to_string(), Side::Buy, bid * 0.90, SZ);
+    let mut rest = OrderRequest::new_limit(
+        Exchange::Hyperliquid,
+        COIN.to_string(),
+        Side::Buy,
+        bid * 0.90,
+        SZ,
+    );
     rest.order_type = OrderType::LimitMaker;
     rest.instance_id = "mainfill".to_string();
     let u = tr.submit_order(&rest).expect("rest submit");
     println!("[mainnet] place resting -> {:?}", u.status);
 
     // IOC buy crossing the ask → FILL (userFills + orderUpdates "filled").
-    let mut ioc = OrderRequest::new_limit(Exchange::Hyperliquid, COIN.to_string(), Side::Buy, ask * 1.005, SZ);
+    let mut ioc = OrderRequest::new_limit(
+        Exchange::Hyperliquid,
+        COIN.to_string(),
+        Side::Buy,
+        ask * 1.005,
+        SZ,
+    );
     ioc.order_type = OrderType::Fak;
     ioc.post_only = false;
     ioc.price = Some(ask * 1.005);
     ioc.instance_id = "mainfill".to_string();
     let u = tr.submit_order(&ioc).expect("ioc submit");
-    println!("[mainnet] IOC buy -> {:?} filled={} @ {}", u.status, u.filled_quantity, u.avg_fill_price);
+    println!(
+        "[mainnet] IOC buy -> {:?} filled={} @ {}",
+        u.status, u.filled_quantity, u.avg_fill_price
+    );
 
     // Cancel the resting → orderUpdates "canceled".
     let _ = tr.cancel_order(Exchange::Hyperliquid, &rest.client_order_id);
     // Market sell → flatten (fills).
     let u = tr.submit_order(&mkt(Side::Sell)).expect("market sell");
-    println!("[mainnet] market sell -> {:?} filled={} @ {}", u.status, u.filled_quantity, u.avg_fill_price);
+    println!(
+        "[mainnet] market sell -> {:?} filled={} @ {}",
+        u.status, u.filled_quantity, u.avg_fill_price
+    );
 
     // Collect pushes.
     let (mut fills, mut statuses) = (0u32, 0u32);
@@ -78,10 +102,16 @@ fn mainnet_fill_and_pushes() {
         while let Ok(u) = rx.try_recv() {
             if u.trade_id.is_some() {
                 fills += 1;
-                println!("[mainnet] FILL {:?} sz={} @ {}", u.side, u.filled_quantity, u.avg_fill_price);
+                println!(
+                    "[mainnet] FILL {:?} sz={} @ {}",
+                    u.side, u.filled_quantity, u.avg_fill_price
+                );
             } else {
                 statuses += 1;
-                println!("[mainnet] ORDER-STATUS {:?} oid={:?}", u.status, u.exchange_order_id);
+                println!(
+                    "[mainnet] ORDER-STATUS {:?} oid={:?}",
+                    u.status, u.exchange_order_id
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -89,19 +119,36 @@ fn mainnet_fill_and_pushes() {
 
     // Safety net: cancel all + close any residual position.
     let _ = tr.cancel_all(Exchange::Hyperliquid, COIN);
-    if let Ok(pos) = hexagent_exchange::exchange::hyperliquid::fetch_positions(&info_url, &auth.account_address) {
+    if let Ok(pos) =
+        hexagent_exchange::exchange::hyperliquid::fetch_positions(&info_url, &auth.account_address)
+    {
         if let Some(p) = pos.get(COIN) {
             if p.quantity.abs() > 1e-9 {
-                let side = if p.quantity > 0.0 { Side::Sell } else { Side::Buy };
-                println!("[mainnet] residual {:.6} — closing with market {:?}", p.quantity, side);
-                let mut c = OrderRequest::new_market(Exchange::Hyperliquid, COIN.to_string(), side, p.quantity.abs());
+                let side = if p.quantity > 0.0 {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                println!(
+                    "[mainnet] residual {:.6} — closing with market {:?}",
+                    p.quantity, side
+                );
+                let mut c = OrderRequest::new_market(
+                    Exchange::Hyperliquid,
+                    COIN.to_string(),
+                    side,
+                    p.quantity.abs(),
+                );
                 c.instance_id = "mainfill".to_string();
                 let _ = tr.submit_order(&c);
             }
         }
     }
 
-    println!("[mainnet] fills(userFills)={} order-status(orderUpdates)={}", fills, statuses);
+    println!(
+        "[mainnet] fills(userFills)={} order-status(orderUpdates)={}",
+        fills, statuses
+    );
     assert!(fills > 0, "userFills fill push must arrive");
     assert!(statuses > 0, "orderUpdates order-status push must arrive");
     println!("MAINNET FILL + PUSHES OK");

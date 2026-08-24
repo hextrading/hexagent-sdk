@@ -2,9 +2,8 @@
 //! → `OrderUpdate`.
 //!
 //! Same shape as the Hyperliquid user feed: [`spawn_user_feed`] returns a
-//! `crossbeam_channel::Receiver<OrderUpdate>` plus a shutdown flag; the
-//! litmaker strategy drains it each quote tick to keep net inventory in sync
-//! with maker fills. Fills (from the trades channel, `trade_id` set) drive
+//! bounded private lane consumed directly by the owning strategy worker. Fills
+//! (from the trades channel, `trade_id` set) drive
 //! inventory; order-status pushes (orders channel, `trade_id` None,
 //! `filled_quantity` 0) are informational.
 //!
@@ -19,6 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::exchange::{private_update_lane, PrivateUpdateLane, PrivateUpdatePublisher};
 use crate::types::{now_ns, Exchange, Liquidity, OrderStatus, OrderUpdate, Side};
 
 use super::signer::LighterSigner;
@@ -35,24 +35,30 @@ pub fn spawn_user_feed(
     ws_url: &str,
     signer: Arc<LighterSigner>,
     market_symbols: std::collections::HashMap<i16, String>,
-) -> (crossbeam_channel::Receiver<OrderUpdate>, Arc<AtomicBool>) {
-    let (tx, rx) = crossbeam_channel::unbounded::<OrderUpdate>();
-    let shutdown = Arc::new(AtomicBool::new(false));
+) -> PrivateUpdateLane {
+    let (publisher, lane) = private_update_lane(Exchange::Lighter);
+    let shutdown = lane.shutdown_token();
     let ws_url = if ws_url.is_empty() {
         "wss://mainnet.zklighter.elliot.ai/stream".to_string()
     } else {
         ws_url.to_string()
     };
     let sd = shutdown.clone();
-    crate::async_rt::handle().spawn(user_feed_task(ws_url, signer, market_symbols, tx, sd));
-    (rx, shutdown)
+    crate::async_rt::handle().spawn(user_feed_task(
+        ws_url,
+        signer,
+        market_symbols,
+        publisher,
+        sd,
+    ));
+    lane
 }
 
 async fn user_feed_task(
     ws_url: String,
     signer: Arc<LighterSigner>,
     market_symbols: std::collections::HashMap<i16, String>,
-    tx: crossbeam_channel::Sender<OrderUpdate>,
+    publisher: PrivateUpdatePublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -62,12 +68,20 @@ async fn user_feed_task(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        info!("[Lighter] user-feed connecting to {} for account {}", ws_url, account_index);
+        info!(
+            "[Lighter] user-feed connecting to {} for account {}",
+            ws_url, account_index
+        );
         let stream = match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((s, _)) => s,
             Err(e) => {
+                publisher.disconnected();
                 let delay = backoff.next_delay();
-                warn!("[Lighter] user-feed connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Lighter] user-feed connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -93,8 +107,10 @@ async fn user_feed_task(
             }
         }
         if !sub_ok {
+            publisher.disconnected();
             continue;
         }
+        publisher.connected();
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -131,12 +147,12 @@ async fn user_feed_task(
                                 // only stream incremental updates.
                                 "update/account_all_trades" => {
                                     for u in parse_trades(&data, account_index, &market_symbols) {
-                                        if tx.send(u).is_err() { return; }
+                                        if !publisher.publish(u) { return; }
                                     }
                                 }
                                 "update/account_all_orders" => {
                                     for u in parse_orders(&data, &market_symbols) {
-                                        if tx.send(u).is_err() { return; }
+                                        if !publisher.publish(u) { return; }
                                     }
                                 }
                                 _ => {}
@@ -151,10 +167,15 @@ async fn user_feed_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        publisher.disconnected();
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -172,22 +193,38 @@ fn parse_trades(
         return out;
     };
     for (mid_str, arr) in by_market {
-        let Ok(mid) = mid_str.parse::<i16>() else { continue };
+        let Ok(mid) = mid_str.parse::<i16>() else {
+            continue;
+        };
         let symbol = match market_symbols.get(&mid) {
             Some(s) => s.clone(),
             None => continue, // not a market we trade
         };
-        let Some(trades) = arr.as_array() else { continue };
+        let Some(trades) = arr.as_array() else {
+            continue;
+        };
         for t in trades {
-            let price: f64 = t.get("price").and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let size: f64 = t.get("size").and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let price: f64 = t
+                .get("price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let size: f64 = t
+                .get("size")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
             if price <= 0.0 || size <= 0.0 {
                 continue;
             }
-            let ask_acct = t.get("ask_account_id").and_then(|v| v.as_i64()).unwrap_or(-1);
-            let bid_acct = t.get("bid_account_id").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let ask_acct = t
+                .get("ask_account_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            let bid_acct = t
+                .get("bid_account_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
             // Our side of the trade. (Self-trades can't happen — STP.)
             let side = if bid_acct == account_index {
                 Side::Buy
@@ -196,9 +233,12 @@ fn parse_trades(
             } else {
                 continue; // not ours (shouldn't happen on an account channel)
             };
-            let is_maker_ask = t.get("is_maker_ask").and_then(|v| v.as_bool()).unwrap_or(false);
-            let we_are_maker = (is_maker_ask && side == Side::Sell)
-                || (!is_maker_ask && side == Side::Buy);
+            let is_maker_ask = t
+                .get("is_maker_ask")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let we_are_maker =
+                (is_maker_ask && side == Side::Sell) || (!is_maker_ask && side == Side::Buy);
             let coid = match side {
                 Side::Buy => t.get("bid_client_id"),
                 Side::Sell => t.get("ask_client_id"),
@@ -210,8 +250,11 @@ fn parse_trades(
                 .get("trade_id")
                 .and_then(|v| v.as_i64())
                 .map(|v| v.to_string());
-            let ts = t.get("timestamp").and_then(|v| v.as_u64())
-                .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+            let ts = t
+                .get("timestamp")
+                .and_then(|v| v.as_u64())
+                .map(|ms| ms * 1_000_000)
+                .unwrap_or_else(now_ns);
             out.push(OrderUpdate {
                 client_order_id: coid,
                 exchange: Exchange::Lighter,
@@ -219,7 +262,11 @@ fn parse_trades(
                 side,
                 exchange_order_id: None,
                 status: OrderStatus::Filled, // one discrete fill; strategy accumulates
-                liquidity: Some(if we_are_maker { Liquidity::Maker } else { Liquidity::Taker }),
+                liquidity: Some(if we_are_maker {
+                    Liquidity::Maker
+                } else {
+                    Liquidity::Taker
+                }),
                 filled_quantity: size,
                 remaining_quantity: 0.0,
                 avg_fill_price: price,
@@ -246,12 +293,16 @@ fn parse_orders(
         return out;
     };
     for (mid_str, arr) in by_market {
-        let Ok(mid) = mid_str.parse::<i16>() else { continue };
+        let Ok(mid) = mid_str.parse::<i16>() else {
+            continue;
+        };
         let symbol = match market_symbols.get(&mid) {
             Some(s) => s.clone(),
             None => continue,
         };
-        let Some(orders) = arr.as_array() else { continue };
+        let Some(orders) = arr.as_array() else {
+            continue;
+        };
         for o in orders {
             let status_raw = o.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let status = match status_raw {
@@ -261,18 +312,27 @@ fn parse_orders(
                 s if s.contains("expir") => OrderStatus::Cancelled,
                 _ => continue, // unknown lifecycle state — ignore
             };
-            let is_ask = o.get("is_ask").and_then(|v| v.as_bool())
+            let is_ask = o
+                .get("is_ask")
+                .and_then(|v| v.as_bool())
                 .or_else(|| o.get("is_ask").and_then(|v| v.as_i64()).map(|n| n != 0))
                 .unwrap_or(false);
-            let coid = o.get("client_order_id")
+            let coid = o
+                .get("client_order_id")
                 .map(|v| match v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 })
                 .unwrap_or_default();
-            let oid = o.get("order_index").and_then(|v| v.as_i64()).map(|v| v.to_string());
-            let ts = o.get("timestamp").and_then(|v| v.as_u64())
-                .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+            let oid = o
+                .get("order_index")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string());
+            let ts = o
+                .get("timestamp")
+                .and_then(|v| v.as_u64())
+                .map(|ms| ms * 1_000_000)
+                .unwrap_or_else(now_ns);
             out.push(OrderUpdate {
                 client_order_id: coid,
                 exchange: Exchange::Lighter,

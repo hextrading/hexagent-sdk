@@ -1,12 +1,9 @@
 //! Hyperliquid user feed — async WS `userFills` / `orderUpdates` → `OrderUpdate`.
 //!
 //! Keyed purely by the account address (no signing needed), so this is a
-//! standalone spawnable task: [`spawn_user_feed`] returns a
-//! `crossbeam_channel::Receiver<OrderUpdate>` plus a shutdown flag. The
-//! hypermaker strategy drains the receiver each quote tick to keep its net
-//! inventory in sync with maker fills (which arrive asynchronously, not on the
-//! synchronous place path). This avoids adding a venue-specific user-feed
-//! subsystem to the engine.
+//! standalone spawnable task: [`spawn_user_feed`] returns a bounded private
+//! update lane consumed directly by the owning strategy worker. Fills therefore
+//! remain independent of public quote cadence.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,19 +12,17 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::exchange::{private_update_lane, PrivateUpdateLane, PrivateUpdatePublisher};
 use crate::types::{now_ns, Exchange, Liquidity, OrderStatus, OrderUpdate, Side};
 
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Spawn the user-feed task. Returns the fill receiver and a shutdown flag
-/// (set it `true` to stop the task).
-pub fn spawn_user_feed(
-    ws_url: &str,
-    account_address: &str,
-) -> (crossbeam_channel::Receiver<OrderUpdate>, Arc<AtomicBool>) {
-    let (tx, rx) = crossbeam_channel::unbounded::<OrderUpdate>();
-    let shutdown = Arc::new(AtomicBool::new(false));
+/// Spawn one bounded, owner-routed private feed. Dropping the returned lane
+/// requests task shutdown.
+pub fn spawn_user_feed(ws_url: &str, account_address: &str) -> PrivateUpdateLane {
+    let (publisher, lane) = private_update_lane(Exchange::Hyperliquid);
+    let shutdown = lane.shutdown_token();
     let ws_url = if ws_url.is_empty() {
         "wss://api.hyperliquid.xyz/ws".to_string()
     } else {
@@ -35,14 +30,14 @@ pub fn spawn_user_feed(
     };
     let account = account_address.to_string();
     let sd = shutdown.clone();
-    crate::async_rt::handle().spawn(user_feed_task(ws_url, account, tx, sd));
-    (rx, shutdown)
+    crate::async_rt::handle().spawn(user_feed_task(ws_url, account, publisher, sd));
+    lane
 }
 
 async fn user_feed_task(
     ws_url: String,
     account: String,
-    tx: crossbeam_channel::Sender<OrderUpdate>,
+    publisher: PrivateUpdatePublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -51,12 +46,20 @@ async fn user_feed_task(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        info!("[Hyperliquid] user-feed connecting to {} for {}", ws_url, account);
+        info!(
+            "[Hyperliquid] user-feed connecting to {} for {}",
+            ws_url, account
+        );
         let stream = match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((s, _)) => s,
             Err(e) => {
+                publisher.disconnected();
                 let delay = backoff.next_delay();
-                warn!("[Hyperliquid] user-feed connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Hyperliquid] user-feed connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -82,8 +85,10 @@ async fn user_feed_task(
             }
         }
         if !sub_ok {
+            publisher.disconnected();
             continue;
         }
+        publisher.connected();
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -116,7 +121,7 @@ async fn user_feed_task(
                                 if let Some(ups) = d.as_array() {
                                     for ou in ups {
                                         if let Some(u) = parse_order_update(ou) {
-                                            if tx.send(u).is_err() { return; }
+                                            if !publisher.publish(u) { return; }
                                         }
                                     }
                                 }
@@ -137,7 +142,7 @@ async fn user_feed_task(
                             };
                             for f in fills {
                                 if let Some(u) = parse_fill(f) {
-                                    if tx.send(u).is_err() { return; }
+                                    if !publisher.publish(u) { return; }
                                 }
                             }
                         }
@@ -147,10 +152,15 @@ async fn user_feed_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        publisher.disconnected();
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -169,9 +179,15 @@ fn parse_order_update(ou: &serde_json::Value) -> Option<OrderUpdate> {
     let status = match status_raw {
         "open" => OrderStatus::Accepted,
         "filled" => OrderStatus::Filled,
-        "canceled" | "marginCanceled" | "liquidatedCanceled" | "vaultWithdrawalCanceled"
-        | "openInterestCapCanceled" | "selfTradeCanceled" | "reduceOnlyCanceled"
-        | "siblingFilledCanceled" | "delistedCanceled" => OrderStatus::Cancelled,
+        "canceled"
+        | "marginCanceled"
+        | "liquidatedCanceled"
+        | "vaultWithdrawalCanceled"
+        | "openInterestCapCanceled"
+        | "selfTradeCanceled"
+        | "reduceOnlyCanceled"
+        | "siblingFilledCanceled"
+        | "delistedCanceled" => OrderStatus::Cancelled,
         "rejected" => OrderStatus::Rejected,
         _ => return None, // triggered / scheduled / unknown — ignore
     };
@@ -180,8 +196,16 @@ fn parse_order_update(ou: &serde_json::Value) -> Option<OrderUpdate> {
         _ => Side::Sell,
     };
     let oid = o.get("oid").and_then(|v| v.as_u64()).map(|n| n.to_string());
-    let cloid = o.get("cloid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ts = ou.get("statusTimestamp").and_then(|v| v.as_u64()).map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+    let cloid = o
+        .get("cloid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ts = ou
+        .get("statusTimestamp")
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms * 1_000_000)
+        .unwrap_or_else(now_ns);
     Some(OrderUpdate {
         client_order_id: cloid,
         exchange: Exchange::Hyperliquid,
@@ -212,11 +236,23 @@ fn parse_fill(f: &serde_json::Value) -> Option<OrderUpdate> {
         _ => Side::Sell,
     };
     let crossed = f.get("crossed").and_then(|v| v.as_bool()).unwrap_or(false);
-    let liquidity = if crossed { Liquidity::Taker } else { Liquidity::Maker };
+    let liquidity = if crossed {
+        Liquidity::Taker
+    } else {
+        Liquidity::Maker
+    };
     let oid = f.get("oid").and_then(|v| v.as_u64()).map(|o| o.to_string());
     let tid = f.get("tid").and_then(|v| v.as_u64()).map(|t| t.to_string());
-    let cloid = f.get("cloid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ts = f.get("time").and_then(|v| v.as_u64()).map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+    let cloid = f
+        .get("cloid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ts = f
+        .get("time")
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms * 1_000_000)
+        .unwrap_or_else(now_ns);
 
     Some(OrderUpdate {
         client_order_id: cloid,
