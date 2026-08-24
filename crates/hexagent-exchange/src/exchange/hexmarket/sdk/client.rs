@@ -5,8 +5,6 @@
 //! client so connection reuse and TLS session caching are shared with every
 //! other HTTP endpoint in the binary.
 
-use std::sync::RwLock;
-
 use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
 
@@ -57,19 +55,20 @@ pub struct HexClientConfig {
 /// Hexmarket REST client. Thread-safe, cheap to share via `Arc`.
 pub struct HexClient {
     base_url: String,
-    credentials: RwLock<Option<(String, ApiCredentials)>>,
+    credentials: Option<(String, ApiCredentials)>,
 }
 
 impl HexClient {
     pub fn new(config: HexClientConfig) -> Self {
         Self {
             base_url: config.api_url.trim_end_matches('/').to_string(),
-            credentials: RwLock::new(None),
+            credentials: None,
         }
     }
 
-    pub fn set_credentials(&self, pubkey: &str, creds: ApiCredentials) {
-        *self.credentials.write().unwrap() = Some((pubkey.to_string(), creds));
+    /// Install immutable credentials before handing the client to its owner.
+    pub fn set_credentials(&mut self, pubkey: &str, creds: ApiCredentials) {
+        self.credentials = Some((pubkey.to_string(), creds));
     }
 
     fn url(&self, path: &str) -> String {
@@ -77,17 +76,19 @@ impl HexClient {
     }
 
     fn l2_headers(&self, method: &str, path: &str, body: Option<&str>) -> Result<L2Headers> {
-        let guard = self.credentials.read().unwrap();
-        let (pubkey, creds) = guard.as_ref()
+        let (pubkey, creds) = self
+            .credentials
+            .as_ref()
             .ok_or_else(|| anyhow!("Hexmarket: missing API credentials"))?;
         build_l2_headers(creds, pubkey, method, path, body)
     }
 
-    fn require_pubkey(&self) -> Result<String> {
-        let guard = self.credentials.read().unwrap();
-        let (pubkey, _) = guard.as_ref()
+    fn require_pubkey(&self) -> Result<&str> {
+        let (pubkey, _) = self
+            .credentials
+            .as_ref()
             .ok_or_else(|| anyhow!("Hexmarket: missing API credentials"))?;
-        Ok(pubkey.clone())
+        Ok(pubkey)
     }
 
     // ─── Shared HTTP execution ───────────────────────────────

@@ -42,6 +42,9 @@ const POLY_CANCEL_OUTBOX_CAPACITY: usize = 4_096;
 const POLY_SAFETY_CANCEL_OUTBOX_CAPACITY: usize = 1_024;
 const POLY_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
 const HEXMARKET_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
+const HEXMARKET_ROUTE_LIFECYCLE_CAPACITY: usize = 8_192;
+const HEXMARKET_COID_ROUTE_CAPACITY: usize = 8_192;
+const HEXMARKET_COID_KEY_BYTES: usize = 96;
 const VENUE_FAST_OWNER_QUEUE_CAPACITY: usize = 64;
 const VENUE_CANCEL_OWNER_QUEUE_CAPACITY: usize = 4_096;
 const VENUE_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
@@ -10355,6 +10358,8 @@ impl Engine {
                 > = HashMap::new();
                 let mut hex_worker_handles = Vec::<thread::JoinHandle<()>>::new();
                 let mut hex_completion_handles = Vec::<thread::JoinHandle<()>>::new();
+                let (hex_route_lifecycle_tx, hex_route_lifecycle_rx) =
+                    bounded::<HexmarketRouteLifecycle>(HEXMARKET_ROUTE_LIFECYCLE_CAPACITY);
 
                 // Gate Hexmarket execution workers via the pre-computed
                 // capability flags (needs_hex_workers), not a strategy name.
@@ -10393,6 +10398,7 @@ impl Engine {
                             HEXMARKET_COMPLETION_OUTBOX_CAPACITY,
                         );
                     let completion_name = format!("{}-completion-owner", instance_id);
+                    let route_lifecycle_tx = hex_route_lifecycle_tx.clone();
                     let completion_handle = thread::Builder::new()
                         .name(completion_name.clone())
                         .spawn(move || {
@@ -10401,6 +10407,26 @@ impl Engine {
                                 crate::os_tune::ExecutionThreadRole::VenueCompletion,
                             );
                             while let Ok((update_tx, update)) = hex_completion_rx.recv() {
+                                if matches!(
+                                    update.status,
+                                    OrderStatus::Filled
+                                        | OrderStatus::Failed
+                                        | OrderStatus::Cancelled
+                                        | OrderStatus::Rejected
+                                        | OrderStatus::ExecutorRejected
+                                ) {
+                                    if let Ok(coid) = HexmarketCoidRouteKey::new(
+                                        &update.client_order_id,
+                                    ) {
+                                        let _ = route_lifecycle_tx.send(
+                                            HexmarketRouteLifecycle {
+                                                owner: update_tx.owner,
+                                                coid,
+                                                order_slot: update.order_slot,
+                                            },
+                                        );
+                                    }
+                                }
                                 if send_executor_update(&update_tx, update).is_err() {
                                     break;
                                 }
@@ -10459,7 +10485,6 @@ impl Engine {
 
                     instance_pools.insert(instance_id, pool);
                 }
-
                 // Phase 2e-2: LiveRouter now holds per-instance
                 // PolymarketTrade routes. `poly_route_mut(instance_id)`
                 // dispatches each signal to the matching SharedState's
@@ -10899,7 +10924,12 @@ impl Engine {
                 // cancel signals that still carry only a coid. New/batch
                 // traffic is assigned by stable market shard, so all mutable
                 // order identity stays inside one physical connection owner.
-                let mut hex_coid_routes: HashMap<String, HashMap<String, usize>> = HashMap::new();
+                let mut hex_coid_routes: HashMap<String, HexmarketCoidRouteTable> = instance_pools
+                    .keys()
+                    .map(|instance_id| {
+                        (instance_id.clone(), HexmarketCoidRouteTable::default())
+                    })
+                    .collect();
                 let mut shutdown_finalized = false;
 
                 loop {
@@ -10917,6 +10947,21 @@ impl Engine {
                             owner: SYSTEM_SIGNAL_OWNER,
                             signal: Signal::BeginShutdown,
                         }),
+                        recv(hex_route_lifecycle_rx) -> lifecycle => {
+                            if let Ok(lifecycle) = lifecycle {
+                                if let Some(instance_id) = owner_instance_ids
+                                    .get(usize::from(lifecycle.owner))
+                                {
+                                    if let Some(routes) = hex_coid_routes.get_mut(instance_id) {
+                                        routes.remove_if_generation(
+                                            lifecycle.coid.as_str(),
+                                            lifecycle.order_slot,
+                                        );
+                                    }
+                                }
+                            }
+                            None
+                        },
                         recv(signal_rx) -> routed => match routed {
                             Ok(routed) => Some(routed),
                             Err(_) => break,
@@ -11047,14 +11092,30 @@ impl Engine {
                                     &hex_coid_routes,
                                     pool.len(),
                                 );
-                                record_hexmarket_coid_routes(
+                                let admission = match record_hexmarket_coid_routes(
                                     &signal,
                                     &instance_id,
                                     idx,
                                     &mut hex_coid_routes,
-                                );
+                                ) {
+                                    Ok(admission) => admission,
+                                    Err(()) => {
+                                        for update in rejected_venue_signal(
+                                            &signal,
+                                            "hexmarket fixed coid route unavailable",
+                                        ) {
+                                            if send_executor_update(&update_sender, update).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
+                                    if let Some(routes) = hex_coid_routes.get_mut(&instance_id) {
+                                        admission.rollback(routes);
+                                    }
                                     for update in rejected_venue_signal(
                                         &signal,
                                         "hexmarket physical owner queue unavailable",
@@ -11076,14 +11137,30 @@ impl Engine {
                                     &hex_coid_routes,
                                     pool.len(),
                                 );
-                                record_hexmarket_coid_routes(
+                                let admission = match record_hexmarket_coid_routes(
                                     &signal,
                                     &instance_id,
                                     idx,
                                     &mut hex_coid_routes,
-                                );
+                                ) {
+                                    Ok(admission) => admission,
+                                    Err(()) => {
+                                        for update in rejected_venue_signal(
+                                            &signal,
+                                            "hexmarket fixed coid route unavailable",
+                                        ) {
+                                            if send_executor_update(&update_sender, update).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
+                                    if let Some(routes) = hex_coid_routes.get_mut(&instance_id) {
+                                        admission.rollback(routes);
+                                    }
                                     for update in rejected_venue_signal(
                                         &signal,
                                         "hexmarket physical owner queue unavailable",
@@ -11221,6 +11298,8 @@ impl Engine {
                 for handle in venue_execution_handles {
                     let _ = handle.join();
                 }
+                drop(hex_route_lifecycle_rx);
+                drop(hex_route_lifecycle_tx);
                 drop(instance_pools);
                 for handle in hex_worker_handles {
                     let _ = handle.join();
@@ -11845,19 +11924,213 @@ fn stable_connection_slot(key: &str, connection_count: usize) -> usize {
     (hash as usize) % connection_count
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HexmarketCoidRouteKey {
+    len: u8,
+    bytes: [u8; HEXMARKET_COID_KEY_BYTES],
+}
+
+#[derive(Clone, Copy)]
+struct HexmarketRouteLifecycle {
+    owner: u16,
+    coid: HexmarketCoidRouteKey,
+    order_slot: OrderSlot,
+}
+
+impl HexmarketCoidRouteKey {
+    fn new(value: &str) -> Result<Self, ()> {
+        if value.is_empty() || value.len() > HEXMARKET_COID_KEY_BYTES {
+            return Err(());
+        }
+        let mut bytes = [0_u8; HEXMARKET_COID_KEY_BYTES];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(Self {
+            len: value.len() as u8,
+            bytes,
+        })
+    }
+
+    #[inline]
+    fn equals(&self, value: &str) -> bool {
+        usize::from(self.len) == value.len()
+            && self.bytes[..usize::from(self.len)] == *value.as_bytes()
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // The key is copied from a valid UTF-8 `str` and never mutated.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.len)]) }
+    }
+}
+
+/// Dispatcher-owned, startup-allocated compatibility directory for legacy
+/// Hexmarket cancels that still carry only a coid. The single dispatcher is
+/// the sole writer; physical connection workers only receive the selected
+/// lane, so steady-state routing never locks, clones a key or grows the heap.
+struct HexmarketCoidRouteTable {
+    slots: Box<[Option<(HexmarketCoidRouteKey, u16, OrderSlot)>]>,
+    len: usize,
+}
+
+impl Default for HexmarketCoidRouteTable {
+    fn default() -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None)
+                .take(HEXMARKET_COID_ROUTE_CAPACITY)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            len: 0,
+        }
+    }
+}
+
+impl HexmarketCoidRouteTable {
+    #[inline]
+    fn start_index(client_order_id: &str) -> usize {
+        let hash = client_order_id
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        hash as usize & (HEXMARKET_COID_ROUTE_CAPACITY - 1)
+    }
+
+    #[inline]
+    fn get(&self, client_order_id: &str) -> Option<usize> {
+        self.get_entry(client_order_id).map(|(slot, _)| slot)
+    }
+
+    #[inline]
+    fn get_entry(&self, client_order_id: &str) -> Option<(usize, OrderSlot)> {
+        let start = Self::start_index(client_order_id);
+        for offset in 0..HEXMARKET_COID_ROUTE_CAPACITY {
+            match &self.slots[(start + offset) & (HEXMARKET_COID_ROUTE_CAPACITY - 1)] {
+                Some((key, slot, order_slot)) if key.equals(client_order_id) => {
+                    return Some((usize::from(*slot), *order_slot));
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn insert_key(
+        &mut self,
+        key: HexmarketCoidRouteKey,
+        connection_slot: u16,
+        order_slot: OrderSlot,
+    ) -> Result<(), ()> {
+        let client_order_id = key.as_str();
+        let start = Self::start_index(client_order_id);
+        for offset in 0..HEXMARKET_COID_ROUTE_CAPACITY {
+            let index = (start + offset) & (HEXMARKET_COID_ROUTE_CAPACITY - 1);
+            match self.slots[index].as_mut() {
+                Some((existing, slot, existing_order_slot)) if existing.equals(client_order_id) => {
+                    *slot = connection_slot;
+                    *existing_order_slot = order_slot;
+                    return Ok(());
+                }
+                Some(_) => {}
+                None => {
+                    self.slots[index] = Some((key, connection_slot, order_slot));
+                    self.len += 1;
+                    return Ok(());
+                }
+            }
+        }
+        Err(())
+    }
+
+    fn remove_if_generation(&mut self, client_order_id: &str, order_slot: OrderSlot) {
+        let start = Self::start_index(client_order_id);
+        for offset in 0..HEXMARKET_COID_ROUTE_CAPACITY {
+            let index = (start + offset) & (HEXMARKET_COID_ROUTE_CAPACITY - 1);
+            match self.slots[index] {
+                Some((key, _, existing_order_slot))
+                    if key.equals(client_order_id) && existing_order_slot == order_slot =>
+                {
+                    self.slots[index] = None;
+                    self.len -= 1;
+                    // Back-shift the remainder of this probe cluster. This
+                    // preserves early termination on `None` without needing
+                    // tombstones or a second allocation.
+                    let mut next = (index + 1) & (HEXMARKET_COID_ROUTE_CAPACITY - 1);
+                    for _ in 0..HEXMARKET_COID_ROUTE_CAPACITY - 1 {
+                        let Some((rehash_key, rehash_slot, rehash_order_slot)) =
+                            self.slots[next].take()
+                        else {
+                            break;
+                        };
+                        self.len -= 1;
+                        self.insert_key(rehash_key, rehash_slot, rehash_order_slot)
+                            .expect("removed route leaves room for cluster reinsert");
+                        next = (next + 1) & (HEXMARKET_COID_ROUTE_CAPACITY - 1);
+                    }
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    }
+
+    fn remove_admission(&mut self, client_order_id: &str) {
+        if let Some((_, order_slot)) = self.get_entry(client_order_id) {
+            self.remove_if_generation(client_order_id, order_slot);
+        }
+    }
+
+    fn can_insert_signal(&self, signal: &Signal) -> bool {
+        let mut pending = [None; ORDER_BATCH_CAPACITY];
+        let mut pending_len = 0usize;
+        let mut validate = |client_order_id: &str| {
+            let Ok(key) = HexmarketCoidRouteKey::new(client_order_id) else {
+                return false;
+            };
+            if self.get(client_order_id).is_none()
+                && !pending[..pending_len].contains(&Some(key))
+            {
+                if pending_len == pending.len() {
+                    return false;
+                }
+                pending[pending_len] = Some(key);
+                pending_len += 1;
+            }
+            self.len.saturating_add(pending_len) <= HEXMARKET_COID_ROUTE_CAPACITY
+        };
+        match signal {
+            Signal::NewOrder(order) => validate(&order.client_order_id),
+            Signal::BatchNewOrders { orders, .. } => {
+                orders.iter().all(|order| validate(&order.client_order_id))
+            }
+            Signal::BatchUpdateOrders { place_orders, .. }
+            | Signal::ReplaceOrder { place_orders, .. } => place_orders
+                .iter()
+                .all(|order| validate(&order.client_order_id)),
+            _ => true,
+        }
+    }
+}
+
 /// Select one physical Hexmarket connection owner. Market-scoped commands
 /// stay on one shard; the string lookup exists only for the legacy single
 /// cancel envelope that does not yet carry its numeric `OrderSlot`/market.
 fn hexmarket_connection_slot(
     signal: &Signal,
     instance_id: &str,
-    coid_routes: &HashMap<String, HashMap<String, usize>>,
+    coid_routes: &HashMap<String, HexmarketCoidRouteTable>,
     connection_count: usize,
 ) -> usize {
     let existing_coid = match signal {
+        Signal::NewOrder(order) => Some(order.client_order_id.as_str()),
         Signal::CancelOrder {
             client_order_id, ..
         } => Some(client_order_id.as_str()),
+        Signal::BatchNewOrders { orders, .. } => {
+            orders.first().map(|order| order.client_order_id.as_str())
+        }
         Signal::BatchCancelOrders {
             client_order_ids, ..
         } => client_order_ids.first().map(String::as_str),
@@ -11875,7 +12148,6 @@ fn hexmarket_connection_slot(
         if let Some(slot) = coid_routes
             .get(instance_id)
             .and_then(|routes| routes.get(client_order_id))
-            .copied()
         {
             return slot % connection_count;
         }
@@ -11899,25 +12171,69 @@ fn record_hexmarket_coid_routes(
     signal: &Signal,
     instance_id: &str,
     connection_slot: usize,
-    coid_routes: &mut HashMap<String, HashMap<String, usize>>,
-) {
-    let routes = coid_routes.entry(instance_id.to_string()).or_default();
-    match signal {
-        Signal::NewOrder(order) => {
-            routes.insert(order.client_order_id.clone(), connection_slot);
+    coid_routes: &mut HashMap<String, HexmarketCoidRouteTable>,
+) -> Result<HexmarketRouteAdmission, ()> {
+    let routes = coid_routes.get_mut(instance_id).ok_or(())?;
+    if !routes.can_insert_signal(signal) {
+        return Err(());
+    }
+    let mut admission = HexmarketRouteAdmission::default();
+    let mut insert = |client_order_id: &str, order_slot: OrderSlot| {
+        if let Some((existing, existing_order_slot)) = routes.get_entry(client_order_id) {
+            return (existing == connection_slot && existing_order_slot == order_slot)
+                .then_some(())
+                .ok_or(());
         }
-        Signal::BatchNewOrders { orders, .. } => {
-            for order in orders {
-                routes.insert(order.client_order_id.clone(), connection_slot);
-            }
+        let key = HexmarketCoidRouteKey::new(client_order_id)?;
+        routes.insert_key(
+            key,
+            u16::try_from(connection_slot).map_err(|_| ())?,
+            order_slot,
+        )?;
+        if admission.push(key).is_err() {
+            routes.remove_if_generation(client_order_id, order_slot);
+            return Err(());
         }
+        Ok(())
+    };
+    let inserted = match signal {
+        Signal::NewOrder(order) => insert(&order.client_order_id, order.order_slot),
+        Signal::BatchNewOrders { orders, .. } => orders
+            .iter()
+            .try_for_each(|order| insert(&order.client_order_id, order.order_slot)),
         Signal::BatchUpdateOrders { place_orders, .. }
-        | Signal::ReplaceOrder { place_orders, .. } => {
-            for order in place_orders {
-                routes.insert(order.client_order_id.clone(), connection_slot);
-            }
+        | Signal::ReplaceOrder { place_orders, .. } => place_orders
+            .iter()
+            .try_for_each(|order| insert(&order.client_order_id, order.order_slot)),
+        _ => Ok(()),
+    };
+    if inserted.is_err() {
+        admission.rollback(routes);
+        return Err(());
+    }
+    Ok(admission)
+}
+
+#[derive(Default)]
+struct HexmarketRouteAdmission {
+    inserted: [Option<HexmarketCoidRouteKey>; ORDER_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl HexmarketRouteAdmission {
+    fn push(&mut self, key: HexmarketCoidRouteKey) -> Result<(), ()> {
+        if self.len == self.inserted.len() {
+            return Err(());
         }
-        _ => {}
+        self.inserted[self.len] = Some(key);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn rollback(&self, routes: &mut HexmarketCoidRouteTable) {
+        for key in self.inserted[..self.len].iter().flatten() {
+            routes.remove_admission(key.as_str());
+        }
     }
 }
 
@@ -15494,9 +15810,26 @@ mod market_router_tests {
         order.exchange = Exchange::Hexmarket;
         order.symbol = "ETH-USD".into();
         let place = Signal::NewOrder(order);
-        let mut routes = HashMap::new();
+        let mut routes = HashMap::from([(
+            "instance-0".to_string(),
+            HexmarketCoidRouteTable::default(),
+        )]);
         let owner = hexmarket_connection_slot(&place, "instance-0", &routes, 4);
-        record_hexmarket_coid_routes(&place, "instance-0", owner, &mut routes);
+        record_hexmarket_coid_routes(&place, "instance-0", owner, &mut routes).unwrap();
+
+        let duplicate = record_hexmarket_coid_routes(
+            &place,
+            "instance-0",
+            owner,
+            &mut routes,
+        )
+        .unwrap();
+        duplicate.rollback(routes.get_mut("instance-0").unwrap());
+        assert_eq!(
+            routes.get("instance-0").unwrap().get("hex-coid-1"),
+            Some(owner),
+            "rolling back an idempotent admission must retain the prior route",
+        );
 
         let cancel = Signal::CancelOrder {
             exchange: Exchange::Hexmarket,
@@ -15523,6 +15856,22 @@ mod market_router_tests {
             hexmarket_connection_slot(&replace, "instance-0", &routes, 4),
             owner,
         );
+
+        record_hexmarket_coid_routes(&cancel, "instance-0", owner, &mut routes).unwrap();
+        let table = routes.get_mut("instance-0").unwrap();
+        assert_eq!(
+            table.len, 1,
+            "cancel admission retains routing until typed completion"
+        );
+        table.remove_if_generation(
+            "hex-coid-1",
+            OrderSlot::with_generation(7, 9),
+        );
+        assert_eq!(table.len, 1, "late generation cannot remove active route");
+        let (_, active_slot) = table.get_entry("hex-coid-1").unwrap();
+        table.remove_if_generation("hex-coid-1", active_slot);
+        assert_eq!(table.len, 0, "terminal completion releases the route slot");
+        assert_eq!(table.get("hex-coid-1"), None);
     }
 
     struct FixedVenueTestTrade;

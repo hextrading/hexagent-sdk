@@ -14,7 +14,7 @@ use super::auth::{api_url_prefix_or_default, resolve_auth};
 fn make_client(private_key: &str, mnemonic: &str, api_url_prefix: &str) -> Result<HexClient> {
     let api_url_prefix = api_url_prefix_or_default(api_url_prefix);
     let auth = resolve_auth(private_key, mnemonic, api_url_prefix)?;
-    let client = HexClient::new(HexClientConfig {
+    let mut client = HexClient::new(HexClientConfig {
         api_url: api_url_prefix.to_string(),
     });
     client.set_credentials(&auth.pubkey, auth.credentials);
