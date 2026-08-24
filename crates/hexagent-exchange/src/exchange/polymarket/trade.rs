@@ -3,16 +3,15 @@
 //! Implements `ExchangeTrade` for submitting and canceling orders via the
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
-use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use hexagent_account::account::shared_account::{
@@ -67,7 +66,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
 const REQUEST_BUFFER_SLOTS: usize = 64;
 const REQUEST_BUFFER_BYTES: usize = 2_048;
-const RUNTIME_OWNERSHIP_SHARDS: usize = 64;
+const RUNTIME_OWNERSHIP_CAPACITY: usize = 65_536;
+const RUNTIME_OWNERSHIP_MAX_PROBES: usize = 128;
 
 fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
     let pool = Arc::new(ArrayQueue::new(REQUEST_BUFFER_SLOTS));
@@ -78,114 +78,159 @@ fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
 }
 
 /// Read-mostly OID ownership publication used by the private owner actor.
-/// New-order workers touch one shard, while a private event performs one
-/// bounded read and never enters the aggregate account lifecycle lock.
+/// New-order workers publish into a fixed open-addressed table, while a
+/// private event performs one bounded read and never enters the aggregate
+/// account lifecycle lock or grows a string map.
 #[derive(Debug)]
 struct RuntimeOwnershipIndex {
-    shards: Box<[RuntimeOwnershipShard]>,
-}
-
-/// Writers publish with ArcSwap CAS retries; readers never inherit a lower
-/// priority execution worker's scheduling delay through a map lock.
-#[derive(Debug)]
-struct RuntimeOwnershipShard {
-    published: ArcSwap<HashMap<Arc<str>, Arc<RuntimeOwnershipEntry>>>,
+    slots: Box<[ArcSwapOption<RuntimeOwnershipEntry>]>,
 }
 
 #[derive(Debug)]
 struct RuntimeOwnershipEntry {
+    normalized_order_id: Arc<str>,
     ownership: OrderOwnership,
 }
 
 impl RuntimeOwnershipIndex {
     fn new() -> Self {
         Self {
-            shards: (0..RUNTIME_OWNERSHIP_SHARDS)
-                .map(|_| RuntimeOwnershipShard {
-                    published: ArcSwap::from_pointee(HashMap::new()),
-                })
+            slots: (0..RUNTIME_OWNERSHIP_CAPACITY)
+                .map(|_| ArcSwapOption::empty())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
     }
 
-    fn shard_index(order_id: &str) -> usize {
+    fn start_index(order_id: &str) -> usize {
         let mut hasher = DefaultHasher::new();
-        order_id.hash(&mut hasher);
-        hasher.finish() as usize % RUNTIME_OWNERSHIP_SHARDS
-    }
-
-    fn lookup_key(order_id: &str) -> Cow<'_, str> {
-        let trimmed = order_id.trim();
-        let unprefixed = trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .unwrap_or(trimmed);
-        if unprefixed.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            Cow::Owned(unprefixed.to_ascii_lowercase())
-        } else {
-            Cow::Borrowed(unprefixed)
+        for byte in runtime_order_id_view(order_id).bytes() {
+            hasher.write_u8(byte.to_ascii_lowercase());
         }
+        hasher.finish() as usize % RUNTIME_OWNERSHIP_CAPACITY
     }
 
-    fn insert(&self, order_id: &str, ownership: OrderOwnership) {
+    fn insert(&self, order_id: &str, ownership: OrderOwnership) -> Result<(), String> {
         let normalized = Arc::<str>::from(normalize_order_id(order_id));
-        let shard = &self.shards[Self::shard_index(&normalized)];
-        let entry = Arc::new(RuntimeOwnershipEntry { ownership });
-        shard.published.rcu(|current| {
-            let mut next = (**current).clone();
-            next.insert(normalized.clone(), entry.clone());
-            Arc::new(next)
+        let entry = Arc::new(RuntimeOwnershipEntry {
+            normalized_order_id: Arc::clone(&normalized),
+            ownership,
         });
+        let start = Self::start_index(&normalized);
+        for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
+            let slot = &self.slots[(start + offset) % self.slots.len()];
+            slot.rcu(|current| match current {
+                Some(existing) if existing.normalized_order_id.as_ref() != normalized.as_ref() => {
+                    Some(Arc::clone(existing))
+                }
+                _ => Some(Arc::clone(&entry)),
+            });
+            if slot.load().as_ref().is_some_and(|published| {
+                published.normalized_order_id.as_ref() == normalized.as_ref()
+            }) {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "fixed runtime ownership table probe budget exhausted capacity={} probes={}",
+            RUNTIME_OWNERSHIP_CAPACITY, RUNTIME_OWNERSHIP_MAX_PROBES,
+        ))
+    }
+
+    fn find_entry(&self, order_id: &str) -> Option<Arc<RuntimeOwnershipEntry>> {
+        let normalized = runtime_order_id_view(order_id);
+        let start = Self::start_index(order_id);
+        (0..RUNTIME_OWNERSHIP_MAX_PROBES).find_map(|offset| {
+            let entry = self.slots[(start + offset) % self.slots.len()].load();
+            entry
+                .as_ref()
+                .filter(|entry| {
+                    entry
+                        .normalized_order_id
+                        .as_ref()
+                        .eq_ignore_ascii_case(normalized)
+                })
+                .map(Arc::clone)
+        })
     }
 
     fn get(&self, order_id: &str) -> Option<OrderOwnership> {
-        let normalized = Self::lookup_key(order_id);
-        self.shards[Self::shard_index(normalized.as_ref())]
-            .published
-            .load()
-            .get(normalized.as_ref())
+        self.find_entry(order_id)
             .map(|entry| entry.ownership.clone())
     }
 
+    fn contains(&self, order_id: &str) -> bool {
+        let normalized = runtime_order_id_view(order_id);
+        let start = Self::start_index(order_id);
+        (0..RUNTIME_OWNERSHIP_MAX_PROBES).any(|offset| {
+            self.slots[(start + offset) % self.slots.len()]
+                .load()
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry
+                        .normalized_order_id
+                        .as_ref()
+                        .eq_ignore_ascii_case(normalized)
+                })
+        })
+    }
+
+    fn client_order_id(&self, order_id: &str) -> Option<String> {
+        self.find_entry(order_id)
+            .map(|entry| entry.ownership.client_order_id.clone())
+    }
+
     fn remove(&self, order_id: &str) {
-        let normalized = Self::lookup_key(order_id);
-        let shard = &self.shards[Self::shard_index(normalized.as_ref())];
-        if !shard.published.load().contains_key(normalized.as_ref()) {
-            return;
+        let normalized = runtime_order_id_view(order_id);
+        let start = Self::start_index(order_id);
+        for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
+            let slot = &self.slots[(start + offset) % self.slots.len()];
+            if slot.load().as_ref().is_some_and(|entry| {
+                entry
+                    .normalized_order_id
+                    .as_ref()
+                    .eq_ignore_ascii_case(normalized)
+            }) {
+                slot.rcu(|current| match current {
+                    Some(entry)
+                        if entry
+                            .normalized_order_id
+                            .as_ref()
+                            .eq_ignore_ascii_case(normalized) =>
+                    {
+                        None
+                    }
+                    _ => current.clone(),
+                });
+                return;
+            }
         }
-        shard.published.rcu(|current| {
-            let mut next = (**current).clone();
-            next.remove(normalized.as_ref());
-            Arc::new(next)
-        });
     }
 
     fn remove_client_orders(&self, client_order_ids: &HashSet<String>) {
-        for shard in &self.shards {
-            if shard
-                .published
-                .load()
-                .values()
-                .any(|entry| client_order_ids.contains(&entry.ownership.client_order_id))
-            {
-                shard.published.rcu(|current| {
-                    let mut next = (**current).clone();
-                    next.retain(|_, entry| {
-                        !client_order_ids.contains(&entry.ownership.client_order_id)
-                    });
-                    Arc::new(next)
-                });
-            }
+        for slot in &self.slots {
+            slot.rcu(|current| match current {
+                Some(entry) if client_order_ids.contains(&entry.ownership.client_order_id) => None,
+                _ => current.clone(),
+            });
         }
     }
 
     #[cfg(test)]
     fn clear(&self) {
-        for shard in &self.shards {
-            shard.published.store(Arc::new(HashMap::new()));
+        for slot in &self.slots {
+            slot.store(None);
         }
     }
+}
+
+#[inline]
+fn runtime_order_id_view(order_id: &str) -> &str {
+    let trimmed = order_id.trim();
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
 }
 
 #[derive(Debug, Clone)]
@@ -2897,8 +2942,19 @@ impl SharedState {
                 }
                 let ownership = self.account_state.order(&client_order_id);
                 if let Some(ownership) = ownership {
-                    self.runtime_order_ownership
-                        .insert(&exchange_order_id, ownership);
+                    if let Err(error) = self
+                        .runtime_order_ownership
+                        .insert(&exchange_order_id, ownership)
+                    {
+                        self.user_feed_health.set_inventory_uncertain(true);
+                        log::error!(
+                            "[PolymarketTrade] fixed runtime identity publication failed coid={} oid={}: {}",
+                            client_order_id,
+                            exchange_order_id,
+                            error,
+                        );
+                        return;
+                    }
                 }
                 execution.apply(
                     self,
@@ -3302,7 +3358,7 @@ impl SharedState {
     ) -> Result<(), String> {
         if let Some(ownership) = ownership {
             self.runtime_order_ownership
-                .insert(exchange_order_id, ownership.clone());
+                .insert(exchange_order_id, ownership.clone())?;
         }
         let command = ExecutionStateCommand::InstallIdentity {
             client_order_id: client_order_id.to_string(),
@@ -3334,7 +3390,7 @@ impl SharedState {
     ) -> Result<(), String> {
         if let Some(ownership) = ownership.as_ref() {
             self.runtime_order_ownership
-                .insert(exchange_order_id, ownership.clone());
+                .insert(exchange_order_id, ownership.clone())?;
         }
         let command = ExecutionStateCommand::InstallIdentity {
             client_order_id: client_order_id.to_string(),
@@ -3980,8 +4036,11 @@ impl SharedState {
 
     /// Look up client_order_id from Polymarket orderID.
     pub fn lookup_coid(&self, exchange_order_id: &str) -> Option<String> {
-        if let Some(ownership) = self.runtime_order_ownership.get(exchange_order_id) {
-            return Some(ownership.client_order_id);
+        if let Some(client_order_id) = self
+            .runtime_order_ownership
+            .client_order_id(exchange_order_id)
+        {
+            return Some(client_order_id);
         }
         self.execution_snapshot()
             .oid_to_coid
@@ -4030,11 +4089,8 @@ impl SharedState {
     /// lane. A maker trade's top-level taker order normally belongs to another
     /// account; consulting the durable ledger for that negative lookup would
     /// scan every StrategyAccount lifecycle and dominate P99.
-    pub(crate) fn lookup_runtime_order_ownership(
-        &self,
-        exchange_order_id: &str,
-    ) -> Option<OrderOwnership> {
-        self.runtime_order_ownership.get(exchange_order_id)
+    pub(crate) fn has_runtime_order_ownership(&self, exchange_order_id: &str) -> bool {
+        self.runtime_order_ownership.contains(exchange_order_id)
     }
 
     /// Complete account-global settled-audit cleanup only after the durable
@@ -5366,7 +5422,9 @@ impl PolymarketTrade {
                     .insert(order.client_order_id.clone(), order.token_id.clone());
             }
             if !order.client_order_id.is_empty() && !order.order_id.is_empty() {
-                recovered_runtime_ownership.insert(&order.order_id, order.clone());
+                recovered_runtime_ownership
+                    .insert(&order.order_id, order.clone())
+                    .map_err(|error| anyhow!(error))?;
             }
             if matches!(
                 order.status,
@@ -6859,6 +6917,16 @@ impl PolymarketTrade {
 
     /// Cancel ALL open orders on the CLOB (DELETE /cancel-all, no body).
     pub fn cancel_all_orders(&self) {
+        self.cancel_all_orders_inner(None);
+    }
+
+    /// Physical-owner variant used by the independent safety-cancel lane.
+    /// Every request stays on the connection reserved by `permit`.
+    pub fn cancel_all_orders_on(&self, permit: &crate::http1_pool::Permit) {
+        self.cancel_all_orders_inner(Some(permit));
+    }
+
+    fn cancel_all_orders_inner(&self, permit: Option<&crate::http1_pool::Permit>) {
         let tracked: Vec<(String, String)> = {
             let execution = self.shared.execution_snapshot();
             let coids: Vec<String> = execution.open_orders.keys().cloned().collect();
@@ -6868,7 +6936,15 @@ impl PolymarketTrade {
                 .filter_map(|coid| ids.get(&coid).map(|oid| (coid, oid.clone())))
                 .collect()
         };
-        let res = self.shared.http_call_sync("DELETE", "/cancel-all", "");
+        let res = match permit {
+            Some(permit) => self.shared.http_call_sync_on(
+                permit.current_pooled_client(),
+                "DELETE",
+                "/cancel-all",
+                "",
+            ),
+            None => self.shared.http_call_sync("DELETE", "/cancel-all", ""),
+        };
         match res {
             Ok(json) => {
                 let canceled = json
@@ -7076,6 +7152,28 @@ impl PolymarketTrade {
         self.batch_cancel_orders(Exchange::Polymarket, "", &coids)
     }
 
+    /// Physical-owner instance cancel. Requests are executed sequentially on
+    /// the safety lane's reserved connection and completed on this same owner.
+    pub fn cancel_instance_orders_on(
+        &mut self,
+        permit: &crate::http1_pool::Permit,
+    ) -> Result<Vec<OrderUpdate>> {
+        if self.instance_id.is_empty() {
+            return Err(anyhow!(
+                "instance-scoped cancel requires a non-empty instance_id"
+            ));
+        }
+        let execution = self.shared.execution_snapshot();
+        let coids = instance_owned_open_coids(execution.open_orders.iter(), &self.instance_id);
+        drop(execution);
+        let mut updates = Vec::with_capacity(coids.len());
+        for client_order_id in coids {
+            let pending = self.cancel_fire(&client_order_id, permit.current_pooled_client());
+            updates.push(self.complete_cancel(Exchange::Polymarket, &client_order_id, pending));
+        }
+        Ok(updates)
+    }
+
     /// Cancel every resting order for ONE market server-side via
     /// `DELETE /cancel-market-orders`. The endpoint requires BOTH `market`
     /// (condition_id) and `asset_id` (token_id) — they are both mandatory —
@@ -7098,6 +7196,37 @@ impl PolymarketTrade {
         market_condition_id: &str,
         asset_ids: &[String],
         allow_expired_market_terminalization: bool,
+    ) -> MarketCancelFinality {
+        self.cancel_market_orders_until_final_inner(
+            market_condition_id,
+            asset_ids,
+            allow_expired_market_terminalization,
+            None,
+        )
+    }
+
+    /// Physical-owner market cancel used by the safety lane.
+    pub fn cancel_market_orders_until_final_on(
+        &self,
+        market_condition_id: &str,
+        asset_ids: &[String],
+        allow_expired_market_terminalization: bool,
+        permit: &crate::http1_pool::Permit,
+    ) -> MarketCancelFinality {
+        self.cancel_market_orders_until_final_inner(
+            market_condition_id,
+            asset_ids,
+            allow_expired_market_terminalization,
+            Some(permit),
+        )
+    }
+
+    fn cancel_market_orders_until_final_inner(
+        &self,
+        market_condition_id: &str,
+        asset_ids: &[String],
+        allow_expired_market_terminalization: bool,
+        permit: Option<&crate::http1_pool::Permit>,
     ) -> MarketCancelFinality {
         let tokens: HashSet<String> = asset_ids
             .iter()
@@ -7137,10 +7266,18 @@ impl PolymarketTrade {
                     "asset_id": asset_id,
                 })
                 .to_string();
-                match self
-                    .shared
-                    .http_call_sync("DELETE", "/cancel-market-orders", &body)
-                {
+                let reply = match permit {
+                    Some(permit) => self.shared.http_call_sync_on(
+                        permit.current_pooled_client(),
+                        "DELETE",
+                        "/cancel-market-orders",
+                        &body,
+                    ),
+                    None => self
+                        .shared
+                        .http_call_sync("DELETE", "/cancel-market-orders", &body),
+                };
+                match reply {
                     Ok(json) => match validated_cancel_all_counts(&json) {
                         Some((canceled, not_canceled)) => {
                             remote_clean &= not_canceled == 0;
@@ -11767,13 +11904,17 @@ mod tests {
     fn runtime_ownership_reader_never_waits_for_writer_serialization() {
         let index = Arc::new(RuntimeOwnershipIndex::new());
         let ownership = runtime_ownership("0xABC", "maker-1");
-        index.insert(&ownership.order_id, ownership.clone());
+        index
+            .insert(&ownership.order_id, ownership.clone())
+            .unwrap();
 
         let writer_index = index.clone();
         let writer = std::thread::spawn(move || {
             for sequence in 0..1_000 {
                 let oid = format!("0x{sequence:064x}");
-                writer_index.insert(&oid, runtime_ownership(&oid, "writer"));
+                writer_index
+                    .insert(&oid, runtime_ownership(&oid, "writer"))
+                    .unwrap();
             }
         });
         assert_eq!(
@@ -11781,7 +11922,7 @@ mod tests {
                 .get(&ownership.order_id)
                 .map(|value| value.client_order_id),
             Some("maker-1".to_string()),
-            "an RCU reader must remain available while another writer publishes",
+            "a fixed-table reader must remain available while another writer publishes",
         );
         writer.join().unwrap();
     }
@@ -11790,10 +11931,49 @@ mod tests {
     fn runtime_ownership_snapshot_publishes_insert_and_remove() {
         let index = RuntimeOwnershipIndex::new();
         let ownership = runtime_ownership("0xDEF", "maker-2");
-        index.insert(&ownership.order_id, ownership.clone());
+        index
+            .insert(&ownership.order_id, ownership.clone())
+            .unwrap();
         assert!(index.get("def").is_some());
-        index.remove("0xdef");
+        assert!(index.contains("  0XDeF "));
+        index.remove("  0XdEf  ");
         assert!(index.get("DEF").is_none());
+    }
+
+    #[test]
+    fn runtime_ownership_numeric_lookup_latency_profile() {
+        const EVENTS: usize = 20_000;
+        let index = RuntimeOwnershipIndex::new();
+        let ownership = runtime_ownership("0x0123456789abcdef", "maker-latency");
+        index
+            .insert("0x0123456789abcdef", ownership)
+            .expect("benchmark ownership insert");
+
+        let mut samples = Vec::with_capacity(EVENTS);
+        for sequence in 0..EVENTS {
+            let oid = if sequence & 1 == 0 {
+                "0123456789ABCDEF"
+            } else {
+                "  0x0123456789abcdef  "
+            };
+            let started = std::time::Instant::now();
+            assert!(index.contains(oid));
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        eprintln!(
+            "runtime-ownership lookup: boundary=normalized_oid_view_to_fixed_table_match n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} table_capacity={} probe_budget={} queue_depth=0 overflow=0",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+            RUNTIME_OWNERSHIP_CAPACITY,
+            RUNTIME_OWNERSHIP_MAX_PROBES,
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::types::{
-    AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, MarketDataHealth,
-    OrderBookSnapshot, OrderSlot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange,
-    TradeTick,
+    extend_signal_batch, AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument,
+    MarketDataHealth, OrderBookSnapshot, OrderSlot, OrderUpdate, QuoteTick, Signal, SignalBatch,
+    SignalBatchOverflow, SpotPrice, TickSizeChange, TradeTick,
 };
 use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 
@@ -68,8 +68,12 @@ pub trait Strategy: Send {
     /// ticks; latency-sensitive strategies should override this method and
     /// append directly. The default preserves source compatibility while
     /// older implementations migrate away from returning a fresh `Vec`.
-    fn on_quote_into(&mut self, ts_event: u64, out: &mut Vec<Signal>) {
-        out.extend(self.on_quote(ts_event));
+    fn on_quote_into(
+        &mut self,
+        ts_event: u64,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_quote(ts_event))
     }
     fn quote_interval_ms(&self) -> u64 {
         0
@@ -109,16 +113,24 @@ pub trait Strategy: Send {
     fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> {
         Vec::new()
     }
-    fn on_tick_size_change_into(&mut self, tsc: &TickSizeChange, out: &mut Vec<Signal>) {
-        out.extend(self.on_tick_size_change(tsc));
+    fn on_tick_size_change_into(
+        &mut self,
+        tsc: &TickSizeChange,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_tick_size_change(tsc))
     }
     /// Condition-scoped market-data readiness.  Implementations may cancel
     /// only the affected market while the exchange transport remains live.
     fn on_market_data_health(&mut self, _health: &MarketDataHealth) -> Vec<Signal> {
         Vec::new()
     }
-    fn on_market_data_health_into(&mut self, health: &MarketDataHealth, out: &mut Vec<Signal>) {
-        out.extend(self.on_market_data_health(health));
+    fn on_market_data_health_into(
+        &mut self,
+        health: &MarketDataHealth,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_market_data_health(health))
     }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
@@ -128,8 +140,12 @@ pub trait Strategy: Send {
     fn on_watchdog(&mut self, _now_ns: u64) -> Vec<Signal> {
         Vec::new()
     }
-    fn on_watchdog_into(&mut self, now_ns: u64, out: &mut Vec<Signal>) {
-        out.extend(self.on_watchdog(now_ns));
+    fn on_watchdog_into(
+        &mut self,
+        now_ns: u64,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_watchdog(now_ns))
     }
     fn on_exit(&mut self) {}
 
@@ -148,42 +164,63 @@ pub trait Strategy: Send {
     fn on_private_feed_control(&mut self, _control: PrivateFeedControl) -> Vec<Signal> {
         Vec::new()
     }
-    fn on_private_feed_control_into(&mut self, control: PrivateFeedControl, out: &mut Vec<Signal>) {
-        out.extend(self.on_private_feed_control(control));
+    fn on_private_feed_control_into(
+        &mut self,
+        control: PrivateFeedControl,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_private_feed_control(control))
     }
     /// Handle an OrderUpdate arriving from an exchange. Returning a non-empty
-    /// `Vec<Signal>` lets the strategy react synchronously — e.g. fire a
+    /// fixed `SignalBatch` lets the strategy react synchronously — e.g. fire a
     /// `Signal::ReconcilePolymarket` the moment a `NewOrderTimeout` /
     /// `CancelOrderTimeout` lands, rather than waiting for the next
     /// `on_quote` tick to notice the orphan.
-    fn on_order_update(&mut self, _update: &OrderUpdate) -> Vec<Signal> {
-        Vec::new()
+    fn on_order_update(
+        &mut self,
+        _update: &OrderUpdate,
+    ) -> Result<SignalBatch, SignalBatchOverflow> {
+        Ok(SignalBatch::new())
     }
-    fn on_order_update_into(&mut self, update: &OrderUpdate, out: &mut Vec<Signal>) {
-        out.extend(self.on_order_update(update));
+    fn on_order_update_into(
+        &mut self,
+        update: &OrderUpdate,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_order_update(update)?)
     }
 
     /// Owned update hook used by private and executor lanes. The default keeps
     /// existing strategies source compatible; strategies with bounded dedupe
     /// tables may override it and retain the message's IDs without cloning.
-    fn on_order_update_owned(&mut self, update: OrderUpdate) -> Vec<Signal> {
+    fn on_order_update_owned(
+        &mut self,
+        update: OrderUpdate,
+    ) -> Result<SignalBatch, SignalBatchOverflow> {
         self.on_order_update(&update)
     }
-    fn on_order_update_owned_into(&mut self, update: OrderUpdate, out: &mut Vec<Signal>) {
-        out.extend(self.on_order_update_owned(update));
+    fn on_order_update_owned_into(
+        &mut self,
+        update: OrderUpdate,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_order_update_owned(update)?)
     }
 
     /// Preferred numeric lifecycle hook. The default preserves compatibility
     /// while strategies migrate from string-key recovery routing.
-    fn on_lifecycle_update_owned(&mut self, envelope: LifecycleEnvelope) -> Vec<Signal> {
+    fn on_lifecycle_update_owned(
+        &mut self,
+        envelope: LifecycleEnvelope,
+    ) -> Result<SignalBatch, SignalBatchOverflow> {
         self.on_order_update_owned(envelope.update)
     }
     fn on_lifecycle_update_owned_into(
         &mut self,
         envelope: LifecycleEnvelope,
-        out: &mut Vec<Signal>,
-    ) {
-        out.extend(self.on_lifecycle_update_owned(envelope));
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        extend_signal_batch(out, self.on_lifecycle_update_owned(envelope)?)
     }
     fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> {
         Vec::new()

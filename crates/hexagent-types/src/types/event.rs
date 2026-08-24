@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use arrayvec::ArrayVec;
+use serde::{Deserialize, Serialize};
 
 use super::instrument::Instrument;
 use super::market::{
@@ -13,11 +13,39 @@ use super::order::OrderRequest;
 /// by the individual orders have been constructed.
 pub const ORDER_BATCH_CAPACITY: usize = 16;
 
+/// Maximum number of strategy signals produced by one callback. The storage
+/// is inline and reused by the strategy owner, so steady-state quote and
+/// lifecycle dispatch cannot grow a heap-backed `Vec`.
+pub const SIGNAL_BATCH_CAPACITY: usize = 64;
+
 /// Fixed-capacity place payload used by all batch/replace signals.
 pub type OrderBatch = ArrayVec<OrderRequest, ORDER_BATCH_CAPACITY>;
 
 /// Fixed-capacity client-order-id payload used by cancel/update signals.
 pub type OrderIdBatch = ArrayVec<String, ORDER_BATCH_CAPACITY>;
+
+/// Fixed callback output shared by quote, lifecycle, health and watchdog
+/// dispatch. Producers must surface `try_push` failure; silently truncating a
+/// cancel or risk-control signal is not permitted.
+pub type SignalBatch = ArrayVec<Signal, SIGNAL_BATCH_CAPACITY>;
+
+#[derive(Debug)]
+pub struct SignalBatchOverflow {
+    pub signal: Signal,
+}
+
+#[inline]
+pub fn extend_signal_batch(
+    out: &mut SignalBatch,
+    signals: impl IntoIterator<Item = Signal>,
+) -> Result<(), SignalBatchOverflow> {
+    for signal in signals {
+        out.try_push(signal).map_err(|error| SignalBatchOverflow {
+            signal: error.element(),
+        })?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod fixed_batch_tests {
@@ -31,6 +59,25 @@ mod fixed_batch_tests {
         }
         assert_eq!(batch.len(), ORDER_BATCH_CAPACITY);
         assert!(batch.try_push("overflow".to_string()).is_err());
+    }
+
+    #[test]
+    fn fixed_signal_batch_returns_the_first_unqueued_signal() {
+        let mut batch = SignalBatch::new();
+        let signals = (0..=SIGNAL_BATCH_CAPACITY).map(|index| Signal::CancelAll {
+            exchange: Exchange::Polymarket,
+            symbol: index.to_string(),
+            instance_id: "maker".to_string(),
+            timestamp_ns: 1,
+        });
+        let overflow = extend_signal_batch(&mut batch, signals).unwrap_err();
+        assert_eq!(batch.len(), SIGNAL_BATCH_CAPACITY);
+        match overflow.signal {
+            Signal::CancelAll { symbol, .. } => {
+                assert_eq!(symbol, SIGNAL_BATCH_CAPACITY.to_string())
+            }
+            other => panic!("unexpected overflow signal: {other:?}"),
+        }
     }
 }
 
