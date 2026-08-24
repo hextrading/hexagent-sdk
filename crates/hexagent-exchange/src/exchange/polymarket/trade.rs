@@ -86,13 +86,11 @@ struct RuntimeOwnershipIndex {
     shards: Box<[RuntimeOwnershipShard]>,
 }
 
-/// Execution workers serialize only with other writers. The private owner
-/// actor reads an immutable RCU snapshot and can never inherit a lower
-/// priority execution worker's scheduling delay while it holds a map lock.
+/// Writers publish with ArcSwap CAS retries; readers never inherit a lower
+/// priority execution worker's scheduling delay through a map lock.
 #[derive(Debug)]
 struct RuntimeOwnershipShard {
     published: ArcSwap<HashMap<Arc<str>, Arc<RuntimeOwnershipEntry>>>,
-    writer: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -106,7 +104,6 @@ impl RuntimeOwnershipIndex {
             shards: (0..RUNTIME_OWNERSHIP_SHARDS)
                 .map(|_| RuntimeOwnershipShard {
                     published: ArcSwap::from_pointee(HashMap::new()),
-                    writer: Mutex::new(()),
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -133,16 +130,14 @@ impl RuntimeOwnershipIndex {
     }
 
     fn insert(&self, order_id: &str, ownership: OrderOwnership) {
-        let normalized = normalize_order_id(order_id);
+        let normalized = Arc::<str>::from(normalize_order_id(order_id));
         let shard = &self.shards[Self::shard_index(&normalized)];
-        let _writer = shard.writer.lock().unwrap();
-        let current = shard.published.load_full();
-        let mut next = (*current).clone();
-        next.insert(
-            Arc::<str>::from(normalized),
-            Arc::new(RuntimeOwnershipEntry { ownership }),
-        );
-        shard.published.store(Arc::new(next));
+        let entry = Arc::new(RuntimeOwnershipEntry { ownership });
+        shard.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(normalized.clone(), entry.clone());
+            Arc::new(next)
+        });
     }
 
     fn get(&self, order_id: &str) -> Option<OrderOwnership> {
@@ -157,29 +152,39 @@ impl RuntimeOwnershipIndex {
     fn remove(&self, order_id: &str) {
         let normalized = Self::lookup_key(order_id);
         let shard = &self.shards[Self::shard_index(normalized.as_ref())];
-        let _writer = shard.writer.lock().unwrap();
-        let current = shard.published.load_full();
-        if current.contains_key(normalized.as_ref()) {
-            let mut next = (*current).clone();
-            next.remove(normalized.as_ref());
-            shard.published.store(Arc::new(next));
+        if !shard.published.load().contains_key(normalized.as_ref()) {
+            return;
         }
+        shard.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(normalized.as_ref());
+            Arc::new(next)
+        });
     }
 
     fn remove_client_orders(&self, client_order_ids: &HashSet<String>) {
         for shard in &self.shards {
-            let _writer = shard.writer.lock().unwrap();
-            let current = shard.published.load_full();
-            if current
+            if shard
+                .published
+                .load()
                 .values()
                 .any(|entry| client_order_ids.contains(&entry.ownership.client_order_id))
             {
-                let mut next = (*current).clone();
-                next.retain(|_, entry| {
-                    !client_order_ids.contains(&entry.ownership.client_order_id)
+                shard.published.rcu(|current| {
+                    let mut next = (**current).clone();
+                    next.retain(|_, entry| {
+                        !client_order_ids.contains(&entry.ownership.client_order_id)
+                    });
+                    Arc::new(next)
                 });
-                shard.published.store(Arc::new(next));
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.published.store(Arc::new(HashMap::new()));
         }
     }
 }
@@ -1316,6 +1321,156 @@ pub(crate) struct OrderLifecycleTrace {
     pub cancel_dispatched_ns: u64,
 }
 
+/// Immutable execution-state publication consumed by cancel/reconcile/private
+/// workers. The account owner is the only writer; readers take one RCU guard
+/// and never contend with another worker or observe a torn coid/oid update.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecutionStateSnapshot {
+    pub(crate) open_orders: Arc<HashMap<String, TrackedOrder>>,
+    pub(crate) coid_to_oid: Arc<HashMap<String, String>>,
+    pub(crate) oid_to_coid: Arc<HashMap<String, String>>,
+    pub(crate) coid_to_token: Arc<HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+enum ExecutionStateCommand {
+    InstallIdentity {
+        client_order_id: String,
+        exchange_order_id: String,
+        token: String,
+    },
+    TrackOpen {
+        client_order_id: String,
+        tracked: TrackedOrder,
+    },
+    RemoveOpen {
+        client_order_id: String,
+    },
+    RetireMappings {
+        asset_ids: Vec<String>,
+        owned_coids: HashSet<String>,
+    },
+    #[cfg(test)]
+    Clear,
+    #[cfg(test)]
+    BenchmarkPublishOpen {
+        client_order_id: String,
+        tracked: TrackedOrder,
+        enqueued_ns: u64,
+        completion: crossbeam_channel::Sender<u64>,
+    },
+}
+
+struct ExecutionStateOwner {
+    open_orders: HashMap<String, TrackedOrder>,
+    coid_to_oid: HashMap<String, String>,
+    oid_to_coid: HashMap<String, String>,
+    coid_to_token: HashMap<String, String>,
+}
+
+impl ExecutionStateOwner {
+    fn new(current: ExecutionStateSnapshot) -> Self {
+        Self {
+            open_orders: (*current.open_orders).clone(),
+            coid_to_oid: (*current.coid_to_oid).clone(),
+            oid_to_coid: (*current.oid_to_coid).clone(),
+            coid_to_token: (*current.coid_to_token).clone(),
+        }
+    }
+
+    fn apply(&mut self, shared: &SharedState, command: ExecutionStateCommand) {
+        let mut open_changed = false;
+        let mut identity_changed = false;
+        match command {
+            ExecutionStateCommand::InstallIdentity {
+                client_order_id,
+                exchange_order_id,
+                token,
+            } => {
+                let previous = self
+                    .coid_to_oid
+                    .insert(client_order_id.clone(), exchange_order_id.clone());
+                let normalized = normalize_order_id(&exchange_order_id);
+                if let Some(previous) = previous {
+                    let previous = normalize_order_id(&previous);
+                    if previous != normalized {
+                        self.oid_to_coid.remove(&previous);
+                    }
+                }
+                self.oid_to_coid
+                    .insert(normalized, client_order_id.clone());
+                if !token.is_empty() {
+                    self.coid_to_token.insert(client_order_id, token);
+                }
+                identity_changed = true;
+            }
+            ExecutionStateCommand::TrackOpen {
+                client_order_id,
+                tracked,
+            } => {
+                self.open_orders.insert(client_order_id, tracked);
+                open_changed = true;
+            }
+            ExecutionStateCommand::RemoveOpen { client_order_id } => {
+                self.open_orders.remove(&client_order_id);
+                open_changed = true;
+            }
+            ExecutionStateCommand::RetireMappings {
+                asset_ids,
+                owned_coids,
+            } => {
+                reclaim_token_mappings(
+                    &mut self.coid_to_oid,
+                    &mut self.oid_to_coid,
+                    &mut self.coid_to_token,
+                    &asset_ids,
+                    Some(&owned_coids),
+                );
+                shared
+                    .runtime_order_ownership
+                    .remove_client_orders(&owned_coids);
+                identity_changed = true;
+            }
+            #[cfg(test)]
+            ExecutionStateCommand::Clear => {
+                self.open_orders.clear();
+                self.coid_to_oid.clear();
+                self.oid_to_coid.clear();
+                self.coid_to_token.clear();
+                shared.runtime_order_ownership.clear();
+                open_changed = true;
+                identity_changed = true;
+            }
+            #[cfg(test)]
+            ExecutionStateCommand::BenchmarkPublishOpen {
+                client_order_id,
+                tracked,
+                enqueued_ns,
+                completion,
+            } => {
+                self.open_orders.insert(client_order_id, tracked);
+                self.publish(shared, true, false);
+                let _ = completion.send(now_ns().saturating_sub(enqueued_ns));
+                return;
+            }
+        }
+        self.publish(shared, open_changed, identity_changed);
+    }
+
+    fn publish(&self, shared: &SharedState, open_changed: bool, identity_changed: bool) {
+        let mut next = (*shared.execution_state.load_full()).clone();
+        if open_changed {
+            next.open_orders = Arc::new(self.open_orders.clone());
+        }
+        if identity_changed {
+            next.coid_to_oid = Arc::new(self.coid_to_oid.clone());
+            next.oid_to_coid = Arc::new(self.oid_to_coid.clone());
+            next.coid_to_token = Arc::new(self.coid_to_token.clone());
+        }
+        shared.execution_state.store(Arc::new(next));
+    }
+}
+
 fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
     if origin_ns == 0 {
         return -1.0;
@@ -1390,6 +1545,40 @@ struct AttemptAuditJob {
     enqueued_ns: u64,
 }
 
+#[derive(Debug)]
+enum LifecycleTraceJob {
+    Register {
+        client_order_id: String,
+        trace: OrderLifecycleTrace,
+    },
+    Forget {
+        client_order_id: String,
+    },
+    ForgetMany {
+        client_order_ids: HashSet<String>,
+    },
+    CancelSignal {
+        client_order_id: String,
+        signal_ns: u64,
+    },
+    Stage {
+        client_order_id: String,
+        stage: &'static str,
+        exchange_order_id: Option<String>,
+        status: Option<OrderStatus>,
+        trade_id: Option<String>,
+        reason_code: &'static str,
+        reason: String,
+        stage_ns: u64,
+    },
+}
+
+#[derive(Debug)]
+enum AuditJob {
+    Attempt(AttemptAuditJob),
+    Lifecycle(LifecycleTraceJob),
+}
+
 /// Order-level inputs required to replay a live placement in sim_v2.
 ///
 /// This is deliberately an audit payload, not mutable runtime authority.  It
@@ -1435,11 +1624,19 @@ impl AttemptOrderReplica {
     }
 }
 
-const ATTEMPT_AUDIT_QUEUE_CAPACITY: usize = 4_096;
+const EXECUTION_AUDIT_QUEUE_CAPACITY: usize = 4_096;
 
+/// Typed, non-blocking messages consumed by the per-account owner. Commands
+/// must never carry an HTTP future, connection permit, completion closure or
+/// synchronous reply wait: cancel and completion pools remain separate so a
+/// permit waiter cannot occupy the workers needed to release that permit.
 enum AccountLifecycleJob {
     StartupBarrier(crossbeam_channel::Sender<()>),
-    PersistOwnership(OrderOwnership),
+    RegisterLocalOrder {
+        command: ExecutionStateCommand,
+        ownership: Option<OrderOwnership>,
+    },
+    ExecutionState(ExecutionStateCommand),
     DeferredLifecycle(DeferredLifecycleJob),
     PrivateCold(super::user_feed::PrivateColdCommand),
 }
@@ -1918,12 +2115,9 @@ pub struct SharedState {
     pub(crate) instance_id: String,
     /// Account-wide physical/virtual ledger shared by every executor route.
     pub account_state: Arc<hexagent_account::account::shared_account::SharedAccount>,
-    /// Local order tracking: client_order_id → TrackedOrder
-    pub(crate) open_orders: Mutex<HashMap<String, TrackedOrder>>,
-    /// client_order_id → Polymarket orderID (hex hash)
-    pub coid_to_oid: Mutex<HashMap<String, String>>,
-    /// Polymarket orderID → client_order_id
-    pub oid_to_coid: Mutex<HashMap<String, String>>,
+    /// Account-owner-written execution identity and open-order state. Request,
+    /// cancel, completion and private workers read immutable RCU snapshots.
+    execution_state: ArcSwap<ExecutionStateSnapshot>,
     /// Complete ownership captured at the same publication edge as the
     /// runtime OID maps. It is a conservative repair root for the rare case
     /// where a cold snapshot replaces an instance lifecycle row before its
@@ -1939,11 +2133,8 @@ pub struct SharedState {
     /// `<unmapped>` and broadcasting to every instance. This map is reclaimed
     /// only after the strategy's settled-event FIFO explicitly evicts the
     /// event, matching the full late-revision retention window.
-    pub coid_to_token: Mutex<HashMap<String, String>>,
-    /// Quote-origin correlation used by parse-friendly lifecycle logs. Kept
-    /// beyond terminal order state so late private trades and settled-event
-    /// revisions still carry the original quote timestamps.
-    pub(crate) order_lifecycle_traces: Mutex<HashMap<String, OrderLifecycleTrace>>,
+    // `coid_to_token` is retained inside `execution_state` for the same
+    // late-revision lifetime as the bidirectional order identity.
     /// Order IDs (== local EIP-712 order hashes) of the RTT probe's
     /// synthetic resting orders — ring of the most recent 64. The user
     /// feed consults this to identify probe placement / cancellation
@@ -2117,14 +2308,18 @@ pub struct SharedState {
     /// Private account-apply only enqueues the coid; a background worker owns
     /// the readiness check and final teardown.
     account_maintenance_tx: crossbeam_channel::Sender<AccountMaintenanceJob>,
-    /// Lossless, higher-priority lifecycle lane. Both execution replies and
-    /// authenticated private events enter this one account-owned writer.
+    /// Lossless, higher-priority account-owner lane (capacity 16,384). Order
+    /// identity/open-state commands, execution replies and authenticated
+    /// private events share FIFO producer ordering; pre-dispatch overflow
+    /// rejects the order, while terminal overflow marks inventory uncertain.
     account_lifecycle_tx: crossbeam_channel::Sender<AccountLifecycleJob>,
-    /// Multi-producer completion telemetry → one SCHED_OTHER audit worker.
-    /// FIFO capacity is [`ATTEMPT_AUDIT_QUEUE_CAPACITY`]; overflow drops only
+    /// Multi-producer completion/lifecycle telemetry → one SCHED_OTHER audit
+    /// owner. Lifecycle trace overflow is explicitly lossy and cannot delay
+    /// account mutation or execution completion.
+    /// FIFO capacity is [`EXECUTION_AUDIT_QUEUE_CAPACITY`]; overflow drops only
     /// the audit record and logs loudly, never an account/lifecycle mutation.
     /// This lane has no replay because attempt timing is operational telemetry.
-    attempt_audit_tx: crossbeam_channel::Sender<AttemptAuditJob>,
+    attempt_audit_tx: crossbeam_channel::Sender<AuditJob>,
     shutdown_token: ShutdownToken,
     background_worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -2295,25 +2490,35 @@ impl SharedState {
         let _ = self.settled_gc_tx.try_send(());
     }
 
-    fn apply_account_lifecycle_job(&self, job: AccountLifecycleJob) {
+    fn apply_account_lifecycle_job(
+        &self,
+        execution: &mut ExecutionStateOwner,
+        job: AccountLifecycleJob,
+    ) {
         match job {
             AccountLifecycleJob::StartupBarrier(done) => {
                 let _ = done.send(());
             }
-            AccountLifecycleJob::PersistOwnership(ownership) => {
-                if self
-                    .account_state
-                    .backfill_order_ownership(&ownership)
-                    .is_none()
-                {
-                    self.user_feed_health.set_inventory_uncertain(true);
-                    log::error!(
-                        "[PolymarketTrade] async ownership persistence conflict coid={} oid={}",
-                        ownership.client_order_id,
-                        ownership.order_id,
-                    );
+            AccountLifecycleJob::RegisterLocalOrder { command, ownership } => {
+                if let Some(ownership) = ownership {
+                    if self
+                        .account_state
+                        .backfill_order_ownership(&ownership)
+                        .is_none()
+                    {
+                        self.runtime_order_ownership.remove(&ownership.order_id);
+                        self.user_feed_health.set_inventory_uncertain(true);
+                        log::error!(
+                            "[PolymarketTrade] async ownership persistence conflict coid={} oid={}",
+                            ownership.client_order_id,
+                            ownership.order_id,
+                        );
+                        return;
+                    }
                 }
+                execution.apply(self, command);
             }
+            AccountLifecycleJob::ExecutionState(command) => execution.apply(self, command),
             AccountLifecycleJob::DeferredLifecycle(job) => self.apply_deferred_lifecycle(job),
             AccountLifecycleJob::PrivateCold(command) => {
                 super::user_feed::apply_private_cold_command(self, command);
@@ -2333,13 +2538,13 @@ impl SharedState {
         }
     }
 
-    fn run_settled_gc_pass(&self) {
+    fn run_settled_gc_pass(&self, execution: &mut ExecutionStateOwner) {
         if !self.account_state.has_settled_gc_candidates() {
             return;
         }
         let started = crate::latency::Instant::now();
         let (retired_events, retired_live_trades) =
-            self.finalize_ready_settled_audit_retirements();
+            self.finalize_ready_settled_audit_retirements(execution);
         crate::latency::record("polymarket.account.settled_gc", started);
         if retired_events > 0 {
             debug!(
@@ -2353,6 +2558,7 @@ impl SharedState {
 
     fn spawn_account_owner_worker(
         shared: &Arc<Self>,
+        initial_execution_state: ExecutionStateSnapshot,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
         owner_task_rx: crossbeam_channel::Receiver<
             hexagent_account::account::shared_account::AccountOwnerTask,
@@ -2372,6 +2578,7 @@ impl SharedState {
         let handle = std::thread::Builder::new()
             .name(format!("poly-account-owner-{}", shared.instance_id))
             .spawn(move || {
+                let mut execution = ExecutionStateOwner::new(initial_execution_state);
                 crate::os_tune::pin_private_account_cold(
                     "polymarket-account-owner",
                     &account_id,
@@ -2394,7 +2601,7 @@ impl SharedState {
                         // lane is empty. GC is coalesced and runs last.
                         loop {
                             if let Ok(job) = lifecycle_rx.try_recv() {
-                                shared.apply_account_lifecycle_job(job);
+                                shared.apply_account_lifecycle_job(&mut execution, job);
                                 continue;
                             }
                             if let Ok(task) = owner_task_rx.try_recv() {
@@ -2406,7 +2613,7 @@ impl SharedState {
                                 continue;
                             }
                             if settled_gc_rx.try_recv().is_ok() {
-                                shared.run_settled_gc_pass();
+                                shared.run_settled_gc_pass(&mut execution);
                                 continue;
                             }
                             break;
@@ -2415,7 +2622,7 @@ impl SharedState {
                     }
                     crossbeam_channel::select_biased! {
                         recv(lifecycle_rx) -> job => match job {
-                            Ok(job) => shared.apply_account_lifecycle_job(job),
+                            Ok(job) => shared.apply_account_lifecycle_job(&mut execution, job),
                             Err(_) => break,
                         },
                         recv(owner_task_rx) -> task => match task {
@@ -2427,7 +2634,7 @@ impl SharedState {
                             Err(_) => break,
                         },
                         recv(settled_gc_rx) -> wake => match wake {
-                            Ok(()) => shared.run_settled_gc_pass(),
+                            Ok(()) => shared.run_settled_gc_pass(&mut execution),
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> phase => {
@@ -2439,7 +2646,7 @@ impl SharedState {
                             // A certificate may become ready without another
                             // producer wake. This poll is account-owner local
                             // and lower priority than both bounded work lanes.
-                            shared.run_settled_gc_pass();
+                            shared.run_settled_gc_pass(&mut execution);
                         }
                     }
                 }
@@ -2450,30 +2657,31 @@ impl SharedState {
 
     fn spawn_attempt_audit_worker(
         shared: &Arc<Self>,
-        rx: crossbeam_channel::Receiver<AttemptAuditJob>,
+        rx: crossbeam_channel::Receiver<AuditJob>,
     ) -> std::thread::JoinHandle<()> {
         let weak = Arc::downgrade(shared);
         let shutdown = shared.shutdown_token.clone();
         let shutdown_rx = shutdown.subscribe();
         std::thread::Builder::new()
-            .name(format!("poly-attempt-audit-{}", shared.instance_id))
+            .name(format!("poly-execution-audit-{}", shared.instance_id))
             .spawn(move || {
+                let mut lifecycle_traces = HashMap::new();
                 // Audit formatting/export is explicitly lower priority than
                 // lifecycle/account mutation and has its own bounded lane.
-                crate::os_tune::pin_background("polymarket-attempt-audit");
+                crate::os_tune::pin_background("polymarket-execution-audit");
                 loop {
                     let Some(shared) = weak.upgrade() else {
                         break;
                     };
                     if shutdown.is_finished() {
                         while let Ok(job) = rx.try_recv() {
-                            shared.write_attempt_audit(job);
+                            shared.write_audit_job(&mut lifecycle_traces, job);
                         }
                         break;
                     }
                     crossbeam_channel::select_biased! {
                         recv(rx) -> job => match job {
-                            Ok(job) => shared.write_attempt_audit(job),
+                            Ok(job) => shared.write_audit_job(&mut lifecycle_traces, job),
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> _ => continue,
@@ -2640,31 +2848,27 @@ impl SharedState {
         exchange_order_id: &str,
         token: &str,
         ownership: Option<&OrderOwnership>,
-    ) {
+    ) -> Result<(), String> {
         if let Some(ownership) = ownership {
             self.runtime_order_ownership
                 .insert(exchange_order_id, ownership.clone());
         }
-        let previous = self
-            .coid_to_oid
-            .lock()
-            .unwrap()
-            .insert(client_order_id.to_string(), exchange_order_id.to_string());
-        let normalized = normalize_order_id(exchange_order_id);
-        let mut oid_to_coid = self.oid_to_coid.lock().unwrap();
-        if let Some(previous) = previous {
-            let previous = normalize_order_id(&previous);
-            if previous != normalized {
-                oid_to_coid.remove(&previous);
+        let command = ExecutionStateCommand::InstallIdentity {
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: exchange_order_id.to_string(),
+            token: token.to_string(),
+        };
+        if let Err(error) = self
+            .account_lifecycle_tx
+            .try_send(AccountLifecycleJob::ExecutionState(command))
+        {
+            if ownership.is_some() {
+                self.runtime_order_ownership.remove(exchange_order_id);
             }
+            self.user_feed_health.set_inventory_uncertain(true);
+            return Err(format!("execution owner queue unavailable: {error}"));
         }
-        oid_to_coid.insert(normalized, client_order_id.to_string());
-        if !token.is_empty() {
-            self.coid_to_token
-                .lock()
-                .unwrap()
-                .insert(client_order_id.to_string(), token.to_string());
-        }
+        Ok(())
     }
 
     /// Install the deterministic local signing hash in runtime lookup maps.
@@ -2677,38 +2881,91 @@ impl SharedState {
         token: &str,
         ownership: Option<OrderOwnership>,
     ) -> Result<(), String> {
-        self.install_runtime_order_id(
-            client_order_id,
-            exchange_order_id,
-            token,
-            ownership.as_ref(),
-        );
-        let Some(ownership) = ownership else {
-            return Ok(());
+        if let Some(ownership) = ownership.as_ref() {
+            self.runtime_order_ownership
+                .insert(exchange_order_id, ownership.clone());
+        }
+        let command = ExecutionStateCommand::InstallIdentity {
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: exchange_order_id.to_string(),
+            token: token.to_string(),
         };
         if let Err(error) = self
             .account_lifecycle_tx
-            .try_send(AccountLifecycleJob::PersistOwnership(ownership))
+            .try_send(AccountLifecycleJob::RegisterLocalOrder { command, ownership })
         {
             // No HTTP request has been dispatched yet. Roll back the local
             // publication and fail the submit closed instead of blocking the
             // execution actor or allowing an unpersistable live order.
             self.runtime_order_ownership.remove(exchange_order_id);
-            self.coid_to_oid.lock().unwrap().remove(client_order_id);
-            self.oid_to_coid
-                .lock()
-                .unwrap()
-                .remove(&normalize_order_id(exchange_order_id));
-            self.coid_to_token.lock().unwrap().remove(client_order_id);
             return Err(format!("ownership persistence queue unavailable: {error}"));
         }
         Ok(())
     }
 
+    pub(crate) fn execution_snapshot(&self) -> Arc<ExecutionStateSnapshot> {
+        self.execution_state.load_full()
+    }
+
+    pub(crate) fn track_open_order(
+        &self,
+        client_order_id: &str,
+        tracked: TrackedOrder,
+    ) -> Result<(), String> {
+        let command = ExecutionStateCommand::TrackOpen {
+            client_order_id: client_order_id.to_string(),
+            tracked,
+        };
+        self.account_lifecycle_tx
+            .try_send(AccountLifecycleJob::ExecutionState(command))
+            .map_err(|error| {
+                self.user_feed_health.set_inventory_uncertain(true);
+                format!("execution owner queue unavailable: {error}")
+            })
+    }
+
+    fn untrack_open_order(&self, client_order_id: &str) {
+        let command = ExecutionStateCommand::RemoveOpen {
+            client_order_id: client_order_id.to_string(),
+        };
+        if let Err(error) = self
+            .account_lifecycle_tx
+            .try_send(AccountLifecycleJob::ExecutionState(command))
+        {
+            self.user_feed_health.set_inventory_uncertain(true);
+            log::error!(
+                "[PolymarketTrade] execution owner queue unavailable while untracking coid={}: {}",
+                client_order_id,
+                error,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_execution_state_for_test(&self) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        self.account_lifecycle_tx
+            .send(AccountLifecycleJob::StartupBarrier(done_tx))
+            .expect("account owner test barrier enqueue");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("account owner test barrier completion");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_execution_state_for_test(&self) {
+        self.account_lifecycle_tx
+            .send(AccountLifecycleJob::ExecutionState(
+                ExecutionStateCommand::Clear,
+            ))
+            .expect("account owner test clear enqueue");
+        self.flush_execution_state_for_test();
+    }
+
     pub(crate) fn register_order_lifecycle(&self, order: &OrderRequest) {
-        self.order_lifecycle_traces.lock().unwrap().insert(
-            order.client_order_id.clone(),
-            OrderLifecycleTrace {
+        self.enqueue_lifecycle_trace(LifecycleTraceJob::Register {
+            client_order_id: order.client_order_id.clone(),
+            trace: OrderLifecycleTrace {
                 instance_id: order.instance_id.clone(),
                 event_id: order.quote_event_id.clone(),
                 symbol: order.symbol.clone(),
@@ -2725,34 +2982,29 @@ impl SharedState {
                 cancel_prep_ns: 0,
                 cancel_dispatched_ns: 0,
             },
-        );
+        });
     }
 
     pub(crate) fn forget_order_lifecycle(&self, client_order_id: &str) {
-        self.order_lifecycle_traces
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        self.enqueue_lifecycle_trace(LifecycleTraceJob::Forget {
+            client_order_id: client_order_id.to_string(),
+        });
     }
 
     fn record_cancel_signal(&self, client_order_id: &str, signal_ns: u64) {
         if signal_ns == 0 {
             return;
         }
-        if let Some(trace) = self
-            .order_lifecycle_traces
-            .lock()
-            .unwrap()
-            .get_mut(client_order_id)
-        {
-            trace.cancel_signal_ns = signal_ns;
-        }
+        self.enqueue_lifecycle_trace(LifecycleTraceJob::CancelSignal {
+            client_order_id: client_order_id.to_string(),
+            signal_ns,
+        });
     }
 
     pub(crate) fn log_order_lifecycle(
         &self,
         client_order_id: &str,
-        stage: &str,
+        stage: &'static str,
         exchange_order_id: Option<&str>,
         status: Option<OrderStatus>,
         trade_id: Option<&str>,
@@ -2809,7 +3061,7 @@ impl SharedState {
             completed_ns,
             enqueued_ns: now_ns(),
         };
-        if let Err(error) = self.attempt_audit_tx.try_send(job) {
+        if let Err(error) = self.attempt_audit_tx.try_send(AuditJob::Attempt(job)) {
             // This is an audit/measurement loss, not an account mutation.
             // Keep the order completion lane non-blocking and make the loss
             // operationally loud instead of delaying StrategyAccount apply.
@@ -2819,6 +3071,29 @@ impl SharedState {
                 client_order_id,
                 error,
             );
+        }
+    }
+
+    fn enqueue_lifecycle_trace(&self, job: LifecycleTraceJob) {
+        if let Err(error) = self
+            .attempt_audit_tx
+            .try_send(AuditJob::Lifecycle(job))
+        {
+            // Trace state is observability-only. It is intentionally isolated
+            // from the lossless account/execution lane and never backpressures
+            // order completion or private trade application.
+            log::error!("[order_lifecycle] audit queue unavailable: {error}");
+        }
+    }
+
+    fn write_audit_job(
+        &self,
+        lifecycle_traces: &mut HashMap<String, OrderLifecycleTrace>,
+        job: AuditJob,
+    ) {
+        match job {
+            AuditJob::Attempt(job) => self.write_attempt_audit(job),
+            AuditJob::Lifecycle(job) => self.write_lifecycle_trace(lifecycle_traces, job),
         }
     }
 
@@ -2891,11 +3166,11 @@ impl SharedState {
     fn log_order_lifecycle_detail(
         &self,
         client_order_id: &str,
-        stage: &str,
+        stage: &'static str,
         exchange_order_id: Option<&str>,
         status: Option<OrderStatus>,
         trade_id: Option<&str>,
-        reason_code: &str,
+        reason_code: &'static str,
         reason: &str,
     ) {
         // A private fill has no quote/HTTP segment to update. Avoid the trace
@@ -2907,8 +3182,80 @@ impl SharedState {
         {
             return;
         }
-        let stage_ns = now_ns();
-        let mut traces = self.order_lifecycle_traces.lock().unwrap();
+        self.enqueue_lifecycle_trace(LifecycleTraceJob::Stage {
+            client_order_id: client_order_id.to_string(),
+            stage,
+            exchange_order_id: exchange_order_id.map(str::to_string),
+            status,
+            trade_id: trade_id.map(str::to_string),
+            reason_code,
+            reason: reason.to_string(),
+            stage_ns: now_ns(),
+        });
+    }
+
+    fn write_lifecycle_trace(
+        &self,
+        traces: &mut HashMap<String, OrderLifecycleTrace>,
+        job: LifecycleTraceJob,
+    ) {
+        match job {
+            LifecycleTraceJob::Register {
+                client_order_id,
+                trace,
+            } => {
+                traces.insert(client_order_id, trace);
+            }
+            LifecycleTraceJob::Forget { client_order_id } => {
+                traces.remove(&client_order_id);
+            }
+            LifecycleTraceJob::ForgetMany { client_order_ids } => {
+                traces.retain(|coid, _| !client_order_ids.contains(coid));
+            }
+            LifecycleTraceJob::CancelSignal {
+                client_order_id,
+                signal_ns,
+            } => {
+                if let Some(trace) = traces.get_mut(&client_order_id) {
+                    trace.cancel_signal_ns = signal_ns;
+                }
+            }
+            LifecycleTraceJob::Stage {
+                client_order_id,
+                stage,
+                exchange_order_id,
+                status,
+                trade_id,
+                reason_code,
+                reason,
+                stage_ns,
+            } => self.write_order_lifecycle_detail(
+                traces,
+                &client_order_id,
+                stage,
+                exchange_order_id.as_deref(),
+                status,
+                trade_id.as_deref(),
+                reason_code,
+                &reason,
+                stage_ns,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_order_lifecycle_detail(
+        &self,
+        traces: &mut HashMap<String, OrderLifecycleTrace>,
+        client_order_id: &str,
+        stage: &str,
+        exchange_order_id: Option<&str>,
+        status: Option<OrderStatus>,
+        trade_id: Option<&str>,
+        reason_code: &str,
+        reason: &str,
+        stage_ns: u64,
+    ) {
         let mut segment_ns = 0u64;
         let mut segment_name = "";
         if let Some(trace) = traces.get_mut(client_order_id) {
@@ -3008,14 +3355,11 @@ impl SharedState {
             log::log_enabled!(log::Level::Debug)
         };
         if !enabled {
-            // The timestamp/segment metric above is the hot-path contract.
-            // Avoid cloning every string in the trace merely to discover that
-            // the ordinary signed/reserved lifecycle line is debug-disabled.
-            drop(traces);
+            // The producer timestamp preserves the exact measured boundary;
+            // metric aggregation and log decisions stay on this audit owner.
             return;
         }
         let trace = traces.get(client_order_id).cloned();
-        drop(traces);
         let (
             iid,
             event,
@@ -3096,9 +3440,8 @@ impl SharedState {
         // Avoid re-entering the account lifecycle when reconciliation merely
         // repeats an already-installed binding.
         let already_bound = self
+            .execution_snapshot()
             .coid_to_oid
-            .lock()
-            .unwrap()
             .get(client_order_id)
             .is_some_and(|current| {
                 normalize_order_id(current) == normalize_order_id(exchange_order_id)
@@ -3118,19 +3461,28 @@ impl SharedState {
             return;
         }
         let ownership = self.account_state.order(client_order_id);
-        self.install_runtime_order_id(
+        if let Err(error) = self.install_runtime_order_id(
             client_order_id,
             exchange_order_id,
             token,
             ownership.as_ref(),
-        );
+        ) {
+            log::error!(
+                "[PolymarketTrade] cannot publish order identity coid={} oid={}: {}",
+                client_order_id,
+                exchange_order_id,
+                error,
+            );
+        }
     }
 
     /// Look up client_order_id from Polymarket orderID.
     pub fn lookup_coid(&self, exchange_order_id: &str) -> Option<String> {
-        self.oid_to_coid
-            .lock()
-            .unwrap()
+        if let Some(ownership) = self.runtime_order_ownership.get(exchange_order_id) {
+            return Some(ownership.client_order_id);
+        }
+        self.execution_snapshot()
+            .oid_to_coid
             .get(&normalize_order_id(exchange_order_id))
             .cloned()
     }
@@ -3157,12 +3509,18 @@ impl SharedState {
             fallback_started,
         );
         let ownership = ownership?;
-        self.install_runtime_order_id(
+        if let Err(error) = self.install_runtime_order_id(
             &ownership.client_order_id,
             exchange_order_id,
             &ownership.token_id,
             Some(&ownership),
-        );
+        ) {
+            log::error!(
+                "[PolymarketTrade] durable ownership republish failed oid={}: {}",
+                exchange_order_id,
+                error,
+            );
+        }
         Some(ownership)
     }
 
@@ -3180,7 +3538,10 @@ impl SharedState {
     /// Complete account-global settled-audit cleanup only after the durable
     /// shared reference ledger proves every instance has evicted the event and
     /// every associated order/trade is terminal.
-    pub(crate) fn finalize_ready_settled_audit_retirements(&self) -> (usize, usize) {
+    fn finalize_ready_settled_audit_retirements(
+        &self,
+        execution: &mut ExecutionStateOwner,
+    ) -> (usize, usize) {
         let ready = self
             .account_state
             .finalize_ready_settled_audit_retirements();
@@ -3190,10 +3551,8 @@ impl SharedState {
         let retired_events = ready.len();
         let mut retired_runtime_mappings = 0usize;
         for tokens in &ready {
-            let owned_coids: HashSet<String> = self
+            let owned_coids: HashSet<String> = execution
                 .coid_to_token
-                .lock()
-                .unwrap()
                 .iter()
                 .filter(|(_, token)| tokens.contains(*token))
                 .map(|(coid, _)| coid.clone())
@@ -3202,25 +3561,22 @@ impl SharedState {
                 continue;
             }
             let token_list: Vec<String> = tokens.iter().cloned().collect();
-            retired_runtime_mappings = retired_runtime_mappings.saturating_add({
-                let mut coid_to_oid = self.coid_to_oid.lock().unwrap();
-                let mut oid_to_coid = self.oid_to_coid.lock().unwrap();
-                let mut coid_to_token = self.coid_to_token.lock().unwrap();
+            retired_runtime_mappings = retired_runtime_mappings.saturating_add(
                 reclaim_token_mappings(
-                    &mut coid_to_oid,
-                    &mut oid_to_coid,
-                    &mut coid_to_token,
+                    &mut execution.coid_to_oid,
+                    &mut execution.oid_to_coid,
+                    &mut execution.coid_to_token,
                     &token_list,
                     Some(&owned_coids),
-                )
+                ),
+            );
+            self.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
+                client_order_ids: owned_coids.clone(),
             });
-            self.order_lifecycle_traces
-                .lock()
-                .unwrap()
-                .retain(|coid, _| !owned_coids.contains(coid));
             self.runtime_order_ownership
                 .remove_client_orders(&owned_coids);
         }
+        execution.publish(self, false, true);
         let mut live = self.live_position.lock().unwrap();
         let retired_live_trades = ready
             .iter()
@@ -3258,14 +3614,16 @@ impl SharedState {
             effective,
             Some(OrderStatus::Accepted | OrderStatus::PartiallyFilled)
         ) {
-            self.open_orders.lock().unwrap().insert(
-                client_order_id.to_string(),
+            if let Err(error) = self.track_open_order(
+                client_order_id,
                 TrackedOrder {
                     symbol: symbol.to_string(),
                     side,
                     instance_id: instance_id.to_string(),
                 },
-            );
+            ) {
+                log::error!("[PolymarketTrade] cannot restore live order: {error}");
+            }
             self.pending_delayed_orphans
                 .lock()
                 .unwrap()
@@ -3343,7 +3701,7 @@ impl SharedState {
     }
 
     fn remove_cancelled_order_runtime(&self, client_order_id: &str) {
-        self.open_orders.lock().unwrap().remove(client_order_id);
+        self.untrack_open_order(client_order_id);
         self.pending_delayed_orphans
             .lock()
             .unwrap()
@@ -3427,9 +3785,8 @@ impl SharedState {
         account_already_committed: bool,
     ) {
         let terminal_token = if account_already_committed {
-            self.coid_to_token
-                .lock()
-                .unwrap()
+            self.execution_snapshot()
+                .coid_to_token
                 .get(client_order_id)
                 .cloned()
         } else {
@@ -3437,7 +3794,7 @@ impl SharedState {
                 .order(client_order_id)
                 .map(|order| order.token_id)
         };
-        self.open_orders.lock().unwrap().remove(client_order_id);
+        self.untrack_open_order(client_order_id);
         if !account_already_committed {
             self.account_state.release_order(client_order_id, status);
             self.account_state.finish_order_recovery(client_order_id);
@@ -3511,7 +3868,7 @@ impl SharedState {
             }
         };
         if transition.pending() {
-            self.open_orders.lock().unwrap().remove(client_order_id);
+            self.untrack_open_order(client_order_id);
             self.pending_delayed_orphans
                 .lock()
                 .unwrap()
@@ -3549,9 +3906,8 @@ impl SharedState {
         // Once the first job has retired executor tracking, later lifecycle
         // edges are strict background no-ops instead of repeated WAL writes.
         if !self
+            .execution_snapshot()
             .open_orders
-            .lock()
-            .unwrap()
             .contains_key(client_order_id)
         {
             return;
@@ -4573,16 +4929,18 @@ impl PolymarketTrade {
             .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
-            crossbeam_channel::bounded(ATTEMPT_AUDIT_QUEUE_CAPACITY);
+            crossbeam_channel::bounded(EXECUTION_AUDIT_QUEUE_CAPACITY);
+        let initial_execution_state = ExecutionStateSnapshot {
+            open_orders: Arc::new(recovered_open),
+            coid_to_oid: Arc::new(recovered_coid_to_oid),
+            oid_to_coid: Arc::new(recovered_oid_to_coid),
+            coid_to_token: Arc::new(recovered_coid_to_token),
+        };
         let shared = Arc::new(SharedState {
                 instance_id: instance_id.to_string(),
                 account_state,
-                open_orders: Mutex::new(recovered_open),
-                coid_to_oid: Mutex::new(recovered_coid_to_oid),
-                oid_to_coid: Mutex::new(recovered_oid_to_coid),
+                execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
                 runtime_order_ownership: recovered_runtime_ownership,
-                coid_to_token: Mutex::new(recovered_coid_to_token),
-                order_lifecycle_traces: Mutex::new(HashMap::new()),
                 probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
                 auth,
                 signer,
@@ -4631,6 +4989,7 @@ impl PolymarketTrade {
             });
         let (account_owner, account_owner_ready) = SharedState::spawn_account_owner_worker(
             &shared,
+            initial_execution_state,
             account_lifecycle_rx,
             account_owner_task_rx,
             account_maintenance_rx,
@@ -4920,12 +5279,19 @@ impl PolymarketTrade {
                         .reconcile_order_route(&ownership.client_order_id, &anomaly.order_id)
                         .is_some()
                 {
-                    self.shared.install_runtime_order_id(
+                    if let Err(error) = self.shared.install_runtime_order_id(
                         &ownership.client_order_id,
                         &anomaly.order_id,
                         &ownership.token_id,
                         Some(&ownership),
-                    );
+                    ) {
+                        warn!(
+                            "[PolymarketTrade] startup ownership publish failed oid={}: {}",
+                            anomaly.order_id,
+                            error,
+                        );
+                        continue;
+                    }
                     summary.rebuilt = summary.rebuilt.saturating_add(1);
                     info!(
                         "[PolymarketTrade] startup orphan ownership restored from durable row oid={} coid={}",
@@ -5112,7 +5478,7 @@ impl PolymarketTrade {
                         &anomaly.order_id,
                         &identity.asset_id,
                         Some(&ownership),
-                    );
+                    ).ok()?;
                     Some((client_order_id.to_string(), instance_id, identity.clone()))
                 });
 
@@ -5135,14 +5501,17 @@ impl PolymarketTrade {
                             .remove_order_resolved_as(&client_order_id, status);
                     }
                 } else {
-                    self.shared.open_orders.lock().unwrap().insert(
-                        client_order_id.clone(),
+                    if let Err(error) = self.shared.track_open_order(
+                        &client_order_id,
                         TrackedOrder {
                             symbol: identity.asset_id,
                             side: identity.side,
                             instance_id,
                         },
-                    );
+                    ) {
+                        warn!("[PolymarketTrade] startup open-order publish failed: {error}");
+                        continue;
+                    }
                     self.shared
                         .account_state
                         .begin_order_recovery([client_order_id.as_str()]);
@@ -5268,7 +5637,8 @@ impl PolymarketTrade {
                     .startup_query_repair_pending_order_ids()
                     .into_iter()
                     .collect();
-                let ids = self.shared.coid_to_oid.lock().unwrap();
+                let execution = self.shared.execution_snapshot();
+                let ids = &execution.coid_to_oid;
                 coids
                     .into_iter()
                     .filter_map(|coid| {
@@ -5726,8 +6096,9 @@ impl PolymarketTrade {
         token_filter: Option<&HashSet<String>>,
     ) -> RuntimeOrderAuditPass {
         let tracked: Vec<(String, TrackedOrder, String)> = {
-            let open = self.shared.open_orders.lock().unwrap();
-            let ids = self.shared.coid_to_oid.lock().unwrap();
+            let execution = self.shared.execution_snapshot();
+            let open = &execution.open_orders;
+            let ids = &execution.coid_to_oid;
             let mut rows: HashMap<String, (TrackedOrder, String)> = open
                 .iter()
                 .filter(|(_, tracked)| {
@@ -6000,15 +6371,13 @@ impl PolymarketTrade {
     /// Cancel ALL open orders on the CLOB (DELETE /cancel-all, no body).
     pub fn cancel_all_orders(&self) {
         let tracked: Vec<(String, String)> = {
-            let coids: Vec<String> = self
-                .shared
+            let execution = self.shared.execution_snapshot();
+            let coids: Vec<String> = execution
                 .open_orders
-                .lock()
-                .unwrap()
                 .keys()
                 .cloned()
                 .collect();
-            let ids = self.shared.coid_to_oid.lock().unwrap();
+            let ids = &execution.coid_to_oid;
             coids
                 .into_iter()
                 .filter_map(|coid| ids.get(&coid).map(|oid| (coid, oid.clone())))
@@ -6179,7 +6548,7 @@ impl PolymarketTrade {
                     });
                 }
             }
-            let open_orders = self.shared.open_orders.lock().unwrap().len();
+            let open_orders = self.shared.execution_snapshot().open_orders.len();
             let monitoring = self.shared.account_state.monitoring_snapshot();
             let recovery_pending = monitoring.recovery_pending_orders;
             let routine_cancel_audits = monitoring.routine_cancel_audits;
@@ -6215,8 +6584,8 @@ impl PolymarketTrade {
                 "instance-scoped cancel requires a non-empty instance_id"
             ));
         }
-        let coids =
-            instance_owned_open_coids(&self.shared.open_orders.lock().unwrap(), &self.instance_id);
+        let execution = self.shared.execution_snapshot();
+        let coids = instance_owned_open_coids(&execution.open_orders, &self.instance_id);
         if coids.is_empty() {
             return Ok(Vec::new());
         }
@@ -6298,7 +6667,8 @@ impl PolymarketTrade {
                                 json.get("canceled").and_then(|v| v.as_array())
                             {
                                 let coids: Vec<String> = {
-                                    let oid_to_coid = self.shared.oid_to_coid.lock().unwrap();
+                                    let execution = self.shared.execution_snapshot();
+                                    let oid_to_coid = &execution.oid_to_coid;
                                     canceled_ids
                                         .iter()
                                         .filter_map(|value| value.as_str())
@@ -6367,9 +6737,8 @@ impl PolymarketTrade {
             }
             let open_orders = self
                 .shared
+                .execution_snapshot()
                 .open_orders
-                .lock()
-                .unwrap()
                 .values()
                 .filter(|tracked| tokens.contains(&tracked.symbol))
                 .count();
@@ -6462,27 +6831,27 @@ impl PolymarketTrade {
             let owned_coids = shared
                 .account_state
                 .order_ids_for_instance_tokens(&instance_id, &retired_tokens);
-            let reclaimed = {
-                let mut coid_to_oid = shared.coid_to_oid.lock().unwrap();
-                let mut oid_to_coid = shared.oid_to_coid.lock().unwrap();
-                let mut coid_to_token = shared.coid_to_token.lock().unwrap();
-                reclaim_token_mappings(
-                    &mut coid_to_oid,
-                    &mut oid_to_coid,
-                    &mut coid_to_token,
-                    &asset_ids,
-                    Some(&owned_coids),
-                )
+            let reclaimed = owned_coids.len();
+            let command = ExecutionStateCommand::RetireMappings {
+                asset_ids: asset_ids.clone(),
+                owned_coids: owned_coids.clone(),
             };
+            if let Err(error) = shared
+                .account_lifecycle_tx
+                .try_send(AccountLifecycleJob::ExecutionState(command))
             {
-                let mut traces = shared.order_lifecycle_traces.lock().unwrap();
-                for coid in &owned_coids {
-                    traces.remove(coid);
-                }
+                shared.user_feed_health.set_inventory_uncertain(true);
+                warn!(
+                    "[PolymarketTrade] settled runtime retirement queue unavailable instance={} condition={}: {}",
+                    instance_id,
+                    owned_condition_id,
+                    error,
+                );
+                return;
             }
-            shared
-                .runtime_order_ownership
-                .remove_client_orders(&owned_coids);
+            shared.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
+                client_order_ids: owned_coids.clone(),
+            });
             if let Err(error) = shared.account_state.release_settled_event_audit(
                 &instance_id,
                 &owned_condition_id,
@@ -6564,8 +6933,9 @@ impl PolymarketTrade {
         // so they're skipped automatically — the user's "don't repeat
         // cancel" requirement is satisfied by the existing lifecycle.
         let (scope_label, targets): (&'static str, Vec<(String, String)>) = {
-            let open = self.shared.open_orders.lock().unwrap();
-            let coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
+            let execution = self.shared.execution_snapshot();
+            let open = &execution.open_orders;
+            let coid_to_oid = &execution.coid_to_oid;
             let mut targets = Vec::with_capacity(open.len());
             for (c, t) in open.iter() {
                 // Scope to THIS instance's own orders only — a shared-wallet
@@ -7630,7 +8000,12 @@ impl PolymarketTrade {
                 "[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
                 coid, order_id, status, status_str
             );
-            let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
+            let tracked = self
+                .shared
+                .execution_snapshot()
+                .open_orders
+                .get(coid)
+                .cloned();
             let (symbol, side) = tracked
                 .map(|t| (t.symbol, t.side))
                 .unwrap_or_else(|| (String::new(), Side::Buy));
@@ -8232,14 +8607,17 @@ impl PolymarketTrade {
         // here through Submit success / NewOrderTimeout / orphan
         // reconciliation; only definitive `Rejected` (server explicitly
         // refused, e.g. balance / fee / post-only) removes it.
-        self.shared.open_orders.lock().unwrap().insert(
-            order.client_order_id.clone(),
+        if let Err(error) = self.shared.track_open_order(
+            &order.client_order_id,
             TrackedOrder {
                 symbol: order.symbol.clone(),
                 side: order.side,
                 instance_id: self.instance_id.clone(),
             },
-        );
+        ) {
+            self.shared.recycle_request_buffer(body_json);
+            return Err(Self::make_rejected(order, &error));
+        }
 
         Ok(PreparedSubmit {
             local_oid,
@@ -8606,20 +8984,9 @@ impl PolymarketTrade {
         self.shared
             .log_order_lifecycle(client_order_id, "cancel_prep", None, None, None);
         }
-        let order_id = self
-            .shared
-            .coid_to_oid
-            .lock()
-            .unwrap()
-            .get(client_order_id)
-            .cloned();
-        let tracked = self
-            .shared
-            .open_orders
-            .lock()
-            .unwrap()
-            .get(client_order_id)
-            .cloned();
+        let execution = self.shared.execution_snapshot();
+        let order_id = execution.coid_to_oid.get(client_order_id).cloned();
+        let tracked = execution.open_orders.get(client_order_id).cloned();
         let (symbol, side) = tracked
             .map(|t| (t.symbol, t.side))
             .unwrap_or_else(|| (String::new(), Side::Buy));
@@ -8911,8 +9278,9 @@ impl ExchangeTrade for PolymarketTrade {
         let mut order_ids: Vec<String> = Vec::new();
         let mut coids: Vec<String> = Vec::new();
         {
-            let open = self.shared.open_orders.lock().unwrap();
-            let coid_to_oid = self.shared.coid_to_oid.lock().unwrap();
+            let execution = self.shared.execution_snapshot();
+            let open = &execution.open_orders;
+            let coid_to_oid = &execution.coid_to_oid;
             for (coid, tracked) in open.iter() {
                 if tracked.symbol == symbol
                     && (self.instance_id.is_empty() || tracked.instance_id == self.instance_id)
@@ -8999,7 +9367,12 @@ impl ExchangeTrade for PolymarketTrade {
         // evidence may release tracking and collateral.
         let mut updates = Vec::new();
         for (coid, order_id) in coids.iter().zip(order_ids.iter()) {
-            let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
+            let tracked = self
+                .shared
+                .execution_snapshot()
+                .open_orders
+                .get(coid)
+                .cloned();
             let status = response
                 .as_ref()
                 .map(|resp| {
@@ -9179,14 +9552,28 @@ impl ExchangeTrade for PolymarketTrade {
                             all_updates.push(rejected);
                             continue;
                         }
-                        self.shared.open_orders.lock().unwrap().insert(
-                            o.client_order_id.clone(),
+                        if let Err(error) = self.shared.track_open_order(
+                            &o.client_order_id,
                             TrackedOrder {
                                 symbol: o.symbol.clone(),
                                 side: o.side,
                                 instance_id: self.instance_id.clone(),
                             },
-                        );
+                        ) {
+                            let rejected = Self::make_rejected(o, &error);
+                            self.shared.remove_order_resolved_as(
+                                &o.client_order_id,
+                                OrderStatus::Rejected,
+                            );
+                            self.shared.log_preflight_rejected(
+                                &o.client_order_id,
+                                Some(&order_hash),
+                                &rejected,
+                            );
+                            self.shared.forget_order_lifecycle(&o.client_order_id);
+                            all_updates.push(rejected);
+                            continue;
+                        }
                         signed_hashes.push(order_hash);
                         bodies.push(b);
                         body_to_chunk.push(idx);
@@ -9513,7 +9900,8 @@ impl ExchangeTrade for PolymarketTrade {
         let mut sent_coids: Vec<String> = Vec::new();
         let mut unmapped_coids: Vec<String> = Vec::new();
         {
-            let map = self.shared.coid_to_oid.lock().unwrap();
+            let execution = self.shared.execution_snapshot();
+            let map = &execution.coid_to_oid;
             for coid in client_order_ids {
                 if let Some(oid) = map.get(coid) {
                     order_ids.push(oid.clone());
@@ -9561,7 +9949,7 @@ impl ExchangeTrade for PolymarketTrade {
                 std::collections::HashMap::new();
             let fallback_outcome: OrderStatus = match self.delete_detailed(path, &body) {
                 Ok(resp) => {
-                    let oid_to_coid = self.shared.oid_to_coid.lock().unwrap().clone();
+                    let oid_to_coid = self.shared.execution_snapshot().oid_to_coid.clone();
                     let canceled_oids: Vec<String> = resp
                         .get("canceled")
                         .and_then(|v| v.as_array())
@@ -9670,8 +10058,9 @@ impl ExchangeTrade for PolymarketTrade {
             };
             let mut updates = Vec::new();
             for coid in client_order_ids {
-                let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
-                let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
+                let execution = self.shared.execution_snapshot();
+                let tracked = execution.open_orders.get(coid).cloned();
+                let order_id = execution.coid_to_oid.get(coid).cloned();
                 let mut outcome = per_coid_outcome
                     .get(coid)
                     .copied()
@@ -9721,7 +10110,12 @@ impl ExchangeTrade for PolymarketTrade {
         // so OrderManager can retry after the mapping catches up.
         let mut updates = Vec::new();
         for coid in client_order_ids {
-            let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
+            let tracked = self
+                .shared
+                .execution_snapshot()
+                .open_orders
+                .get(coid)
+                .cloned();
             updates.push(OrderUpdate {
                 client_order_id: coid.clone(),
                 exchange,
@@ -9901,7 +10295,8 @@ impl ExchangeTrade for PolymarketTrade {
             );
         }
         {
-            let map = self.shared.coid_to_oid.lock().unwrap();
+            let execution = self.shared.execution_snapshot();
+            let map = &execution.coid_to_oid;
             for coid in cancel_client_order_ids {
                 self.shared.record_cancel_signal(coid, self.gen_ns_hint);
                 self.shared.log_order_lifecycle(
@@ -10015,14 +10410,28 @@ impl ExchangeTrade for PolymarketTrade {
                     // Same sign-time open_orders insert as `submit_kickoff`
                     // and `batch_submit_orders` so all submit paths share
                     // the "open_orders = may be on server" invariant.
-                    self.shared.open_orders.lock().unwrap().insert(
-                        o.client_order_id.clone(),
+                    if let Err(error) = self.shared.track_open_order(
+                        &o.client_order_id,
                         TrackedOrder {
                             symbol: o.symbol.clone(),
                             side: o.side,
                             instance_id: self.instance_id.clone(),
                         },
-                    );
+                    ) {
+                        let rejected = Self::make_rejected(o, &error);
+                        self.shared.remove_order_resolved_as(
+                            &o.client_order_id,
+                            OrderStatus::Rejected,
+                        );
+                        self.shared.log_preflight_rejected(
+                            &o.client_order_id,
+                            Some(&order_hash),
+                            &rejected,
+                        );
+                        self.shared.forget_order_lifecycle(&o.client_order_id);
+                        place_sign_failures.push(rejected);
+                        continue;
+                    }
                     place_signed.push(order_hash);
                     place_bodies.push(b);
                     place_body_to_chunk.push(idx);
@@ -10156,7 +10565,7 @@ impl ExchangeTrade for PolymarketTrade {
                     {
                     Ok(resp) => {
                         // Both /order and /orders return { canceled: [...], not_canceled: {...} }.
-                        let oid_to_coid = self.shared.oid_to_coid.lock().unwrap().clone();
+                        let oid_to_coid = self.shared.execution_snapshot().oid_to_coid.clone();
                             let canceled_oids: Vec<String> = resp
                                 .get("canceled")
                             .and_then(|v| v.as_array())
@@ -10271,8 +10680,9 @@ impl ExchangeTrade for PolymarketTrade {
         };
         if let Some((fallback_outcome, per_coid_outcome)) = cancel_outcome {
             for coid in cancel_client_order_ids {
-                let tracked = self.shared.open_orders.lock().unwrap().get(coid).cloned();
-                let order_id = self.shared.coid_to_oid.lock().unwrap().get(coid).cloned();
+                let execution = self.shared.execution_snapshot();
+                let tracked = execution.open_orders.get(coid).cloned();
+                let order_id = execution.coid_to_oid.get(coid).cloned();
                 let mut outcome = per_coid_outcome
                     .get(coid)
                     .copied()
@@ -10769,6 +11179,104 @@ mod tests {
         assert_eq!(shared.join_background_workers(), 2);
     }
 
+    #[test]
+    fn execution_owner_publication_has_bounded_tail_ordering_and_no_overflow() {
+        const EVENTS: usize = 128;
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        let shared = trade.shared_state();
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(EVENTS);
+        let mut queue_peak = 0usize;
+        let mut overflow = 0usize;
+
+        for index in 0..EVENTS {
+            let command = ExecutionStateCommand::BenchmarkPublishOpen {
+                client_order_id: format!("benchmark-{index}"),
+                tracked: TrackedOrder {
+                    symbol: format!("token-{index}"),
+                    side: Side::Buy,
+                    instance_id: "benchmark-owner".to_string(),
+                },
+                enqueued_ns: now_ns(),
+                completion: completion_tx.clone(),
+            };
+            if shared
+                .account_lifecycle_tx
+                .try_send(AccountLifecycleJob::ExecutionState(command))
+                .is_err()
+            {
+                overflow += 1;
+            }
+            queue_peak = queue_peak.max(shared.account_lifecycle_tx.len());
+        }
+        drop(completion_tx);
+
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS - overflow {
+            samples.push(
+                completion_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("execution owner publication stalled"),
+            );
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let snapshot = shared.execution_snapshot();
+        assert_eq!(snapshot.open_orders.len(), EVENTS);
+        assert_eq!(
+            snapshot.open_orders["benchmark-127"].symbol,
+            "token-127",
+            "FIFO application must publish the final command",
+        );
+        let p50 = percentile(1, 2);
+        let p99 = percentile(99, 100);
+        let p999 = percentile(999, 1_000);
+        let max = *samples.last().unwrap();
+        eprintln!(
+            "execution-owner publication: boundary=try_send_to_arc_swap_store n={} min_ns={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_peak={} overflow={}",
+            samples.len(), samples[0], p50, p99, p999, max, queue_peak, overflow,
+        );
+        assert_eq!(overflow, 0);
+        assert!(
+            max < 50_000_000,
+            "execution owner publication maximum exceeded 50 ms: {max} ns",
+        );
+
+        shutdown.request();
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 2);
+    }
+
+    #[test]
+    fn execution_owner_lane_overflow_is_bounded_and_preserves_the_command() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let command = || {
+            AccountLifecycleJob::ExecutionState(ExecutionStateCommand::TrackOpen {
+                client_order_id: "bounded-coid".to_string(),
+                tracked: TrackedOrder {
+                    symbol: "TOKEN".to_string(),
+                    side: Side::Buy,
+                    instance_id: "owner".to_string(),
+                },
+            })
+        };
+        tx.try_send(command()).unwrap();
+        assert!(matches!(
+            tx.try_send(command()),
+            Err(crossbeam_channel::TrySendError::Full(
+                AccountLifecycleJob::ExecutionState(ExecutionStateCommand::TrackOpen { .. })
+            )),
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AccountLifecycleJob::ExecutionState(
+                ExecutionStateCommand::TrackOpen { .. }
+            )),
+        ));
+    }
+
     fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
         OrderOwnership {
             account_id: "acct".into(),
@@ -10792,20 +11300,25 @@ mod tests {
 
     #[test]
     fn runtime_ownership_reader_never_waits_for_writer_serialization() {
-        let index = RuntimeOwnershipIndex::new();
+        let index = Arc::new(RuntimeOwnershipIndex::new());
         let ownership = runtime_ownership("0xABC", "maker-1");
         index.insert(&ownership.order_id, ownership.clone());
 
-        let normalized = normalize_order_id(&ownership.order_id);
-        let shard = &index.shards[RuntimeOwnershipIndex::shard_index(&normalized)];
-        let _writer = shard.writer.lock().unwrap();
+        let writer_index = index.clone();
+        let writer = std::thread::spawn(move || {
+            for sequence in 0..1_000 {
+                let oid = format!("0x{sequence:064x}");
+                writer_index.insert(&oid, runtime_ownership(&oid, "writer"));
+            }
+        });
         assert_eq!(
             index
                 .get(&ownership.order_id)
                 .map(|value| value.client_order_id),
             Some("maker-1".to_string()),
-            "an RCU reader must remain available while a lower-priority writer is serialized",
+            "an RCU reader must remain available while another writer publishes",
         );
+        writer.join().unwrap();
     }
 
     #[test]
