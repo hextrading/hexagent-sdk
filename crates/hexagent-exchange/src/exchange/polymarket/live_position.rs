@@ -7,7 +7,7 @@
 //! - `available_balance()`: conservative cash estimate for buy order sizing
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::types::{now_ns, OrderUpdate, Side};
@@ -55,6 +55,10 @@ pub struct UserFeedHealth {
     last_valid_business_event_ns: AtomicU64,
     strategy_consumer_ready_fast: AtomicBool,
     strategy_consumer_ready_notify: tokio::sync::Notify,
+    /// Common-path membership guard for ordinary private updates. Only a
+    /// reconnect epoch with enrolled, unacknowledged updates can enter the
+    /// cold recovery-delivery mutex below.
+    recovery_pending_fast: AtomicUsize,
     recovery_delivery: Mutex<RecoveryDeliveryState>,
 }
 
@@ -99,6 +103,7 @@ struct RecoveryDeliveryState {
 #[derive(Debug)]
 pub struct RecoveryUpdateAck {
     health: Arc<UserFeedHealth>,
+    generation: u64,
     instance_id: String,
     update: OrderUpdate,
 }
@@ -108,7 +113,11 @@ impl Drop for RecoveryUpdateAck {
         if !std::thread::panicking() {
             let _ = self
                 .health
-                .acknowledge_recovery_update(&self.instance_id, &self.update);
+                .acknowledge_recovery_update_generation(
+                    self.generation,
+                    &self.instance_id,
+                    &self.update,
+                );
         }
     }
 }
@@ -126,6 +135,7 @@ impl UserFeedHealth {
             last_valid_business_event_ns: AtomicU64::new(0),
             strategy_consumer_ready_fast: AtomicBool::new(false),
             strategy_consumer_ready_notify: tokio::sync::Notify::new(),
+            recovery_pending_fast: AtomicUsize::new(0),
             recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
         }
     }
@@ -192,6 +202,7 @@ impl UserFeedHealth {
         delivery.enrolling = true;
         delivery.pending.clear();
         delivery.startup_buffer.clear();
+        self.recovery_pending_fast.store(0, Ordering::Release);
         delivery.generation
     }
 
@@ -227,6 +238,7 @@ impl UserFeedHealth {
             .pending
             .entry(RecoveryUpdateKey::new(instance_id, update))
             .or_insert(0) += 1;
+        self.recovery_pending_fast.fetch_add(1, Ordering::Release);
         if buffer_update {
             delivery
                 .startup_buffer
@@ -291,6 +303,28 @@ impl UserFeedHealth {
     /// instance id is part of the key.
     pub fn acknowledge_recovery_update(&self, instance_id: &str, update: &OrderUpdate) -> bool {
         let mut delivery = self.recovery_delivery.lock().unwrap();
+        Self::acknowledge_recovery_update_locked(self, &mut delivery, instance_id, update)
+    }
+
+    fn acknowledge_recovery_update_generation(
+        &self,
+        generation: u64,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> bool {
+        let mut delivery = self.recovery_delivery.lock().unwrap();
+        if delivery.generation != generation {
+            return false;
+        }
+        Self::acknowledge_recovery_update_locked(self, &mut delivery, instance_id, update)
+    }
+
+    fn acknowledge_recovery_update_locked(
+        &self,
+        delivery: &mut RecoveryDeliveryState,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> bool {
         let key = RecoveryUpdateKey::new(instance_id, update);
         let Some(count) = delivery.pending.get_mut(&key) else {
             return false;
@@ -300,6 +334,7 @@ impl UserFeedHealth {
         } else {
             delivery.pending.remove(&key);
         }
+        self.recovery_pending_fast.fetch_sub(1, Ordering::Release);
         true
     }
 
@@ -308,6 +343,9 @@ impl UserFeedHealth {
         instance_id: &str,
         update: &OrderUpdate,
     ) -> Option<RecoveryUpdateAck> {
+        if self.recovery_pending_fast.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         let delivery = self.recovery_delivery.lock().unwrap();
         if delivery.pending.is_empty() {
             return None;
@@ -318,6 +356,7 @@ impl UserFeedHealth {
             .contains_key(&key)
             .then(|| RecoveryUpdateAck {
                 health: Arc::clone(self),
+                generation: delivery.generation,
                 instance_id: instance_id.to_string(),
                 update: update.clone(),
             })
@@ -766,6 +805,57 @@ mod user_feed_health_tests {
             assert_eq!(h.recovery_delivery_progress(generation), Some((true, 1)));
         }
         assert_eq!(h.recovery_delivery_progress(generation), Some((true, 0)));
+    }
+
+    #[test]
+    fn superseded_recovery_ack_cannot_consume_the_next_generation() {
+        let h = std::sync::Arc::new(UserFeedHealth::new());
+        let update = recovery_update("btc01-replayed");
+        let old_generation = h.begin_recovery_delivery();
+        h.register_recovery_update(old_generation, "btc01", &update)
+            .unwrap();
+        let old_guard = h.recovery_update_ack("btc01", &update).unwrap();
+
+        let new_generation = h.begin_recovery_delivery();
+        h.register_recovery_update(new_generation, "btc01", &update)
+            .unwrap();
+        assert!(h.finish_recovery_delivery_enrollment(new_generation));
+        drop(old_guard);
+
+        assert_eq!(
+            h.recovery_delivery_progress(new_generation),
+            Some((true, 1)),
+        );
+        assert!(h.acknowledge_recovery_update("btc01", &update));
+        assert_eq!(
+            h.recovery_delivery_progress(new_generation),
+            Some((true, 0)),
+        );
+    }
+
+    #[test]
+    fn ordinary_private_update_recovery_fast_miss_latency_profile() {
+        const EVENTS: usize = 20_000;
+        let h = std::sync::Arc::new(UserFeedHealth::new());
+        let update = recovery_update("btc01-fast-miss");
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = std::time::Instant::now();
+            assert!(h.recovery_update_ack("btc01", &update).is_none());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        eprintln!(
+            "private recovery fast miss: boundary=order_update_to_recovery_membership n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+        );
     }
 }
 
