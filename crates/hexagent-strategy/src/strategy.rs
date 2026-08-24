@@ -1,4 +1,8 @@
-use crate::types::{AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, MarketDataHealth, OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick};
+use crate::types::{
+    AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, MarketDataHealth,
+    OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick,
+};
+use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 
 /// Trait for trading strategies.
 pub trait Strategy: Send {
@@ -11,7 +15,9 @@ pub trait Strategy: Send {
     /// Default empty string → spans still enter but the field is
     /// just an empty value; non-empty strategies should override
     /// (Polymaker / Hexmaker do).
-    fn instance_id(&self) -> &str { "" }
+    fn instance_id(&self) -> &str {
+        ""
+    }
 
     /// Stable market-data symbols this instance subscribes to, used by
     /// the live/paper per-instance market router to fan each event only
@@ -24,15 +30,19 @@ pub trait Strategy: Send {
     /// `Instrument` events and attributes them to the instance whose
     /// subscribed set contains the instrument's slug.
     ///
-    /// Default empty ⇒ the router broadcasts every event to this
-    /// instance (legacy behaviour: receive-all then filter internally).
-    /// Strategies that co-host with others should override.
-    fn subscribed_symbols(&self) -> Vec<String> { Vec::new() }
+    /// Default empty means no symbol-scoped market data is delivered. This is
+    /// deliberately fail-closed: an omitted subscription must never degrade
+    /// into process-wide broadcast as instance counts grow.
+    fn subscribed_symbols(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     fn on_orderbook(&mut self, _ob: &OrderBookSnapshot) {}
     fn on_trade_tick(&mut self, _trade: &TradeTick) {}
     fn on_quote_tick(&mut self, _quote: &QuoteTick) {}
-    fn on_quote(&mut self, _ts_event: u64) -> Vec<Signal> { Vec::new() }
+    fn on_quote(&mut self, _ts_event: u64) -> Vec<Signal> {
+        Vec::new()
+    }
     /// Allocation-aware quote callback. Engines keep `out` capacity across
     /// ticks; latency-sensitive strategies should override this method and
     /// append directly. The default preserves source compatibility while
@@ -40,24 +50,34 @@ pub trait Strategy: Send {
     fn on_quote_into(&mut self, ts_event: u64, out: &mut Vec<Signal>) {
         out.extend(self.on_quote(ts_event));
     }
-    fn quote_interval_ms(&self) -> u64 { 0 }
+    fn quote_interval_ms(&self) -> u64 {
+        0
+    }
     /// When true, only Binance OrderBook events drive the quote cadence;
     /// other venues' OrderBooks update internal state but don't trigger
     /// `on_quote`. Default false = any OrderBook triggers.
-    fn quote_trigger_binance_ob_only(&self) -> bool { false }
+    fn quote_trigger_binance_ob_only(&self) -> bool {
+        false
+    }
     /// Fractional early-trigger tolerance for the quote-cadence gate: an
     /// OrderBook arriving `>= interval × (1 - frac)` after the last quote
     /// fires a quote, absorbing local-timestamp jitter. Default 0.0 = exact.
-    fn quote_interval_tolerance_frac(&self) -> f64 { 0.0 }
+    fn quote_interval_tolerance_frac(&self) -> f64 {
+        0.0
+    }
     /// When true, EVERY OrderBook event triggers a quote (tick-by-tick),
     /// bypassing the `quote_interval_ms` cadence gate — UNLESS
     /// `cadence_rtt_throttle` is also true. Default false.
-    fn quote_tick_by_tick(&self) -> bool { false }
+    fn quote_tick_by_tick(&self) -> bool {
+        false
+    }
     /// Backpressure gate: when true, the rolling tail-RTT detector has
     /// flagged the current event as congested, so tick-by-tick is
     /// suppressed and cadence falls back to the interval throttle.
     /// Default false ⇒ tick-by-tick never suppressed by this path.
-    fn cadence_rtt_throttle(&self) -> bool { false }
+    fn cadence_rtt_throttle(&self) -> bool {
+        false
+    }
     fn on_bar(&mut self, _bar: &BarData) {}
     fn on_spot_price(&mut self, _sp: &SpotPrice) {}
     /// Perp asset-context push (Hyperliquid `activeAssetCtx`: funding rate,
@@ -65,24 +85,57 @@ pub trait Strategy: Send {
     /// Default no-op — perp makers override to consume funding/oracle.
     fn on_asset_ctx(&mut self, _ctx: &AssetCtxTick) {}
     fn on_instrument(&mut self, _inst: &Instrument) {}
-    fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> { Vec::new() }
+    fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> {
+        Vec::new()
+    }
     /// Condition-scoped market-data readiness.  Implementations may cancel
     /// only the affected market while the exchange transport remains live.
-    fn on_market_data_health(&mut self, _health: &MarketDataHealth) -> Vec<Signal> { Vec::new() }
+    fn on_market_data_health(&mut self, _health: &MarketDataHealth) -> Vec<Signal> {
+        Vec::new()
+    }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
     /// Wall-clock safety callback for live workers. It runs even when every
     /// market-data source is silent, allowing a strategy to cancel resting
     /// orders without using a stale quote event as the trigger.
-    fn on_watchdog(&mut self, _now_ns: u64) -> Vec<Signal> { Vec::new() }
+    fn on_watchdog(&mut self, _now_ns: u64) -> Vec<Signal> {
+        Vec::new()
+    }
     fn on_exit(&mut self) {}
+
+    /// Transfer an optional venue-private event lane to the engine at strategy
+    /// worker startup. The engine gives it priority over market data and calls
+    /// `on_order_update_owned` on this same owner thread. Implementations must
+    /// return the lane at most once.
+    fn take_private_update_lane(&mut self) -> Option<PrivateUpdateLane> {
+        None
+    }
+
+    /// Connectivity/overflow notification for the private lane. `Overflow`
+    /// means a non-replayable lifecycle update may be missing; live strategies
+    /// should enter inventory-uncertain and emit cancels without reopening until
+    /// an authoritative account snapshot has been applied.
+    fn on_private_feed_control(&mut self, _control: PrivateFeedControl) -> Vec<Signal> {
+        Vec::new()
+    }
     /// Handle an OrderUpdate arriving from an exchange. Returning a non-empty
     /// `Vec<Signal>` lets the strategy react synchronously — e.g. fire a
     /// `Signal::ReconcilePolymarket` the moment a `NewOrderTimeout` /
     /// `CancelOrderTimeout` lands, rather than waiting for the next
     /// `on_quote` tick to notice the orphan.
-    fn on_order_update(&mut self, _update: &OrderUpdate) -> Vec<Signal> { Vec::new() }
-    fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> { Vec::new() }
+    fn on_order_update(&mut self, _update: &OrderUpdate) -> Vec<Signal> {
+        Vec::new()
+    }
+
+    /// Owned update hook used by private and executor lanes. The default keeps
+    /// existing strategies source compatible; strategies with bounded dedupe
+    /// tables may override it and retain the message's IDs without cloning.
+    fn on_order_update_owned(&mut self, update: OrderUpdate) -> Vec<Signal> {
+        self.on_order_update(&update)
+    }
+    fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> {
+        Vec::new()
+    }
     fn on_hist_bar(&mut self, _bar: &BarData) {}
     /// Called after all historical bars from load_hist_data have been
     /// delivered. `end_ns` is the load's target end (≈now in live, `start_ns`
@@ -134,7 +187,9 @@ pub trait Strategy: Send {
     fn apv2_warmup_finalize_cache(&mut self) {}
 
     fn on_init(&mut self) {}
-    fn on_shutdown(&mut self) -> Vec<Signal> { Vec::new() }
+    fn on_shutdown(&mut self) -> Vec<Signal> {
+        Vec::new()
+    }
 
     /// **BT engine hook**: push a one-shot per-event override of the RTT
     /// gate's `prev_event_p_ms`. The engine calls this just before the
@@ -156,10 +211,7 @@ pub trait Strategy: Send {
 /// polymaker / hexmaker instances become trivially grep-able per
 /// instance without touching every log macro in the strategy code.
 #[inline]
-pub fn dispatch_in_span<S: Strategy + ?Sized, R>(
-    s: &mut S,
-    f: impl FnOnce(&mut S) -> R,
-) -> R {
+pub fn dispatch_in_span<S: Strategy + ?Sized, R>(s: &mut S, f: impl FnOnce(&mut S) -> R) -> R {
     let span = tracing::info_span!("strat", iid = %s.instance_id());
     let _g = span.enter();
     f(s)

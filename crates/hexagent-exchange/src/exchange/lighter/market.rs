@@ -16,9 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::types::{
-    now_ns, Exchange, MarketEvent, OrderBookSnapshot, PriceLevel, Side, TradeTick,
-};
+use crate::types::{now_ns, Exchange, MarketEvent, OrderBookSnapshot, PriceLevel, Side, TradeTick};
 
 use super::info::LighterMeta;
 
@@ -64,8 +62,12 @@ impl LocalBook {
     fn apply_side(side: &mut BTreeMap<u64, f64>, levels: &[serde_json::Value]) {
         for lvl in levels {
             let (Some(px), Some(sz)) = (
-                lvl.get("price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
-                lvl.get("size").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                lvl.get("price")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()),
+                lvl.get("size")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()),
             ) else {
                 continue;
             };
@@ -86,13 +88,19 @@ impl LocalBook {
             .iter()
             .rev()
             .take(MAX_DEPTH)
-            .map(|(p, q)| PriceLevel { price: f64::from_bits(*p), quantity: *q })
+            .map(|(p, q)| PriceLevel {
+                price: f64::from_bits(*p),
+                quantity: *q,
+            })
             .collect();
         let asks = self
             .asks
             .iter()
             .take(MAX_DEPTH)
-            .map(|(p, q)| PriceLevel { price: f64::from_bits(*p), quantity: *q })
+            .map(|(p, q)| PriceLevel {
+                price: f64::from_bits(*p),
+                quantity: *q,
+            })
             .collect();
         (bids, asks)
     }
@@ -120,7 +128,11 @@ async fn lighter_ws_task(
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Lighter] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Lighter] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -141,7 +153,10 @@ async fn lighter_ws_task(
                 }
             }
         }
-        info!("[Lighter] Connected, subscribed order_book+trade for {:?}", market_ids);
+        info!(
+            "[Lighter] Connected, subscribed order_book+trade for {:?}",
+            market_ids
+        );
 
         let mut books: HashMap<i16, LocalBook> = HashMap::new();
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
@@ -230,7 +245,7 @@ async fn lighter_ws_task(
                                         exchange_timestamp_ns: ts,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                                 "update/trade" => {
                                     let channel = data.get("channel").and_then(|v| v.as_str()).unwrap_or("");
@@ -261,7 +276,7 @@ async fn lighter_ws_task(
                                             exchange_timestamp_ns: ts,
                                             local_timestamp_ns: now_ns(),
                                         });
-                                        if event_tx.send(event).is_err() { return; }
+                                        if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                     }
                                 }
                                 // connected / subscribed/trade (history) / pong — ignore.
@@ -279,10 +294,14 @@ async fn lighter_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -303,7 +322,10 @@ impl super::super::ExchangeMarket for LighterMarket {
                     market_ids.insert(mid, sym.clone());
                 }
                 None => {
-                    return Err(anyhow!("lighter: unknown symbol `{}` (not in orderBookDetails)", sym));
+                    return Err(anyhow!(
+                        "lighter: unknown symbol `{}` (not in orderBookDetails)",
+                        sym
+                    ));
                 }
             }
         }
@@ -323,7 +345,10 @@ impl super::super::ExchangeMarket for LighterMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),

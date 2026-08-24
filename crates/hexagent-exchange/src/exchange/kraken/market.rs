@@ -43,14 +43,20 @@ async fn kraken_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Kraken] Connecting to {}", KRAKEN_WS_URL);
         let stream = match tokio_tungstenite::connect_async(KRAKEN_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Kraken] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Kraken] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -127,7 +133,7 @@ async fn kraken_ws_task(
                                     exchange_timestamp_ns: now_ns(),
                                     local_timestamp_ns: now_ns(),
                                 });
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                             }
                         }
                         Message::Ping(payload) => {
@@ -141,10 +147,14 @@ async fn kraken_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -169,7 +179,10 @@ impl ExchangeMarket for KrakenMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -185,5 +198,7 @@ impl ExchangeMarket for KrakenMarket {
         info!("[Kraken] Disconnected");
     }
 
-    fn name(&self) -> &str { "kraken" }
+    fn name(&self) -> &str {
+        "kraken"
+    }
 }

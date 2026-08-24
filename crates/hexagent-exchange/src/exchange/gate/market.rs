@@ -43,14 +43,20 @@ async fn gate_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Gate] Connecting to {}", GATE_WS_URL);
         let stream = match tokio_tungstenite::connect_async(GATE_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Gate] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Gate] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -66,7 +72,10 @@ async fn gate_ws_task(
                 "event": "subscribe",
                 "payload": [symbol, "5", "100ms"],
             });
-            if write.send(Message::Text(msg.to_string())).await.is_err() { sub_failed = true; break; }
+            if write.send(Message::Text(msg.to_string())).await.is_err() {
+                sub_failed = true;
+                break;
+            }
 
             let msg = serde_json::json!({
                 "time": chrono::Utc::now().timestamp(),
@@ -74,9 +83,14 @@ async fn gate_ws_task(
                 "event": "subscribe",
                 "payload": [symbol],
             });
-            if write.send(Message::Text(msg.to_string())).await.is_err() { sub_failed = true; break; }
+            if write.send(Message::Text(msg.to_string())).await.is_err() {
+                sub_failed = true;
+                break;
+            }
         }
-        if sub_failed { continue; }
+        if sub_failed {
+            continue;
+        }
 
         info!("[Gate] Connected, subscribed to {:?}", symbols);
 
@@ -160,7 +174,7 @@ async fn gate_ws_task(
                                         exchange_timestamp_ns: ts_ns,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                                 continue;
                             }
@@ -202,7 +216,7 @@ async fn gate_ws_task(
                                 exchange_timestamp_ns: ts_ms * 1_000_000,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
                         Message::Ping(payload) => {
                             let _ = write.send(Message::Pong(payload)).await;
@@ -215,10 +229,14 @@ async fn gate_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -243,7 +261,10 @@ impl ExchangeMarket for GateMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -259,5 +280,7 @@ impl ExchangeMarket for GateMarket {
         info!("[Gate] Disconnected");
     }
 
-    fn name(&self) -> &str { "gate" }
+    fn name(&self) -> &str {
+        "gate"
+    }
 }

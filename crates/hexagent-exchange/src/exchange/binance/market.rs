@@ -119,8 +119,8 @@ enum RestProbeResult {
 impl RestProbeResult {
     fn label(self) -> &'static str {
         match self {
-            RestProbeResult::Ok       => "REST=alive (WS-only outage — likely endpoint migrated)",
-            RestProbeResult::Failed   => "REST=failed (network / DNS / firewall — check upstream)",
+            RestProbeResult::Ok => "REST=alive (WS-only outage — likely endpoint migrated)",
+            RestProbeResult::Failed => "REST=failed (network / DNS / firewall — check upstream)",
             RestProbeResult::TimedOut => "REST=timeout (upstream slow / blocked)",
         }
     }
@@ -131,15 +131,19 @@ impl RestProbeResult {
 /// fail-fast gate at startup (a transient REST blip shouldn't kill
 /// a long-running recorder).
 async fn probe_rest_liveness(rest_base: &str, futures: bool) -> RestProbeResult {
-    let ping_path = if futures { "/fapi/v1/ping" } else { "/api/v3/ping" };
+    let ping_path = if futures {
+        "/fapi/v1/ping"
+    } else {
+        "/api/v3/ping"
+    };
     let url = format!("{}{}", rest_base, ping_path);
     // Shared h1.1 Query pool; the outer tokio timeout enforces the probe
     // budget (tighter than the pool client's own ceiling).
     let client = crate::http1_pool::client(crate::http1_pool::Role::Query);
     match tokio::time::timeout(REST_PROBE_TIMEOUT, client.get(&url).send()).await {
         Ok(Ok(resp)) if resp.status().is_success() => RestProbeResult::Ok,
-        Ok(Ok(_)) => RestProbeResult::Failed,   // non-2xx
-        Ok(Err(_)) => RestProbeResult::Failed,  // network / DNS / TLS
+        Ok(Ok(_)) => RestProbeResult::Failed,  // non-2xx
+        Ok(Err(_)) => RestProbeResult::Failed, // network / DNS / TLS
         Err(_) => RestProbeResult::TimedOut,
     }
 }
@@ -277,7 +281,7 @@ impl BinanceMarket {
     fn ws_host(&self) -> &str {
         match (&self.ws_base_override, self.futures) {
             (Some(s), _) => s.as_str(),
-            (None, true)  => BINANCE_FUTURES_WS_HOST_DEFAULT,
+            (None, true) => BINANCE_FUTURES_WS_HOST_DEFAULT,
             (None, false) => BINANCE_WS_HOST_DEFAULT,
         }
     }
@@ -286,7 +290,7 @@ impl BinanceMarket {
     fn rest_base(&self) -> &str {
         match (&self.rest_base_override, self.futures) {
             (Some(s), _) => s.as_str(),
-            (None, true)  => BINANCE_FUTURES_REST_BASE_DEFAULT,
+            (None, true) => BINANCE_FUTURES_REST_BASE_DEFAULT,
             (None, false) => BINANCE_REST_BASE_DEFAULT,
         }
     }
@@ -307,7 +311,9 @@ impl BinanceMarket {
         let host = self.ws_host();
         // Futures: <host>/market/stream?streams=usdtusd@assetIndex/...
         if self.futures {
-            let streams: Vec<String> = self.symbols.iter()
+            let streams: Vec<String> = self
+                .symbols
+                .iter()
                 .map(|s| {
                     if let Some((sym, stream_type)) = s.split_once('@') {
                         format!("{}@{}", sym.to_lowercase(), stream_type)
@@ -352,12 +358,16 @@ impl BinanceMarket {
     /// recover the symbol from the wrapper. The plain `/ws/<stream>`
     /// path strips the wrapper, leaving partial-depth OBs symbol-less.
     fn build_single_symbol_spot_url(&self, symbol: &str) -> String {
-        debug_assert!(!symbol.is_empty(), "build_single_symbol_spot_url with empty symbol");
+        debug_assert!(
+            !symbol.is_empty(),
+            "build_single_symbol_spot_url with empty symbol"
+        );
         let lower = symbol.to_lowercase();
         let kline_iv = self.kline_interval.as_str();
         let streams = format!(
             "{lo}@depth10@100ms/{lo}@trade/{lo}@kline_{iv}",
-            lo = lower, iv = kline_iv,
+            lo = lower,
+            iv = kline_iv,
         );
         // Combined-stream path on the resolved host (default = the
         // public spot host). Format documented at
@@ -380,13 +390,16 @@ fn parse_depth_update(data: &serde_json::Value) -> Option<MarketEvent> {
         let Some(levels) = data.get(key).and_then(|v| v.as_array()) else {
             return Some(Vec::new());
         };
-        levels.iter().map(|level| {
-            let values = level.as_array()?;
-            Some(PriceLevel {
-                price: parse_finite_text(values.first()?)?,
-                quantity: parse_finite_text(values.get(1)?)?,
+        levels
+            .iter()
+            .map(|level| {
+                let values = level.as_array()?;
+                Some(PriceLevel {
+                    price: parse_finite_text(values.first()?)?,
+                    quantity: parse_finite_text(values.get(1)?)?,
+                })
             })
-        }).collect()
+            .collect()
     };
 
     Some(MarketEvent::OrderBook(OrderBookSnapshot {
@@ -409,13 +422,16 @@ fn parse_partial_depth(data: &serde_json::Value, symbol_hint: &str) -> Option<Ma
         let Some(levels) = data.get(key).and_then(|v| v.as_array()) else {
             return Some(Vec::new());
         };
-        levels.iter().map(|level| {
-            let values = level.as_array()?;
-            Some(PriceLevel {
-                price: parse_finite_text(values.first()?)?,
-                quantity: parse_finite_text(values.get(1)?)?,
+        levels
+            .iter()
+            .map(|level| {
+                let values = level.as_array()?;
+                Some(PriceLevel {
+                    price: parse_finite_text(values.first()?)?,
+                    quantity: parse_finite_text(values.get(1)?)?,
+                })
             })
-        }).collect()
+            .collect()
     };
 
     Some(MarketEvent::OrderBook(OrderBookSnapshot {
@@ -441,7 +457,11 @@ fn parse_trade_message(data: &serde_json::Value) -> Option<MarketEvent> {
         exchange_trade_id: None,
         price,
         quantity,
-        side: if is_buyer_maker { Side::Sell } else { Side::Buy },
+        side: if is_buyer_maker {
+            Side::Sell
+        } else {
+            Side::Buy
+        },
         exchange_timestamp_ns: exchange_ts,
         local_timestamp_ns: now_ns(),
     }))
@@ -500,7 +520,6 @@ fn parse_kline_message(data: &serde_json::Value) -> Option<MarketEvent> {
     } else {
         None
     }
-
 }
 
 /// Parse Binance Futures assetIndexUpdate event.
@@ -540,18 +559,16 @@ fn parse_asset_index(data: &serde_json::Value) -> Option<MarketEvent> {
 /// change shouldn't crash the parser).
 fn parse_stream_symbol(stream_key: &str) -> Option<String> {
     let (sym, _) = stream_key.split_once('@')?;
-    if sym.is_empty() { return None; }
+    if sym.is_empty() {
+        return None;
+    }
     Some(sym.to_uppercase())
 }
 
 /// Parse a single WS frame into a `MarketEvent`. Pure parser — does
 /// not touch the event channel; the caller handles dispatch (so
 /// closed-kline gap detection + REST gap-fill can wrap the send).
-fn parse_message_to_event(
-    text: &str,
-    futures: bool,
-    symbol_hint: &str,
-) -> Option<MarketEvent> {
+fn parse_message_to_event(text: &str, futures: bool, symbol_hint: &str) -> Option<MarketEvent> {
     // simd-json drop-in for SIMD parse speedup.
     let mut buf = text.as_bytes().to_vec();
     let raw: serde_json::Value = match simd_json::serde::from_slice(&mut buf) {
@@ -588,8 +605,11 @@ fn parse_message_to_event(
 
     let event_type = data.get("e").and_then(|e| e.as_str());
     if futures {
-        log::trace!("[BinanceFutures] msg: e={:?} keys={:?}",
-            event_type, data.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        log::trace!(
+            "[BinanceFutures] msg: e={:?} keys={:?}",
+            event_type,
+            data.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
     }
 
     let event = match event_type {
@@ -724,34 +744,48 @@ async fn dispatch_event(
                                     .join(&symbol_persist)
                                     .join(&interval_persist);
                                 if let Err(e) = crate::recorder::hist_reader::save_bars_to_local(
-                                    &hist_dir, bars, &interval_persist,
+                                    &hist_dir,
+                                    bars,
+                                    &interval_persist,
                                 ) {
                                     warn!(
                                         "[Binance] gap-fill persist failed for {} \
                                          interval={} ({} bars): {} — bars still \
                                          dispatched live but next restart will \
                                          re-fetch the gap",
-                                        symbol_persist, interval_persist, bars.len(), e,
+                                        symbol_persist,
+                                        interval_persist,
+                                        bars.len(),
+                                        e,
                                     );
                                 } else {
                                     info!(
                                         "[Binance] gap-fill persisted: {} bars → {}",
-                                        bars.len(), hist_dir.display(),
+                                        bars.len(),
+                                        hist_dir.display(),
                                     );
                                 }
                             }
                         }
                         fetched
-                    }).await;
+                    })
+                    .await;
                     match fetch_result {
                         Ok(Ok(fill_bars)) => {
                             info!(
                                 "[Binance] kline gap-fill ok: {} bars for {} \
                                  covering {}s",
-                                fill_bars.len(), bar.symbol, gap_secs,
+                                fill_bars.len(),
+                                bar.symbol,
+                                gap_secs,
                             );
                             for fb in fill_bars {
-                                if event_tx.send(MarketEvent::Bar(fb)).is_err() {
+                                if crate::exchange::publish_market_event(
+                                    event_tx,
+                                    MarketEvent::Bar(fb),
+                                )
+                                .is_err()
+                                {
                                     return false;
                                 }
                             }
@@ -778,7 +812,7 @@ async fn dispatch_event(
         }
     }
 
-    event_tx.send(event).is_ok()
+    crate::exchange::publish_market_event(&event_tx, event).is_ok()
 }
 
 // `rest_base` is the resolved REST host root (e.g.
@@ -796,7 +830,11 @@ async fn binance_ws_task(
 ) {
     let tag = if futures { "BinanceFutures" } else { "Binance" };
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
-    let stale_threshold = if futures { STALE_THRESHOLD_FUTURES } else { STALE_THRESHOLD_SPOT };
+    let stale_threshold = if futures {
+        STALE_THRESHOLD_FUTURES
+    } else {
+        STALE_THRESHOLD_SPOT
+    };
 
     // Phase C: per-symbol kline timeline state. Lives outside the
     // connect-reconnect loop so a WS reconnect triggers REST gap-fill
@@ -825,14 +863,21 @@ async fn binance_ws_task(
     let mut next_alert_at: u32 = SILENT_ALERT_THRESHOLD;
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[{}] Connecting to {}", tag, url);
         let stream = match tokio_tungstenite::connect_async(&url).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[{}] WS connect failed: {}, retry in {:.1}s", tag, e, delay.as_secs_f64());
+                warn!(
+                    "[{}] WS connect failed: {}, retry in {:.1}s",
+                    tag,
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -919,7 +964,9 @@ async fn binance_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
         // Inner loop exited → this connect cycle is done. Note the
@@ -967,7 +1014,9 @@ async fn binance_ws_task(
         // `got_data_this_cycle` is re-declared at the top of the
         // outer loop on the next iteration, so no explicit reset.
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -1060,7 +1109,9 @@ impl ExchangeMarket for BinanceMarket {
             }
             info!(
                 "[Binance] {} per-symbol WS task(s) launched (symbols={:?}, api_key_len={})",
-                self.symbols.len(), self.symbols, self.api_key.len(),
+                self.symbols.len(),
+                self.symbols,
+                self.api_key.len(),
             );
         }
         Ok(())
@@ -1070,14 +1121,21 @@ impl ExchangeMarket for BinanceMarket {
         self.symbols = symbols.to_vec();
         info!(
             "[{}] Symbols set: {:?}",
-            if self.futures { "BinanceFutures" } else { "Binance" },
+            if self.futures {
+                "BinanceFutures"
+            } else {
+                "Binance"
+            },
             self.symbols,
         );
         Ok(())
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -1092,12 +1150,20 @@ impl ExchangeMarket for BinanceMarket {
         self.event_rx = None;
         info!(
             "[{}] Disconnected",
-            if self.futures { "BinanceFutures" } else { "Binance" },
+            if self.futures {
+                "BinanceFutures"
+            } else {
+                "Binance"
+            },
         );
     }
 
     fn name(&self) -> &str {
-        if self.futures { "binance_futures" } else { "binance" }
+        if self.futures {
+            "binance_futures"
+        } else {
+            "binance"
+        }
     }
 }
 
@@ -1136,17 +1202,38 @@ mod tests {
     #[test]
     fn parse_stream_symbol_extracts_symbol_from_combined_stream_name() {
         // depth + interval form
-        assert_eq!(parse_stream_symbol("btcusdt@depth10@100ms").as_deref(), Some("BTCUSDT"));
-        assert_eq!(parse_stream_symbol("ethusdt@depth5@100ms").as_deref(), Some("ETHUSDT"));
-        assert_eq!(parse_stream_symbol("solusdt@depth20@1000ms").as_deref(), Some("SOLUSDT"));
+        assert_eq!(
+            parse_stream_symbol("btcusdt@depth10@100ms").as_deref(),
+            Some("BTCUSDT")
+        );
+        assert_eq!(
+            parse_stream_symbol("ethusdt@depth5@100ms").as_deref(),
+            Some("ETHUSDT")
+        );
+        assert_eq!(
+            parse_stream_symbol("solusdt@depth20@1000ms").as_deref(),
+            Some("SOLUSDT")
+        );
         // trade
-        assert_eq!(parse_stream_symbol("btcusdt@trade").as_deref(), Some("BTCUSDT"));
+        assert_eq!(
+            parse_stream_symbol("btcusdt@trade").as_deref(),
+            Some("BTCUSDT")
+        );
         // kline
-        assert_eq!(parse_stream_symbol("btcusdt@kline_1m").as_deref(), Some("BTCUSDT"));
+        assert_eq!(
+            parse_stream_symbol("btcusdt@kline_1m").as_deref(),
+            Some("BTCUSDT")
+        );
         // bookTicker (no interval)
-        assert_eq!(parse_stream_symbol("btcusdt@bookTicker").as_deref(), Some("BTCUSDT"));
+        assert_eq!(
+            parse_stream_symbol("btcusdt@bookTicker").as_deref(),
+            Some("BTCUSDT")
+        );
         // Futures asset index (uppercase symbol part)
-        assert_eq!(parse_stream_symbol("USDTUSD@assetIndex").as_deref(), Some("USDTUSD"));
+        assert_eq!(
+            parse_stream_symbol("USDTUSD@assetIndex").as_deref(),
+            Some("USDTUSD")
+        );
     }
 
     /// Malformed inputs return `None` so the caller falls back to
@@ -1155,10 +1242,14 @@ mod tests {
     #[test]
     fn parse_stream_symbol_returns_none_for_malformed_input() {
         assert!(parse_stream_symbol("").is_none());
-        assert!(parse_stream_symbol("no_at_sign").is_none(),
-            "missing '@' should not resolve a symbol");
-        assert!(parse_stream_symbol("@depth10").is_none(),
-            "leading '@' (empty symbol) should not resolve");
+        assert!(
+            parse_stream_symbol("no_at_sign").is_none(),
+            "missing '@' should not resolve a symbol"
+        );
+        assert!(
+            parse_stream_symbol("@depth10").is_none(),
+            "leading '@' (empty symbol) should not resolve"
+        );
     }
 
     /// Per-symbol URL must:
@@ -1174,8 +1265,10 @@ mod tests {
         let url = m.build_single_symbol_spot_url("BTCUSDT");
 
         // Combined-stream form ensures `{"stream":...}` wrapper on every msg.
-        assert!(url.contains("/stream?streams="),
-            "must use combined-stream form, got: {url}");
+        assert!(
+            url.contains("/stream?streams="),
+            "must use combined-stream form, got: {url}"
+        );
 
         // Exactly the three streams for THIS symbol.
         assert!(url.contains("btcusdt@depth10@100ms"));
@@ -1211,11 +1304,15 @@ mod tests {
     fn build_single_symbol_spot_url_honors_kline_interval() {
         let m_1s = BinanceMarket::with_kline_interval(String::new(), false, "1s".to_string());
         let url = m_1s.build_single_symbol_spot_url("BTCUSDT");
-        assert!(url.contains("btcusdt@kline_1s"),
-            "1s kline interval should appear in URL, got: {url}");
+        assert!(
+            url.contains("btcusdt@kline_1s"),
+            "1s kline interval should appear in URL, got: {url}"
+        );
         // Legacy 1m must NOT be present in the 1s URL.
-        assert!(!url.contains("btcusdt@kline_1m"),
-            "1m stream must NOT appear in 1s-configured URL, got: {url}");
+        assert!(
+            !url.contains("btcusdt@kline_1m"),
+            "1m stream must NOT appear in 1s-configured URL, got: {url}"
+        );
     }
 
     // ─── Phase C: kline gap detection ──────────────────────────
@@ -1241,7 +1338,10 @@ mod tests {
             interval: interval.to_string(),
             open_time_ns,
             close_time_ns: open_time_ns + kline_interval_to_ns(interval).unwrap() - 1,
-            open: 100.0, high: 100.0, low: 100.0, close: 100.0,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
             volume: 0.0,
             taker_buy_base: 0.0,
             quote_volume: 0.0,
@@ -1261,8 +1361,15 @@ mod tests {
         let bar = closed_bar("BTCUSDT", "1s", 1_000_000_000_000);
         // Run inline using a current-thread runtime (test harness).
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
-        let sent = rt.block_on(dispatch_event(MarketEvent::Bar(bar.clone()), &tx, &mut state, None));
+            .enable_all()
+            .build()
+            .unwrap();
+        let sent = rt.block_on(dispatch_event(
+            MarketEvent::Bar(bar.clone()),
+            &tx,
+            &mut state,
+            None,
+        ));
         assert!(sent, "dispatch should succeed");
         // Exactly one event in the channel (the live bar; no fill bars).
         assert_eq!(rx.try_iter().count(), 1);
@@ -1279,7 +1386,9 @@ mod tests {
         let mut state = KlineGapState::new();
         let interval_ns = 1_000_000_000u64;
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         // 3 contiguous 1s klines.
         for i in 0..3u64 {
             let bar = closed_bar("BTCUSDT", "1s", 1_000_000_000_000 + i * interval_ns);
@@ -1298,20 +1407,26 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = KlineGapState::new();
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         let trade = MarketEvent::Trade(TradeTick {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
             exchange_trade_id: None,
-            price: 100.0, quantity: 1.0,
+            price: 100.0,
+            quantity: 1.0,
             side: Side::Buy,
-            exchange_timestamp_ns: 0, local_timestamp_ns: 0,
+            exchange_timestamp_ns: 0,
+            local_timestamp_ns: 0,
         });
         let sent = rt.block_on(dispatch_event(trade, &tx, &mut state, None));
         assert!(sent);
         assert_eq!(rx.try_iter().count(), 1);
-        assert!(state.is_empty(),
-            "non-kline events must not pollute gap_state");
+        assert!(
+            state.is_empty(),
+            "non-kline events must not pollute gap_state"
+        );
     }
 
     /// Open / non-closed klines never reach dispatch_event (filtered in
@@ -1327,13 +1442,17 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = KlineGapState::new();
         let mut bar = closed_bar("BTCUSDT", "1s", 1_000_000_000_000);
-        bar.is_closed = false;  // simulate open bar
+        bar.is_closed = false; // simulate open bar
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         let sent = rt.block_on(dispatch_event(MarketEvent::Bar(bar), &tx, &mut state, None));
         assert!(sent);
-        assert!(state.is_empty(),
-            "open-kline gap_state must NOT be updated by an unclosed bar");
+        assert!(
+            state.is_empty(),
+            "open-kline gap_state must NOT be updated by an unclosed bar"
+        );
     }
 
     // NOTE: we don't unit-test the actual REST fetch branch — that
@@ -1363,8 +1482,10 @@ mod tests {
     #[test]
     fn new_constructor_data_dir_defaults_to_none() {
         let m = BinanceMarket::new(String::new(), false);
-        assert!(m.data_dir.is_none(),
-            "new() must default data_dir=None for back-compat");
+        assert!(
+            m.data_dir.is_none(),
+            "new() must default data_dir=None for back-compat"
+        );
     }
 
     /// dispatch_event with `data_dir=Some(...)` but no gap-fill needed
@@ -1374,9 +1495,8 @@ mod tests {
     /// directories or write files in the no-gap case.
     #[test]
     fn dispatch_event_no_gap_does_not_touch_filesystem_even_with_data_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "hexbot-phase-cplus-test-{}", std::process::id(),
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("hexbot-phase-cplus-test-{}", std::process::id(),));
         // Ensure clean slate — directory should NOT exist after dispatch.
         let _ = std::fs::remove_dir_all(&tmp);
 
@@ -1384,17 +1504,28 @@ mod tests {
         let mut state = KlineGapState::new();
         let bar = closed_bar("BTCUSDT", "1s", 2_000_000_000_000);
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         let sent = rt.block_on(dispatch_event(
-            MarketEvent::Bar(bar), &tx, &mut state, Some(&tmp),
+            MarketEvent::Bar(bar),
+            &tx,
+            &mut state,
+            Some(&tmp),
         ));
         assert!(sent);
         // No fetch happened (first kline ever) → no persistence happened.
         // The `histdata/` subtree must not have been created.
-        let hist_dir = tmp.join("histdata").join("binance").join("BTCUSDT").join("1s");
-        assert!(!hist_dir.exists(),
+        let hist_dir = tmp
+            .join("histdata")
+            .join("binance")
+            .join("BTCUSDT")
+            .join("1s");
+        assert!(
+            !hist_dir.exists(),
             "no-gap dispatch must not create histdata directories \
-             (would indicate eager persistence in the wrong branch)");
+             (would indicate eager persistence in the wrong branch)"
+        );
         // Cleanup (in case any sibling dir slipped in).
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1408,7 +1539,7 @@ mod tests {
     #[test]
     fn silent_counter_resets_on_data() {
         let mut cycles = 9_u32;
-        let mut next  = 10_u32;
+        let mut next = 10_u32;
         let alert = update_silent_cycle_counter(true, &mut cycles, &mut next);
         assert!(alert.is_none());
         assert_eq!(cycles, 0);
@@ -1419,10 +1550,14 @@ mod tests {
     #[test]
     fn silent_counter_no_alert_below_threshold() {
         let mut cycles = 0_u32;
-        let mut next  = SILENT_ALERT_THRESHOLD;
+        let mut next = SILENT_ALERT_THRESHOLD;
         for expected in 1..SILENT_ALERT_THRESHOLD {
             let alert = update_silent_cycle_counter(false, &mut cycles, &mut next);
-            assert!(alert.is_none(), "no alert before threshold @ cycles={}", expected);
+            assert!(
+                alert.is_none(),
+                "no alert before threshold @ cycles={}",
+                expected
+            );
             assert_eq!(cycles, expected);
         }
         // `next_alert_at` shouldn't have moved yet.
@@ -1435,7 +1570,7 @@ mod tests {
     #[test]
     fn silent_counter_fires_alert_at_threshold_and_doubles_pacing() {
         let mut cycles = 0_u32;
-        let mut next  = SILENT_ALERT_THRESHOLD;
+        let mut next = SILENT_ALERT_THRESHOLD;
 
         // Run SILENT_ALERT_THRESHOLD silent cycles → first alert at the last.
         let mut alerts: Vec<u32> = Vec::new();
@@ -1508,16 +1643,22 @@ mod tests {
             .with_ws_base("wss://example.com/market/stream".to_string());
         m.symbols = vec!["usdtusd@assetIndex".to_string()];
         let url = m.build_stream_url();
-        assert!(url.starts_with("wss://example.com/market/stream?streams="),
-            "futures URL: {}", url);
+        assert!(
+            url.starts_with("wss://example.com/market/stream?streams="),
+            "futures URL: {}",
+            url
+        );
         assert!(!url.contains("fstream.binance.com"));
 
         // Spot single-symbol: override applies to the host portion.
-        let m = BinanceMarket::new(String::new(), false)
-            .with_ws_base("wss://example.com".to_string());
+        let m =
+            BinanceMarket::new(String::new(), false).with_ws_base("wss://example.com".to_string());
         let url = m.build_single_symbol_spot_url("BTCUSDT");
-        assert!(url.starts_with("wss://example.com/stream?streams="),
-            "spot single-symbol URL: {}", url);
+        assert!(
+            url.starts_with("wss://example.com/stream?streams="),
+            "spot single-symbol URL: {}",
+            url
+        );
     }
 
     /// REST override (used by the liveness probe) follows the same
@@ -1547,7 +1688,7 @@ mod tests {
     #[test]
     fn silent_counter_fresh_alert_after_recovery() {
         let mut cycles = 0_u32;
-        let mut next  = SILENT_ALERT_THRESHOLD;
+        let mut next = SILENT_ALERT_THRESHOLD;
         // First episode → first alert.
         for _ in 0..SILENT_ALERT_THRESHOLD {
             update_silent_cycle_counter(false, &mut cycles, &mut next);

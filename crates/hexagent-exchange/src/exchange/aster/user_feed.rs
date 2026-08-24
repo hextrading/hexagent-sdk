@@ -1,10 +1,7 @@
 //! Aster user feed — listenKey WS `ORDER_TRADE_UPDATE` → `OrderUpdate`.
 //!
 //! Same shape as the Hyperliquid user feed: [`spawn_user_feed`] returns a
-//! `crossbeam_channel::Receiver<OrderUpdate>` plus a shutdown flag, and the
-//! astermaker strategy drains the receiver each quote tick to keep its net
-//! inventory in sync with maker fills (which arrive asynchronously, not on
-//! the synchronous place path).
+//! bounded private lane consumed directly by the owning strategy worker.
 //!
 //! Lifecycle per the V3 docs: `POST /fapi/v3/listenKey` (signed) creates a
 //! key valid 60 min; `PUT` extends it; the stream lives at
@@ -24,6 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::exchange::{private_update_lane, PrivateUpdateLane, PrivateUpdatePublisher};
 use crate::types::{now_ns, Exchange, Liquidity, OrderStatus, OrderUpdate, Side};
 
 use super::auth::AsterAuth;
@@ -34,15 +32,15 @@ const STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(630)
 /// listenKey is valid 60 min; refresh at half-life.
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Spawn the user-feed task. Returns the fill receiver and a shutdown flag
-/// (set it `true` to stop the task).
-pub fn spawn_user_feed(auth: &AsterAuth) -> (crossbeam_channel::Receiver<OrderUpdate>, Arc<AtomicBool>) {
-    let (tx, rx) = crossbeam_channel::unbounded::<OrderUpdate>();
-    let shutdown = Arc::new(AtomicBool::new(false));
+/// Spawn one bounded, owner-routed private feed. Dropping the returned lane
+/// requests task shutdown.
+pub fn spawn_user_feed(auth: &AsterAuth) -> PrivateUpdateLane {
+    let (publisher, lane) = private_update_lane(Exchange::Aster);
+    let shutdown = lane.shutdown_token();
     let sd = shutdown.clone();
     let auth = auth.clone();
-    crate::async_rt::handle().spawn(user_feed_task(auth, tx, sd));
-    (rx, shutdown)
+    crate::async_rt::handle().spawn(user_feed_task(auth, publisher, sd));
+    lane
 }
 
 /// Async signed request against `/fapi/v3/listenKey` (POST create / PUT
@@ -66,14 +64,19 @@ async fn listen_key_request(auth: &AsterAuth, method: &str) -> anyhow::Result<St
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow::anyhow!("{} listenKey -> {}: {}", method, status, text));
+        return Err(anyhow::anyhow!(
+            "{} listenKey -> {}: {}",
+            method,
+            status,
+            text
+        ));
     }
     Ok(text)
 }
 
 async fn user_feed_task(
     auth: AsterAuth,
-    tx: crossbeam_channel::Sender<OrderUpdate>,
+    publisher: PrivateUpdatePublisher,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
@@ -88,8 +91,11 @@ async fn user_feed_task(
             Ok(text) => {
                 match serde_json::from_str::<serde_json::Value>(&text)
                     .ok()
-                    .and_then(|v| v.get("listenKey").and_then(|k| k.as_str()).map(String::from))
-                {
+                    .and_then(|v| {
+                        v.get("listenKey")
+                            .and_then(|k| k.as_str())
+                            .map(String::from)
+                    }) {
                     Some(k) => k,
                     None => {
                         warn!("[Aster] user-feed: listenKey missing in response: {}", text);
@@ -99,8 +105,13 @@ async fn user_feed_task(
                 }
             }
             Err(e) => {
+                publisher.disconnected();
                 let delay = backoff.next_delay();
-                warn!("[Aster] user-feed listenKey failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Aster] user-feed listenKey failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -108,17 +119,26 @@ async fn user_feed_task(
 
         // 2. connect the stream.
         let url = format!("{}/ws/{}", auth.ws_base(), listen_key);
-        info!("[Aster] user-feed connecting for signer {}", auth.signer_address);
+        info!(
+            "[Aster] user-feed connecting for signer {}",
+            auth.signer_address
+        );
         let stream = match tokio_tungstenite::connect_async(&url).await {
             Ok((s, _)) => s,
             Err(e) => {
+                publisher.disconnected();
                 let delay = backoff.next_delay();
-                warn!("[Aster] user-feed connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Aster] user-feed connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
         };
         backoff.reset();
+        publisher.connected();
         let (mut write, mut read) = stream.split();
 
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -150,7 +170,7 @@ async fn user_feed_task(
                             match data.get("e").and_then(|v| v.as_str()).unwrap_or("") {
                                 "ORDER_TRADE_UPDATE" => {
                                     if let Some(u) = parse_order_trade_update(&data) {
-                                        if tx.send(u).is_err() { return; }
+                                        if !publisher.publish(u) { return; }
                                     }
                                 }
                                 "listenKeyExpired" => {
@@ -168,10 +188,15 @@ async fn user_feed_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        publisher.disconnected();
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -187,7 +212,11 @@ async fn user_feed_task(
 fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
     let o = data.get("o")?;
     let symbol = o.get("s")?.as_str()?.to_string();
-    let cloid = o.get("c").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let cloid = o
+        .get("c")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let side = match o.get("S").and_then(|v| v.as_str()) {
         Some("BUY") => Side::Buy,
         _ => Side::Sell,
@@ -195,17 +224,33 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
     let oid = o.get("i").and_then(|v| v.as_u64()).map(|n| n.to_string());
     let exec_type = o.get("x").and_then(|v| v.as_str()).unwrap_or("");
     let status_raw = o.get("X").and_then(|v| v.as_str()).unwrap_or("");
-    let ts = data.get("E").and_then(|v| v.as_u64()).map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
+    let ts = data
+        .get("E")
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms * 1_000_000)
+        .unwrap_or_else(now_ns);
 
     if exec_type == "TRADE" {
-        let last_qty: f64 = o.get("l").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let last_px: f64 = o.get("L").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let last_qty: f64 = o
+            .get("l")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let last_px: f64 = o
+            .get("L")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         if last_qty <= 0.0 {
             return None;
         }
         let is_maker = o.get("m").and_then(|v| v.as_bool()).unwrap_or(false);
         let tid = o.get("t").and_then(|v| v.as_u64()).map(|t| t.to_string());
-        let status = if status_raw == "FILLED" { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
+        let status = if status_raw == "FILLED" {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
+        };
         return Some(OrderUpdate {
             client_order_id: cloid,
             exchange: Exchange::Aster,
@@ -213,7 +258,11 @@ fn parse_order_trade_update(data: &serde_json::Value) -> Option<OrderUpdate> {
             side,
             exchange_order_id: oid,
             status,
-            liquidity: Some(if is_maker { Liquidity::Maker } else { Liquidity::Taker }),
+            liquidity: Some(if is_maker {
+                Liquidity::Maker
+            } else {
+                Liquidity::Taker
+            }),
             filled_quantity: last_qty, // incremental; strategy accumulates
             remaining_quantity: 0.0,
             avg_fill_price: last_px,
@@ -258,14 +307,17 @@ mod tests {
 
     #[test]
     fn parse_fill_event() {
-        let ev: serde_json::Value = serde_json::from_str(r#"{
+        let ev: serde_json::Value = serde_json::from_str(
+            r#"{
             "e":"ORDER_TRADE_UPDATE","E":1568879465651,"T":1568879465650,
             "o":{"s":"BTCUSDT","c":"550e8400-e29b-41d4-a716-446655440000",
                  "S":"SELL","o":"LIMIT","f":"GTX","q":"0.001","p":"50000",
                  "ap":"50000","x":"TRADE","X":"FILLED","i":8886774,
                  "l":"0.001","z":"0.001","L":"50000","n":"0.005","N":"USDT",
                  "T":1568879465651,"t":12345,"m":true,"R":false,"ps":"BOTH","rp":"0"}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let u = parse_order_trade_update(&ev).unwrap();
         assert_eq!(u.status, OrderStatus::Filled);
         assert_eq!(u.filled_quantity, 0.001);
@@ -277,11 +329,14 @@ mod tests {
 
     #[test]
     fn parse_status_event_no_inventory_effect() {
-        let ev: serde_json::Value = serde_json::from_str(r#"{
+        let ev: serde_json::Value = serde_json::from_str(
+            r#"{
             "e":"ORDER_TRADE_UPDATE","E":1568879465651,
             "o":{"s":"BTCUSDT","c":"abc","S":"BUY","x":"CANCELED","X":"CANCELED",
                  "i":1,"l":"0","z":"0","L":"0","t":0}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let u = parse_order_trade_update(&ev).unwrap();
         assert_eq!(u.status, OrderStatus::Cancelled);
         assert_eq!(u.filled_quantity, 0.0);

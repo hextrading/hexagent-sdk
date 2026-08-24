@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::sdk::{HexClient, HexClientConfig};
 use super::sdk::types::ListEventsParams;
+use super::sdk::{HexClient, HexClientConfig};
 
 use crate::exchange::ExchangeMarket;
 use crate::types::*;
@@ -64,7 +64,8 @@ fn market_detail_to_binary_option(
 ) -> BinaryOption {
     let outcome_ids: Vec<String> = md.outcomes.iter().map(|o| o.id.to_string()).collect();
     let outcome_labels: Vec<String> = md.outcomes.iter().map(|o| o.label.clone()).collect();
-    let outcome_prices: Vec<String> = md.outcomes
+    let outcome_prices: Vec<String> = md
+        .outcomes
         .iter()
         .map(|o| {
             o.price
@@ -72,14 +73,18 @@ fn market_detail_to_binary_option(
                 .unwrap_or_else(|| "0.00".to_string())
         })
         .collect();
-    let tick_size = md.market.price_increment
+    let tick_size = md
+        .market
+        .price_increment
         .and_then(|p| p.to_f64())
         .unwrap_or(0.001);
-    let liquidity: f64 = md.outcomes
+    let liquidity: f64 = md
+        .outcomes
         .iter()
         .map(|o| o.liquidity.and_then(|l| l.to_f64()).unwrap_or(0.0))
         .sum();
-    let volume: f64 = md.outcomes
+    let volume: f64 = md
+        .outcomes
         .iter()
         .map(|o| o.total_volume.and_then(|v| v.to_f64()).unwrap_or(0.0))
         .sum();
@@ -186,7 +191,10 @@ pub fn fetch_events(
         limit: Some(limit as i64),
         ..Default::default()
     };
-    info!("[Hexmarket] Fetching events (status={:?}, limit={})", status, limit);
+    info!(
+        "[Hexmarket] Fetching events (status={:?}, limit={})",
+        status, limit
+    );
 
     let events = client
         .list_events(&params)
@@ -205,7 +213,10 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
         Err(_) => return vec![],
     };
 
-    let event_type = data.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+    let event_type = data
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let asset_id = data.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
     if asset_id.is_empty() {
         return vec![];
@@ -221,9 +232,9 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
                             .filter_map(|level| {
                                 Some(PriceLevel {
                                     price: level.get("price")?.as_f64()?,
-                                    quantity: level
-                                        .get("quantity")
-                                        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))?,
+                                    quantity: level.get("quantity").and_then(|v| {
+                                        v.as_f64().or_else(|| v.as_i64().map(|i| i as f64))
+                                    })?,
                                 })
                             })
                             .collect()
@@ -278,7 +289,11 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
                 exchange_trade_id: None,
                 price,
                 quantity,
-                side: if side_str == "sell" { Side::Sell } else { Side::Buy },
+                side: if side_str == "sell" {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                },
                 exchange_timestamp_ns: now,
                 local_timestamp_ns: now,
             })]
@@ -313,14 +328,20 @@ async fn hexmarket_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Hexmarket] Connecting to {}", url);
         let stream = match tokio_tungstenite::connect_async(&url).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Hexmarket] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Hexmarket] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -367,7 +388,7 @@ async fn hexmarket_ws_task(
                         Message::Text(text) => {
                             let t_parse = crate::latency::Instant::now();
                             for event in parse_ws_message(&text) {
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                             }
                             crate::latency::record("hexmarket.ws.parse", t_parse);
                         }
@@ -382,10 +403,14 @@ async fn hexmarket_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -423,7 +448,9 @@ impl ExchangeMarket for HexmarketMarket {
                 .get_event(symbol)
                 .map_err(|e| anyhow!("SDK error fetching event '{}': {}", symbol, e))?;
 
-            let total_outcomes: usize = event_detail.markets.iter()
+            let total_outcomes: usize = event_detail
+                .markets
+                .iter()
                 .map(|md| md.outcomes.len())
                 .sum();
             info!(
@@ -468,9 +495,10 @@ impl ExchangeMarket for HexmarketMarket {
                 }
 
                 let binary_option = market_detail_to_binary_option(&event_detail.event, md);
-                self.pending_events.push_back(MarketEvent::Instrument(
-                    Instrument::BinaryOption(binary_option),
-                ));
+                self.pending_events
+                    .push_back(MarketEvent::Instrument(Instrument::BinaryOption(
+                        binary_option,
+                    )));
 
                 self.market_count += 1;
             }
@@ -494,7 +522,10 @@ impl ExchangeMarket for HexmarketMarket {
             return Ok(Some(event));
         }
 
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => {

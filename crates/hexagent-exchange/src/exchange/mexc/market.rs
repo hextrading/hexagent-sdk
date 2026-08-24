@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::proto::{PushDataWrapper, WrapperBody};
 use crate::exchange::ExchangeMarket;
 use crate::types::*;
-use super::proto::{PushDataWrapper, WrapperBody};
 
 const MEXC_WS_URL: &str = "wss://wbs-api.mexc.com/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -48,14 +48,20 @@ async fn mexc_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[MEXC] Connecting to {}", MEXC_WS_URL);
         let stream = match tokio_tungstenite::connect_async(MEXC_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[MEXC] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[MEXC] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -63,11 +69,14 @@ async fn mexc_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        let params: Vec<String> = symbols.iter()
-            .flat_map(|s| vec![
-                format!("spot@public.limit.depth.v3.api.pb@{}@5", s),
-                format!("spot@public.aggre.deals.v3.api.pb@100ms@{}", s),
-            ])
+        let params: Vec<String> = symbols
+            .iter()
+            .flat_map(|s| {
+                vec![
+                    format!("spot@public.limit.depth.v3.api.pb@{}@5", s),
+                    format!("spot@public.aggre.deals.v3.api.pb@100ms@{}", s),
+                ]
+            })
             .collect();
         let sub = serde_json::json!({"method": "SUBSCRIPTION", "params": params});
         if let Err(e) = write.send(Message::Text(sub.to_string())).await {
@@ -135,7 +144,7 @@ async fn mexc_ws_task(
                                         exchange_timestamp_ns: ts_ms * 1_000_000,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                                 Some(WrapperBody::PublicAggreDeals(deals)) => {
                                     for deal in &deals.deals {
@@ -155,7 +164,7 @@ async fn mexc_ws_task(
                                             exchange_timestamp_ns: deal.time as u64 * 1_000_000,
                                             local_timestamp_ns: now_ns(),
                                         });
-                                        if event_tx.send(event).is_err() { return; }
+                                        if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                     }
                                 }
                                 _ => {}
@@ -173,10 +182,14 @@ async fn mexc_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -201,7 +214,10 @@ impl ExchangeMarket for MexcMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -217,5 +233,7 @@ impl ExchangeMarket for MexcMarket {
         info!("[MEXC] Disconnected");
     }
 
-    fn name(&self) -> &str { "mexc" }
+    fn name(&self) -> &str {
+        "mexc"
+    }
 }

@@ -41,17 +41,33 @@ async fn get_ws_endpoint() -> Result<(String, String, u64)> {
         .send()
         .await
         .map_err(|e| anyhow!("bullet-public POST failed: {}", e))?;
-    let text = resp.text().await.map_err(|e| anyhow!("bullet-public body: {}", e))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("bullet-public body: {}", e))?;
     let resp: serde_json::Value = serde_json::from_str(&text)?;
-    let data = resp.get("data").ok_or_else(|| anyhow!("Missing data in bullet-public response"))?;
-    let token = data.get("token").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing token"))?.to_string();
-    let server = data.get("instanceServers").and_then(|v| v.as_array())
+    let data = resp
+        .get("data")
+        .ok_or_else(|| anyhow!("Missing data in bullet-public response"))?;
+    let token = data
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing token"))?
+        .to_string();
+    let server = data
+        .get("instanceServers")
+        .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .ok_or_else(|| anyhow!("No instance servers"))?;
-    let endpoint = server.get("endpoint").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing endpoint"))?.to_string();
-    let ping_interval = server.get("pingInterval").and_then(|v| v.as_u64()).unwrap_or(18000);
+    let endpoint = server
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing endpoint"))?
+        .to_string();
+    let ping_interval = server
+        .get("pingInterval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(18000);
     Ok((endpoint, token, ping_interval))
 }
 
@@ -63,14 +79,20 @@ async fn kucoin_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[KuCoin] Fetching public WebSocket token...");
         let (endpoint, token, ping_interval_ms) = match get_ws_endpoint().await {
             Ok(v) => v,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[KuCoin] token fetch failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[KuCoin] token fetch failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -83,7 +105,11 @@ async fn kucoin_ws_task(
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[KuCoin] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[KuCoin] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -91,7 +117,8 @@ async fn kucoin_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        let ob_topics: Vec<String> = symbols.iter()
+        let ob_topics: Vec<String> = symbols
+            .iter()
             .map(|s| format!("/spotMarket/level2Depth5:{}", s))
             .collect();
         let msg = serde_json::json!({
@@ -100,9 +127,12 @@ async fn kucoin_ws_task(
             "topic": ob_topics.join(","),
             "response": true,
         });
-        if write.send(Message::Text(msg.to_string())).await.is_err() { continue; }
+        if write.send(Message::Text(msg.to_string())).await.is_err() {
+            continue;
+        }
 
-        let trade_topics: Vec<String> = symbols.iter()
+        let trade_topics: Vec<String> = symbols
+            .iter()
             .map(|s| format!("/market/match:{}", s))
             .collect();
         let msg = serde_json::json!({
@@ -111,7 +141,9 @@ async fn kucoin_ws_task(
             "topic": trade_topics.join(","),
             "response": true,
         });
-        if write.send(Message::Text(msg.to_string())).await.is_err() { continue; }
+        if write.send(Message::Text(msg.to_string())).await.is_err() {
+            continue;
+        }
 
         info!("[KuCoin] Connected, subscribed to {:?}", symbols);
 
@@ -183,7 +215,7 @@ async fn kucoin_ws_task(
                                     exchange_timestamp_ns: ts_ns,
                                     local_timestamp_ns: now_ns(),
                                 });
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 continue;
                             }
 
@@ -219,7 +251,7 @@ async fn kucoin_ws_task(
                                 exchange_timestamp_ns: ts_ms * 1_000_000,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
                         Message::Ping(payload) => {
                             let _ = write.send(Message::Pong(payload)).await;
@@ -232,10 +264,14 @@ async fn kucoin_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -260,7 +296,10 @@ impl ExchangeMarket for KucoinMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -276,5 +315,7 @@ impl ExchangeMarket for KucoinMarket {
         info!("[KuCoin] Disconnected");
     }
 
-    fn name(&self) -> &str { "kucoin" }
+    fn name(&self) -> &str {
+        "kucoin"
+    }
 }

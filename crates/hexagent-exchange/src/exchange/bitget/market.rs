@@ -43,14 +43,20 @@ async fn bitget_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Bitget] Connecting to {}", BITGET_WS_URL);
         let stream = match tokio_tungstenite::connect_async(BITGET_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Bitget] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Bitget] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -58,11 +64,14 @@ async fn bitget_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        let args: Vec<serde_json::Value> = symbols.iter()
-            .flat_map(|s| vec![
-                serde_json::json!({"instType": "SPOT", "channel": "books5", "instId": s}),
-                serde_json::json!({"instType": "SPOT", "channel": "trade", "instId": s}),
-            ])
+        let args: Vec<serde_json::Value> = symbols
+            .iter()
+            .flat_map(|s| {
+                vec![
+                    serde_json::json!({"instType": "SPOT", "channel": "books5", "instId": s}),
+                    serde_json::json!({"instType": "SPOT", "channel": "trade", "instId": s}),
+                ]
+            })
             .collect();
         let sub = serde_json::json!({"op": "subscribe", "args": args});
         if let Err(e) = write.send(Message::Text(sub.to_string())).await {
@@ -140,7 +149,7 @@ async fn bitget_ws_task(
                                         exchange_timestamp_ns: ts_ms * 1_000_000,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 } else if channel == "books5" {
                                     let parse_levels = |key: &str| -> Vec<PriceLevel> {
                                         item.get(key)
@@ -172,7 +181,7 @@ async fn bitget_ws_task(
                                         exchange_timestamp_ns: ts_ms * 1_000_000,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                             }
                         }
@@ -187,10 +196,14 @@ async fn bitget_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -215,7 +228,10 @@ impl ExchangeMarket for BitgetMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -231,5 +247,7 @@ impl ExchangeMarket for BitgetMarket {
         info!("[Bitget] Disconnected");
     }
 
-    fn name(&self) -> &str { "bitget" }
+    fn name(&self) -> &str {
+        "bitget"
+    }
 }

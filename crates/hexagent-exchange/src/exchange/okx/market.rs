@@ -41,14 +41,20 @@ async fn okx_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[OKX] Connecting to {}", OKX_WS_URL);
         let stream = match tokio_tungstenite::connect_async(OKX_WS_URL).await {
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[OKX] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[OKX] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -56,11 +62,14 @@ async fn okx_ws_task(
         backoff.reset();
         let (mut write, mut read) = stream.split();
 
-        let args: Vec<serde_json::Value> = symbols.iter()
-            .flat_map(|s| vec![
-                serde_json::json!({"channel": "books5", "instId": s}),
-                serde_json::json!({"channel": "trades", "instId": s}),
-            ])
+        let args: Vec<serde_json::Value> = symbols
+            .iter()
+            .flat_map(|s| {
+                vec![
+                    serde_json::json!({"channel": "books5", "instId": s}),
+                    serde_json::json!({"channel": "trades", "instId": s}),
+                ]
+            })
             .collect();
         let sub = serde_json::json!({"op": "subscribe", "args": args});
         if let Err(e) = write.send(Message::Text(sub.to_string())).await {
@@ -172,7 +181,7 @@ async fn okx_ws_task(
                                         local_timestamp_ns: now_ns(),
                                     })
                                 };
-                                if event_tx.send(event).is_err() { return; }
+                                if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                             }
                         }
                         Message::Ping(payload) => {
@@ -186,10 +195,14 @@ async fn okx_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -214,7 +227,10 @@ impl ExchangeMarket for OkxMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -230,5 +246,7 @@ impl ExchangeMarket for OkxMarket {
         info!("[OKX] Disconnected");
     }
 
-    fn name(&self) -> &str { "okx" }
+    fn name(&self) -> &str {
+        "okx"
+    }
 }

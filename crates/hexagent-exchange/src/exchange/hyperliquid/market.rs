@@ -54,7 +54,10 @@ fn parse_levels(arr: &serde_json::Value) -> Vec<PriceLevel> {
                 .filter_map(|lvl| {
                     let px: f64 = lvl.get("px")?.as_str()?.parse().ok()?;
                     let sz: f64 = lvl.get("sz")?.as_str()?.parse().ok()?;
-                    Some(PriceLevel { price: px, quantity: sz })
+                    Some(PriceLevel {
+                        price: px,
+                        quantity: sz,
+                    })
                 })
                 .take(MAX_DEPTH)
                 .collect()
@@ -79,7 +82,11 @@ async fn hyperliquid_ws_task(
             Ok((s, _)) => s,
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!("[Hyperliquid] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Hyperliquid] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -110,7 +117,10 @@ async fn hyperliquid_ws_task(
         if !sub_ok {
             continue;
         }
-        info!("[Hyperliquid] Connected, subscribed l2Book(fast)+trades+activeAssetCtx for {:?}", coins);
+        info!(
+            "[Hyperliquid] Connected, subscribed l2Book(fast)+trades+activeAssetCtx for {:?}",
+            coins
+        );
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -165,7 +175,7 @@ async fn hyperliquid_ws_task(
                                         exchange_timestamp_ns: ts,
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                                 "trades" => {
                                     let trades = match data.get("data").and_then(|v| v.as_array()) {
@@ -196,7 +206,7 @@ async fn hyperliquid_ws_task(
                                             exchange_timestamp_ns: ts,
                                             local_timestamp_ns: now_ns(),
                                         });
-                                        if event_tx.send(event).is_err() { return; }
+                                        if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                     }
                                 }
                                 "activeAssetCtx" => {
@@ -232,7 +242,7 @@ async fn hyperliquid_ws_task(
                                         prev_day_px: f("prevDayPx"),
                                         local_timestamp_ns: now_ns(),
                                     });
-                                    if event_tx.send(event).is_err() { return; }
+                                    if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                                 }
                                 // subscriptionResponse / pong / other — ignore.
                                 _ => {}
@@ -249,10 +259,14 @@ async fn hyperliquid_ws_task(
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -283,7 +297,10 @@ impl super::super::ExchangeMarket for HyperliquidMarket {
     }
 
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),

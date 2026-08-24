@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::exchange::{
-    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL,
-    POLYMARKET_RTDS_PING_PAYLOAD, POLYMARKET_WS_HEALTH_LOG_INTERVAL, WS_CONNECT_TIMEOUT,
+    ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL, POLYMARKET_RTDS_PING_PAYLOAD,
+    POLYMARKET_WS_HEALTH_LOG_INTERVAL, WS_CONNECT_TIMEOUT,
 };
 use crate::types::*;
 
@@ -79,17 +79,25 @@ async fn chainlink_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(100, 6_400);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
 
         info!("[Chainlink] Connecting to {}", RTDS_URL);
         let stream = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(RTDS_URL),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok((s, _))) => s,
             Ok(Err(e)) => {
                 let delay = backoff.next_delay();
-                warn!("[Chainlink] WS connect failed: {}, retry in {:.1}s", e, delay.as_secs_f64());
+                warn!(
+                    "[Chainlink] WS connect failed: {}, retry in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -148,8 +156,7 @@ async fn chainlink_ws_task(
 
         let mut ping_interval = tokio::time::interval(POLYMARKET_RTDS_PING_INTERVAL);
         ping_interval.tick().await;
-        let mut health_interval =
-            tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
+        let mut health_interval = tokio::time::interval(POLYMARKET_WS_HEALTH_LOG_INTERVAL);
         health_interval.tick().await;
 
         loop {
@@ -319,20 +326,26 @@ async fn chainlink_ws_task(
                                 timestamp_ns: server_ts_ms * 1_000_000,
                                 local_timestamp_ns: now_ns(),
                             });
-                            if event_tx.send(event).is_err() { return; }
+                            if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
                         _ => {}
                     }
                 }
             }
-            if shutdown.load(Ordering::Relaxed) { return; }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
         }
 
-        if shutdown.load(Ordering::Relaxed) { break; }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         // Reset the exponential backoff only when the connection was stable for
         // ≥30s; otherwise keep escalating 0.1→0.2→…→6.4s so consecutive fast
         // drops back off instead of storming the endpoint into HTTP 429.
-        if connected_at.elapsed().as_secs() >= 30 { backoff.reset(); }
+        if connected_at.elapsed().as_secs() >= 30 {
+            backoff.reset();
+        }
         let delay = backoff.next_delay();
         tokio::time::sleep(delay).await;
     }
@@ -366,7 +379,10 @@ impl ExchangeMarket for ChainlinkMarket {
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
         }
-        let rx = self.event_rx.as_ref().ok_or_else(|| anyhow!("Not connected"))?;
+        let rx = self
+            .event_rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not connected"))?;
         match rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -382,5 +398,7 @@ impl ExchangeMarket for ChainlinkMarket {
         info!("[Chainlink] Disconnected");
     }
 
-    fn name(&self) -> &str { "chainlink" }
+    fn name(&self) -> &str {
+        "chainlink"
+    }
 }
