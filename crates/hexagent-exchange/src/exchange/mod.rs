@@ -776,6 +776,30 @@ pub trait ExchangeTrade: Send {
     /// Cancel all orders for a symbol on an exchange
     fn cancel_all(&mut self, exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>>;
 
+    /// Stream cancel-all lifecycle results to the connection owner's completion
+    /// lane.  Unlike [`Self::cancel_all_into`], this API has no artificial
+    /// fixed-batch ceiling: an account can legitimately have more open orders
+    /// than one transport batch can hold.  Returning `false` from `emit` means
+    /// the downstream owner has gone away and lets a native adapter stop
+    /// producing compatibility-only results early.
+    ///
+    /// Adapters should override this method and emit while walking their
+    /// owner-local order table.  The default keeps legacy adapters correct (and
+    /// lossless) while they migrate away from their temporary `Vec`.
+    fn cancel_all_with(
+        &mut self,
+        exchange: Exchange,
+        symbol: &str,
+        emit: &mut dyn FnMut(OrderUpdate) -> bool,
+    ) -> Result<()> {
+        for update in self.cancel_all(exchange, symbol)? {
+            if !emit(update) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Fixed-capacity cancel-all output. Adapters should override this method
     /// when their native implementation can emit directly; the compatibility
     /// default contains the legacy allocation outside the caller's reusable

@@ -2861,11 +2861,12 @@ impl SharedState {
             .map_err(|error| format!("account owner private diagnosis timed out: {error}"))
     }
 
-    fn take_request_buffer(&self) -> BytesMut {
-        self.request_buffers.pop().unwrap_or_else(|| {
+    fn take_request_buffer(&self) -> Option<BytesMut> {
+        let buffer = self.request_buffers.pop();
+        if buffer.is_none() {
             crate::latency::record_ns("polymarket.order.request_buffer_pool_exhausted", 1);
-            BytesMut::with_capacity(REQUEST_BUFFER_BYTES)
-        })
+        }
+        buffer
     }
 
     fn recycle_request_buffer(&self, mut buffer: BytesMut) {
@@ -5112,6 +5113,12 @@ struct PreparedSubmit {
     prep_ns: u64,
     signed_ns: u64,
     account_recorded_ns: u64,
+}
+
+pub(crate) enum PreparedCancelBody {
+    Ready(Bytes),
+    NoOrderId,
+    BufferUnavailable,
 }
 
 /// Polymarket CLOB live order executor.
@@ -8990,7 +8997,7 @@ impl PolymarketTrade {
         let prep_ns = now_ns();
         let (ctx, body) = self.cancel_prep(client_order_id, false);
         let (rx, timing, attempt) = match body {
-            Some(body_bytes) => {
+            PreparedCancelBody::Ready(body_bytes) => {
                 let attempt = client.begin_attempt(signal_ns, prep_ns, 0, 0);
                 let (rx, timing) = self.shared.http_call_async_on_timed_bytes(
                     client,
@@ -9001,7 +9008,14 @@ impl PolymarketTrade {
                 );
                 (Some(rx), Some(timing), Some(attempt))
             }
-            None => (None, None, None),
+            PreparedCancelBody::NoOrderId => (None, None, None),
+            PreparedCancelBody::BufferUnavailable => {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let _ = tx.send(Err(HttpErr::Transport(
+                    "cancel request buffer pool exhausted before dispatch".to_string(),
+                )));
+                (Some(rx), None, None)
+            }
         };
         let dispatched_ns = rx.as_ref().map(|_| now_ns()).unwrap_or(0);
         if let Some(attempt) = &attempt {
@@ -9163,7 +9177,12 @@ impl PolymarketTrade {
                 None,
             );
         }
-        let mut body_json = self.shared.take_request_buffer();
+        let Some(mut body_json) = self.shared.take_request_buffer() else {
+            return Err(Self::make_rejected(
+                order,
+                "request buffer pool exhausted before dispatch",
+            ));
+        };
         body_json.clear();
         if let Err(e) = serde_json::to_writer((&mut body_json).writer(), &body) {
             self.shared.recycle_request_buffer(body_json);
@@ -9540,7 +9559,7 @@ impl PolymarketTrade {
     ) -> (CancelCtx, Option<crossbeam_channel::Receiver<HttpReply>>) {
         let (ctx, body) = self.cancel_prep(client_order_id, true);
         match body {
-            Some(body_bytes) => {
+            PreparedCancelBody::Ready(body_bytes) => {
                 let body_text = std::str::from_utf8(body_bytes.as_ref())
                     .expect("Polymarket cancel serialization must produce UTF-8 JSON");
                 let rx = self.shared.http_call_async("DELETE", "/order", body_text);
@@ -9556,7 +9575,7 @@ impl PolymarketTrade {
                 );
                 (ctx, Some(rx))
             }
-            None => {
+            PreparedCancelBody::NoOrderId => {
                 self.shared.log_order_lifecycle(
                     client_order_id,
                     "cancel_not_dispatched",
@@ -9565,6 +9584,20 @@ impl PolymarketTrade {
                     None,
                 );
                 (ctx, None)
+            }
+            PreparedCancelBody::BufferUnavailable => {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let _ = tx.send(Err(HttpErr::Transport(
+                    "cancel request buffer pool exhausted before dispatch".to_string(),
+                )));
+                self.shared.log_order_lifecycle(
+                    client_order_id,
+                    "cancel_not_dispatched_buffer_unavailable",
+                    ctx.local_oid.as_deref(),
+                    None,
+                    None,
+                );
+                (ctx, Some(rx))
             }
         }
     }
@@ -9578,7 +9611,7 @@ impl PolymarketTrade {
         &mut self,
         client_order_id: &str,
         legacy_trace: bool,
-    ) -> (CancelCtx, Option<Bytes>) {
+    ) -> (CancelCtx, PreparedCancelBody) {
         let prep_ns = now_ns();
         if self.gen_ns_hint > 0 {
             crate::latency::record_ns(
@@ -9616,29 +9649,29 @@ impl PolymarketTrade {
                     "[PolymarketTrade] Cancel request orderID={}... coid={} gen_ns={}",
                     oid_short, client_order_id, self.gen_ns_hint
                 );
-                let mut body = self.shared.take_request_buffer();
+                let Some(mut body) = self.shared.take_request_buffer() else {
+                    return (ctx, PreparedCancelBody::BufferUnavailable);
+                };
                 body.clear();
                 if let Err(error) =
                     serde_json::to_writer((&mut body).writer(), &CancelBody { order_id: oid })
                 {
                     self.shared.recycle_request_buffer(body);
                     warn!(
-                        "[PolymarketTrade] pooled cancel serialization failed coid={}; retrying allocated buffer: {}",
+                        "[PolymarketTrade] pooled cancel serialization failed coid={}; cancel not dispatched: {}",
                         client_order_id,
                         error,
                     );
-                    let fallback = serde_json::to_vec(&CancelBody { order_id: oid })
-                        .expect("CancelBody serialization is infallible");
-                    return (ctx, Some(Bytes::from(fallback)));
+                    return (ctx, PreparedCancelBody::BufferUnavailable);
                 }
-                (ctx, Some(body.freeze()))
+                (ctx, PreparedCancelBody::Ready(body.freeze()))
             }
             None => {
                 info!(
                     "[PolymarketTrade] Cancel coid={} — no orderID locally, nothing to send",
                     client_order_id
                 );
-                (ctx, None)
+                (ctx, PreparedCancelBody::NoOrderId)
             }
         }
     }
@@ -11992,6 +12025,21 @@ mod tests {
         recovered.clear();
         assert_eq!(recovered.as_ptr(), original_ptr);
         pool.push(recovered).unwrap();
+        assert_eq!(pool.len(), REQUEST_BUFFER_SLOTS);
+    }
+
+    #[test]
+    fn request_body_pool_exhaustion_is_explicit_and_bounded() {
+        let pool = new_request_buffer_pool();
+        let mut leased = Vec::with_capacity(REQUEST_BUFFER_SLOTS);
+        while let Some(buffer) = pool.pop() {
+            leased.push(buffer);
+        }
+        assert_eq!(leased.len(), REQUEST_BUFFER_SLOTS);
+        assert!(pool.pop().is_none(), "pool must not allocate a fallback buffer");
+        for buffer in leased {
+            pool.push(buffer).unwrap();
+        }
         assert_eq!(pool.len(), REQUEST_BUFFER_SLOTS);
     }
 

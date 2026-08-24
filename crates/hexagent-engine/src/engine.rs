@@ -41,6 +41,7 @@ const POLY_RECONCILE_OWNER_QUEUE_CAPACITY: usize = 32;
 const POLY_CANCEL_OUTBOX_CAPACITY: usize = 4_096;
 const POLY_SAFETY_CANCEL_OUTBOX_CAPACITY: usize = 1_024;
 const POLY_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
+const HEXMARKET_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
 const VENUE_FAST_OWNER_QUEUE_CAPACITY: usize = 64;
 const VENUE_CANCEL_OWNER_QUEUE_CAPACITY: usize = 4_096;
 const VENUE_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
@@ -78,6 +79,7 @@ enum ExecutionDiagnostic {
         operation: &'static str,
         detail: String,
     },
+    #[cfg(test)]
     FixedLifecycleOverflow {
         client_order_id: String,
     },
@@ -109,6 +111,7 @@ fn spawn_execution_diagnostics(
                     } => error!(
                         "[Executor] venue={exchange:?} operation={operation} failed: {detail}"
                     ),
+                    #[cfg(test)]
                     ExecutionDiagnostic::FixedLifecycleOverflow { client_order_id } => error!(
                         "[Executor] fixed lifecycle scratch overflow coid={client_order_id}"
                     ),
@@ -10299,7 +10302,8 @@ impl Engine {
             .iter()
             .find(|e| e.name == "hexmarket")
             .map(|e| e.max_connections)
-            .unwrap_or(4);
+            .unwrap_or(4)
+            .max(1);
         // Pre-compute (with the registry, before the `move`) which strategies
         // need Hexmarket execution workers, so the spawned thread — which only
         // captures a `config` clone — gates on a capability, not a strategy name.
@@ -10350,6 +10354,7 @@ impl Engine {
                     Vec<Sender<(Signal, ExecutorUpdateSender)>>,
                 > = HashMap::new();
                 let mut hex_worker_handles = Vec::<thread::JoinHandle<()>>::new();
+                let mut hex_completion_handles = Vec::<thread::JoinHandle<()>>::new();
 
                 // Gate Hexmarket execution workers via the pre-computed
                 // capability flags (needs_hex_workers), not a strategy name.
@@ -10383,6 +10388,27 @@ impl Engine {
                     let trade = HexmarketTrade::new(&pk, &mn, &api, rate_limit);
                     info!("[Executor] Instance '{}': creating {} workers", instance_id, hex_max_connections);
 
+                    let (hex_completion_tx, hex_completion_rx) =
+                        bounded::<(ExecutorUpdateSender, OrderUpdate)>(
+                            HEXMARKET_COMPLETION_OUTBOX_CAPACITY,
+                        );
+                    let completion_name = format!("{}-completion-owner", instance_id);
+                    let completion_handle = thread::Builder::new()
+                        .name(completion_name.clone())
+                        .spawn(move || {
+                            crate::os_tune::pin_execution_role(
+                                &completion_name,
+                                crate::os_tune::ExecutionThreadRole::VenueCompletion,
+                            );
+                            while let Ok((update_tx, update)) = hex_completion_rx.recv() {
+                                if send_executor_update(&update_tx, update).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .expect("spawn Hexmarket completion owner");
+                    hex_completion_handles.push(completion_handle);
+
                     let mut pool = Vec::<Sender<(Signal, ExecutorUpdateSender)>>::with_capacity(
                         hex_max_connections,
                     );
@@ -10390,6 +10416,7 @@ impl Engine {
                         let mut worker = trade.clone_worker();
                         let inst_id = instance_id.clone();
                         let diagnostics = execution_diagnostic_tx.clone();
+                        let completion_tx = hex_completion_tx.clone();
                         let (tx, rx) = bounded::<(Signal, ExecutorUpdateSender)>(64);
                         let worker_name = format!("{}-worker-{}", inst_id, i);
                         let handle = thread::Builder::new()
@@ -10403,16 +10430,24 @@ impl Engine {
                                     "execution.diagnostic.overflow",
                                 ]);
                                 while let Ok((signal, update_tx)) = rx.recv() {
-                                    let mut updates = OrderUpdateBatch::new();
-                                    execute_venue_signal_into(
+                                    let mut completion_open = true;
+                                    execute_venue_signal_with(
                                         &mut worker,
                                         signal,
                                         150,
-                                        &mut updates,
                                         &diagnostics,
+                                        &mut |update| {
+                                            if !completion_open {
+                                                return false;
+                                            }
+                                            completion_open = completion_tx
+                                                .send((update_tx.clone(), update))
+                                                .is_ok();
+                                            completion_open
+                                        },
                                     );
-                                    for update in updates.drain(..) {
-                                        let _ = send_executor_update(&update_tx, update);
+                                    if !completion_open {
+                                        break;
                                     }
                                 }
                             })
@@ -10420,6 +10455,7 @@ impl Engine {
                         pool.push(tx);
                         hex_worker_handles.push(handle);
                     }
+                    drop(hex_completion_tx);
 
                     instance_pools.insert(instance_id, pool);
                 }
@@ -10859,7 +10895,11 @@ impl Engine {
                     instance_pools.len(), total_workers, stale_summary,
                 );
 
-                let mut round_robins: HashMap<String, usize> = HashMap::new();
+                // Dispatcher-owned cold compatibility index for legacy
+                // cancel signals that still carry only a coid. New/batch
+                // traffic is assigned by stable market shard, so all mutable
+                // order identity stays inside one physical connection owner.
+                let mut hex_coid_routes: HashMap<String, HashMap<String, usize>> = HashMap::new();
                 let mut shutdown_finalized = false;
 
                 loop {
@@ -10963,15 +11003,56 @@ impl Engine {
                             info!("[Executor] Stopping");
                             break;
                         }
+                        Signal::CancelAll {
+                            exchange: Exchange::Hexmarket,
+                            symbol,
+                            instance_id: signal_instance_id,
+                            timestamp_ns,
+                        } => {
+                            if let Some(pool) = instance_pools.get(&instance_id) {
+                                for lane in pool {
+                                    let shard_signal = Signal::CancelAll {
+                                        exchange: Exchange::Hexmarket,
+                                        symbol: symbol.clone(),
+                                        instance_id: signal_instance_id.clone(),
+                                        timestamp_ns: *timestamp_ns,
+                                    };
+                                    if let Err(error) =
+                                        lane.try_send((shard_signal, update_sender.clone()))
+                                    {
+                                        let (signal, update_sender) = error.into_inner();
+                                        for update in rejected_venue_signal(
+                                            &signal,
+                                            "hexmarket physical owner queue unavailable",
+                                        ) {
+                                            if send_executor_update(&update_sender, update).is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!("[Executor] Unknown instance '{}', dropping signal", instance_id);
+                            }
+                        }
                         Signal::BatchUpdateOrders { exchange: Exchange::Hexmarket, .. }
                         | Signal::BatchNewOrders { exchange: Exchange::Hexmarket, .. }
                         | Signal::BatchCancelOrders { exchange: Exchange::Hexmarket, .. }
-                        | Signal::CancelAll { exchange: Exchange::Hexmarket, .. }
                         | Signal::CancelOrder { exchange: Exchange::Hexmarket, .. } => {
                             if let Some(pool) = instance_pools.get(&instance_id) {
-                                let rr = round_robins.entry(instance_id.clone()).or_insert(0);
-                                let idx = *rr % pool.len();
-                                *rr += 1;
+                                let idx = hexmarket_connection_slot(
+                                    &signal,
+                                    &instance_id,
+                                    &hex_coid_routes,
+                                    pool.len(),
+                                );
+                                record_hexmarket_coid_routes(
+                                    &signal,
+                                    &instance_id,
+                                    idx,
+                                    &mut hex_coid_routes,
+                                );
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
                                     for update in rejected_venue_signal(
@@ -10989,9 +11070,18 @@ impl Engine {
                         }
                         Signal::NewOrder(order) if order.exchange == Exchange::Hexmarket => {
                             if let Some(pool) = instance_pools.get(&instance_id) {
-                                let rr = round_robins.entry(instance_id.clone()).or_insert(0);
-                                let idx = *rr % pool.len();
-                                *rr += 1;
+                                let idx = hexmarket_connection_slot(
+                                    &signal,
+                                    &instance_id,
+                                    &hex_coid_routes,
+                                    pool.len(),
+                                );
+                                record_hexmarket_coid_routes(
+                                    &signal,
+                                    &instance_id,
+                                    idx,
+                                    &mut hex_coid_routes,
+                                );
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
                                     for update in rejected_venue_signal(
@@ -11133,6 +11223,9 @@ impl Engine {
                 }
                 drop(instance_pools);
                 for handle in hex_worker_handles {
+                    let _ = handle.join();
+                }
+                for handle in hex_completion_handles {
                     let _ = handle.join();
                 }
                 drop(poly_connection_routes.take());
@@ -11396,42 +11489,44 @@ fn admission_log_snapshot(
     by_inst
 }
 
-/// Execute one bounded venue command into owner-local reusable storage.
-/// Adapter failures are converted to typed lifecycle feedback where an exact
-/// order identity exists; fixed-capacity overflow is logged as a correctness
-/// fault and never silently truncates the returned prefix.
-fn execute_venue_signal_into<T: ExchangeTrade>(
+/// Execute one venue command and stream every lifecycle result to the
+/// connection owner's completion lane. Bounded place/update commands still use
+/// owner-local fixed scratch inside the adapter, while cancel-all is streamed
+/// because its cardinality is the number of live orders, not a transport-batch
+/// constant.
+fn execute_venue_signal_with<T: ExchangeTrade>(
     worker: &mut T,
     signal: Signal,
     stale_threshold_ms: u64,
-    out: &mut OrderUpdateBatch,
     diagnostics: &Sender<ExecutionDiagnostic>,
+    emit: &mut dyn FnMut(OrderUpdate) -> bool,
 ) {
-    out.clear();
     let is_stale = |timestamp_ns: u64| {
         timestamp_ns != 0
             && stale_threshold_ms != 0
             && now_ns().saturating_sub(timestamp_ns) / 1_000_000 > stale_threshold_ms
     };
-    let push = |out: &mut OrderUpdateBatch, update: OrderUpdate| {
-        if let Err(overflow) = push_order_update(out, update) {
-            try_submit_execution_diagnostic(
-                diagnostics,
-                ExecutionDiagnostic::FixedLifecycleOverflow {
-                    client_order_id: overflow.update.client_order_id,
-                },
-            );
+    let mut fixed = OrderUpdateBatch::new();
+    let drain_fixed = |fixed: &mut OrderUpdateBatch,
+                       emit: &mut dyn FnMut(OrderUpdate) -> bool| {
+        for update in fixed.drain(..) {
+            if !emit(update) {
+                return false;
+            }
         }
+        true
     };
     match signal {
         Signal::NewOrder(order)
             if is_stale(order.timestamp_ns)
                 || is_stale(order.quote_trigger_local_timestamp_ns) =>
         {
-            push(out, exec_rejected_place(&order));
+            let _ = emit(exec_rejected_place(&order));
         }
         Signal::NewOrder(order) => match worker.submit_order(&order) {
-            Ok(update) => push(out, update),
+            Ok(update) => {
+                let _ = emit(update);
+            }
             Err(error) => {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
@@ -11445,7 +11540,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                 let mut update = exec_rejected_place(&order);
                 update.status = OrderStatus::Rejected;
                 update.error = Some(detail);
-                push(out, update);
+                let _ = emit(update);
             }
         },
         Signal::CancelOrder {
@@ -11453,7 +11548,9 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
             client_order_id,
             ..
         } => match worker.cancel_order(exchange, &client_order_id) {
-            Ok(update) => push(out, update),
+            Ok(update) => {
+                let _ = emit(update);
+            }
             Err(error) => {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
@@ -11473,7 +11570,9 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                     },
                     &detail,
                 ) {
-                    push(out, update);
+                    if !emit(update) {
+                        break;
+                    }
                 }
             }
         },
@@ -11483,7 +11582,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
             instance_id,
             timestamp_ns,
         } => {
-            if let Err(error) = worker.cancel_all_into(exchange, &symbol, out) {
+            if let Err(error) = worker.cancel_all_with(exchange, &symbol, emit) {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
                     diagnostics,
@@ -11493,17 +11592,17 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         detail: detail.clone(),
                     },
                 );
-                if out.is_empty() {
-                    for update in rejected_venue_signal(
-                        &Signal::CancelAll {
-                            exchange,
-                            symbol,
-                            instance_id,
-                            timestamp_ns,
-                        },
-                        &detail,
-                    ) {
-                        push(out, update);
+                for update in rejected_venue_signal(
+                    &Signal::CancelAll {
+                        exchange,
+                        symbol,
+                        instance_id,
+                        timestamp_ns,
+                    },
+                    &detail,
+                ) {
+                    if !emit(update) {
+                        break;
                     }
                 }
             }
@@ -11519,9 +11618,13 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                     || is_stale(order.quote_trigger_local_timestamp_ns)
             }) {
                 for order in &orders {
-                    push(out, exec_rejected_place(order));
+                    if !emit(exec_rejected_place(order)) {
+                        break;
+                    }
                 }
-            } else if let Err(error) = worker.batch_submit_orders_into(&market_id, &orders, out) {
+            } else if let Err(error) =
+                worker.batch_submit_orders_into(&market_id, &orders, &mut fixed)
+            {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
                     diagnostics,
@@ -11531,7 +11634,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         detail: detail.clone(),
                     },
                 );
-                if out.is_empty() {
+                if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::BatchNewOrders {
                             exchange,
@@ -11541,10 +11644,13 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         },
                         &detail,
                     ) {
-                        push(out, update);
+                        if !emit(update) {
+                            break;
+                        }
                     }
                 }
             }
+            let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::BatchCancelOrders {
             exchange,
@@ -11557,7 +11663,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                 exchange,
                 &market_id,
                 &client_order_ids,
-                out,
+                &mut fixed,
             ) {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
@@ -11568,7 +11674,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         detail: detail.clone(),
                     },
                 );
-                if out.is_empty() {
+                if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::BatchCancelOrders {
                             exchange,
@@ -11579,10 +11685,13 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         },
                         &detail,
                     ) {
-                        push(out, update);
+                        if !emit(update) {
+                            break;
+                        }
                     }
                 }
             }
+            let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::BatchUpdateOrders {
             exchange,
@@ -11597,7 +11706,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                 &market_id,
                 &cancel_client_order_ids,
                 &place_orders,
-                out,
+                &mut fixed,
             ) {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
@@ -11608,7 +11717,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         detail: detail.clone(),
                     },
                 );
-                if out.is_empty() {
+                if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::BatchUpdateOrders {
                             exchange,
@@ -11620,10 +11729,13 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         },
                         &detail,
                     ) {
-                        push(out, update);
+                        if !emit(update) {
+                            break;
+                        }
                     }
                 }
             }
+            let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::ReplaceOrder {
             exchange,
@@ -11638,7 +11750,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                 &market_id,
                 &cancel_client_order_ids,
                 &place_orders,
-                out,
+                &mut fixed,
             ) {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
@@ -11649,7 +11761,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         detail: detail.clone(),
                     },
                 );
-                if out.is_empty() {
+                if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::ReplaceOrder {
                             exchange,
@@ -11661,12 +11773,54 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
                         },
                         &detail,
                     ) {
-                        push(out, update);
+                        if !emit(update) {
+                            break;
+                        }
                     }
                 }
             }
+            let _ = drain_fixed(&mut fixed, emit);
         }
         _ => {}
+    }
+}
+
+/// Fixed-output compatibility wrapper used by bounded callers and focused
+/// tests. It returns the first unqueued update instead of dropping it.
+#[cfg(test)]
+fn execute_venue_signal_into<T: ExchangeTrade>(
+    worker: &mut T,
+    signal: Signal,
+    stale_threshold_ms: u64,
+    out: &mut OrderUpdateBatch,
+    diagnostics: &Sender<ExecutionDiagnostic>,
+) -> Result<(), OrderUpdate> {
+    out.clear();
+    let mut overflow = None;
+    execute_venue_signal_with(
+        worker,
+        signal,
+        stale_threshold_ms,
+        diagnostics,
+        &mut |update| match push_order_update(out, update) {
+            Ok(()) => true,
+            Err(error) => {
+                overflow = Some(error.update);
+                false
+            }
+        },
+    );
+    match overflow {
+        Some(update) => {
+            try_submit_execution_diagnostic(
+                diagnostics,
+                ExecutionDiagnostic::FixedLifecycleOverflow {
+                    client_order_id: update.client_order_id.clone(),
+                },
+            );
+            Err(update)
+        }
+        None => Ok(()),
     }
 }
 
@@ -11680,6 +11834,91 @@ struct VenueExecutionCommand {
 struct VenueExecutionRoutes {
     fast: Sender<VenueExecutionCommand>,
     cancel: Sender<VenueExecutionCommand>,
+}
+
+#[inline]
+fn stable_connection_slot(key: &str, connection_count: usize) -> usize {
+    debug_assert!(connection_count > 0);
+    let hash = key.as_bytes().iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (hash as usize) % connection_count
+}
+
+/// Select one physical Hexmarket connection owner. Market-scoped commands
+/// stay on one shard; the string lookup exists only for the legacy single
+/// cancel envelope that does not yet carry its numeric `OrderSlot`/market.
+fn hexmarket_connection_slot(
+    signal: &Signal,
+    instance_id: &str,
+    coid_routes: &HashMap<String, HashMap<String, usize>>,
+    connection_count: usize,
+) -> usize {
+    let existing_coid = match signal {
+        Signal::CancelOrder {
+            client_order_id, ..
+        } => Some(client_order_id.as_str()),
+        Signal::BatchCancelOrders {
+            client_order_ids, ..
+        } => client_order_ids.first().map(String::as_str),
+        Signal::BatchUpdateOrders {
+            cancel_client_order_ids,
+            ..
+        }
+        | Signal::ReplaceOrder {
+            cancel_client_order_ids,
+            ..
+        } => cancel_client_order_ids.first().map(String::as_str),
+        _ => None,
+    };
+    if let Some(client_order_id) = existing_coid {
+        if let Some(slot) = coid_routes
+            .get(instance_id)
+            .and_then(|routes| routes.get(client_order_id))
+            .copied()
+        {
+            return slot % connection_count;
+        }
+    }
+    let shard_key = match signal {
+        Signal::NewOrder(order) => order.symbol.as_str(),
+        Signal::CancelOrder {
+            client_order_id, ..
+        } => client_order_id.as_str(),
+        Signal::CancelAll { symbol, .. } => symbol.as_str(),
+        Signal::BatchNewOrders { market_id, .. }
+        | Signal::BatchCancelOrders { market_id, .. }
+        | Signal::BatchUpdateOrders { market_id, .. }
+        | Signal::ReplaceOrder { market_id, .. } => market_id.as_str(),
+        _ => instance_id,
+    };
+    stable_connection_slot(shard_key, connection_count)
+}
+
+fn record_hexmarket_coid_routes(
+    signal: &Signal,
+    instance_id: &str,
+    connection_slot: usize,
+    coid_routes: &mut HashMap<String, HashMap<String, usize>>,
+) {
+    let routes = coid_routes.entry(instance_id.to_string()).or_default();
+    match signal {
+        Signal::NewOrder(order) => {
+            routes.insert(order.client_order_id.clone(), connection_slot);
+        }
+        Signal::BatchNewOrders { orders, .. } => {
+            for order in orders {
+                routes.insert(order.client_order_id.clone(), connection_slot);
+            }
+        }
+        Signal::BatchUpdateOrders { place_orders, .. }
+        | Signal::ReplaceOrder { place_orders, .. } => {
+            for order in place_orders {
+                routes.insert(order.client_order_id.clone(), connection_slot);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn signal_exchange(signal: &Signal) -> Option<Exchange> {
@@ -11821,26 +12060,26 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
                         .as_nanos()
                         .min(u64::MAX as u128) as u64,
                 );
-                let mut updates = OrderUpdateBatch::new();
-                execute_venue_signal_into(
+                let mut completion_open = true;
+                execute_venue_signal_with(
                     &mut worker,
                     command.signal,
                     command.stale_threshold_ms,
-                    &mut updates,
                     &diagnostics,
+                    &mut |update| {
+                        if !completion_open {
+                            return false;
+                        }
+                        completion_open = completion_tx
+                            .send(RoutedOrderUpdate {
+                                owner: command.owner,
+                                update,
+                            })
+                            .is_ok();
+                        completion_open
+                    },
                 );
-                for update in updates.drain(..) {
-                    if completion_tx
-                        .send(RoutedOrderUpdate {
-                            owner: command.owner,
-                            update,
-                        })
-                        .is_err()
-                    {
-                        return false;
-                    }
-                }
-                true
+                completion_open
             };
             loop {
                 let command = crossbeam_channel::select_biased! {
@@ -15249,6 +15488,43 @@ mod market_router_tests {
         }
     }
 
+    #[test]
+    fn hexmarket_single_cancel_returns_to_the_physical_order_owner() {
+        let mut order = order_req("hex-coid-1", "instance-0");
+        order.exchange = Exchange::Hexmarket;
+        order.symbol = "ETH-USD".into();
+        let place = Signal::NewOrder(order);
+        let mut routes = HashMap::new();
+        let owner = hexmarket_connection_slot(&place, "instance-0", &routes, 4);
+        record_hexmarket_coid_routes(&place, "instance-0", owner, &mut routes);
+
+        let cancel = Signal::CancelOrder {
+            exchange: Exchange::Hexmarket,
+            client_order_id: "hex-coid-1".into(),
+            instance_id: "instance-0".into(),
+            timestamp_ns: 2,
+        };
+        assert_eq!(
+            hexmarket_connection_slot(&cancel, "instance-0", &routes, 4),
+            owner,
+        );
+
+        let mut cancel_ids = OrderIdBatch::new();
+        cancel_ids.push("hex-coid-1".into());
+        let replace = Signal::BatchUpdateOrders {
+            exchange: Exchange::Hexmarket,
+            market_id: "legacy-market-alias".into(),
+            cancel_client_order_ids: cancel_ids,
+            place_orders: OrderBatch::new(),
+            timestamp_ns: 3,
+            instance_id: "instance-0".into(),
+        };
+        assert_eq!(
+            hexmarket_connection_slot(&replace, "instance-0", &routes, 4),
+            owner,
+        );
+    }
+
     struct FixedVenueTestTrade;
 
     impl ExchangeTrade for FixedVenueTestTrade {
@@ -15286,7 +15562,9 @@ mod market_router_tests {
             _exchange: Exchange,
             _symbol: &str,
         ) -> Result<Vec<OrderUpdate>> {
-            Ok(Vec::new())
+            (0..=ORDER_UPDATE_BATCH_CAPACITY)
+                .map(|index| self.submit_order(&order_req(&format!("cancel-{index}"), "instance-0")))
+                .collect()
         }
 
         fn batch_submit_orders_into(
@@ -15324,11 +15602,40 @@ mod market_router_tests {
         let mut worker = FixedVenueTestTrade;
         let mut updates = OrderUpdateBatch::new();
         let (diagnostics, _diagnostic_rx) = bounded(4);
-        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics);
+        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics).unwrap();
         assert_eq!(updates.len(), ORDER_BATCH_CAPACITY);
         assert!(updates
             .iter()
             .all(|update| update.status == OrderStatus::Accepted));
+    }
+
+    #[test]
+    fn venue_cancel_all_streams_past_fixed_batch_capacity_without_loss() {
+        let signal = Signal::CancelAll {
+            exchange: Exchange::Hyperliquid,
+            symbol: "BTC".into(),
+            instance_id: "instance-0".into(),
+            timestamp_ns: 1,
+        };
+        let mut worker = FixedVenueTestTrade;
+        let (diagnostics, _diagnostic_rx) = bounded(4);
+        let mut coids = Vec::new();
+        execute_venue_signal_with(
+            &mut worker,
+            signal,
+            0,
+            &diagnostics,
+            &mut |update| {
+                coids.push(update.client_order_id);
+                true
+            },
+        );
+        assert_eq!(coids.len(), ORDER_UPDATE_BATCH_CAPACITY + 1);
+        assert_eq!(coids.first().map(String::as_str), Some("cancel-0"));
+        assert_eq!(
+            coids.last().map(String::as_str),
+            Some("cancel-64"),
+        );
     }
 
     #[test]
@@ -15342,7 +15649,7 @@ mod market_router_tests {
         let mut worker = FixedVenueTestTrade;
         let mut updates = OrderUpdateBatch::new();
         let (diagnostics, diagnostic_rx) = bounded(4);
-        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics);
+        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, OrderStatus::CancelUncertain);
         assert_eq!(updates[0].client_order_id, "cancel-me");

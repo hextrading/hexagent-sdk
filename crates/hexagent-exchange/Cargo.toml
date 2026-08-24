@@ -14,6 +14,7 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 arc-swap = "1"
 bytes = "1"
+arrayvec = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
