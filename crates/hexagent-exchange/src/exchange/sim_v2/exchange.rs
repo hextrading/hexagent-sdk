@@ -2122,6 +2122,7 @@ impl SimExchangeV2 {
                 trade_id: Some(trade_id),
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             });
             if f.fully {
                 self.orders.remove(&f.coid);
@@ -2878,6 +2879,7 @@ impl SimExchangeV2 {
             trade_id: Some(format!("simv2-taker-{}", o.client_order_id)),
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -3206,6 +3208,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -3229,6 +3232,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: Some(err.to_string()),
+            order_slot: Default::default(),
         }
     }
 
@@ -3249,6 +3253,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -3332,6 +3337,7 @@ impl SimExchangeV2 {
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             };
         }
         // Not resting — matched-can't-cancel if it just filled. Re-emit the
@@ -3374,6 +3380,7 @@ impl SimExchangeV2 {
                 trade_id: Some(trade_id),
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             };
         }
         // Unknown / stale: not resting and didn't just fill. Almost always a
@@ -3406,6 +3413,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 
@@ -3442,6 +3450,7 @@ impl SimExchangeV2 {
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             });
         }
         for (coid, _oid) in pending_cancels {
@@ -3461,6 +3470,7 @@ impl SimExchangeV2 {
                 trade_id: None,
                 order_audit: None,
                 error: None,
+                order_slot: Default::default(),
             });
         }
         out
@@ -3559,6 +3569,7 @@ mod tests {
             post_only,
             reduce_only: false,
             outcome_label: String::new(),
+            order_slot: Default::default(),
         }
     }
 

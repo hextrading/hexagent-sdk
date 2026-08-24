@@ -6,7 +6,7 @@
 //! instance's weighted virtual balance/inventory is its private ceiling.
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderStatus, Side};
+use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderSlot, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
@@ -56,11 +56,406 @@ const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
 const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
+#[cfg(not(test))]
+const ACCOUNT_OWNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ACCOUNT_OWNER_REQUEST_TIMEOUT: Duration = Duration::from_millis(25);
 
-/// Cold account control work transferred to the account's single writer.
-/// Callers must never enqueue quote-path work or perform external I/O inside
-/// the closure. The bounded lane is consumed by the exchange account owner.
-pub type AccountOwnerTask = Box<dyn FnOnce(&SharedAccount) + Send + 'static>;
+/// Opaque, typed cold-control message consumed by the account's single writer.
+/// Unlike the former boxed-closure lane, the complete operation set is
+/// reviewable here and cannot capture arbitrary I/O or quote-path state.
+pub struct AccountOwnerCommand(AccountOwnerOperation);
+
+enum AccountOwnerOperation {
+    #[cfg(test)]
+    Barrier(crossbeam_channel::Sender<()>),
+    TokenInterests(crossbeam_channel::Sender<Vec<TokenInterest>>),
+    RegisterTokenInterest {
+        instance_id: String,
+        condition_id: String,
+        up_token_id: String,
+        down_token_id: String,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
+    RetireTokenInterest {
+        instance_id: String,
+        condition_id: String,
+        reply: crossbeam_channel::Sender<()>,
+    },
+    RecordSettlementAndRetire {
+        instance_id: String,
+        condition_id: String,
+        values: HashMap<String, f64>,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
+    RecordSidecarCheckpoint {
+        sidecar_id: String,
+        checkpoint: DurableSidecarCheckpoint,
+        reply: crossbeam_channel::Sender<Result<bool, String>>,
+    },
+    RecordSettledTokenValues {
+        values: HashMap<String, f64>,
+        reply: Option<crossbeam_channel::Sender<()>>,
+    },
+    ApplyScopedPhysicalSnapshot {
+        generation: Option<u64>,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+        reply: crossbeam_channel::Sender<Result<bool, String>>,
+    },
+    ObservePlatformBinaryRedeem {
+        observed_cash: f64,
+        observed_positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    SetRiskBlocker {
+        source: String,
+        reason: String,
+        reply: Option<crossbeam_channel::Sender<()>>,
+    },
+    ClearRiskBlocker {
+        source: String,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    BeginOrderRecovery {
+        client_order_ids: Vec<String>,
+    },
+    FinishOrderRecovery {
+        client_order_id: String,
+    },
+    RecordMaintenanceQueueWait {
+        wait: Duration,
+    },
+    MonitoringSnapshot(crossbeam_channel::Sender<AccountMonitoringSnapshot>),
+    RebindOrderId {
+        client_order_id: String,
+        order_id: String,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    BackfillOrderOwnership {
+        ownership: OrderOwnership,
+        reply: crossbeam_channel::Sender<Option<OrderOwnership>>,
+    },
+    MarkOrderStatusEffective {
+        client_order_id: String,
+        status: OrderStatus,
+        reply: crossbeam_channel::Sender<Option<OrderStatus>>,
+    },
+    MarkFilledPendingAudit {
+        client_order_id: String,
+        reply: crossbeam_channel::Sender<FillAuditPendingTransition>,
+    },
+    ApplyAuthoritativeOrderAudit {
+        client_order_id: String,
+        status: OrderStatus,
+        audit: AuthoritativeOrderAudit,
+        reply: crossbeam_channel::Sender<Result<FillAuditPendingTransition, String>>,
+    },
+    MarkCancelledPendingAudit {
+        client_order_id: String,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    ReleaseOrder {
+        client_order_id: String,
+        status: OrderStatus,
+    },
+    ApplyRedeemedLegs {
+        legs: Vec<(String, f64, f64)>,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
+    ReserveMaintenanceOperation {
+        operation_id: String,
+        kind: MaintenanceOperationKind,
+        condition_id: String,
+        up_token_id: String,
+        down_token_id: String,
+        allocations: HashMap<String, f64>,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
+    MarkMaintenanceOperationSubmitted {
+        operation_id: String,
+        tx_id: String,
+        reply: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    MarkMaintenanceOperationUncertain {
+        operation_id: String,
+        detail: String,
+    },
+    MarkMaintenanceAttributionUncertain {
+        operation_id: String,
+        detail: String,
+    },
+    RepairConfirmedMaintenanceRiskBlockers(crossbeam_channel::Sender<usize>),
+    PendingMaintenanceOperations(crossbeam_channel::Sender<Vec<MaintenanceOperation>>),
+    MaintenanceOperation {
+        operation_id: String,
+        reply: crossbeam_channel::Sender<Option<MaintenanceOperation>>,
+    },
+    FailMaintenanceOperation {
+        operation_id: String,
+        detail: String,
+    },
+    ConfirmMaintenanceOperation {
+        operation_id: String,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
+    Trades(crossbeam_channel::Sender<Vec<TradeOwnership>>),
+}
+
+impl AccountOwnerCommand {
+    pub fn execute(self, account: &SharedAccount) {
+        use AccountOwnerOperation::*;
+        match self.0 {
+            #[cfg(test)]
+            Barrier(reply) => {
+                let _ = reply.send(());
+            }
+            TokenInterests(reply) => {
+                let _ = reply.send(account.token_interests());
+            }
+            RegisterTokenInterest {
+                instance_id,
+                condition_id,
+                up_token_id,
+                down_token_id,
+                reply,
+            } => {
+                let blocker = format!("token_interest:{condition_id}");
+                let result = account.register_token_interest(
+                    &instance_id,
+                    &condition_id,
+                    &up_token_id,
+                    &down_token_id,
+                );
+                match &result {
+                    Ok(()) => {
+                        account.clear_risk_blocker(&blocker);
+                    }
+                    Err(error) => account.set_risk_blocker(
+                        &blocker,
+                        format!("failed to register token interest for {condition_id}: {error}"),
+                    ),
+                }
+                let _ = reply.send(result);
+            }
+            RetireTokenInterest {
+                instance_id,
+                condition_id,
+                reply,
+            } => {
+                account.retire_token_interest(&instance_id, &condition_id);
+                let _ = reply.send(());
+            }
+            RecordSettlementAndRetire {
+                instance_id,
+                condition_id,
+                values,
+                reply,
+            } => {
+                let _ = reply.send(account.record_settlement_and_retire(
+                    &instance_id,
+                    &condition_id,
+                    &values,
+                ));
+            }
+            RecordSidecarCheckpoint {
+                sidecar_id,
+                checkpoint,
+                reply,
+            } => {
+                let _ = reply.send(account.record_sidecar_checkpoint(&sidecar_id, checkpoint));
+            }
+            RecordSettledTokenValues { values, reply } => {
+                account.record_settled_token_values(&values);
+                if let Some(reply) = reply {
+                    let _ = reply.send(());
+                }
+            }
+            ApplyScopedPhysicalSnapshot {
+                generation,
+                cash,
+                positions,
+                authoritative_tokens,
+                reply,
+            } => {
+                let result = match generation {
+                    Some(generation) => account.apply_scoped_physical_snapshot_versioned(
+                        generation,
+                        cash,
+                        positions,
+                        authoritative_tokens,
+                    ),
+                    None => account.apply_scoped_physical_snapshot(
+                        cash,
+                        positions,
+                        authoritative_tokens,
+                    ),
+                };
+                let _ = reply.send(result);
+            }
+            ObservePlatformBinaryRedeem {
+                observed_cash,
+                observed_positions,
+                authoritative_tokens,
+                reply,
+            } => {
+                let _ = reply.send(account.observe_platform_binary_redeem(
+                    observed_cash,
+                    &observed_positions,
+                    &authoritative_tokens,
+                ));
+            }
+            SetRiskBlocker {
+                source,
+                reason,
+                reply,
+            } => {
+                account.set_risk_blocker(&source, reason);
+                if let Some(reply) = reply {
+                    let _ = reply.send(());
+                }
+            }
+            ClearRiskBlocker { source, reply } => {
+                let _ = reply.send(account.clear_risk_blocker(&source));
+            }
+            BeginOrderRecovery { client_order_ids } => {
+                account.begin_order_recovery(client_order_ids.iter().map(String::as_str));
+            }
+            FinishOrderRecovery { client_order_id } => {
+                account.finish_order_recovery(&client_order_id);
+            }
+            RecordMaintenanceQueueWait { wait } => {
+                account.record_maintenance_queue_wait(wait);
+            }
+            MonitoringSnapshot(reply) => {
+                let _ = reply.send(account.monitoring_snapshot());
+            }
+            RebindOrderId {
+                client_order_id,
+                order_id,
+                reply,
+            } => {
+                let _ = reply.send(account.rebind_order_id(&client_order_id, &order_id));
+            }
+            BackfillOrderOwnership { ownership, reply } => {
+                let _ = reply.send(account.backfill_order_ownership(&ownership));
+            }
+            MarkOrderStatusEffective {
+                client_order_id,
+                status,
+                reply,
+            } => {
+                let _ = reply.send(account.mark_order_status_effective(&client_order_id, status));
+            }
+            MarkFilledPendingAudit {
+                client_order_id,
+                reply,
+            } => {
+                let _ = reply.send(account.mark_filled_pending_audit(&client_order_id));
+            }
+            ApplyAuthoritativeOrderAudit {
+                client_order_id,
+                status,
+                audit,
+                reply,
+            } => {
+                let _ = reply.send(account.apply_authoritative_order_audit(
+                    &client_order_id,
+                    status,
+                    &audit,
+                ));
+            }
+            MarkCancelledPendingAudit {
+                client_order_id,
+                reply,
+            } => {
+                let _ = reply.send(account.mark_cancelled_pending_audit(&client_order_id));
+            }
+            ReleaseOrder {
+                client_order_id,
+                status,
+            } => {
+                account.release_order(&client_order_id, status);
+            }
+            ApplyRedeemedLegs { legs, reply } => {
+                let _ = reply.send(account.apply_redeemed_legs(&legs));
+            }
+            ReserveMaintenanceOperation {
+                operation_id,
+                kind,
+                condition_id,
+                up_token_id,
+                down_token_id,
+                allocations,
+                reply,
+            } => {
+                let _ = reply.send(account.reserve_maintenance_operation_inner(
+                    &operation_id,
+                    kind,
+                    &condition_id,
+                    &up_token_id,
+                    &down_token_id,
+                    &allocations,
+                    false,
+                ));
+            }
+            MarkMaintenanceOperationSubmitted {
+                operation_id,
+                tx_id,
+                reply,
+            } => {
+                let _ =
+                    reply.send(account.mark_maintenance_operation_submitted(&operation_id, &tx_id));
+            }
+            MarkMaintenanceOperationUncertain {
+                operation_id,
+                detail,
+            } => {
+                account.mark_maintenance_operation_uncertain(&operation_id, detail);
+            }
+            MarkMaintenanceAttributionUncertain {
+                operation_id,
+                detail,
+            } => {
+                account.mark_maintenance_attribution_uncertain(&operation_id, detail);
+            }
+            RepairConfirmedMaintenanceRiskBlockers(reply) => {
+                let _ = reply.send(account.repair_confirmed_maintenance_risk_blockers());
+            }
+            PendingMaintenanceOperations(reply) => {
+                let _ = reply.send(account.pending_maintenance_operations());
+            }
+            MaintenanceOperation {
+                operation_id,
+                reply,
+            } => {
+                let _ = reply.send(account.maintenance_operation(&operation_id));
+            }
+            FailMaintenanceOperation {
+                operation_id,
+                detail,
+            } => {
+                account.fail_maintenance_operation(&operation_id, detail);
+            }
+            ConfirmMaintenanceOperation {
+                operation_id,
+                reply,
+            } => {
+                let _ = reply.send(account.confirm_maintenance_operation(&operation_id));
+            }
+            Trades(reply) => {
+                let _ = reply.send(account.trades());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn barrier(reply: crossbeam_channel::Sender<()>) -> Self {
+        Self(AccountOwnerOperation::Barrier(reply))
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LockMonitoringSnapshot {
@@ -734,6 +1129,10 @@ pub struct AccountAvailability {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderOwnership {
+    /// Owner-local numeric routing slot. Durable/private replay can return the
+    /// lifecycle directly to a fixed strategy table without parsing coid.
+    #[serde(default)]
+    pub order_slot: OrderSlot,
     pub account_id: String,
     pub instance_id: String,
     pub client_order_id: String,
@@ -783,6 +1182,8 @@ pub struct PersistedOrphanOrderAnomaly {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeOwnership {
+    #[serde(default)]
+    pub order_slot: OrderSlot,
     pub account_id: String,
     pub instance_id: String,
     pub trade_key: String,
@@ -4053,8 +4454,8 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
 pub struct SharedAccount {
     account_id: String,
     state: Arc<Mutex<SharedAccountState>>,
-    account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerTask>,
-    account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerTask>>>,
+    account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
+    account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
     account_owner_lane_bound: AtomicBool,
     account_owner_thread_id: OnceLock<std::thread::ThreadId>,
     /// Cold account-wide mutations (wallet snapshots, maintenance and explicit
@@ -4255,7 +4656,7 @@ impl SharedAccount {
     /// single-writer ownership.
     pub fn bind_account_owner_task_lane(
         &self,
-    ) -> Result<crossbeam_channel::Receiver<AccountOwnerTask>, String> {
+    ) -> Result<crossbeam_channel::Receiver<AccountOwnerCommand>, String> {
         let mut receiver = self.account_owner_task_rx.lock().unwrap();
         let receiver = receiver
             .take()
@@ -4291,9 +4692,12 @@ impl SharedAccount {
     /// Enqueue non-blocking cold account work. This API is intentionally
     /// fail-closed on an unbound or full lane; callers choose their own retry
     /// and admission behavior instead of silently mutating off-owner.
-    pub fn try_submit_account_owner_task(&self, task: AccountOwnerTask) -> Result<(), String> {
+    pub fn try_submit_account_owner_command(
+        &self,
+        command: AccountOwnerCommand,
+    ) -> Result<(), String> {
         if self.is_account_owner_thread() {
-            task(self);
+            command.execute(self);
             return Ok(());
         }
         if !self.account_owner_lane_bound.load(Ordering::Acquire) {
@@ -4302,34 +4706,27 @@ impl SharedAccount {
                 self.account_id
             ));
         }
-        self.account_owner_task_tx.try_send(task).map_err(|error| {
-            format!(
-                "account {} owner task enqueue failed: {error}",
-                self.account_id,
-            )
-        })
+        self.account_owner_task_tx
+            .try_send(command)
+            .map_err(|error| {
+                format!(
+                    "account {} owner task enqueue failed: {error}",
+                    self.account_id,
+                )
+            })
     }
 
     /// Transfer a cold mutation to the account writer and wait for its result.
     /// The direct path exists only before the runtime binds the owner lane
     /// (CLI/startup/tests); once bound, no non-owner thread may execute it.
-    pub fn call_on_account_owner<T, F>(&self, operation: F) -> Result<T, String>
+    fn request_account_owner<T, F>(&self, build: F) -> Result<T, String>
     where
         T: Send + 'static,
-        F: FnOnce(&SharedAccount) -> T + Send + 'static,
+        F: FnOnce(crossbeam_channel::Sender<T>) -> AccountOwnerCommand,
     {
-        if self.is_account_owner_thread() || !self.account_owner_lane_bound.load(Ordering::Acquire)
-        {
-            return Ok(operation(self));
-        }
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.account_owner_task_tx
-            .send_timeout(
-                Box::new(move |account| {
-                    let _ = reply_tx.send(operation(account));
-                }),
-                Duration::from_secs(5),
-            )
+            .send_timeout(build(reply_tx), ACCOUNT_OWNER_REQUEST_TIMEOUT)
             .map_err(|error| {
                 format!(
                     "account {} owner task enqueue timed out: {error}",
@@ -4337,13 +4734,112 @@ impl SharedAccount {
                 )
             })?;
         reply_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(ACCOUNT_OWNER_REQUEST_TIMEOUT)
             .map_err(|error| {
                 format!(
                     "account {} owner task completion timed out: {error}",
                     self.account_id,
                 )
             })
+    }
+
+    pub fn submit_register_token_interest(
+        &self,
+        instance_id: String,
+        condition_id: String,
+        up_token_id: String,
+        down_token_id: String,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), ReservationError>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::RegisterTokenInterest {
+                instance_id,
+                condition_id,
+                up_token_id,
+                down_token_id,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_retire_token_interest(
+        &self,
+        instance_id: String,
+        condition_id: String,
+    ) -> Result<crossbeam_channel::Receiver<()>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::RetireTokenInterest {
+                instance_id,
+                condition_id,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_settlement_and_retire(
+        &self,
+        instance_id: String,
+        condition_id: String,
+        values: HashMap<String, f64>,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), ReservationError>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::RecordSettlementAndRetire {
+                instance_id,
+                condition_id,
+                values,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_sidecar_checkpoint(
+        &self,
+        sidecar_id: String,
+        checkpoint: DurableSidecarCheckpoint,
+    ) -> Result<crossbeam_channel::Receiver<Result<bool, String>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::RecordSidecarCheckpoint {
+                sidecar_id,
+                checkpoint,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_set_risk_blocker(
+        &self,
+        source: String,
+        reason: String,
+    ) -> Result<crossbeam_channel::Receiver<()>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.admission_fast.store(false, Ordering::Release);
+        self.passive_admission_fast.store(false, Ordering::Release);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::SetRiskBlocker {
+                source,
+                reason,
+                reply: Some(reply),
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_clear_risk_blocker(
+        &self,
+        source: String,
+    ) -> Result<crossbeam_channel::Receiver<bool>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_submit_account_owner_command(AccountOwnerCommand(
+            AccountOwnerOperation::ClearRiskBlocker { source, reply },
+        ))?;
+        Ok(completion)
     }
 
     pub fn account_owner_task_queue_depth(&self) -> usize {
@@ -6347,6 +6843,16 @@ impl SharedAccount {
         sidecar_id: &str,
         checkpoint: DurableSidecarCheckpoint,
     ) -> Result<bool, String> {
+        if self.must_dispatch_to_account_owner() {
+            let sidecar_id = sidecar_id.to_string();
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::RecordSidecarCheckpoint {
+                    sidecar_id,
+                    checkpoint,
+                    reply,
+                })
+            })?;
+        }
         if sidecar_id.trim().is_empty()
             || checkpoint.generation == 0
             || checkpoint.expected_entries == 0
@@ -6614,6 +7120,23 @@ impl SharedAccount {
         up_token_id: &str,
         down_token_id: &str,
     ) -> Result<(), ReservationError> {
+        if self.must_dispatch_to_account_owner() {
+            let instance_id = instance_id.to_string();
+            let condition_id = condition_id.to_string();
+            let up_token_id = up_token_id.to_string();
+            let down_token_id = down_token_id.to_string();
+            return self
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::RegisterTokenInterest {
+                        instance_id,
+                        condition_id,
+                        up_token_id,
+                        down_token_id,
+                        reply,
+                    })
+                })
+                .map_err(ReservationError::InvalidOrder)?;
+        }
         self.register_token_interest_scoped(
             instance_id,
             condition_id,
@@ -6673,13 +7196,24 @@ impl SharedAccount {
         Ok(())
     }
 
+    /// Fallible account-owner snapshot for background callers. A busy owner is
+    /// transient backpressure, not process corruption; callers that control a
+    /// retry loop must use this API instead of turning the timeout into panic.
+    pub fn try_token_interests(&self) -> Result<Vec<TokenInterest>, String> {
+        if self.must_dispatch_to_account_owner() {
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::TokenInterests(reply))
+            });
+        }
+        Ok(self.token_interests())
+    }
+
     pub fn token_interests(&self) -> Vec<TokenInterest> {
         if self.must_dispatch_to_account_owner() {
-            return self
-                .call_on_account_owner(|account| account.token_interests())
-                .unwrap_or_else(|error| {
-                    panic!("account owner token-interest snapshot failed: {error}")
-                });
+            return self.try_token_interests().unwrap_or_else(|error| {
+                log::error!("[shared_account] retryable token-interest snapshot failure: {error}");
+                Vec::new()
+            });
         }
         let mut state = self.lock_state();
         let now_ms = wall_clock_ms();
@@ -6807,6 +7341,22 @@ impl SharedAccount {
     /// their on-chain/settlement query scope expires only after inventory is
     /// authoritatively observed at zero.
     pub fn retire_token_interest(&self, instance_id: &str, condition_id: &str) {
+        if self.must_dispatch_to_account_owner() {
+            let instance_id = instance_id.to_string();
+            let condition_id = condition_id.to_string();
+            if let Err(error) = self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::RetireTokenInterest {
+                    instance_id,
+                    condition_id,
+                    reply,
+                })
+            }) {
+                log::error!("[shared_account] retire-token owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut state = self.lock_state();
         if let Some(instance) = state.instances.get_mut(instance_id) {
             if let Some(interest) = instance.token_interests.get_mut(condition_id) {
@@ -7420,9 +7970,12 @@ impl SharedAccount {
     pub fn record_settled_token_values(&self, values: &HashMap<String, f64>) {
         if self.must_dispatch_to_account_owner() {
             let values = values.clone();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.record_settled_token_values(&values);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::RecordSettledTokenValues {
+                    values,
+                    reply: None,
+                },
+            )) {
                 log::error!("[shared_account] settled-token owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -7465,6 +8018,21 @@ impl SharedAccount {
         condition_id: &str,
         values: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
+        if self.must_dispatch_to_account_owner() {
+            let instance_id = instance_id.to_string();
+            let condition_id = condition_id.to_string();
+            let values = values.clone();
+            return self
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::RecordSettlementAndRetire {
+                        instance_id,
+                        condition_id,
+                        values,
+                        reply,
+                    })
+                })
+                .map_err(ReservationError::InvalidOrder)?;
+        }
         if instance_id.trim().is_empty() || condition_id.trim().is_empty() {
             return Err(ReservationError::InvalidOrder(
                 "settlement mutation requires instance and condition identifiers".into(),
@@ -7678,8 +8246,14 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         if self.must_dispatch_to_account_owner() {
-            return self.call_on_account_owner(move |account| {
-                account.apply_scoped_physical_snapshot(cash, positions, authoritative_tokens)
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ApplyScopedPhysicalSnapshot {
+                    generation: None,
+                    cash,
+                    positions,
+                    authoritative_tokens,
+                    reply,
+                })
             })?;
         }
         self.apply_scoped_physical_snapshot_inner(None, cash, positions, authoritative_tokens)
@@ -7694,13 +8268,14 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         if self.must_dispatch_to_account_owner() {
-            return self.call_on_account_owner(move |account| {
-                account.apply_scoped_physical_snapshot_versioned(
-                    generation,
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ApplyScopedPhysicalSnapshot {
+                    generation: Some(generation),
                     cash,
                     positions,
                     authoritative_tokens,
-                )
+                    reply,
+                })
             })?;
         }
         self.apply_scoped_physical_snapshot_inner(
@@ -7830,12 +8405,13 @@ impl SharedAccount {
             let observed_positions = observed_positions.clone();
             let authoritative_tokens = authoritative_tokens.clone();
             return self
-                .call_on_account_owner(move |account| {
-                    account.observe_platform_binary_redeem(
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ObservePlatformBinaryRedeem {
                         observed_cash,
-                        &observed_positions,
-                        &authoritative_tokens,
-                    )
+                        observed_positions,
+                        authoritative_tokens,
+                        reply,
+                    })
                 })
                 .unwrap_or_else(|error| {
                     panic!("account owner redeem observation failed: {error}")
@@ -8049,9 +8625,15 @@ impl SharedAccount {
         let reason = reason.into();
         if self.must_dispatch_to_account_owner() {
             let source = source.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.set_risk_blocker(&source, reason);
-            }) {
+            self.admission_fast.store(false, Ordering::Release);
+            self.passive_admission_fast.store(false, Ordering::Release);
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::SetRiskBlocker {
+                    source,
+                    reason,
+                    reply: None,
+                },
+            )) {
                 log::error!("[shared_account] risk-blocker owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -8083,6 +8665,38 @@ impl SharedAccount {
         self.schedule_persist(&state);
     }
 
+    /// Submit a settled-token update and return its typed completion without
+    /// waiting on the caller thread. Cold workers that require a persistence
+    /// barrier can await this receiver before flushing; strategy callbacks use
+    /// [`record_settled_token_values`] and remain fire-and-forget.
+    pub fn submit_settled_token_values(
+        &self,
+        values: HashMap<String, f64>,
+    ) -> Result<crossbeam_channel::Receiver<()>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        if self.is_account_owner_thread() || !self.account_owner_lane_bound.load(Ordering::Acquire)
+        {
+            self.record_settled_token_values(&values);
+            let _ = reply.send(());
+            return Ok(completion);
+        }
+        self.account_owner_task_tx
+            .send_timeout(
+                AccountOwnerCommand(AccountOwnerOperation::RecordSettledTokenValues {
+                    values,
+                    reply: Some(reply),
+                }),
+                Duration::from_secs(5),
+            )
+            .map_err(|error| {
+                format!(
+                    "account {} settled-token enqueue timed out: {error}",
+                    self.account_id,
+                )
+            })?;
+        Ok(completion)
+    }
+
     /// Clear exactly one subsystem blocker, then re-evaluate every remaining
     /// derived account invariant. Callers cannot accidentally reopen admission
     /// for a different source.
@@ -8090,7 +8704,9 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let source = source.to_string();
             return self
-                .call_on_account_owner(move |account| account.clear_risk_blocker(&source))
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ClearRiskBlocker { source, reply })
+                })
                 .unwrap_or(false);
         }
         let source = source.trim();
@@ -8131,9 +8747,9 @@ impl SharedAccount {
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .collect();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.begin_order_recovery(client_order_ids.iter().map(String::as_str));
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::BeginOrderRecovery { client_order_ids },
+            )) {
                 log::error!("[shared_account] begin-recovery owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -8176,9 +8792,9 @@ impl SharedAccount {
     pub fn finish_order_recovery(&self, client_order_id: &str) {
         if self.must_dispatch_to_account_owner() {
             let client_order_id = client_order_id.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.finish_order_recovery(&client_order_id);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::FinishOrderRecovery { client_order_id },
+            )) {
                 log::error!("[shared_account] finish-recovery owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -8385,9 +9001,9 @@ impl SharedAccount {
 
     pub fn record_maintenance_queue_wait(&self, wait: Duration) {
         if self.must_dispatch_to_account_owner() {
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.record_maintenance_queue_wait(wait);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::RecordMaintenanceQueueWait { wait },
+            )) {
                 log::error!("[shared_account] maintenance metric owner dispatch failed: {error}");
             }
             return;
@@ -8402,7 +9018,9 @@ impl SharedAccount {
     pub fn monitoring_snapshot(&self) -> AccountMonitoringSnapshot {
         if self.must_dispatch_to_account_owner() {
             return self
-                .call_on_account_owner(|account| account.monitoring_snapshot())
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MonitoringSnapshot(reply))
+                })
                 .unwrap_or_else(|error| {
                     panic!("account owner monitoring snapshot failed: {error}")
                 });
@@ -8801,6 +9419,32 @@ impl SharedAccount {
         price: f64,
         fee_rate_bps: u32,
     ) -> Result<OrderOwnership, ReservationError> {
+        self.prepare_order_ownership_in_slot(
+            instance_id,
+            client_order_id,
+            order_id,
+            token_id,
+            side,
+            quantity,
+            price,
+            fee_rate_bps,
+            OrderSlot::UNASSIGNED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_order_ownership_in_slot(
+        &self,
+        instance_id: &str,
+        client_order_id: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        fee_rate_bps: u32,
+        order_slot: OrderSlot,
+    ) -> Result<OrderOwnership, ReservationError> {
         if instance_id.is_empty()
             || client_order_id.is_empty()
             || order_id.is_empty()
@@ -8827,6 +9471,7 @@ impl SharedAccount {
         }
         let reserved_quantity = if side == Side::Sell { quantity } else { 0.0 };
         let ownership = OrderOwnership {
+            order_slot,
             account_id: self.account_id.clone(),
             instance_id: instance_id.to_string(),
             client_order_id: client_order_id.to_string(),
@@ -9039,6 +9684,7 @@ impl SharedAccount {
             }
         }
         let ownership = OrderOwnership {
+            order_slot: Default::default(),
             account_id: self.account_id.clone(),
             instance_id: instance_id.into(),
             client_order_id: client_order_id.into(),
@@ -9104,8 +9750,12 @@ impl SharedAccount {
             let client_order_id = client_order_id.to_string();
             let order_id = order_id.to_string();
             return self
-                .call_on_account_owner(move |account| {
-                    account.rebind_order_id(&client_order_id, &order_id)
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::RebindOrderId {
+                        client_order_id,
+                        order_id,
+                        reply,
+                    })
                 })
                 .unwrap_or(false);
         }
@@ -9756,7 +10406,12 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let ownership = ownership.clone();
             return self
-                .call_on_account_owner(move |account| account.backfill_order_ownership(&ownership))
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::BackfillOrderOwnership {
+                        ownership,
+                        reply,
+                    })
+                })
                 .unwrap_or(None);
         }
         if ownership.account_id != self.account_id
@@ -9845,8 +10500,12 @@ impl SharedAccount {
             let client_order_id = client_order_id.to_string();
             let diagnostic_coid = client_order_id.clone();
             return self
-                .call_on_account_owner(move |account| {
-                    account.mark_order_status_effective(&client_order_id, status)
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MarkOrderStatusEffective {
+                        client_order_id,
+                        status,
+                        reply,
+                    })
                 })
                 .unwrap_or_else(|error| {
                     log::error!(
@@ -9985,8 +10644,11 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             return self
-                .call_on_account_owner(move |account| {
-                    account.mark_filled_pending_audit(&client_order_id)
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MarkFilledPendingAudit {
+                        client_order_id,
+                        reply,
+                    })
                 })
                 .unwrap_or(FillAuditPendingTransition::NotTracked);
         }
@@ -10047,8 +10709,13 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             let audit = audit.clone();
-            return self.call_on_account_owner(move |account| {
-                account.apply_authoritative_order_audit(&client_order_id, status, &audit)
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ApplyAuthoritativeOrderAudit {
+                    client_order_id,
+                    status,
+                    audit,
+                    reply,
+                })
             })?;
         }
         if !matches!(status, OrderStatus::Filled | OrderStatus::Cancelled) {
@@ -10283,8 +10950,11 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             return self
-                .call_on_account_owner(move |account| {
-                    account.mark_cancelled_pending_audit(&client_order_id)
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MarkCancelledPendingAudit {
+                        client_order_id,
+                        reply,
+                    })
                 })
                 .unwrap_or(false);
         }
@@ -10333,9 +11003,12 @@ impl SharedAccount {
     pub fn release_order(&self, client_order_id: &str, status: OrderStatus) {
         if self.must_dispatch_to_account_owner() {
             let client_order_id = client_order_id.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.release_order(&client_order_id, status);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::ReleaseOrder {
+                    client_order_id,
+                    status,
+                },
+            )) {
                 log::error!("[shared_account] release-order owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -10522,7 +11195,9 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let legs = legs.to_vec();
             return self
-                .call_on_account_owner(move |account| account.apply_redeemed_legs(&legs))
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ApplyRedeemedLegs { legs, reply })
+                })
                 .map_err(ReservationError::InvalidOrder)?;
         }
         let mut state = self.lock_state();
@@ -10799,16 +11474,16 @@ impl SharedAccount {
             let up_token_id = up_token_id.to_string();
             let down_token_id = down_token_id.to_string();
             let allocations = allocations.clone();
-            self.call_on_account_owner(move |account| {
-                account.reserve_maintenance_operation_inner(
-                    &operation_id,
+            self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ReserveMaintenanceOperation {
+                    operation_id,
                     kind,
-                    &condition_id,
-                    &up_token_id,
-                    &down_token_id,
-                    &allocations,
-                    false,
-                )
+                    condition_id,
+                    up_token_id,
+                    down_token_id,
+                    allocations,
+                    reply,
+                })
             })
             .map_err(ReservationError::InvalidOrder)??;
             if let Err(error) = self.flush_maintenance_admission_persistence() {
@@ -11000,8 +11675,12 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
             let tx_id = tx_id.to_string();
-            return self.call_on_account_owner(move |account| {
-                account.mark_maintenance_operation_submitted(&operation_id, &tx_id)
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::MarkMaintenanceOperationSubmitted {
+                    operation_id,
+                    tx_id,
+                    reply,
+                })
             })?;
         }
         if tx_id.is_empty() {
@@ -11044,9 +11723,12 @@ impl SharedAccount {
         let detail = detail.into();
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.mark_maintenance_operation_uncertain(&operation_id, detail);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::MarkMaintenanceOperationUncertain {
+                    operation_id,
+                    detail,
+                },
+            )) {
                 log::error!(
                     "[shared_account] uncertain maintenance owner dispatch failed: {error}"
                 );
@@ -11079,9 +11761,12 @@ impl SharedAccount {
         let detail = detail.into();
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.mark_maintenance_attribution_uncertain(&operation_id, detail);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::MarkMaintenanceAttributionUncertain {
+                    operation_id,
+                    detail,
+                },
+            )) {
                 log::error!(
                     "[shared_account] maintenance attribution owner dispatch failed: {error}"
                 );
@@ -11102,8 +11787,10 @@ impl SharedAccount {
     pub fn repair_confirmed_maintenance_risk_blockers(&self) -> usize {
         if self.must_dispatch_to_account_owner() {
             return self
-                .call_on_account_owner(|account| {
-                    account.repair_confirmed_maintenance_risk_blockers()
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(
+                        AccountOwnerOperation::RepairConfirmedMaintenanceRiskBlockers(reply),
+                    )
                 })
                 .unwrap_or(0);
         }
@@ -11122,12 +11809,24 @@ impl SharedAccount {
         cleared.len()
     }
 
+    /// Fallible maintenance snapshot used by the maintenance worker. Owner
+    /// saturation is explicitly retryable and must never unwind the worker.
+    pub fn try_pending_maintenance_operations(&self) -> Result<Vec<MaintenanceOperation>, String> {
+        if self.must_dispatch_to_account_owner() {
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::PendingMaintenanceOperations(reply))
+            });
+        }
+        Ok(self.pending_maintenance_operations())
+    }
+
     pub fn pending_maintenance_operations(&self) -> Vec<MaintenanceOperation> {
         if self.must_dispatch_to_account_owner() {
             return self
-                .call_on_account_owner(|account| account.pending_maintenance_operations())
+                .try_pending_maintenance_operations()
                 .unwrap_or_else(|error| {
-                    panic!("account owner maintenance snapshot failed: {error}")
+                    log::error!("[shared_account] retryable maintenance snapshot failure: {error}");
+                    Vec::new()
                 });
         }
         self.read_cold_state(|state| {
@@ -11151,7 +11850,12 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
             return self
-                .call_on_account_owner(move |account| account.maintenance_operation(&operation_id))
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MaintenanceOperation {
+                        operation_id,
+                        reply,
+                    })
+                })
                 .unwrap_or(None);
         }
         self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
@@ -11161,9 +11865,12 @@ impl SharedAccount {
         let detail = detail.into();
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
-            if let Err(error) = self.call_on_account_owner(move |account| {
-                account.fail_maintenance_operation(&operation_id, detail);
-            }) {
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::FailMaintenanceOperation {
+                    operation_id,
+                    detail,
+                },
+            )) {
                 log::error!("[shared_account] failed-maintenance owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -11215,8 +11922,11 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
             return self
-                .call_on_account_owner(move |account| {
-                    account.confirm_maintenance_operation(&operation_id)
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ConfirmMaintenanceOperation {
+                        operation_id,
+                        reply,
+                    })
                 })
                 .map_err(ReservationError::InvalidOrder)?;
         }
@@ -11535,6 +12245,7 @@ impl SharedAccount {
         }
 
         let ownership = TradeOwnership {
+            order_slot: OrderSlot::UNASSIGNED,
             account_id: self.account_id.clone(),
             instance_id: candidate_owners[0].clone(),
             trade_key: trade_key.to_string(),
@@ -11970,6 +12681,7 @@ impl SharedAccount {
         }
 
         let ownership = TradeOwnership {
+            order_slot: order.order_slot,
             account_id: self.account_id.clone(),
             instance_id: instance_id.to_string(),
             trade_key: trade_key.to_string(),
@@ -12376,6 +13088,7 @@ impl SharedAccount {
             schedule_trade_persist(&state);
             return None;
         }
+        let order_slot = order.order_slot;
         let instance_id = order.instance_id;
 
         if let Some(applied) = existing.as_ref() {
@@ -12599,6 +13312,7 @@ impl SharedAccount {
             }
         }
         let ownership = TradeOwnership {
+            order_slot,
             account_id: self.account_id.clone(),
             instance_id,
             trade_key: trade_key.into(),
@@ -12903,7 +13617,9 @@ impl SharedAccount {
     pub fn trades(&self) -> Vec<TradeOwnership> {
         if self.must_dispatch_to_account_owner() {
             return self
-                .call_on_account_owner(|account| account.trades())
+                .request_account_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::Trades(reply))
+                })
                 .unwrap_or_else(|error| panic!("account owner trade snapshot failed: {error}"));
         }
         self.lock_state()
@@ -16292,9 +17008,9 @@ mod tests {
         let owner = std::thread::spawn(move || {
             owner_account.mark_account_owner_thread().unwrap();
             for _ in 0..3 {
-                let task = owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let command = owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
                 thread_tx.send(std::thread::current().id()).unwrap();
-                task(&owner_account);
+                command.execute(&owner_account);
             }
         });
 
@@ -16319,15 +17035,42 @@ mod tests {
     fn account_owner_task_lane_is_bounded_and_fails_closed() {
         let account = SharedAccount::new("owner-lane-capacity");
         let _owner_rx = account.bind_account_owner_task_lane().unwrap();
+        let (reply_tx, _reply_rx) = crossbeam_channel::bounded(1);
         for _ in 0..ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
             account
-                .try_submit_account_owner_task(Box::new(|_| {}))
+                .try_submit_account_owner_command(AccountOwnerCommand::barrier(reply_tx.clone()))
                 .unwrap();
         }
         assert!(account
-            .try_submit_account_owner_task(Box::new(|_| {}))
+            .try_submit_account_owner_command(AccountOwnerCommand::barrier(reply_tx))
             .unwrap_err()
             .contains("full"));
+    }
+
+    #[test]
+    fn owner_snapshot_timeout_is_retryable_and_never_panics() {
+        let account = SharedAccount::new("owner-snapshot-timeout");
+        // Bind the bounded lane but intentionally do not run its consumer.
+        // This deterministically models a long account-owner replay turn.
+        let _owner_rx = account.bind_account_owner_task_lane().unwrap();
+
+        let maintenance_error = account
+            .try_pending_maintenance_operations()
+            .expect_err("busy owner must return a retryable maintenance error");
+        assert!(maintenance_error.contains("completion timed out"));
+        assert!(
+            account.pending_maintenance_operations().is_empty(),
+            "compatibility wrapper must degrade without unwinding the worker",
+        );
+
+        let token_error = account
+            .try_token_interests()
+            .expect_err("busy owner must return a retryable token-snapshot error");
+        assert!(token_error.contains("completion timed out"));
+        assert!(
+            account.token_interests().is_empty(),
+            "compatibility wrapper must not panic on owner timeout",
+        );
     }
 
     #[test]
@@ -16461,6 +17204,7 @@ mod tests {
     fn applied_trade_with_generation(generation: u64) -> AppliedTrade {
         AppliedTrade {
             ownership: TradeOwnership {
+                order_slot: Default::default(),
                 account_id: "acct".to_string(),
                 instance_id: "a".to_string(),
                 trade_key: "trade".to_string(),
@@ -16531,6 +17275,7 @@ mod tests {
                 let oid = format!("oid-{instance_id}-gc-{row}");
                 let trade_key = format!("trade-{instance_id}-gc-{row}");
                 let order = OrderOwnership {
+                    order_slot: Default::default(),
                     account_id: "settled-gc-bench".into(),
                     instance_id: instance_id.clone(),
                     client_order_id: coid.clone(),
@@ -16550,6 +17295,7 @@ mod tests {
                 };
                 let trade = AppliedTrade {
                     ownership: TradeOwnership {
+                        order_slot: Default::default(),
                         account_id: "settled-gc-bench".into(),
                         instance_id: instance_id.clone(),
                         trade_key: trade_key.clone(),
@@ -16876,6 +17622,7 @@ mod tests {
         state.orders.insert(
             "btc01-residual".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: "btc01".to_string(),
                 client_order_id: "btc01-residual".to_string(),
@@ -18866,6 +19613,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             let oid = format!("oid-gc-{index}");
             let trade_key = format!("trade-gc-{index}");
             let order = OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "acct".into(),
                 instance_id: "a".into(),
                 client_order_id: coid.clone(),
@@ -18885,6 +19633,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             };
             let trade = AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: "acct".into(),
                     instance_id: "a".into(),
                     trade_key: trade_key.clone(),
@@ -19655,6 +20404,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "trade".into(),
             AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: "acct".into(),
                     instance_id: "a".into(),
                     trade_key: "trade".into(),
@@ -21800,6 +22550,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
                 client_order_id: coid.to_string(),
@@ -21826,6 +22577,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             trade_key.to_string(),
             AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: account_id.to_string(),
                     instance_id: instance_id.to_string(),
                     trade_key: trade_key.to_string(),
@@ -21932,6 +22684,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
                 client_order_id: coid.to_string(),
@@ -21954,6 +22707,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "trade-mined:0xCANCELLEDPARTIAL".to_string(),
             AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: account_id.to_string(),
                     instance_id: instance_id.to_string(),
                     trade_key: "trade-mined:0xCANCELLEDPARTIAL".to_string(),
@@ -22044,6 +22798,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
                 client_order_id: coid.to_string(),
@@ -22070,6 +22825,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             trade_key.to_string(),
             RetiredTradeOwnershipTombstone {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: account_id.to_string(),
                     instance_id: instance_id.to_string(),
                     trade_key: trade_key.to_string(),
@@ -22152,6 +22908,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
                 client_order_id: coid.to_string(),
@@ -22178,6 +22935,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             trade_key.to_string(),
             RetiredTradeOwnershipTombstone {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: account_id.to_string(),
                     instance_id: instance_id.to_string(),
                     trade_key: trade_key.to_string(),
@@ -22228,6 +22986,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-1".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "unowned".to_string(),
                 instance_id: "maker".to_string(),
                 client_order_id: "maker-1".to_string(),
@@ -22282,6 +23041,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-1".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "recoverable".to_string(),
                 instance_id: "maker".to_string(),
                 client_order_id: "maker-1".to_string(),
@@ -22344,6 +23104,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-order".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "maker".to_string(),
                 client_order_id: "maker-order".to_string(),
@@ -22375,6 +23136,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "trade".to_string(),
             AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: "account".to_string(),
                     instance_id: "maker".to_string(),
                     trade_key: "trade".to_string(),
@@ -22415,6 +23177,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-order".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "maker".to_string(),
                 client_order_id: "maker-order".to_string(),
@@ -22441,6 +23204,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "trade".to_string(),
             AppliedTrade {
                 ownership: TradeOwnership {
+                    order_slot: Default::default(),
                     account_id: "account".to_string(),
                     instance_id: "maker".to_string(),
                     trade_key: "trade".to_string(),
@@ -22493,6 +23257,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "btc01-sell".to_string(),
             OrderOwnership {
+                order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "btc01".to_string(),
                 client_order_id: "btc01-sell".to_string(),

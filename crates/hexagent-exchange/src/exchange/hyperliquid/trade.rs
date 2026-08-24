@@ -13,15 +13,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::async_rt;
-use crate::types::{
-    Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side,
-};
+use crate::types::{Exchange, OrderRequest, OrderStatus, OrderType, OrderUpdate, Side};
 
 use super::auth::HlAuth;
 use super::info::HlMeta;
 use super::signer::{
-    float_to_wire, sign_l1_action, CancelAction, CancelByCloidAction,
-    CancelCloidWire, CancelWire, LimitWire, OrderAction, OrderTypeWire, OrderWire,
+    float_to_wire, sign_l1_action, CancelAction, CancelByCloidAction, CancelCloidWire, CancelWire,
+    LimitWire, OrderAction, OrderTypeWire, OrderWire,
 };
 
 pub struct HyperliquidTrade {
@@ -65,10 +63,21 @@ impl HyperliquidTrade {
 
     /// Sign `action` and POST `{action, nonce, signature, vaultAddress}` on
     /// the given role pool (orders → Fast, cancels → Cancel).
-    fn send_signed<T: serde::Serialize>(&mut self, role: crate::http1_pool::Role, action: &T) -> Result<ExchangeResponse> {
+    fn send_signed<T: serde::Serialize>(
+        &mut self,
+        role: crate::http1_pool::Role,
+        action: &T,
+    ) -> Result<ExchangeResponse> {
         let nonce = self.next_nonce();
         let is_mainnet = self.auth.network.is_mainnet();
-        let sig = sign_l1_action(&self.auth.key, action, self.vault(), nonce, None, is_mainnet)?;
+        let sig = sign_l1_action(
+            &self.auth.key,
+            action,
+            self.vault(),
+            nonce,
+            None,
+            is_mainnet,
+        )?;
         let body = json!({
             "action": action,
             "nonce": nonce,
@@ -112,8 +121,14 @@ impl HyperliquidTrade {
         }
         let (bids, asks) = (&book.levels[0], &book.levels[1]);
         let px = match side {
-            Side::Buy => asks.first().and_then(|l| l.px.parse::<f64>().ok()).map(|a| a * (1.0 + slippage)),
-            Side::Sell => bids.first().and_then(|l| l.px.parse::<f64>().ok()).map(|b| b * (1.0 - slippage)),
+            Side::Buy => asks
+                .first()
+                .and_then(|l| l.px.parse::<f64>().ok())
+                .map(|a| a * (1.0 + slippage)),
+            Side::Sell => bids
+                .first()
+                .and_then(|l| l.px.parse::<f64>().ok())
+                .map(|b| b * (1.0 - slippage)),
         };
         px.filter(|p| *p > 0.0)
             .ok_or_else(|| anyhow!("hyperliquid: empty book for market order on {}", coin))
@@ -156,7 +171,9 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
                 p: px_str,
                 s: sz_str,
                 r: order.reduce_only,
-                t: OrderTypeWire { limit: LimitWire { tif } },
+                t: OrderTypeWire {
+                    limit: LimitWire { tif },
+                },
                 c: cloid,
             }],
             grouping: "na".to_string(),
@@ -176,12 +193,19 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
         let asset = match self.coid_asset.get(client_order_id).copied() {
             Some(a) => a,
             None => {
-                debug!("[Hyperliquid] cancel for unknown cloid {} — no-op", client_order_id);
+                debug!(
+                    "[Hyperliquid] cancel for unknown cloid {} — no-op",
+                    client_order_id
+                );
                 return Ok(cancel_update(client_order_id, true, None));
             }
         };
-        let cloid = coid_to_cloid(client_order_id)
-            .ok_or_else(|| anyhow!("hyperliquid: client_order_id not a uuid: {}", client_order_id))?;
+        let cloid = coid_to_cloid(client_order_id).ok_or_else(|| {
+            anyhow!(
+                "hyperliquid: client_order_id not a uuid: {}",
+                client_order_id
+            )
+        })?;
         let action = CancelByCloidAction {
             ty: "cancelByCloid".to_string(),
             cancels: vec![CancelCloidWire { asset, cloid }],
@@ -217,7 +241,11 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
         let mut new_oids = Vec::new();
         for o in place_orders {
             let u = self.submit_order(o)?;
-            if let Some(oid) = u.exchange_order_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(oid) = u
+                .exchange_order_id
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
                 new_oids.push(oid);
             }
             updates.push(u);
@@ -229,10 +257,17 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
             if let Ok(asset) = self.asset_for(&coin) {
                 let action = CancelAction {
                     ty: "cancel".to_string(),
-                    cancels: prev.iter().map(|o| CancelWire { a: asset, o: *o }).collect(),
+                    cancels: prev
+                        .iter()
+                        .map(|o| CancelWire { a: asset, o: *o })
+                        .collect(),
                 };
                 if let Err(e) = self.send_signed(crate::http1_pool::Role::Cancel, &action) {
-                    warn!("[Hyperliquid] replace cancel of {} prev oids failed: {}", prev.len(), e);
+                    warn!(
+                        "[Hyperliquid] replace cancel of {} prev oids failed: {}",
+                        prev.len(),
+                        e
+                    );
                 }
             }
         }
@@ -247,14 +282,17 @@ impl super::super::ExchangeTrade for HyperliquidTrade {
     fn cancel_all(&mut self, _exchange: Exchange, symbol: &str) -> Result<Vec<OrderUpdate>> {
         let asset = self.asset_for(symbol)?;
         self.prev_oids.remove(symbol); // authoritative sweep supersedes tracked oids
-        // Query open orders for the account, keep this coin's oids.
+                                       // Query open orders for the account, keep this coin's oids.
         let open = fetch_open_oids(&self.auth, symbol)?;
         if open.is_empty() {
             return Ok(Vec::new());
         }
         let action = CancelAction {
             ty: "cancel".to_string(),
-            cancels: open.iter().map(|(oid, _)| CancelWire { a: asset, o: *oid }).collect(),
+            cancels: open
+                .iter()
+                .map(|(oid, _)| CancelWire { a: asset, o: *oid })
+                .collect(),
         };
         let resp = self.send_signed(crate::http1_pool::Role::Cancel, &action)?;
         let ok = resp.cancel_ok();
@@ -293,9 +331,15 @@ struct ExchangeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum StatusEntry {
-    Resting { resting: RestingStatus },
-    Filled { filled: FilledStatus },
-    Error { error: String },
+    Resting {
+        resting: RestingStatus,
+    },
+    Filled {
+        filled: FilledStatus,
+    },
+    Error {
+        error: String,
+    },
     /// Cancel batch returns plain strings: "success" or an error message.
     Str(String),
 }
@@ -354,7 +398,9 @@ impl ExchangeResponse {
         }
         let st = self.statuses();
         !st.is_empty()
-            && st.iter().all(|s| matches!(s, StatusEntry::Str(v) if v == "success"))
+            && st
+                .iter()
+                .all(|s| matches!(s, StatusEntry::Str(v) if v == "success"))
     }
 
     fn cancel_error(&self) -> Option<String> {
@@ -376,6 +422,7 @@ impl StatusEntry {
                     filled: f64,
                     avg: f64,
                     err: Option<String>| OrderUpdate {
+            order_slot: order.order_slot,
             client_order_id: order.client_order_id.clone(),
             exchange: Exchange::Hyperliquid,
             symbol: order.symbol.clone(),
@@ -393,9 +440,13 @@ impl StatusEntry {
             error: err,
         };
         match self {
-            StatusEntry::Resting { resting } => {
-                base(OrderStatus::Accepted, Some(resting.oid.to_string()), 0.0, 0.0, None)
-            }
+            StatusEntry::Resting { resting } => base(
+                OrderStatus::Accepted,
+                Some(resting.oid.to_string()),
+                0.0,
+                0.0,
+                None,
+            ),
             StatusEntry::Filled { filled } => {
                 let sz: f64 = filled.total_sz.parse().unwrap_or(0.0);
                 let avg: f64 = filled.avg_px.parse().unwrap_or(0.0);
@@ -423,12 +474,17 @@ impl StatusEntry {
 
 fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderUpdate {
     OrderUpdate {
+        order_slot: Default::default(),
         client_order_id: client_order_id.to_string(),
         exchange: Exchange::Hyperliquid,
         symbol: String::new(),
         side: Side::Buy, // not meaningful for a cancel ack
         exchange_order_id: None,
-        status: if ok { OrderStatus::Cancelled } else { OrderStatus::Rejected },
+        status: if ok {
+            OrderStatus::Cancelled
+        } else {
+            OrderStatus::Rejected
+        },
         liquidity: None,
         filled_quantity: 0.0,
         remaining_quantity: 0.0,
@@ -516,7 +572,10 @@ fn round_price(px: f64, sz_decimals: u32) -> f64 {
     let decimals = max_decimals.min(sig_decimals);
     let f = 10f64.powi(decimals);
     let r = (px * f).round() / f;
-    debug!("[Hyperliquid] round_price {} -> {} (decimals={})", px, r, decimals);
+    debug!(
+        "[Hyperliquid] round_price {} -> {} (decimals={})",
+        px, r, decimals
+    );
     r
 }
 
@@ -539,7 +598,7 @@ mod tests {
         // BTC-like: szDecimals=5 → max 1 decimal, 5 sig figs
         assert_eq!(round_price(113377.37, 5), 113377.0); // 5 sig figs dominates
         assert_eq!(round_price(3650.256, 5), 3650.3); // 1 decimal
-        // size rounding
+                                                      // size rounding
         assert_eq!(round_size(0.123456, 4), 0.1235);
     }
 

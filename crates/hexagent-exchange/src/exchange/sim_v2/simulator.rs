@@ -1696,6 +1696,7 @@ impl Simulator {
             trade_id: None,
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         })
     }
 }
@@ -1977,11 +1978,13 @@ mod tests {
         Signal::BatchUpdateOrders {
             exchange: Exchange::Polymarket,
             market_id: String::new(),
-            cancel_client_order_ids: vec![cancel_coid.to_string()],
-            place_orders: vec![match place_signal(place_coid) {
+            cancel_client_order_ids: [cancel_coid.to_string()].into_iter().collect(),
+            place_orders: [match place_signal(place_coid) {
                 Signal::NewOrder(o) => o,
                 _ => unreachable!(),
-            }],
+            }]
+            .into_iter()
+            .collect(),
             timestamp_ns: 0,
             instance_id: String::new(),
         }
@@ -2058,6 +2061,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             outcome_label: String::new(),
+            order_slot: Default::default(),
         })
     }
 

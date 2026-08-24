@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -39,7 +41,12 @@ const HEALTHY_GAP_REPLAY_ACTIVE_MS: u64 = 10_000;
 const HEALTHY_GAP_REPLAY_IDLE_MS: u64 = 30_000;
 const HEALTHY_GAP_REPLAY_ACTIVITY_WINDOW_NS: u64 = 30_000_000_000;
 const PRIVATE_APPLY_QUEUE_CAPACITY: usize = 1024;
-const GAP_APPLY_BATCH_SIZE: usize = 16;
+// A replay command executes as one uninterrupted account-owner turn. Keep the
+// cold batch at one record so a long REST catch-up cannot hold the owner across
+// many persistence/account transactions; the awaiting producer yields before
+// it submits the next record, which gives owner-control snapshots and live
+// lifecycle work an admission point between every historical event.
+const GAP_APPLY_BATCH_SIZE: usize = 1;
 
 fn periodic_gap_retry_delay(base: Duration, failures: u32) -> Duration {
     let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX).max(1);
@@ -100,41 +107,6 @@ impl FailedTradeDiagnosticDedupe {
     }
 }
 
-fn admit_failed_trade_diagnostic(venue_trade_id: &str) -> bool {
-    static DEDUPE: OnceLock<Mutex<FailedTradeDiagnosticDedupe>> = OnceLock::new();
-    DEDUPE
-        .get_or_init(|| {
-            Mutex::new(FailedTradeDiagnosticDedupe::new(
-                FAILED_TRADE_DIAGNOSTIC_CAPACITY,
-            ))
-        })
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .admit(venue_trade_id)
-}
-
-fn terminal_gap_replay_cache() -> &'static Mutex<HashMap<String, FailedTradeDiagnosticDedupe>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, FailedTradeDiagnosticDedupe>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn terminal_gap_replay_seen(account_id: &str, key: &str) -> bool {
-    terminal_gap_replay_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(account_id)
-        .is_some_and(|cache| cache.seen.contains(key))
-}
-
-fn remember_terminal_gap_replay(account_id: &str, key: &str) {
-    terminal_gap_replay_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(account_id.to_string())
-        .or_insert_with(|| FailedTradeDiagnosticDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY))
-        .admit(key);
-}
-
 #[derive(Debug)]
 struct GapReplayLifecycleDedupe {
     capacity: usize,
@@ -173,11 +145,6 @@ impl GapReplayLifecycleDedupe {
     }
 }
 
-fn replay_lifecycle_cache() -> &'static Mutex<HashMap<String, GapReplayLifecycleDedupe>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, GapReplayLifecycleDedupe>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn trade_lifecycle_identity(payload: &serde_json::Value) -> Option<(&str, u8)> {
     let trade_id = payload
         .get("id")
@@ -201,27 +168,46 @@ fn trade_lifecycle_identity(payload: &serde_json::Value) -> Option<(&str, u8)> {
     Some((trade_id, rank))
 }
 
-fn replay_lifecycle_seen(account_id: &str, payload: &serde_json::Value) -> bool {
-    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else {
-        return false;
-    };
-    replay_lifecycle_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(account_id)
-        .is_some_and(|cache| cache.seen(trade_id, rank))
+/// Mutable replay and diagnostic suppression owned exclusively by the
+/// physical account owner thread. No process-global map or mutex participates
+/// in authenticated private lifecycle processing.
+pub(crate) struct PrivateReplayOwner {
+    failed_diagnostics: FailedTradeDiagnosticDedupe,
+    terminal: FailedTradeDiagnosticDedupe,
+    lifecycle: GapReplayLifecycleDedupe,
 }
 
-fn remember_replay_lifecycle(account_id: &str, payload: &serde_json::Value) {
-    let Some((trade_id, rank)) = trade_lifecycle_identity(payload) else {
-        return;
-    };
-    replay_lifecycle_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entry(account_id.to_string())
-        .or_insert_with(|| GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY))
-        .remember(trade_id, rank);
+impl PrivateReplayOwner {
+    pub(crate) fn new() -> Self {
+        Self {
+            failed_diagnostics: FailedTradeDiagnosticDedupe::new(FAILED_TRADE_DIAGNOSTIC_CAPACITY),
+            terminal: FailedTradeDiagnosticDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+            lifecycle: GapReplayLifecycleDedupe::new(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+        }
+    }
+
+    fn admit_failed_diagnostic(&mut self, venue_trade_id: &str) -> bool {
+        self.failed_diagnostics.admit(venue_trade_id)
+    }
+
+    fn terminal_seen(&self, key: &str) -> bool {
+        self.terminal.seen.contains(key)
+    }
+
+    fn remember_terminal(&mut self, key: &str) {
+        self.terminal.admit(key);
+    }
+
+    fn lifecycle_seen(&self, payload: &serde_json::Value) -> bool {
+        trade_lifecycle_identity(payload)
+            .is_some_and(|(trade_id, rank)| self.lifecycle.seen(trade_id, rank))
+    }
+
+    fn remember_lifecycle(&mut self, payload: &serde_json::Value) {
+        if let Some((trade_id, rank)) = trade_lifecycle_identity(payload) {
+            self.lifecycle.remember(trade_id, rank);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +223,12 @@ struct GapReplayCheckpoint {
     after_secs: u64,
     cursor: String,
     seen_cursors: HashSet<String>,
+    /// Decoded remainder of the current REST page. It is retained across a
+    /// reconnect/apply failure so the retry resumes at the exact failed record
+    /// rather than fetching and replaying the already-committed page prefix.
+    pending_page: VecDeque<PrivateEventDelta>,
+    pending_page_records: usize,
+    pending_next_cursor: Option<String>,
     records: usize,
     pages: usize,
     cursor_resets: usize,
@@ -249,6 +241,9 @@ impl GapReplayCheckpoint {
             after_secs,
             cursor: String::new(),
             seen_cursors: HashSet::new(),
+            pending_page: VecDeque::new(),
+            pending_page_records: 0,
+            pending_next_cursor: None,
             records: 0,
             pages: 0,
             cursor_resets: 0,
@@ -1013,6 +1008,12 @@ fn parse_order_event(
         OrderStatus::Accepted | OrderStatus::PartiallyFilled => {
             shared.mark_order_live(
                 &coid,
+                shared
+                    .execution_snapshot()
+                    .open_orders
+                    .get(&coid)
+                    .map(|tracked| tracked.order_slot)
+                    .unwrap_or_default(),
                 &ownership.token_id,
                 ownership.side,
                 &ownership.instance_id,
@@ -1037,6 +1038,7 @@ fn parse_order_event(
         lifecycle_started,
     );
     let update = OrderUpdate {
+        order_slot: ownership.order_slot,
         client_order_id: coid,
         exchange: Exchange::Polymarket,
         symbol: asset_id.to_string(),
@@ -1255,6 +1257,7 @@ fn parse_user_event_checked(
     data: &serde_json::Value,
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
 ) -> std::result::Result<Vec<OrderUpdate>, String> {
     let event_type = data
         .get("event_type")
@@ -1265,7 +1268,7 @@ fn parse_user_event_checked(
         "order" => parse_order_event(data, shared),
         "trade" => {
             validate_trade_event(data, shared)?;
-            let updates = parse_user_event_validated(data, shared, live_position);
+            let updates = parse_user_event_validated(data, shared, live_position, replay);
             Ok(updates)
         }
         _ => Ok(Vec::new()),
@@ -1283,7 +1286,7 @@ pub(crate) struct ParsedPrivateEvent {
     pub(crate) rejection_reason: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PrivateEventDelta {
     Order(serde_json::Value),
     Trade(serde_json::Value),
@@ -1690,6 +1693,7 @@ fn route_private_event_fast(
             };
             Ok(vec![FastPrivateUpdate {
                 update: OrderUpdate {
+                    order_slot: ownership.order_slot,
                     client_order_id: ownership.client_order_id,
                     exchange: Exchange::Polymarket,
                     symbol: asset_id.to_string(),
@@ -1756,15 +1760,16 @@ fn route_private_event_fast(
                         let order_id = required_string(maker, &["order_id"], "maker order_id")?;
                         let ownership = match shared.lookup_order_ownership(order_id) {
                             Some(ownership) => ownership,
-                            None if matches!(status_name, "CONFIRMED" | "FAILED")
-                                && terminal_trade_is_durably_resolved(data, shared) =>
-                            {
-                                // Historical terminal replay after the
-                                // runtime OID route was compacted. Only this
-                                // cold fallback consults the durable ledger;
-                                // ordinary terminal updates stay entirely on
-                                // the runtime ownership mirror.
-                                return Ok(Vec::new());
+                            None if matches!(status_name, "CONFIRMED" | "FAILED") => {
+                                // Do not reject an authenticated historical
+                                // terminal leg before the cold account writer
+                                // can inspect it. No strategy update is emitted
+                                // here. The cold path still requires either an
+                                // exact durable trade tombstone or settlement
+                                // proof plus one unique historical token owner;
+                                // ambiguity therefore remains fail-closed and
+                                // keeps the replay cursor pinned.
+                                continue;
                             }
                             None => {
                                 return Err(format!(
@@ -1788,6 +1793,7 @@ fn route_private_event_fast(
                         let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
                         routed.push(FastPrivateUpdate {
                             update: OrderUpdate {
+                                order_slot: ownership.order_slot,
                                 client_order_id: ownership.client_order_id,
                                 exchange: Exchange::Polymarket,
                                 symbol: symbol.to_string(),
@@ -1815,9 +1821,11 @@ fn route_private_event_fast(
                     let order_id = taker_order_id(data).unwrap_or("");
                     let ownership = match shared.lookup_order_ownership(order_id) {
                         Some(ownership) => ownership,
-                        None if matches!(status_name, "CONFIRMED" | "FAILED")
-                            && terminal_trade_is_durably_resolved(data, shared) =>
-                        {
+                        None if matches!(status_name, "CONFIRMED" | "FAILED") => {
+                            // `classify_private_trade_role` authenticated this
+                            // account as the taker. Defer the strict historical
+                            // ownership proof to the cold single writer without
+                            // broadcasting an unowned fill to any strategy.
                             return Ok(Vec::new());
                         }
                         None => {
@@ -1840,6 +1848,7 @@ fn route_private_event_fast(
                     }
                     routed.push(FastPrivateUpdate {
                         update: OrderUpdate {
+                            order_slot: ownership.order_slot,
                             client_order_id: ownership.client_order_id,
                             exchange: Exchange::Polymarket,
                             symbol: symbol.to_string(),
@@ -2032,6 +2041,7 @@ fn route_private_batch(
 fn apply_private_cold_batch_owned(
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
     events: &[PrivateEventDelta],
     recovery_generation: Option<u64>,
 ) -> std::result::Result<usize, String> {
@@ -2039,8 +2049,16 @@ fn apply_private_cold_batch_owned(
     for event in events {
         let payload = event.payload();
         let is_trade = matches!(event, PrivateEventDelta::Trade(_));
+        if (is_trade && replay.lifecycle_seen(payload))
+            || event
+                .terminal_trade_key()
+                .is_some_and(|key| replay.terminal_seen(&key))
+        {
+            crate::latency::record_ns("polymarket.user.owner_replay_skip", 1);
+            continue;
+        }
         let account_apply_started = crate::latency::Instant::now();
-        let parsed = parse_user_event_with_health_owned(payload, shared, live_position);
+        let parsed = parse_user_event_with_health_owned(payload, shared, live_position, replay);
         crate::latency::record(
             if is_trade {
                 "polymarket.user.account_apply.trade"
@@ -2082,7 +2100,7 @@ fn apply_private_cold_batch_owned(
             // Advance the cross-round replay cache only after every derived
             // strategy update was delivered. A delivery failure must remain
             // replayable even though the account ledger is idempotent.
-            remember_replay_lifecycle(shared.account_state.account_id(), event.payload());
+            replay.remember_lifecycle(event.payload());
         }
         if let Some(key) = terminal_to_remember {
             // Only a newly durable terminal edge can make a zero-reference
@@ -2092,7 +2110,7 @@ fn apply_private_cold_batch_owned(
             for token in terminal_tokens {
                 shared.request_settled_gc_for_token(&token);
             }
-            remember_terminal_gap_replay(shared.account_state.account_id(), &key);
+            replay.remember_terminal(&key);
         }
         applied = applied.saturating_add(1);
         if recovery_generation.is_some() {
@@ -2112,8 +2130,14 @@ fn apply_private_cold_batch(
     recovery_generation: Option<u64>,
 ) -> std::result::Result<usize, String> {
     shared.with_test_live_position(|live_position| {
-        let result =
-            apply_private_cold_batch_owned(shared, live_position, events, recovery_generation);
+        let mut replay = PrivateReplayOwner::new();
+        let result = apply_private_cold_batch_owned(
+            shared,
+            live_position,
+            &mut replay,
+            events,
+            recovery_generation,
+        );
         shared.publish_live_position_watermark(live_position.last_match_time_secs());
         result
     })
@@ -2125,6 +2149,7 @@ fn apply_private_cold_batch(
 pub(crate) fn apply_private_cold_command(
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
     command: PrivateColdCommand,
 ) {
     let PrivateColdCommand {
@@ -2137,7 +2162,7 @@ pub(crate) fn apply_private_cold_command(
     } = command;
     crate::latency::record("polymarket.user.fast_route_to_account_owner", routed_at);
     let result =
-        apply_private_cold_batch_owned(shared, live_position, &events, recovery_generation);
+        apply_private_cold_batch_owned(shared, live_position, replay, &events, recovery_generation);
     shared.publish_live_position_watermark(live_position.last_match_time_secs());
     if let Err(error) = &result {
         shared.user_feed_health.set_recovering(true);
@@ -2312,6 +2337,7 @@ fn parse_user_event_with_health_owned(
     data: &serde_json::Value,
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
 ) -> ParsedPrivateEvent {
     let recognized = data
         .get("event_type")
@@ -2326,7 +2352,7 @@ fn parse_user_event_with_health_owned(
             rejection_reason: None,
         };
     }
-    match parse_user_event_checked(data, shared, live_position) {
+    match parse_user_event_checked(data, shared, live_position, replay) {
         Ok(updates) => {
             let anomaly_started = crate::latency::Instant::now();
             resolve_valid_private_event_anomaly(data, shared);
@@ -2356,7 +2382,8 @@ fn parse_user_event_with_health(
     shared: &SharedState,
 ) -> ParsedPrivateEvent {
     shared.with_test_live_position(|live_position| {
-        let parsed = parse_user_event_with_health_owned(data, shared, live_position);
+        let mut replay = PrivateReplayOwner::new();
+        let parsed = parse_user_event_with_health_owned(data, shared, live_position, &mut replay);
         shared.publish_live_position_watermark(live_position.last_match_time_secs());
         parsed
     })
@@ -2415,8 +2442,9 @@ pub(crate) fn parse_user_event_diagnosed_owned(
     data: &serde_json::Value,
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
 ) -> ParsedPrivateEvent {
-    parse_user_event_with_health_owned(data, shared, live_position)
+    parse_user_event_with_health_owned(data, shared, live_position, replay)
 }
 
 #[cfg(test)]
@@ -2431,6 +2459,7 @@ fn parse_user_event_validated(
     data: &serde_json::Value,
     shared: &SharedState,
     live_position: &mut LivePositionManager,
+    replay: &mut PrivateReplayOwner,
 ) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
     let event_type = match data
@@ -2731,6 +2760,7 @@ fn parse_user_event_validated(
                     }
 
                     let update = OrderUpdate {
+                        order_slot: ownership.order_slot,
                         client_order_id: coid,
                         exchange: Exchange::Polymarket,
                         symbol: mo_asset_id,
@@ -2863,6 +2893,7 @@ fn parse_user_event_validated(
                 }
 
                 let update = OrderUpdate {
+                    order_slot: ownership.order_slot,
                     client_order_id: coid,
                     exchange: Exchange::Polymarket,
                     symbol: asset_id,
@@ -2900,7 +2931,7 @@ fn parse_user_event_validated(
             if status == OrderStatus::Failed
                 && failure_reason.is_none()
                 && !updates.is_empty()
-                && admit_failed_trade_diagnostic(trade_id)
+                && replay.admit_failed_diagnostic(trade_id)
             {
                 // A venue trade can legitimately contain maker legs owned by
                 // several configured accounts. Keep every account-scoped
@@ -2915,11 +2946,7 @@ fn parse_user_event_validated(
                     .get("maker_orders")
                     .and_then(serde_json::Value::as_array)
                     .map_or(0, Vec::len);
-                warn!(
-                    "[PolyUserFeed] FAILED venue trade {} carries no known reason field \
-                     (tx_hash={}, maker_legs={}); account-scoped reversals remain enabled",
-                    trade_id, tx_hash, maker_legs,
-                );
+                shared.enqueue_private_diagnostic(trade_id, tx_hash, maker_legs);
             }
 
             updates
@@ -2984,6 +3011,67 @@ async fn replay_missed_trades_inner(
     const PAGES_PER_YIELD: usize = 1;
     let mut attempt_pages = 0usize;
     loop {
+        if checkpoint.pending_next_cursor.is_some() {
+            let apply_stage = crate::latency::TimedStage::new("polymarket.gap_replay.apply_page");
+            while !checkpoint.pending_page.is_empty() {
+                let batch_len = checkpoint.pending_page.len().min(GAP_APPLY_BATCH_SIZE);
+                // Retain the exact batch until the account owner acknowledges
+                // it. A rejected/closed completion is therefore retryable at
+                // this record boundary without refetching the page.
+                let owned: Vec<_> = checkpoint
+                    .pending_page
+                    .iter()
+                    .take(batch_len)
+                    .cloned()
+                    .collect();
+                let owner_turn_started = crate::latency::Instant::now();
+                let apply_result = apply_lane
+                    .apply_replay_batch(owned, recovery_generation)
+                    .await;
+                crate::latency::record(
+                    "polymarket.gap_replay.owner_turn_roundtrip",
+                    owner_turn_started,
+                );
+                apply_result.map_err(|error| {
+                    anyhow!(
+                        "Gap-fetch /data/trades rejected private batch after {} records: {}",
+                        checkpoint.records,
+                        error,
+                    )
+                })?;
+                checkpoint.pending_page.drain(..batch_len);
+                tokio::task::yield_now().await;
+            }
+            let next = checkpoint
+                .pending_next_cursor
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gap-fetch /data/trades lost its pending cursor after {} records",
+                        checkpoint.records,
+                    )
+                })?;
+            let has_next =
+                advance_gap_cursor(&mut checkpoint.cursor, &mut checkpoint.seen_cursors, next)?;
+            checkpoint.pending_next_cursor = None;
+            checkpoint.records = checkpoint
+                .records
+                .saturating_add(checkpoint.pending_page_records);
+            checkpoint.pending_page_records = 0;
+            checkpoint.pages += 1;
+            attempt_pages += 1;
+            if !has_next {
+                drop(apply_stage);
+                break;
+            }
+            drop(apply_stage);
+            if attempt_pages % PAGES_PER_YIELD == 0 {
+                tokio::task::yield_now().await;
+            }
+            continue;
+        }
+
         let page_stage = crate::latency::TimedStage::new("polymarket.gap_replay.page_total");
         let url = if checkpoint.cursor.is_empty() {
             format!("{}/data/trades?after={}", CLOB_BASE_URL, after_param)
@@ -3093,8 +3181,6 @@ async fn replay_missed_trades_inner(
         // slot before routing/deduplicating records.
         drop(permit);
 
-        let apply_stage = crate::latency::TimedStage::new("polymarket.gap_replay.apply_page");
-
         let (records, next) = if let Some(arr) = json.as_array() {
             (arr.clone(), String::new())
         } else if let Some(object) = json.as_object() {
@@ -3132,51 +3218,19 @@ async fn replay_missed_trades_inner(
             let Some(delta) = PrivateEventDelta::classify(rec) else {
                 continue;
             };
-            if matches!(&delta, PrivateEventDelta::Trade(_))
-                && replay_lifecycle_seen(shared.account_state.account_id(), delta.payload())
-            {
-                checkpoint.terminal_fast_skips = checkpoint.terminal_fast_skips.saturating_add(1);
-                continue;
-            }
-            if delta.terminal_trade_key().is_some_and(|key| {
-                terminal_gap_replay_seen(shared.account_state.account_id(), &key)
-            }) {
-                checkpoint.terminal_fast_skips = checkpoint.terminal_fast_skips.saturating_add(1);
-                continue;
-            }
             if dedupe.insert(delta.dedupe_key()) {
                 deltas.push(delta);
             }
         }
-        while !deltas.is_empty() {
-            let batch_len = deltas.len().min(GAP_APPLY_BATCH_SIZE);
-            let owned: Vec<_> = deltas.drain(..batch_len).collect();
-            apply_lane
-                .apply_replay_batch(owned, recovery_generation)
-                .await
-                .map_err(|error| {
-                    anyhow!(
-                        "Gap-fetch /data/trades rejected private batch after {} records: {}",
-                        checkpoint.records,
-                        error,
-                    )
-                })?;
-            tokio::task::yield_now().await;
-        }
-        checkpoint.records = checkpoint.records.saturating_add(record_count);
-
-        checkpoint.pages += 1;
-        attempt_pages += 1;
-        if !advance_gap_cursor(&mut checkpoint.cursor, &mut checkpoint.seen_cursors, next)? {
-            drop(apply_stage);
-            drop(page_stage);
-            break;
-        }
-        drop(apply_stage);
+        debug_assert!(checkpoint.pending_page.is_empty());
+        debug_assert!(checkpoint.pending_next_cursor.is_none());
+        checkpoint.pending_page = deltas.into();
+        checkpoint.pending_page_records = record_count;
+        checkpoint.pending_next_cursor = Some(next);
         drop(page_stage);
-        if attempt_pages % PAGES_PER_YIELD == 0 {
-            tokio::task::yield_now().await;
-        }
+        // Apply through the staged-page branch above. Keeping fetch and apply
+        // as separate turns also lets the live socket run after JSON decode.
+        tokio::task::yield_now().await;
     }
 
     Ok(GapReplayOutcome::Complete {
@@ -4581,6 +4635,7 @@ mod tests {
             .track_open_order(
                 "owner-1",
                 super::super::trade::TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "TOKEN".to_string(),
                     side: Side::Buy,
                     instance_id: "owner".to_string(),
@@ -4718,6 +4773,41 @@ mod tests {
         assert_eq!(checkpoint.cursor, "page-3");
     }
 
+    #[test]
+    fn gap_replay_checkpoint_retains_exact_failed_record_before_cursor_commit() {
+        let mut checkpoint = GapReplayCheckpoint::new(997);
+        checkpoint.pending_page = VecDeque::from([
+            PrivateEventDelta::Trade(serde_json::json!({
+                "event_type": "trade", "id": "already-applied"
+            })),
+            PrivateEventDelta::Trade(serde_json::json!({
+                "event_type": "trade", "id": "failed-record"
+            })),
+        ]);
+        checkpoint.pending_page_records = 2;
+        checkpoint.pending_next_cursor = Some("page-2".to_string());
+
+        // Model the first owner acknowledgement, then an error on the next
+        // record. The failed record and old page cursor remain intact.
+        checkpoint.pending_page.pop_front();
+        assert_eq!(checkpoint.pending_page.len(), 1);
+        assert_eq!(
+            checkpoint.pending_page.front().unwrap().dedupe_key(),
+            "trade:failed-record|||",
+        );
+        assert_eq!(checkpoint.cursor, "");
+        assert_eq!(checkpoint.pending_next_cursor.as_deref(), Some("page-2"));
+
+        // Only a fully acknowledged page may advance the server cursor.
+        checkpoint.pending_page.pop_front();
+        let next = checkpoint.pending_next_cursor.take().unwrap();
+        assert!(
+            advance_gap_cursor(&mut checkpoint.cursor, &mut checkpoint.seen_cursors, next,)
+                .unwrap()
+        );
+        assert_eq!(checkpoint.cursor, "page-2");
+    }
+
     fn owned_taker_shared(limit_price: f64) -> Arc<SharedState> {
         let shared = test_shared();
         shared.account_state.register_instance("owner", 1.0);
@@ -4747,6 +4837,7 @@ mod tests {
             .track_open_order(
                 "owner-1",
                 super::super::trade::TrackedOrder {
+                    order_slot: Default::default(),
                     symbol: "TOKEN".to_string(),
                     side: Side::Buy,
                     instance_id: "owner".to_string(),
@@ -5361,6 +5452,66 @@ mod tests {
     }
 
     #[test]
+    fn fast_route_defers_unknown_authenticated_terminal_maker_to_cold_recovery() {
+        let shared = test_shared();
+        shared
+            .account_state
+            .register_instance("historical-owner", 1.0);
+        shared
+            .account_state
+            .register_token_interest("historical-owner", "historical-condition", "TOKEN", "OTHER")
+            .unwrap();
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::from([("TOKEN".to_string(), 0.0)]))
+            .unwrap();
+        shared
+            .account_state
+            .record_settled_token_values(&HashMap::from([("TOKEN".to_string(), 1.0)]));
+        let payload = serde_json::json!({
+            "event_type": "trade",
+            "id": "unknown-historical-maker",
+            "status": "CONFIRMED",
+            "asset_id": "COUNTERPARTY",
+            "side": "BUY",
+            "size": "7",
+            "price": "0.4",
+            "match_time": "123",
+            "taker_order_id": "counterparty-order",
+            "maker_orders": [{
+                "maker_address": shared.order_maker_address.clone(),
+                "asset_id": "TOKEN",
+                "side": "SELL",
+                "matched_amount": "7",
+                "price": "0.6",
+                "order_id": "unknown-historical-oid"
+            }]
+        });
+
+        let event = PrivateEventDelta::classify(payload).unwrap();
+        let routed = route_private_event_fast(&event, &shared).unwrap();
+        assert!(
+            routed.is_empty(),
+            "historical recovery must not emit a fill"
+        );
+        assert!(!shared.account_state.is_uncertain());
+
+        let cold = parse_user_event_with_health(event.payload(), &shared);
+        assert!(cold.valid_business_event);
+        assert!(!cold.invalid_business_event);
+        assert!(cold.updates.is_empty());
+        assert!(cold.rejection_reason.is_none());
+        assert_eq!(
+            shared
+                .account_state
+                .trade_ownership("unknown-historical-maker:unknown-historical-oid")
+                .unwrap()
+                .instance_id,
+            "historical-owner",
+        );
+    }
+
+    #[test]
     fn fast_route_does_not_suppress_failed_after_matched_high_water() {
         let shared = owned_taker_shared(0.5);
         let matched = valid_taker_event();
@@ -5455,7 +5606,7 @@ mod tests {
 
     #[test]
     fn terminal_gap_replay_dedupe_survives_page_and_sweep_boundaries() {
-        let account = format!("terminal-gap-test-{}", std::process::id());
+        let mut replay = PrivateReplayOwner::new();
         let terminal = PrivateEventDelta::classify(serde_json::json!({
             "event_type": "trade",
             "id": "trade-terminal-dedupe",
@@ -5463,9 +5614,9 @@ mod tests {
         }))
         .unwrap();
         let key = terminal.terminal_trade_key().unwrap();
-        assert!(!terminal_gap_replay_seen(&account, &key));
-        remember_terminal_gap_replay(&account, &key);
-        assert!(terminal_gap_replay_seen(&account, &key));
+        assert!(!replay.terminal_seen(&key));
+        replay.remember_terminal(&key);
+        assert!(replay.terminal_seen(&key));
         let advancing = PrivateEventDelta::classify(serde_json::json!({
             "event_type": "trade",
             "id": "trade-terminal-dedupe",

@@ -864,6 +864,7 @@ mod tests {
             trade_id: Some(format!("trade-{sequence}")),
             order_audit: None,
             error: None,
+            order_slot: Default::default(),
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::types::{
     AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument, MarketDataHealth,
-    OrderBookSnapshot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange, TradeTick,
+    OrderBookSnapshot, OrderSlot, OrderUpdate, QuoteTick, Signal, SpotPrice, TickSizeChange,
+    TradeTick,
 };
 use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 
@@ -11,6 +12,8 @@ use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 #[derive(Debug)]
 pub struct LifecycleEnvelope {
     pub owner: u16,
+    /// Direct index into the strategy owner's fixed order table.
+    pub order_slot: OrderSlot,
     pub sequence: u64,
     pub source: LifecycleSource,
     pub update: OrderUpdate,
