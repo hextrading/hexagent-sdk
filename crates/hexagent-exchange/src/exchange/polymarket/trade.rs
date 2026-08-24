@@ -18,13 +18,12 @@ use crossbeam_queue::ArrayQueue;
 use hexagent_account::account::shared_account::{
     measure_deferred_lifecycle_stages, normalize_order_id, OrderOwnership,
 };
-use log::{debug, info, warn};
 use hexagent_runtime::shutdown::{ShutdownPhase, ShutdownToken};
+use log::{debug, info, warn};
 
 use super::auth::PolyAuth;
 use super::live_position::LivePositionManager;
 use super::signer::{validate_signing_inputs, OrderSigner, SignatureType};
-use super::user_feed::parse_user_event_diagnosed;
 use crate::async_rt;
 use crate::exchange::ExchangeTrade;
 use crate::types::*;
@@ -467,10 +466,7 @@ fn prequery_recovered_order_close_reason(
 /// Event-end evidence is only a pre-I/O shortcut for an order restored from
 /// durable recovery. Runtime cancel audits must query the order itself, while
 /// startup query-repair rows are explicitly required to do the same.
-fn should_lookup_recovered_event_end(
-    is_recovered: bool,
-    requires_query_repair: bool,
-) -> bool {
+fn should_lookup_recovered_event_end(is_recovered: bool, requires_query_repair: bool) -> bool {
     is_recovered && !requires_query_repair
 }
 
@@ -1120,6 +1116,7 @@ fn is_cancel_not_found_already_canceled_or_matched(reason: &str) -> bool {
 
 pub(crate) const CANCEL_NOT_FOUND_TERMINAL_LIMIT: u32 = 3;
 
+#[cfg(test)]
 fn record_cancel_not_found_observation(
     counts: &mut HashMap<String, u32>,
     coid: &str,
@@ -1324,12 +1321,120 @@ pub(crate) struct OrderLifecycleTrace {
 /// Immutable execution-state publication consumed by cancel/reconcile/private
 /// workers. The account owner is the only writer; readers take one RCU guard
 /// and never contend with another worker or observe a torn coid/oid update.
+const EXECUTION_READ_SHARDS: usize = 64;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionReadMap<V> {
+    shards: Arc<[Arc<HashMap<String, V>>; EXECUTION_READ_SHARDS]>,
+    len: usize,
+}
+
+impl<V> Default for ExecutionReadMap<V> {
+    fn default() -> Self {
+        Self {
+            shards: Arc::new(std::array::from_fn(|_| Arc::new(HashMap::new()))),
+            len: 0,
+        }
+    }
+}
+
+impl<V> ExecutionReadMap<V> {
+    #[inline]
+    fn shard_index(key: &str) -> usize {
+        // Stable FNV-1a avoids RandomState construction and keeps the same key
+        // on one shard across snapshot generations.
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in key.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash as usize % EXECUTION_READ_SHARDS
+    }
+
+    fn from_hash_map(values: HashMap<String, V>) -> Self {
+        let len = values.len();
+        let mut shards: [HashMap<String, V>; EXECUTION_READ_SHARDS] =
+            std::array::from_fn(|_| HashMap::new());
+        for (key, value) in values {
+            shards[Self::shard_index(&key)].insert(key, value);
+        }
+        Self {
+            shards: Arc::new(shards.map(Arc::new)),
+            len,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+        self.shards[Self::shard_index(key)].get(key)
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &V)> {
+        self.shards.iter().flat_map(|shard| shard.iter())
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(key, _)| key)
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+}
+
+impl<V: Clone> ExecutionReadMap<V> {
+    fn with_insert(&self, key: String, value: V) -> Self {
+        let index = Self::shard_index(&key);
+        let mut shards = (*self.shards).clone();
+        let mut shard = (*shards[index]).clone();
+        let inserted = shard.insert(key, value).is_none();
+        shards[index] = Arc::new(shard);
+        Self {
+            shards: Arc::new(shards),
+            len: self.len + usize::from(inserted),
+        }
+    }
+
+    fn with_remove(&self, key: &str) -> Self {
+        let index = Self::shard_index(key);
+        if !self.shards[index].contains_key(key) {
+            return self.clone();
+        }
+        let mut shards = (*self.shards).clone();
+        let mut shard = (*shards[index]).clone();
+        shard.remove(key);
+        shards[index] = Arc::new(shard);
+        Self {
+            shards: Arc::new(shards),
+            len: self.len.saturating_sub(1),
+        }
+    }
+}
+
+impl<V> std::ops::Index<&str> for ExecutionReadMap<V> {
+    type Output = V;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        self.get(index).expect("execution read-map key missing")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExecutionStateSnapshot {
-    pub(crate) open_orders: Arc<HashMap<String, TrackedOrder>>,
-    pub(crate) coid_to_oid: Arc<HashMap<String, String>>,
-    pub(crate) oid_to_coid: Arc<HashMap<String, String>>,
-    pub(crate) coid_to_token: Arc<HashMap<String, String>>,
+    pub(crate) open_orders: ExecutionReadMap<TrackedOrder>,
+    pub(crate) coid_to_oid: ExecutionReadMap<String>,
+    pub(crate) oid_to_coid: ExecutionReadMap<String>,
+    pub(crate) coid_to_token: ExecutionReadMap<String>,
 }
 
 #[derive(Debug)]
@@ -1371,16 +1476,31 @@ struct ExecutionStateOwner {
 impl ExecutionStateOwner {
     fn new(current: ExecutionStateSnapshot) -> Self {
         Self {
-            open_orders: (*current.open_orders).clone(),
-            coid_to_oid: (*current.coid_to_oid).clone(),
-            oid_to_coid: (*current.oid_to_coid).clone(),
-            coid_to_token: (*current.coid_to_token).clone(),
+            open_orders: current
+                .open_orders
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            coid_to_oid: current
+                .coid_to_oid
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            oid_to_coid: current
+                .oid_to_coid
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            coid_to_token: current
+                .coid_to_token
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
     fn apply(&mut self, shared: &SharedState, command: ExecutionStateCommand) {
-        let mut open_changed = false;
-        let mut identity_changed = false;
+        let mut next = (*shared.execution_state.load_full()).clone();
         match command {
             ExecutionStateCommand::InstallIdentity {
                 client_order_id,
@@ -1391,29 +1511,38 @@ impl ExecutionStateOwner {
                     .coid_to_oid
                     .insert(client_order_id.clone(), exchange_order_id.clone());
                 let normalized = normalize_order_id(&exchange_order_id);
+                next.coid_to_oid = next
+                    .coid_to_oid
+                    .with_insert(client_order_id.clone(), exchange_order_id);
                 if let Some(previous) = previous {
                     let previous = normalize_order_id(&previous);
                     if previous != normalized {
                         self.oid_to_coid.remove(&previous);
+                        next.oid_to_coid = next.oid_to_coid.with_remove(&previous);
                     }
                 }
                 self.oid_to_coid
-                    .insert(normalized, client_order_id.clone());
+                    .insert(normalized.clone(), client_order_id.clone());
+                next.oid_to_coid = next
+                    .oid_to_coid
+                    .with_insert(normalized, client_order_id.clone());
                 if !token.is_empty() {
-                    self.coid_to_token.insert(client_order_id, token);
+                    self.coid_to_token
+                        .insert(client_order_id.clone(), token.clone());
+                    next.coid_to_token = next.coid_to_token.with_insert(client_order_id, token);
                 }
-                identity_changed = true;
             }
             ExecutionStateCommand::TrackOpen {
                 client_order_id,
                 tracked,
             } => {
-                self.open_orders.insert(client_order_id, tracked);
-                open_changed = true;
+                self.open_orders
+                    .insert(client_order_id.clone(), tracked.clone());
+                next.open_orders = next.open_orders.with_insert(client_order_id, tracked);
             }
             ExecutionStateCommand::RemoveOpen { client_order_id } => {
                 self.open_orders.remove(&client_order_id);
-                open_changed = true;
+                next.open_orders = next.open_orders.with_remove(&client_order_id);
             }
             ExecutionStateCommand::RetireMappings {
                 asset_ids,
@@ -1429,7 +1558,11 @@ impl ExecutionStateOwner {
                 shared
                     .runtime_order_ownership
                     .remove_client_orders(&owned_coids);
-                identity_changed = true;
+                // Settled-event retirement is cold and can remove many keys;
+                // rebuild once instead of cloning one shard per deletion.
+                next.coid_to_oid = ExecutionReadMap::from_hash_map(self.coid_to_oid.clone());
+                next.oid_to_coid = ExecutionReadMap::from_hash_map(self.oid_to_coid.clone());
+                next.coid_to_token = ExecutionReadMap::from_hash_map(self.coid_to_token.clone());
             }
             #[cfg(test)]
             ExecutionStateCommand::Clear => {
@@ -1438,8 +1571,7 @@ impl ExecutionStateOwner {
                 self.oid_to_coid.clear();
                 self.coid_to_token.clear();
                 shared.runtime_order_ownership.clear();
-                open_changed = true;
-                identity_changed = true;
+                next = ExecutionStateSnapshot::default();
             }
             #[cfg(test)]
             ExecutionStateCommand::BenchmarkPublishOpen {
@@ -1448,24 +1580,26 @@ impl ExecutionStateOwner {
                 enqueued_ns,
                 completion,
             } => {
-                self.open_orders.insert(client_order_id, tracked);
-                self.publish(shared, true, false);
+                self.open_orders
+                    .insert(client_order_id.clone(), tracked.clone());
+                next.open_orders = next.open_orders.with_insert(client_order_id, tracked);
+                shared.execution_state.store(Arc::new(next));
                 let _ = completion.send(now_ns().saturating_sub(enqueued_ns));
                 return;
             }
         }
-        self.publish(shared, open_changed, identity_changed);
+        shared.execution_state.store(Arc::new(next));
     }
 
     fn publish(&self, shared: &SharedState, open_changed: bool, identity_changed: bool) {
         let mut next = (*shared.execution_state.load_full()).clone();
         if open_changed {
-            next.open_orders = Arc::new(self.open_orders.clone());
+            next.open_orders = ExecutionReadMap::from_hash_map(self.open_orders.clone());
         }
         if identity_changed {
-            next.coid_to_oid = Arc::new(self.coid_to_oid.clone());
-            next.oid_to_coid = Arc::new(self.oid_to_coid.clone());
-            next.coid_to_token = Arc::new(self.coid_to_token.clone());
+            next.coid_to_oid = ExecutionReadMap::from_hash_map(self.coid_to_oid.clone());
+            next.oid_to_coid = ExecutionReadMap::from_hash_map(self.oid_to_coid.clone());
+            next.coid_to_token = ExecutionReadMap::from_hash_map(self.coid_to_token.clone());
         }
         shared.execution_state.store(Arc::new(next));
     }
@@ -1478,12 +1612,11 @@ fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
     (stage_ns as i128 - origin_ns as i128) as f64 / 1_000_000.0
 }
 
-fn instance_owned_open_coids(
-    open: &HashMap<String, TrackedOrder>,
+fn instance_owned_open_coids<'a>(
+    open: impl Iterator<Item = (&'a String, &'a TrackedOrder)>,
     instance_id: &str,
 ) -> Vec<String> {
     let mut coids: Vec<String> = open
-        .iter()
         .filter(|(_, tracked)| tracked.instance_id == instance_id)
         .map(|(coid, _)| coid.clone())
         .collect();
@@ -1637,8 +1770,18 @@ enum AccountLifecycleJob {
         ownership: Option<OrderOwnership>,
     },
     ExecutionState(ExecutionStateCommand),
+    MarkLive {
+        client_order_id: String,
+        tracked: TrackedOrder,
+        status: OrderStatus,
+        enqueued_ns: u64,
+    },
     DeferredLifecycle(DeferredLifecycleJob),
     PrivateCold(super::user_feed::PrivateColdCommand),
+    DiagnosePrivate {
+        record: serde_json::Value,
+        completion: crossbeam_channel::Sender<super::user_feed::ParsedPrivateEvent>,
+    },
 }
 
 #[derive(Debug)]
@@ -2142,7 +2285,7 @@ pub struct SharedState {
     /// surface as `<unmapped>` (an ops anomaly signal expected to stay
     /// at zero) and broadcast to every instance. Identified probe
     /// events are logged at DEBUG and NOT forwarded.
-    pub probe_order_ids: Mutex<std::collections::VecDeque<String>>,
+    pub(crate) probe_order_ids: ProbeOrderIdRing,
     /// Authentication for REST requests
     pub auth: PolyAuth,
     /// EIP-712 order signer (v1 — pre-2026-04-28-cutover).
@@ -2188,8 +2331,12 @@ pub struct SharedState {
     /// take one buffer without blocking and return its allocation after the
     /// async HTTP future has dropped its body reference.
     request_buffers: Arc<ArrayQueue<BytesMut>>,
-    /// Live position & balance manager (trade-status-based)
-    pub live_position: Mutex<LivePositionManager>,
+    /// Immutable-reader mirror of the account-owner's live-position replay
+    /// watermark. The mutable trade ledger itself lives only on the account
+    /// owner thread and is never exposed through a lock.
+    live_position_last_match_secs: AtomicU64,
+    #[cfg(test)]
+    test_live_position: Mutex<LivePositionManager>,
     /// Narrow user-feed health handle shared with the strategy (pause-quoting
     /// signals). See [`UserFeedHealth`]. The user feed writes; the strategy
     /// reads (wired via `set_user_feed_health` in `build_strategies`).
@@ -2247,7 +2394,7 @@ pub struct SharedState {
     /// — the reconciler naturally retries it after the deadline expires.
     /// This must never become an account-wide circuit breaker: one noisy
     /// order cannot delay terminal audits for every strategy sharing state.
-    pub(crate) http_425_reconcile_backoff_until_ns: Mutex<HashMap<String, u64>>,
+    pub(crate) http_425_reconcile_backoff_until_ns: PublishedStringMap<u64>,
     /// Structured safety telemetry counters. These are per SharedState
     /// (account/instance route) and are emitted with every transition so the
     /// live log can be aggregated without a separate metrics dependency.
@@ -2269,7 +2416,7 @@ pub struct SharedState {
     /// The first two reconcile responses remain cancel orphans; the third
     /// resolves the local lifecycle to Cancelled. Cleared with the order on
     /// any terminal result.
-    pub(crate) reconcile_cancel_not_found_counts: Mutex<HashMap<String, u32>>,
+    pub(crate) reconcile_cancel_not_found_counts: PublishedStringMap<u32>,
     /// Independent placement/cancel retry counters. Placement counts only
     /// uninterrupted explicit not-found responses; a coid can be in both
     /// orphan sets after cancel-before-ack, so cancel diagnostics must never
@@ -2286,12 +2433,12 @@ pub struct SharedState {
     /// cleanup — a real fill still lands via the WS user_feed independent of
     /// this GET. Cleared alongside the placement counter on any
     /// conclusive placement resolution.
-    pub(crate) placement_reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
+    pub(crate) placement_reconcile_next_retry_ns: PublishedStringMap<u64>,
     /// Per-coid retry deadline for cancel-order GETs that returned an explicit
     /// not-found/empty success. Jittered exponential delay avoids synchronizing
     /// many orphans on the strategy quote cadence while preserving the
     /// worst-case reservation until a conclusive status or private fill arrives.
-    pub(crate) cancel_reconcile_next_retry_ns: Mutex<HashMap<String, u64>>,
+    pub(crate) cancel_reconcile_next_retry_ns: PublishedStringMap<u64>,
 
     /// Coids whose cancel was rejected with a `pending/delayed` reason — the
     /// cancel raced the placement, so the order is still being processed and
@@ -2301,7 +2448,7 @@ pub struct SharedState {
     /// CANCELED → Cancelled), instead of committing Cancelled on a
     /// not-yet-indexed order. Inserted at the cancel-reply classification sites
     /// and cleared only on conclusive resolution via `remove_order`.
-    pub(crate) pending_delayed_orphans: Mutex<HashSet<String>>,
+    pub(crate) pending_delayed_orphans: PublishedStringSet,
     /// Coalescing wakeup for account-wide settled-history GC.
     settled_gc_tx: crossbeam_channel::Sender<()>,
     /// Terminal executor bookkeeping can acquire several audit/runtime locks.
@@ -2326,33 +2473,162 @@ pub struct SharedState {
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
 /// bounded state machine; cancel attempts are unbounded diagnostics only.
+#[derive(Debug)]
+pub(crate) struct PublishedStringMap<V> {
+    published: ArcSwap<HashMap<String, V>>,
+}
+
+/// Bounded, lock-free reader view of synthetic RTT-probe order identities.
+///
+/// The probe writer is operational/cold. Private websocket parsing is the
+/// latency-sensitive reader, so it observes an immutable RCU snapshot and
+/// never contends with probe placement or cancellation.
+#[derive(Debug, Default)]
+pub(crate) struct ProbeOrderIdRing {
+    published: ArcSwap<std::collections::VecDeque<Arc<str>>>,
+}
+
+impl ProbeOrderIdRing {
+    const CAPACITY: usize = 64;
+
+    pub(crate) fn contains(&self, order_id: &str) -> bool {
+        let normalized = normalize_order_id(order_id);
+        self.published
+            .load()
+            .iter()
+            .any(|probe| probe.as_ref() == normalized)
+    }
+
+    pub(crate) fn insert(&self, order_id: &str) {
+        let normalized = Arc::<str>::from(normalize_order_id(order_id));
+        self.published.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(index) = next.iter().position(|probe| probe == &normalized) {
+                next.remove(index);
+            }
+            if next.len() == Self::CAPACITY {
+                next.pop_front();
+            }
+            next.push_back(Arc::clone(&normalized));
+            Arc::new(next)
+        });
+    }
+}
+
+impl<V> Default for PublishedStringMap<V> {
+    fn default() -> Self {
+        Self {
+            published: ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
+}
+
+impl<V: Clone> PublishedStringMap<V> {
+    fn get(&self, key: &str) -> Option<V> {
+        self.published.load().get(key).cloned()
+    }
+
+    fn insert(&self, key: String, value: V) {
+        self.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(key.clone(), value.clone());
+            Arc::new(next)
+        });
+    }
+
+    fn remove(&self, key: &str) -> Option<V> {
+        let previous = self.get(key);
+        if previous.is_some() {
+            self.published.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(key);
+                Arc::new(next)
+            });
+        }
+        previous
+    }
+
+    fn update<F>(&self, key: &str, update: F)
+    where
+        F: Fn(Option<&V>) -> Option<V>,
+    {
+        self.published.rcu(|current| {
+            let mut next = (**current).clone();
+            match update(current.get(key)) {
+                Some(value) => {
+                    next.insert(key.to_string(), value);
+                }
+                None => {
+                    next.remove(key);
+                }
+            }
+            Arc::new(next)
+        });
+    }
+
+    fn snapshot(&self) -> Arc<HashMap<String, V>> {
+        self.published.load_full()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PublishedStringSet {
+    published: ArcSwap<HashSet<String>>,
+}
+
+impl PublishedStringSet {
+    fn contains(&self, key: &str) -> bool {
+        self.published.load().contains(key)
+    }
+
+    fn insert(&self, key: String) {
+        self.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(key.clone());
+            Arc::new(next)
+        });
+    }
+
+    fn remove(&self, key: &str) -> bool {
+        let existed = self.contains(key);
+        if existed {
+            self.published.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(key);
+                Arc::new(next)
+            });
+        }
+        existed
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ReconcileAttemptCounters {
-    placement: Mutex<HashMap<String, u32>>,
-    cancel: Mutex<HashMap<String, u32>>,
+    placement: PublishedStringMap<u32>,
+    cancel: PublishedStringMap<u32>,
 }
 
 impl ReconcileAttemptCounters {
     fn next_placement(&self, coid: &str) -> u32 {
-        let mut attempts = self.placement.lock().unwrap();
-        let entry = attempts.entry(coid.to_string()).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
+        self.placement.update(coid, |attempt| {
+            Some(attempt.copied().unwrap_or(0).saturating_add(1))
+        });
+        self.placement.get(coid).unwrap_or(0)
     }
 
     fn clear_placement(&self, coid: &str) {
-        self.placement.lock().unwrap().remove(coid);
+        self.placement.remove(coid);
     }
 
     fn next_cancel(&self, coid: &str) -> u32 {
-        let mut attempts = self.cancel.lock().unwrap();
-        let entry = attempts.entry(coid.to_string()).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
+        self.cancel.update(coid, |attempt| {
+            Some(attempt.copied().unwrap_or(0).saturating_add(1))
+        });
+        self.cancel.get(coid).unwrap_or(0)
     }
 
     fn clear_cancel(&self, coid: &str) {
-        self.cancel.lock().unwrap().remove(coid);
+        self.cancel.remove(coid);
     }
 }
 
@@ -2400,6 +2676,7 @@ pub(crate) const HTTP_425_BACKOFF_NS: u64 = 1_000_000_000;
 /// Add or extend a 425 backoff for one orphan. Kept pure so tests can verify
 /// isolation and monotonic deadlines without constructing authenticated
 /// `SharedState`.
+#[cfg(test)]
 fn record_http_425_backoff(
     backoffs: &mut HashMap<String, u64>,
     client_order_id: &str,
@@ -2415,6 +2692,7 @@ fn record_http_425_backoff(
 
 /// Check one orphan's 425 backoff, removing an expired entry as part of the
 /// lookup. No other coid can influence the result.
+#[cfg(test)]
 fn is_http_425_backoff_active(
     backoffs: &mut HashMap<String, u64>,
     client_order_id: &str,
@@ -2459,6 +2737,40 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    pub(crate) fn live_position_last_match_secs(&self) -> u64 {
+        self.live_position_last_match_secs.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_live_position_watermark(&self, match_time_secs: u64) {
+        self.live_position_last_match_secs
+            .fetch_max(match_time_secs, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_live_position<R>(
+        &self,
+        apply: impl FnOnce(&mut LivePositionManager) -> R,
+    ) -> R {
+        let mut live_position = self.test_live_position.lock().unwrap();
+        apply(&mut live_position)
+    }
+
+    fn diagnose_private_record_on_owner(
+        &self,
+        record: serde_json::Value,
+    ) -> std::result::Result<super::user_feed::ParsedPrivateEvent, String> {
+        if self.account_state.is_account_owner_thread() {
+            return Err("private reconcile diagnosis cannot wait on its own account owner".into());
+        }
+        let (completion, result) = crossbeam_channel::bounded(1);
+        self.account_lifecycle_tx
+            .send(AccountLifecycleJob::DiagnosePrivate { record, completion })
+            .map_err(|_| "account owner lifecycle lane is closed".to_string())?;
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("account owner private diagnosis timed out: {error}"))
+    }
+
     fn take_request_buffer(&self) -> BytesMut {
         self.request_buffers.pop().unwrap_or_else(|| {
             crate::latency::record_ns("polymarket.order.request_buffer_pool_exhausted", 1);
@@ -2493,6 +2805,7 @@ impl SharedState {
     fn apply_account_lifecycle_job(
         &self,
         execution: &mut ExecutionStateOwner,
+        live_position: &mut LivePositionManager,
         job: AccountLifecycleJob,
     ) {
         match job {
@@ -2519,9 +2832,48 @@ impl SharedState {
                 execution.apply(self, command);
             }
             AccountLifecycleJob::ExecutionState(command) => execution.apply(self, command),
+            AccountLifecycleJob::MarkLive {
+                client_order_id,
+                tracked,
+                status,
+                enqueued_ns,
+            } => {
+                crate::latency::record_ns(
+                    "polymarket.account.mark_live_queue",
+                    now_ns().saturating_sub(enqueued_ns),
+                );
+                let effective = self
+                    .account_state
+                    .mark_order_status_effective(&client_order_id, status);
+                if matches!(
+                    effective,
+                    Some(OrderStatus::Accepted | OrderStatus::PartiallyFilled)
+                ) {
+                    execution.apply(
+                        self,
+                        ExecutionStateCommand::TrackOpen {
+                            client_order_id: client_order_id.clone(),
+                            tracked,
+                        },
+                    );
+                    self.pending_delayed_orphans.remove(&client_order_id);
+                    self.reconcile_cancel_not_found_counts
+                        .remove(&client_order_id);
+                    self.cancel_reconcile_next_retry_ns.remove(&client_order_id);
+                }
+            }
             AccountLifecycleJob::DeferredLifecycle(job) => self.apply_deferred_lifecycle(job),
             AccountLifecycleJob::PrivateCold(command) => {
-                super::user_feed::apply_private_cold_command(self, command);
+                super::user_feed::apply_private_cold_command(self, live_position, command);
+            }
+            AccountLifecycleJob::DiagnosePrivate { record, completion } => {
+                let parsed = super::user_feed::parse_user_event_diagnosed_owned(
+                    &record,
+                    self,
+                    live_position,
+                );
+                self.publish_live_position_watermark(live_position.last_match_time_secs());
+                let _ = completion.send(parsed);
             }
         }
     }
@@ -2538,13 +2890,17 @@ impl SharedState {
         }
     }
 
-    fn run_settled_gc_pass(&self, execution: &mut ExecutionStateOwner) {
+    fn run_settled_gc_pass(
+        &self,
+        execution: &mut ExecutionStateOwner,
+        live_position: &mut LivePositionManager,
+    ) {
         if !self.account_state.has_settled_gc_candidates() {
             return;
         }
         let started = crate::latency::Instant::now();
         let (retired_events, retired_live_trades) =
-            self.finalize_ready_settled_audit_retirements(execution);
+            self.finalize_ready_settled_audit_retirements(execution, live_position);
         crate::latency::record("polymarket.account.settled_gc", started);
         if retired_events > 0 {
             debug!(
@@ -2559,16 +2915,14 @@ impl SharedState {
     fn spawn_account_owner_worker(
         shared: &Arc<Self>,
         initial_execution_state: ExecutionStateSnapshot,
+        initial_live_position: LivePositionManager,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
         owner_task_rx: crossbeam_channel::Receiver<
             hexagent_account::account::shared_account::AccountOwnerTask,
         >,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
-    ) -> (
-        std::thread::JoinHandle<()>,
-        crossbeam_channel::Receiver<()>,
-    ) {
+    ) -> (std::thread::JoinHandle<()>, crossbeam_channel::Receiver<()>) {
         let weak = Arc::downgrade(shared);
         let owner_account_state = shared.account_state.clone();
         let account_id = shared.account_state.account_id().to_string();
@@ -2579,10 +2933,8 @@ impl SharedState {
             .name(format!("poly-account-owner-{}", shared.instance_id))
             .spawn(move || {
                 let mut execution = ExecutionStateOwner::new(initial_execution_state);
-                crate::os_tune::pin_private_account_cold(
-                    "polymarket-account-owner",
-                    &account_id,
-                );
+                let mut live_position = initial_live_position;
+                crate::os_tune::pin_private_account_cold("polymarket-account-owner", &account_id);
                 if let Err(error) = owner_account_state.mark_account_owner_thread() {
                     log::error!("[PolymarketTrade] account owner binding failed: {error}");
                     return;
@@ -2601,7 +2953,11 @@ impl SharedState {
                         // lane is empty. GC is coalesced and runs last.
                         loop {
                             if let Ok(job) = lifecycle_rx.try_recv() {
-                                shared.apply_account_lifecycle_job(&mut execution, job);
+                                shared.apply_account_lifecycle_job(
+                                    &mut execution,
+                                    &mut live_position,
+                                    job,
+                                );
                                 continue;
                             }
                             if let Ok(task) = owner_task_rx.try_recv() {
@@ -2613,7 +2969,7 @@ impl SharedState {
                                 continue;
                             }
                             if settled_gc_rx.try_recv().is_ok() {
-                                shared.run_settled_gc_pass(&mut execution);
+                                shared.run_settled_gc_pass(&mut execution, &mut live_position);
                                 continue;
                             }
                             break;
@@ -2622,7 +2978,11 @@ impl SharedState {
                     }
                     crossbeam_channel::select_biased! {
                         recv(lifecycle_rx) -> job => match job {
-                            Ok(job) => shared.apply_account_lifecycle_job(&mut execution, job),
+                            Ok(job) => shared.apply_account_lifecycle_job(
+                                &mut execution,
+                                &mut live_position,
+                                job,
+                            ),
                             Err(_) => break,
                         },
                         recv(owner_task_rx) -> task => match task {
@@ -2634,7 +2994,10 @@ impl SharedState {
                             Err(_) => break,
                         },
                         recv(settled_gc_rx) -> wake => match wake {
-                            Ok(()) => shared.run_settled_gc_pass(&mut execution),
+                            Ok(()) => shared.run_settled_gc_pass(
+                                &mut execution,
+                                &mut live_position,
+                            ),
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> phase => {
@@ -2646,7 +3009,7 @@ impl SharedState {
                             // A certificate may become ready without another
                             // producer wake. This poll is account-owner local
                             // and lower priority than both bounded work lanes.
-                            shared.run_settled_gc_pass(&mut execution);
+                            shared.run_settled_gc_pass(&mut execution, &mut live_position);
                         }
                     }
                 }
@@ -3075,10 +3438,7 @@ impl SharedState {
     }
 
     fn enqueue_lifecycle_trace(&self, job: LifecycleTraceJob) {
-        if let Err(error) = self
-            .attempt_audit_tx
-            .try_send(AuditJob::Lifecycle(job))
-        {
+        if let Err(error) = self.attempt_audit_tx.try_send(AuditJob::Lifecycle(job)) {
             // Trace state is observability-only. It is intentionally isolated
             // from the lossless account/execution lane and never backpressures
             // order completion or private trade application.
@@ -3370,24 +3730,24 @@ impl SharedState {
             trigger_local_ns,
             quote_emit_ns,
         ) = match trace {
-                Some(trace) => (
-                    trace.instance_id,
-                    trace.event_id,
-                    trace.symbol,
-                    trace.side.to_string(),
-                    trace.trigger_source,
-                    trace.trigger_exchange_ns,
-                    trace.trigger_local_ns,
-                    trace.quote_emit_ns,
-                ),
-                None => (
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
+            Some(trace) => (
+                trace.instance_id,
+                trace.event_id,
+                trace.symbol,
+                trace.side.to_string(),
+                trace.trigger_source,
+                trace.trigger_exchange_ns,
+                trace.trigger_local_ns,
+                trace.quote_emit_ns,
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
                 QuoteTriggerSource::Unknown,
-                    0,
-                    0,
+                0,
+                0,
                 0,
             ),
         };
@@ -3541,6 +3901,7 @@ impl SharedState {
     fn finalize_ready_settled_audit_retirements(
         &self,
         execution: &mut ExecutionStateOwner,
+        live_position: &mut LivePositionManager,
     ) -> (usize, usize) {
         let ready = self
             .account_state
@@ -3561,15 +3922,14 @@ impl SharedState {
                 continue;
             }
             let token_list: Vec<String> = tokens.iter().cloned().collect();
-            retired_runtime_mappings = retired_runtime_mappings.saturating_add(
-                reclaim_token_mappings(
+            retired_runtime_mappings =
+                retired_runtime_mappings.saturating_add(reclaim_token_mappings(
                     &mut execution.coid_to_oid,
                     &mut execution.oid_to_coid,
                     &mut execution.coid_to_token,
                     &token_list,
                     Some(&owned_coids),
-                ),
-            );
+                ));
             self.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
                 client_order_ids: owned_coids.clone(),
             });
@@ -3577,10 +3937,9 @@ impl SharedState {
                 .remove_client_orders(&owned_coids);
         }
         execution.publish(self, false, true);
-        let mut live = self.live_position.lock().unwrap();
         let retired_live_trades = ready
             .iter()
-            .map(|tokens| live.prune_terminal_history(tokens))
+            .map(|tokens| live_position.prune_terminal_history(tokens))
             .sum();
         debug!(
             "[PolySettledGc] account={} owner certificates complete runtime_mappings={}",
@@ -3607,37 +3966,28 @@ impl SharedState {
             status,
             OrderStatus::Accepted | OrderStatus::PartiallyFilled
         ));
-        let effective = self
-            .account_state
-            .mark_order_status_effective(client_order_id, status);
-        if matches!(
-            effective,
-            Some(OrderStatus::Accepted | OrderStatus::PartiallyFilled)
-        ) {
-            if let Err(error) = self.track_open_order(
+        let job = AccountLifecycleJob::MarkLive {
+            client_order_id: client_order_id.to_string(),
+            tracked: TrackedOrder {
+                symbol: symbol.to_string(),
+                side,
+                instance_id: instance_id.to_string(),
+            },
+            status,
+            enqueued_ns: now_ns(),
+        };
+        if let Err(error) = self.account_lifecycle_tx.try_send(job) {
+            self.user_feed_health.set_inventory_uncertain(true);
+            log::error!(
+                "[PolymarketTrade] account owner queue unavailable while restoring live coid={}: {}",
                 client_order_id,
-                TrackedOrder {
-                    symbol: symbol.to_string(),
-                    side,
-                    instance_id: instance_id.to_string(),
-                },
-            ) {
-                log::error!("[PolymarketTrade] cannot restore live order: {error}");
-            }
-            self.pending_delayed_orphans
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
-            self.reconcile_cancel_not_found_counts
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
-            self.cancel_reconcile_next_retry_ns
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
+                error,
+            );
         }
-        effective
+        // StrategyAccount is the immediate lifecycle authority. The shared
+        // monitoring ledger applies the same edge asynchronously on its sole
+        // owner and may retain a stronger terminal state there.
+        Some(status)
     }
 
     /// Apply the weak outcome of one cancel attempt without allowing a late
@@ -3650,31 +4000,13 @@ impl SharedState {
         client_order_id: &str,
         candidate: OrderStatus,
     ) -> OrderStatus {
-        let effective = match candidate {
-            OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain => self
-                .account_state
-                .mark_order_status_effective(client_order_id, candidate)
-                .unwrap_or(candidate),
-            OrderStatus::Accepted => self
-                .account_state
-                .order(client_order_id)
-                .map(|order| match order.status {
-                    terminal @ (OrderStatus::Cancelled
-                    | OrderStatus::Filled
-                    | OrderStatus::Rejected
-                    | OrderStatus::Failed) => terminal,
-                    _ => candidate,
-                })
-                .unwrap_or(candidate),
-            _ => candidate,
-        };
-        if effective != candidate {
-            info!(
-                "[order_lifecycle_race] coid={} ignored_stale_cancel_status={:?} retained_terminal={:?}",
-                client_order_id, candidate, effective,
-            );
+        if matches!(
+            candidate,
+            OrderStatus::CancelOrderTimeout | OrderStatus::CancelUncertain
+        ) {
+            self.defer_lifecycle_account_apply(client_order_id, candidate);
         }
-        effective
+        candidate
     }
 
     /// Drop the order from the **active-order** tracker.
@@ -3702,18 +4034,10 @@ impl SharedState {
 
     fn remove_cancelled_order_runtime(&self, client_order_id: &str) {
         self.untrack_open_order(client_order_id);
-        self.pending_delayed_orphans
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        self.pending_delayed_orphans.remove(client_order_id);
         self.reconcile_cancel_not_found_counts
-            .lock()
-            .unwrap()
             .remove(client_order_id);
-        self.cancel_reconcile_next_retry_ns
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        self.cancel_reconcile_next_retry_ns.remove(client_order_id);
     }
 
     pub fn remove_order_as(&self, client_order_id: &str, status: OrderStatus) {
@@ -3728,7 +4052,7 @@ impl SharedState {
                 .mark_filled_pending_audit(client_order_id);
             if transition.pending() {
                 if transition.newly_pending() {
-            warn!(
+                    warn!(
                 "[PolymarketTrade] Filled coid={} awaits complete trade audit; preserving reservation",
                 client_order_id,
             );
@@ -3738,8 +4062,8 @@ impl SharedState {
                         client_order_id,
                     );
                 }
-            return;
-        }
+                return;
+            }
         }
         if status == OrderStatus::Cancelled {
             self.remove_cancelled_order_runtime(client_order_id);
@@ -3770,11 +4094,7 @@ impl SharedState {
     /// cleanup in one account transaction. Re-entering `release_order` and
     /// `finish_order_recovery` here used to take the account control/lifecycle
     /// locks twice more for every terminal private order push.
-    fn remove_order_after_authoritative_commit(
-        &self,
-        client_order_id: &str,
-        status: OrderStatus,
-    ) {
+    fn remove_order_after_authoritative_commit(&self, client_order_id: &str, status: OrderStatus) {
         self.remove_order_resolved_as_inner(client_order_id, status, true);
     }
 
@@ -3801,21 +4121,17 @@ impl SharedState {
         }
         // Conclusive resolution — drop any pending/delayed orphan flag so the
         // set never leaks and a future coid reuse starts fresh.
-        self.pending_delayed_orphans
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        self.pending_delayed_orphans.remove(client_order_id);
         self.reconcile_cancel_not_found_counts
-            .lock()
-            .unwrap()
             .remove(client_order_id);
-        self.cancel_reconcile_next_retry_ns
-            .lock()
-            .unwrap()
-            .remove(client_order_id);
+        self.cancel_reconcile_next_retry_ns.remove(client_order_id);
         let now = crate::types::now_ns();
-        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
-        if backoffs.remove(client_order_id).is_some() {
+        if self
+            .http_425_reconcile_backoff_until_ns
+            .remove(client_order_id)
+            .is_some()
+        {
+            let backoffs = self.http_425_reconcile_backoff_until_ns.snapshot();
             let active_count = backoffs
                 .values()
                 .filter(|deadline| **deadline > now)
@@ -3847,13 +4163,10 @@ impl SharedState {
         audit: &AuthoritativeOrderAudit,
     ) -> bool {
         let audit_started = crate::latency::Instant::now();
-        let transition_result = self
-            .account_state
-            .apply_authoritative_order_audit(client_order_id, status, audit);
-        crate::latency::record(
-            "polymarket.account.terminal_audit_commit",
-            audit_started,
-        );
+        let transition_result =
+            self.account_state
+                .apply_authoritative_order_audit(client_order_id, status, audit);
+        crate::latency::record("polymarket.account.terminal_audit_commit", audit_started);
         let transition = match transition_result {
             Ok(transition) => transition,
             Err(error) => {
@@ -3869,18 +4182,10 @@ impl SharedState {
         };
         if transition.pending() {
             self.untrack_open_order(client_order_id);
-            self.pending_delayed_orphans
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
+            self.pending_delayed_orphans.remove(client_order_id);
             self.reconcile_cancel_not_found_counts
-                .lock()
-                .unwrap()
                 .remove(client_order_id);
-            self.cancel_reconcile_next_retry_ns
-                .lock()
-                .unwrap()
-                .remove(client_order_id);
+            self.cancel_reconcile_next_retry_ns.remove(client_order_id);
             debug!(
                 "[PolymarketTrade] authoritative terminal audit committed coid={} status={:?} trade_ids={} pending=true",
                 client_order_id,
@@ -4113,9 +4418,22 @@ impl SharedState {
     /// in the shared account. Idempotent — only advances that coid's deadline.
     pub(crate) fn note_http_425_backoff(&self, coid: &str) {
         let now = crate::types::now_ns();
-        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
-        let was_active = backoffs.get(coid).is_some_and(|deadline| *deadline > now);
-        record_http_425_backoff(&mut backoffs, coid, now);
+        let was_active = self
+            .http_425_reconcile_backoff_until_ns
+            .get(coid)
+            .is_some_and(|deadline| deadline > now);
+        if !coid.is_empty() {
+            self.http_425_reconcile_backoff_until_ns
+                .update(coid, |deadline| {
+                    Some(
+                        deadline
+                            .copied()
+                            .unwrap_or(0)
+                            .max(now.saturating_add(HTTP_425_BACKOFF_NS)),
+                    )
+                });
+        }
+        let backoffs = self.http_425_reconcile_backoff_until_ns.snapshot();
         let active_count = backoffs
             .values()
             .filter(|deadline| **deadline > now)
@@ -4140,10 +4458,12 @@ impl SharedState {
     /// removed lazily; other coids never affect this decision.
     pub(crate) fn in_http_425_backoff(&self, coid: &str) -> bool {
         let now = crate::types::now_ns();
-        let mut backoffs = self.http_425_reconcile_backoff_until_ns.lock().unwrap();
-        let existed = backoffs.contains_key(coid);
-        let active = is_http_425_backoff_active(&mut backoffs, coid, now);
+        let deadline = self.http_425_reconcile_backoff_until_ns.get(coid);
+        let existed = deadline.is_some();
+        let active = deadline.is_some_and(|until| now < until);
         if existed && !active {
+            self.http_425_reconcile_backoff_until_ns.remove(coid);
+            let backoffs = self.http_425_reconcile_backoff_until_ns.snapshot();
             let active_count = backoffs
                 .values()
                 .filter(|deadline| **deadline > now)
@@ -4218,9 +4538,17 @@ impl SharedState {
         reason: Option<&str>,
         outcome: CancelReasonOutcome,
     ) -> CancelReasonOutcome {
-        let attempt = {
-            let mut counts = self.reconcile_cancel_not_found_counts.lock().unwrap();
-            record_cancel_not_found_observation(&mut counts, coid, reason, outcome)
+        let attempt = if outcome == CancelReasonOutcome::Uncertain
+            && !coid.is_empty()
+            && reason.is_some_and(is_cancel_not_found_already_canceled_or_matched)
+        {
+            self.reconcile_cancel_not_found_counts
+                .update(coid, |count| {
+                    Some(count.copied().unwrap_or(0).saturating_add(1))
+                });
+            self.reconcile_cancel_not_found_counts.get(coid)
+        } else {
+            None
         };
         let Some(attempt) = attempt else {
             return outcome;
@@ -4471,7 +4799,7 @@ impl SharedState {
                     headers,
                     body_a,
                 )
-                        .await;
+                .await;
                 if let Ok(mut buffer) = recyclable.try_into_mut() {
                     buffer.clear();
                     let _ = request_buffers.push(buffer);
@@ -4904,9 +5232,9 @@ impl PolymarketTrade {
                 recovered_open.insert(
                     order.client_order_id.clone(),
                     TrackedOrder {
-                    symbol: order.token_id.clone(),
-                    side: order.side,
-                    instance_id: order.instance_id.clone(),
+                        symbol: order.token_id.clone(),
+                        side: order.side,
+                        instance_id: order.instance_id.clone(),
                     },
                 );
             }
@@ -4922,8 +5250,7 @@ impl PolymarketTrade {
         }
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
-        let (account_lifecycle_tx, account_lifecycle_rx) =
-            crossbeam_channel::bounded(16_384);
+        let (account_lifecycle_tx, account_lifecycle_rx) = crossbeam_channel::bounded(16_384);
         let account_owner_task_rx = account_state
             .bind_account_owner_task_lane()
             .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
@@ -4931,65 +5258,68 @@ impl PolymarketTrade {
         let (attempt_audit_tx, attempt_audit_rx) =
             crossbeam_channel::bounded(EXECUTION_AUDIT_QUEUE_CAPACITY);
         let initial_execution_state = ExecutionStateSnapshot {
-            open_orders: Arc::new(recovered_open),
-            coid_to_oid: Arc::new(recovered_coid_to_oid),
-            oid_to_coid: Arc::new(recovered_oid_to_coid),
-            coid_to_token: Arc::new(recovered_coid_to_token),
+            open_orders: ExecutionReadMap::from_hash_map(recovered_open),
+            coid_to_oid: ExecutionReadMap::from_hash_map(recovered_coid_to_oid),
+            oid_to_coid: ExecutionReadMap::from_hash_map(recovered_oid_to_coid),
+            coid_to_token: ExecutionReadMap::from_hash_map(recovered_coid_to_token),
         };
+        let initial_live_position = LivePositionManager::from_restored(recovered_trades);
+        let restored_live_position_watermark = initial_live_position.last_match_time_secs();
         let shared = Arc::new(SharedState {
-                instance_id: instance_id.to_string(),
-                account_state,
-                execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
-                runtime_order_ownership: recovered_runtime_ownership,
-                probe_order_ids: Mutex::new(std::collections::VecDeque::new()),
-                auth,
-                signer,
-                signer_v2,
-                order_maker_address,
-                clob_version,
-                use_batch_orders,
-                clob_base_url,
+            instance_id: instance_id.to_string(),
+            account_state,
+            execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
+            runtime_order_ownership: recovered_runtime_ownership,
+            probe_order_ids: ProbeOrderIdRing::default(),
+            auth,
+            signer,
+            signer_v2,
+            order_maker_address,
+            clob_version,
+            use_batch_orders,
+            clob_base_url,
             order_url,
             request_buffers: new_request_buffer_pool(),
-                live_position: Mutex::new(LivePositionManager::from_restored(recovered_trades)),
-                user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
-                gap_replay,
-                rate_limiter: crate::exchange::AtomicRateLimiter::new(
-                    rate_limit_per_second.max(1),
-                ),
-                balance_backoff_until_ns: ArcSwap::from_pointee(HashMap::new()),
-                trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
-                invalid_token_backoff: ArcSwap::from_pointee(HashMap::new()),
-                http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
-                http_425_reconcile_backoff_until_ns: Mutex::new(HashMap::new()),
-                http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
-                startup_recovery_lookup_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
-                get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
+            live_position_last_match_secs: AtomicU64::new(restored_live_position_watermark),
+            #[cfg(test)]
+            test_live_position: Mutex::new(LivePositionManager::new()),
+            user_feed_health: std::sync::Arc::new(super::live_position::UserFeedHealth::new()),
+            gap_replay,
+            rate_limiter: crate::exchange::AtomicRateLimiter::new(rate_limit_per_second.max(1)),
+            balance_backoff_until_ns: ArcSwap::from_pointee(HashMap::new()),
+            trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
+            invalid_token_backoff: ArcSwap::from_pointee(HashMap::new()),
+            http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
+            http_425_reconcile_backoff_until_ns: PublishedStringMap::default(),
+            http_425_circuit_entries_total: std::sync::atomic::AtomicU64::new(0),
+            startup_recovery_lookup_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
+            get_live_delete_uncertain_total: std::sync::atomic::AtomicU64::new(0),
             get_live_delete_uncertain_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
-                get_live_delete_uncertain_suppressed: std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_missing_total: std::sync::atomic::AtomicU64::new(0),
+            get_live_delete_uncertain_suppressed: std::sync::atomic::AtomicU64::new(0),
+            terminal_trade_backfill_missing_total: std::sync::atomic::AtomicU64::new(0),
             terminal_trade_backfill_missing_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(
-                    0,
-                ),
+                0,
+            ),
             terminal_trade_backfill_missing_suppressed: std::sync::atomic::AtomicU64::new(0),
             terminal_trade_backfill_noop_total: std::sync::atomic::AtomicU64::new(0),
             terminal_trade_backfill_noop_log_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
-                terminal_trade_backfill_noop_suppressed: std::sync::atomic::AtomicU64::new(0),
-                reconcile_cancel_not_found_counts: Mutex::new(HashMap::new()),
-                reconcile_attempts: ReconcileAttemptCounters::default(),
-                placement_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
-                cancel_reconcile_next_retry_ns: Mutex::new(HashMap::new()),
-                pending_delayed_orphans: Mutex::new(HashSet::new()),
-                settled_gc_tx,
-                account_maintenance_tx,
-                account_lifecycle_tx,
-                attempt_audit_tx,
-                shutdown_token,
-                background_worker_handles: Mutex::new(Vec::with_capacity(2)),
-            });
+            terminal_trade_backfill_noop_suppressed: std::sync::atomic::AtomicU64::new(0),
+            reconcile_cancel_not_found_counts: PublishedStringMap::default(),
+            reconcile_attempts: ReconcileAttemptCounters::default(),
+            placement_reconcile_next_retry_ns: PublishedStringMap::default(),
+            cancel_reconcile_next_retry_ns: PublishedStringMap::default(),
+            pending_delayed_orphans: PublishedStringSet::default(),
+            settled_gc_tx,
+            account_maintenance_tx,
+            account_lifecycle_tx,
+            attempt_audit_tx,
+            shutdown_token,
+            background_worker_handles: Mutex::new(Vec::with_capacity(2)),
+        });
         let (account_owner, account_owner_ready) = SharedState::spawn_account_owner_worker(
             &shared,
             initial_execution_state,
+            initial_live_position,
             account_lifecycle_rx,
             account_owner_task_rx,
             account_maintenance_rx,
@@ -5001,7 +5331,9 @@ impl PolymarketTrade {
         let (account_owner_barrier_tx, account_owner_barrier_rx) = crossbeam_channel::bounded(1);
         shared
             .account_lifecycle_tx
-            .send(AccountLifecycleJob::StartupBarrier(account_owner_barrier_tx))
+            .send(AccountLifecycleJob::StartupBarrier(
+                account_owner_barrier_tx,
+            ))
             .map_err(|error| anyhow!("Polymarket account owner startup lane closed: {error}"))?;
         account_owner_barrier_rx
             .recv_timeout(std::time::Duration::from_secs(2))
@@ -5287,8 +5619,7 @@ impl PolymarketTrade {
                     ) {
                         warn!(
                             "[PolymarketTrade] startup ownership publish failed oid={}: {}",
-                            anomaly.order_id,
-                            error,
+                            anomaly.order_id, error,
                         );
                         continue;
                     }
@@ -5366,9 +5697,9 @@ impl PolymarketTrade {
                             .shared
                             .account_state
                             .record_authoritative_absent_orphan_order_audit(
-                            &anomaly.order_id,
-                            anomaly.client_order_id.as_deref(),
-                            &evidence,
+                                &anomaly.order_id,
+                                anomaly.client_order_id.as_deref(),
+                                &evidence,
                             )
                         {
                             summary.tombstoned = summary.tombstoned.saturating_add(1);
@@ -5473,12 +5804,14 @@ impl PolymarketTrade {
                         .shared
                         .account_state
                         .backfill_order_ownership(&ownership)?;
-                    self.shared.install_runtime_order_id(
-                        client_order_id,
-                        &anomaly.order_id,
-                        &identity.asset_id,
-                        Some(&ownership),
-                    ).ok()?;
+                    self.shared
+                        .install_runtime_order_id(
+                            client_order_id,
+                            &anomaly.order_id,
+                            &identity.asset_id,
+                            Some(&ownership),
+                        )
+                        .ok()?;
                     Some((client_order_id.to_string(), instance_id, identity.clone()))
                 });
 
@@ -5540,13 +5873,13 @@ impl PolymarketTrade {
                     .shared
                     .account_state
                     .record_terminal_orphan_order_audit(
-                    &anomaly.order_id,
-                    anomaly.client_order_id.as_deref(),
-                    status,
-                    quantity,
-                    matched,
-                    &fetched.audit.associate_trades,
-                    &evidence,
+                        &anomaly.order_id,
+                        anomaly.client_order_id.as_deref(),
+                        status,
+                        quantity,
+                        matched,
+                        &fetched.audit.associate_trades,
+                        &evidence,
                     )
                 {
                     summary.tombstoned = summary.tombstoned.saturating_add(1);
@@ -5579,10 +5912,10 @@ impl PolymarketTrade {
                 .client_order_id
                 .as_deref()
                 .is_some_and(|client_order_id| {
-                self.shared
-                    .account_state
-                    .instance_id_for_historical_coid(client_order_id)
-                    .is_none()
+                    self.shared
+                        .account_state
+                        .instance_id_for_historical_coid(client_order_id)
+                        .is_none()
                 })
             {
                 OrphanOrderRepairFailure::UnknownInstance
@@ -5607,9 +5940,8 @@ impl PolymarketTrade {
     /// ledger. Startup callers may use `reconcile_recovered_orders()` and seed
     /// strategy state from the recovered virtual snapshot instead.
     pub fn reconcile_recovered_orders_with_updates(&self) -> (usize, Vec<OrderUpdate>) {
-        let _reconcile_stage = crate::latency::TimedStage::new(
-            "polymarket.recovery.reconcile_recovered_orders",
-        );
+        let _reconcile_stage =
+            crate::latency::TimedStage::new("polymarket.recovery.reconcile_recovered_orders");
         // Keep a single pass sub-second. The account worker is now woken on
         // pending-audit edges and retries every 500 ms, so multi-second sleeps
         // here would only serialize unrelated orders behind one slow replica.
@@ -5649,11 +5981,11 @@ impl PolymarketTrade {
                             (
                                 coid,
                                 oid.clone(),
-                                    ownership,
-                                    is_recovered,
-                                    requires_query_repair,
-                                )
-                            })
+                                ownership,
+                                is_recovered,
+                                requires_query_repair,
+                            )
+                        })
                     })
                     .collect()
             };
@@ -5666,23 +5998,21 @@ impl PolymarketTrade {
             }
 
             for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
-                let event_has_ended = if should_lookup_recovered_event_end(
-                    is_recovered,
-                    requires_query_repair,
-                ) {
-                    let event_end_started = crate::latency::Instant::now();
-                    let ended = self
-                        .shared
-                        .account_state
-                        .token_event_has_ended(&ownership.token_id);
-                    crate::latency::record(
-                        "polymarket.recovery.event_end_lookup",
-                        event_end_started,
-                    );
-                    ended
-                } else {
-                    false
-                };
+                let event_has_ended =
+                    if should_lookup_recovered_event_end(is_recovered, requires_query_repair) {
+                        let event_end_started = crate::latency::Instant::now();
+                        let ended = self
+                            .shared
+                            .account_state
+                            .token_event_has_ended(&ownership.token_id);
+                        crate::latency::record(
+                            "polymarket.recovery.event_end_lookup",
+                            event_end_started,
+                        );
+                        ended
+                    } else {
+                        false
+                    };
                 if let Some(reason) = prequery_recovered_order_close_reason(
                     is_recovered,
                     event_has_ended,
@@ -5870,10 +6200,10 @@ impl PolymarketTrade {
                     }
                     FetchOrderResult::Unavailable(kind) => {
                         if fetch_unavailable_should_warn(&kind) {
-                        unavailable_count = unavailable_count.saturating_add(1);
-                        if unavailable_samples.len() < 3 {
-                            unavailable_samples.push(format!("{}:{:?}", coid, kind));
-                        }
+                            unavailable_count = unavailable_count.saturating_add(1);
+                            if unavailable_samples.len() < 3 {
+                                unavailable_samples.push(format!("{}:{:?}", coid, kind));
+                            }
                         } else {
                             json_null_count = json_null_count.saturating_add(1);
                         }
@@ -5919,10 +6249,7 @@ impl PolymarketTrade {
             }
             let (recovery_pending, routine_cancel_audits) =
                 self.shared.account_state.pending_order_audit_counts();
-            if startup_recovery_audits_complete(
-                recovery_pending,
-                routine_cancel_audits,
-            ) {
+            if startup_recovery_audits_complete(recovery_pending, routine_cancel_audits) {
                 return (recovery_pending, replayed_updates);
             }
         }
@@ -6126,9 +6453,9 @@ impl PolymarketTrade {
                     coid,
                     (
                         TrackedOrder {
-                    symbol: order.token_id,
-                    side: order.side,
-                    instance_id: order.instance_id,
+                            symbol: order.token_id,
+                            side: order.side,
+                            instance_id: order.instance_id,
                         },
                         order_id.clone(),
                     ),
@@ -6372,11 +6699,7 @@ impl PolymarketTrade {
     pub fn cancel_all_orders(&self) {
         let tracked: Vec<(String, String)> = {
             let execution = self.shared.execution_snapshot();
-            let coids: Vec<String> = execution
-                .open_orders
-                .keys()
-                .cloned()
-                .collect();
+            let coids: Vec<String> = execution.open_orders.keys().cloned().collect();
             let ids = &execution.coid_to_oid;
             coids
                 .into_iter()
@@ -6410,8 +6733,7 @@ impl PolymarketTrade {
                         }
                         CancelReasonOutcome::Uncertain => {
                             self.shared
-                                .account_state
-                                .mark_order_status(coid, OrderStatus::CancelUncertain);
+                                .defer_lifecycle_account_apply(coid, OrderStatus::CancelUncertain);
                             warn!(
                                 "[PolymarketTrade] Cancel-all left coid={} orderID={} ambiguous — retaining reservation",
                                 coid, order_id,
@@ -6423,8 +6745,7 @@ impl PolymarketTrade {
             Err(e) => {
                 for (coid, _) in &tracked {
                     self.shared
-                        .account_state
-                        .mark_order_status(coid, OrderStatus::CancelOrderTimeout);
+                        .defer_lifecycle_account_apply(coid, OrderStatus::CancelOrderTimeout);
                 }
                 warn!(
                     "[PolymarketTrade] Cancel-all failed: {} — retaining {} order reservations",
@@ -6585,7 +6906,7 @@ impl PolymarketTrade {
             ));
         }
         let execution = self.shared.execution_snapshot();
-        let coids = instance_owned_open_coids(&execution.open_orders, &self.instance_id);
+        let coids = instance_owned_open_coids(execution.open_orders.iter(), &self.instance_id);
         if coids.is_empty() {
             return Ok(Vec::new());
         }
@@ -6627,7 +6948,7 @@ impl PolymarketTrade {
                 updates: Vec::new(),
                 detail:
                     "market cancel requires a non-empty condition id and distinct non-empty tokens"
-                    .to_string(),
+                        .to_string(),
             };
         }
 
@@ -6945,7 +7266,7 @@ impl PolymarketTrade {
                     continue;
                 }
                 let in_scope = match side {
-                    Side::Buy  => t.side == Side::Buy,
+                    Side::Buy => t.side == Side::Buy,
                     Side::Sell => t.side == Side::Sell && t.symbol == symbol,
                 };
                 if !in_scope {
@@ -6956,7 +7277,7 @@ impl PolymarketTrade {
                 }
             }
             let lbl = match side {
-                Side::Buy  => "all-BUYs (USDC pool)",
+                Side::Buy => "all-BUYs (USDC pool)",
                 Side::Sell => "same-symbol SELLs (token pool)",
             };
             (lbl, targets)
@@ -7202,9 +7523,9 @@ impl PolymarketTrade {
                 self.shared.register_order_lifecycle(order);
                 let rejected = Self::make_rejected(order, reason);
                 self.shared.log_preflight_rejected(
-                &order.client_order_id,
-                rejected.exchange_order_id.as_deref(),
-                &rejected,
+                    &order.client_order_id,
+                    rejected.exchange_order_id.as_deref(),
+                    &rejected,
                 );
                 self.shared.forget_order_lifecycle(&order.client_order_id);
                 rejected
@@ -7358,13 +7679,7 @@ impl PolymarketTrade {
                 // Per-coid exponential backoff: skip the GET until this coid's
                 // next-retry deadline (set on the previous not-found). Keeps the
                 // orphan parked without re-hammering a slow PM REST endpoint.
-                if let Some(&next_ns) = self
-                    .shared
-                    .placement_reconcile_next_retry_ns
-                    .lock()
-                    .unwrap()
-                    .get(coid)
-                {
+                if let Some(next_ns) = self.shared.placement_reconcile_next_retry_ns.get(coid) {
                     if now_ns() < next_ns {
                         continue;
                     }
@@ -7397,11 +7712,7 @@ impl PolymarketTrade {
                     let attempts = self.shared.reconcile_attempts.next_placement(coid);
                     if attempts >= RECONCILE_NOT_FOUND_RETRY_LIMIT {
                         self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .remove(coid);
+                        self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         warn!(
                             "[orphan_metric] placement_not_found_terminal=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
                             coid, oid, attempts,
@@ -7434,11 +7745,7 @@ impl PolymarketTrade {
                         coid, oid, attempts, RECONCILE_NOT_FOUND_RETRY_LIMIT,
                     );
                     let backoff_ms = placement_reconcile_backoff_ms(attempts);
-                    self.shared
-                        .placement_reconcile_next_retry_ns
-                        .lock()
-                        .unwrap()
-                        .insert(
+                    self.shared.placement_reconcile_next_retry_ns.insert(
                         coid.clone(),
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
@@ -7460,11 +7767,7 @@ impl PolymarketTrade {
                         // Conclusive answer — clear the not_found counter
                         // so a future unrelated 404 starts fresh.
                         self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .remove(coid);
+                        self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         let Some(ownership) = self.shared.account_state.order(coid) else {
                             warn!(
                                 "[PolymarketTrade] Reconcile placement coid={} orderID={} LIVE without durable ownership — keeping orphan",
@@ -7531,11 +7834,7 @@ impl PolymarketTrade {
                     }
                     "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED" => {
                         self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .remove(coid);
+                        self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         if let Some(audit) = order_audit.as_ref() {
                             self.shared.commit_authoritative_terminal_audit(
                                 coid,
@@ -7558,7 +7857,7 @@ impl PolymarketTrade {
                                 self.shared.complete_filled_order_audit(coid);
                             }
                         } else {
-                        self.shared.remove_order_as(coid, OrderStatus::Filled);
+                            self.shared.remove_order_as(coid, OrderStatus::Filled);
                         }
                         info!(
                             "[PolymarketTrade] Reconciled placement coid={} orderID={} → Filled",
@@ -7624,11 +7923,7 @@ impl PolymarketTrade {
                         }
 
                         self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .remove(coid);
+                        self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         self.shared.commit_authoritative_terminal_audit(
                             coid,
                             OrderStatus::Cancelled,
@@ -7688,11 +7983,7 @@ impl PolymarketTrade {
                         // ran with no quoting. Treat exactly like
                         // Rejected so the orphan clears immediately.
                         self.shared.reconcile_attempts.clear_placement(coid);
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .remove(coid);
+                        self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         warn!(
                             "[PolymarketTrade] Reconcile: placement coid={} orderID={} status=INVALID → Rejected (server validation failed)",
                             coid, oid,
@@ -7725,15 +8016,11 @@ impl PolymarketTrade {
                             "[PolymarketTrade] Reconcile: placement coid={} orderID={} returned unexpected status '{}' — keeping as orphan",
                             coid, oid, other,
                         );
-                        self.shared
-                            .placement_reconcile_next_retry_ns
-                            .lock()
-                            .unwrap()
-                            .insert(
+                        self.shared.placement_reconcile_next_retry_ns.insert(
                             coid.clone(),
-                                now_ns().saturating_add(
-                                    RECONCILE_BACKOFF_BASE_MS.saturating_mul(1_000_000),
-                                ),
+                            now_ns().saturating_add(
+                                RECONCILE_BACKOFF_BASE_MS.saturating_mul(1_000_000),
+                            ),
                         );
                     }
                 }
@@ -7744,11 +8031,15 @@ impl PolymarketTrade {
         for (coid, order_id) in pending_cancels {
             {
                 let now = now_ns();
-                let mut deadlines = self.shared.cancel_reconcile_next_retry_ns.lock().unwrap();
-                if deadlines.get(coid).is_some_and(|deadline| *deadline > now) {
+                if self
+                    .shared
+                    .cancel_reconcile_next_retry_ns
+                    .get(coid)
+                    .is_some_and(|deadline| deadline > now)
+                {
                     continue;
                 }
-                deadlines.remove(coid);
+                self.shared.cancel_reconcile_next_retry_ns.remove(coid);
             }
             if self.shared.in_http_425_backoff(coid) {
                 continue;
@@ -7846,12 +8137,7 @@ impl PolymarketTrade {
                     // Count attempts for diagnostics only; never convert retry
                     // exhaustion into a fabricated Cancelled status.
                     let attempts = self.shared.reconcile_attempts.next_cancel(coid);
-                    let pending_delayed = self
-                        .shared
-                        .pending_delayed_orphans
-                        .lock()
-                        .unwrap()
-                        .contains(coid);
+                    let pending_delayed = self.shared.pending_delayed_orphans.contains(coid);
                     let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts).max(
                         if http_425_backoff_active {
                             HTTP_425_BACKOFF_NS / 1_000_000
@@ -7859,11 +8145,7 @@ impl PolymarketTrade {
                             0
                         },
                     );
-                    self.shared
-                        .cancel_reconcile_next_retry_ns
-                        .lock()
-                        .unwrap()
-                        .insert(
+                    self.shared.cancel_reconcile_next_retry_ns.insert(
                         coid.clone(),
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
@@ -7892,7 +8174,7 @@ impl PolymarketTrade {
                         }
                         FetchOrderResult::Unavailable(kind) => {
                             if fetch_unavailable_should_warn(kind) {
-                            warn!(
+                                warn!(
                                 "[PolymarketTrade] Reconcile cancel coid={} orderID={} evidence=unavailable kind={:?} attempt={} pending_delayed={} retry_ms={} — keeping orphan and worst-case reservation",
                                 coid, order_id, kind, attempts, pending_delayed, backoff_ms,
                             );
@@ -7916,11 +8198,7 @@ impl PolymarketTrade {
                     // without changing the semantic order state.
                     let attempts = self.shared.reconcile_attempts.next_cancel(coid);
                     let backoff_ms = cancel_reconcile_backoff_ms(coid, attempts);
-                    self.shared
-                        .cancel_reconcile_next_retry_ns
-                        .lock()
-                        .unwrap()
-                        .insert(
+                    self.shared.cancel_reconcile_next_retry_ns.insert(
                         coid.clone(),
                         now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                     );
@@ -7948,11 +8226,7 @@ impl PolymarketTrade {
                         0
                     },
                 );
-                self.shared
-                    .cancel_reconcile_next_retry_ns
-                    .lock()
-                    .unwrap()
-                    .insert(
+                self.shared.cancel_reconcile_next_retry_ns.insert(
                     coid.clone(),
                     now_ns().saturating_add(backoff_ms.saturating_mul(1_000_000)),
                 );
@@ -7989,7 +8263,7 @@ impl PolymarketTrade {
                         self.shared.remove_order_resolved_as(coid, status);
                     }
                 } else {
-                self.shared.remove_order_as(coid, status);
+                    self.shared.remove_order_as(coid, status);
                 }
                 // Clear the defensive-retry counter on conclusive resolution
                 // so a later unrelated unknown-status arm for the same coid
@@ -8098,7 +8372,13 @@ impl PolymarketTrade {
                         .entry("event_type".to_string())
                         .or_insert(serde_json::Value::String("trade".to_string()));
                 }
-                let parsed = parse_user_event_diagnosed(&record, &self.shared);
+                let parsed = match self.shared.diagnose_private_record_on_owner(record) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        rejection_reasons.push(error);
+                        continue;
+                    }
+                };
                 if let Some(reason) = parsed.rejection_reason {
                     rejection_reasons.push(reason);
                 } else if parsed.valid_business_event && parsed.updates.is_empty() {
@@ -8396,7 +8676,7 @@ impl PolymarketTrade {
                     "DELETE",
                     "/order",
                     body_bytes,
-        );
+                );
                 (Some(rx), Some(timing), Some(attempt))
             }
             None => (None, None, None),
@@ -8524,14 +8804,14 @@ impl PolymarketTrade {
     ) -> std::result::Result<PreparedSubmit, OrderUpdate> {
         let prep_ns = now_ns();
         if legacy_trace {
-        self.shared.register_order_lifecycle(order);
-        self.shared.log_order_lifecycle(
-            &order.client_order_id,
-            "submit_prep",
-            None,
-            Some(OrderStatus::Pending),
-            None,
-        );
+            self.shared.register_order_lifecycle(order);
+            self.shared.log_order_lifecycle(
+                &order.client_order_id,
+                "submit_prep",
+                None,
+                Some(OrderStatus::Pending),
+                None,
+            );
         }
         if !self.shared.check_rate_limit() {
             return Err(Self::make_rejected(order, "rate limited"));
@@ -8552,21 +8832,21 @@ impl PolymarketTrade {
         let local_oid = order_hash;
         let signed_ns = now_ns();
         if legacy_trace {
-        self.shared.log_order_lifecycle(
-            &order.client_order_id,
-            "signed",
-            Some(&local_oid),
-            None,
-            None,
-        );
+            self.shared.log_order_lifecycle(
+                &order.client_order_id,
+                "signed",
+                Some(&local_oid),
+                None,
+                None,
+            );
         }
         let mut body_json = self.shared.take_request_buffer();
         body_json.clear();
         if let Err(e) = serde_json::to_writer((&mut body_json).writer(), &body) {
             self.shared.recycle_request_buffer(body_json);
-                return Err(Self::make_rejected(
-                    order,
-                    &format!("body serialize: {}", e),
+            return Err(Self::make_rejected(
+                order,
+                &format!("body serialize: {}", e),
             ));
         }
         let ownership = match self.record_account_order(order, &local_oid) {
@@ -8578,13 +8858,13 @@ impl PolymarketTrade {
         };
         let account_recorded_ns = now_ns();
         if legacy_trace {
-        self.shared.log_order_lifecycle(
-            &order.client_order_id,
-            "account_recorded",
-            Some(&local_oid),
-            Some(OrderStatus::Pending),
-            None,
-        );
+            self.shared.log_order_lifecycle(
+                &order.client_order_id,
+                "account_recorded",
+                Some(&local_oid),
+                Some(OrderStatus::Pending),
+                None,
+            );
         }
         if let Err(error) = self.shared.register_local_order_id(
             &order.client_order_id,
@@ -8648,51 +8928,109 @@ impl PolymarketTrade {
         legacy_trace: bool,
     ) -> OrderUpdate {
         let update = (|| {
-        let resp = match reply {
-            Ok(r) => r,
-            Err(e) if e.is_submit_unknown_state() => {
-                if matches!(e, HttpErr::Timeout) {
-                    let detail = format!(
-                        "operation=place target={} coid={}",
-                        self.shared.clob_base_url, order.client_order_id,
-                    );
-                    super::network_incident::record(
-                        super::network_incident::NetworkSignal::HttpPlaceTimeout,
-                        &detail,
-                    );
-                }
-                if e.is_http_425() {
-                    self.shared.note_http_425_backoff(&order.client_order_id);
-                }
-                if self.shared.should_warn_unknown_state(&e) {
-                    warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
+            let resp = match reply {
+                Ok(r) => r,
+                Err(e) if e.is_submit_unknown_state() => {
+                    if matches!(e, HttpErr::Timeout) {
+                        let detail = format!(
+                            "operation=place target={} coid={}",
+                            self.shared.clob_base_url, order.client_order_id,
+                        );
+                        super::network_incident::record(
+                            super::network_incident::NetworkSignal::HttpPlaceTimeout,
+                            &detail,
+                        );
+                    }
+                    if e.is_http_425() {
+                        self.shared.note_http_425_backoff(&order.client_order_id);
+                    }
+                    if self.shared.should_warn_unknown_state(&e) {
+                        warn!("[PolymarketTrade] Order unknown state ({}) coid={} oid={} → NewOrderTimeout",
                         e, order.client_order_id, &local_oid[..18.min(local_oid.len())]);
+                    }
+                    if legacy_trace {
+                        self.shared.defer_lifecycle_account_apply(
+                            &order.client_order_id,
+                            OrderStatus::NewOrderTimeout,
+                        );
+                    } else {
+                        self.shared.defer_lifecycle_account_apply(
+                            &order.client_order_id,
+                            OrderStatus::NewOrderTimeout,
+                        );
+                    }
+                    return Self::make_timeout_place(order, Some(local_oid));
                 }
-                if legacy_trace {
-                    self.shared
-                        .account_state
-                        .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
-                } else {
-                    self.shared.defer_lifecycle_account_apply(
-                        &order.client_order_id,
-                        OrderStatus::NewOrderTimeout,
-                    );
-                }
-                return Self::make_timeout_place(order, Some(local_oid));
-            }
-            Err(e) => {
-                let err_s = e.to_string();
-                if SharedState::is_trading_disabled_error(&err_s) {
-                    self.handle_trading_disabled(&err_s);
-                } else if SharedState::is_balance_error(&err_s) {
+                Err(e) => {
+                    let err_s = e.to_string();
+                    if SharedState::is_trading_disabled_error(&err_s) {
+                        self.handle_trading_disabled(&err_s);
+                    } else if SharedState::is_balance_error(&err_s) {
                         self.handle_balance_error(
                             &order.client_order_id,
                             order.side,
                             &order.symbol,
                         );
-                } else if SharedState::is_invalid_token_error(&err_s) {
-                    self.handle_invalid_token(&order.symbol);
+                    } else if SharedState::is_invalid_token_error(&err_s) {
+                        self.handle_invalid_token(&order.symbol);
+                    }
+                    if legacy_trace {
+                        self.shared
+                            .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
+                    } else {
+                        self.shared.defer_lifecycle_account_apply(
+                            &order.client_order_id,
+                            OrderStatus::Rejected,
+                        );
+                    }
+                    if legacy_trace && e.is_definitive_submit_rejection() {
+                        warn!(
+                            "[PolymarketTrade] Order server-rejected: {} coid={} → Rejected",
+                            e, order.client_order_id
+                        );
+                    } else if legacy_trace {
+                        warn!(
+                            "[PolymarketTrade] Local order failure: {} coid={}",
+                            e, order.client_order_id
+                        );
+                    }
+                    return Self::make_rejected(order, &err_s);
                 }
+            };
+
+            let response_parse_started = crate::latency::Instant::now();
+            let parsed_result = parse_placement_response(&resp);
+            crate::latency::record("polymarket.order.response_parse", response_parse_started);
+            let parsed = match parsed_result {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    if legacy_trace {
+                        self.shared.defer_lifecycle_account_apply(
+                            &order.client_order_id,
+                            OrderStatus::NewOrderTimeout,
+                        );
+                        warn!(
+                        "[PolymarketTrade] ambiguous HTTP 2xx placement response coid={} local={} reason={} body={} → NewOrderTimeout",
+                        order.client_order_id,
+                        local_oid,
+                        reason,
+                        resp,
+                    );
+                    } else {
+                        self.shared.defer_lifecycle_account_apply(
+                            &order.client_order_id,
+                            OrderStatus::NewOrderTimeout,
+                        );
+                    }
+                    return Self::make_timeout_place(order, Some(local_oid));
+                }
+            };
+            let success = parsed.success;
+            let order_id = parsed.order_id;
+            let status_str = parsed.status;
+            let error_msg = parsed.error_msg;
+
+            if !success {
                 if legacy_trace {
                     self.shared
                         .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
@@ -8702,88 +9040,32 @@ impl PolymarketTrade {
                         OrderStatus::Rejected,
                     );
                 }
-                if legacy_trace && e.is_definitive_submit_rejection() {
-                        warn!(
-                            "[PolymarketTrade] Order server-rejected: {} coid={} → Rejected",
-                            e, order.client_order_id
-                        );
-                } else if legacy_trace {
-                        warn!(
-                            "[PolymarketTrade] Local order failure: {} coid={}",
-                            e, order.client_order_id
-                        );
+                if SharedState::is_trading_disabled_error(&error_msg) {
+                    self.handle_trading_disabled(&error_msg);
+                } else if SharedState::is_balance_error(&error_msg) {
+                    self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
+                } else if SharedState::is_invalid_token_error(&error_msg) {
+                    self.handle_invalid_token(&order.symbol);
                 }
-                return Self::make_rejected(order, &err_s);
-            }
-        };
-
-        let response_parse_started = crate::latency::Instant::now();
-        let parsed_result = parse_placement_response(&resp);
-        crate::latency::record("polymarket.order.response_parse", response_parse_started);
-        let parsed = match parsed_result {
-            Ok(parsed) => parsed,
-            Err(reason) => {
                 if legacy_trace {
-                    self.shared
-                        .account_state
-                        .mark_order_status(&order.client_order_id, OrderStatus::NewOrderTimeout);
                     warn!(
-                        "[PolymarketTrade] ambiguous HTTP 2xx placement response coid={} local={} reason={} body={} → NewOrderTimeout",
-                        order.client_order_id,
-                        local_oid,
-                        reason,
-                        resp,
-                    );
-                } else {
-                    self.shared.defer_lifecycle_account_apply(
-                        &order.client_order_id,
-                        OrderStatus::NewOrderTimeout,
+                        "[PolymarketTrade] Order rejected by server: {} coid={} → Rejected",
+                        error_msg, order.client_order_id
                     );
                 }
-                return Self::make_timeout_place(order, Some(local_oid));
+                return Self::make_rejected(order, &error_msg);
             }
-        };
-        let success = parsed.success;
-        let order_id = parsed.order_id;
-        let status_str = parsed.status;
-        let error_msg = parsed.error_msg;
-
-        if !success {
-            if legacy_trace {
-                self.shared
-                    .remove_order_as(&order.client_order_id, OrderStatus::Rejected);
-            } else {
-                self.shared.defer_lifecycle_account_apply(
-                    &order.client_order_id,
-                    OrderStatus::Rejected,
-                );
-            }
-            if SharedState::is_trading_disabled_error(&error_msg) {
-                self.handle_trading_disabled(&error_msg);
-            } else if SharedState::is_balance_error(&error_msg) {
-                self.handle_balance_error(&order.client_order_id, order.side, &order.symbol);
-            } else if SharedState::is_invalid_token_error(&error_msg) {
-                self.handle_invalid_token(&order.symbol);
-            }
-            if legacy_trace {
-                warn!(
-                    "[PolymarketTrade] Order rejected by server: {} coid={} → Rejected",
-                    error_msg, order.client_order_id
-                );
-            }
-            return Self::make_rejected(order, &error_msg);
-        }
-        // Accepted by the server → token is registered/tradeable; clear any
-        // invalid-token strikes/backoff for it.
-        self.shared.clear_invalid_token(&order.symbol);
-        let account_apply_started = crate::latency::Instant::now();
+            // Accepted by the server → token is registered/tradeable; clear any
+            // invalid-token strikes/backoff for it.
+            self.shared.clear_invalid_token(&order.symbol);
+            let account_apply_started = crate::latency::Instant::now();
             let effective_ack_status = if legacy_trace {
                 self.shared.mark_order_live(
-            &order.client_order_id,
-            &order.symbol,
-            order.side,
-            &self.instance_id,
-            OrderStatus::Accepted,
+                    &order.client_order_id,
+                    &order.symbol,
+                    order.side,
+                    &self.instance_id,
+                    OrderStatus::Accepted,
                 )
             } else {
                 // Runtime ownership/open-order publication happened before HTTP
@@ -8798,126 +9080,126 @@ impl PolymarketTrade {
                 account_apply_started,
             );
 
-        if !order_id.is_empty() && !Self::oid_eq(&order_id, local_oid) {
-            warn!(
+            if !order_id.is_empty() && !Self::oid_eq(&order_id, local_oid) {
+                warn!(
                 "[PolymarketTrade] orderID MISMATCH coid={} local={} server={} — local hash is wrong!",
                 order.client_order_id, local_oid, order_id,
             );
                 self.shared
                     .register_order_id(&order.client_order_id, &order_id, &order.symbol);
-        }
+            }
 
-        // `mark_order_live` idempotently restores `open_orders` and account
-        // collateral if an out-of-order cancellation arrived first.
+            // `mark_order_live` idempotently restores `open_orders` and account
+            // collateral if an out-of-order cancellation arrived first.
 
-        // Map HTTP `status` → local OrderStatus and book-keeping fields.
-        //
-        // `matched`: the server reports the order matched fully on submit
-        // (no resting). The WS user_feed will deliver the authoritative
-        // fill ~300 ms later carrying the real `trade_id` and price; that
-        // push books the ledger entry. We emit a placeholder `Filled`
-        // *now* with `filled_quantity = 0.0` so:
-        //   - OrderManager removes the order from `self.orders` immediately
-        //     (its Filled branch ignores filled_quantity), eliminating the
-        //     "matched orders can't be canceled" race where the strategy
-        //     emits a Cancel signal off stale OM state in the 300 ms gap.
-        //   - PositionManager's ledger ingestion is gated by
-        //     `filled_quantity > 0.0` (see strategy/polymaker/strategy.rs
-        //     ~ line 4781) so the placeholder does NOT double-count
-        //     volume / cashflow / fees. The real WS push (trade_id present,
-        //     filled_quantity = qty) lands the trade exactly once.
-        // Polymaker treats this zero-quantity terminal as a placement orphan
-        // and immediately performs an order-specific REST lookup. A complete
-        // MATCHED/FILLED audit then moves the residual into its
-        // `UnauditedMatchedOrders` bridge; the POST response itself does not
-        // create a parallel inventory cache.
-        match status_str.as_str() {
-            "matched" => {
-                let trade_ids = resp
-                    .get("tradeIDs")
-                    .and_then(|v| v.as_array())
-                    .map(|ids| ids.len())
-                    .unwrap_or(0);
+            // Map HTTP `status` → local OrderStatus and book-keeping fields.
+            //
+            // `matched`: the server reports the order matched fully on submit
+            // (no resting). The WS user_feed will deliver the authoritative
+            // fill ~300 ms later carrying the real `trade_id` and price; that
+            // push books the ledger entry. We emit a placeholder `Filled`
+            // *now* with `filled_quantity = 0.0` so:
+            //   - OrderManager removes the order from `self.orders` immediately
+            //     (its Filled branch ignores filled_quantity), eliminating the
+            //     "matched orders can't be canceled" race where the strategy
+            //     emits a Cancel signal off stale OM state in the 300 ms gap.
+            //   - PositionManager's ledger ingestion is gated by
+            //     `filled_quantity > 0.0` (see strategy/polymaker/strategy.rs
+            //     ~ line 4781) so the placeholder does NOT double-count
+            //     volume / cashflow / fees. The real WS push (trade_id present,
+            //     filled_quantity = qty) lands the trade exactly once.
+            // Polymaker treats this zero-quantity terminal as a placement orphan
+            // and immediately performs an order-specific REST lookup. A complete
+            // MATCHED/FILLED audit then moves the residual into its
+            // `UnauditedMatchedOrders` bridge; the POST response itself does not
+            // create a parallel inventory cache.
+            match status_str.as_str() {
+                "matched" => {
+                    let trade_ids = resp
+                        .get("tradeIDs")
+                        .and_then(|v| v.as_array())
+                        .map(|ids| ids.len())
+                        .unwrap_or(0);
                     debug!(
                         "[PolymarketTrade] Matched immediately: orderID={} trades={} \
                        (emitting placeholder Filled for immediate order REST audit; \
                        ledger updated via authoritative trade updates)",
                         order_id, trade_ids
                     );
+                }
+                "delayed" => {
+                    debug!("[PolymarketTrade] Deferred execution: orderID={}", order_id);
+                }
+                _ => {}
             }
-            "delayed" => {
-                debug!("[PolymarketTrade] Deferred execution: orderID={}", order_id);
-            }
-            _ => {}
-        }
-        let status = placement_response_status(true, &status_str, effective_ack_status);
-        // The admission-bound path returns this update to the sole-writer
-        // StrategyAccount, which already owns the current lifecycle state.
-        // Reading the cold shared account here can block behind private-trade
-        // persistence for tens of milliseconds. Legacy synchronous callers
-        // still need their effective shared-state quantity.
-        let effective_remaining = if legacy_trace {
-            self.shared
-                .account_state
-                .order(&order.client_order_id)
-                .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
-                .unwrap_or(order.quantity)
-        } else {
-            order.quantity
-        };
-        let (filled_quantity, remaining_quantity) = if status == OrderStatus::Filled {
-            (0.0, 0.0)
-        } else {
-            (0.0, effective_remaining)
-        };
+            let status = placement_response_status(true, &status_str, effective_ack_status);
+            // The admission-bound path returns this update to the sole-writer
+            // StrategyAccount, which already owns the current lifecycle state.
+            // Reading the cold shared account here can block behind private-trade
+            // persistence for tens of milliseconds. Legacy synchronous callers
+            // still need their effective shared-state quantity.
+            let effective_remaining = if legacy_trace {
+                self.shared
+                    .account_state
+                    .order(&order.client_order_id)
+                    .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
+                    .unwrap_or(order.quantity)
+            } else {
+                order.quantity
+            };
+            let (filled_quantity, remaining_quantity) = if status == OrderStatus::Filled {
+                (0.0, 0.0)
+            } else {
+                (0.0, effective_remaining)
+            };
 
             debug!(
                 "[PolymarketTrade] Order accepted: orderID={} status={} coid={}",
                 order_id, status_str, order.client_order_id
             );
 
-        OrderUpdate {
-            client_order_id: order.client_order_id.clone(),
-            exchange: Exchange::Polymarket,
-            symbol: order.symbol.clone(),
-            side: order.side,
+            OrderUpdate {
+                client_order_id: order.client_order_id.clone(),
+                exchange: Exchange::Polymarket,
+                symbol: order.symbol.clone(),
+                side: order.side,
                 exchange_order_id: Some(if order_id.is_empty() {
                     local_oid.to_string()
                 } else {
                     order_id
                 }),
-            status,
-            liquidity: None,
-            filled_quantity,
-            remaining_quantity,
-            // Carry the resting price on an `Accepted` reply so a resurrection
-            // (PositionManager::sync_pending_from_update + OrderManager) can
-            // re-lock / re-track at the right price if a pending/delayed cancel
-            // race already dropped this order. Mirrors the placement-reconcile
-            // "LIVE" arm (which already sets avg_fill_price = price). Harmless
-            // for the normal path: an Accepted has filled_quantity = 0, so the
-            // PM ledger's `filled_quantity > 0` gate ignores it; 0.0 for the
-            // `matched`→Filled placeholder (the WS push books the real price).
-            avg_fill_price: if status == OrderStatus::Accepted {
-                order.price.unwrap_or(0.0)
-            } else {
-                0.0
-            },
-            timestamp_ns: now_ns(),
-            exchange_event_timestamp_ns: None,
-            trade_id: None,
-            order_audit: None,
-            error: None,
-        }
+                status,
+                liquidity: None,
+                filled_quantity,
+                remaining_quantity,
+                // Carry the resting price on an `Accepted` reply so a resurrection
+                // (PositionManager::sync_pending_from_update + OrderManager) can
+                // re-lock / re-track at the right price if a pending/delayed cancel
+                // race already dropped this order. Mirrors the placement-reconcile
+                // "LIVE" arm (which already sets avg_fill_price = price). Harmless
+                // for the normal path: an Accepted has filled_quantity = 0, so the
+                // PM ledger's `filled_quantity > 0` gate ignores it; 0.0 for the
+                // `matched`→Filled placeholder (the WS push books the real price).
+                avg_fill_price: if status == OrderStatus::Accepted {
+                    order.price.unwrap_or(0.0)
+                } else {
+                    0.0
+                },
+                timestamp_ns: now_ns(),
+                exchange_event_timestamp_ns: None,
+                trade_id: None,
+                order_audit: None,
+                error: None,
+            }
         })();
         if legacy_trace {
-        self.shared.log_order_lifecycle(
-            &order.client_order_id,
-            "http_response",
-            update.exchange_order_id.as_deref().or(Some(local_oid)),
-            Some(update.status),
-            None,
-        );
+            self.shared.log_order_lifecycle(
+                &order.client_order_id,
+                "http_response",
+                update.exchange_order_id.as_deref().or(Some(local_oid)),
+                Some(update.status),
+                None,
+            );
         }
         update
     }
@@ -8979,10 +9261,10 @@ impl PolymarketTrade {
             );
         }
         if legacy_trace {
-        self.shared
-            .record_cancel_signal(client_order_id, self.gen_ns_hint);
-        self.shared
-            .log_order_lifecycle(client_order_id, "cancel_prep", None, None, None);
+            self.shared
+                .record_cancel_signal(client_order_id, self.gen_ns_hint);
+            self.shared
+                .log_order_lifecycle(client_order_id, "cancel_prep", None, None, None);
         }
         let execution = self.shared.execution_snapshot();
         let order_id = execution.coid_to_oid.get(client_order_id).cloned();
@@ -9060,124 +9342,122 @@ impl PolymarketTrade {
                 symbol,
                 side,
             } = ctx;
-        let classify_started = crate::latency::Instant::now();
-        // Worst-case default: the order is still live. Only an explicit
-        // terminal response below is allowed to remove tracking.
-        let mut should_remove = false;
-        let mut orphan_status: Option<OrderStatus> = None;
-        let mut ok_status = OrderStatus::Accepted;
+            let classify_started = crate::latency::Instant::now();
+            // Worst-case default: the order is still live. Only an explicit
+            // terminal response below is allowed to remove tracking.
+            let mut should_remove = false;
+            let mut orphan_status: Option<OrderStatus> = None;
+            let mut ok_status = OrderStatus::Accepted;
 
-        if let Some(reply) = reply {
-            let oid_ref = local_oid.as_deref().unwrap_or("");
-            let oid_short = &oid_ref[..16.min(oid_ref.len())];
-            match reply {
-                Ok(resp) => {
-                    let canceled = resp.get("canceled").and_then(|v| v.as_array());
-                    let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
-                    let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
-                    let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
-                    info!(
+            if let Some(reply) = reply {
+                let oid_ref = local_oid.as_deref().unwrap_or("");
+                let oid_short = &oid_ref[..16.min(oid_ref.len())];
+                match reply {
+                    Ok(resp) => {
+                        let canceled = resp.get("canceled").and_then(|v| v.as_array());
+                        let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
+                        let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
+                        let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
+                        info!(
                         "[PolymarketTrade] Cancel result orderID={}... coid={} canceled={} not_canceled={}",
                         oid_short, client_order_id, canceled_n, nc_n,
                     );
-                    let explicitly_canceled = canceled
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|id| id == oid_ref))
-                        .unwrap_or(false);
-                    let matching_reason = not_canceled
-                        .and_then(|nc| nc.get(oid_ref))
-                        .and_then(|reason| reason.as_str());
-                    if let Some(nc) = not_canceled {
-                        for (id, reason) in nc {
-                            let reason_str = reason.as_str().unwrap_or("");
+                        let explicitly_canceled = canceled
+                            .map(|a| a.iter().filter_map(|v| v.as_str()).any(|id| id == oid_ref))
+                            .unwrap_or(false);
+                        let matching_reason = not_canceled
+                            .and_then(|nc| nc.get(oid_ref))
+                            .and_then(|reason| reason.as_str());
+                        if let Some(nc) = not_canceled {
+                            for (id, reason) in nc {
+                                let reason_str = reason.as_str().unwrap_or("");
                                 info!(
                                     "[PolymarketTrade] Cancel rejected: {} reason={} coid={}",
                                     id, reason_str, client_order_id
                                 );
+                            }
                         }
-                    }
-                    if !oid_ref.is_empty() {
-                        // The initial/ordinary cancel establishes the orphan
-                        // but does not consume one of its three reconcile
-                        // DELETE observations.
-                        let outcome = cancel_delete_response_outcome(&resp, oid_ref);
-                        match outcome {
-                            CancelReasonOutcome::Cancelled => {
-                                should_remove = true;
-                                ok_status = OrderStatus::Cancelled;
-                            }
-                            CancelReasonOutcome::Filled => {
-                                should_remove = true;
-                                ok_status = OrderStatus::Filled;
-                            }
-                            CancelReasonOutcome::Uncertain => {
-                                if matching_reason.is_some_and(is_pending_delayed_reason) {
+                        if !oid_ref.is_empty() {
+                            // The initial/ordinary cancel establishes the orphan
+                            // but does not consume one of its three reconcile
+                            // DELETE observations.
+                            let outcome = cancel_delete_response_outcome(&resp, oid_ref);
+                            match outcome {
+                                CancelReasonOutcome::Cancelled => {
+                                    should_remove = true;
+                                    ok_status = OrderStatus::Cancelled;
+                                }
+                                CancelReasonOutcome::Filled => {
+                                    should_remove = true;
+                                    ok_status = OrderStatus::Filled;
+                                }
+                                CancelReasonOutcome::Uncertain => {
+                                    if matching_reason.is_some_and(is_pending_delayed_reason) {
                                         self.shared
                                             .pending_delayed_orphans
-                                            .lock()
-                                            .unwrap()
-                                        .insert(client_order_id.to_string());
-                                }
-                                if explicitly_canceled {
-                                    warn!("[PolymarketTrade] Cancel response contradictory for coid={} orderID={}... (canceled + not_canceled reason={}) → orphan",
+                                            .insert(client_order_id.to_string());
+                                    }
+                                    if explicitly_canceled {
+                                        warn!("[PolymarketTrade] Cancel response contradictory for coid={} orderID={}... (canceled + not_canceled reason={}) → orphan",
                                         client_order_id, oid_short, matching_reason.unwrap_or(""));
-                                } else if let Some(reason) = matching_reason {
-                                    debug!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
+                                    } else if let Some(reason) = matching_reason {
+                                        debug!("[PolymarketTrade] Cancel reply uncertain (reason={}) coid={} → orphan",
                                         reason, client_order_id);
-                                } else {
-                                    warn!("[PolymarketTrade] Cancel response omitted coid={} orderID={}... → orphan",
+                                    } else {
+                                        warn!("[PolymarketTrade] Cancel response omitted coid={} orderID={}... → orphan",
                                         client_order_id, oid_short);
+                                    }
+                                    // Reply received but ambiguous — orphan as
+                                    // CancelUncertain, NOT a transport timeout.
+                                    orphan_status = Some(OrderStatus::CancelUncertain);
                                 }
-                                // Reply received but ambiguous — orphan as
-                                // CancelUncertain, NOT a transport timeout.
-                                orphan_status = Some(OrderStatus::CancelUncertain);
                             }
+                        } else {
+                            // No exchange OID means we cannot reconcile by ID.
+                            // Preserve the local Active state so the normal refresh
+                            // path can retry once the mapping appears.
                         }
-                    } else {
-                        // No exchange OID means we cannot reconcile by ID.
-                        // Preserve the local Active state so the normal refresh
-                        // path can retry once the mapping appears.
                     }
-                }
-                Err(e) if e.is_unknown_state() => {
-                    if matches!(e, HttpErr::Timeout) {
-                        let detail = format!(
-                            "operation=cancel target={} coid={}",
-                            self.shared.clob_base_url, client_order_id,
-                        );
-                        super::network_incident::record(
-                            super::network_incident::NetworkSignal::HttpCancelTimeout,
-                            &detail,
-                        );
-                    }
-                    // 425 falls through here too (per `is_unknown_state`); the
-                    // dedup helper suppresses repeats of 425 storms within 5
-                    // min. Timeouts / 5xx always WARN.
-                    if self.shared.should_warn_unknown_state(&e) {
-                        warn!("[PolymarketTrade] Cancel unknown state ({}) coid={} orderID={}... → CancelOrderTimeout",
+                    Err(e) if e.is_unknown_state() => {
+                        if matches!(e, HttpErr::Timeout) {
+                            let detail = format!(
+                                "operation=cancel target={} coid={}",
+                                self.shared.clob_base_url, client_order_id,
+                            );
+                            super::network_incident::record(
+                                super::network_incident::NetworkSignal::HttpCancelTimeout,
+                                &detail,
+                            );
+                        }
+                        // 425 falls through here too (per `is_unknown_state`); the
+                        // dedup helper suppresses repeats of 425 storms within 5
+                        // min. Timeouts / 5xx always WARN.
+                        if self.shared.should_warn_unknown_state(&e) {
+                            warn!("[PolymarketTrade] Cancel unknown state ({}) coid={} orderID={}... → CancelOrderTimeout",
                             e, client_order_id, oid_short);
+                        }
+                        // HTTP 425 backs off reconciliation for this orphan only.
+                        // The order still becomes an orphan (we cannot know if the
+                        // cancel landed), while unrelated audits keep running.
+                        if matches!(e, HttpErr::Status(425, _)) {
+                            self.shared.note_http_425_backoff(client_order_id);
+                        }
+                        should_remove = false;
+                        orphan_status = Some(OrderStatus::CancelOrderTimeout);
                     }
-                    // HTTP 425 backs off reconciliation for this orphan only.
-                    // The order still becomes an orphan (we cannot know if the
-                    // cancel landed), while unrelated audits keep running.
-                    if matches!(e, HttpErr::Status(425, _)) {
-                        self.shared.note_http_425_backoff(client_order_id);
-                    }
-                    should_remove = false;
-                    orphan_status = Some(OrderStatus::CancelOrderTimeout);
-                }
-                Err(e) => {
-                    // Genuine 4xx rejection (post-425-routing): no dedup —
-                    // these are per-request anomalies the operator should see.
-                    warn!("[PolymarketTrade] Cancel HTTP error, will retry: {} coid={} orderID={}...",
+                    Err(e) => {
+                        // Genuine 4xx rejection (post-425-routing): no dedup —
+                        // these are per-request anomalies the operator should see.
+                        warn!("[PolymarketTrade] Cancel HTTP error, will retry: {} coid={} orderID={}...",
                         e, client_order_id, oid_short);
-                    should_remove = false;
+                        should_remove = false;
+                    }
                 }
             }
-        }
-        crate::latency::record("polymarket.cancel.response_classify", classify_started);
+            crate::latency::record("polymarket.cancel.response_classify", classify_started);
 
-        if let Some(status) = orphan_status {
-            let account_apply_started = crate::latency::Instant::now();
+            if let Some(status) = orphan_status {
+                let account_apply_started = crate::latency::Instant::now();
                 let effective = if legacy_trace {
                     self.shared
                         .effective_cancel_attempt_status(client_order_id, status)
@@ -9188,21 +9468,21 @@ impl PolymarketTrade {
                 };
                 let update =
                     Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, effective);
-            crate::latency::record(
-                "polymarket.cancel.response_account_apply",
-                account_apply_started,
-            );
-            return update;
-        }
-        let account_apply_started = crate::latency::Instant::now();
-        if should_remove {
+                crate::latency::record(
+                    "polymarket.cancel.response_account_apply",
+                    account_apply_started,
+                );
+                return update;
+            }
+            let account_apply_started = crate::latency::Instant::now();
+            if should_remove {
                 if !legacy_trace && ok_status == OrderStatus::Cancelled {
                     self.shared.remove_cancelled_order_runtime(client_order_id);
                     self.shared
                         .defer_lifecycle_account_apply(client_order_id, ok_status);
                 } else {
-            self.shared.remove_order_as(client_order_id, ok_status);
-        }
+                    self.shared.remove_order_as(client_order_id, ok_status);
+                }
             }
             let status = if should_remove {
                 ok_status
@@ -9216,37 +9496,37 @@ impl PolymarketTrade {
                 status
             };
 
-        let update = OrderUpdate {
-            client_order_id: client_order_id.to_string(),
-            exchange,
-            symbol,
-            side,
-            exchange_order_id: local_oid,
-            status,
-            liquidity: None,
-            filled_quantity: 0.0,
-            remaining_quantity: 0.0,
-            avg_fill_price: 0.0,
-            timestamp_ns: now_ns(),
-            exchange_event_timestamp_ns: None,
-            trade_id: None,
-            order_audit: None,
-            error: None,
-        };
-        crate::latency::record(
-            "polymarket.cancel.response_account_apply",
-            account_apply_started,
-        );
-        update
+            let update = OrderUpdate {
+                client_order_id: client_order_id.to_string(),
+                exchange,
+                symbol,
+                side,
+                exchange_order_id: local_oid,
+                status,
+                liquidity: None,
+                filled_quantity: 0.0,
+                remaining_quantity: 0.0,
+                avg_fill_price: 0.0,
+                timestamp_ns: now_ns(),
+                exchange_event_timestamp_ns: None,
+                trade_id: None,
+                order_audit: None,
+                error: None,
+            };
+            crate::latency::record(
+                "polymarket.cancel.response_account_apply",
+                account_apply_started,
+            );
+            update
         })();
         if legacy_trace {
-        self.shared.log_order_lifecycle(
-            client_order_id,
-            "cancel_response",
-            update.exchange_order_id.as_deref(),
-            Some(update.status),
-            None,
-        );
+            self.shared.log_order_lifecycle(
+                client_order_id,
+                "cancel_response",
+                update.exchange_order_id.as_deref(),
+                Some(update.status),
+                None,
+            );
         }
         update
     }
@@ -9376,12 +9656,12 @@ impl ExchangeTrade for PolymarketTrade {
             let status = response
                 .as_ref()
                 .map(|resp| {
-                // Ordinary cancel-all responses do not advance the bounded
-                // reconcile DELETE counter.
-                match cancel_delete_response_outcome(resp, order_id) {
-                    CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
-                    CancelReasonOutcome::Filled => OrderStatus::Filled,
-                    CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
+                    // Ordinary cancel-all responses do not advance the bounded
+                    // reconcile DELETE counter.
+                    match cancel_delete_response_outcome(resp, order_id) {
+                        CancelReasonOutcome::Cancelled => OrderStatus::Cancelled,
+                        CancelReasonOutcome::Filled => OrderStatus::Filled,
+                        CancelReasonOutcome::Uncertain => OrderStatus::CancelUncertain,
                     }
                 })
                 .unwrap_or(fallback_status);
@@ -9398,11 +9678,7 @@ impl ExchangeTrade for PolymarketTrade {
                     .and_then(|v| v.as_str())
                 {
                     if is_pending_delayed_reason(reason) {
-                        self.shared
-                            .pending_delayed_orphans
-                            .lock()
-                            .unwrap()
-                            .insert(coid.clone());
+                        self.shared.pending_delayed_orphans.insert(coid.clone());
                     }
                 }
             }
@@ -9514,15 +9790,15 @@ impl ExchangeTrade for PolymarketTrade {
                         let ownership = match self.record_account_order(o, &order_hash) {
                             Ok(ownership) => ownership,
                             Err(rejected) => {
-                            self.shared.log_preflight_rejected(
-                                &o.client_order_id,
-                                Some(&order_hash),
-                                &rejected,
-                            );
-                            self.shared.forget_order_lifecycle(&o.client_order_id);
-                            all_updates.push(rejected);
-                            continue;
-                        }
+                                self.shared.log_preflight_rejected(
+                                    &o.client_order_id,
+                                    Some(&order_hash),
+                                    &rejected,
+                                );
+                                self.shared.forget_order_lifecycle(&o.client_order_id);
+                                all_updates.push(rejected);
+                                continue;
+                            }
                         };
                         self.shared.log_order_lifecycle(
                             &o.client_order_id,
@@ -9638,7 +9914,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let order = &chunk[body_to_chunk[i]];
                         let local_oid = &signed_hashes[i];
                         let Some(r) = responses.get(i) else {
-                            self.shared.account_state.mark_order_status(
+                            self.shared.defer_lifecycle_account_apply(
                                 &order.client_order_id,
                                 OrderStatus::NewOrderTimeout,
                             );
@@ -9652,7 +9928,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let parsed = match parse_placement_response(r) {
                             Ok(parsed) => parsed,
                             Err(reason) => {
-                                self.shared.account_state.mark_order_status(
+                                self.shared.defer_lifecycle_account_apply(
                                     &order.client_order_id,
                                     OrderStatus::NewOrderTimeout,
                                 );
@@ -9670,7 +9946,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let error_msg = parsed.error_msg;
 
                         if success && order_id.is_empty() {
-                            self.shared.account_state.mark_order_status(
+                            self.shared.defer_lifecycle_account_apply(
                                 &order.client_order_id,
                                 OrderStatus::NewOrderTimeout,
                             );
@@ -9716,10 +9992,10 @@ impl ExchangeTrade for PolymarketTrade {
                                 self.handle_trading_disabled(&error_msg);
                             } else if SharedState::is_balance_error(&error_msg) {
                                 self.handle_balance_error(
-                                &order.client_order_id,
+                                    &order.client_order_id,
                                     order.side,
                                     &order.symbol,
-                            );
+                                );
                             }
                             warn!(
                                 "[PolymarketTrade] Submit rejected: coid={} err=\"{}\" status={}",
@@ -9729,12 +10005,11 @@ impl ExchangeTrade for PolymarketTrade {
 
                         let response_status =
                             placement_response_status(success, &status_str, effective_ack_status);
-                        let effective_remaining = self
-                            .shared
-                            .account_state
-                            .order(&order.client_order_id)
-                            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
-                            .unwrap_or(order.quantity);
+                        // Private fills are delivered on the lossless owner
+                        // lane and remain authoritative over this weaker HTTP
+                        // acknowledgement. Do not enter SharedAccount's live
+                        // lifecycle shard merely to decorate the ACK.
+                        let effective_remaining = order.quantity;
                         all_updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -9802,7 +10077,7 @@ impl ExchangeTrade for PolymarketTrade {
                         if is_http_425 {
                             self.shared.note_http_425_backoff(&order.client_order_id);
                         }
-                        self.shared.account_state.mark_order_status(
+                        self.shared.defer_lifecycle_account_apply(
                             &order.client_order_id,
                             OrderStatus::NewOrderTimeout,
                         );
@@ -9977,12 +10252,12 @@ impl ExchangeTrade for PolymarketTrade {
                     let not_canceled_coids: Vec<String> = not_canceled
                         .map(|m| {
                             m.keys()
-                            .map(|oid| {
-                                oid_to_coid
-                                    .get(&normalize_order_id(oid))
-                                    .cloned()
-                                    .unwrap_or_default()
-                            })
+                                .map(|oid| {
+                                    oid_to_coid
+                                        .get(&normalize_order_id(oid))
+                                        .cloned()
+                                        .unwrap_or_default()
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -10013,11 +10288,7 @@ impl ExchangeTrade for PolymarketTrade {
                                 if s == OrderStatus::CancelUncertain
                                     && is_pending_delayed_reason(reason_str)
                                 {
-                                    self.shared
-                                        .pending_delayed_orphans
-                                        .lock()
-                                        .unwrap()
-                                        .insert(coid.clone());
+                                    self.shared.pending_delayed_orphans.insert(coid.clone());
                                 }
                                 per_coid_outcome.insert(coid, s);
                             }
@@ -10374,15 +10645,15 @@ impl ExchangeTrade for PolymarketTrade {
                     let ownership = match self.record_account_order(o, &order_hash) {
                         Ok(ownership) => ownership,
                         Err(rejected) => {
-                        self.shared.log_preflight_rejected(
-                            &o.client_order_id,
-                            Some(&order_hash),
-                            &rejected,
-                        );
-                        self.shared.forget_order_lifecycle(&o.client_order_id);
-                        place_sign_failures.push(rejected);
-                        continue;
-                    }
+                            self.shared.log_preflight_rejected(
+                                &o.client_order_id,
+                                Some(&order_hash),
+                                &rejected,
+                            );
+                            self.shared.forget_order_lifecycle(&o.client_order_id);
+                            place_sign_failures.push(rejected);
+                            continue;
+                        }
                     };
                     self.shared.log_order_lifecycle(
                         &o.client_order_id,
@@ -10419,10 +10690,8 @@ impl ExchangeTrade for PolymarketTrade {
                         },
                     ) {
                         let rejected = Self::make_rejected(o, &error);
-                        self.shared.remove_order_resolved_as(
-                            &o.client_order_id,
-                            OrderStatus::Rejected,
-                        );
+                        self.shared
+                            .remove_order_resolved_as(&o.client_order_id, OrderStatus::Rejected);
                         self.shared.log_preflight_rejected(
                             &o.client_order_id,
                             Some(&order_hash),
@@ -10534,150 +10803,148 @@ impl ExchangeTrade for PolymarketTrade {
         // "matched" reason is mapped to Filled, see `cancel_not_canceled_outcome`).
         let cancel_outcome: Option<(OrderStatus, std::collections::HashMap<String, OrderStatus>)> =
             match cancel_rx {
-            None if !cancel_client_order_ids.is_empty() => {
-                info!(
+                None if !cancel_client_order_ids.is_empty() => {
+                    info!(
                     "[PolymarketTrade] Cancel request: 0 orders ({} unmapped coids={:?}) → keep live for retry",
                     unmapped_coids.len(), unmapped_coids,
                 );
-                Some((OrderStatus::Accepted, std::collections::HashMap::new()))
-            }
-            None => None,
-            Some(rx) => {
-                // Classify the response so we can emit the right OrderStatus for
-                // each coid:
-                //   - Ok                     → per-order authoritative result;
-                //                              omitted/ambiguous → orphan
-                //   - Err::is_unknown_state  → CancelOrderTimeout (timeout or
-                //                              HTTP 5xx — server state unknown,
-                //                              orphan reconciler will verify)
-                //   - Err (other / 4xx)      → Accepted/live (the cancel was
-                //                              rejected; keep collateral and
-                //                              retry through normal refresh)
-                // Build a per-coid outcome map; on Ok responses use
-                // `canceled`/`not_canceled` to distinguish plain cancels
-                // from fills that raced ahead of our cancel. On errors
-                // every coid gets the fallback outcome.
+                    Some((OrderStatus::Accepted, std::collections::HashMap::new()))
+                }
+                None => None,
+                Some(rx) => {
+                    // Classify the response so we can emit the right OrderStatus for
+                    // each coid:
+                    //   - Ok                     → per-order authoritative result;
+                    //                              omitted/ambiguous → orphan
+                    //   - Err::is_unknown_state  → CancelOrderTimeout (timeout or
+                    //                              HTTP 5xx — server state unknown,
+                    //                              orphan reconciler will verify)
+                    //   - Err (other / 4xx)      → Accepted/live (the cancel was
+                    //                              rejected; keep collateral and
+                    //                              retry through normal refresh)
+                    // Build a per-coid outcome map; on Ok responses use
+                    // `canceled`/`not_canceled` to distinguish plain cancels
+                    // from fills that raced ahead of our cancel. On errors
+                    // every coid gets the fallback outcome.
                     let mut per_coid_outcome: std::collections::HashMap<String, OrderStatus> =
                         std::collections::HashMap::new();
                     let fallback = match rx
                         .recv()
                         .unwrap_or_else(|_| Err(HttpErr::Transport("reply dropped".into())))
                     {
-                    Ok(resp) => {
-                        // Both /order and /orders return { canceled: [...], not_canceled: {...} }.
-                        let oid_to_coid = self.shared.execution_snapshot().oid_to_coid.clone();
+                        Ok(resp) => {
+                            // Both /order and /orders return { canceled: [...], not_canceled: {...} }.
+                            let oid_to_coid = self.shared.execution_snapshot().oid_to_coid.clone();
                             let canceled_oids: Vec<String> = resp
                                 .get("canceled")
-                            .and_then(|v| v.as_array())
+                                .and_then(|v| v.as_array())
                                 .map(|a| {
                                     a.iter()
                                         .filter_map(|v| v.as_str().map(String::from))
                                         .collect()
                                 })
-                            .unwrap_or_default();
-                        let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
-                        for oid in &canceled_oids {
-                            if let Some(coid) = oid_to_coid.get(&normalize_order_id(oid)) {
-                                per_coid_outcome.insert(coid.clone(), OrderStatus::Cancelled);
+                                .unwrap_or_default();
+                            let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
+                            for oid in &canceled_oids {
+                                if let Some(coid) = oid_to_coid.get(&normalize_order_id(oid)) {
+                                    per_coid_outcome.insert(coid.clone(), OrderStatus::Cancelled);
+                                }
                             }
-                        }
                             let canceled_coids: Vec<String> = canceled_oids
                                 .iter()
-                            .map(|oid| {
-                                oid_to_coid
-                                    .get(&normalize_order_id(oid))
-                                    .cloned()
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        let not_canceled_coids: Vec<String> = not_canceled
-                                .map(|m| {
-                                    m.keys()
                                 .map(|oid| {
                                     oid_to_coid
                                         .get(&normalize_order_id(oid))
                                         .cloned()
                                         .unwrap_or_default()
                                 })
+                                .collect();
+                            let not_canceled_coids: Vec<String> = not_canceled
+                                .map(|m| {
+                                    m.keys()
+                                        .map(|oid| {
+                                            oid_to_coid
+                                                .get(&normalize_order_id(oid))
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        })
                                         .collect()
                                 })
-                            .unwrap_or_default();
-                        info!(
-                            "[PolymarketTrade] Cancel result: canceled={:?} not_canceled={:?}",
-                            canceled_coids, not_canceled_coids,
-                        );
-                        if let Some(nc) = not_canceled {
-                            for (id, reason) in nc {
-                                let coid = oid_to_coid
-                                    .get(&normalize_order_id(id))
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let reason_str = reason.as_str().unwrap_or("");
-                                info!(
+                                .unwrap_or_default();
+                            info!(
+                                "[PolymarketTrade] Cancel result: canceled={:?} not_canceled={:?}",
+                                canceled_coids, not_canceled_coids,
+                            );
+                            if let Some(nc) = not_canceled {
+                                for (id, reason) in nc {
+                                    let coid = oid_to_coid
+                                        .get(&normalize_order_id(id))
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let reason_str = reason.as_str().unwrap_or("");
+                                    info!(
                                     "[PolymarketTrade] Cancel rejected: orderID={} reason={} coid={}",
                                     id, reason_str, coid,
                                 );
-                                if !coid.is_empty() {
-                                    // This is the initial/ordinary cancel
-                                    // path; it must not advance reconcile
-                                    // DELETE observations.
-                                    let outcome = cancel_not_canceled_outcome(reason_str);
-                                    let s = match outcome {
+                                    if !coid.is_empty() {
+                                        // This is the initial/ordinary cancel
+                                        // path; it must not advance reconcile
+                                        // DELETE observations.
+                                        let outcome = cancel_not_canceled_outcome(reason_str);
+                                        let s = match outcome {
                                             CancelReasonOutcome::Cancelled => {
                                                 OrderStatus::Cancelled
                                             }
-                                        CancelReasonOutcome::Filled => OrderStatus::Filled,
+                                            CancelReasonOutcome::Filled => OrderStatus::Filled,
                                             CancelReasonOutcome::Uncertain => {
                                                 OrderStatus::CancelUncertain
                                             }
-                                    };
-                                    if s == OrderStatus::CancelUncertain
-                                        && is_pending_delayed_reason(reason_str)
-                                    {
+                                        };
+                                        if s == OrderStatus::CancelUncertain
+                                            && is_pending_delayed_reason(reason_str)
+                                        {
                                             self.shared
                                                 .pending_delayed_orphans
-                                                .lock()
-                                                .unwrap()
                                                 .insert(coid.clone());
+                                        }
+                                        per_coid_outcome.insert(coid, s);
                                     }
-                                    per_coid_outcome.insert(coid, s);
                                 }
                             }
+                            // Healthy reply; unresolved orders are ambiguous.
+                            OrderStatus::CancelUncertain
                         }
-                        // Healthy reply; unresolved orders are ambiguous.
-                        OrderStatus::CancelUncertain
-                    }
-                    Err(e) if e.is_unknown_state() => {
-                        if matches!(e, HttpErr::Timeout) {
-                            let detail = format!(
-                                "operation=cancel_replace_cancel target={} orders={}",
-                                self.shared.clob_base_url,
-                                cancel_client_order_ids.len(),
-                            );
-                            super::network_incident::record(
-                                super::network_incident::NetworkSignal::HttpCancelTimeout,
-                                &detail,
-                            );
-                        }
-                        if self.shared.should_warn_unknown_state(&e) {
-                            warn!(
+                        Err(e) if e.is_unknown_state() => {
+                            if matches!(e, HttpErr::Timeout) {
+                                let detail = format!(
+                                    "operation=cancel_replace_cancel target={} orders={}",
+                                    self.shared.clob_base_url,
+                                    cancel_client_order_ids.len(),
+                                );
+                                super::network_incident::record(
+                                    super::network_incident::NetworkSignal::HttpCancelTimeout,
+                                    &detail,
+                                );
+                            }
+                            if self.shared.should_warn_unknown_state(&e) {
+                                warn!(
                                 "[PolymarketTrade] Cancel unknown state ({}) coids={:?} → CancelOrderTimeout",
                                 e, cancel_client_order_ids,
                             );
+                            }
+                            OrderStatus::CancelOrderTimeout
                         }
-                        OrderStatus::CancelOrderTimeout
-                    }
-                    Err(e) => {
+                        Err(e) => {
                             warn!(
                                 "[PolymarketTrade] Cancel HTTP error: {} coids={:?}",
                                 e, cancel_client_order_ids
                             );
-                        OrderStatus::Accepted
-                    }
-                };
-                Some((fallback, per_coid_outcome))
-            }
-        };
+                            OrderStatus::Accepted
+                        }
+                    };
+                    Some((fallback, per_coid_outcome))
+                }
+            };
         if let Some((fallback_outcome, per_coid_outcome)) = cancel_outcome {
             for coid in cancel_client_order_ids {
                 let execution = self.shared.execution_snapshot();
@@ -10754,7 +11021,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let order = &place_chunk[place_body_to_chunk[i]];
                         let local_oid = &place_signed[i];
                         let Some(r) = responses.get(i) else {
-                            self.shared.account_state.mark_order_status(
+                            self.shared.defer_lifecycle_account_apply(
                                 &order.client_order_id,
                                 OrderStatus::NewOrderTimeout,
                             );
@@ -10768,7 +11035,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let parsed = match parse_placement_response(r) {
                             Ok(parsed) => parsed,
                             Err(reason) => {
-                                self.shared.account_state.mark_order_status(
+                                self.shared.defer_lifecycle_account_apply(
                                     &order.client_order_id,
                                     OrderStatus::NewOrderTimeout,
                                 );
@@ -10785,7 +11052,7 @@ impl ExchangeTrade for PolymarketTrade {
                         let status_str = parsed.status;
                         let error_msg = parsed.error_msg;
                         if success && order_id.is_empty() {
-                            self.shared.account_state.mark_order_status(
+                            self.shared.defer_lifecycle_account_apply(
                                 &order.client_order_id,
                                 OrderStatus::NewOrderTimeout,
                             );
@@ -10893,12 +11160,7 @@ impl ExchangeTrade for PolymarketTrade {
                         } else {
                             None
                         };
-                        let effective_remaining = self
-                            .shared
-                            .account_state
-                            .order(&order.client_order_id)
-                            .map(|owned| (owned.quantity - owned.filled_quantity).max(0.0))
-                            .unwrap_or(order.quantity);
+                        let effective_remaining = order.quantity;
                         updates.push(OrderUpdate {
                             client_order_id: order.client_order_id.clone(),
                             exchange: Exchange::Polymarket,
@@ -10959,7 +11221,7 @@ impl ExchangeTrade for PolymarketTrade {
                         if is_http_425 {
                             self.shared.note_http_425_backoff(&order.client_order_id);
                         }
-                        self.shared.account_state.mark_order_status(
+                        self.shared.defer_lifecycle_account_apply(
                             &order.client_order_id,
                             OrderStatus::NewOrderTimeout,
                         );
@@ -11123,10 +11385,8 @@ mod tests {
         drain_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("account owner pre-measurement barrier stalled");
-        let pre_measurement_drain_ns = drain_started
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let pre_measurement_drain_ns =
+            drain_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(EVENTS);
         let mut queue_peak = 0usize;
@@ -11226,8 +11486,7 @@ mod tests {
         let snapshot = shared.execution_snapshot();
         assert_eq!(snapshot.open_orders.len(), EVENTS);
         assert_eq!(
-            snapshot.open_orders["benchmark-127"].symbol,
-            "token-127",
+            snapshot.open_orders["benchmark-127"].symbol, "token-127",
             "FIFO application must publish the final command",
         );
         let p50 = percentile(1, 2);
@@ -11479,7 +11738,10 @@ mod tests {
         assert!(!replica.post_only);
         assert!(replica.reduce_only);
         assert_eq!(replica.fee_rate_bps, 125);
-        assert_eq!(replica.trigger_source, QuoteTriggerSource::OrderBook(Exchange::Polymarket));
+        assert_eq!(
+            replica.trigger_source,
+            QuoteTriggerSource::OrderBook(Exchange::Polymarket)
+        );
         assert_eq!(replica.trigger_exchange_ns, 101);
         assert_eq!(replica.trigger_local_ns, 202);
     }
@@ -12554,11 +12816,11 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            instance_owned_open_coids(&open, "a"),
+            instance_owned_open_coids(open.iter(), "a"),
             vec!["a-1".to_string(), "a-2".to_string()],
         );
         assert_eq!(
-            instance_owned_open_coids(&open, "b"),
+            instance_owned_open_coids(open.iter(), "b"),
             vec!["b-1".to_string()],
         );
     }

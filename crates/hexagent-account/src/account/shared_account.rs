@@ -224,13 +224,22 @@ impl Drop for HeldLockMetric<'_> {
 /// route entries themselves are rebuilt from the durable lifecycle ledger.
 #[derive(Debug)]
 struct ShardedRouteMap {
-    shards: Box<[RwLock<HashMap<String, String>>]>,
+    shards: Box<[RouteShard]>,
+}
+
+#[derive(Debug)]
+struct RouteShard {
+    /// Readers consume an immutable ownership snapshot. Route mutation uses
+    /// ArcSwap RCU, so neither readers nor account-owner writes take a lock.
+    published: ArcSwap<HashMap<String, String>>,
 }
 
 impl ShardedRouteMap {
     fn new() -> Self {
         let shards = (0..ROUTE_SHARD_COUNT)
-            .map(|_| RwLock::new(HashMap::new()))
+            .map(|_| RouteShard {
+                published: ArcSwap::from_pointee(HashMap::new()),
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self { shards }
@@ -244,53 +253,89 @@ impl ShardedRouteMap {
 
     fn get(&self, key: &str) -> Option<String> {
         self.shards[Self::shard_index(key)]
-            .read()
-            .unwrap()
+            .published
+            .load()
             .get(key)
             .cloned()
     }
 
     fn try_get(&self, key: &str) -> Result<Option<String>, ()> {
-        self.shards[Self::shard_index(key)]
-            .try_read()
-            .map(|shard| shard.get(key).cloned())
-            .map_err(|_| ())
-    }
-
-    fn write_shard(&self, key: &str) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
-        self.shards[Self::shard_index(key)].write().unwrap()
+        Ok(self.get(key))
     }
 
     fn insert(&self, key: String, owner: String) {
-        self.write_shard(&key).insert(key, owner);
+        let shard = &self.shards[Self::shard_index(&key)];
+        shard.published.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(key.clone(), owner.clone());
+            Arc::new(next)
+        });
     }
 
     fn remove(&self, key: &str) -> Option<String> {
-        self.write_shard(key).remove(key)
+        let shard = &self.shards[Self::shard_index(key)];
+        let previous = shard.published.load().get(key).cloned();
+        if previous.is_some() {
+            shard.published.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(key);
+                Arc::new(next)
+            });
+        }
+        previous
+    }
+
+    /// Atomically claims a route on the account-owner private lane.
+    fn insert_if_vacant_or_same(&self, key: &str, owner: &str) -> bool {
+        let shard = &self.shards[Self::shard_index(key)];
+        if shard
+            .published
+            .load()
+            .get(key)
+            .is_some_and(|current| current != owner)
+        {
+            return false;
+        }
+        shard.published.rcu(|current| {
+            if current.contains_key(key) {
+                Arc::clone(current)
+            } else {
+                let mut next = (**current).clone();
+                next.insert(key.to_string(), owner.to_string());
+                Arc::new(next)
+            }
+        });
+        shard
+            .published
+            .load()
+            .get(key)
+            .is_some_and(|current| current == owner)
     }
 
     fn retain_owner_keys(&self, owner: &str, desired: &HashSet<String>) {
         for shard in &self.shards {
-            shard
-                .write()
-                .unwrap()
-                .retain(|key, route_owner| route_owner != owner || desired.contains(key));
+            shard.published.rcu(|current| {
+                let mut next = (**current).clone();
+                next.retain(|key, route_owner| route_owner != owner || desired.contains(key));
+                Arc::new(next)
+            });
         }
     }
 
     fn retain_owners(&self, owners: &HashSet<String>) {
         for shard in &self.shards {
-            shard
-                .write()
-                .unwrap()
-                .retain(|_, route_owner| owners.contains(route_owner));
+            shard.published.rcu(|current| {
+                let mut next = (**current).clone();
+                next.retain(|_, route_owner| owners.contains(route_owner));
+                Arc::new(next)
+            });
         }
     }
 
     fn keys(&self) -> Vec<String> {
         self.shards
             .iter()
-            .flat_map(|shard| shard.read().unwrap().keys().cloned().collect::<Vec<_>>())
+            .flat_map(|shard| shard.published.load().keys().cloned().collect::<Vec<_>>())
             .collect()
     }
 }
@@ -1169,6 +1214,10 @@ struct VirtualAccount {
     /// concurrent cold publisher can preserve both unrelated control changes
     /// and the just-applied fill without taking `control_gate` on the feed.
     trade_epoch: AtomicU64,
+    /// Lock-free monitoring mirrors. The mutable sets remain owner-local;
+    /// cross-thread telemetry consumes only these published counts.
+    recovery_pending_count: AtomicUsize,
+    routine_cancel_audit_count: AtomicUsize,
 }
 
 impl VirtualAccount {
@@ -1214,7 +1263,16 @@ impl VirtualAccount {
             reservation_publish: Mutex::new(()),
             reservation_epoch: AtomicU64::new(0),
             trade_epoch: AtomicU64::new(0),
+            recovery_pending_count: AtomicUsize::new(0),
+            routine_cancel_audit_count: AtomicUsize::new(0),
         }
+    }
+
+    fn publish_lifecycle_counts(&self, lifecycle: &VirtualLifecycle) {
+        self.recovery_pending_count
+            .store(lifecycle.recovery_pending_orders.len(), Ordering::Release);
+        self.routine_cancel_audit_count
+            .store(lifecycle.routine_cancel_audits.len(), Ordering::Release);
     }
 
     fn position(&self, token: &str) -> Arc<VirtualPositionQuota> {
@@ -3719,7 +3777,11 @@ fn repair_retired_trade_replays_from_wal(
                 "{}@{}{}",
                 item.trade_key,
                 item.resurrection_generation,
-                if item.re_compacted { "/recompacted" } else { "/live" },
+                if item.re_compacted {
+                    "/recompacted"
+                } else {
+                    "/live"
+                },
             )
         })
         .collect();
@@ -4014,7 +4076,7 @@ pub struct SharedAccount {
     retired_trade_routes: ShardedRouteMap,
     /// Only anomalous trade ids are present. Exact replays for those ids take
     /// the cold audit path until a verified replay clears the durable anomaly.
-    anomalous_trade_keys: RwLock<HashSet<String>>,
+    anomalous_trade_keys: ArcSwap<HashSet<String>>,
     /// Exact private-event anomaly keys mirrored from the durable account.
     /// Successful ordinary events can skip the account-wide reconciliation
     /// lock unless their own key is known to need repair.
@@ -4091,10 +4153,8 @@ pub struct SharedAccount {
     /// through one bounded route and executed by that instance's strategy
     /// thread. Completion certificates return on one account-scoped lane.
     settled_gc_owner_routes: RwLock<BTreeMap<String, SettledGcOwnerRoute>>,
-    settled_gc_completion_tx:
-        crossbeam_channel::Sender<SettledGcCompletionCertificate>,
-    settled_gc_completion_rx:
-        crossbeam_channel::Receiver<SettledGcCompletionCertificate>,
+    settled_gc_completion_tx: crossbeam_channel::Sender<SettledGcCompletionCertificate>,
+    settled_gc_completion_rx: crossbeam_channel::Receiver<SettledGcCompletionCertificate>,
     settled_gc_coordinator: Mutex<SettledGcCoordinator>,
     settled_gc_activity_generation: AtomicU64,
     settled_gc_request_queue_high_water: AtomicUsize,
@@ -4225,32 +4285,29 @@ impl SharedAccount {
     }
 
     fn must_dispatch_to_account_owner(&self) -> bool {
-        self.account_owner_lane_bound.load(Ordering::Acquire)
-            && !self.is_account_owner_thread()
+        self.account_owner_lane_bound.load(Ordering::Acquire) && !self.is_account_owner_thread()
     }
 
     /// Enqueue non-blocking cold account work. This API is intentionally
     /// fail-closed on an unbound or full lane; callers choose their own retry
     /// and admission behavior instead of silently mutating off-owner.
-    pub fn try_submit_account_owner_task(
-        &self,
-        task: AccountOwnerTask,
-    ) -> Result<(), String> {
+    pub fn try_submit_account_owner_task(&self, task: AccountOwnerTask) -> Result<(), String> {
         if self.is_account_owner_thread() {
             task(self);
             return Ok(());
         }
         if !self.account_owner_lane_bound.load(Ordering::Acquire) {
-            return Err(format!("account {} owner task lane is not bound", self.account_id));
+            return Err(format!(
+                "account {} owner task lane is not bound",
+                self.account_id
+            ));
         }
-        self.account_owner_task_tx
-            .try_send(task)
-            .map_err(|error| {
-                format!(
-                    "account {} owner task enqueue failed: {error}",
-                    self.account_id,
-                )
-            })
+        self.account_owner_task_tx.try_send(task).map_err(|error| {
+            format!(
+                "account {} owner task enqueue failed: {error}",
+                self.account_id,
+            )
+        })
     }
 
     /// Transfer a cold mutation to the account writer and wait for its result.
@@ -4261,8 +4318,7 @@ impl SharedAccount {
         T: Send + 'static,
         F: FnOnce(&SharedAccount) -> T + Send + 'static,
     {
-        if self.is_account_owner_thread()
-            || !self.account_owner_lane_bound.load(Ordering::Acquire)
+        if self.is_account_owner_thread() || !self.account_owner_lane_bound.load(Ordering::Acquire)
         {
             return Ok(operation(self));
         }
@@ -4280,12 +4336,14 @@ impl SharedAccount {
                     self.account_id,
                 )
             })?;
-        reply_rx.recv_timeout(Duration::from_secs(5)).map_err(|error| {
-            format!(
-                "account {} owner task completion timed out: {error}",
-                self.account_id,
-            )
-        })
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| {
+                format!(
+                    "account {} owner task completion timed out: {error}",
+                    self.account_id,
+                )
+            })
     }
 
     pub fn account_owner_task_queue_depth(&self) -> usize {
@@ -4314,9 +4372,7 @@ impl SharedAccount {
                 .token_interests
                 .values()
                 .filter(|interest| interest.retire_after_ms.is_some())
-                .flat_map(|interest| {
-                    [interest.up_token_id.clone(), interest.down_token_id.clone()]
-                })
+                .flat_map(|interest| [interest.up_token_id.clone(), interest.down_token_id.clone()])
         }));
         tokens
     }
@@ -4397,7 +4453,7 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
-            anomalous_trade_keys: RwLock::new(HashSet::new()),
+            anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
             risk_blocker_sources_fast: RwLock::new(HashSet::new()),
@@ -4733,8 +4789,10 @@ impl SharedAccount {
             })
             .collect();
         let initial_unresolved_trade_match_times = state.unresolved_trade_match_times.clone();
-        let initial_unresolved_trade_keys: Vec<String> =
-            initial_unresolved_trade_match_times.keys().cloned().collect();
+        let initial_unresolved_trade_keys: Vec<String> = initial_unresolved_trade_match_times
+            .keys()
+            .cloned()
+            .collect();
         let initial_risk_blocker_sources = state.risk_blockers.keys().cloned().collect();
         let initial_settled_gc_candidates: BTreeMap<String, BTreeSet<String>> = state
             .settled_audit_references
@@ -4749,8 +4807,7 @@ impl SharedAccount {
             .collect();
         let initial_settled_generation = Self::effective_settled_token_values_generation(&state);
         let initial_settled_values = state.settled_token_values.clone();
-        let initial_retired_order_audit_tombstones =
-            state.retired_order_audit_tombstones.clone();
+        let initial_retired_order_audit_tombstones = state.retired_order_audit_tombstones.clone();
         let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
@@ -4782,16 +4839,14 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
-            anomalous_trade_keys: RwLock::new(HashSet::new()),
+            anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
             anomalous_private_event_keys: RwLock::new(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(
                 initial_retired_order_audit_tombstones,
             ),
             risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
-            unresolved_trade_match_times_fast: RwLock::new(
-                initial_unresolved_trade_match_times,
-            ),
+            unresolved_trade_match_times_fast: RwLock::new(initial_unresolved_trade_match_times),
             private_anomaly_transition: Mutex::new(()),
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
@@ -5330,6 +5385,7 @@ impl SharedAccount {
         client_order_id: &str,
         token_id: &str,
     ) {
+        account.publish_lifecycle_counts(lifecycle);
         let epoch = account
             .trade_epoch
             .fetch_add(1, Ordering::AcqRel)
@@ -5440,6 +5496,7 @@ impl SharedAccount {
                 .map(str::to_string)
                 .collect();
             lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
+            account.publish_lifecycle_counts(&lifecycle);
         }
         if merged_concurrent_trade {
             recompute_reconciliation(state, "concurrent private trade publication merge");
@@ -5500,12 +5557,14 @@ impl SharedAccount {
         self.coid_routes.retain_owners(&live_owners);
         self.oid_routes.retain_owners(&live_owners);
         self.trade_routes.retain_owners(&live_owners);
-        *self.anomalous_trade_keys.write().unwrap() = state
-            .ownership_anomalies
-            .keys()
-            .filter_map(|key| key.strip_prefix("trade:"))
-            .map(str::to_string)
-            .collect();
+        self.anomalous_trade_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("trade:"))
+                .map(str::to_string)
+                .collect(),
+        ));
         *self.anomalous_private_event_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
@@ -5604,6 +5663,7 @@ impl SharedAccount {
             .map(str::to_string)
             .collect();
         lifecycle.sidecar_checkpoint = state.sidecar_checkpoints.get(instance_id).cloned();
+        account.publish_lifecycle_counts(&lifecycle);
         if merged_concurrent_trade {
             recompute_reconciliation(state, "concurrent private trade publication merge");
         }
@@ -5637,12 +5697,14 @@ impl SharedAccount {
             self.trade_routes
                 .retain_owner_keys(instance_id, &trade_keys);
         }
-        *self.anomalous_trade_keys.write().unwrap() = state
-            .ownership_anomalies
-            .keys()
-            .filter_map(|key| key.strip_prefix("trade:"))
-            .map(str::to_string)
-            .collect();
+        self.anomalous_trade_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("trade:"))
+                .map(str::to_string)
+                .collect(),
+        ));
         *self.anomalous_private_event_keys.write().unwrap() = state
             .ownership_anomalies
             .keys()
@@ -6876,8 +6938,7 @@ impl SharedAccount {
                 "cannot register settled GC owner for unknown instance `{instance_id}`",
             ));
         }
-        let (tx, request_rx) =
-            crossbeam_channel::bounded(SETTLED_GC_OWNER_QUEUE_CAPACITY);
+        let (tx, request_rx) = crossbeam_channel::bounded(SETTLED_GC_OWNER_QUEUE_CAPACITY);
         let registration_id = {
             let mut coordinator = self.settled_gc_coordinator.lock().unwrap();
             coordinator.next_registration_id = coordinator
@@ -6911,12 +6972,8 @@ impl SharedAccount {
             pending_request: None,
             completion_tx: self.settled_gc_completion_tx.clone(),
             pending_completion: None,
-            completion_queue_high_water: Arc::clone(
-                &self.settled_gc_completion_queue_high_water,
-            ),
-            completion_queue_overflows: Arc::clone(
-                &self.settled_gc_completion_queue_overflows,
-            ),
+            completion_queue_high_water: Arc::clone(&self.settled_gc_completion_queue_high_water),
+            completion_queue_overflows: Arc::clone(&self.settled_gc_completion_queue_overflows),
             certificates_completed: Arc::clone(&self.settled_gc_certificates_completed),
         })
     }
@@ -6935,9 +6992,7 @@ impl SharedAccount {
     /// account-global commit is allowed only when every current owner has a
     /// certificate whose reservation/trade epochs are still current.
     pub fn finalize_ready_settled_audit_retirements(&self) -> Vec<HashSet<String>> {
-        let activity = self
-            .settled_gc_activity_generation
-            .load(Ordering::Acquire);
+        let activity = self.settled_gc_activity_generation.load(Ordering::Acquire);
         let mut coordinator = self.settled_gc_coordinator.lock().unwrap();
 
         // The return lane is lossless: an owner retains its certificate when
@@ -7055,9 +7110,7 @@ impl SharedAccount {
                 .read()
                 .unwrap()
                 .keys()
-                .map(|instance_id| {
-                    (instance_id.clone(), SettledGcOwnerProgress::NeedsDispatch)
-                })
+                .map(|instance_id| (instance_id.clone(), SettledGcOwnerProgress::NeedsDispatch))
                 .collect();
             coordinator.inflight = Some(SettledGcInflight {
                 condition_id,
@@ -7074,8 +7127,7 @@ impl SharedAccount {
             .into_iter()
             .flat_map(|inflight| inflight.owners.iter())
             .filter_map(|(instance_id, progress)| {
-                (*progress == SettledGcOwnerProgress::NeedsDispatch)
-                    .then(|| instance_id.clone())
+                (*progress == SettledGcOwnerProgress::NeedsDispatch).then(|| instance_id.clone())
             })
             .collect();
         for instance_id in needs_dispatch {
@@ -7626,14 +7678,9 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         if self.must_dispatch_to_account_owner() {
-            return self
-                .call_on_account_owner(move |account| {
-                    account.apply_scoped_physical_snapshot(
-                        cash,
-                        positions,
-                        authoritative_tokens,
-                    )
-                })?;
+            return self.call_on_account_owner(move |account| {
+                account.apply_scoped_physical_snapshot(cash, positions, authoritative_tokens)
+            })?;
         }
         self.apply_scoped_physical_snapshot_inner(None, cash, positions, authoritative_tokens)
     }
@@ -7647,15 +7694,14 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         if self.must_dispatch_to_account_owner() {
-            return self
-                .call_on_account_owner(move |account| {
-                    account.apply_scoped_physical_snapshot_versioned(
-                        generation,
-                        cash,
-                        positions,
-                        authoritative_tokens,
-                    )
-                })?;
+            return self.call_on_account_owner(move |account| {
+                account.apply_scoped_physical_snapshot_versioned(
+                    generation,
+                    cash,
+                    positions,
+                    authoritative_tokens,
+                )
+            })?;
         }
         self.apply_scoped_physical_snapshot_inner(
             Some(generation),
@@ -7673,10 +7719,7 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
         validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
-        if self
-            .startup_snapshot_applied_fast
-            .load(Ordering::Acquire)
-        {
+        if self.startup_snapshot_applied_fast.load(Ordering::Acquire) {
             return Ok(false);
         }
         let mut state = self.lock_state();
@@ -7794,7 +7837,9 @@ impl SharedAccount {
                         &authoritative_tokens,
                     )
                 })
-                .unwrap_or_else(|error| panic!("account owner redeem observation failed: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("account owner redeem observation failed: {error}")
+                });
         }
         if !observed_cash.is_finite()
             || observed_cash < 0.0
@@ -8080,6 +8125,21 @@ impl SharedAccount {
     /// balance-changing maintenance remains fail-closed until authoritative
     /// terminal metadata arrives.
     pub fn begin_order_recovery<'a>(&self, client_order_ids: impl IntoIterator<Item = &'a str>) {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_ids: Vec<String> = client_order_ids
+                .into_iter()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.begin_order_recovery(client_order_ids.iter().map(String::as_str));
+            }) {
+                log::error!("[shared_account] begin-recovery owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut newly_pending = false;
         for client_order_id in client_order_ids.into_iter().filter(|id| !id.is_empty()) {
             let Some(account) = self.virtual_account_for_coid(client_order_id) else {
@@ -8114,6 +8174,17 @@ impl SharedAccount {
     }
 
     pub fn finish_order_recovery(&self, client_order_id: &str) {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.finish_order_recovery(&client_order_id);
+            }) {
+                log::error!("[shared_account] finish-recovery owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
@@ -8484,8 +8555,14 @@ impl SharedAccount {
         let mut reserved_positions = HashMap::<String, f64>::new();
         let mut virtual_cash = 0.0;
         let mut reserved_cash = 0.0;
+        let mut recovery_pending_orders = 0usize;
+        let mut routine_cancel_audits = 0usize;
         let mut instances = Vec::with_capacity(accounts.len());
         for account in accounts {
+            recovery_pending_orders = recovery_pending_orders
+                .saturating_add(account.recovery_pending_count.load(Ordering::Acquire));
+            routine_cancel_audits = routine_cancel_audits
+                .saturating_add(account.routine_cancel_audit_count.load(Ordering::Acquire));
             let instance = account.ledger_snapshot();
             let instance_reserved_positions = instance.total_reserved_positions();
             let instance_reserved_cash = instance.total_reserved_cash();
@@ -8511,12 +8588,9 @@ impl SharedAccount {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Operational monitoring must never contend with private lifecycle
-        // apply. These counts may lag until the next cold owner transaction;
-        // they are observability-only and the exact live sets remain owned by
-        // the account writer.
-        let recovery_pending_orders = state.recovery_pending_orders.len();
-        let routine_cancel_audits = state.routine_cancel_audits.len();
+        // Operational monitoring never borrows the mutable private lifecycle.
+        // Counts are owner-published atomics and may lag by at most one owner
+        // mutation; they are observability-only.
         AccountMonitoringSnapshot {
             account_id: self.account_id.clone(),
             seeded: self.seeded_fast.load(Ordering::Acquire),
@@ -8529,8 +8603,7 @@ impl SharedAccount {
             provisional_position_owners: state.provisional_position_owners.clone(),
             reserved_cash,
             reserved_positions,
-            uncertain: self.uncertain_fast.load(Ordering::Acquire)
-                || persistence_error.is_some(),
+            uncertain: self.uncertain_fast.load(Ordering::Acquire) || persistence_error.is_some(),
             uncertain_reason: persistence_error
                 .as_ref()
                 .map(|error| format!("account ledger persistence error: {error}"))
@@ -8906,12 +8979,6 @@ impl SharedAccount {
         let lifecycle_wait = Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
         let lifecycle_metric = self.reservation_lifecycle_lock.acquired(lifecycle_wait);
-        let coid_wait = Instant::now();
-        let mut coid_routes = self.coid_routes.write_shard(client_order_id);
-        let coid_metric = self.reservation_coid_route_lock.acquired(coid_wait);
-        let oid_wait = Instant::now();
-        let mut oid_routes = self.oid_routes.write_shard(&normalized_order_id);
-        let oid_metric = self.reservation_oid_route_lock.acquired(oid_wait);
         if let Some(existing) = lifecycle.orders.get(client_order_id) {
             if normalize_order_id(&existing.order_id) == normalize_order_id(order_id)
                 && existing.instance_id == instance_id
@@ -8926,12 +8993,12 @@ impl SharedAccount {
                 client_order_id.into(),
             ));
         }
-        if coid_routes.contains_key(client_order_id) {
+        if self.coid_routes.get(client_order_id).is_some() {
             return Err(ReservationError::DuplicateClientOrderId(
                 client_order_id.into(),
             ));
         }
-        if oid_routes.contains_key(&normalized_order_id) {
+        if self.oid_routes.get(&normalized_order_id).is_some() {
             return Err(ReservationError::InvalidOrder(format!(
                 "order_id `{order_id}` is already owned by another order",
             )));
@@ -8992,8 +9059,10 @@ impl SharedAccount {
         lifecycle
             .orders
             .insert(client_order_id.into(), ownership.clone());
-        coid_routes.insert(client_order_id.into(), instance_id.into());
-        oid_routes.insert(normalized_order_id, instance_id.into());
+        self.coid_routes
+            .insert(client_order_id.into(), instance_id.into());
+        self.oid_routes
+            .insert(normalized_order_id, instance_id.into());
         account.reservation_epoch.fetch_add(1, Ordering::Release);
         let persisted_reserved_cash = account.reserved_cash.load();
         let persisted_reserved_position = account
@@ -9020,10 +9089,6 @@ impl SharedAccount {
 
         // End every admission lock before allocating WAL paths or invoking
         // serde. The writer materializes this raw command into typed JSON.
-        drop(oid_metric);
-        drop(oid_routes);
-        drop(coid_metric);
-        drop(coid_routes);
         drop(lifecycle_metric);
         drop(lifecycle);
         // Deliberately asynchronous: startup exchange reconciliation is the
@@ -9035,6 +9100,15 @@ impl SharedAccount {
     }
 
     pub fn rebind_order_id(&self, client_order_id: &str, order_id: &str) -> bool {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            let order_id = order_id.to_string();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.rebind_order_id(&client_order_id, &order_id)
+                })
+                .unwrap_or(false);
+        }
         if client_order_id.is_empty() || order_id.is_empty() {
             return false;
         }
@@ -9062,12 +9136,11 @@ impl SharedAccount {
             let conflicts = lifecycle.orders.iter().any(|(coid, order)| {
                 coid != client_order_id && normalize_order_id(&order.order_id) == normalized
             });
-            let mut new_oid_routes = self.oid_routes.write_shard(&normalized);
-            let routed_elsewhere = new_oid_routes
+            let routed_elsewhere = self
+                .oid_routes
                 .get(&normalized)
-                .is_some_and(|owner| owner != &account.instance_id);
+                .is_some_and(|owner| owner != account.instance_id);
             if conflicts || routed_elsewhere {
-                drop(new_oid_routes);
                 drop(lifecycle);
                 return self.record_order_binding_anomaly(
                     client_order_id,
@@ -9087,8 +9160,8 @@ impl SharedAccount {
                 .expect("order checked above")
                 .token_id
                 .clone();
-            new_oid_routes.insert(normalized, account.instance_id.clone());
-            drop(new_oid_routes);
+            self.oid_routes
+                .insert(normalized, account.instance_id.clone());
             self.oid_routes.remove(&normalized_old);
             Self::record_virtual_trade_mutation(
                 &account,
@@ -9490,10 +9563,8 @@ impl SharedAccount {
         self.unresolved_trade_keys
             .insert(trade_key.to_string(), String::new());
         if let Some(persistence) = &self.persistence {
-            persistence.schedule_unresolved_trade_match_time(
-                trade_key.to_string(),
-                Some(match_time_secs),
-            );
+            persistence
+                .schedule_unresolved_trade_match_time(trade_key.to_string(), Some(match_time_secs));
         }
     }
 
@@ -9506,15 +9577,12 @@ impl SharedAccount {
         if anchors.remove(trade_key).is_some() {
             let all_trades_resolved = anchors.is_empty();
             drop(anchors);
-            if all_trades_resolved
-                && !self.unsettled_maintenance_fast.load(Ordering::Acquire)
-            {
+            if all_trades_resolved && !self.unsettled_maintenance_fast.load(Ordering::Acquire) {
                 self.startup_snapshot_deferred_fast
                     .store(false, Ordering::Release);
             }
             if let Some(persistence) = &self.persistence {
-                persistence
-                    .schedule_unresolved_trade_match_time(trade_key.to_string(), None);
+                persistence.schedule_unresolved_trade_match_time(trade_key.to_string(), None);
             }
         }
     }
@@ -9685,6 +9753,12 @@ impl SharedAccount {
     /// idempotent and raises reservation counters only to the conservative
     /// minimum implied by all retained orders, so it cannot double-reserve.
     pub fn backfill_order_ownership(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
+        if self.must_dispatch_to_account_owner() {
+            let ownership = ownership.clone();
+            return self
+                .call_on_account_owner(move |account| account.backfill_order_ownership(&ownership))
+                .unwrap_or(None);
+        }
         if ownership.account_id != self.account_id
             || ownership.client_order_id.is_empty()
             || ownership.order_id.is_empty()
@@ -9702,14 +9776,14 @@ impl SharedAccount {
         }) {
             return None;
         }
-        let mut coid_routes = self.coid_routes.write_shard(&ownership.client_order_id);
-        let mut oid_routes = self.oid_routes.write_shard(&normalized);
-        if coid_routes
+        if self
+            .coid_routes
             .get(&ownership.client_order_id)
-            .is_some_and(|owner| owner != &ownership.instance_id)
-            || oid_routes
+            .is_some_and(|owner| owner != ownership.instance_id)
+            || self
+                .oid_routes
                 .get(&normalized)
-                .is_some_and(|owner| owner != &ownership.instance_id)
+                .is_some_and(|owner| owner != ownership.instance_id)
         {
             return None;
         }
@@ -9735,11 +9809,12 @@ impl SharedAccount {
                 .reserved
                 .ensure_at_least(minimum_position);
         }
-        coid_routes.insert(
+        self.coid_routes.insert(
             ownership.client_order_id.clone(),
             ownership.instance_id.clone(),
         );
-        oid_routes.insert(normalized.clone(), ownership.instance_id.clone());
+        self.oid_routes
+            .insert(normalized.clone(), ownership.instance_id.clone());
         if inserted {
             account.reservation_epoch.fetch_add(1, Ordering::Release);
             self.schedule_virtual_lifecycle_persist(
@@ -9748,8 +9823,6 @@ impl SharedAccount {
                 &ownership.client_order_id,
             );
         }
-        drop(oid_routes);
-        drop(coid_routes);
         drop(lifecycle);
         drop(_publication);
         self.resolve_private_event_anomaly(&format!("order:{normalized}"));
@@ -9768,6 +9841,24 @@ impl SharedAccount {
         client_order_id: &str,
         status: OrderStatus,
     ) -> Option<OrderStatus> {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            let diagnostic_coid = client_order_id.clone();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.mark_order_status_effective(&client_order_id, status)
+                })
+                .unwrap_or_else(|error| {
+                    log::error!(
+                        "[shared_account] lifecycle owner dispatch failed coid={}: {}",
+                        diagnostic_coid,
+                        error,
+                    );
+                    self.uncertain_fast.store(true, Ordering::Release);
+                    self.admission_fast.store(false, Ordering::Release);
+                    None
+                });
+        }
         let account = self.virtual_account_for_coid(client_order_id)?;
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
@@ -9891,6 +9982,14 @@ impl SharedAccount {
     /// the sticky audit gate until those fills are booked. The edge result lets
     /// callers suppress duplicate WARNs from repeated Filled lifecycle rows.
     pub fn mark_filled_pending_audit(&self, client_order_id: &str) -> FillAuditPendingTransition {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.mark_filled_pending_audit(&client_order_id)
+                })
+                .unwrap_or(FillAuditPendingTransition::NotTracked);
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return FillAuditPendingTransition::NotTracked;
         };
@@ -9945,6 +10044,13 @@ impl SharedAccount {
         status: OrderStatus,
         audit: &AuthoritativeOrderAudit,
     ) -> Result<FillAuditPendingTransition, String> {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            let audit = audit.clone();
+            return self.call_on_account_owner(move |account| {
+                account.apply_authoritative_order_audit(&client_order_id, status, &audit)
+            })?;
+        }
         if !matches!(status, OrderStatus::Filled | OrderStatus::Cancelled) {
             return Err(format!(
                 "authoritative terminal audit requires Filled/Cancelled, got {status:?}",
@@ -9975,10 +10081,7 @@ impl SharedAccount {
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return Ok(FillAuditPendingTransition::NotTracked);
         };
-        crate::latency::record(
-            "polymarket.account.terminal_audit_route",
-            route_started,
-        );
+        crate::latency::record("polymarket.account.terminal_audit_route", route_started);
         let lifecycle_wait_started = crate::latency::Instant::now();
         let mut lifecycle = account.lifecycle.lock().unwrap();
         crate::latency::record(
@@ -10177,6 +10280,14 @@ impl SharedAccount {
     /// residual lock until an order-specific audit arrives, without globally
     /// pausing unrelated instances on the same account.
     pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            return self
+                .call_on_account_owner(move |account| {
+                    account.mark_cancelled_pending_audit(&client_order_id)
+                })
+                .unwrap_or(false);
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
@@ -10220,6 +10331,17 @@ impl SharedAccount {
     /// Release the still-unfilled reservation after an authoritative terminal
     /// order outcome. Ownership is retained for late fill attribution.
     pub fn release_order(&self, client_order_id: &str, status: OrderStatus) {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            if let Err(error) = self.call_on_account_owner(move |account| {
+                account.release_order(&client_order_id, status);
+            }) {
+                log::error!("[shared_account] release-order owner dispatch failed: {error}");
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return;
         };
@@ -10925,7 +11047,9 @@ impl SharedAccount {
             if let Err(error) = self.call_on_account_owner(move |account| {
                 account.mark_maintenance_operation_uncertain(&operation_id, detail);
             }) {
-                log::error!("[shared_account] uncertain maintenance owner dispatch failed: {error}");
+                log::error!(
+                    "[shared_account] uncertain maintenance owner dispatch failed: {error}"
+                );
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
             }
@@ -10958,7 +11082,9 @@ impl SharedAccount {
             if let Err(error) = self.call_on_account_owner(move |account| {
                 account.mark_maintenance_attribution_uncertain(&operation_id, detail);
             }) {
-                log::error!("[shared_account] maintenance attribution owner dispatch failed: {error}");
+                log::error!(
+                    "[shared_account] maintenance attribution owner dispatch failed: {error}"
+                );
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
             }
@@ -11025,9 +11151,7 @@ impl SharedAccount {
         if self.must_dispatch_to_account_owner() {
             let operation_id = operation_id.to_string();
             return self
-                .call_on_account_owner(move |account| {
-                    account.maintenance_operation(&operation_id)
-                })
+                .call_on_account_owner(move |account| account.maintenance_operation(&operation_id))
                 .unwrap_or(None);
         }
         self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
@@ -11657,17 +11781,14 @@ impl SharedAccount {
         }
 
         // Claim the immutable trade-id owner only after every order invariant
-        // has passed and before changing economics. The index has its own tiny
-        // critical section and never touches the physical account ledger.
+        // has passed and before changing economics. The private lane is the
+        // sole runtime writer, so publication is lock-free for both readers
+        // and this ownership claim.
+        if !self
+            .trade_routes
+            .insert_if_vacant_or_same(trade_key, instance_id)
         {
-            let mut routes = self.trade_routes.write_shard(trade_key);
-            match routes.get(trade_key) {
-                Some(owner) if owner != instance_id => return VirtualTradeAttempt::Fallback,
-                Some(_) => {}
-                None => {
-                    routes.insert(trade_key.to_string(), instance_id.to_string());
-                }
-            }
+            return VirtualTradeAttempt::Fallback;
         }
 
         let already_booked = existing.as_ref().is_some_and(|trade| trade.booked);
@@ -11998,13 +12119,9 @@ impl SharedAccount {
         let coid_scope = self.coid_routes.get(client_order_id);
         let oid_scope = self.oid_routes.get(&normalize_order_id(order_id));
         let trade_scope = self.trade_routes.get(trade_key);
-        let retired_trade = trade_scope.is_none()
-            && self.retired_trade_routes.get(trade_key).is_some();
-        let anomalous_trade = self
-            .anomalous_trade_keys
-            .read()
-            .unwrap()
-            .contains(trade_key);
+        let retired_trade =
+            trade_scope.is_none() && self.retired_trade_routes.get(trade_key).is_some();
+        let anomalous_trade = self.anomalous_trade_keys.load().contains(trade_key);
         // A cross-instance runtime/durable binding disagreement is an anomaly,
         // not a valid single-shard transition. Materialize the cold aggregate
         // only for that rare reject path so the original conflict proof is
@@ -13198,10 +13315,8 @@ impl SharedAccount {
             state.trades.remove(trade_key);
             state.fee_attribution_pending.remove(trade_key);
             if let Some(trade) = removed {
-                self.retired_trade_routes.insert(
-                    trade_key.clone(),
-                    trade.ownership.instance_id.clone(),
-                );
+                self.retired_trade_routes
+                    .insert(trade_key.clone(), trade.ownership.instance_id.clone());
                 state.retired_trade_ownership_tombstones.insert(
                     trade_key.clone(),
                     RetiredTradeOwnershipTombstone {
@@ -13290,10 +13405,8 @@ impl SharedAccount {
         let outcome = prune_terminal_history_locked(&mut state, instance_id, tokens);
         for trade_key in &outcome.trades {
             if let Some(tombstone) = state.retired_trade_ownership_tombstones.get(trade_key) {
-                self.retired_trade_routes.insert(
-                    trade_key.clone(),
-                    tombstone.ownership.instance_id.clone(),
-                );
+                self.retired_trade_routes
+                    .insert(trade_key.clone(), tombstone.ownership.instance_id.clone());
             }
         }
         self.retired_trade_tombstone_count_fast.store(
@@ -14492,9 +14605,7 @@ fn repair_failed_trade_under_reservations_for_query(
         };
         if !matches!(
             snapshot.status,
-            OrderStatus::Cancelled
-                | OrderStatus::CancelUncertain
-                | OrderStatus::CancelOrderTimeout
+            OrderStatus::Cancelled | OrderStatus::CancelUncertain | OrderStatus::CancelOrderTimeout
         ) {
             continue;
         }
@@ -14513,7 +14624,10 @@ fn repair_failed_trade_under_reservations_for_query(
 
         let cash_delta = expected_cash - snapshot.reserved_cash;
         let quantity_delta = expected_quantity - snapshot.reserved_quantity;
-        let instance = state.instances.get_mut(&snapshot.instance_id).ok_or_else(|| {
+        let instance = state
+            .instances
+            .get_mut(&snapshot.instance_id)
+            .ok_or_else(|| {
                 format!(
                     "query-repair order `{coid}` references missing instance `{}`",
                     snapshot.instance_id,
@@ -16274,8 +16388,7 @@ mod tests {
                 .cloned()
                 .collect();
             std::hint::black_box(pending);
-            full_transaction
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            full_transaction.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
 
             let started = Instant::now();
             std::hint::black_box(account.pending_maintenance_operations());
@@ -16316,28 +16429,14 @@ mod tests {
         let account = SharedAccount::new("periodic-snapshot");
         account.register_instance("maker", 1.0);
         assert!(account
-            .apply_scoped_physical_snapshot_versioned(
-                1,
-                100.0,
-                HashMap::new(),
-                HashSet::new(),
-            )
+            .apply_scoped_physical_snapshot_versioned(1, 100.0, HashMap::new(), HashSet::new(),)
             .unwrap());
         let acquisitions = account.account_lock_acquisitions.load(Ordering::Relaxed);
 
         assert!(!account
-            .apply_scoped_physical_snapshot_versioned(
-                2,
-                100.0,
-                HashMap::new(),
-                HashSet::new(),
-            )
+            .apply_scoped_physical_snapshot_versioned(2, 100.0, HashMap::new(), HashSet::new(),)
             .unwrap());
-        assert!(!account.observe_platform_binary_redeem(
-            100.0,
-            &HashMap::new(),
-            &HashSet::new(),
-        ));
+        assert!(!account.observe_platform_binary_redeem(100.0, &HashMap::new(), &HashSet::new(),));
         assert_eq!(
             account.account_lock_acquisitions.load(Ordering::Relaxed),
             acquisitions,
@@ -16485,9 +16584,7 @@ mod tests {
                 account
                     .oid_routes
                     .insert(normalize_order_id(&oid), instance_id.clone());
-                account
-                    .trade_routes
-                    .insert(trade_key, instance_id.clone());
+                account.trade_routes.insert(trade_key, instance_id.clone());
             }
         }
         account
@@ -16693,11 +16790,11 @@ mod tests {
                 path: vec!["ledger_generation".into()],
                 value: serde_json::json!(generation),
             }];
-            let undo = apply_persistence_wal_changes_transactional(&mut in_place, &changes).unwrap();
+            let undo =
+                apply_persistence_wal_changes_transactional(&mut in_place, &changes).unwrap();
             std::hint::black_box(&in_place);
             drop(undo);
-            in_place_samples
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            in_place_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
         let clone = latency_summary_ns(&mut clone_samples);
         let in_place = latency_summary_ns(&mut in_place_samples);
@@ -16718,18 +16815,13 @@ mod tests {
     #[test]
     fn control_snapshot_publication_cannot_regress_fast_ledger_generation() {
         let account = SharedAccount::new("monotonic-ledger-generation");
-        account
-            .ledger_generation_fast
-            .store(12, Ordering::Release);
+        account.ledger_generation_fast.store(12, Ordering::Release);
         let mut stale = SharedAccountState::default();
         stale.ledger_generation = 11;
 
         account.publish_control_snapshots(&stale);
 
-        assert_eq!(
-            account.ledger_generation_fast.load(Ordering::Acquire),
-            12,
-        );
+        assert_eq!(account.ledger_generation_fast.load(Ordering::Acquire), 12,);
     }
 
     #[test]
@@ -16761,10 +16853,9 @@ mod tests {
         assert_eq!(state.ledger_generation, 12);
 
         state.ledger_generation = 11;
-        state.trades.insert(
-            "unproven".to_string(),
-            applied_trade_with_generation(13),
-        );
+        state
+            .trades
+            .insert("unproven".to_string(), applied_trade_with_generation(13));
         assert!(!repair_regressed_trade_ledger_generation_from_wal(
             "acct", &mut state, &evidence,
         ));
@@ -17001,8 +17092,8 @@ mod tests {
         let locks = account.monitoring_snapshot();
         assert_eq!(locks.reservation_control_lock.acquisitions, 0);
         assert_eq!(locks.reservation_lifecycle_lock.acquisitions, 1);
-        assert_eq!(locks.reservation_coid_route_lock.acquisitions, 1);
-        assert_eq!(locks.reservation_oid_route_lock.acquisitions, 1);
+        assert_eq!(locks.reservation_coid_route_lock.acquisitions, 0);
+        assert_eq!(locks.reservation_oid_route_lock.acquisitions, 0);
         let err = account
             .reserve_order("a", "a-2", "oid-a-2", "UP", Side::Buy, 0.1, 1.0, 0)
             .unwrap_err();
@@ -18369,6 +18460,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
 
         // This wallet view may already contain trade-buy, but a snapshot has no
         // trade id and therefore cannot prove that fact. Preserve the trade-
@@ -18834,9 +18928,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             for (trade_key, trade) in &trades {
                 lifecycle.trades.insert(trade_key.clone(), trade.clone());
                 state.trades.insert(trade_key.clone(), trade.clone());
-                account
-                    .trade_routes
-                    .insert(trade_key.clone(), "a".into());
+                account.trade_routes.insert(trade_key.clone(), "a".into());
             }
         }
 
@@ -18887,8 +18979,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 account.prune_terminal_history_scoped(Some("owner"), &tokens),
                 (70, 70),
             );
-            aggregate_samples
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            aggregate_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
         for _ in 0..EVENTS {
             let account = settled_gc_benchmark_account();
@@ -18902,24 +18993,18 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 ),
                 (70, 70),
             );
-            owner_all_samples
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            owner_all_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
         for _ in 0..EVENTS {
             let account = settled_gc_benchmark_account();
-            install_test_settled_gc_candidate(
-                &account,
-                "condition-owner-turn-benchmark",
-                &tokens,
-            );
+            install_test_settled_gc_candidate(&account, "condition-owner-turn-benchmark", &tokens);
             let mut mailbox = account.register_settled_gc_owner("owner").unwrap();
             assert!(account
                 .finalize_ready_settled_audit_retirements()
                 .is_empty());
             let started = Instant::now();
             let certificate = mailbox.poll_once(&account).unwrap().unwrap();
-            owner_turn_samples
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            owner_turn_samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             assert_eq!(
                 (certificate.retired_orders, certificate.retired_trades),
                 (
@@ -20190,6 +20275,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
         account.apply_scoped_physical_snapshot(
             100.0,
             HashMap::new(),
@@ -20252,6 +20340,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
 
         account.apply_physical_snapshot(130.0, HashMap::from([("ETH-WIN".into(), 20.0)]));
         assert!(!account.is_uncertain());
@@ -20390,6 +20481,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
 
         account
             .apply_physical_snapshot(189.0, HashMap::new())
@@ -20426,6 +20520,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
         account
             .apply_physical_snapshot(189.0, HashMap::new())
             .unwrap();
@@ -20545,6 +20642,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
 
         account
             .apply_physical_snapshot(179.95, HashMap::new())
@@ -20614,6 +20714,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
         account.apply_scoped_physical_snapshot(
             130.0,
             HashMap::new(),
@@ -20636,6 +20739,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .lock()
             .unwrap()
             .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
         account.apply_physical_snapshot(130.0, HashMap::new());
         assert!(!account.is_uncertain());
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 100.0);
@@ -20923,16 +21029,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .apply_physical_snapshot(100.0, HashMap::new())
                 .unwrap();
             account
-                .reserve_order(
-                    "btc",
-                    "btc-1",
-                    "oid-1",
-                    "TOKEN",
-                    Side::Buy,
-                    10.0,
-                    0.5,
-                    0,
-                )
+                .reserve_order("btc", "btc-1", "oid-1", "TOKEN", Side::Buy, 10.0, 0.5, 0)
                 .unwrap();
             assert!(matches!(
                 account.apply_trade_transition_with_context(
@@ -21232,16 +21329,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .apply_physical_snapshot(100.0, HashMap::from([(token.into(), 40.0)]))
             .unwrap();
         account
-            .reserve_order(
-                instance_id,
-                coid,
-                oid,
-                token,
-                Side::Sell,
-                10.0,
-                0.36,
-                0,
-            )
+            .reserve_order(instance_id, coid, oid, token, Side::Sell, 10.0, 0.36, 0)
             .unwrap();
         assert!(matches!(
             account.apply_trade_transition_with_context(
@@ -21303,11 +21391,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
 
         let mut re_compacted = resurrected.clone();
         re_compacted.trades.remove(trade_key);
-        add_economic_state(
-            &mut re_compacted.compacted_economic_effects,
-            &effect,
-            1.0,
-        );
+        add_economic_state(&mut re_compacted.compacted_economic_effects, &effect, 1.0);
         // An authoritative wallet snapshot is independent of immutable
         // instance-event replay and may legitimately move physical cash.
         // Retired-trade recovery must preserve that newer observation.
@@ -21322,7 +21406,11 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             re_compacted: true,
         };
         let mut unrelated_damage = re_compacted.clone();
-        unrelated_damage.instances.get_mut(instance_id).unwrap().cash += 0.25;
+        unrelated_damage
+            .instances
+            .get_mut(instance_id)
+            .unwrap()
+            .cash += 0.25;
         assert!(!repair_retired_trade_replays_from_wal(
             account_id,
             &mut unrelated_damage,
@@ -23074,14 +23162,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 )
                 .unwrap();
             assert!(started.elapsed() >= Duration::from_millis(300));
-            let operation = account
-                .maintenance_operation("split-slow-ledger")
-                .unwrap();
+            let operation = account.maintenance_operation("split-slow-ledger").unwrap();
             assert_eq!(operation.status, MaintenanceOperationStatus::Reserved);
-            assert_eq!(
-                account.instance_snapshot("a").unwrap().reserved_cash,
-                30.0,
-            );
+            assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 30.0,);
             let monitoring = account.monitoring_snapshot();
             assert_eq!(monitoring.persistence_generation_lag, 0);
             assert_eq!(
@@ -23630,10 +23713,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             for _ in 0..EVENTS {
                 let started = Instant::now();
                 let (status, timing) = measure_deferred_lifecycle_stages(|| {
-                    account.mark_order_status_effective(
-                        "a-deferred-latency",
-                        OrderStatus::Accepted,
-                    )
+                    account.mark_order_status_effective("a-deferred-latency", OrderStatus::Accepted)
                 });
                 totals.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                 lock_waits.push(timing.lock_wait_ns);
@@ -23748,10 +23828,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let worker_account = Arc::clone(&account);
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            assert!(worker_account.rebind_order_id(
-                "a-lifecycle-no-control",
-                "oid-lifecycle-no-control-rebound",
-            ));
+            assert!(worker_account
+                .rebind_order_id("a-lifecycle-no-control", "oid-lifecycle-no-control-rebound",));
             worker_account.begin_order_recovery(["a-lifecycle-no-control"]);
             worker_account.finish_order_recovery("a-lifecycle-no-control");
             assert!(worker_account.mark_cancelled_pending_audit("a-lifecycle-no-control"));
@@ -23807,17 +23885,12 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .collect();
             for order_id in &order_ids {
                 let started = Instant::now();
-                assert!(worker_account.rebind_order_id(
-                    "a-lifecycle-latency",
-                    order_id,
-                ));
+                assert!(worker_account.rebind_order_id("a-lifecycle-latency", order_id,));
                 worker_account.begin_order_recovery(["a-lifecycle-latency"]);
                 worker_account.finish_order_recovery("a-lifecycle-latency");
                 assert_eq!(
-                    worker_account.mark_order_status_effective(
-                        "a-lifecycle-latency",
-                        OrderStatus::Accepted,
-                    ),
+                    worker_account
+                        .mark_order_status_effective("a-lifecycle-latency", OrderStatus::Accepted,),
                     Some(OrderStatus::Accepted),
                 );
                 samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);

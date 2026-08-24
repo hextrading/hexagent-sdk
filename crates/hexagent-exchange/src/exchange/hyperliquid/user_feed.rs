@@ -121,7 +121,7 @@ async fn user_feed_task(
                                 if let Some(ups) = d.as_array() {
                                     for ou in ups {
                                         if let Some(u) = parse_order_update(ou) {
-                                            if !publisher.publish(u) { return; }
+                                            if !publisher.publish(u).await { return; }
                                         }
                                     }
                                 }
@@ -142,7 +142,7 @@ async fn user_feed_task(
                             };
                             for f in fills {
                                 if let Some(u) = parse_fill(f) {
-                                    if !publisher.publish(u) { return; }
+                                    if !publisher.publish(u).await { return; }
                                 }
                             }
                         }

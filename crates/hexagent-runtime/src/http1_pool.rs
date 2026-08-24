@@ -60,9 +60,13 @@
 //!   the exact slot, build a fresh client in the background, prewarm it, and
 //!   only then atomically return it to admission.
 
+use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -281,7 +285,7 @@ pub fn clients_all() -> Vec<Arc<reqwest::Client>> {
                 &account.reconcile,
                 &account.gap_replay,
             ] {
-                all.extend(rp.slots.iter().map(|s| s.client.read().unwrap().clone()));
+                all.extend(rp.slots.iter().map(|s| s.client.load_full()));
             }
         }
     }
@@ -729,13 +733,16 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
 /// One connection slot: a warm h1.1 client + an in-use flag. Held by at
 /// most one in-flight request at a time.
 struct Slot {
-    client: Arc<RwLock<Arc<reqwest::Client>>>,
+    client: Arc<ArcSwap<reqwest::Client>>,
     busy: Arc<AtomicBool>,
+    /// True exactly while this free slot has one token in the role lane.
+    /// This fences concurrent permit-drop and quarantine-release publication.
+    available_token: Arc<AtomicBool>,
     last_activity_ns: Arc<AtomicU64>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
-    last_rebuild: Arc<Mutex<Option<Instant>>>,
+    last_rebuild_ns: Arc<AtomicU64>,
     /// Fixed storage reused by consecutive requests admitted on this slot.
     /// The slot permit guarantees a single writer and prevents reuse until
     /// completion has consumed the trace.
@@ -748,12 +755,14 @@ struct ConnectionHealth {
     role: Role,
     slot: usize,
     generation_at_pick: u64,
-    slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
+    slot_client: Arc<ArcSwap<reqwest::Client>>,
+    busy: Arc<AtomicBool>,
+    available_token: Arc<AtomicBool>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
-    last_rebuild: Arc<Mutex<Option<Instant>>>,
-    availability: Arc<(Mutex<()>, Condvar)>,
+    last_rebuild_ns: Arc<AtomicU64>,
+    available_tx: Sender<usize>,
     timeout: Duration,
 }
 
@@ -776,15 +785,21 @@ impl ConnectionHealth {
         if failures < threshold.max(1) {
             return None;
         }
-        let now = Instant::now();
-        let mut last = self.last_rebuild.lock().unwrap();
-        if last
-            .map(|t| now.duration_since(t) < cooldown)
-            .unwrap_or(false)
-        {
-            return None;
+        let now_ns = activity_now_ns();
+        let cooldown_ns = cooldown.as_nanos().min(u64::MAX as u128) as u64;
+        loop {
+            let last_ns = self.last_rebuild_ns.load(Ordering::Acquire);
+            if last_ns != 0 && now_ns.saturating_sub(last_ns) < cooldown_ns {
+                return None;
+            }
+            if self
+                .last_rebuild_ns
+                .compare_exchange(last_ns, now_ns, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
-        *last = Some(now);
         self.quarantined.store(true, Ordering::Release);
         Some(failures)
     }
@@ -801,7 +816,7 @@ impl ConnectionHealth {
         if !self.is_current() {
             return None;
         }
-        *self.slot_client.write().unwrap() = replacement;
+        self.slot_client.store(replacement);
         self.transport_failures.store(0, Ordering::Release);
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.release_quarantine();
@@ -813,10 +828,14 @@ impl ConnectionHealth {
     }
 
     fn release_quarantine(&self) {
-        let (lock, ready) = &*self.availability;
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.quarantined.store(false, Ordering::Release);
-        ready.notify_all();
+        publish_slot_token(
+            self.slot,
+            &self.busy,
+            &self.quarantined,
+            &self.available_token,
+            &self.available_tx,
+        );
     }
 
     async fn rebuild_and_prewarm(self, prewarm_url: String, failures: usize) {
@@ -1041,15 +1060,16 @@ pub struct Permit {
     slot: usize,
     acquired_generation: u64,
     flag: Arc<AtomicBool>,
+    available_token: Arc<AtomicBool>,
     last_activity_ns: Arc<AtomicU64>,
     client: Arc<reqwest::Client>,
-    slot_client: Arc<RwLock<Arc<reqwest::Client>>>,
+    slot_client: Arc<ArcSwap<reqwest::Client>>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
-    last_rebuild: Arc<Mutex<Option<Instant>>>,
+    last_rebuild_ns: Arc<AtomicU64>,
     attempt_trace: Arc<AttemptTraceSlot>,
-    availability: Arc<(Mutex<()>, Condvar)>,
+    available_tx: Sender<usize>,
     timeout: Duration,
 }
 
@@ -1075,11 +1095,13 @@ impl Permit {
             slot: self.slot,
             generation_at_pick,
             slot_client: self.slot_client.clone(),
+            busy: self.flag.clone(),
+            available_token: self.available_token.clone(),
             quarantined: self.quarantined.clone(),
             transport_failures: self.transport_failures.clone(),
             generation: self.generation.clone(),
-            last_rebuild: self.last_rebuild.clone(),
-            availability: self.availability.clone(),
+            last_rebuild_ns: self.last_rebuild_ns.clone(),
+            available_tx: self.available_tx.clone(),
             timeout: self.timeout,
         }
     }
@@ -1096,7 +1118,7 @@ impl Permit {
     /// Current client installed in this slot. Reconcile callers use this
     /// accessor because a long batch can rebuild the slot between order GETs.
     pub fn current_client(&self) -> Arc<reqwest::Client> {
-        self.slot_client.read().unwrap().clone()
+        self.slot_client.load_full()
     }
 
     pub fn current_pooled_client(&self) -> PooledClient {
@@ -1112,17 +1134,42 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Synchronise release + notification with `RolePool::acquire`.
-        // Taking the mutex closes the classic "recheck, then sleep" lost-wake
-        // race while the atomic flag keeps the uncontended try path lock-free.
-        let (lock, ready) = &*self.availability;
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Eligibility is measured from request completion. Every permit user
         // (business and keep-warm) refreshes the same slot activity clock.
         self.last_activity_ns
             .store(activity_now_ns(), Ordering::Release);
         self.flag.store(false, Ordering::Release);
-        ready.notify_one();
+        publish_slot_token(
+            self.slot,
+            &self.flag,
+            &self.quarantined,
+            &self.available_token,
+            &self.available_tx,
+        );
+    }
+}
+
+/// Publish one connection-owner token at most once. The bounded role lane is
+/// the ownership transfer: receiving a token grants the sole right to move
+/// that physical slot to busy, and permit drop returns it.
+fn publish_slot_token(
+    slot: usize,
+    busy: &AtomicBool,
+    quarantined: &AtomicBool,
+    available_token: &AtomicBool,
+    available_tx: &Sender<usize>,
+) {
+    if busy.load(Ordering::Acquire) || quarantined.load(Ordering::Acquire) {
+        return;
+    }
+    if available_token
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && available_tx.try_send(slot).is_err()
+    {
+        // A full bounded lane indicates an invariant violation. Fail closed:
+        // clear the publication bit so a later owner transition can recover.
+        available_token.store(false, Ordering::Release);
     }
 }
 
@@ -1134,7 +1181,8 @@ struct RolePool {
     role: Role,
     slots: Vec<Slot>,
     rr: AtomicUsize, // round-robin cursor for exempt (no-permit) picks
-    availability: Arc<(Mutex<()>, Condvar)>,
+    available_tx: Sender<usize>,
+    available_rx: Receiver<usize>,
     keep_warm_inflight: Arc<AtomicBool>,
     // Admission counters per LOGICAL role sharing this pool:
     // index 0 = primary (Fast / Reconcile / GapReplay), 1 = secondary
@@ -1148,25 +1196,31 @@ struct RolePool {
 impl RolePool {
     fn new(n: usize, timeout: Duration, role: Role) -> Result<Self> {
         let n = n.max(1);
+        let (available_tx, available_rx) = crossbeam_channel::bounded(n);
         let mut slots = Vec::with_capacity(n);
         for slot in 0..n {
             slots.push(Slot {
-                client: Arc::new(RwLock::new(Arc::new(build_h1_client(timeout)?))),
+                client: Arc::new(ArcSwap::from(Arc::new(build_h1_client(timeout)?))),
                 busy: Arc::new(AtomicBool::new(false)),
+                available_token: Arc::new(AtomicBool::new(true)),
                 last_activity_ns: Arc::new(AtomicU64::new(activity_now_ns())),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 transport_failures: Arc::new(AtomicUsize::new(0)),
                 generation: Arc::new(AtomicU64::new(0)),
-                last_rebuild: Arc::new(Mutex::new(None)),
+                last_rebuild_ns: Arc::new(AtomicU64::new(0)),
                 attempt_trace: Arc::new(AttemptTraceSlot::new(role, slot)),
                 timeout,
             });
+            available_tx
+                .try_send(slot)
+                .expect("fresh connection owner lane must have capacity");
         }
         Ok(Self {
             role,
             slots,
             rr: AtomicUsize::new(0),
-            availability: Arc::new((Mutex::new(()), Condvar::new())),
+            available_tx,
+            available_rx,
             keep_warm_inflight: Arc::new(AtomicBool::new(false)),
             acquires: [AtomicU64::new(0), AtomicU64::new(0)],
             skips: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -1203,23 +1257,24 @@ impl RolePool {
             return permit;
         }
         self.waits[ctr].fetch_add(1, Ordering::Relaxed);
-        let (lock, ready) = &*self.availability;
-        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if let Some(permit) = self.try_acquire_inner(false, ctr) {
+            let slot = self
+                .available_rx
+                .recv()
+                .expect("connection owner lane disconnected");
+            if let Some(permit) = self.claim_received_slot(slot) {
+                self.acquires[ctr].fetch_add(1, Ordering::Relaxed);
                 return permit;
             }
-            guard = ready
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
     fn try_acquire_inner(&self, count_skip: bool, ctr: usize) -> Option<Permit> {
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.slots.len() {
-            let slot = (start + offset) % self.slots.len();
-            if let Some(permit) = self.try_acquire_slot(slot) {
+        for _ in 0..self.slots.len() {
+            let Ok(slot) = self.available_rx.try_recv() else {
+                break;
+            };
+            if let Some(permit) = self.claim_received_slot(slot) {
                 self.acquires[ctr].fetch_add(1, Ordering::Relaxed);
                 return Some(permit);
             }
@@ -1234,7 +1289,32 @@ impl RolePool {
     /// Used by keep-warm so round-robin eligibility cannot silently bind the
     /// probe to a different, recently active connection.
     fn try_acquire_slot(&self, slot: usize) -> Option<Permit> {
+        if slot >= self.slots.len() {
+            return None;
+        }
+        for _ in 0..self.slots.len() {
+            let Ok(candidate) = self.available_rx.try_recv() else {
+                return None;
+            };
+            if candidate == slot {
+                return self.claim_received_slot(candidate);
+            }
+            let state = &self.slots[candidate];
+            state.available_token.store(false, Ordering::Release);
+            publish_slot_token(
+                candidate,
+                &state.busy,
+                &state.quarantined,
+                &state.available_token,
+                &self.available_tx,
+            );
+        }
+        None
+    }
+
+    fn claim_received_slot(&self, slot: usize) -> Option<Permit> {
         let s = self.slots.get(slot)?;
+        s.available_token.store(false, Ordering::Release);
         if s.quarantined.load(Ordering::Acquire) {
             return None;
         }
@@ -1255,15 +1335,16 @@ impl RolePool {
             slot,
             acquired_generation,
             flag: s.busy.clone(),
+            available_token: s.available_token.clone(),
             last_activity_ns: s.last_activity_ns.clone(),
-            client: s.client.read().unwrap().clone(),
+            client: s.client.load_full(),
             slot_client: s.client.clone(),
             quarantined: s.quarantined.clone(),
             transport_failures: s.transport_failures.clone(),
             generation: s.generation.clone(),
-            last_rebuild: s.last_rebuild.clone(),
+            last_rebuild_ns: s.last_rebuild_ns.clone(),
             attempt_trace: Arc::clone(&s.attempt_trace),
-            availability: self.availability.clone(),
+            available_tx: self.available_tx.clone(),
             timeout: s.timeout,
         })
     }
@@ -1279,17 +1360,19 @@ impl RolePool {
         let state = &self.slots[slot];
         let generation = state.generation.load(Ordering::Acquire);
         PooledClient {
-            client: state.client.read().unwrap().clone(),
+            client: state.client.load_full(),
             health: ConnectionHealth {
                 role: self.role,
                 slot,
                 generation_at_pick: generation,
                 slot_client: state.client.clone(),
+                busy: state.busy.clone(),
+                available_token: state.available_token.clone(),
                 quarantined: state.quarantined.clone(),
                 transport_failures: state.transport_failures.clone(),
                 generation: state.generation.clone(),
-                last_rebuild: state.last_rebuild.clone(),
-                availability: self.availability.clone(),
+                last_rebuild_ns: state.last_rebuild_ns.clone(),
+                available_tx: self.available_tx.clone(),
                 timeout: state.timeout,
             },
             attempt_trace: Arc::clone(&state.attempt_trace),
@@ -1318,10 +1401,7 @@ impl RolePool {
     }
 
     fn clients(&self) -> Vec<Arc<reqwest::Client>> {
-        self.slots
-            .iter()
-            .map(|s| s.client.read().unwrap().clone())
-            .collect()
+        self.slots.iter().map(|s| s.client.load_full()).collect()
     }
 
     fn pooled_clients(&self) -> Vec<PooledClient> {
@@ -1973,7 +2053,10 @@ mod tests {
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_none());
-        *permit.last_rebuild.lock().unwrap() = Some(Instant::now() - Duration::from_secs(31));
+        permit.last_rebuild_ns.store(
+            activity_now_ns().saturating_sub(Duration::from_secs(31).as_nanos() as u64),
+            Ordering::Release,
+        );
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
     }
 

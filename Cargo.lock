@@ -1171,6 +1171,7 @@ name = "hexagent-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "chrono",
  "core_affinity",
  "crossbeam-channel",

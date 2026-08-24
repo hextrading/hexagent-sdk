@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
 futures-util = "0.3"
 crossbeam-channel = "0.5"
+arc-swap = "1"
 hdrhistogram = { version = "7", default-features = false }
 quanta = "0.12"
 core_affinity = "0.8"

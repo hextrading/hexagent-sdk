@@ -18,7 +18,7 @@ pub mod pyth;
 pub mod sim;
 pub mod sim_v2;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,9 +81,7 @@ impl PublicMarketReceiver {
         event
     }
 
-    pub fn try_recv(
-        &self,
-    ) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
+    pub fn try_recv(&self) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
         if self.ordered_burst.load(Ordering::Relaxed) >= PUBLIC_MARKET_ORDERED_BURST {
             if let Some(event) = self.latest.pop() {
                 self.ordered_burst.store(0, Ordering::Relaxed);
@@ -158,9 +156,7 @@ impl Drop for PublicMarketReceiver {
     }
 }
 
-pub fn market_event_channel(
-    capacity: usize,
-) -> (PublicMarketPublisher, PublicMarketReceiver) {
+pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMarketReceiver) {
     market_event_channel_inner(capacity, true)
 }
 
@@ -235,9 +231,8 @@ impl PublicMarketPublisher {
 pub const PRIVATE_UPDATE_LANE_CAPACITY: usize = 4096;
 
 /// Replaceable control state for a [`PrivateUpdateLane`]. Connectivity changes
-/// are informational. `Overflow` is terminal for the current feed generation:
-/// at least one non-replayable lifecycle event could not be admitted, so the
-/// strategy owner must fail closed until an authoritative reconciliation.
+/// are informational. `Overflow` is retained for wire/source compatibility;
+/// current producers backpressure at capacity and never emit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateFeedControl {
     Connected(Exchange),
@@ -250,9 +245,9 @@ pub enum PrivateFeedControl {
 /// Ownership and recovery semantics:
 /// - one async authenticated feed task publishes FIFO `OrderUpdate`s;
 /// - exactly one strategy thread consumes and mutates its private account;
-/// - `updates` is lossless while capacity is available and never blocks Tokio;
-/// - on capacity exhaustion the producer publishes `Overflow`, stops, and the
-///   owner must cancel/fail closed because these venues have no gap replay;
+/// - `updates` is lossless; at capacity the async producer retains the exact
+///   update and yields until the owner accepts it, naturally backpressuring the
+///   authenticated websocket rather than consuming and discarding more data;
 /// - dropping the lane requests feed shutdown.
 pub struct PrivateUpdateLane {
     pub updates: crossbeam_channel::Receiver<OrderUpdate>,
@@ -280,16 +275,23 @@ pub(crate) struct PrivateUpdatePublisher {
     updates: crossbeam_channel::Sender<OrderUpdate>,
     control: crossbeam_channel::Sender<PrivateFeedControl>,
     control_replace: crossbeam_channel::Receiver<PrivateFeedControl>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl PrivateUpdatePublisher {
-    pub(crate) fn publish(&self, update: OrderUpdate) -> bool {
-        match self.updates.try_send(update) {
-            Ok(()) => true,
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                self.publish_control(PrivateFeedControl::Overflow(self.exchange));
-                false
+    pub(crate) async fn publish(&self, mut update: OrderUpdate) -> bool {
+        loop {
+            match self.updates.try_send(update) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
+                Err(crossbeam_channel::TrySendError::Full(retained)) => {
+                    update = retained;
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    hexagent_runtime::latency::record_ns("private_update.producer_backpressure", 1);
+                    tokio::time::sleep(Duration::from_micros(50)).await;
+                }
             }
         }
     }
@@ -327,6 +329,7 @@ pub(crate) fn private_update_lane(
             updates: update_tx,
             control: control_tx,
             control_replace: control_rx.clone(),
+            shutdown: Arc::clone(&shutdown),
         },
         PrivateUpdateLane {
             updates: update_rx,
@@ -455,12 +458,7 @@ impl AtomicRateLimiter {
 
     #[inline]
     pub(crate) fn try_acquire(&self) -> bool {
-        self.try_acquire_at(
-            self.origin
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
-        )
+        self.try_acquire_at(self.origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
     }
 
     pub(crate) fn max_per_second(&self) -> u32 {
@@ -869,19 +867,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn private_lane_is_fifo_and_overflow_is_terminal_control_state() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn private_lane_is_fifo_and_full_head_is_retained() {
         let (publisher, lane) = private_update_lane(Exchange::Hyperliquid);
         publisher.connected();
         for sequence in 0..PRIVATE_UPDATE_LANE_CAPACITY {
-            assert!(publisher.publish(private_update(sequence)));
+            assert!(publisher.publish(private_update(sequence)).await);
         }
-        assert!(!publisher.publish(private_update(PRIVATE_UPDATE_LANE_CAPACITY)));
+        let (published, first) = tokio::join!(
+            publisher.publish(private_update(PRIVATE_UPDATE_LANE_CAPACITY)),
+            async {
+                tokio::task::yield_now().await;
+                lane.updates.try_recv().unwrap()
+            },
+        );
+        assert!(published);
+        assert_eq!(first.client_order_id, "private-0");
         assert_eq!(
             lane.control.try_recv(),
-            Ok(PrivateFeedControl::Overflow(Exchange::Hyperliquid)),
+            Ok(PrivateFeedControl::Connected(Exchange::Hyperliquid)),
         );
-        for sequence in 0..PRIVATE_UPDATE_LANE_CAPACITY {
+        for sequence in 1..=PRIVATE_UPDATE_LANE_CAPACITY {
             assert_eq!(
                 lane.updates.try_recv().unwrap().client_order_id,
                 format!("private-{sequence}"),
@@ -1072,10 +1078,7 @@ mod tests {
                 exchange: Exchange::Binance
             })
         ));
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(MarketEvent::SpotPrice(_))
-        ));
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::SpotPrice(_))));
     }
 
     #[test]
@@ -1108,10 +1111,7 @@ mod tests {
                 Ok(MarketEvent::Connected { .. })
             ));
         }
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(MarketEvent::SpotPrice(_))
-        ));
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::SpotPrice(_))));
     }
 
     #[test]
