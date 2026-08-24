@@ -347,10 +347,6 @@ impl OrderManager {
             LocalOrderStatus::Submitted => {
                 if self.cancel_intents.insert(client_order_id.to_string()) {
                     self.cancel_before_ack_count = self.cancel_before_ack_count.saturating_add(1);
-                    log::debug!(
-                        "[orphan_metric] cancel_before_ack=1 cancel_before_ack_total={} symbol={} coid={} state=Submitted",
-                        self.cancel_before_ack_count, self.symbol, client_order_id,
-                    );
                 }
                 None
             }
@@ -669,23 +665,73 @@ impl OrderManager {
     /// orders park a cancel intent until their first exchange result, avoiding
     /// DELETE overtaking POST. Used by the hard-position-cap enforcer.
     pub fn cancel_orders_by_side(&mut self, side: Side, ts_event: u64) -> Vec<Signal> {
-        let coids: Vec<String> = self
-            .cancelable_order_ids
-            .iter()
-            .filter(|coid| {
-                self.orders
-                    .get(*coid)
-                    .is_some_and(|order| order.side == side)
-            })
-            .cloned()
-            .collect();
-        let mut signals = Vec::with_capacity(coids.len());
-        for coid in coids {
-            if let Some(signal) = self.request_cancel(&coid, ts_event) {
+        let mut signals = Vec::new();
+        let result: Result<(), std::convert::Infallible> =
+            self.cancel_orders_by_side_with(side, ts_event, |signal| {
                 signals.push(signal);
+                Ok(())
+            });
+        debug_assert!(result.is_ok());
+        signals
+    }
+
+    /// Ownership-local cancellation walk for strategy-owner scratch.
+    ///
+    /// The strategy thread temporarily takes ownership of the cancelable
+    /// index. That permits mutation of the order table without cloning every
+    /// coid into a temporary `Vec` (or repeatedly rescanning the BTree). Items
+    /// on the other side and any unvisited tail after an output error are
+    /// restored before returning.
+    pub fn cancel_orders_by_side_with<E>(
+        &mut self,
+        side: Side,
+        ts_event: u64,
+        mut emit: impl FnMut(Signal) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut pending = std::mem::take(&mut self.cancelable_order_ids);
+        while let Some(coid) = pending.pop_first() {
+            let status = self
+                .orders
+                .get(&coid)
+                .map(|order| (order.side, order.status));
+            let Some((order_side, status)) = status else {
+                continue;
+            };
+            if order_side != side {
+                self.cancelable_order_ids.insert(coid);
+                continue;
+            }
+            match status {
+                LocalOrderStatus::Submitted => {
+                    if self.cancel_intents.insert(coid.clone()) {
+                        self.cancel_before_ack_count =
+                            self.cancel_before_ack_count.saturating_add(1);
+                    }
+                    self.cancelable_order_ids.insert(coid);
+                }
+                LocalOrderStatus::Active => {
+                    self.cancel_intents.remove(&coid);
+                    if let Some(order) = self.orders.get_mut(&coid) {
+                        order.status = LocalOrderStatus::Cancelling;
+                    }
+                    let signal = Signal::CancelOrder {
+                        exchange: self.exchange,
+                        client_order_id: coid,
+                        instance_id: self.instance_id.clone(),
+                        timestamp_ns: ts_event,
+                    };
+                    if let Err(error) = emit(signal) {
+                        self.cancelable_order_ids.append(&mut pending);
+                        return Err(error);
+                    }
+                }
+                LocalOrderStatus::Cancelling
+                | LocalOrderStatus::Rejected
+                | LocalOrderStatus::Cancelled
+                | LocalOrderStatus::Matched => {}
             }
         }
-        signals
+        Ok(())
     }
 
     /// Total quantity locked by active sell orders. `Cancelling` is
@@ -779,9 +825,25 @@ impl OrderManager {
     /// drain (BUY cancels then SELL cancels, BTreeMap order). Used by polymaker
     /// to pull all resting orders at event expiry / settlement.
     pub fn cancel_all(&mut self, ts_event: u64) -> Vec<Signal> {
-        let mut signals = self.cancel_orders_by_side(Side::Buy, ts_event);
-        signals.extend(self.cancel_orders_by_side(Side::Sell, ts_event));
+        let mut signals = Vec::new();
+        let result: Result<(), std::convert::Infallible> =
+            self.cancel_all_with(ts_event, |signal| {
+                signals.push(signal);
+                Ok(())
+            });
+        debug_assert!(result.is_ok());
         signals
+    }
+
+    /// Callback peer of [`Self::cancel_all`] used by fixed strategy output
+    /// buffers. BUY-before-SELL and BTree ordering remain identical.
+    pub fn cancel_all_with<E>(
+        &mut self,
+        ts_event: u64,
+        mut emit: impl FnMut(Signal) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.cancel_orders_by_side_with(Side::Buy, ts_event, &mut emit)?;
+        self.cancel_orders_by_side_with(Side::Sell, ts_event, emit)
     }
 
     /// Snapshot the maker-policy knobs for the reconcile primitive. Lets the
@@ -1043,6 +1105,137 @@ mod tests {
             m.live_count(Side::Buy),
             1,
             "Cancelled excludes b → live back to 1"
+        );
+    }
+
+    #[test]
+    fn fixed_cancel_walk_preserves_order_above_legacy_chunk() {
+        let mut manager = om();
+        for index in 0..514 {
+            manager.inject_open_order(
+                format!("order-{index:03}"),
+                if index % 2 == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                },
+                0.40,
+                5.0,
+            );
+        }
+        let mut cancelled = Vec::new();
+        manager
+            .cancel_all_with(2, |signal| {
+                if let Signal::CancelOrder {
+                    client_order_id, ..
+                } = signal
+                {
+                    cancelled.push(client_order_id);
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(cancelled.len(), 514);
+        assert!(cancelled[..257].windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(cancelled[257..].windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(manager.active_count(), 0);
+        assert_eq!(manager.live_count(Side::Buy), 257);
+        assert_eq!(manager.live_count(Side::Sell), 257);
+    }
+
+    #[test]
+    fn fixed_cancel_walk_restores_unvisited_tail_after_sink_overflow() {
+        let mut manager = om();
+        for index in 0..6 {
+            manager.inject_open_order(
+                format!("order-{index}"),
+                Side::Buy,
+                0.40,
+                5.0,
+            );
+        }
+        let mut emitted = 0usize;
+        let result = manager.cancel_orders_by_side_with(Side::Buy, 2, |_signal| {
+            emitted += 1;
+            (emitted < 3).then_some(()).ok_or("full")
+        });
+        assert_eq!(result, Err("full"));
+        assert_eq!(emitted, 3);
+        assert_eq!(manager.active_count(), 3, "unvisited tail remains cancelable");
+        assert_eq!(manager.live_count(Side::Buy), 6, "sent and unsent cancels stay live");
+
+        let mut retried = Vec::new();
+        manager
+            .cancel_orders_by_side_with(Side::Buy, 3, |signal| {
+                retried.push(signal);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(retried.len(), 3);
+        assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn fixed_cancel_walk_tail_latency_profile() {
+        const EVENTS: usize = 256;
+        const ORDERS: usize = 130;
+        fn populated() -> OrderManager {
+            let mut manager = om();
+            for index in 0..ORDERS {
+                manager.inject_open_order(
+                    format!("order-{index:03}"),
+                    if index % 2 == 0 {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    },
+                    0.40,
+                    5.0,
+                );
+            }
+            manager
+        }
+        fn profile(mut samples: Vec<u64>) -> (u64, u64, u64, u64) {
+            samples.sort_unstable();
+            let at = |n: usize, d: usize| samples[(samples.len() - 1) * n / d];
+            (
+                at(1, 2),
+                at(99, 100),
+                at(999, 1_000),
+                samples[samples.len() - 1],
+            )
+        }
+
+        let mut fixed = Vec::with_capacity(EVENTS);
+        let mut allocated = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let mut manager = populated();
+            let started = std::time::Instant::now();
+            manager
+                .cancel_all_with(2, |_signal| Ok::<(), ()>(()))
+                .unwrap();
+            fixed.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+
+            let mut manager = populated();
+            let started = std::time::Instant::now();
+            for side in [Side::Buy, Side::Sell] {
+                let coids: Vec<String> = manager
+                    .cancelable_order_ids
+                    .iter()
+                    .filter(|coid| manager.orders[*coid].side == side)
+                    .cloned()
+                    .collect();
+                for coid in coids {
+                    let _ = manager.request_cancel(&coid, 2);
+                }
+            }
+            allocated.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let (p50, p99, p999, max) = profile(fixed);
+        let (old_p50, old_p99, old_p999, old_max) = profile(allocated);
+        eprintln!(
+            "fixed-cancel-walk: boundary=130_order_cancel_emit events={} p50_ns={} p99_ns={} p999_ns={} max_ns={} baseline_alloc_p50_ns={} baseline_alloc_p99_ns={} baseline_alloc_p999_ns={} baseline_alloc_max_ns={} queue_depth=0 overflow=0",
+            EVENTS, p50, p99, p999, max, old_p50, old_p99, old_p999, old_max,
         );
     }
 

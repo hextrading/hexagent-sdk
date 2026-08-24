@@ -41,6 +41,13 @@ const POLY_RECONCILE_OWNER_QUEUE_CAPACITY: usize = 32;
 const POLY_CANCEL_OUTBOX_CAPACITY: usize = 4_096;
 const POLY_SAFETY_CANCEL_OUTBOX_CAPACITY: usize = 1_024;
 const POLY_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
+const VENUE_FAST_OWNER_QUEUE_CAPACITY: usize = 64;
+const VENUE_CANCEL_OWNER_QUEUE_CAPACITY: usize = 4_096;
+const VENUE_COMPLETION_OUTBOX_CAPACITY: usize = 8_192;
+const EXECUTION_DIAGNOSTIC_CAPACITY: usize = 1_024;
+// Per-strategy lossless lifecycle spool. It is allocated once by the router;
+// overflow quarantines only that owner and relies on private replay/reconcile.
+const LIFECYCLE_OWNER_OUTBOX_CAPACITY: usize = CHANNEL_CAPACITY;
 // Four account updates keep fill/cancel feedback responsive while bounding
 // the time an already-enqueued market trigger can sit behind the biased lane.
 // At the private-apply target (<=1 ms p95), 32 permitted a 32 ms quote stall.
@@ -63,6 +70,52 @@ const POLY_ROTATION_GRACE_NS: u64 = 3_000_000_000;
 const POLY_REPLACEMENT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS: u32 = 3;
 const MEMORY_TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug)]
+enum ExecutionDiagnostic {
+    VenueFailure {
+        exchange: Exchange,
+        operation: &'static str,
+        detail: String,
+    },
+    FixedLifecycleOverflow {
+        client_order_id: String,
+    },
+}
+
+#[inline]
+fn try_submit_execution_diagnostic(
+    sender: &Sender<ExecutionDiagnostic>,
+    diagnostic: ExecutionDiagnostic,
+) {
+    if sender.try_send(diagnostic).is_err() {
+        crate::latency::record_ns("execution.diagnostic.overflow", 1);
+    }
+}
+
+fn spawn_execution_diagnostics(
+    receiver: Receiver<ExecutionDiagnostic>,
+) -> Result<thread::JoinHandle<()>> {
+    Ok(thread::Builder::new()
+        .name("execution-diagnostics".into())
+        .spawn(move || {
+            crate::os_tune::pin_background("execution-diagnostics");
+            while let Ok(diagnostic) = receiver.recv() {
+                match diagnostic {
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation,
+                        detail,
+                    } => error!(
+                        "[Executor] venue={exchange:?} operation={operation} failed: {detail}"
+                    ),
+                    ExecutionDiagnostic::FixedLifecycleOverflow { client_order_id } => error!(
+                        "[Executor] fixed lifecycle scratch overflow coid={client_order_id}"
+                    ),
+                }
+            }
+        })?)
+}
 
 fn spawn_memory_telemetry(shutdown_token: ShutdownToken) -> Result<thread::JoinHandle<()>> {
     let shutdown_rx = shutdown_token.subscribe();
@@ -481,7 +534,10 @@ fn spawn_polymarket_feed_worker(
     thread::Builder::new()
         .name(format!("feed-polymarket-{}", epoch.generation))
         .spawn(move || {
-            crate::os_tune::pin_execution("feed-polymarket");
+            crate::os_tune::pin_execution_role(
+                "feed-polymarket",
+                crate::os_tune::ExecutionThreadRole::Feed,
+            );
             let liveness = epoch.liveness;
             let generation = epoch.generation;
             let force_clob_runtime_fallback = epoch.force_clob_runtime_fallback;
@@ -2081,20 +2137,125 @@ struct QueuedOrderUpdate {
 }
 
 #[derive(Debug)]
-struct PendingLifecycleDelivery {
-    owner: usize,
-    queued: QueuedOrderUpdate,
-}
-
-#[derive(Debug)]
 struct LifecycleRouteFailure {
     owner: Option<usize>,
     queued: QueuedOrderUpdate,
     reason: &'static str,
 }
 
-type LifecycleRouteResult =
-    std::result::Result<Option<PendingLifecycleDelivery>, LifecycleRouteFailure>;
+type LifecycleRouteResult = std::result::Result<(), LifecycleRouteFailure>;
+
+struct LifecycleOwnerOutboxes {
+    queues: Vec<VecDeque<QueuedOrderUpdate>>,
+    next_owner: usize,
+}
+
+impl LifecycleOwnerOutboxes {
+    fn new(owner_count: usize) -> Self {
+        Self {
+            queues: (0..owner_count)
+                .map(|_| VecDeque::with_capacity(LIFECYCLE_OWNER_OUTBOX_CAPACITY))
+                .collect(),
+            next_owner: 0,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.queues.iter().any(|queue| !queue.is_empty())
+    }
+
+    fn push(&mut self, owner: usize, queued: QueuedOrderUpdate) -> LifecycleRouteResult {
+        let Some(queue) = self.queues.get_mut(owner) else {
+            return Err(LifecycleRouteFailure {
+                owner: Some(owner),
+                queued,
+                reason: "invalid lifecycle owner outbox index",
+            });
+        };
+        if queue.len() >= LIFECYCLE_OWNER_OUTBOX_CAPACITY {
+            return Err(LifecycleRouteFailure {
+                owner: Some(owner),
+                queued,
+                reason: "lifecycle owner outbox overflow",
+            });
+        }
+        queue.push_back(queued);
+        Ok(())
+    }
+
+    fn try_flush_one(&mut self, update_txs: &[Sender<QueuedOrderUpdate>]) -> LifecycleRouteResult {
+        if self.queues.is_empty() {
+            return Ok(());
+        }
+        for offset in 0..self.queues.len() {
+            let owner = (self.next_owner + offset) % self.queues.len();
+            let Some(queued) = self.queues[owner].pop_front() else {
+                continue;
+            };
+            self.next_owner = (owner + 1) % self.queues.len();
+            let Some(tx) = update_txs.get(owner) else {
+                return Err(LifecycleRouteFailure {
+                    owner: Some(owner),
+                    queued,
+                    reason: "invalid lifecycle owner index during outbox flush",
+                });
+            };
+            return match tx.try_send(queued) {
+                Ok(()) => Ok(()),
+                Err(crossbeam_channel::TrySendError::Full(queued)) => {
+                    self.queues[owner].push_front(queued);
+                    Ok(())
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(queued)) => {
+                    Err(LifecycleRouteFailure {
+                        owner: Some(owner),
+                        queued,
+                        reason: "lifecycle target disconnected during outbox flush",
+                    })
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn discard_owner_after_quarantine(&mut self, owner: usize) {
+        if let Some(queue) = self.queues.get_mut(owner) {
+            let replay_required = queue.len();
+            queue.clear();
+            if replay_required > 0 {
+                hexagent_runtime::latency::record_ns(
+                    "strategy.private_update.quarantine_replay_required",
+                    replay_required as u64,
+                );
+            }
+        }
+    }
+
+    fn flush_all_blocking(
+        &mut self,
+        update_txs: &[Sender<QueuedOrderUpdate>],
+    ) -> LifecycleRouteResult {
+        for owner in 0..self.queues.len() {
+            while let Some(queued) = self.queues[owner].pop_front() {
+                let Some(tx) = update_txs.get(owner) else {
+                    return Err(LifecycleRouteFailure {
+                        owner: Some(owner),
+                        queued,
+                        reason: "invalid lifecycle owner index during shutdown drain",
+                    });
+                };
+                if let Err(error) = tx.send(queued) {
+                    return Err(LifecycleRouteFailure {
+                        owner: Some(owner),
+                        queued: error.0,
+                        reason: "lifecycle target disconnected during shutdown drain",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 struct HistoricalLoadJob {
     epoch: u64,
@@ -2235,7 +2396,10 @@ fn spawn_strategy_signal_arbiter(
         thread::Builder::new()
             .name("strategy-signal-arbiter".into())
             .spawn(move || {
-                crate::os_tune::pin_execution("strategy-signal-arbiter");
+                crate::os_tune::pin_execution_role(
+                    "strategy-signal-arbiter",
+                    crate::os_tune::ExecutionThreadRole::Dispatcher,
+                );
                 // The system sender owns every producer for the arbiter's
                 // lifetime, so channels cannot disappear before Exit. Build
                 // the selector once at startup: no per-signal registration or
@@ -7146,30 +7310,21 @@ impl Engine {
                     crossbeam_channel::tick(std::time::Duration::from_micros(50));
                 let never_lifecycle_retry_rx =
                     crossbeam_channel::never::<std::time::Instant>();
-                let mut pending_lifecycle: Option<PendingLifecycleDelivery> = None;
+                let mut lifecycle_outboxes = LifecycleOwnerOutboxes::new(instance_ids.len());
                 let market_ready_rx = market_rx.ready_receiver().clone();
                 'router: loop {
-                    if let Some(pending) = pending_lifecycle.take() {
-                        match enqueue_lifecycle_delivery(
-                            pending.owner,
-                            pending.queued,
-                            &update_txs,
+                    if let Err(failure) = lifecycle_outboxes.try_flush_one(&update_txs) {
+                        if handle_lifecycle_route_failure(
+                            &failure,
+                            &instance_ids,
                             &worker_quarantined,
+                            &signal_tx,
+                            &mut lifecycle_outboxes,
                         ) {
-                            Ok(next) => pending_lifecycle = next,
-                            Err(failure) => {
-                                quarantine_lifecycle_failure(
-                                    &failure,
-                                    &instance_ids,
-                                    &worker_quarantined,
-                                    &signal_tx,
-                                );
-                                break 'router;
-                            }
+                            break 'router;
                         }
                     }
-                    let lifecycle_backpressured = pending_lifecycle.is_some();
-                    let selectable_lifecycle_retry_rx = if lifecycle_backpressured {
+                    let selectable_lifecycle_retry_rx = if lifecycle_outboxes.has_pending() {
                         &lifecycle_retry_tick
                     } else {
                         &never_lifecycle_retry_rx
@@ -7178,7 +7333,7 @@ impl Engine {
                     // than replaceable market data. Bound the priority burst
                     // so a pathological update storm still permits one public
                     // event, then immediately return to private-first routing.
-                    let selectable_update_rx = if !lifecycle_backpressured && private_update_lane_enabled(
+                    let selectable_update_rx = if private_update_lane_enabled(
                         root_private_update_burst,
                         !market_rx.is_empty(),
                     ) {
@@ -7186,7 +7341,7 @@ impl Engine {
                     } else {
                         &never_root_update_rx
                     };
-                    let selectable_executor_update_rx = if !lifecycle_backpressured && private_update_lane_enabled(
+                    let selectable_executor_update_rx = if private_update_lane_enabled(
                         root_private_update_burst,
                         !market_rx.is_empty(),
                     ) {
@@ -7206,13 +7361,16 @@ impl Engine {
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
+                                    &mut lifecycle_outboxes,
                                 ) {
-                                    Ok(next) => pending_lifecycle = next,
+                                    Ok(()) => {},
                                     Err(failure) => {
-                                        quarantine_lifecycle_failure(
+                                        if handle_lifecycle_route_failure(
                                             &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
+                                            &mut lifecycle_outboxes,
+                                        ) {
+                                            break 'router;
+                                        }
                                     }
                                 }
                             }
@@ -7227,13 +7385,16 @@ impl Engine {
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
+                                    &mut lifecycle_outboxes,
                                 ) {
-                                    Ok(next) => pending_lifecycle = next,
+                                    Ok(()) => {},
                                     Err(failure) => {
-                                        quarantine_lifecycle_failure(
+                                        if handle_lifecycle_route_failure(
                                             &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
+                                            &mut lifecycle_outboxes,
+                                        ) {
+                                            break 'router;
+                                        }
                                     }
                                 }
                             }
@@ -7334,15 +7495,11 @@ impl Engine {
                                 // enqueued, but select may see this independent
                                 // channel first. Drain the root tail into the
                                 // same lossless per-instance spools.
-                                if let Some(pending) = pending_lifecycle.take() {
-                                    if let Err(failure) = flush_pending_lifecycle(
-                                        pending, &update_txs,
-                                    ) {
-                                        quarantine_lifecycle_failure(
-                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
-                                    }
+                                if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
+                                    quarantine_lifecycle_failure(
+                                        &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                    );
+                                    break 'router;
                                 }
                                 while let Ok(u) = update_rx.try_recv() {
                                     let result = Self::route_private_update(
@@ -7350,10 +7507,9 @@ impl Engine {
                                         &iid_to_idx,
                                         &update_txs,
                                         &worker_quarantined,
+                                        &mut lifecycle_outboxes,
                                     );
-                                    if let Err(failure) = flush_lifecycle_route_result(
-                                        result, &update_txs,
-                                    ) {
+                                    if let Err(failure) = result {
                                         quarantine_lifecycle_failure(
                                             &failure, &instance_ids, &worker_quarantined, &signal_tx,
                                         );
@@ -7366,15 +7522,19 @@ impl Engine {
                                         &iid_to_idx,
                                         &update_txs,
                                         &worker_quarantined,
+                                        &mut lifecycle_outboxes,
                                     );
-                                    if let Err(failure) = flush_lifecycle_route_result(
-                                        result, &update_txs,
-                                    ) {
+                                    if let Err(failure) = result {
                                         quarantine_lifecycle_failure(
                                             &failure, &instance_ids, &worker_quarantined, &signal_tx,
                                         );
                                         break 'router;
                                     }
+                                }
+                                if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
+                                    quarantine_lifecycle_failure(
+                                        &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                    );
                                 }
                                 break 'router;
                             }
@@ -7458,6 +7618,7 @@ impl Engine {
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
+        lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
         if routed.owner == SYSTEM_SIGNAL_OWNER {
             // Account-wide shutdown/recovery operations are not emitted by a
@@ -7468,6 +7629,7 @@ impl Engine {
                 iid_to_idx,
                 update_txs,
                 worker_quarantined,
+                lifecycle_outboxes,
             );
         }
         let owner = routed.owner as usize;
@@ -7480,6 +7642,7 @@ impl Engine {
             },
             update_txs,
             worker_quarantined,
+            lifecycle_outboxes,
         )
     }
 
@@ -7488,6 +7651,7 @@ impl Engine {
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
+        lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
         if routed.owner == SYSTEM_SIGNAL_OWNER {
             return Self::route_private_update_with_source(
@@ -7496,6 +7660,7 @@ impl Engine {
                 iid_to_idx,
                 update_txs,
                 worker_quarantined,
+                lifecycle_outboxes,
             );
         }
         enqueue_lifecycle_delivery(
@@ -7507,6 +7672,7 @@ impl Engine {
             },
             update_txs,
             worker_quarantined,
+            lifecycle_outboxes,
         )
     }
 
@@ -7516,13 +7682,14 @@ impl Engine {
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
+        lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
         // RTT probes reserve/release their synthetic orders directly in the
         // shared monitoring account.  Their executor-style acknowledgements
         // deliberately have no numeric strategy owner and must not enter (or
         // contaminate the latency metrics of) the lossless strategy lane.
         if is_synthetic_probe_update(&update) {
-            return Ok(None);
+            return Ok(());
         }
         // Polymarket execution completions and private owner-fast routing stamp
         // OrderUpdate with a local wall-clock timestamp. Reject stale/exchange
@@ -7556,6 +7723,7 @@ impl Engine {
                 },
                 update_txs,
                 worker_quarantined,
+                lifecycle_outboxes,
             ),
             PrivateUpdateRoute::DropQuarantined(i) => Err(LifecycleRouteFailure {
                 owner: Some(i),
@@ -7786,6 +7954,7 @@ impl Engine {
         // OS thread. Results still return to this sole strategy writer.
         let (hist_result_tx, hist_result_rx) = bounded::<HistoricalLoadResult>(8);
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
+        crate::strategy::prepare_strategy_span(instance_id);
         crate::latency::prepare_thread_stages(&[
             "strategy.market.queue",
             "strategy.market.callback",
@@ -7794,6 +7963,7 @@ impl Engine {
             "strategy.watchdog.callback",
             "strategy.private_feed.callback",
         ]);
+        crate::latency::prepare_thread_stages(strategy.latency_stages());
         // The sender is permanently tagged with this worker's numeric owner.
         // Normal traffic is non-blocking; overflow quarantines only this owner
         // and submits an emergency cancel on the independent control lane.
@@ -8436,7 +8606,10 @@ impl Engine {
             let handle = thread::Builder::new()
                 .name(format!("feed-{}", cfg.name))
                 .spawn(move || {
-                    crate::os_tune::pin_execution(&format!("feed-{}", cfg.name));
+                    crate::os_tune::pin_execution_role(
+                        &format!("feed-{}", cfg.name),
+                        crate::os_tune::ExecutionThreadRole::Feed,
+                    );
                     if let Some(liveness) = polymarket_liveness.as_ref() {
                         liveness.set_phase(PolymarketFeedPhase::Starting);
                         liveness.heartbeat_feed_loop();
@@ -10160,14 +10333,23 @@ impl Engine {
         thread::Builder::new()
             .name("execution".into())
             .spawn(move || {
-                crate::os_tune::pin_execution("execution");
+                crate::os_tune::pin_execution_role(
+                    "execution",
+                    crate::os_tune::ExecutionThreadRole::Dispatcher,
+                );
                 crate::latency::prepare_polymarket_order_stages();
                 let execution_shutdown_rx = shutdown_token.subscribe();
+                let (execution_diagnostic_tx, execution_diagnostic_rx) =
+                    bounded::<ExecutionDiagnostic>(EXECUTION_DIAGNOSTIC_CAPACITY);
+                let execution_diagnostic_handle =
+                    spawn_execution_diagnostics(execution_diagnostic_rx)
+                        .expect("spawn execution diagnostics");
                 let hex_cfg = config.exchanges.iter().find(|e| e.name == "hexmarket");
                 let mut instance_pools: HashMap<
                     String,
                     Vec<Sender<(Signal, ExecutorUpdateSender)>>,
                 > = HashMap::new();
+                let mut hex_worker_handles = Vec::<thread::JoinHandle<()>>::new();
 
                 // Gate Hexmarket execution workers via the pre-computed
                 // capability flags (needs_hex_workers), not a strategy name.
@@ -10201,27 +10383,43 @@ impl Engine {
                     let trade = HexmarketTrade::new(&pk, &mn, &api, rate_limit);
                     info!("[Executor] Instance '{}': creating {} workers", instance_id, hex_max_connections);
 
-                    let pool: Vec<Sender<(Signal, ExecutorUpdateSender)>> = (0..hex_max_connections)
-                        .map(|i| {
-                            let mut worker = trade.clone_worker();
-                            let inst_id = instance_id.clone();
-                            let (tx, rx) = bounded::<(Signal, ExecutorUpdateSender)>(64);
-                            let worker_name = format!("{}-worker-{}", inst_id, i);
-                            thread::Builder::new()
-                                .name(worker_name.clone())
-                                .spawn(move || {
-                                    crate::os_tune::pin_execution(&worker_name);
-                                    while let Ok((signal, update_tx)) = rx.recv() {
-                                        let updates = execute_hex_signal(&mut worker, signal);
-                                        for update in updates {
-                                            let _ = send_executor_update(&update_tx, update);
-                                        }
+                    let mut pool = Vec::<Sender<(Signal, ExecutorUpdateSender)>>::with_capacity(
+                        hex_max_connections,
+                    );
+                    for i in 0..hex_max_connections {
+                        let mut worker = trade.clone_worker();
+                        let inst_id = instance_id.clone();
+                        let diagnostics = execution_diagnostic_tx.clone();
+                        let (tx, rx) = bounded::<(Signal, ExecutorUpdateSender)>(64);
+                        let worker_name = format!("{}-worker-{}", inst_id, i);
+                        let handle = thread::Builder::new()
+                            .name(worker_name.clone())
+                            .spawn(move || {
+                                crate::os_tune::pin_execution_role(
+                                    &worker_name,
+                                    crate::os_tune::ExecutionThreadRole::HexWorker,
+                                );
+                                crate::latency::prepare_thread_stages(&[
+                                    "execution.diagnostic.overflow",
+                                ]);
+                                while let Ok((signal, update_tx)) = rx.recv() {
+                                    let mut updates = OrderUpdateBatch::new();
+                                    execute_venue_signal_into(
+                                        &mut worker,
+                                        signal,
+                                        150,
+                                        &mut updates,
+                                        &diagnostics,
+                                    );
+                                    for update in updates.drain(..) {
+                                        let _ = send_executor_update(&update_tx, update);
                                     }
-                                })
-                                .unwrap();
-                            tx
-                        })
-                        .collect();
+                                }
+                            })
+                            .unwrap();
+                        pool.push(tx);
+                        hex_worker_handles.push(handle);
+                    }
 
                     instance_pools.insert(instance_id, pool);
                 }
@@ -10230,7 +10428,56 @@ impl Engine {
                 // PolymarketTrade routes. `poly_route_mut(instance_id)`
                 // dispatches each signal to the matching SharedState's
                 // auth/signer.
-                let mut fallback = LiveRouter::new_with_poly_map(&config, &poly_states);
+                let fallback = LiveRouter::new_with_poly_map(&config, &poly_states);
+                let LiveRouter {
+                    binance,
+                    poly_routes: _,
+                    polymarket: _,
+                    hexmarket: _,
+                    hyperliquid,
+                    aster,
+                    lighter,
+                } = fallback;
+                let mut venue_execution_routes = HashMap::<Exchange, VenueExecutionRoutes>::new();
+                let mut venue_execution_handles = Vec::<thread::JoinHandle<()>>::new();
+                let (route, handles) = spawn_venue_execution_owner(
+                    Exchange::Binance,
+                    binance,
+                    update_tx.clone(),
+                    execution_diagnostic_tx.clone(),
+                );
+                venue_execution_routes.insert(Exchange::Binance, route);
+                venue_execution_handles.extend(handles);
+                if let Some(worker) = hyperliquid {
+                    let (route, handles) = spawn_venue_execution_owner(
+                        Exchange::Hyperliquid,
+                        worker,
+                        update_tx.clone(),
+                        execution_diagnostic_tx.clone(),
+                    );
+                    venue_execution_routes.insert(Exchange::Hyperliquid, route);
+                    venue_execution_handles.extend(handles);
+                }
+                if let Some(worker) = aster {
+                    let (route, handles) = spawn_venue_execution_owner(
+                        Exchange::Aster,
+                        worker,
+                        update_tx.clone(),
+                        execution_diagnostic_tx.clone(),
+                    );
+                    venue_execution_routes.insert(Exchange::Aster, route);
+                    venue_execution_handles.extend(handles);
+                }
+                if let Some(worker) = lighter {
+                    let (route, handles) = spawn_venue_execution_owner(
+                        Exchange::Lighter,
+                        worker,
+                        update_tx.clone(),
+                        execution_diagnostic_tx.clone(),
+                    );
+                    venue_execution_routes.insert(Exchange::Lighter, route);
+                    venue_execution_handles.extend(handles);
+                }
 
                 // Bind every Fast/Cancel/Reconcile physical slot before
                 // accepting a signal.  One SPSC-style bounded lane and one
@@ -10268,7 +10515,10 @@ impl Engine {
                         let handle = thread::Builder::new()
                             .name(thread_name.clone())
                             .spawn(move || {
-                                crate::os_tune::pin_execution(&thread_name);
+                                crate::os_tune::pin_execution_role(
+                                    &thread_name,
+                                    crate::os_tune::ExecutionThreadRole::PolymarketCompletion,
+                                );
                                 while let Ok(update) = completion_rx.recv() {
                                     if root_tx.send(update).is_err() {
                                         break;
@@ -10341,7 +10591,12 @@ impl Engine {
                                 if role == Role::Reconcile {
                                     crate::os_tune::pin_background(&thread_name);
                                 } else {
-                                    crate::os_tune::pin_execution(&thread_name);
+                                    let execution_role = match role {
+                                        Role::Fast => crate::os_tune::ExecutionThreadRole::PolymarketFast,
+                                        Role::Cancel => crate::os_tune::ExecutionThreadRole::PolymarketCancel,
+                                        Role::Reconcile | Role::Query | Role::GapReplay => unreachable!(),
+                                    };
+                                    crate::os_tune::pin_execution_role(&thread_name, execution_role);
                                 }
                                 run_poly_connection_owner(router, permit, role, rx);
                             })
@@ -10706,7 +10961,6 @@ impl Engine {
                                 continue;
                             }
                             info!("[Executor] Stopping");
-                            drop(instance_pools);
                             break;
                         }
                         Signal::BatchUpdateOrders { exchange: Exchange::Hexmarket, .. }
@@ -10718,7 +10972,17 @@ impl Engine {
                                 let rr = round_robins.entry(instance_id.clone()).or_insert(0);
                                 let idx = *rr % pool.len();
                                 *rr += 1;
-                                let _ = pool[idx].send((signal, update_sender.clone()));
+                                if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
+                                    let (signal, update_sender) = error.into_inner();
+                                    for update in rejected_venue_signal(
+                                        &signal,
+                                        "hexmarket physical owner queue unavailable",
+                                    ) {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
                             } else {
                                 warn!("[Executor] Unknown instance '{}', dropping signal", instance_id);
                             }
@@ -10728,7 +10992,17 @@ impl Engine {
                                 let rr = round_robins.entry(instance_id.clone()).or_insert(0);
                                 let idx = *rr % pool.len();
                                 *rr += 1;
-                                let _ = pool[idx].send((signal, update_sender.clone()));
+                                if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
+                                    let (signal, update_sender) = error.into_inner();
+                                    for update in rejected_venue_signal(
+                                        &signal,
+                                        "hexmarket physical owner queue unavailable",
+                                    ) {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
                             } else {
                                 warn!("[Executor] Unknown instance '{}', dropping signal", instance_id);
                             }
@@ -10744,7 +11018,25 @@ impl Engine {
                                 .get(&instance_id)
                                 .map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
                                 .unwrap_or(150);
-                            if let Some(shared) = poly_states.get(&instance_id) {
+                            if signal_exchange(&signal) == Some(Exchange::Polymarket) {
+                                let Some(shared) = poly_states.get(&instance_id) else {
+                                    let mut updates = rejected_venue_signal(
+                                        &signal,
+                                        "polymarket signal has no configured account owner",
+                                    );
+                                    if updates.is_empty() {
+                                        updates.push(control_lane_rejected(
+                                            &signal,
+                                            "polymarket signal has no configured account owner",
+                                        ));
+                                    }
+                                    for update in updates {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                };
                                 let account_id = shared.account_state.account_id();
                                 if let Some(routes) = poly_connection_routes
                                     .as_mut()
@@ -10763,10 +11055,50 @@ impl Engine {
                                         "[Executor] no physical connection owner for account={} instance={}",
                                         account_id, instance_id,
                                     );
-                                    for update in execute_fallback_signal(
-                                        &mut fallback,
-                                        signal,
-                                        stale_threshold_ms,
+                                    let mut updates = rejected_venue_signal(
+                                        &signal,
+                                        "polymarket physical connection owner unavailable",
+                                    );
+                                    if updates.is_empty() {
+                                        updates.push(control_lane_rejected(
+                                            &signal,
+                                            "polymarket physical connection owner unavailable",
+                                        ));
+                                    }
+                                    for update in updates {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if let Some(exchange) = signal_exchange(&signal) {
+                                let Some(routes) = venue_execution_routes.get(&exchange) else {
+                                    for update in rejected_venue_signal(
+                                        &signal,
+                                        "venue execution owner unavailable",
+                                    ) {
+                                        if send_executor_update(&update_sender, update).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                };
+                                let command = VenueExecutionCommand {
+                                    signal,
+                                    owner: update_sender.owner,
+                                    stale_threshold_ms,
+                                    enqueued_at: std::time::Instant::now(),
+                                };
+                                let result = if signal_uses_cancel_lane(&command.signal) {
+                                    routes.cancel.try_send(command)
+                                } else {
+                                    routes.fast.try_send(command)
+                                };
+                                if let Err(error) = result {
+                                    let command = error.into_inner();
+                                    for update in rejected_venue_signal(
+                                        &command.signal,
+                                        "bounded venue owner lane unavailable",
                                     ) {
                                         if send_executor_update(&update_sender, update).is_err() {
                                             break;
@@ -10774,8 +11106,10 @@ impl Engine {
                                     }
                                 }
                             } else {
-                                let updates = execute_fallback_signal(&mut fallback, signal, stale_threshold_ms);
-                                for update in updates {
+                                for update in rejected_venue_signal(
+                                    &signal,
+                                    "signal has no execution venue",
+                                ) {
                                     if send_executor_update(&update_sender, update).is_err() { break; }
                                 }
                             }
@@ -10793,6 +11127,14 @@ impl Engine {
                         }
                     }
                 }
+                drop(venue_execution_routes);
+                for handle in venue_execution_handles {
+                    let _ = handle.join();
+                }
+                drop(instance_pools);
+                for handle in hex_worker_handles {
+                    let _ = handle.join();
+                }
                 drop(poly_connection_routes.take());
                 for h in poly_connection_handles {
                     let _ = h.join();
@@ -10803,6 +11145,8 @@ impl Engine {
                 }
                 poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
+                drop(execution_diagnostic_tx);
+                let _ = execution_diagnostic_handle.join();
                 info!("[Executor] Thread stopped");
             })
             .unwrap()
@@ -10852,6 +11196,7 @@ fn enqueue_lifecycle_delivery(
     queued: QueuedOrderUpdate,
     update_txs: &[Sender<QueuedOrderUpdate>],
     quarantined: &[Arc<AtomicBool>],
+    outboxes: &mut LifecycleOwnerOutboxes,
 ) -> LifecycleRouteResult {
     if owner >= update_txs.len() || owner >= quarantined.len() {
         return Err(LifecycleRouteFailure {
@@ -10867,11 +11212,18 @@ fn enqueue_lifecycle_delivery(
             reason: "lifecycle target owner is quarantined",
         });
     }
+    if outboxes
+        .queues
+        .get(owner)
+        .is_some_and(|queue| !queue.is_empty())
+    {
+        return outboxes.push(owner, queued);
+    }
     match update_txs[owner].try_send(queued) {
-        Ok(()) => Ok(None),
+        Ok(()) => Ok(()),
         Err(crossbeam_channel::TrySendError::Full(queued)) => {
             hexagent_runtime::latency::record_ns("strategy.private_update.backpressure", 1);
-            Ok(Some(PendingLifecycleDelivery { owner, queued }))
+            outboxes.push(owner, queued)
         }
         Err(crossbeam_channel::TrySendError::Disconnected(queued)) => Err(LifecycleRouteFailure {
             owner: Some(owner),
@@ -10881,35 +11233,6 @@ fn enqueue_lifecycle_delivery(
     }
 }
 
-fn flush_lifecycle_route_result(
-    result: LifecycleRouteResult,
-    update_txs: &[Sender<QueuedOrderUpdate>],
-) -> std::result::Result<(), LifecycleRouteFailure> {
-    match result? {
-        None => Ok(()),
-        Some(pending) => flush_pending_lifecycle(pending, update_txs),
-    }
-}
-
-fn flush_pending_lifecycle(
-    pending: PendingLifecycleDelivery,
-    update_txs: &[Sender<QueuedOrderUpdate>],
-) -> std::result::Result<(), LifecycleRouteFailure> {
-    let Some(tx) = update_txs.get(pending.owner) else {
-        return Err(LifecycleRouteFailure {
-            owner: Some(pending.owner),
-            queued: pending.queued,
-            reason: "invalid lifecycle owner index during shutdown drain",
-        });
-    };
-    tx.send(pending.queued)
-        .map_err(|error| LifecycleRouteFailure {
-            owner: Some(pending.owner),
-            queued: error.0,
-            reason: "lifecycle target disconnected during shutdown drain",
-        })
-}
-
 fn quarantine_lifecycle_failure(
     failure: &LifecycleRouteFailure,
     instance_ids: &[String],
@@ -10917,7 +11240,7 @@ fn quarantine_lifecycle_failure(
     signal_tx: &SignalSender,
 ) {
     error!(
-        "[strategy_router] lossless lifecycle delivery failed reason={} owner={:?} coid={} status={:?}; stopping router for replay/recovery",
+        "[strategy_router] lossless lifecycle delivery failed reason={} owner={:?} coid={} status={:?}; quarantining affected owner for replay/recovery",
         failure.reason,
         failure.owner,
         failure.queued.update.client_order_id,
@@ -10938,6 +11261,26 @@ fn quarantine_lifecycle_failure(
                 );
             }
         }
+    }
+}
+
+/// Quarantine only the owner whose bounded lossless lane failed. An unowned
+/// lifecycle update remains process-fatal because no instance can be proven
+/// safe; an identified slow/disconnected owner must not stop siblings.
+fn handle_lifecycle_route_failure(
+    failure: &LifecycleRouteFailure,
+    instance_ids: &[String],
+    quarantined: &[Arc<AtomicBool>],
+    signal_tx: &SignalSender,
+    outboxes: &mut LifecycleOwnerOutboxes,
+) -> bool {
+    let failed_owner = failure.owner;
+    quarantine_lifecycle_failure(failure, instance_ids, quarantined, signal_tx);
+    if let Some(owner) = failed_owner {
+        outboxes.discard_owner_after_quarantine(owner);
+        false
+    } else {
+        true
     }
 }
 
@@ -11053,30 +11396,56 @@ fn admission_log_snapshot(
     by_inst
 }
 
-fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderUpdate> {
+/// Execute one bounded venue command into owner-local reusable storage.
+/// Adapter failures are converted to typed lifecycle feedback where an exact
+/// order identity exists; fixed-capacity overflow is logged as a correctness
+/// fault and never silently truncates the returned prefix.
+fn execute_venue_signal_into<T: ExchangeTrade>(
+    worker: &mut T,
+    signal: Signal,
+    stale_threshold_ms: u64,
+    out: &mut OrderUpdateBatch,
+    diagnostics: &Sender<ExecutionDiagnostic>,
+) {
+    out.clear();
+    let is_stale = |timestamp_ns: u64| {
+        timestamp_ns != 0
+            && stale_threshold_ms != 0
+            && now_ns().saturating_sub(timestamp_ns) / 1_000_000 > stale_threshold_ms
+    };
+    let push = |out: &mut OrderUpdateBatch, update: OrderUpdate| {
+        if let Err(overflow) = push_order_update(out, update) {
+            try_submit_execution_diagnostic(
+                diagnostics,
+                ExecutionDiagnostic::FixedLifecycleOverflow {
+                    client_order_id: overflow.update.client_order_id,
+                },
+            );
+        }
+    };
     match signal {
+        Signal::NewOrder(order)
+            if is_stale(order.timestamp_ns)
+                || is_stale(order.quote_trigger_local_timestamp_ns) =>
+        {
+            push(out, exec_rejected_place(&order));
+        }
         Signal::NewOrder(order) => match worker.submit_order(&order) {
-            Ok(update) => vec![update],
-            Err(e) => {
-                error!("[Executor] Submit error: {}", e);
-                vec![OrderUpdate {
-                    order_slot: order.order_slot,
-                    client_order_id: order.client_order_id,
-                    exchange: order.exchange,
-                    symbol: order.symbol,
-                    side: order.side,
-                    exchange_order_id: None,
-                    status: OrderStatus::Rejected,
-                    liquidity: None,
-                    filled_quantity: 0.0,
-                    remaining_quantity: order.quantity,
-                    avg_fill_price: 0.0,
-                    timestamp_ns: now_ns(),
-                    exchange_event_timestamp_ns: None,
-                    trade_id: None,
-                    order_audit: None,
-                    error: None,
-                }]
+            Ok(update) => push(out, update),
+            Err(error) => {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange: order.exchange,
+                        operation: "submit",
+                        detail: detail.clone(),
+                    },
+                );
+                let mut update = exec_rejected_place(&order);
+                update.status = OrderStatus::Rejected;
+                update.error = Some(detail);
+                push(out, update);
             }
         },
         Signal::CancelOrder {
@@ -11084,56 +11453,431 @@ fn execute_hex_signal(worker: &mut HexmarketTrade, signal: Signal) -> Vec<OrderU
             client_order_id,
             ..
         } => match worker.cancel_order(exchange, &client_order_id) {
-            Ok(update) => vec![update],
-            Err(e) => {
-                error!("[Executor] Cancel error: {}", e);
-                vec![]
+            Ok(update) => push(out, update),
+            Err(error) => {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "cancel",
+                        detail: detail.clone(),
+                    },
+                );
+                for update in rejected_venue_signal(
+                    &Signal::CancelOrder {
+                        exchange,
+                        client_order_id,
+                        instance_id: String::new(),
+                        timestamp_ns: 0,
+                    },
+                    &detail,
+                ) {
+                    push(out, update);
+                }
             }
         },
         Signal::CancelAll {
-            exchange, symbol, ..
-        } => worker.cancel_all(exchange, &symbol).unwrap_or_else(|e| {
-            error!("[Executor] Cancel-all error: {}", e);
-            vec![]
-        }),
+            exchange,
+            symbol,
+            instance_id,
+            timestamp_ns,
+        } => {
+            if let Err(error) = worker.cancel_all_into(exchange, &symbol, out) {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "cancel_all",
+                        detail: detail.clone(),
+                    },
+                );
+                if out.is_empty() {
+                    for update in rejected_venue_signal(
+                        &Signal::CancelAll {
+                            exchange,
+                            symbol,
+                            instance_id,
+                            timestamp_ns,
+                        },
+                        &detail,
+                    ) {
+                        push(out, update);
+                    }
+                }
+            }
+        }
         Signal::BatchNewOrders {
-            market_id, orders, ..
-        } => worker
-            .batch_submit_orders(&market_id, &orders)
-            .unwrap_or_else(|e| {
-                error!("[Executor] Batch place error: {}", e);
-                vec![]
-            }),
+            exchange,
+            market_id,
+            orders,
+            instance_id,
+        } => {
+            if orders.iter().any(|order| {
+                is_stale(order.timestamp_ns)
+                    || is_stale(order.quote_trigger_local_timestamp_ns)
+            }) {
+                for order in &orders {
+                    push(out, exec_rejected_place(order));
+                }
+            } else if let Err(error) = worker.batch_submit_orders_into(&market_id, &orders, out) {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "batch_submit",
+                        detail: detail.clone(),
+                    },
+                );
+                if out.is_empty() {
+                    for update in rejected_venue_signal(
+                        &Signal::BatchNewOrders {
+                            exchange,
+                            market_id,
+                            orders,
+                            instance_id,
+                        },
+                        &detail,
+                    ) {
+                        push(out, update);
+                    }
+                }
+            }
+        }
         Signal::BatchCancelOrders {
             exchange,
             market_id,
             client_order_ids,
-            ..
-        } => worker
-            .batch_cancel_orders(exchange, &market_id, &client_order_ids)
-            .unwrap_or_else(|e| {
-                error!("[Executor] Batch cancel error: {}", e);
-                vec![]
-            }),
+            instance_id,
+            timestamp_ns,
+        } => {
+            if let Err(error) = worker.batch_cancel_orders_into(
+                exchange,
+                &market_id,
+                &client_order_ids,
+                out,
+            ) {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "batch_cancel",
+                        detail: detail.clone(),
+                    },
+                );
+                if out.is_empty() {
+                    for update in rejected_venue_signal(
+                        &Signal::BatchCancelOrders {
+                            exchange,
+                            market_id,
+                            client_order_ids,
+                            instance_id,
+                            timestamp_ns,
+                        },
+                        &detail,
+                    ) {
+                        push(out, update);
+                    }
+                }
+            }
+        }
         Signal::BatchUpdateOrders {
             exchange,
             market_id,
             cancel_client_order_ids,
             place_orders,
-            ..
-        } => worker
-            .batch_update_orders(
+            timestamp_ns,
+            instance_id,
+        } => {
+            if let Err(error) = worker.batch_update_orders_into(
                 exchange,
                 &market_id,
                 &cancel_client_order_ids,
                 &place_orders,
-            )
-            .unwrap_or_else(|e| {
-                error!("[Executor] Batch update error: {}", e);
-                vec![]
-            }),
-        _ => vec![],
+                out,
+            ) {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "batch_update",
+                        detail: detail.clone(),
+                    },
+                );
+                if out.is_empty() {
+                    for update in rejected_venue_signal(
+                        &Signal::BatchUpdateOrders {
+                            exchange,
+                            market_id,
+                            cancel_client_order_ids,
+                            place_orders,
+                            timestamp_ns,
+                            instance_id,
+                        },
+                        &detail,
+                    ) {
+                        push(out, update);
+                    }
+                }
+            }
+        }
+        Signal::ReplaceOrder {
+            exchange,
+            market_id,
+            cancel_client_order_ids,
+            place_orders,
+            timestamp_ns,
+            instance_id,
+        } => {
+            if let Err(error) = worker.replace_order_into(
+                exchange,
+                &market_id,
+                &cancel_client_order_ids,
+                &place_orders,
+                out,
+            ) {
+                let detail = error.to_string();
+                try_submit_execution_diagnostic(
+                    diagnostics,
+                    ExecutionDiagnostic::VenueFailure {
+                        exchange,
+                        operation: "replace",
+                        detail: detail.clone(),
+                    },
+                );
+                if out.is_empty() {
+                    for update in rejected_venue_signal(
+                        &Signal::ReplaceOrder {
+                            exchange,
+                            market_id,
+                            cancel_client_order_ids,
+                            place_orders,
+                            timestamp_ns,
+                            instance_id,
+                        },
+                        &detail,
+                    ) {
+                        push(out, update);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+struct VenueExecutionCommand {
+    signal: Signal,
+    owner: u16,
+    stale_threshold_ms: u64,
+    enqueued_at: std::time::Instant,
+}
+
+struct VenueExecutionRoutes {
+    fast: Sender<VenueExecutionCommand>,
+    cancel: Sender<VenueExecutionCommand>,
+}
+
+fn signal_exchange(signal: &Signal) -> Option<Exchange> {
+    match signal {
+        Signal::NewOrder(order) => Some(order.exchange),
+        Signal::CancelOrder { exchange, .. }
+        | Signal::CancelAll { exchange, .. }
+        | Signal::BatchNewOrders { exchange, .. }
+        | Signal::BatchCancelOrders { exchange, .. }
+        | Signal::BatchUpdateOrders { exchange, .. }
+        | Signal::ReplaceOrder { exchange, .. } => Some(*exchange),
+        Signal::ReconcilePolymarket { .. }
+        | Signal::PolymarketCancelAllOrders { .. }
+        | Signal::RetainPolymarketEventAudit { .. }
+        | Signal::RetirePolymarketEventAudit { .. } => Some(Exchange::Polymarket),
+        _ => None,
+    }
+}
+
+fn signal_uses_cancel_lane(signal: &Signal) -> bool {
+    matches!(
+        signal,
+        Signal::CancelOrder { .. }
+            | Signal::CancelAll { .. }
+            | Signal::BatchCancelOrders { .. }
+            | Signal::BatchUpdateOrders { .. }
+            | Signal::ReplaceOrder { .. }
+    )
+}
+
+fn rejected_venue_signal(signal: &Signal, detail: &str) -> Vec<OrderUpdate> {
+    let cancel_uncertain = |exchange: Exchange, coid: String| OrderUpdate {
+        order_slot: OrderSlot::UNASSIGNED,
+        client_order_id: coid,
+        exchange,
+        symbol: String::new(),
+        side: Side::Buy,
+        exchange_order_id: None,
+        status: OrderStatus::CancelUncertain,
+        liquidity: None,
+        filled_quantity: 0.0,
+        remaining_quantity: 0.0,
+        avg_fill_price: 0.0,
+        timestamp_ns: now_ns(),
+        exchange_event_timestamp_ns: None,
+        trade_id: None,
+        order_audit: None,
+        error: Some(detail.to_string()),
+    };
+    match signal {
+        Signal::NewOrder(order) => vec![exec_rejected_place(order)],
+        Signal::BatchNewOrders { orders, .. } => {
+            orders.iter().map(exec_rejected_place).collect()
+        }
+        Signal::CancelOrder {
+            exchange,
+            client_order_id,
+            ..
+        } => vec![cancel_uncertain(*exchange, client_order_id.clone())],
+        Signal::CancelAll {
+            exchange,
+            instance_id,
+            ..
+        } => vec![cancel_uncertain(*exchange, instance_id.clone())],
+        Signal::BatchCancelOrders {
+            exchange,
+            client_order_ids,
+            ..
+        } => client_order_ids
+            .iter()
+            .map(|coid| cancel_uncertain(*exchange, coid.clone()))
+            .collect(),
+        Signal::BatchUpdateOrders {
+            exchange,
+            cancel_client_order_ids,
+            place_orders,
+            ..
+        }
+        | Signal::ReplaceOrder {
+            exchange,
+            cancel_client_order_ids,
+            place_orders,
+            ..
+        } => cancel_client_order_ids
+            .iter()
+            .map(|coid| cancel_uncertain(*exchange, coid.clone()))
+            .chain(place_orders.iter().map(exec_rejected_place))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
+    venue: Exchange,
+    mut worker: T,
+    root_update_tx: Sender<RoutedOrderUpdate>,
+    diagnostics: Sender<ExecutionDiagnostic>,
+) -> (VenueExecutionRoutes, Vec<thread::JoinHandle<()>>) {
+    let (fast_tx, fast_rx) =
+        bounded::<VenueExecutionCommand>(VENUE_FAST_OWNER_QUEUE_CAPACITY);
+    let (cancel_tx, cancel_rx) =
+        bounded::<VenueExecutionCommand>(VENUE_CANCEL_OWNER_QUEUE_CAPACITY);
+    let (completion_tx, completion_rx) =
+        bounded::<RoutedOrderUpdate>(VENUE_COMPLETION_OUTBOX_CAPACITY);
+    let completion_name = format!("venue-completion-{venue:?}").to_ascii_lowercase();
+    let completion_handle = thread::Builder::new()
+        .name(completion_name.clone())
+        .spawn(move || {
+            crate::os_tune::pin_execution_role(
+                &completion_name,
+                crate::os_tune::ExecutionThreadRole::VenueCompletion,
+            );
+            while let Ok(update) = completion_rx.recv() {
+                if root_update_tx.send(update).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn venue completion outbox");
+
+    let owner_name = format!("venue-owner-{venue:?}").to_ascii_lowercase();
+    let owner_handle = thread::Builder::new()
+        .name(owner_name.clone())
+        .spawn(move || {
+            crate::os_tune::pin_execution_role(
+                &owner_name,
+                crate::os_tune::ExecutionThreadRole::VenueOwner,
+            );
+            crate::latency::prepare_thread_stages(&[
+                "venue.execution.owner_queue",
+                "execution.diagnostic.overflow",
+            ]);
+            let mut execute_command = |command: VenueExecutionCommand| -> bool {
+                crate::latency::record_ns(
+                    "venue.execution.owner_queue",
+                    command
+                        .enqueued_at
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
+                );
+                let mut updates = OrderUpdateBatch::new();
+                execute_venue_signal_into(
+                    &mut worker,
+                    command.signal,
+                    command.stale_threshold_ms,
+                    &mut updates,
+                    &diagnostics,
+                );
+                for update in updates.drain(..) {
+                    if completion_tx
+                        .send(RoutedOrderUpdate {
+                            owner: command.owner,
+                            update,
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                true
+            };
+            loop {
+                let command = crossbeam_channel::select_biased! {
+                    recv(cancel_rx) -> command => command,
+                    recv(fast_rx) -> command => command,
+                };
+                match command {
+                    Ok(command) => {
+                        if !execute_command(command) {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        while let Ok(command) = cancel_rx.try_recv() {
+                            if !execute_command(command) {
+                                return;
+                            }
+                        }
+                        while let Ok(command) = fast_rx.try_recv() {
+                            if !execute_command(command) {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn venue execution owner");
+
+    (
+        VenueExecutionRoutes {
+            fast: fast_tx,
+            cancel: cancel_tx,
+        },
+        vec![owner_handle, completion_handle],
+    )
 }
 
 /// Typed business commands accepted by one physical Polymarket connection
@@ -14505,6 +15249,112 @@ mod market_router_tests {
         }
     }
 
+    struct FixedVenueTestTrade;
+
+    impl ExchangeTrade for FixedVenueTestTrade {
+        fn submit_order(&mut self, order: &OrderRequest) -> Result<OrderUpdate> {
+            Ok(OrderUpdate {
+                order_slot: order.order_slot,
+                client_order_id: order.client_order_id.clone(),
+                exchange: order.exchange,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                exchange_order_id: None,
+                status: OrderStatus::Accepted,
+                liquidity: None,
+                filled_quantity: 0.0,
+                remaining_quantity: order.quantity,
+                avg_fill_price: 0.0,
+                timestamp_ns: now_ns(),
+                exchange_event_timestamp_ns: None,
+                trade_id: None,
+                order_audit: None,
+                error: None,
+            })
+        }
+
+        fn cancel_order(
+            &mut self,
+            _exchange: Exchange,
+            _client_order_id: &str,
+        ) -> Result<OrderUpdate> {
+            Err(anyhow::anyhow!("cancel transport unavailable"))
+        }
+
+        fn cancel_all(
+            &mut self,
+            _exchange: Exchange,
+            _symbol: &str,
+        ) -> Result<Vec<OrderUpdate>> {
+            Ok(Vec::new())
+        }
+
+        fn batch_submit_orders_into(
+            &mut self,
+            _market_id: &str,
+            orders: &[OrderRequest],
+            out: &mut OrderUpdateBatch,
+        ) -> Result<()> {
+            for order in orders {
+                push_order_update(out, self.submit_order(order)?)
+                    .map_err(|_| anyhow::anyhow!("unexpected fixed test overflow"))?;
+            }
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "fixed-test"
+        }
+    }
+
+    #[test]
+    fn venue_owner_batch_emits_into_fixed_lifecycle_scratch() {
+        let mut orders = OrderBatch::new();
+        for index in 0..ORDER_BATCH_CAPACITY {
+            orders
+                .try_push(order_req(&format!("coid-{index}"), "instance-0"))
+                .unwrap();
+        }
+        let signal = Signal::BatchNewOrders {
+            exchange: Exchange::Polymarket,
+            market_id: "market".into(),
+            orders,
+            instance_id: "instance-0".into(),
+        };
+        let mut worker = FixedVenueTestTrade;
+        let mut updates = OrderUpdateBatch::new();
+        let (diagnostics, _diagnostic_rx) = bounded(4);
+        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics);
+        assert_eq!(updates.len(), ORDER_BATCH_CAPACITY);
+        assert!(updates
+            .iter()
+            .all(|update| update.status == OrderStatus::Accepted));
+    }
+
+    #[test]
+    fn venue_cancel_failure_is_typed_and_never_silently_dropped() {
+        let signal = Signal::CancelOrder {
+            exchange: Exchange::Hyperliquid,
+            client_order_id: "cancel-me".into(),
+            instance_id: "instance-0".into(),
+            timestamp_ns: 1,
+        };
+        let mut worker = FixedVenueTestTrade;
+        let mut updates = OrderUpdateBatch::new();
+        let (diagnostics, diagnostic_rx) = bounded(4);
+        execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::CancelUncertain);
+        assert_eq!(updates[0].client_order_id, "cancel-me");
+        assert!(matches!(
+            diagnostic_rx.try_recv(),
+            Ok(ExecutionDiagnostic::VenueFailure {
+                operation: "cancel",
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn quote_trigger_stamps_exact_orderbook_clock_on_every_place() {
         let mut signals = vec![
@@ -15162,6 +16012,7 @@ mod market_router_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ];
+        let mut outboxes = LifecycleOwnerOutboxes::new(2);
         let routed = Engine::route_executor_update(
             RoutedOrderUpdate {
                 owner: 1,
@@ -15189,9 +16040,10 @@ mod market_router_tests {
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
             &flags,
+            &mut outboxes,
         )
         .unwrap();
-        assert!(routed.is_none());
+        assert_eq!(routed, ());
         assert!(owner0_rx.try_recv().is_err());
         assert_eq!(
             owner1_rx.try_recv().unwrap().update.client_order_id,
@@ -15207,6 +16059,7 @@ mod market_router_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ];
+        let mut outboxes = LifecycleOwnerOutboxes::new(2);
         let result = Engine::route_private_update(
             RoutedOrderUpdate {
                 owner: 1,
@@ -15232,9 +16085,10 @@ mod market_router_tests {
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
             &flags,
+            &mut outboxes,
         )
         .unwrap();
-        assert!(result.is_none());
+        assert_eq!(result, ());
         assert!(owner0_rx.try_recv().is_err());
         let delivered = owner1_rx.try_recv().unwrap();
         assert_eq!(delivered.update.order_slot, OrderSlot::new(17));
@@ -15246,6 +16100,7 @@ mod market_router_tests {
     fn full_lifecycle_lane_retains_exact_event_until_owner_accepts_it() {
         let (owner_tx, owner_rx) = bounded(1);
         let flags = vec![Arc::new(AtomicBool::new(false))];
+        let mut outboxes = LifecycleOwnerOutboxes::new(1);
         let occupied = QueuedOrderUpdate {
             update: OrderUpdate {
                 order_slot: Default::default(),
@@ -15269,7 +16124,7 @@ mod market_router_tests {
             source: LifecycleSource::Execution,
         };
         owner_tx.send(occupied).unwrap();
-        let retained = Engine::route_executor_update(
+        Engine::route_executor_update(
             RoutedOrderUpdate {
                 owner: 0,
                 update: OrderUpdate {
@@ -15294,14 +16149,17 @@ mod market_router_tests {
             &HashMap::new(),
             std::slice::from_ref(&owner_tx),
             &flags,
+            &mut outboxes,
         )
-        .unwrap()
-        .expect("full owner lane must retain its exact head event");
+        .unwrap();
+        assert_eq!(outboxes.queues[0].len(), 1);
         assert_eq!(
             owner_rx.recv().unwrap().update.client_order_id,
             "owner-occupied"
         );
-        flush_pending_lifecycle(retained, std::slice::from_ref(&owner_tx)).unwrap();
+        outboxes
+            .try_flush_one(std::slice::from_ref(&owner_tx))
+            .unwrap();
         let delivered = owner_rx.recv().unwrap();
         assert_eq!(delivered.update.client_order_id, "opaque-lossless");
         assert_eq!(
@@ -15309,6 +16167,62 @@ mod market_router_tests {
             Some("oid-lossless")
         );
         assert_eq!(delivered.source, LifecycleSource::Execution);
+    }
+
+    #[test]
+    fn full_owner_lifecycle_lane_does_not_block_sibling_delivery() {
+        let (owner0_tx, owner0_rx) = bounded(1);
+        let (owner1_tx, owner1_rx) = bounded(1);
+        let update = |coid: &str| OrderUpdate {
+            order_slot: Default::default(),
+            client_order_id: coid.into(),
+            exchange: Exchange::Hexmarket,
+            symbol: "market".into(),
+            side: Side::Buy,
+            exchange_order_id: None,
+            status: OrderStatus::Accepted,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 1.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: 1,
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            order_audit: None,
+            error: None,
+        };
+        let flags = vec![
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let mut outboxes = LifecycleOwnerOutboxes::new(2);
+        owner0_tx
+            .send(QueuedOrderUpdate {
+                update: update("owner0-occupied"),
+                enqueued_at: std::time::Instant::now(),
+                source: LifecycleSource::Execution,
+            })
+            .unwrap();
+
+        for (owner, coid) in [(0_u16, "owner0-pending"), (1, "owner1-live")] {
+            Engine::route_executor_update(
+                RoutedOrderUpdate {
+                    owner,
+                    update: update(coid),
+                },
+                &HashMap::new(),
+                &[owner0_tx.clone(), owner1_tx.clone()],
+                &flags,
+                &mut outboxes,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(outboxes.queues[0].len(), 1);
+        assert_eq!(owner1_rx.recv().unwrap().update.client_order_id, "owner1-live");
+        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "owner0-occupied");
+        outboxes.try_flush_one(&[owner0_tx, owner1_tx]).unwrap();
+        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "owner0-pending");
     }
 
     #[test]

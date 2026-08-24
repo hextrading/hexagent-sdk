@@ -6,7 +6,7 @@ use super::market::{
     AssetCtxTick, BarData, Exchange, OrderBookSnapshot, QuoteTick, Side, SpotPrice, TickSizeChange,
     TradeTick,
 };
-use super::order::OrderRequest;
+use super::order::{OrderRequest, OrderUpdate};
 
 /// Hard upper bound for one exchange batch. Keeping the payload inline makes
 /// the strategy-to-execution handoff allocation-free after the strings owned
@@ -17,6 +17,12 @@ pub const ORDER_BATCH_CAPACITY: usize = 16;
 /// is inline and reused by the strategy owner, so steady-state quote and
 /// lifecycle dispatch cannot grow a heap-backed `Vec`.
 pub const SIGNAL_BATCH_CAPACITY: usize = 64;
+
+/// Maximum lifecycle results produced by one bounded execution command.
+/// Batch place/update is already capped at 16+16 entries; the wider bound
+/// leaves room for venue-specific control acknowledgements without growing a
+/// `Vec` on the connection-owner thread.
+pub const ORDER_UPDATE_BATCH_CAPACITY: usize = 64;
 
 /// Fixed-capacity place payload used by all batch/replace signals.
 pub type OrderBatch = ArrayVec<OrderRequest, ORDER_BATCH_CAPACITY>;
@@ -29,9 +35,39 @@ pub type OrderIdBatch = ArrayVec<String, ORDER_BATCH_CAPACITY>;
 /// cancel or risk-control signal is not permitted.
 pub type SignalBatch = ArrayVec<Signal, SIGNAL_BATCH_CAPACITY>;
 
+/// Reusable fixed output buffer for execution/lifecycle adapters.
+pub type OrderUpdateBatch = ArrayVec<OrderUpdate, ORDER_UPDATE_BATCH_CAPACITY>;
+
 #[derive(Debug)]
 pub struct SignalBatchOverflow {
     pub signal: Signal,
+}
+
+#[derive(Debug)]
+pub struct OrderUpdateBatchOverflow {
+    pub update: OrderUpdate,
+}
+
+#[inline]
+pub fn push_order_update(
+    out: &mut OrderUpdateBatch,
+    update: OrderUpdate,
+) -> Result<(), OrderUpdateBatchOverflow> {
+    out.try_push(update)
+        .map_err(|error| OrderUpdateBatchOverflow {
+            update: error.element(),
+        })
+}
+
+#[inline]
+pub fn extend_order_update_batch(
+    out: &mut OrderUpdateBatch,
+    updates: impl IntoIterator<Item = OrderUpdate>,
+) -> Result<(), OrderUpdateBatchOverflow> {
+    for update in updates {
+        push_order_update(out, update)?;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -77,6 +113,44 @@ mod fixed_batch_tests {
                 assert_eq!(symbol, SIGNAL_BATCH_CAPACITY.to_string())
             }
             other => panic!("unexpected overflow signal: {other:?}"),
+        }
+    }
+    #[test]
+    fn fixed_order_update_batch_returns_the_first_unqueued_update() {
+        let mut batch = OrderUpdateBatch::new();
+        for sequence in 0..ORDER_UPDATE_BATCH_CAPACITY {
+            push_order_update(&mut batch, test_order_update(sequence)).unwrap();
+        }
+        let overflow = push_order_update(
+            &mut batch,
+            test_order_update(ORDER_UPDATE_BATCH_CAPACITY),
+        )
+        .unwrap_err();
+        assert_eq!(batch.len(), ORDER_UPDATE_BATCH_CAPACITY);
+        assert_eq!(
+            overflow.update.client_order_id,
+            ORDER_UPDATE_BATCH_CAPACITY.to_string()
+        );
+    }
+
+    fn test_order_update(sequence: usize) -> OrderUpdate {
+        OrderUpdate {
+            order_slot: super::super::order::OrderSlot::UNASSIGNED,
+            client_order_id: sequence.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: String::new(),
+            side: Side::Buy,
+            exchange_order_id: None,
+            status: super::super::order::OrderStatus::Accepted,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: 0,
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            order_audit: None,
+            error: None,
         }
     }
 }

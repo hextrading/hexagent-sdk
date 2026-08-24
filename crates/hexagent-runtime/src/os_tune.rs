@@ -259,6 +259,62 @@ impl CorePlan {
         self.execution
     }
 
+    fn route_execution_role(&self, role: ExecutionThreadRole, thread_name: &str) -> usize {
+        match role {
+            ExecutionThreadRole::Dispatcher => self.execution,
+            ExecutionThreadRole::Feed => thread_name
+                .strip_prefix("feed-")
+                .and_then(|exchange| self.feed_cores.get(exchange).copied())
+                .unwrap_or(self.execution),
+            ExecutionThreadRole::HexWorker => {
+                if self.hex_worker_cores.is_empty() {
+                    self.execution
+                } else {
+                    let index = HEX_WORKER_RR.fetch_add(1, Ordering::Relaxed)
+                        % self.hex_worker_cores.len();
+                    self.hex_worker_cores[index]
+                }
+            }
+            ExecutionThreadRole::VenueOwner => self.execution,
+            ExecutionThreadRole::VenueCompletion => {
+                if self.poly_completion_cores.is_empty() {
+                    self.execution
+                } else {
+                    let index = POLY_COMPLETION_RR.fetch_add(1, Ordering::Relaxed)
+                        % self.poly_completion_cores.len();
+                    self.poly_completion_cores[index]
+                }
+            }
+            ExecutionThreadRole::PolymarketFast => {
+                if self.poly_exec_cores.is_empty() {
+                    self.execution
+                } else {
+                    let index = POLY_EXEC_RR.fetch_add(1, Ordering::Relaxed)
+                        % self.poly_exec_cores.len();
+                    self.poly_exec_cores[index]
+                }
+            }
+            ExecutionThreadRole::PolymarketCancel => {
+                if self.poly_cancel_cores.is_empty() {
+                    self.execution
+                } else {
+                    let index = POLY_CANCEL_RR.fetch_add(1, Ordering::Relaxed)
+                        % self.poly_cancel_cores.len();
+                    self.poly_cancel_cores[index]
+                }
+            }
+            ExecutionThreadRole::PolymarketCompletion => {
+                if self.poly_completion_cores.is_empty() {
+                    self.execution
+                } else {
+                    let index = POLY_COMPLETION_RR.fetch_add(1, Ordering::Relaxed)
+                        % self.poly_completion_cores.len();
+                    self.poly_completion_cores[index]
+                }
+            }
+        }
+    }
+
     /// Validate the production invariant that every enabled strategy worker
     /// has a genuinely dedicated CPU and no latency-critical runtime role can
     /// silently fall back onto it. Public feeds may intentionally share one
@@ -495,6 +551,23 @@ static POLY_COMPLETION_RR: AtomicUsize = AtomicUsize::new(0);
 static BACKGROUND_RR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static SELECTIVE_MEMORY_LOCKING: AtomicBool = AtomicBool::new(false);
+
+/// Scheduling role for a latency-critical execution thread.
+///
+/// Thread names are observability labels, not a scheduling API: account ids
+/// and descriptive prefixes change as owners are split, while the role/core
+/// contract must remain compile-time explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionThreadRole {
+    Dispatcher,
+    Feed,
+    HexWorker,
+    VenueOwner,
+    VenueCompletion,
+    PolymarketFast,
+    PolymarketCancel,
+    PolymarketCompletion,
+}
 
 /// Install the CorePlan resolved from the TOML `[os_tune]` block. Must be
 /// called once at process startup, **before** any thread calls
@@ -1024,6 +1097,25 @@ pub fn pin_execution(thread_name: &str) {
     set_fifo(priority, thread_name);
 }
 
+/// Pin an execution thread by its declared runtime role. New long-lived
+/// execution owners must use this entry point so a renamed observability label
+/// cannot silently move them onto the dispatcher core or change FIFO priority.
+pub fn pin_execution_role(thread_name: &str, role: ExecutionThreadRole) {
+    let p = plan();
+    let core = p.route_execution_role(role, thread_name);
+    pin_current(core, thread_name);
+    let priority = match role {
+        ExecutionThreadRole::Feed if thread_name == "feed-polymarket" => {
+            p.fifo_polymarket_feed
+        }
+        ExecutionThreadRole::VenueCompletion | ExecutionThreadRole::PolymarketCompletion => {
+            p.fifo_completion
+        }
+        _ => p.fifo_execution,
+    };
+    set_fifo(priority, thread_name);
+}
+
 /// Pin a non-critical I/O-bound background thread to the background
 /// pool. `SCHED_OTHER` (no FIFO). Use for: recorder (flushes every
 /// 60 s), latency-dump, paper-exec, async-task joiner threads
@@ -1378,6 +1470,16 @@ mod tests {
             plan.route_execution("poly-exec-1"),
             plan.route_execution("poly-done-1"),
         );
+        assert!(plan.poly_cancel_cores.contains(&plan.route_execution_role(
+            ExecutionThreadRole::PolymarketCancel,
+            "poly-safety-cancel-zhu02-0",
+        )));
+        assert!(plan
+            .poly_completion_cores
+            .contains(&plan.route_execution_role(
+                ExecutionThreadRole::PolymarketCompletion,
+                "poly-completion-outbox-zhu02",
+            )));
 
         let mut overlap = five_instance_config();
         overlap.poly_exec_cores = vec![14, 15];
