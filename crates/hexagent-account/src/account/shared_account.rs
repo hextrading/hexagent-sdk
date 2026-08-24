@@ -66,6 +66,163 @@ const ACCOUNT_OWNER_REQUEST_TIMEOUT: Duration = Duration::from_millis(25);
 /// reviewable here and cannot capture arbitrary I/O or quote-path state.
 pub struct AccountOwnerCommand(AccountOwnerOperation);
 
+/// Cloneable, message-only endpoint for the account's single writer.
+///
+/// Runtime workers keep this handle; only [`SharedAccountOwnerState`] owns the
+/// receiving side.  The opaque command type prevents callers from smuggling a
+/// closure (and therefore arbitrary blocking work) onto the account lane.
+#[derive(Clone, Debug)]
+pub struct SharedAccountHandle {
+    account_id: Arc<str>,
+    tx: crossbeam_channel::Sender<AccountOwnerCommand>,
+    bound: Arc<AtomicBool>,
+    admission_fast: Arc<AtomicBool>,
+    passive_admission_fast: Arc<AtomicBool>,
+}
+
+impl SharedAccountHandle {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.bound.load(Ordering::Acquire)
+    }
+
+    pub fn try_send(&self, command: AccountOwnerCommand) -> Result<(), String> {
+        if !self.is_bound() {
+            return Err(format!(
+                "account {} owner lane is not bound",
+                self.account_id
+            ));
+        }
+        self.tx
+            .try_send(command)
+            .map_err(|error| format!("account {} owner enqueue failed: {error}", self.account_id))
+    }
+
+    pub fn submit_register_token_interest(
+        &self,
+        instance_id: String,
+        condition_id: String,
+        up_token_id: String,
+        down_token_id: String,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), ReservationError>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(
+            AccountOwnerOperation::RegisterTokenInterest {
+                instance_id,
+                condition_id,
+                up_token_id,
+                down_token_id,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_retire_token_interest(
+        &self,
+        instance_id: String,
+        condition_id: String,
+    ) -> Result<crossbeam_channel::Receiver<()>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(
+            AccountOwnerOperation::RetireTokenInterest {
+                instance_id,
+                condition_id,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_settlement_and_retire(
+        &self,
+        instance_id: String,
+        condition_id: String,
+        values: HashMap<String, f64>,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), ReservationError>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(
+            AccountOwnerOperation::RecordSettlementAndRetire {
+                instance_id,
+                condition_id,
+                values,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_sidecar_checkpoint(
+        &self,
+        sidecar_id: String,
+        checkpoint: DurableSidecarCheckpoint,
+    ) -> Result<crossbeam_channel::Receiver<Result<bool, String>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(
+            AccountOwnerOperation::RecordSidecarCheckpoint {
+                sidecar_id,
+                checkpoint,
+                reply,
+            },
+        ))?;
+        Ok(completion)
+    }
+
+    pub fn submit_set_risk_blocker(
+        &self,
+        source: String,
+        reason: String,
+    ) -> Result<crossbeam_channel::Receiver<()>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        // Risk closes synchronously through atomics; durable aggregate state
+        // still advances only on the owner task.
+        self.admission_fast.store(false, Ordering::Release);
+        self.passive_admission_fast.store(false, Ordering::Release);
+        self.try_send(AccountOwnerCommand(AccountOwnerOperation::SetRiskBlocker {
+            source,
+            reason,
+            reply: Some(reply),
+        }))?;
+        Ok(completion)
+    }
+
+    pub fn submit_clear_risk_blocker(
+        &self,
+        source: String,
+    ) -> Result<crossbeam_channel::Receiver<bool>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(
+            AccountOwnerOperation::ClearRiskBlocker { source, reply },
+        ))?;
+        Ok(completion)
+    }
+}
+
+/// Receiving half of a [`SharedAccountHandle`].  It is deliberately not
+/// cloneable: moving this value into the account worker establishes the sole
+/// consumer and sole mutation authority for owner-dispatched operations.
+pub struct SharedAccountOwnerState {
+    account: Arc<SharedAccount>,
+    rx: crossbeam_channel::Receiver<AccountOwnerCommand>,
+}
+
+impl SharedAccountOwnerState {
+    pub fn mark_current_thread(&self) -> Result<(), String> {
+        self.account.mark_account_owner_thread()
+    }
+
+    pub fn receiver(&self) -> &crossbeam_channel::Receiver<AccountOwnerCommand> {
+        &self.rx
+    }
+
+    pub fn execute(&self, command: AccountOwnerCommand) {
+        command.execute(&self.account);
+    }
+}
+
 enum AccountOwnerOperation {
     #[cfg(test)]
     Barrier(crossbeam_channel::Sender<()>),
@@ -4456,7 +4613,7 @@ pub struct SharedAccount {
     state: Arc<Mutex<SharedAccountState>>,
     account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
     account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
-    account_owner_lane_bound: AtomicBool,
+    account_owner_lane_bound: Arc<AtomicBool>,
     account_owner_thread_id: OnceLock<std::thread::ThreadId>,
     /// Cold account-wide mutations (wallet snapshots, maintenance and explicit
     /// allocation migrations) take the write side. Ordinary order paths take
@@ -4510,8 +4667,8 @@ pub struct SharedAccount {
     token_fee_configs_fast: RwLock<HashMap<String, TokenFeeConfig>>,
     seeded_fast: AtomicBool,
     uncertain_fast: AtomicBool,
-    admission_fast: AtomicBool,
-    passive_admission_fast: AtomicBool,
+    admission_fast: Arc<AtomicBool>,
+    passive_admission_fast: Arc<AtomicBool>,
     /// Monotonic for one process: once the startup wallet snapshot is applied,
     /// hot readiness checks remain a single acquire load until restart.
     startup_snapshot_applied_fast: AtomicBool,
@@ -4651,10 +4808,31 @@ impl Drop for AccountStateGuard<'_> {
 }
 
 impl SharedAccount {
+    /// Split the account runtime into a cloneable message handle and one
+    /// non-cloneable owner state.  Live runtimes must bind through this API so
+    /// the receiver cannot leak to request/completion workers.
+    pub fn bind_account_owner(
+        self: &Arc<Self>,
+    ) -> Result<(SharedAccountHandle, SharedAccountOwnerState), String> {
+        let receiver = self.bind_account_owner_task_lane()?;
+        let handle = SharedAccountHandle {
+            account_id: Arc::from(self.account_id.as_str()),
+            tx: self.account_owner_task_tx.clone(),
+            bound: Arc::clone(&self.account_owner_lane_bound),
+            admission_fast: Arc::clone(&self.admission_fast),
+            passive_admission_fast: Arc::clone(&self.passive_admission_fast),
+        };
+        let owner = SharedAccountOwnerState {
+            account: Arc::clone(self),
+            rx: receiver,
+        };
+        Ok((handle, owner))
+    }
+
     /// Bind the fixed-capacity cold-control lane to the one account writer.
     /// Binding twice is rejected because two consumers would violate ordered
     /// single-writer ownership.
-    pub fn bind_account_owner_task_lane(
+    fn bind_account_owner_task_lane(
         &self,
     ) -> Result<crossbeam_channel::Receiver<AccountOwnerCommand>, String> {
         let mut receiver = self.account_owner_task_rx.lock().unwrap();
@@ -4667,7 +4845,7 @@ impl SharedAccount {
 
     /// Mark the current consumer as the sole writer. Re-entrant owner calls
     /// execute inline instead of deadlocking while waiting on their own lane.
-    pub fn mark_account_owner_thread(&self) -> Result<(), String> {
+    fn mark_account_owner_thread(&self) -> Result<(), String> {
         let current = std::thread::current().id();
         match self.account_owner_thread_id.set(current) {
             Ok(()) => Ok(()),
@@ -4692,10 +4870,7 @@ impl SharedAccount {
     /// Enqueue non-blocking cold account work. This API is intentionally
     /// fail-closed on an unbound or full lane; callers choose their own retry
     /// and admission behavior instead of silently mutating off-owner.
-    pub fn try_submit_account_owner_command(
-        &self,
-        command: AccountOwnerCommand,
-    ) -> Result<(), String> {
+    fn try_submit_account_owner_command(&self, command: AccountOwnerCommand) -> Result<(), String> {
         if self.is_account_owner_thread() {
             command.execute(self);
             return Ok(());
@@ -4941,7 +5116,7 @@ impl SharedAccount {
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
-            account_owner_lane_bound: AtomicBool::new(false),
+            account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
@@ -4959,8 +5134,8 @@ impl SharedAccount {
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
-            admission_fast: AtomicBool::new(false),
-            passive_admission_fast: AtomicBool::new(false),
+            admission_fast: Arc::new(AtomicBool::new(false)),
+            passive_admission_fast: Arc::new(AtomicBool::new(false)),
             startup_snapshot_applied_fast: AtomicBool::new(false),
             startup_snapshot_deferred_fast: AtomicBool::new(false),
             unsettled_maintenance_fast: AtomicBool::new(false),
@@ -5327,7 +5502,7 @@ impl SharedAccount {
             state,
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
-            account_owner_lane_bound: AtomicBool::new(false),
+            account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
@@ -5347,8 +5522,8 @@ impl SharedAccount {
             token_fee_configs_fast: RwLock::new(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
-            admission_fast: AtomicBool::new(false),
-            passive_admission_fast: AtomicBool::new(false),
+            admission_fast: Arc::new(AtomicBool::new(false)),
+            passive_admission_fast: Arc::new(AtomicBool::new(false)),
             startup_snapshot_applied_fast: AtomicBool::new(false),
             startup_snapshot_deferred_fast: AtomicBool::new(false),
             unsettled_maintenance_fast: AtomicBool::new(false),
@@ -13666,15 +13841,34 @@ impl SharedAccount {
             })
     }
 
-    /// Non-blocking terminal high-water lookup for the authenticated private
-    /// owner route. A contended shard is deliberately reported as "not yet
-    /// resolved": routing the event again is safe because StrategyAccount and
-    /// the cold ledger both deduplicate by trade id, whereas waiting for the
-    /// cold lifecycle writer would add its scheduling tail to private apply.
-    pub fn trade_status_matches_nonblocking(&self, trade_key: &str, status: &str) -> bool {
+    /// Non-blocking lifecycle high-water lookup for the authenticated private
+    /// owner route. A durable later edge covers an earlier replay edge, while
+    /// conflicting terminal states never cover one another. A contended shard
+    /// is deliberately reported as "not yet covered": replay remains safe and
+    /// must not inherit another control transaction's scheduling tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trade_lifecycle_covers_nonblocking(
+        &self,
+        trade_key: &str,
+        status: &str,
+        order_id: &str,
+        token_id: &str,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        is_maker: bool,
+    ) -> bool {
         if trade_key.is_empty() || status.is_empty() {
             return false;
         }
+        let covered = |ownership: &TradeOwnership, stored_is_maker: Option<bool>| {
+            trade_lifecycle_covers(&ownership.status, status)
+                && stored_is_maker.is_none_or(|stored| stored == is_maker)
+                && validate_owned_trade_replay(
+                    ownership, "", order_id, token_id, side, quantity, price,
+                )
+                .is_ok()
+        };
         let instance_id = match self.trade_routes.try_get(trade_key) {
             Ok(instance_id) => instance_id,
             Err(()) => return false,
@@ -13687,17 +13881,17 @@ impl SharedAccount {
             let Some(account) = account else {
                 return false;
             };
-            return account
-                .lifecycle
-                .try_lock()
-                .ok()
-                .and_then(|lifecycle| {
-                    lifecycle
-                        .trades
-                        .get(trade_key)
-                        .map(|trade| trade.ownership.status.eq_ignore_ascii_case(status))
-                })
-                .unwrap_or(false);
+            if let Some(covered) = account.lifecycle.try_lock().ok().and_then(|lifecycle| {
+                lifecycle
+                    .trades
+                    .get(trade_key)
+                    .map(|trade| covered(&trade.ownership, trade.is_maker))
+            }) {
+                return covered;
+            }
+            // A stale active route can briefly outlive its compacted shard
+            // row. Fall through to the durable tombstone instead of forcing a
+            // full aggregate transaction for every historical replay row.
         }
         let Ok(state) = self.state.try_lock() else {
             return false;
@@ -13705,13 +13899,13 @@ impl SharedAccount {
         state
             .trades
             .get(trade_key)
-            .map(|trade| trade.ownership.status.eq_ignore_ascii_case(status))
+            .map(|trade| covered(&trade.ownership, trade.is_maker))
             .or_else(|| {
                 state
                     .retired_trade_ownership_tombstones
                     .get(trade_key)
                     .map(|tombstone| {
-                        tombstone.ownership.status.eq_ignore_ascii_case(status)
+                        covered(&tombstone.ownership, tombstone.is_maker)
                             && retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
                     })
             })
@@ -14308,6 +14502,26 @@ fn wall_clock_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+fn trade_lifecycle_covers(stored: &str, incoming: &str) -> bool {
+    let stored = stored.trim_start_matches("TRADE_STATUS_");
+    let incoming = incoming.trim_start_matches("TRADE_STATUS_");
+    let stored_is = |status: &str| stored.eq_ignore_ascii_case(status);
+    // Terminal conflicts must still reach the fail-closed validator.
+    if incoming.eq_ignore_ascii_case("FAILED") {
+        stored_is("FAILED")
+    } else if incoming.eq_ignore_ascii_case("CONFIRMED") {
+        stored_is("CONFIRMED")
+    } else if incoming.eq_ignore_ascii_case("MINED") {
+        stored_is("MINED") || stored_is("CONFIRMED") || stored_is("FAILED")
+    } else if incoming.eq_ignore_ascii_case("MATCHED")
+        || incoming.eq_ignore_ascii_case("MATCHED_NOT_BROADCASTED")
+    {
+        stored_is("MATCHED") || stored_is("MINED") || stored_is("CONFIRMED") || stored_is("FAILED")
+    } else {
+        false
+    }
 }
 
 fn retired_trade_tombstone_is_live(
@@ -17002,31 +17216,49 @@ mod tests {
     #[test]
     fn bound_cold_operations_execute_on_single_account_owner() {
         let account = Arc::new(SharedAccount::new("owner-lane"));
-        let owner_rx = account.bind_account_owner_task_lane().unwrap();
-        let owner_account = Arc::clone(&account);
+        account.register_instance("maker-1", 1.0);
+        let (handle, owner_state) = account.bind_account_owner().unwrap();
+        assert_eq!(handle.account_id(), "owner-lane");
+        assert!(handle.is_bound());
         let (thread_tx, thread_rx) = crossbeam_channel::bounded(3);
         let owner = std::thread::spawn(move || {
-            owner_account.mark_account_owner_thread().unwrap();
+            owner_state.mark_current_thread().unwrap();
             for _ in 0..3 {
-                let command = owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let command = owner_state
+                    .receiver()
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap();
                 thread_tx.send(std::thread::current().id()).unwrap();
-                command.execute(&owner_account);
+                owner_state.execute(command);
             }
         });
 
-        account.record_maintenance_queue_wait(Duration::from_millis(7));
-        account.record_settled_token_values(&HashMap::from([("UP".to_string(), 1.0)]));
-        let snapshot = account.monitoring_snapshot();
+        handle
+            .submit_register_token_interest(
+                "maker-1".to_string(),
+                "condition-1".to_string(),
+                "UP".to_string(),
+                "DOWN".to_string(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        handle
+            .submit_set_risk_blocker("test-owner".to_string(), "test".to_string())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(handle
+            .submit_clear_risk_blocker("test-owner".to_string())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap());
 
         let owner_thread = thread_rx.recv().unwrap();
         assert_eq!(thread_rx.recv().unwrap(), owner_thread);
         assert_eq!(thread_rx.recv().unwrap(), owner_thread);
         assert_ne!(owner_thread, std::thread::current().id());
-        assert_eq!(snapshot.maintenance_queue_jobs, 1);
-        assert_eq!(
-            account.settled_token_values_snapshot_arc().values.get("UP"),
-            Some(&1.0),
-        );
         assert_eq!(account.account_owner_task_queue_depth(), 0);
         owner.join().unwrap();
     }
@@ -19357,6 +19589,38 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .monitoring_snapshot()
                 .retired_trade_ownership_tombstones,
             1,
+        );
+        let covered = |status| {
+            account.trade_lifecycle_covers_nonblocking(
+                "trade-retired",
+                status,
+                "oid-retired",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                true,
+            )
+        };
+        assert!(covered("MATCHED"));
+        assert!(covered("MINED"));
+        assert!(covered("CONFIRMED"));
+        assert!(
+            !covered("FAILED"),
+            "a conflicting terminal state must still take the fail-closed path",
+        );
+        assert!(
+            !account.trade_lifecycle_covers_nonblocking(
+                "trade-retired",
+                "MATCHED",
+                "oid-retired",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.4,
+                true,
+            ),
+            "same-id replay with changed economics must reach cold validation",
         );
 
         // A mismatching replay remains fail-closed. Only an exact replay of

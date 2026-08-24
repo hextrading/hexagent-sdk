@@ -328,6 +328,20 @@ pub struct OrderUpdate {
     pub error: Option<String>,
 }
 
+/// Strategy-owned lifecycle message used across execution and authenticated
+/// private-feed boundaries. `owner` is the startup-assigned strategy worker
+/// index; normal runtime routing must never recover it by parsing a client
+/// order-id namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutedOrderUpdate {
+    pub owner: u16,
+    pub update: OrderUpdate,
+}
+
+/// Reserved numeric owner for account-wide/cold compatibility operations that
+/// do not originate from one live strategy instance.
+pub const SYSTEM_STRATEGY_OWNER: u16 = u16::MAX;
+
 /// A single fill record for backtest results (serialized to JSON).
 #[derive(Debug, Clone, Serialize)]
 pub struct BacktestFill {

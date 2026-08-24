@@ -1786,6 +1786,11 @@ enum AccountLifecycleJob {
         ownership: Option<OrderOwnership>,
     },
     ExecutionState(ExecutionStateCommand),
+    RebindServerIdentity {
+        client_order_id: String,
+        exchange_order_id: String,
+        token: String,
+    },
     MarkLive {
         client_order_id: String,
         tracked: TrackedOrder,
@@ -2274,6 +2279,10 @@ pub struct SharedState {
     pub(crate) instance_id: String,
     /// Account-wide physical/virtual ledger shared by every executor route.
     pub account_state: Arc<hexagent_account::account::shared_account::SharedAccount>,
+    /// Message-only endpoint for strategy/cold-control producers.  Keeping it
+    /// beside the read/snapshot account reference prevents those producers
+    /// from invoking mutations on the live aggregate object.
+    pub account_owner_handle: hexagent_account::account::shared_account::SharedAccountHandle,
     /// Account-owner-written execution identity and open-order state. Request,
     /// cancel, completion and private workers read immutable RCU snapshots.
     execution_state: ArcSwap<ExecutionStateSnapshot>,
@@ -2282,6 +2291,10 @@ pub struct SharedState {
     /// where a cold snapshot replaces an instance lifecycle row before its
     /// asynchronous typed WAL delta is folded into the aggregate state.
     runtime_order_ownership: RuntimeOwnershipIndex,
+    /// Startup-published instance → numeric strategy owner directory. Private
+    /// producers resolve the durable instance identity here exactly once and
+    /// publish an already-routed lifecycle message to the engine.
+    strategy_owner_by_instance: ArcSwap<HashMap<String, u16>>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -2753,6 +2766,22 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    /// Publish the immutable live strategy-owner directory before the private
+    /// feed starts. Replacing it is a startup/reconfiguration operation; reads
+    /// on the private owner lane are lock-free.
+    pub fn install_strategy_owner_routes(&self, routes: HashMap<String, u16>) {
+        self.strategy_owner_by_instance.store(Arc::new(routes));
+    }
+
+    #[inline]
+    pub fn strategy_owner(&self, instance_id: &str) -> Option<u16> {
+        self.strategy_owner_by_instance
+            .load()
+            .get(instance_id)
+            .copied()
+            .filter(|owner| *owner != SYSTEM_STRATEGY_OWNER)
+    }
+
     pub(crate) fn live_position_last_match_secs(&self) -> u64 {
         self.live_position_last_match_secs.load(Ordering::Acquire)
     }
@@ -2849,6 +2878,37 @@ impl SharedState {
                 execution.apply(self, command);
             }
             AccountLifecycleJob::ExecutionState(command) => execution.apply(self, command),
+            AccountLifecycleJob::RebindServerIdentity {
+                client_order_id,
+                exchange_order_id,
+                token,
+            } => {
+                if !self
+                    .account_state
+                    .rebind_order_id(&client_order_id, &exchange_order_id)
+                {
+                    self.user_feed_health.set_inventory_uncertain(true);
+                    log::error!(
+                        "[PolymarketTrade] refused inconsistent server identity coid={} oid={}",
+                        client_order_id,
+                        exchange_order_id,
+                    );
+                    return;
+                }
+                let ownership = self.account_state.order(&client_order_id);
+                if let Some(ownership) = ownership {
+                    self.runtime_order_ownership
+                        .insert(&exchange_order_id, ownership);
+                }
+                execution.apply(
+                    self,
+                    ExecutionStateCommand::InstallIdentity {
+                        client_order_id,
+                        exchange_order_id,
+                        token,
+                    },
+                );
+            }
             AccountLifecycleJob::MarkLive {
                 client_order_id,
                 tracked,
@@ -2940,14 +3000,11 @@ impl SharedState {
         initial_execution_state: ExecutionStateSnapshot,
         initial_live_position: LivePositionManager,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
-        owner_task_rx: crossbeam_channel::Receiver<
-            hexagent_account::account::shared_account::AccountOwnerCommand,
-        >,
+        account_owner: hexagent_account::account::shared_account::SharedAccountOwnerState,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
     ) -> (std::thread::JoinHandle<()>, crossbeam_channel::Receiver<()>) {
         let weak = Arc::downgrade(shared);
-        let owner_account_state = shared.account_state.clone();
         let account_id = shared.account_state.account_id().to_string();
         let shutdown = shared.shutdown_token.clone();
         let shutdown_rx = shutdown.subscribe();
@@ -2959,7 +3016,7 @@ impl SharedState {
                 let mut live_position = initial_live_position;
                 let mut private_replay = super::user_feed::PrivateReplayOwner::new();
                 crate::os_tune::pin_private_account_cold("polymarket-account-owner", &account_id);
-                if let Err(error) = owner_account_state.mark_account_owner_thread() {
+                if let Err(error) = account_owner.mark_current_thread() {
                     log::error!("[PolymarketTrade] account owner binding failed: {error}");
                     return;
                 }
@@ -2985,8 +3042,8 @@ impl SharedState {
                                 );
                                 continue;
                             }
-                            if let Ok(command) = owner_task_rx.try_recv() {
-                                command.execute(&shared.account_state);
+                            if let Ok(command) = account_owner.receiver().try_recv() {
+                                account_owner.execute(command);
                                 continue;
                             }
                             if let Ok(job) = maintenance_rx.try_recv() {
@@ -3011,8 +3068,8 @@ impl SharedState {
                             ),
                             Err(_) => break,
                         },
-                        recv(owner_task_rx) -> command => match command {
-                            Ok(command) => command.execute(&shared.account_state),
+                        recv(account_owner.receiver()) -> command => match command {
+                            Ok(command) => account_owner.execute(command),
                             Err(_) => break,
                         },
                         recv(maintenance_rx) -> job => match job {
@@ -3087,11 +3144,16 @@ impl SharedState {
         );
         let apply_started = crate::latency::Instant::now();
         let branch_stage = match job.status {
+            OrderStatus::Filled => "polymarket.account.lifecycle_apply.filled",
             OrderStatus::Cancelled => "polymarket.account.lifecycle_apply.cancelled",
             OrderStatus::Rejected => "polymarket.account.lifecycle_apply.rejected",
             _ => "polymarket.account.lifecycle_apply.status_update",
         };
         let ((), timing) = measure_deferred_lifecycle_stages(|| match job.status {
+            OrderStatus::Filled => {
+                self.account_state
+                    .mark_filled_pending_audit(&job.client_order_id);
+            }
             OrderStatus::Cancelled => {
                 self.account_state
                     .mark_cancelled_pending_audit(&job.client_order_id);
@@ -3894,29 +3956,21 @@ impl SharedState {
             .is_some_and(|current| {
                 normalize_order_id(current) == normalize_order_id(exchange_order_id)
             });
-        // Make the durable ledger authoritative for a genuinely new binding.
-        // If it detects an unknown coid or an oid collision it enters risk-off;
-        // never install a runtime mapping that disagrees with persistence.
-        if !already_bound
-            && !self
-                .account_state
-                .rebind_order_id(client_order_id, exchange_order_id)
-        {
-            warn!(
-                "[PolymarketTrade] Refusing inconsistent order mapping coid={} oid={}",
-                client_order_id, exchange_order_id,
-            );
+        if already_bound {
             return;
         }
-        let ownership = self.account_state.order(client_order_id);
-        if let Err(error) = self.install_runtime_order_id(
-            client_order_id,
-            exchange_order_id,
-            token,
-            ownership.as_ref(),
-        ) {
+        // Server identity repair is ordered with every other lifecycle
+        // mutation on the account owner. Completion/private workers never
+        // synchronously enter SharedAccount route or persistence locks.
+        let job = AccountLifecycleJob::RebindServerIdentity {
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: exchange_order_id.to_string(),
+            token: token.to_string(),
+        };
+        if let Err(error) = self.account_lifecycle_tx.try_send(job) {
+            self.user_feed_health.set_inventory_uncertain(true);
             log::error!(
-                "[PolymarketTrade] cannot publish order identity coid={} oid={}: {}",
+                "[PolymarketTrade] server identity owner queue unavailable coid={} oid={}: {}",
                 client_order_id,
                 exchange_order_id,
                 error,
@@ -4136,6 +4190,13 @@ impl SharedState {
         // has reached the account ledger. Preserve the reservation and keep the
         // order reconcilable until private-feed/gap-replay trade audit consumes
         // it. Cancelled/rejected outcomes can release immediately.
+        if !self.account_state.is_account_owner_thread() {
+            if status == OrderStatus::Cancelled {
+                self.remove_cancelled_order_runtime(client_order_id);
+            }
+            self.defer_lifecycle_account_apply(client_order_id, status);
+            return;
+        }
         if status == OrderStatus::Filled {
             let transition = self
                 .account_state
@@ -5342,8 +5403,8 @@ impl PolymarketTrade {
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
         let (account_lifecycle_tx, account_lifecycle_rx) = crossbeam_channel::bounded(16_384);
-        let account_owner_task_rx = account_state
-            .bind_account_owner_task_lane()
+        let (account_owner_handle, account_owner_state) = account_state
+            .bind_account_owner()
             .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
@@ -5359,8 +5420,10 @@ impl PolymarketTrade {
         let shared = Arc::new(SharedState {
             instance_id: instance_id.to_string(),
             account_state,
+            account_owner_handle,
             execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
             runtime_order_ownership: recovered_runtime_ownership,
+            strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
             probe_order_ids: ProbeOrderIdRing::default(),
             auth,
             signer,
@@ -5412,7 +5475,7 @@ impl PolymarketTrade {
             initial_execution_state,
             initial_live_position,
             account_lifecycle_rx,
-            account_owner_task_rx,
+            account_owner_state,
             account_maintenance_rx,
             settled_gc_rx,
         );

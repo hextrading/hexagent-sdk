@@ -109,10 +109,16 @@ pub trait Strategy: Send {
     fn on_tick_size_change(&mut self, _tsc: &TickSizeChange) -> Vec<Signal> {
         Vec::new()
     }
+    fn on_tick_size_change_into(&mut self, tsc: &TickSizeChange, out: &mut Vec<Signal>) {
+        out.extend(self.on_tick_size_change(tsc));
+    }
     /// Condition-scoped market-data readiness.  Implementations may cancel
     /// only the affected market while the exchange transport remains live.
     fn on_market_data_health(&mut self, _health: &MarketDataHealth) -> Vec<Signal> {
         Vec::new()
+    }
+    fn on_market_data_health_into(&mut self, health: &MarketDataHealth, out: &mut Vec<Signal>) {
+        out.extend(self.on_market_data_health(health));
     }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
@@ -121,6 +127,9 @@ pub trait Strategy: Send {
     /// orders without using a stale quote event as the trigger.
     fn on_watchdog(&mut self, _now_ns: u64) -> Vec<Signal> {
         Vec::new()
+    }
+    fn on_watchdog_into(&mut self, now_ns: u64, out: &mut Vec<Signal>) {
+        out.extend(self.on_watchdog(now_ns));
     }
     fn on_exit(&mut self) {}
 
@@ -139,6 +148,9 @@ pub trait Strategy: Send {
     fn on_private_feed_control(&mut self, _control: PrivateFeedControl) -> Vec<Signal> {
         Vec::new()
     }
+    fn on_private_feed_control_into(&mut self, control: PrivateFeedControl, out: &mut Vec<Signal>) {
+        out.extend(self.on_private_feed_control(control));
+    }
     /// Handle an OrderUpdate arriving from an exchange. Returning a non-empty
     /// `Vec<Signal>` lets the strategy react synchronously — e.g. fire a
     /// `Signal::ReconcilePolymarket` the moment a `NewOrderTimeout` /
@@ -147,6 +159,9 @@ pub trait Strategy: Send {
     fn on_order_update(&mut self, _update: &OrderUpdate) -> Vec<Signal> {
         Vec::new()
     }
+    fn on_order_update_into(&mut self, update: &OrderUpdate, out: &mut Vec<Signal>) {
+        out.extend(self.on_order_update(update));
+    }
 
     /// Owned update hook used by private and executor lanes. The default keeps
     /// existing strategies source compatible; strategies with bounded dedupe
@@ -154,11 +169,21 @@ pub trait Strategy: Send {
     fn on_order_update_owned(&mut self, update: OrderUpdate) -> Vec<Signal> {
         self.on_order_update(&update)
     }
+    fn on_order_update_owned_into(&mut self, update: OrderUpdate, out: &mut Vec<Signal>) {
+        out.extend(self.on_order_update_owned(update));
+    }
 
     /// Preferred numeric lifecycle hook. The default preserves compatibility
     /// while strategies migrate from string-key recovery routing.
     fn on_lifecycle_update_owned(&mut self, envelope: LifecycleEnvelope) -> Vec<Signal> {
         self.on_order_update_owned(envelope.update)
+    }
+    fn on_lifecycle_update_owned_into(
+        &mut self,
+        envelope: LifecycleEnvelope,
+        out: &mut Vec<Signal>,
+    ) {
+        out.extend(self.on_lifecycle_update_owned(envelope));
     }
     fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> {
         Vec::new()
