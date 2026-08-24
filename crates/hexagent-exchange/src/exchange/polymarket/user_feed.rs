@@ -4565,18 +4565,20 @@ mod tests {
                 0,
             )
             .unwrap();
-        shared.open_orders.lock().unwrap().insert(
-            "owner-1".to_string(),
+        shared.track_open_order(
+            "owner-1",
             super::super::trade::TrackedOrder {
                 symbol: "TOKEN".to_string(),
                 side: Side::Buy,
                 instance_id: "owner".to_string(),
             },
-        );
+        ).unwrap();
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
+        shared.flush_execution_state_for_test();
 
         shared.remove_order_as("owner-1", OrderStatus::Filled);
-        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        shared.flush_execution_state_for_test();
+        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
         assert_eq!(
             shared
                 .account_state
@@ -4609,12 +4611,12 @@ mod tests {
         );
         assert_eq!(updates.len(), 1);
         let cleanup_deadline = Instant::now() + Duration::from_millis(100);
-        while shared.open_orders.lock().unwrap().contains_key("owner-1")
+        while shared.execution_snapshot().open_orders.contains_key("owner-1")
             && Instant::now() < cleanup_deadline
         {
             std::thread::yield_now();
         }
-        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        assert!(!shared.execution_snapshot().open_orders.contains_key("owner-1"));
         assert_eq!(
             shared
                 .account_state
@@ -4718,14 +4720,15 @@ mod tests {
             )
             .unwrap();
         shared.register_order_id("owner-1", "oid-1", "TOKEN");
-        shared.open_orders.lock().unwrap().insert(
-            "owner-1".to_string(),
+        shared.track_open_order(
+            "owner-1",
             super::super::trade::TrackedOrder {
                 symbol: "TOKEN".to_string(),
                 side: Side::Buy,
                 instance_id: "owner".to_string(),
             },
-        );
+        ).unwrap();
+        shared.flush_execution_state_for_test();
         shared
     }
 
@@ -4871,7 +4874,8 @@ mod tests {
                 .reserved_cash,
             0.0
         );
-        assert!(!shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        shared.flush_execution_state_for_test();
+        assert!(!shared.execution_snapshot().open_orders.contains_key("owner-1"));
 
         let resurrection = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -4890,7 +4894,8 @@ mod tests {
                 .reserved_cash,
             5.0
         );
-        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        shared.flush_execution_state_for_test();
+        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
 
         let shared = owned_taker_shared(0.5);
         let mut update = serde_json::json!({
@@ -5119,7 +5124,8 @@ mod tests {
             0
         );
         assert!(!shared.account_state.is_uncertain());
-        assert!(shared.open_orders.lock().unwrap().contains_key("owner-1"));
+        shared.flush_execution_state_for_test();
+        assert!(shared.execution_snapshot().open_orders.contains_key("owner-1"));
 
         let stale_placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -5257,9 +5263,7 @@ mod tests {
                 .prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
             (1, 1),
         );
-        shared.coid_to_oid.lock().unwrap().clear();
-        shared.oid_to_coid.lock().unwrap().clear();
-        shared.coid_to_token.lock().unwrap().clear();
+        shared.clear_execution_state_for_test();
         assert!(shared.lookup_coid("oid-1").is_none());
         assert!(shared.account_state.order_owner_by_oid("oid-1").is_none());
 
@@ -5308,9 +5312,7 @@ mod tests {
                 .prune_terminal_history(&HashSet::from(["TOKEN".to_string()])),
             (1, 1),
         );
-        shared.coid_to_oid.lock().unwrap().clear();
-        shared.oid_to_coid.lock().unwrap().clear();
-        shared.coid_to_token.lock().unwrap().clear();
+        shared.clear_execution_state_for_test();
 
         let event = PrivateEventDelta::classify(event).unwrap();
         let routed = route_private_event_fast(&event, &shared).unwrap();
