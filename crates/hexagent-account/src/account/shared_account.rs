@@ -4680,6 +4680,7 @@ pub struct SharedAccount {
     wallet_calibration_coalesced: AtomicU64,
     account_owner_lane_bound: Arc<AtomicBool>,
     account_owner_thread_id: OnceLock<std::thread::ThreadId>,
+    account_lifecycle_thread_id: OnceLock<std::thread::ThreadId>,
     /// Cold account-wide mutations (wallet snapshots, maintenance and explicit
     /// allocation migrations) take the write side. Ordinary order paths take
     /// only a shared guard and then mutate one virtual account shard.
@@ -5006,8 +5007,36 @@ impl SharedAccount {
             .is_some_and(|owner| *owner == std::thread::current().id())
     }
 
+    /// Bind the lossless private trade/order lifecycle shard to its dedicated
+    /// high-priority consumer. Cold aggregate operations remain owned by
+    /// `account_owner_thread_id`; this identity authorizes only methods that
+    /// mutate virtual lifecycle rows directly.
+    pub fn mark_account_lifecycle_thread(&self) -> Result<(), String> {
+        let current = std::thread::current().id();
+        match self.account_lifecycle_thread_id.set(current) {
+            Ok(()) => Ok(()),
+            Err(existing) if existing == current => Ok(()),
+            Err(existing) => Err(format!(
+                "account {} lifecycle owner already assigned to thread {:?}",
+                self.account_id, existing,
+            )),
+        }
+    }
+
+    pub fn is_account_lifecycle_thread(&self) -> bool {
+        self.account_lifecycle_thread_id
+            .get()
+            .is_some_and(|owner| *owner == std::thread::current().id())
+    }
+
     fn must_dispatch_to_account_owner(&self) -> bool {
         self.account_owner_lane_bound.load(Ordering::Acquire) && !self.is_account_owner_thread()
+    }
+
+    fn must_dispatch_lifecycle_to_account_owner(&self) -> bool {
+        self.account_owner_lane_bound.load(Ordering::Acquire)
+            && !self.is_account_owner_thread()
+            && !self.is_account_lifecycle_thread()
     }
 
     /// Enqueue non-blocking cold account work. This API is intentionally
@@ -5408,6 +5437,7 @@ impl SharedAccount {
             wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
+            account_lifecycle_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
@@ -5800,6 +5830,7 @@ impl SharedAccount {
             wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
+            account_lifecycle_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
             virtual_accounts: RwLock::new(BTreeMap::new()),
             coid_routes: ShardedRouteMap::new(),
@@ -9447,7 +9478,7 @@ impl SharedAccount {
     /// balance-changing maintenance remains fail-closed until authoritative
     /// terminal metadata arrives.
     pub fn begin_order_recovery<'a>(&self, client_order_ids: impl IntoIterator<Item = &'a str>) {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_ids: Vec<String> = client_order_ids
                 .into_iter()
                 .filter(|id| !id.is_empty())
@@ -9496,7 +9527,7 @@ impl SharedAccount {
     }
 
     pub fn finish_order_recovery(&self, client_order_id: &str) {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
                 AccountOwnerOperation::FinishOrderRecovery { client_order_id },
@@ -10452,7 +10483,7 @@ impl SharedAccount {
     }
 
     pub fn rebind_order_id(&self, client_order_id: &str, order_id: &str) -> bool {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             let order_id = order_id.to_string();
             return self
@@ -11109,7 +11140,7 @@ impl SharedAccount {
     /// idempotent and raises reservation counters only to the conservative
     /// minimum implied by all retained orders, so it cannot double-reserve.
     pub fn backfill_order_ownership(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let ownership = ownership.clone();
             return self
                 .request_account_owner(|reply| {
@@ -11202,7 +11233,7 @@ impl SharedAccount {
         client_order_id: &str,
         status: OrderStatus,
     ) -> Option<OrderStatus> {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             let diagnostic_coid = client_order_id.clone();
             return self
@@ -11347,7 +11378,7 @@ impl SharedAccount {
     /// the sticky audit gate until those fills are booked. The edge result lets
     /// callers suppress duplicate WARNs from repeated Filled lifecycle rows.
     pub fn mark_filled_pending_audit(&self, client_order_id: &str) -> FillAuditPendingTransition {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             return self
                 .request_account_owner(|reply| {
@@ -11412,7 +11443,7 @@ impl SharedAccount {
         status: OrderStatus,
         audit: &AuthoritativeOrderAudit,
     ) -> Result<FillAuditPendingTransition, String> {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             let audit = audit.clone();
             return self.request_account_owner(|reply| {
@@ -11653,7 +11684,7 @@ impl SharedAccount {
     /// residual lock until an order-specific audit arrives, without globally
     /// pausing unrelated instances on the same account.
     pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             return self
                 .request_account_owner(|reply| {
@@ -11707,7 +11738,7 @@ impl SharedAccount {
     /// Release the still-unfilled reservation after an authoritative terminal
     /// order outcome. Ownership is retained for late fill attribution.
     pub fn release_order(&self, client_order_id: &str, status: OrderStatus) {
-        if self.must_dispatch_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_account_owner() {
             let client_order_id = client_order_id.to_string();
             if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
                 AccountOwnerOperation::ReleaseOrder {
