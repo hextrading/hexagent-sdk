@@ -8217,7 +8217,7 @@ impl SharedAccount {
             // Retry the same conservative inference while holding the account
             // lock so the outcome and any resulting virtual redemption are
             // persisted as one state transition.
-            try_attribute_binary_redeem(&mut state);
+            try_attribute_binary_redeem(&mut state, &self.account_id);
             self.schedule_persist(&state);
         }
     }
@@ -8270,7 +8270,7 @@ impl SharedAccount {
         }
         if changed {
             state.settled_token_values_generation = effective_generation.saturating_add(1).max(1);
-            try_attribute_binary_redeem(&mut state);
+            try_attribute_binary_redeem(&mut state, &self.account_id);
         }
         if let Some(interest) = state
             .instances
@@ -8590,7 +8590,7 @@ impl SharedAccount {
         if mark_failed_trades_reconciled_by_snapshot(&mut state, &authoritative_tokens) {
             recompute_reconciliation(&mut state, "authoritative physical snapshot");
         }
-        try_attribute_binary_redeem(&mut state);
+        try_attribute_binary_redeem(&mut state, &self.account_id);
         state.startup_snapshot_applied_this_process = true;
         self.schedule_persist(&state);
         Ok(true)
@@ -8637,6 +8637,11 @@ impl SharedAccount {
                 .values()
                 .any(|qty| !qty.is_finite() || *qty < 0.0)
         {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition=<snapshot> reason=invalid_wallet_snapshot observed_cash={:?}",
+                self.account_id,
+                observed_cash,
+            );
             return false;
         }
         if !self.seeded_fast.load(Ordering::Acquire)
@@ -8644,58 +8649,84 @@ impl SharedAccount {
         {
             return false;
         }
-        // The periodic wallet poll normally observes no redeem. Reject that
-        // common case from the aggregate state snapshot without materializing
-        // and republishing every virtual lifecycle shard. Only a positive cash
-        // delta can be a candidate 1:1 platform redemption.
-        let prior_cash = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .physical_cash;
-        if observed_cash - prior_cash <= EPS {
+        // The periodic wallet poll normally observes no difference. Keep that
+        // common case on the lightweight persisted aggregate. Divergence is
+        // reconciled only by the cold wallet worker on the account's sole
+        // writer; the quote and private-event lanes never execute this scan.
+        let has_observable_divergence = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.unallocated_cash < -reconciliation_tolerance(state.physical_cash, observed_cash)
+                || (observed_cash - state.physical_cash).abs()
+                    > reconciliation_tolerance(observed_cash, state.physical_cash)
+                || authoritative_tokens.iter().any(|token| {
+                    let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
+                    let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+                    (observed - prior).abs() > reconciliation_tolerance(observed, prior)
+                })
+        };
+        if !has_observable_divergence {
             return false;
         }
         let mut state = self.lock_state();
-        if !state.seeded
-            || has_unsettled_trade_lifecycle(&state)
-            || has_unsettled_maintenance_operation(&state)
-        {
+        let unsettled_trade = has_unsettled_trade_lifecycle(&state);
+        let unsettled_maintenance = has_unsettled_maintenance_operation(&state);
+        if !state.seeded || unsettled_trade || unsettled_maintenance {
+            let reason = if !state.seeded {
+                "account_not_seeded"
+            } else if unsettled_trade {
+                "unsettled_trade_lifecycle"
+            } else {
+                "unsettled_maintenance_operation"
+            };
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition=<snapshot> reason={}",
+                self.account_id,
+                reason,
+            );
+            log_wallet_reconciliation_alerts(
+                &self.account_id,
+                &state,
+                observed_cash,
+                observed_positions,
+                authoritative_tokens,
+            );
             return false;
         }
         let cash_delta = observed_cash - state.physical_cash;
-        if cash_delta <= EPS {
+        let analysis = analyze_condition_scoped_binary_redeems(
+            &state,
+            observed_positions,
+            authoritative_tokens,
+            cash_delta,
+        );
+        for failure in &analysis.failures {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason={} detail={:?}",
+                self.account_id,
+                failure.condition_id,
+                failure.reason,
+                failure.detail,
+            );
+        }
+        if analysis.selected.is_empty() {
+            log_wallet_reconciliation_alerts(
+                &self.account_id,
+                &state,
+                observed_cash,
+                observed_positions,
+                authoritative_tokens,
+            );
             return false;
         }
 
-        let mut removed = Vec::new();
-        let mut conditions = BTreeSet::new();
-        for token in authoritative_tokens {
-            let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
-            let observed = observed_positions.get(token).copied().unwrap_or(0.0);
-            let delta = observed - prior;
-            if delta.abs() <= reconciliation_tolerance(prior, observed) {
-                continue;
-            }
-            let Some((condition_id, value)) = proven_binary_token_value(&state, token) else {
-                return false;
-            };
-            if delta < 0.0 {
-                removed.push((token.clone(), -delta, value));
-                conditions.insert(condition_id);
-            } else {
-                return false;
-            }
-        }
-        if removed.is_empty() {
-            return false;
-        }
-        let removed_total: f64 = removed.iter().map(|(_, qty, _)| qty).sum();
-        let expected_payout: f64 = removed.iter().map(|(_, qty, value)| qty * value).sum();
-        let tolerance = 0.02_f64.max(removed_total.abs().max(cash_delta.abs()) * 0.001);
-        if expected_payout <= EPS || cash_delta + tolerance < expected_payout {
-            return false;
-        }
+        let expected_payout: f64 = analysis
+            .selected
+            .iter()
+            .map(|candidate| candidate.expected_payout)
+            .sum();
         // Polymarket can settle a redeem a few cents below its proven binary
         // payout (for example, because the platform deducted a redeem fee).
         // The physical side already contains the authoritative wallet delta,
@@ -8703,58 +8734,78 @@ impl SharedAccount {
         // pro rata across every winning token/owner. Positive excess cash is
         // intentionally left unallocated, preserving the existing deposit
         // safety boundary.
-        let attributed_payout = cash_delta.min(expected_payout);
-        let payout_scale = attributed_payout / expected_payout;
+        let attributed_payout = cash_delta.max(0.0).min(expected_payout);
+        let payout_scale = if expected_payout > EPS {
+            attributed_payout / expected_payout
+        } else {
+            1.0
+        };
         let residual_cash = cash_delta - expected_payout;
-        for (token, qty, _) in &removed {
-            let virtual_total: f64 = state
-                .instances
-                .values()
-                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-                .sum();
-            if virtual_total + tolerance < *qty {
-                return false;
-            }
+        if expected_payout > EPS {
+            state.physical_cash = observed_cash;
         }
-
-        state.physical_cash += cash_delta;
-        let mut attributed = Vec::new();
-        for (token, qty, value) in &removed {
-            let physical = state.physical_positions.entry(token.clone()).or_insert(0.0);
-            *physical = (*physical - *qty).max(0.0);
-            let virtual_total: f64 = state
-                .instances
-                .values()
-                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-                .sum();
-            if virtual_total <= EPS {
-                continue;
-            }
-            for (instance_id, instance) in &mut state.instances {
-                let owned = instance.positions.get(token).copied().unwrap_or(0.0);
-                if owned <= EPS {
+        let mut applied_conditions = Vec::with_capacity(analysis.selected.len());
+        let mut applied_removed = Vec::new();
+        for candidate in analysis.selected {
+            let adjustment_label = format!("observed_platform_redeem:{}", candidate.condition_id);
+            for removed in candidate.removed {
+                if removed.observed <= EPS {
+                    state.physical_positions.remove(&removed.token_id);
+                } else {
+                    state
+                        .physical_positions
+                        .insert(removed.token_id.clone(), removed.observed);
+                }
+                let virtual_total: f64 = state
+                    .instances
+                    .values()
+                    .map(|instance| {
+                        instance
+                            .positions
+                            .get(&removed.token_id)
+                            .copied()
+                            .unwrap_or(0.0)
+                    })
+                    .sum();
+                if virtual_total <= EPS {
                     continue;
                 }
-                let burned = (owned * *qty / virtual_total).min(owned);
-                *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-                let instance_cash_delta = burned * *value * payout_scale;
-                instance.cash += instance_cash_delta;
-                attributed.push((
-                    instance_id.clone(),
-                    token.clone(),
-                    burned,
-                    instance_cash_delta,
+                let mut attributed = Vec::new();
+                for (instance_id, instance) in &mut state.instances {
+                    let owned = instance
+                        .positions
+                        .get(&removed.token_id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if owned <= EPS {
+                        continue;
+                    }
+                    let burned = (owned * removed.quantity / virtual_total).min(owned);
+                    *instance
+                        .positions
+                        .entry(removed.token_id.clone())
+                        .or_insert(0.0) -= burned;
+                    let instance_cash_delta = burned * removed.value * payout_scale;
+                    instance.cash += instance_cash_delta;
+                    attributed.push((instance_id.clone(), burned, instance_cash_delta));
+                }
+                for (instance_id, burned, instance_cash_delta) in attributed {
+                    record_internal_external_adjustment(
+                        &mut state,
+                        &adjustment_label,
+                        &instance_id,
+                        instance_cash_delta,
+                        HashMap::from([(removed.token_id.clone(), -burned)]),
+                    );
+                }
+                applied_removed.push((
+                    candidate.condition_id.clone(),
+                    removed.token_id,
+                    removed.quantity,
+                    removed.value,
                 ));
             }
-        }
-        for (instance_id, token, burned, instance_cash_delta) in attributed {
-            record_internal_external_adjustment(
-                &mut state,
-                "observed_platform_redeem",
-                &instance_id,
-                instance_cash_delta,
-                HashMap::from([(token, -burned)]),
-            );
+            applied_conditions.push(candidate.condition_id);
         }
         recompute_reconciliation(&mut state, "platform automatic binary redeem");
         self.schedule_persist(&state);
@@ -8766,8 +8817,15 @@ impl SharedAccount {
             payout_scale,
             cash_delta,
             residual_cash,
-            conditions,
-            removed,
+            applied_conditions,
+            applied_removed,
+        );
+        log_wallet_reconciliation_alerts(
+            &self.account_id,
+            &state,
+            observed_cash,
+            observed_positions,
+            authoritative_tokens,
         );
         true
     }
@@ -17014,153 +17072,636 @@ fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: St
     set_uncertain(state, reason);
 }
 
-/// Return a token's authoritative binary outcome only when its registered
-/// event has complementary 1/0 outcomes. A token-level settlement value alone
-/// is insufficient proof because unrelated wallet changes can overlap a
-/// restart snapshot.
-fn proven_binary_token_value(state: &SharedAccountState, token_id: &str) -> Option<(String, f64)> {
-    let mut proof = None;
-    let mut mappings: Vec<(&str, &str, &str)> = state
+#[derive(Debug)]
+struct ConditionRedeemRemoval {
+    token_id: String,
+    quantity: f64,
+    observed: f64,
+    value: f64,
+}
+
+#[derive(Debug)]
+struct ConditionRedeemCandidate {
+    condition_id: String,
+    removed: Vec<ConditionRedeemRemoval>,
+    removed_total: f64,
+    expected_payout: f64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConditionRedeemFailure {
+    condition_id: String,
+    reason: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Default)]
+struct ConditionRedeemAnalysis {
+    selected: Vec<ConditionRedeemCandidate>,
+    failures: Vec<ConditionRedeemFailure>,
+}
+
+fn registered_binary_condition_pairs(
+    state: &SharedAccountState,
+) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let mut conditions = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    for interest in state
         .instances
         .values()
         .flat_map(|instance| instance.token_interests.values())
-        .filter(|interest| interest.up_token_id == token_id || interest.down_token_id == token_id)
-        .map(|interest| {
-            (
-                interest.condition_id.as_str(),
-                interest.up_token_id.as_str(),
-                interest.down_token_id.as_str(),
-            )
-        })
-        .collect();
-    mappings.extend(
-        state
-            .maintenance_ops
-            .values()
-            .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
-            .filter(|operation| {
-                operation.up_token_id == token_id || operation.down_token_id == token_id
-            })
-            .map(|operation| {
-                (
-                    operation.condition_id.as_str(),
-                    operation.up_token_id.as_str(),
-                    operation.down_token_id.as_str(),
-                )
-            }),
-    );
-    for (condition_id, up_token_id, down_token_id) in mappings {
-        let up = state.settled_token_values.get(up_token_id).copied()?;
-        let down = state.settled_token_values.get(down_token_id).copied()?;
-        if !((up == 1.0 && down == 0.0) || (up == 0.0 && down == 1.0)) {
+    {
+        conditions
+            .entry(interest.condition_id.clone())
+            .or_default()
+            .insert((interest.up_token_id.clone(), interest.down_token_id.clone()));
+    }
+    for operation in state
+        .maintenance_ops
+        .values()
+        .filter(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+    {
+        conditions
+            .entry(operation.condition_id.clone())
+            .or_default()
+            .insert((
+                operation.up_token_id.clone(),
+                operation.down_token_id.clone(),
+            ));
+    }
+    conditions
+}
+
+/// Analyze a periodic wallet observation by complete event scope. A failure in
+/// one condition must not prevent an independently proven condition from being
+/// repaired. The caller applies the returned candidates in one account-writer
+/// transaction, making a repeated identical snapshot an idempotent no-op.
+fn analyze_condition_scoped_binary_redeems(
+    state: &SharedAccountState,
+    observed_positions: &HashMap<String, f64>,
+    authoritative_tokens: &HashSet<String>,
+    cash_delta: f64,
+) -> ConditionRedeemAnalysis {
+    let mut analysis = ConditionRedeemAnalysis::default();
+    let mut changed = BTreeMap::<String, (f64, f64, f64)>::new();
+    for token in authoritative_tokens {
+        let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
+        let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+        let delta = observed - prior;
+        if delta.abs() > reconciliation_tolerance(prior, observed) {
+            changed.insert(token.clone(), (prior, observed, delta));
+        }
+    }
+    if changed.is_empty() {
+        return analysis;
+    }
+
+    let condition_pairs = registered_binary_condition_pairs(state);
+    let mut token_conditions = BTreeMap::<String, BTreeSet<String>>::new();
+    for (condition_id, pairs) in &condition_pairs {
+        for (up_token_id, down_token_id) in pairs {
+            token_conditions
+                .entry(up_token_id.clone())
+                .or_default()
+                .insert(condition_id.clone());
+            token_conditions
+                .entry(down_token_id.clone())
+                .or_default()
+                .insert(condition_id.clone());
+        }
+    }
+
+    let mut handled_tokens = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for (condition_id, pairs) in condition_pairs {
+        let relevant_tokens: BTreeSet<String> = pairs
+            .iter()
+            .flat_map(|(up, down)| [up.clone(), down.clone()])
+            .filter(|token| changed.contains_key(token))
+            .collect();
+        if relevant_tokens.is_empty() {
             continue;
         }
-        let value = if up_token_id == token_id { up } else { down };
-        let candidate = (condition_id.to_string(), value);
-        if proof
-            .as_ref()
-            .is_some_and(|existing| existing != &candidate)
-        {
-            return None;
+        handled_tokens.extend(relevant_tokens.iter().cloned());
+        if pairs.len() != 1 {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "conflicting_condition_token_mapping",
+                detail: format!("mappings={pairs:?} changed_tokens={relevant_tokens:?}"),
+            });
+            continue;
         }
-        proof = Some(candidate);
+        let (up_token_id, down_token_id) = pairs.into_iter().next().unwrap();
+        let ambiguous_tokens: Vec<String> = [&up_token_id, &down_token_id]
+            .into_iter()
+            .filter(|token| {
+                token_conditions
+                    .get(*token)
+                    .is_some_and(|conditions| conditions.len() != 1)
+            })
+            .cloned()
+            .collect();
+        if !ambiguous_tokens.is_empty() {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "ambiguous_token_condition_mapping",
+                detail: format!("tokens={ambiguous_tokens:?}"),
+            });
+            continue;
+        }
+        let missing_scope: Vec<String> = [&up_token_id, &down_token_id]
+            .into_iter()
+            .filter(|token| {
+                !authoritative_tokens.contains(*token)
+                    && state.physical_positions.get(*token).copied().unwrap_or(0.0) > EPS
+            })
+            .cloned()
+            .collect();
+        if !missing_scope.is_empty() {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "partial_authoritative_scope",
+                detail: format!("missing_tokens={missing_scope:?}"),
+            });
+            continue;
+        }
+
+        let token_deltas: Vec<(&String, f64, f64, f64)> = [&up_token_id, &down_token_id]
+            .into_iter()
+            .map(|token| {
+                let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
+                let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+                (token, prior, observed, observed - prior)
+            })
+            .collect();
+        let positive_deltas: Vec<(&String, f64)> = token_deltas
+            .iter()
+            .filter(|(_, prior, observed, delta)| {
+                *delta > reconciliation_tolerance(*prior, *observed)
+            })
+            .map(|(token, _, _, delta)| (*token, *delta))
+            .collect();
+        if !positive_deltas.is_empty() {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "positive_wallet_position_delta",
+                detail: format!("deltas={positive_deltas:?}"),
+            });
+            continue;
+        }
+
+        let Some(up_value) = state.settled_token_values.get(&up_token_id).copied() else {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "missing_settled_outcome",
+                detail: format!("token={up_token_id}"),
+            });
+            continue;
+        };
+        let Some(down_value) = state.settled_token_values.get(&down_token_id).copied() else {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "missing_settled_outcome",
+                detail: format!("token={down_token_id}"),
+            });
+            continue;
+        };
+        if !((up_value == 1.0 && down_value == 0.0) || (up_value == 0.0 && down_value == 1.0)) {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "non_binary_or_non_complementary_outcome",
+                detail: format!("up={up_value} down={down_value}"),
+            });
+            continue;
+        }
+
+        let mut removed = Vec::new();
+        let mut ownership_failure = None;
+        for (token, prior, observed, delta) in token_deltas {
+            if delta >= -reconciliation_tolerance(prior, observed) {
+                continue;
+            }
+            let quantity = -delta;
+            let virtual_total: f64 = state
+                .instances
+                .values()
+                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
+                .sum();
+            let tolerance = reconciliation_tolerance(virtual_total, quantity);
+            if virtual_total + tolerance < quantity {
+                ownership_failure = Some(format!(
+                    "token={token} removed={quantity:.9} virtual_owned={virtual_total:.9}"
+                ));
+                break;
+            }
+            let value = if token == &up_token_id {
+                up_value
+            } else {
+                down_value
+            };
+            removed.push(ConditionRedeemRemoval {
+                token_id: token.clone(),
+                quantity,
+                observed,
+                value,
+            });
+        }
+        if let Some(detail) = ownership_failure {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id,
+                reason: "removed_quantity_exceeds_virtual_ownership",
+                detail,
+            });
+            continue;
+        }
+        if removed.is_empty() {
+            continue;
+        }
+        let removed_total = removed.iter().map(|removed| removed.quantity).sum();
+        let expected_payout = removed
+            .iter()
+            .map(|removed| removed.quantity * removed.value)
+            .sum();
+        candidates.push(ConditionRedeemCandidate {
+            condition_id,
+            removed,
+            removed_total,
+            expected_payout,
+        });
     }
-    proof
+
+    for (token, (prior, observed, delta)) in changed {
+        if !handled_tokens.contains(&token) {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id: "<unmapped>".to_string(),
+                reason: "token_has_no_registered_condition",
+                detail: format!(
+                    "token={token} prior={prior:.9} observed={observed:.9} delta={delta:+.9}"
+                ),
+            });
+        }
+    }
+
+    // Cash is a snapshot-wide budget, but eligibility remains condition-local:
+    // a large unaffordable condition is skipped without blocking a later
+    // smaller or zero-payout condition.
+    let mut remaining_cash = cash_delta.max(0.0);
+    for candidate in candidates {
+        let tolerance = 0.02_f64.max(
+            candidate
+                .removed_total
+                .abs()
+                .max(candidate.expected_payout.abs())
+                * 0.001,
+        );
+        if candidate.expected_payout > EPS && remaining_cash + tolerance < candidate.expected_payout
+        {
+            analysis.failures.push(ConditionRedeemFailure {
+                condition_id: candidate.condition_id,
+                reason: "insufficient_observed_cash_delta",
+                detail: format!(
+                    "expected_payout={:.9} remaining_cash_delta={:.9} tolerance={:.9}",
+                    candidate.expected_payout, remaining_cash, tolerance,
+                ),
+            });
+            continue;
+        }
+        remaining_cash = (remaining_cash - candidate.expected_payout).max(0.0);
+        analysis.selected.push(candidate);
+    }
+    analysis
+}
+
+fn log_wallet_reconciliation_alerts(
+    account_id: &str,
+    state: &SharedAccountState,
+    observed_cash: f64,
+    observed_positions: &HashMap<String, f64>,
+    authoritative_tokens: &HashSet<String>,
+) {
+    if state.unallocated_cash < -EPS {
+        log::warn!(
+            "[shared_account_reconciliation_alert] account={} kind=negative_unallocated_cash unallocated_cash={:+.9}",
+            account_id,
+            state.unallocated_cash,
+        );
+    }
+
+    let cash_delta = observed_cash - state.physical_cash;
+    if cash_delta.abs() > reconciliation_tolerance(observed_cash, state.physical_cash) {
+        log::warn!(
+            "[shared_account_reconciliation_alert] account={} kind=wallet_physical_cash_divergence wallet_cash={:.9} physical_cash={:.9} delta={:+.9}",
+            account_id,
+            observed_cash,
+            state.physical_cash,
+            cash_delta,
+        );
+    }
+
+    let mut differences = Vec::new();
+    let mut absolute_delta = 0.0;
+    for token in authoritative_tokens {
+        let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
+        let wallet = observed_positions.get(token).copied().unwrap_or(0.0);
+        let delta = wallet - physical;
+        if delta.abs() > reconciliation_tolerance(wallet, physical) {
+            absolute_delta += delta.abs();
+            differences.push((token.clone(), physical, wallet, delta));
+        }
+    }
+    differences.sort_by(|left, right| left.0.cmp(&right.0));
+    if !differences.is_empty() {
+        let examples: Vec<_> = differences.iter().take(16).collect();
+        log::warn!(
+            "[shared_account_reconciliation_alert] account={} kind=wallet_physical_position_divergence token_count={} absolute_delta={:.9} differences={:?} suppressed={}",
+            account_id,
+            differences.len(),
+            absolute_delta,
+            examples,
+            differences.len().saturating_sub(examples.len()),
+        );
+    }
 }
 
 /// Polymarket may redeem settled binary inventory outside the bot process.
-/// Burn only tokens backed by a complete registered 1/0 outcome pair and
-/// credit exactly their proven payout. Any additional positive cash remains
-/// unallocated instead of being assigned to strategy inventory.
-fn try_attribute_binary_redeem(state: &mut SharedAccountState) -> bool {
-    if state.unallocated_cash <= EPS {
-        return false;
-    }
-    let removed: Vec<(String, String, f64, f64)> = state
+/// Burn only condition-scoped tokens backed by a complete registered 1/0
+/// outcome pair and credit exactly their proven payout. Each eligible
+/// condition is independent, so incomplete history for one event cannot block
+/// another event. Any additional positive cash remains unallocated instead of
+/// being assigned to strategy inventory.
+fn try_attribute_binary_redeem(state: &mut SharedAccountState, account_id: &str) -> bool {
+    let negative_tokens: BTreeSet<String> = state
         .unallocated_positions
         .iter()
-        .filter_map(|(token, delta)| {
-            if *delta >= -EPS {
-                return None;
-            }
-            proven_binary_token_value(state, token)
-                .map(|(condition_id, value)| (condition_id, token.clone(), -*delta, value))
-        })
+        .filter(|(_, delta)| **delta < -EPS)
+        .map(|(token, _)| token.clone())
         .collect();
-    if removed.is_empty() {
+    if negative_tokens.is_empty() {
         return false;
     }
-    let removed_total: f64 = removed.iter().map(|(_, _, qty, _)| *qty).sum();
-    let expected_payout: f64 = removed.iter().map(|(_, _, qty, value)| qty * value).sum();
-    let tolerance = 0.02_f64.max(removed_total * 0.001);
-    if expected_payout <= EPS || state.unallocated_cash + tolerance < expected_payout {
+
+    let condition_pairs = registered_binary_condition_pairs(state);
+    let mut token_conditions = BTreeMap::<String, BTreeSet<String>>::new();
+    for (condition_id, pairs) in &condition_pairs {
+        for (up_token_id, down_token_id) in pairs {
+            token_conditions
+                .entry(up_token_id.clone())
+                .or_default()
+                .insert(condition_id.clone());
+            token_conditions
+                .entry(down_token_id.clone())
+                .or_default()
+                .insert(condition_id.clone());
+        }
+    }
+    let mut handled_tokens = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for (condition_id, pairs) in condition_pairs {
+        let relevant_tokens: BTreeSet<String> = pairs
+            .iter()
+            .flat_map(|(up, down)| [up.clone(), down.clone()])
+            .filter(|token| negative_tokens.contains(token))
+            .collect();
+        if relevant_tokens.is_empty() {
+            continue;
+        }
+        handled_tokens.extend(relevant_tokens.iter().cloned());
+        if pairs.len() != 1 {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=conflicting_condition_token_mapping detail={:?}",
+                account_id,
+                condition_id,
+                format!("mappings={pairs:?} changed_tokens={relevant_tokens:?}"),
+            );
+            continue;
+        }
+        let (up_token_id, down_token_id) = pairs.into_iter().next().unwrap();
+        let ambiguous_tokens: Vec<String> = [&up_token_id, &down_token_id]
+            .into_iter()
+            .filter(|token| {
+                token_conditions
+                    .get(*token)
+                    .is_some_and(|conditions| conditions.len() != 1)
+            })
+            .cloned()
+            .collect();
+        if !ambiguous_tokens.is_empty() {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=ambiguous_token_condition_mapping detail={:?}",
+                account_id,
+                condition_id,
+                format!("tokens={ambiguous_tokens:?}"),
+            );
+            continue;
+        }
+        let Some(up_value) = state.settled_token_values.get(&up_token_id).copied() else {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=missing_settled_outcome detail={:?}",
+                account_id,
+                condition_id,
+                format!("token={up_token_id}"),
+            );
+            continue;
+        };
+        let Some(down_value) = state.settled_token_values.get(&down_token_id).copied() else {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=missing_settled_outcome detail={:?}",
+                account_id,
+                condition_id,
+                format!("token={down_token_id}"),
+            );
+            continue;
+        };
+        if !((up_value == 1.0 && down_value == 0.0) || (up_value == 0.0 && down_value == 1.0)) {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=non_binary_or_non_complementary_outcome detail={:?}",
+                account_id,
+                condition_id,
+                format!("up={up_value} down={down_value}"),
+            );
+            continue;
+        }
+
+        let mut removed = Vec::new();
+        let mut ownership_failure = None;
+        for (token, value) in [(&up_token_id, up_value), (&down_token_id, down_value)] {
+            let quantity = -state
+                .unallocated_positions
+                .get(token)
+                .copied()
+                .unwrap_or(0.0);
+            if quantity <= EPS {
+                continue;
+            }
+            let virtual_total: f64 = state
+                .instances
+                .values()
+                .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
+                .sum();
+            let tolerance = reconciliation_tolerance(virtual_total, quantity);
+            if virtual_total + tolerance < quantity {
+                ownership_failure = Some(format!(
+                    "token={token} removed={quantity:.9} virtual_owned={virtual_total:.9}"
+                ));
+                break;
+            }
+            removed.push(ConditionRedeemRemoval {
+                token_id: token.clone(),
+                quantity,
+                observed: state.physical_positions.get(token).copied().unwrap_or(0.0),
+                value,
+            });
+        }
+        if let Some(detail) = ownership_failure {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=removed_quantity_exceeds_virtual_ownership detail={:?}",
+                account_id,
+                condition_id,
+                detail,
+            );
+            continue;
+        }
+        let removed_total = removed.iter().map(|removed| removed.quantity).sum();
+        let expected_payout = removed
+            .iter()
+            .map(|removed| removed.quantity * removed.value)
+            .sum();
+        candidates.push(ConditionRedeemCandidate {
+            condition_id,
+            removed,
+            removed_total,
+            expected_payout,
+        });
+    }
+
+    for token in negative_tokens.difference(&handled_tokens) {
+        log::warn!(
+            "[shared_account_redeem_attribution_failed] account={} condition=<unmapped> reason=token_has_no_registered_condition detail={:?}",
+            account_id,
+            format!(
+                "token={token} unallocated_position={:+.9}",
+                state
+                    .unallocated_positions
+                    .get(token)
+                    .copied()
+                    .unwrap_or(0.0),
+            ),
+        );
+    }
+
+    let observed_cash_delta = state.unallocated_cash;
+    let mut remaining_cash = observed_cash_delta.max(0.0);
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        let tolerance = 0.02_f64.max(
+            candidate
+                .removed_total
+                .abs()
+                .max(candidate.expected_payout.abs())
+                * 0.001,
+        );
+        if candidate.expected_payout > EPS && remaining_cash + tolerance < candidate.expected_payout
+        {
+            log::warn!(
+                "[shared_account_redeem_attribution_failed] account={} condition={} reason=insufficient_unallocated_cash detail={:?}",
+                account_id,
+                candidate.condition_id,
+                format!(
+                    "expected_payout={:.9} remaining_unallocated_cash={:.9} tolerance={:.9}",
+                    candidate.expected_payout, remaining_cash, tolerance,
+                ),
+            );
+            continue;
+        }
+        remaining_cash = (remaining_cash - candidate.expected_payout).max(0.0);
+        selected.push(candidate);
+    }
+    if selected.is_empty() {
         return false;
     }
+
+    let expected_payout: f64 = selected
+        .iter()
+        .map(|candidate| candidate.expected_payout)
+        .sum();
     // Attribute no more than the observed wallet cash. A tolerated
     // underpayment is spread over the proven winning payout instead of
     // crediting the theoretical $1/token and immediately creating a negative
     // reconciliation residual. Any overpayment remains unallocated.
-    let attributed_payout = state.unallocated_cash.min(expected_payout);
-    let payout_scale = attributed_payout / expected_payout;
-    let residual_cash = state.unallocated_cash - expected_payout;
-    for (_, token, qty, _) in &removed {
-        let virtual_total: f64 = state
-            .instances
-            .values()
-            .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-            .sum();
-        if virtual_total + EPS < *qty {
-            return false;
-        }
-    }
-
-    let observed_cash_delta = state.unallocated_cash;
-    let conditions: BTreeSet<String> = removed
-        .iter()
-        .map(|(condition_id, _, _, _)| condition_id.clone())
-        .collect();
-    for (_, token, qty, value) in &removed {
-        let virtual_total: f64 = state
-            .instances
-            .values()
-            .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
-            .sum();
-        if virtual_total <= EPS {
-            continue;
-        }
-        let mut attributed = Vec::new();
-        for (instance_id, instance) in &mut state.instances {
-            let owned = instance.positions.get(token).copied().unwrap_or(0.0);
-            if owned <= EPS {
+    let attributed_payout = observed_cash_delta.max(0.0).min(expected_payout);
+    let payout_scale = if expected_payout > EPS {
+        attributed_payout / expected_payout
+    } else {
+        1.0
+    };
+    let residual_cash = observed_cash_delta - expected_payout;
+    let mut conditions = Vec::with_capacity(selected.len());
+    let mut applied_removed = Vec::new();
+    for candidate in selected {
+        let adjustment_label = format!("platform_redeem:{}", candidate.condition_id);
+        for removed in candidate.removed {
+            let virtual_total: f64 = state
+                .instances
+                .values()
+                .map(|instance| {
+                    instance
+                        .positions
+                        .get(&removed.token_id)
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            if virtual_total <= EPS {
                 continue;
             }
-            let burned = (owned * *qty / virtual_total).min(owned);
-            *instance.positions.entry(token.clone()).or_insert(0.0) -= burned;
-            let cash_delta = burned * *value * payout_scale;
-            instance.cash += cash_delta;
-            attributed.push((instance_id.clone(), burned, cash_delta));
+            let mut attributed = Vec::new();
+            for (instance_id, instance) in &mut state.instances {
+                let owned = instance
+                    .positions
+                    .get(&removed.token_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                if owned <= EPS {
+                    continue;
+                }
+                let burned = (owned * removed.quantity / virtual_total).min(owned);
+                *instance
+                    .positions
+                    .entry(removed.token_id.clone())
+                    .or_insert(0.0) -= burned;
+                let cash_delta = burned * removed.value * payout_scale;
+                instance.cash += cash_delta;
+                attributed.push((instance_id.clone(), burned, cash_delta));
+            }
+            for (instance_id, burned, cash_delta) in attributed {
+                record_internal_external_adjustment(
+                    state,
+                    &adjustment_label,
+                    &instance_id,
+                    cash_delta,
+                    HashMap::from([(removed.token_id.clone(), -burned)]),
+                );
+            }
+            applied_removed.push((
+                candidate.condition_id.clone(),
+                removed.token_id,
+                removed.quantity,
+                removed.value,
+            ));
         }
-        for (instance_id, burned, cash_delta) in attributed {
-            record_internal_external_adjustment(
-                state,
-                "platform_redeem",
-                &instance_id,
-                cash_delta,
-                HashMap::from([(token.clone(), -burned)]),
-            );
-        }
+        conditions.push(candidate.condition_id);
     }
     log::info!(
-        "[shared_account] inferred platform binary redeem: payout={:.6} attributed_payout={:.6} payout_scale={:.9} observed_cash_delta={:.6} residual_cash={:+.6} conditions={:?} removed={:?}",
+        "[shared_account] inferred condition-scoped platform binary redeem account={} payout={:.6} attributed_payout={:.6} payout_scale={:.9} observed_cash_delta={:.6} residual_cash={:+.6} conditions={:?} removed={:?}",
+        account_id,
         expected_payout,
         attributed_payout,
         payout_scale,
         observed_cash_delta,
         residual_cash,
         conditions,
-        removed,
+        applied_removed,
     );
-    recompute_reconciliation(state, "inferred platform binary redeem");
+    recompute_reconciliation(state, "inferred condition-scoped platform binary redeem");
     true
 }
 
@@ -21631,6 +22172,237 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             &HashSet::from(["BTC-WIN".into(), "ETH-UP".into()]),
         ));
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn condition_scoped_redeem_is_not_blocked_by_another_conditions_positive_delta() {
+        let account = SharedAccount::new("condition-scoped-platform-redeem");
+        account.register_instance("btc", 1.0);
+        account.register_instance("eth", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account
+            .register_token_interest("eth", "eth-event", "ETH-WIN", "ETH-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("BTC-WIN".into(), 30.0), ("ETH-WIN".into(), 20.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0),
+            ("BTC-LOSE".into(), 0.0),
+            ("ETH-WIN".into(), 1.0),
+            ("ETH-LOSE".into(), 0.0),
+        ]));
+        let observed_positions = HashMap::from([("ETH-WIN".into(), 25.0)]);
+        let authoritative_tokens = HashSet::from([
+            "BTC-WIN".into(),
+            "BTC-LOSE".into(),
+            "ETH-WIN".into(),
+            "ETH-LOSE".into(),
+        ]);
+        {
+            let state = account.lock_state();
+            let analysis = analyze_condition_scoped_binary_redeems(
+                &state,
+                &observed_positions,
+                &authoritative_tokens,
+                30.0,
+            );
+            assert_eq!(analysis.selected.len(), 1);
+            assert_eq!(analysis.selected[0].condition_id, "btc-event");
+            assert!(analysis.failures.iter().any(|failure| {
+                failure.condition_id == "eth-event"
+                    && failure.reason == "positive_wallet_position_delta"
+            }));
+        }
+
+        assert!(account.observe_platform_binary_redeem(
+            130.0,
+            &observed_positions,
+            &authoritative_tokens,
+        ));
+        let metric = account.monitoring_snapshot();
+        assert_eq!(metric.physical_cash, 130.0);
+        assert_eq!(metric.physical_positions.get("BTC-WIN"), None);
+        assert_eq!(metric.physical_positions.get("ETH-WIN"), Some(&20.0));
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 80.0);
+        assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
+
+        let adjustment_count = account.state.lock().unwrap().external_adjustments.len();
+        assert!(!account.observe_platform_binary_redeem(
+            130.0,
+            &observed_positions,
+            &authoritative_tokens,
+        ));
+        assert_eq!(
+            account.state.lock().unwrap().external_adjustments.len(),
+            adjustment_count,
+            "replaying an identical wallet snapshot must not duplicate ledger adjustments",
+        );
+    }
+
+    #[test]
+    fn insufficient_cash_for_one_condition_does_not_block_a_smaller_condition() {
+        let account = SharedAccount::new("condition-cash-budget-platform-redeem");
+        account.register_instance("large", 1.0);
+        account.register_instance("small", 1.0);
+        account
+            .register_token_interest("large", "a-large", "LARGE-WIN", "LARGE-LOSE")
+            .unwrap();
+        account
+            .register_token_interest("small", "b-small", "SMALL-WIN", "SMALL-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("LARGE-WIN".into(), 100.0), ("SMALL-WIN".into(), 20.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("LARGE-WIN".into(), 1.0),
+            ("LARGE-LOSE".into(), 0.0),
+            ("SMALL-WIN".into(), 1.0),
+            ("SMALL-LOSE".into(), 0.0),
+        ]));
+        let authoritative_tokens = HashSet::from([
+            "LARGE-WIN".into(),
+            "LARGE-LOSE".into(),
+            "SMALL-WIN".into(),
+            "SMALL-LOSE".into(),
+        ]);
+        {
+            let state = account.lock_state();
+            let analysis = analyze_condition_scoped_binary_redeems(
+                &state,
+                &HashMap::new(),
+                &authoritative_tokens,
+                20.0,
+            );
+            assert_eq!(analysis.selected.len(), 1);
+            assert_eq!(analysis.selected[0].condition_id, "b-small");
+            assert!(analysis.failures.iter().any(|failure| {
+                failure.condition_id == "a-large"
+                    && failure.reason == "insufficient_observed_cash_delta"
+            }));
+        }
+
+        assert!(account.observe_platform_binary_redeem(
+            120.0,
+            &HashMap::new(),
+            &authoritative_tokens,
+        ));
+        let metric = account.monitoring_snapshot();
+        assert_eq!(metric.physical_cash, 120.0);
+        assert_eq!(metric.physical_positions.get("LARGE-WIN"), Some(&100.0));
+        assert_eq!(metric.physical_positions.get("SMALL-WIN"), None);
+        assert_eq!(account.instance_snapshot("large").unwrap().cash, 50.0);
+        assert_eq!(account.instance_snapshot("small").unwrap().cash, 70.0);
+    }
+
+    #[test]
+    fn restart_condition_scoped_redeem_skips_only_the_unfunded_condition() {
+        let account = SharedAccount::new("restart-condition-cash-budget-redeem");
+        account.register_instance("large", 1.0);
+        account.register_instance("small", 1.0);
+        account
+            .register_token_interest("large", "a-large", "LARGE-WIN", "LARGE-LOSE")
+            .unwrap();
+        account
+            .register_token_interest("small", "b-small", "SMALL-WIN", "SMALL-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("LARGE-WIN".into(), 100.0), ("SMALL-WIN".into(), 20.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("LARGE-WIN".into(), 1.0),
+            ("LARGE-LOSE".into(), 0.0),
+            ("SMALL-WIN".into(), 1.0),
+            ("SMALL-LOSE".into(), 0.0),
+        ]));
+        account
+            .state
+            .lock()
+            .unwrap()
+            .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
+
+        account
+            .apply_physical_snapshot(120.0, HashMap::new())
+            .unwrap();
+
+        let metric = account.monitoring_snapshot();
+        assert_eq!(metric.physical_cash, 120.0);
+        assert!(metric.physical_positions.is_empty());
+        assert_eq!(
+            account
+                .instance_snapshot("large")
+                .unwrap()
+                .positions
+                .get("LARGE-WIN"),
+            Some(&100.0),
+        );
+        assert_eq!(
+            account
+                .instance_snapshot("small")
+                .unwrap()
+                .positions
+                .get("SMALL-WIN")
+                .copied()
+                .unwrap_or(0.0),
+            0.0,
+        );
+        assert_eq!(metric.unallocated_positions.get("LARGE-WIN"), Some(&-100.0));
+        assert_eq!(account.instance_snapshot("large").unwrap().cash, 50.0);
+        assert_eq!(account.instance_snapshot("small").unwrap().cash, 70.0);
+    }
+
+    #[test]
+    fn zero_payout_condition_redeem_reconciles_without_a_cash_delta() {
+        let account = SharedAccount::new("losing-platform-redeem");
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([("BTC-LOSE".into(), 30.0)]))
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("BTC-WIN".into(), 1.0),
+            ("BTC-LOSE".into(), 0.0),
+        ]));
+
+        assert!(account.observe_platform_binary_redeem(
+            100.0,
+            &HashMap::new(),
+            &HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+        ));
+        let metric = account.monitoring_snapshot();
+        assert_eq!(metric.physical_cash, 100.0);
+        assert_eq!(metric.physical_positions.get("BTC-LOSE"), None);
+        assert_eq!(
+            account
+                .instance_snapshot("btc")
+                .unwrap()
+                .positions
+                .get("BTC-LOSE")
+                .copied()
+                .unwrap_or(0.0),
+            0.0,
+        );
+        assert!(!account.observe_platform_binary_redeem(
+            100.0,
+            &HashMap::new(),
+            &HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+        ));
     }
 
     #[test]
