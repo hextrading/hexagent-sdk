@@ -4927,49 +4927,160 @@ pub struct MaintenanceJob {
         Option<std::sync::Arc<hexagent_account::account::shared_account::SharedAccount>>,
 }
 
-// ── Global maintenance executor ──
-// Replaces the old per-call detached thread. One worker thread per
-// `account_id` (lazily spawned) drains that account's queue SERIALLY, so
-// two instances sharing a wallet (e.g. BTC + ETH whose 5-min events end
-// at the same instant) never run split/redeem concurrently on the same
-// wallet — which would race on the shared USDC pool and the signer's
-// on-chain nonce. Different accounts get different workers → parallel.
+// ── Per-account wallet/on-chain actor ──
+// One worker thread per `account_id` owns every maintenance operation for
+// that wallet. Split/redeem and merge share one FIFO lane: chain I/O is never
+// performed while holding a cross-operation mutex, and a merge cannot race a
+// split/redeem for collateral, ERC-1155 inventory, or the signer/Safe nonce.
 type MaintenanceQueueItem = (
     MaintenanceJob,
     Option<crossbeam_channel::Sender<()>>,
     std::time::Instant,
 );
 
-static MAINTENANCE_QUEUES: std::sync::OnceLock<
+enum WalletActorCommand {
+    Maintenance(MaintenanceQueueItem),
+    Merge(MergeQueueItem),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalletActorCommandKind { Maintenance, Merge }
+
+impl WalletActorCommand {
+    fn kind(&self) -> WalletActorCommandKind {
+        match self {
+            Self::Maintenance(_) => WalletActorCommandKind::Maintenance,
+            Self::Merge(_) => WalletActorCommandKind::Merge,
+        }
+    }
+}
+
+static WALLET_ACTOR_QUEUES: std::sync::OnceLock<
     std::sync::Mutex<
-        std::collections::HashMap<String, crossbeam_channel::Sender<MaintenanceQueueItem>>,
+        std::collections::HashMap<String, crossbeam_channel::Sender<WalletActorCommand>>,
     >,
 > = std::sync::OnceLock::new();
+static WALLET_ACTOR_QUEUE_HIGH_WATER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static WALLET_ACTOR_QUEUE_OVERFLOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 const MAINTENANCE_COALESCE_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAINTENANCE_COALESCE_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// One account can have only a bounded number of event-boundary operations in
 /// flight. Overflow fails the requesting strategy closed instead of allowing
 /// a slow chain RPC to grow process memory without limit.
-const MAINTENANCE_QUEUE_CAPACITY: usize = 64;
+const WALLET_ACTOR_QUEUE_CAPACITY: usize = 64;
 
-/// Cross-operation account lock. Split/redeem and merge have independent
-/// coalescing queues, but transactions for one wallet must still be strictly
-/// serialized so they cannot race on collateral, ERC-1155 inventory, or the
-/// Safe/signer nonce.
-static ACCOUNT_MAINTENANCE_LOCKS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
-> = std::sync::OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletActorQueueMetrics {
+    pub capacity: usize,
+    pub high_water: usize,
+    pub overflow: u64,
+}
 
-fn account_maintenance_lock(account_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-    let locks = ACCOUNT_MAINTENANCE_LOCKS
+pub fn wallet_actor_queue_metrics() -> WalletActorQueueMetrics {
+    WalletActorQueueMetrics {
+        capacity: WALLET_ACTOR_QUEUE_CAPACITY,
+        high_water: WALLET_ACTOR_QUEUE_HIGH_WATER.load(std::sync::atomic::Ordering::Relaxed),
+        overflow: WALLET_ACTOR_QUEUE_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+fn wallet_actor_sender(account: &str) -> crossbeam_channel::Sender<WalletActorCommand> {
+    let queues = WALLET_ACTOR_QUEUES
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    locks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(account_id.to_string())
-        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-        .clone()
+    let mut map = queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(account.to_string()).or_insert_with(|| {
+        let (tx, rx) = crossbeam_channel::bounded(WALLET_ACTOR_QUEUE_CAPACITY);
+        let worker_label = if account.is_empty() { "env".to_string() } else { account.to_string() };
+        let worker_name = format!("poly-wallet-{}", worker_label);
+        std::thread::Builder::new().name(worker_name.clone()).spawn(move || {
+            crate::os_tune::pin_background(&worker_name);
+            while let Ok(first) = rx.recv() {
+                let mut burst = vec![first];
+                let started = std::time::Instant::now();
+                while started.elapsed() < MAINTENANCE_COALESCE_MAX {
+                    let remaining = MAINTENANCE_COALESCE_MAX.saturating_sub(started.elapsed());
+                    match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
+                        Ok(next) => burst.push(next),
+                        Err(_) => break,
+                    }
+                }
+                run_wallet_actor_burst(burst);
+            }
+        }).expect("Failed to spawn wallet/on-chain actor");
+        tx
+    }).clone()
+}
+
+fn partition_wallet_actor_runs(burst: Vec<WalletActorCommand>) -> Vec<Vec<WalletActorCommand>> {
+    let mut runs: Vec<Vec<WalletActorCommand>> = Vec::new();
+    for command in burst {
+        if let Some(run) = runs.last_mut().filter(|run| run[0].kind() == command.kind()) {
+            run.push(command);
+        } else {
+            runs.push(vec![command]);
+        }
+    }
+    runs
+}
+
+fn run_wallet_actor_burst(burst: Vec<WalletActorCommand>) {
+    for run in partition_wallet_actor_runs(burst) {
+        match run[0].kind() {
+            WalletActorCommandKind::Maintenance => run_maintenance_actor_batch(run.into_iter().map(|command| match command {
+                WalletActorCommand::Maintenance(item) => item,
+                WalletActorCommand::Merge(_) => unreachable!("mixed wallet actor run"),
+            }).collect()),
+            WalletActorCommandKind::Merge => run_merge_actor_batch(run.into_iter().map(|command| match command {
+                WalletActorCommand::Merge(item) => item,
+                WalletActorCommand::Maintenance(_) => unreachable!("mixed wallet actor run"),
+            }).collect()),
+        }
+    }
+}
+
+fn partition_adjacent_maintenance_targets(burst: Vec<MaintenanceQueueItem>) -> Vec<Vec<MaintenanceQueueItem>> {
+    let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
+    for item in burst {
+        if let Some(group) = groups.last_mut().filter(|group| maintenance_jobs_share_target(&group[0].0, &item.0)) {
+            group.push(item);
+        } else {
+            groups.push(vec![item]);
+        }
+    }
+    groups
+}
+
+fn run_maintenance_actor_batch(mut burst: Vec<MaintenanceQueueItem>) {
+    for (job, _, _) in &mut burst { resolve_maintenance_split_target(job); }
+    let mut redeem_claimed = false;
+    for mut group in partition_adjacent_maintenance_targets(burst) {
+        let wants_redeem = group.iter().any(|item| item.0.redeem_enabled);
+        if redeem_claimed {
+            for item in &mut group { item.0.redeem_enabled = false; }
+        } else if wants_redeem {
+            redeem_claimed = true;
+        }
+        run_maintenance_group(group);
+    }
+}
+
+fn partition_adjacent_merge_targets(burst: Vec<MergeQueueItem>) -> Vec<Vec<MergeQueueItem>> {
+    let mut groups: Vec<Vec<MergeQueueItem>> = Vec::new();
+    for item in burst {
+        if let Some(group) = groups.last_mut().filter(|group| merge_jobs_share_target(&group[0].0, &item.0)) {
+            group.push(item);
+        } else {
+            groups.push(vec![item]);
+        }
+    }
+    groups
+}
+
+fn run_merge_actor_batch(burst: Vec<MergeQueueItem>) {
+    for group in partition_adjacent_merge_targets(burst) { run_merge_maintenance_group(group); }
 }
 
 /// Enqueue a job onto its account's serial worker, spawning the worker on
@@ -4982,96 +5093,19 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         *s.lock().unwrap() = MaintenanceStatus::Running;
     }
     let account = job.account_id.clone();
-    let queues =
-        MAINTENANCE_QUEUES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = queues.lock().unwrap();
-    let tx = map.entry(account.clone()).or_insert_with(|| {
-        let (tx, rx) =
-            crossbeam_channel::bounded::<MaintenanceQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
-        let worker_label = if account.is_empty() {
-            "env".to_string()
-        } else {
-            account.clone()
-        };
-        let worker_name = format!("poly-maint-{}", worker_label);
-        std::thread::Builder::new()
-            .name(worker_name.clone())
-            .spawn(move || {
-                // This worker is lazily spawned by the strategy owner, which
-                // is SCHED_FIFO and pinned in low-latency live mode. pthreads
-                // inherit both policy and affinity: without an immediate
-                // demotion the first split/redeem burst time-sliced on the
-                // strategy core and produced repeatable ~40 ms Instrument and
-                // quote-queue tails at every event pre-registration.
-                crate::os_tune::pin_background(&worker_name);
-                // Serial drain with an idle-debounce coalescing window. Jobs for the
-                // same account + series arriving together (the normal case
-                // for sibling instances on one event boundary) become one
-                // on-chain redeem/split operation.
-                while let Ok(first) = rx.recv() {
-                    let mut burst = vec![first];
-                    let burst_started = std::time::Instant::now();
-                    while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
-                        let remaining =
-                            MAINTENANCE_COALESCE_MAX.saturating_sub(burst_started.elapsed());
-                        match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
-                            Ok(next) => burst.push(next),
-                            Err(_) => break,
-                        }
-                    }
-                    // Gamma resolution can itself take longer than the idle
-                    // window. Include everything that arrived while it was in
-                    // flight, resolving identical selectors via singleflight.
-                    loop {
-                        for (job, _, _) in &mut burst {
-                            resolve_maintenance_split_target(job);
-                        }
-                        let before = burst.len();
-                        burst.extend(rx.try_iter());
-                        if burst.len() == before {
-                            break;
-                        }
-                    }
-                    let mut groups: Vec<Vec<MaintenanceQueueItem>> = Vec::new();
-                    for item in burst {
-                        if let Some(group) = groups
-                            .iter_mut()
-                            .find(|group| maintenance_jobs_share_target(&group[0].0, &item.0))
-                        {
-                            group.push(item);
-                        } else {
-                            groups.push(vec![item]);
-                        }
-                    }
-                    let mut redeem_claimed = false;
-                    for mut group in groups {
-                        let wants_redeem = group.iter().any(|item| item.0.redeem_enabled);
-                        if redeem_claimed {
-                            for item in &mut group {
-                                item.0.redeem_enabled = false;
-                            }
-                        } else if wants_redeem {
-                            redeem_claimed = true;
-                        }
-                        run_maintenance_group(group);
-                    }
-                }
-            })
-            .expect("Failed to spawn maintenance worker");
-        tx
-    });
-    if let Err(error) = tx.try_send((job, done, std::time::Instant::now())) {
+    let tx = wallet_actor_sender(&account);
+    let admitted_depth = tx.len().saturating_add(1).min(WALLET_ACTOR_QUEUE_CAPACITY);
+    if let Err(error) = tx.try_send(WalletActorCommand::Maintenance((job, done, std::time::Instant::now()))) {
         let (item, reason) = match error {
-            crossbeam_channel::TrySendError::Full(item) => (
-                item,
-                format!(
-                    "maintenance queue capacity {} exhausted; refusing unbounded chain backlog",
-                    MAINTENANCE_QUEUE_CAPACITY,
-                ),
-            ),
-            crossbeam_channel::TrySendError::Disconnected(item) => {
-                (item, "maintenance worker disconnected".to_string())
+            crossbeam_channel::TrySendError::Full(WalletActorCommand::Maintenance(item)) => {
+                WALLET_ACTOR_QUEUE_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (item, format!("wallet actor queue capacity {} exhausted; refusing unbounded chain backlog", WALLET_ACTOR_QUEUE_CAPACITY))
             }
+            crossbeam_channel::TrySendError::Disconnected(item) => {
+                let WalletActorCommand::Maintenance(item) = item else { unreachable!() };
+                (item, "wallet/on-chain actor disconnected".to_string())
+            }
+            _ => unreachable!(),
         };
         let (job, done, _) = item;
         if let Some(status) = &job.status {
@@ -5090,6 +5124,8 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
             account,
             reason
         );
+    } else {
+        WALLET_ACTOR_QUEUE_HIGH_WATER.fetch_max(admitted_depth, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -5391,10 +5427,6 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
         allocations.len().max(1), job.account_id, job.split_series_id,
         job.split_amount_usdc, allocations,
     );
-    let account_lock = account_maintenance_lock(&job.account_id);
-    let _operation_guard = account_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let ready_condition_id = job.split_target_condition_id.clone();
     let ready_token_ids = job.split_target_token_ids.clone();
     run_maintenance_job(job, allocations);
@@ -5463,10 +5495,6 @@ type MergeQueueItem = (
     std::time::Instant,
 );
 
-static MERGE_MAINTENANCE_QUEUES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<MergeQueueItem>>>,
-> = std::sync::OnceLock::new();
-
 fn merge_jobs_share_target(left: &MergeMaintenanceJob, right: &MergeMaintenanceJob) -> bool {
     left.condition_id == right.condition_id
         && left.up_token_id == right.up_token_id
@@ -5480,68 +5508,19 @@ fn enqueue_merge_maintenance(
     done: Option<crossbeam_channel::Sender<std::result::Result<(), String>>>,
 ) {
     let account = job.account_id.clone();
-    let queues = MERGE_MAINTENANCE_QUEUES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = queues
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let tx = map.entry(account.clone()).or_insert_with(|| {
-        let (tx, rx) = crossbeam_channel::bounded::<MergeQueueItem>(MAINTENANCE_QUEUE_CAPACITY);
-        let worker_label = if account.is_empty() {
-            "env".to_string()
-        } else {
-            account.clone()
-        };
-        let worker_name = format!("poly-merge-{}", worker_label);
-        std::thread::Builder::new()
-            .name(worker_name.clone())
-            .spawn(move || {
-                // Merge is also first spawned from a strategy callback. Drop
-                // inherited real-time policy/affinity before touching its
-                // cold coalescing and chain-I/O path.
-                crate::os_tune::pin_background(&worker_name);
-                while let Ok(first) = rx.recv() {
-                    let mut burst = vec![first];
-                    let burst_started = std::time::Instant::now();
-                    while burst_started.elapsed() < MAINTENANCE_COALESCE_MAX {
-                        let remaining =
-                            MAINTENANCE_COALESCE_MAX.saturating_sub(burst_started.elapsed());
-                        match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
-                            Ok(next) => burst.push(next),
-                            Err(_) => break,
-                        }
-                    }
-                    let mut groups: Vec<Vec<MergeQueueItem>> = Vec::new();
-                    for item in burst {
-                        if let Some(group) = groups
-                            .iter_mut()
-                            .find(|group| merge_jobs_share_target(&group[0].0, &item.0))
-                        {
-                            group.push(item);
-                        } else {
-                            groups.push(vec![item]);
-                        }
-                    }
-                    for group in groups {
-                        run_merge_maintenance_group(group);
-                    }
-                }
-            })
-            .expect("Failed to spawn merge maintenance worker");
-        tx
-    });
-    if let Err(error) = tx.try_send((job, done, std::time::Instant::now())) {
+    let tx = wallet_actor_sender(&account);
+    let admitted_depth = tx.len().saturating_add(1).min(WALLET_ACTOR_QUEUE_CAPACITY);
+    if let Err(error) = tx.try_send(WalletActorCommand::Merge((job, done, std::time::Instant::now()))) {
         let (item, reason) = match error {
-            crossbeam_channel::TrySendError::Full(item) => (
-                item,
-                format!(
-                    "merge queue capacity {} exhausted; refusing unbounded chain backlog",
-                    MAINTENANCE_QUEUE_CAPACITY,
-                ),
-            ),
-            crossbeam_channel::TrySendError::Disconnected(item) => {
-                (item, "merge maintenance worker disconnected".to_string())
+            crossbeam_channel::TrySendError::Full(WalletActorCommand::Merge(item)) => {
+                WALLET_ACTOR_QUEUE_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (item, format!("wallet actor queue capacity {} exhausted; refusing unbounded chain backlog", WALLET_ACTOR_QUEUE_CAPACITY))
             }
+            crossbeam_channel::TrySendError::Disconnected(item) => {
+                let WalletActorCommand::Merge(item) = item else { unreachable!() };
+                (item, "wallet/on-chain actor disconnected".to_string())
+            }
+            _ => unreachable!(),
         };
         let (job, done, _) = item;
         if let Some(done) = done {
@@ -5553,6 +5532,8 @@ fn enqueue_merge_maintenance(
             job.condition_id,
             reason,
         );
+    } else {
+        WALLET_ACTOR_QUEUE_HIGH_WATER.fetch_max(admitted_depth, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -5611,10 +5592,6 @@ fn run_merge_maintenance_group(mut items: Vec<MergeQueueItem>) {
         job.amount_usdc,
         allocations,
     );
-    let account_lock = account_maintenance_lock(&job.account_id);
-    let _operation_guard = account_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = run_merge_maintenance_job(job, allocations);
     if let Err(reason) = &result {
         log::warn!("[Maintenance] Merge failed: {}", reason);
@@ -6404,6 +6381,35 @@ mod maintenance_status_tests {
         }
     }
 
+    fn maintenance_command(account: &str, instance: &str, target: &str, sequence: u64) -> WalletActorCommand {
+        let mut job = maintenance_job(Some(target), sequence);
+        job.account_id = account.to_string();
+        job.instance_id = instance.to_string();
+        job.split_target_token_ids = vec![format!("{target}-up"), format!("{target}-down")];
+        WalletActorCommand::Maintenance((job, None, std::time::Instant::now()))
+    }
+
+    fn merge_command(account: &str, instance: &str, target: &str, sequence: u64) -> WalletActorCommand {
+        let mut job = merge_job(&format!("{target}-{sequence}"), &format!("{target}-up"), &format!("{target}-down"));
+        job.account_id = account.to_string();
+        job.instance_id = instance.to_string();
+        WalletActorCommand::Merge((job, None, std::time::Instant::now()))
+    }
+
+    fn command_sequence(command: &WalletActorCommand) -> u64 {
+        match command {
+            WalletActorCommand::Maintenance((job, _, _)) => job.split_end_date_min_secs,
+            WalletActorCommand::Merge((job, _, _)) => job.condition_id.rsplit_once('-')
+                .and_then(|(_, value)| value.parse().ok()).unwrap(),
+        }
+    }
+
+    fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+        let index = sorted.len().saturating_mul(numerator).div_ceil(denominator)
+            .saturating_sub(1).min(sorted.len().saturating_sub(1));
+        sorted[index]
+    }
+
     #[test]
     fn maintenance_coalescing_requires_the_exact_resolved_event() {
         let mut event_a_early = maintenance_job(Some("event-a"), 100);
@@ -6454,6 +6460,77 @@ mod maintenance_status_tests {
         assert!(!merge_jobs_share_target(&base, &other_event));
         assert!(!merge_jobs_share_target(&base, &wrong_tokens));
         assert!(!merge_jobs_share_target(&base, &direct_gas));
+    }
+
+    #[test]
+    fn wallet_actor_preserves_fifo_duplicates_and_adjacent_coalescing() {
+        let commands = vec![
+            maintenance_command("account", "a", "event-a", 1),
+            maintenance_command("account", "a", "event-a", 1),
+            merge_command("account", "a", "event-m", 2),
+            maintenance_command("account", "b", "event-b", 3),
+            maintenance_command("account", "a", "event-a", 4),
+        ];
+        let runs = partition_wallet_actor_runs(commands);
+        assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1, 2]);
+        assert_eq!(runs.iter().flatten().map(command_sequence).collect::<Vec<_>>(), vec![1, 1, 2, 3, 4]);
+        let final_items = runs.into_iter().nth(2).unwrap().into_iter().map(|command| match command {
+            WalletActorCommand::Maintenance(item) => item,
+            WalletActorCommand::Merge(_) => unreachable!(),
+        }).collect();
+        assert_eq!(partition_adjacent_maintenance_targets(final_items).len(), 2,
+            "different targets must not be reordered to create a wider coalescing group");
+    }
+
+    #[test]
+    fn wallet_actor_registry_is_single_writer_and_instance_isolated() {
+        let unique = format!("wallet-actor-isolation-{}", std::process::id());
+        let left = wallet_actor_sender(&format!("{unique}-left"));
+        let left_again = wallet_actor_sender(&format!("{unique}-left"));
+        let right = wallet_actor_sender(&format!("{unique}-right"));
+        assert!(left.same_channel(&left_again));
+        assert!(!left.same_channel(&right));
+        assert_eq!(left.capacity(), Some(WALLET_ACTOR_QUEUE_CAPACITY));
+    }
+
+    #[test]
+    fn wallet_actor_ingress_reports_latency_order_and_bounded_overflow() {
+        const EVENTS: usize = 4_096;
+        let (tx, rx) = crossbeam_channel::bounded::<WalletActorCommand>(WALLET_ACTOR_QUEUE_CAPACITY);
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<u64>(1);
+        let consumer = std::thread::spawn(move || {
+            while let Ok(command) = rx.recv() { ack_tx.send(command_sequence(&command)).unwrap(); }
+        });
+        let mut samples = Vec::with_capacity(EVENTS);
+        let mut high_water = 0usize;
+        let mut overflow = 0u64;
+        for sequence in 0..EVENTS as u64 {
+            let command = maintenance_command("latency", "instance", "event", sequence);
+            let admitted_depth = tx.len().saturating_add(1);
+            let started = std::time::Instant::now();
+            match tx.try_send(command) {
+                Ok(()) => high_water = high_water.max(admitted_depth),
+                Err(_) => overflow += 1,
+            }
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            assert_eq!(ack_rx.recv().unwrap(), sequence);
+        }
+        drop(tx);
+        consumer.join().unwrap();
+        samples.sort_unstable();
+        let (p50, p99, p999, max) = (
+            percentile(&samples, 50, 100), percentile(&samples, 99, 100),
+            percentile(&samples, 999, 1_000), *samples.last().unwrap(),
+        );
+        eprintln!("wallet actor ingress boundary=bounded_try_send n={EVENTS} p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} queue_high_water={high_water} overflow={overflow}");
+        assert_eq!(overflow, 0);
+
+        let (full_tx, _full_rx) = crossbeam_channel::bounded(WALLET_ACTOR_QUEUE_CAPACITY);
+        for sequence in 0..WALLET_ACTOR_QUEUE_CAPACITY as u64 {
+            full_tx.try_send(maintenance_command("overflow", "instance", "event", sequence)).unwrap();
+        }
+        assert!(matches!(full_tx.try_send(maintenance_command("overflow", "instance", "event", 65)), Err(crossbeam_channel::TrySendError::Full(_))));
+        assert_eq!(full_tx.len(), WALLET_ACTOR_QUEUE_CAPACITY);
     }
 
     #[test]
