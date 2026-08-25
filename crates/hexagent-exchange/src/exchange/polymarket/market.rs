@@ -42,6 +42,7 @@ const CLOB_SOCKET_RCVBUF_BYTES: libc::c_int = 8 * 1024 * 1024;
 const CLOB_STANDBY_MAX_RAW_AGE: Duration = Duration::from_secs(15);
 const CLOB_STANDBY_RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const CLOB_DUAL_SILENCE_WINDOWS: u8 = 2;
+const CLOB_RARE_HANDLER_TAIL: Duration = Duration::from_millis(10);
 
 fn clob_standby_is_hot(observed_data: bool, last_raw_at: Instant, now: Instant) -> bool {
     observed_data && now.saturating_duration_since(last_raw_at) <= CLOB_STANDBY_MAX_RAW_AGE
@@ -3596,7 +3597,16 @@ fn forward_clob_events(
 
 struct ClobBookRepairResult {
     token: String,
+    generation: u64,
     result: std::result::Result<BookFields, String>,
+}
+
+fn advance_clob_repair_generation(epoch: &AtomicU64) -> u64 {
+    epoch.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+}
+
+fn clob_repair_generation_is_current(epoch: &AtomicU64, generation: u64) -> bool {
+    epoch.load(Ordering::Acquire) == generation
 }
 
 async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookFields, String> {
@@ -3634,20 +3644,41 @@ async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookF
 
 fn request_clob_book_repairs(
     tokens: Vec<String>,
+    active_tokens: &[String],
+    generation: u64,
+    generation_epoch: &Arc<AtomicU64>,
     in_flight: &mut HashSet<String>,
     tx: &tokio::sync::mpsc::Sender<ClobBookRepairResult>,
 ) {
     for token in tokens {
+        if !active_tokens.contains(&token) {
+            log::debug!(
+                "[clob_bbo_repair_skipped] token={} generation={} reason=retired_token",
+                token,
+                generation,
+            );
+            continue;
+        }
         if !in_flight.insert(token.clone()) {
             continue;
         }
         let tx = tx.clone();
+        let generation_epoch = Arc::clone(generation_epoch);
         // REST repair is control-plane I/O, not socket reading. Keep it off
         // the single-threaded CLOB runtime so a slow HTTP client/future cannot
         // stop frame reads and the runtime's own watchdog timers together.
         crate::async_rt::handle().spawn(async move {
+            if !clob_repair_generation_is_current(&generation_epoch, generation) {
+                return;
+            }
             let result = fetch_authoritative_clob_book(&token).await;
-            let _ = tx.send(ClobBookRepairResult { token, result }).await;
+            let _ = tx
+                .send(ClobBookRepairResult {
+                    token,
+                    generation,
+                    result,
+                })
+                .await;
         });
     }
 }
@@ -3655,17 +3686,33 @@ fn request_clob_book_repairs(
 fn request_clob_book_repair_after(
     token: String,
     delay: Duration,
+    active_tokens: &[String],
+    generation: u64,
+    generation_epoch: &Arc<AtomicU64>,
     in_flight: &mut HashSet<String>,
     tx: &tokio::sync::mpsc::Sender<ClobBookRepairResult>,
 ) {
+    if !active_tokens.contains(&token) {
+        return;
+    }
     if !in_flight.insert(token.clone()) {
         return;
     }
     let tx = tx.clone();
+    let generation_epoch = Arc::clone(generation_epoch);
     crate::async_rt::handle().spawn(async move {
         tokio::time::sleep(delay).await;
+        if !clob_repair_generation_is_current(&generation_epoch, generation) {
+            return;
+        }
         let result = fetch_authoritative_clob_book(&token).await;
-        let _ = tx.send(ClobBookRepairResult { token, result }).await;
+        let _ = tx
+            .send(ClobBookRepairResult {
+                token,
+                generation,
+                result,
+            })
+            .await;
     });
 }
 
@@ -3791,6 +3838,8 @@ fn promote_clob_standby(
     books: &mut ClobLocalBooks,
     repair_tx: &mut tokio::sync::mpsc::Sender<ClobBookRepairResult>,
     repair_rx: &mut tokio::sync::mpsc::Receiver<ClobBookRepairResult>,
+    repair_generation: &mut u64,
+    repair_generation_epoch: &Arc<AtomicU64>,
     repairs_in_flight: &mut HashSet<String>,
     repair_superseded_attempts: &mut HashMap<String, u8>,
     liveness: &PolymarketLiveness,
@@ -3832,9 +3881,17 @@ fn promote_clob_standby(
     let (new_repair_tx, new_repair_rx) = tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
     *repair_tx = new_repair_tx;
     *repair_rx = new_repair_rx;
+    *repair_generation = advance_clob_repair_generation(repair_generation_epoch);
     repairs_in_flight.clear();
     repair_superseded_attempts.clear();
-    request_clob_book_repairs(subscription.tokens.clone(), repairs_in_flight, repair_tx);
+    request_clob_book_repairs(
+        subscription.tokens.clone(),
+        &subscription.tokens,
+        *repair_generation,
+        repair_generation_epoch,
+        repairs_in_flight,
+        repair_tx,
+    );
     liveness.mark_subscribed();
 
     if let Some(connect) = standby_connect.take() {
@@ -3905,6 +3962,7 @@ async fn clob_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
     let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
+    let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
         subscribed_once: was_previously_subscribed,
@@ -3927,6 +3985,10 @@ async fn clob_ws_task(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // Fence every REST repair spawned by an older socket/subscription
+        // generation before reconnect delay or control-message processing.
+        let mut repair_generation =
+            advance_clob_repair_generation(repair_generation_epoch.as_ref());
 
         // Drain any buffered ctrl messages — take the latest Resubscribe so
         // we don't churn through stale token lists if rotations piled up.
@@ -4067,6 +4129,11 @@ async fn clob_ws_task(
                                 if activate {
                                     subscription = new_subscription;
                                 }
+                                repair_generation = advance_clob_repair_generation(
+                                    repair_generation_epoch.as_ref(),
+                                );
+                                repairs_in_flight.clear();
+                                repair_superseded_attempts.clear();
                                 info!(
                                     "[clob_atomic_cutover] mode=preseeded_subset wire_tokens={} logical_tokens={} activate={} not_ready_ms=0",
                                     wire_subscription.tokens.len(),
@@ -4128,6 +4195,9 @@ async fn clob_ws_task(
                                 tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
                             repair_tx = new_repair_tx;
                             repair_rx = new_repair_rx;
+                            repair_generation = advance_clob_repair_generation(
+                                repair_generation_epoch.as_ref(),
+                            );
                             super::network_incident::update_ws_peers(active.peer_addr, None);
                             liveness.mark_subscribed();
                             liveness.record_market_data(clob_monotonic_now_ns());
@@ -4264,6 +4334,9 @@ async fn clob_ws_task(
                     }
                     request_clob_book_repairs(
                         batch.repair_tokens,
+                        &wire_subscription.tokens,
+                        repair_generation,
+                        &repair_generation_epoch,
                         &mut repairs_in_flight,
                         &repair_tx,
                     );
@@ -4285,6 +4358,17 @@ async fn clob_ws_task(
                     let Some(repair) = repair else {
                         continue;
                     };
+                    if repair.generation != repair_generation
+                        || !wire_subscription.tokens.contains(&repair.token)
+                    {
+                        log::debug!(
+                            "[clob_bbo_repair_skipped] token={} result_generation={} active_generation={} reason=stale_or_retired_result",
+                            repair.token,
+                            repair.generation,
+                            repair_generation,
+                        );
+                        continue;
+                    }
                     repairs_in_flight.remove(&repair.token);
                     if !books.quarantined_tokens.contains(&repair.token) {
                         repair_superseded_attempts.remove(&repair.token);
@@ -4350,6 +4434,9 @@ async fn clob_ws_task(
                                     request_clob_book_repair_after(
                                         repair.token,
                                         delay,
+                                        &wire_subscription.tokens,
+                                        repair_generation,
+                                        &repair_generation_epoch,
                                         &mut repairs_in_flight,
                                         &repair_tx,
                                     );
@@ -4741,6 +4828,8 @@ async fn clob_ws_task(
                                 &mut books,
                                 &mut repair_tx,
                                 &mut repair_rx,
+                                &mut repair_generation,
+                                &repair_generation_epoch,
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
@@ -4768,6 +4857,8 @@ async fn clob_ws_task(
                                 &mut books,
                                 &mut repair_tx,
                                 &mut repair_rx,
+                                &mut repair_generation,
+                                &repair_generation_epoch,
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
@@ -4837,6 +4928,9 @@ async fn clob_ws_task(
                             }
                             request_clob_book_repairs(
                                 batch.repair_tokens,
+                                &wire_subscription.tokens,
+                                repair_generation,
+                                &repair_generation_epoch,
                                 &mut repairs_in_flight,
                                 &repair_tx,
                             );
@@ -4856,7 +4950,23 @@ async fn clob_ws_task(
                             // CLOB WS frame (simd-json + typed deser +
                             // all contained items + crossbeam sends).
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
-                            active.diagnostics.record_read_handler(received_at.elapsed());
+                            let read_handler_elapsed = received_at.elapsed();
+                            if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
+                                diagnostic_sampler.observe(received_at, ClobDiagnostic {
+                                    key: "clob_read_handler_tail",
+                                    detail: format!(
+                                        "frame_bytes={} total_us={} parse_apply_us={} non_parse_us={} runtime_scheduler_max_us={}",
+                                        frame_len,
+                                        read_handler_elapsed.as_micros(),
+                                        parse_apply_elapsed.as_micros(),
+                                        read_handler_elapsed
+                                            .saturating_sub(parse_apply_elapsed)
+                                            .as_micros(),
+                                        runtime_scheduler_max_us.load(Ordering::Relaxed),
+                                    ),
+                                });
+                            }
+                            active.diagnostics.record_read_handler(read_handler_elapsed);
                         }
                         Message::Ping(payload) => {
                             active.record_raw(received_at);
@@ -4947,11 +5057,13 @@ async fn clob_ws_task(
                                 &mut standby,
                                 &mut standby_connect,
                                 &mut next_lane_id,
-                                &subscription,
+                                &wire_subscription,
                                 &mut health,
                                 &mut books,
                                 &mut repair_tx,
                                 &mut repair_rx,
+                                &mut repair_generation,
+                                &repair_generation_epoch,
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
@@ -9390,7 +9502,8 @@ mod pick_current_event_tests {
         );
         assert_eq!(batch.wire.ignored, 1);
         assert_eq!(batch.wire.unknown, 1);
-        assert_eq!(batch.diagnostics.len(), 2);
+        assert_eq!(batch.diagnostics.len(), 1);
+        assert_eq!(batch.diagnostics[0].key, "unknown_event");
     }
 
     #[test]
@@ -9506,5 +9619,15 @@ mod pick_current_event_tests {
         assert!(clob_peers_are_anti_affine(active_v6, other_v6));
         assert!(!clob_peers_are_anti_affine(active_v4, None));
         assert!(!clob_peers_are_anti_affine(None, other_v4));
+    }
+
+    #[test]
+    fn bbo_repair_generation_fences_retired_token_requests() {
+        let epoch = AtomicU64::new(0);
+        let first = advance_clob_repair_generation(&epoch);
+        assert!(clob_repair_generation_is_current(&epoch, first));
+        let second = advance_clob_repair_generation(&epoch);
+        assert!(!clob_repair_generation_is_current(&epoch, first));
+        assert!(clob_repair_generation_is_current(&epoch, second));
     }
 }

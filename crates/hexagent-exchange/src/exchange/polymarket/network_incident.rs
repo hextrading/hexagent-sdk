@@ -5,22 +5,39 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const INCIDENT_CORRELATION_WINDOW: Duration = Duration::from_secs(10);
-const TIMEOUT_CLUSTER_WINDOW_NS: u64 = 750_000_000;
-const TIMEOUT_CLUSTER_CONNECTIONS: u32 = 2;
-const TIMEOUT_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
+const CONNECTION_FAILURE_CLUSTER_WINDOW_NS: u64 = 750_000_000;
+const CONNECTION_FAILURE_CLUSTER_CONNECTIONS: u32 = 2;
+const CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionFailureKind {
+    Timeout,
+    Transport,
+}
+
+impl ConnectionFailureKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+        }
+    }
+}
 
 #[derive(Debug, Default)]
-struct TimeoutClusterGate {
+struct ConnectionFailureClusterGate {
     window_started_ns: AtomicU64,
     connection_mask: AtomicU64,
     place_blocked_until_ns: AtomicU64,
 }
 
-impl TimeoutClusterGate {
+impl ConnectionFailureClusterGate {
     fn note(&self, now_ns: u64, role: crate::http1_pool::Role, slot: usize) -> (u32, bool) {
         loop {
             let started = self.window_started_ns.load(Ordering::Acquire);
-            if started != 0 && now_ns.saturating_sub(started) <= TIMEOUT_CLUSTER_WINDOW_NS {
+            if started != 0
+                && now_ns.saturating_sub(started) <= CONNECTION_FAILURE_CLUSTER_WINDOW_NS
+            {
                 break;
             }
             if self
@@ -42,10 +59,10 @@ impl TimeoutClusterGate {
         let bit = 1u64 << (role_offset + slot.min(7));
         let mask = self.connection_mask.fetch_or(bit, Ordering::AcqRel) | bit;
         let connections = mask.count_ones();
-        if connections < TIMEOUT_CLUSTER_CONNECTIONS {
+        if connections < CONNECTION_FAILURE_CLUSTER_CONNECTIONS {
             return (connections, false);
         }
-        let until = now_ns.saturating_add(TIMEOUT_CLUSTER_PLACE_BLOCK_NS);
+        let until = now_ns.saturating_add(CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS);
         let previous = self.place_blocked_until_ns.fetch_max(until, Ordering::AcqRel);
         (connections, previous <= now_ns)
     }
@@ -55,20 +72,25 @@ impl TimeoutClusterGate {
     }
 }
 
-fn timeout_gate() -> &'static TimeoutClusterGate {
-    static GATE: OnceLock<TimeoutClusterGate> = OnceLock::new();
-    GATE.get_or_init(TimeoutClusterGate::default)
+fn connection_failure_gate() -> &'static ConnectionFailureClusterGate {
+    static GATE: OnceLock<ConnectionFailureClusterGate> = OnceLock::new();
+    GATE.get_or_init(ConnectionFailureClusterGate::default)
 }
 
-pub(crate) fn note_http_connection_timeout(role: crate::http1_pool::Role, slot: usize) {
+pub(crate) fn note_http_connection_failure(
+    role: crate::http1_pool::Role,
+    slot: usize,
+    kind: ConnectionFailureKind,
+) {
     let now_ns = crate::types::now_ns();
-    let (connections, entered) = timeout_gate().note(now_ns, role, slot);
+    let (connections, entered) = connection_failure_gate().note(now_ns, role, slot);
     if entered {
         warn!(
-            "[timeout_cluster] connections={} window_ms={} place_block_ms={} action=pause_new_place_allow_cancel_reconcile trigger_role={:?} trigger_slot={}",
+            "[connection_failure_cluster] connections={} window_ms={} place_block_ms={} action=pause_new_place_allow_cancel_reconcile trigger_kind={} trigger_role={:?} trigger_slot={}",
             connections,
-            TIMEOUT_CLUSTER_WINDOW_NS / 1_000_000,
-            TIMEOUT_CLUSTER_PLACE_BLOCK_NS / 1_000_000,
+            CONNECTION_FAILURE_CLUSTER_WINDOW_NS / 1_000_000,
+            CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS / 1_000_000,
+            kind.name(),
             role,
             slot,
         );
@@ -76,8 +98,8 @@ pub(crate) fn note_http_connection_timeout(role: crate::http1_pool::Role, slot: 
 }
 
 #[inline]
-pub(crate) fn place_blocked_by_timeout_cluster() -> bool {
-    timeout_gate().place_blocked(crate::types::now_ns())
+pub(crate) fn place_blocked_by_connection_failure_cluster() -> bool {
+    connection_failure_gate().place_blocked(crate::types::now_ns())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,15 +257,15 @@ mod tests {
     }
 
     #[test]
-    fn distinct_connection_timeouts_gate_only_after_threshold_and_expire() {
-        let gate = TimeoutClusterGate::default();
+    fn distinct_connection_failures_gate_only_after_threshold_and_expire() {
+        let gate = ConnectionFailureClusterGate::default();
         assert_eq!(gate.note(1, crate::http1_pool::Role::Fast, 0), (1, false));
         assert_eq!(gate.note(2, crate::http1_pool::Role::Fast, 0), (1, false));
         assert_eq!(gate.note(3, crate::http1_pool::Role::Cancel, 0), (2, true));
         assert_eq!(gate.note(4, crate::http1_pool::Role::Cancel, 1), (3, false));
         assert!(gate.place_blocked(5));
         assert!(!gate.place_blocked(
-            4 + TIMEOUT_CLUSTER_PLACE_BLOCK_NS
+            4 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS
         ));
     }
 }
