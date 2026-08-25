@@ -1794,6 +1794,10 @@ struct VirtualLifecycle {
     /// to merge only the touched order/trade/token instead of overwriting the
     /// hot shard or copying the whole account.
     recent_trade_mutations: VecDeque<VirtualTradeMutationHint>,
+    /// Incremental aggregate of virtual trade effects that have not reached
+    /// the wallet yet. The private lifecycle owner updates this alongside the
+    /// affected trade row, so wallet calibration never scans trade history.
+    pending_physical: PendingPhysicalTracker,
 }
 
 #[derive(Debug, Clone)]
@@ -5931,8 +5935,7 @@ impl SharedAccount {
             state
                 .instances
                 .insert(instance_id.clone(), account.ledger_snapshot());
-            let instance_pending =
-                pending_physical_deltas_from_trades(lifecycle.trades.values());
+            let instance_pending = lifecycle.pending_physical.snapshot();
             pending.cash += instance_pending.cash;
             pending.unsettled |= instance_pending.unsettled;
             for (token, quantity) in instance_pending.positions {
@@ -6452,6 +6455,14 @@ impl SharedAccount {
                 .filter(|(_, trade)| trade.ownership.instance_id == *instance_id)
                 .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
                 .collect();
+            {
+                let VirtualLifecycle {
+                    trades,
+                    pending_physical,
+                    ..
+                } = &mut *lifecycle;
+                pending_physical.rebuild(trades);
+            }
             lifecycle.recovery_pending_orders = state
                 .recovery_pending_orders
                 .iter()
@@ -6619,6 +6630,14 @@ impl SharedAccount {
             .filter(|(_, trade)| trade.ownership.instance_id == instance_id)
             .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
             .collect();
+        {
+            let VirtualLifecycle {
+                trades,
+                pending_physical,
+                ..
+            } = &mut *lifecycle;
+            pending_physical.rebuild(trades);
+        }
         lifecycle.recovery_pending_orders = state
             .recovery_pending_orders
             .iter()
@@ -13327,6 +13346,14 @@ impl SharedAccount {
                 ledger_generation: existing.as_ref().map_or(0, |trade| trade.ledger_generation),
             },
         );
+        {
+            let VirtualLifecycle {
+                trades,
+                pending_physical,
+                ..
+            } = &mut *lifecycle;
+            pending_physical.apply_transition(existing.as_ref(), trades.get(trade_key));
+        }
 
         let mut fee_economics_changed = false;
         if let Some((is_maker, _)) = trade_context {
@@ -14646,6 +14673,9 @@ impl SharedAccount {
         let retired_at_ms = wall_clock_ms();
         for trade_key in &stale_trades {
             let removed = lifecycle.trades.remove(trade_key);
+            lifecycle
+                .pending_physical
+                .apply_transition(removed.as_ref(), None);
             lifecycle.fee_attribution_pending.remove(trade_key);
             state.trades.remove(trade_key);
             state.fee_attribution_pending.remove(trade_key);
@@ -15196,6 +15226,14 @@ fn apply_trade_fee_transition_virtual(
         // Settlement bookkeeping is local metadata. The wallet snapshot owns
         // physical_cash/physical_positions and consumes no trade-thread lock.
         trade.physical_fee_booked = settled_fee;
+    }
+    {
+        let VirtualLifecycle {
+            trades,
+            pending_physical,
+            ..
+        } = lifecycle;
+        pending_physical.apply_transition(Some(&existing), trades.get(trade_key));
     }
     lifecycle.fee_attribution_pending.remove(trade_key);
     Ok(virtual_multiplier != 0.0
@@ -16236,6 +16274,87 @@ struct PendingPhysicalDeltas {
     cash: f64,
     positions: HashMap<String, f64>,
     unsettled: bool,
+}
+
+/// Owner-local running total for physical settlement edges. Only the private
+/// lifecycle writer mutates it. Cold wallet calibration copies this bounded
+/// economic view instead of walking the durable trade history.
+#[derive(Debug, Default)]
+struct PendingPhysicalTracker {
+    cash: f64,
+    positions: HashMap<String, f64>,
+    unsettled_trades: usize,
+}
+
+impl PendingPhysicalTracker {
+    fn snapshot(&self) -> PendingPhysicalDeltas {
+        PendingPhysicalDeltas {
+            cash: self.cash,
+            positions: self.positions.clone(),
+            unsettled: self.unsettled_trades != 0,
+        }
+    }
+
+    fn rebuild(&mut self, trades: &HashMap<String, AppliedTrade>) {
+        self.cash = 0.0;
+        self.positions.clear();
+        self.unsettled_trades = 0;
+        for trade in trades.values() {
+            self.apply_trade(trade, 1.0);
+        }
+    }
+
+    fn apply_transition(&mut self, before: Option<&AppliedTrade>, after: Option<&AppliedTrade>) {
+        if let Some(before) = before {
+            self.apply_trade(before, -1.0);
+        }
+        if let Some(after) = after {
+            self.apply_trade(after, 1.0);
+        }
+    }
+
+    fn apply_trade(&mut self, trade: &AppliedTrade, multiplier: f64) {
+        let Some((cash, token, position)) = pending_physical_effect(trade) else {
+            return;
+        };
+        self.cash += cash * multiplier;
+        let quantity = self.positions.entry(token.to_string()).or_insert(0.0);
+        *quantity += position * multiplier;
+        if quantity.abs() <= EPS {
+            self.positions.remove(token);
+        }
+        if multiplier > 0.0 {
+            self.unsettled_trades = self.unsettled_trades.saturating_add(1);
+        } else {
+            debug_assert!(self.unsettled_trades > 0);
+            self.unsettled_trades = self.unsettled_trades.saturating_sub(1);
+        }
+    }
+}
+
+fn pending_physical_effect(trade: &AppliedTrade) -> Option<(f64, &str, f64)> {
+    if !trade.booked || trade.failed {
+        return None;
+    }
+    let mut cash = 0.0;
+    let mut position = 0.0;
+    let mut unsettled = false;
+    if !trade.physical_booked {
+        unsettled = true;
+        let sign = if trade.ownership.side == Side::Buy {
+            1.0
+        } else {
+            -1.0
+        };
+        cash -= sign * trade.ownership.quantity * trade.ownership.price;
+        position += sign * trade.ownership.quantity;
+    }
+    if trade.virtual_fee_booked && !trade.physical_fee_booked {
+        unsettled = true;
+        cash -= trade.usdc_fee;
+        position -= trade.shares_fee;
+    }
+    unsettled.then_some((cash, trade.ownership.token_id.as_str(), position))
 }
 
 fn pending_physical_deltas_from_trades<'a>(
@@ -18425,6 +18544,126 @@ mod tests {
             match_time_secs: 1,
             ledger_generation: generation,
         }
+    }
+
+    fn assert_pending_physical_equal(
+        actual: &PendingPhysicalDeltas,
+        expected: &PendingPhysicalDeltas,
+    ) {
+        assert!((actual.cash - expected.cash).abs() < EPS);
+        assert_eq!(actual.unsettled, expected.unsettled);
+        assert_eq!(actual.positions.len(), expected.positions.len());
+        for (token, expected_quantity) in &expected.positions {
+            let actual_quantity = actual.positions.get(token).copied().unwrap_or(0.0);
+            assert!((actual_quantity - expected_quantity).abs() < EPS);
+        }
+    }
+
+    fn assert_virtual_pending_tracker_matches_scan(account: &SharedAccount, instance_id: &str) {
+        let virtual_account = account.virtual_account(instance_id).unwrap();
+        let lifecycle = virtual_account.lifecycle.lock().unwrap();
+        assert_pending_physical_equal(
+            &lifecycle.pending_physical.snapshot(),
+            &pending_physical_deltas_from_trades(lifecycle.trades.values()),
+        );
+    }
+
+    #[test]
+    fn incremental_pending_physical_matches_trade_scan_across_lifecycle_edges() {
+        let mut tracker = PendingPhysicalTracker::default();
+        let mut trades = HashMap::new();
+
+        let mut matched = applied_trade_with_generation(1);
+        matched.booked = true;
+        matched.ownership.status = "MATCHED".to_string();
+        tracker.apply_transition(None, Some(&matched));
+        trades.insert("trade".to_string(), matched.clone());
+        assert_pending_physical_equal(
+            &tracker.snapshot(),
+            &pending_physical_deltas_from_trades(trades.values()),
+        );
+
+        let mut fee_attributed = matched.clone();
+        fee_attributed.usdc_fee = 0.02;
+        fee_attributed.virtual_fee_booked = true;
+        tracker.apply_transition(Some(&matched), Some(&fee_attributed));
+        trades.insert("trade".to_string(), fee_attributed.clone());
+        assert_pending_physical_equal(
+            &tracker.snapshot(),
+            &pending_physical_deltas_from_trades(trades.values()),
+        );
+
+        let mut confirmed = fee_attributed.clone();
+        confirmed.ownership.status = "CONFIRMED".to_string();
+        confirmed.physical_booked = true;
+        confirmed.physical_fee_booked = true;
+        tracker.apply_transition(Some(&fee_attributed), Some(&confirmed));
+        trades.insert("trade".to_string(), confirmed.clone());
+        assert_pending_physical_equal(
+            &tracker.snapshot(),
+            &pending_physical_deltas_from_trades(trades.values()),
+        );
+
+        tracker.apply_transition(Some(&confirmed), None);
+        trades.remove("trade");
+        assert_pending_physical_equal(
+            &tracker.snapshot(),
+            &pending_physical_deltas_from_trades(trades.values()),
+        );
+    }
+
+    #[test]
+    #[ignore = "focused wallet-calibration pending-delta benchmark"]
+    fn benchmark_pending_physical_snapshot_vs_trade_history_scan() {
+        const TRADE_ROWS: usize = 38_000;
+        const EVENTS_PER_VARIANT: usize = 40;
+        let mut trades = HashMap::with_capacity(TRADE_ROWS);
+        for index in 0..TRADE_ROWS {
+            let mut trade = applied_trade_with_generation(index as u64 + 1);
+            trade.ownership.trade_key = format!("trade-{index}");
+            trade.ownership.client_order_id = format!("order-{index}");
+            trade.booked = true;
+            trade.physical_booked = index % 1_000 != 0;
+            trade.ownership.status = if trade.physical_booked {
+                "CONFIRMED".to_string()
+            } else {
+                "MATCHED".to_string()
+            };
+            trades.insert(trade.ownership.trade_key.clone(), trade);
+        }
+        let mut tracker = PendingPhysicalTracker::default();
+        tracker.rebuild(&trades);
+
+        let mut history_scan = Vec::with_capacity(EVENTS_PER_VARIANT);
+        let mut incremental_snapshot = Vec::with_capacity(EVENTS_PER_VARIANT);
+        for _ in 0..EVENTS_PER_VARIANT {
+            let started = Instant::now();
+            std::hint::black_box(pending_physical_deltas_from_trades(trades.values()));
+            history_scan.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+
+            let started = Instant::now();
+            std::hint::black_box(tracker.snapshot());
+            incremental_snapshot
+                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let scan = latency_summary_ns(&mut history_scan);
+        let snapshot = latency_summary_ns(&mut incremental_snapshot);
+        eprintln!(
+            "wallet pending-delta boundary (trade_rows={TRADE_ROWS}, events_per_variant={EVENTS_PER_VARIANT}, queue_depth=0, overflow=0) ns: history_scan median/p99/p999/max={}/{}/{}/{} incremental_snapshot={}/{}/{}/{}",
+            scan.0,
+            scan.1,
+            scan.2,
+            scan.3,
+            snapshot.0,
+            snapshot.1,
+            snapshot.2,
+            snapshot.3,
+        );
+        assert_pending_physical_equal(
+            &tracker.snapshot(),
+            &pending_physical_deltas_from_trades(trades.values()),
+        );
+        assert!(snapshot.2 < scan.2);
     }
 
     fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
@@ -21297,6 +21536,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             0.0,
             0.2,
         ));
+        assert_virtual_pending_tracker_matches_scan(&account, "a");
         let virtual_matched = account.instance_snapshot("a").unwrap();
         assert!((virtual_matched.positions["UP"] - 19.8).abs() < EPS);
         let physical_matched = account.monitoring_snapshot();
@@ -21324,6 +21564,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             0.0,
             0.2,
         ));
+        assert_virtual_pending_tracker_matches_scan(&account, "a");
         let mined = account.monitoring_snapshot();
         assert!((mined.physical_positions["UP"] - 40.0).abs() < EPS);
         assert!(!mined.uncertain);
@@ -21349,6 +21590,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             0.0,
             0.2,
         ));
+        assert_virtual_pending_tracker_matches_scan(&account, "a");
         let reverted = account.monitoring_snapshot();
         assert!((account.instance_snapshot("a").unwrap().positions["UP"] - 10.0).abs() < EPS);
         assert!((reverted.physical_positions["UP"] - 40.0).abs() < EPS);

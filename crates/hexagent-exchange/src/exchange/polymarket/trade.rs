@@ -4047,7 +4047,14 @@ impl SharedState {
         } else {
             5_000_000
         };
-        let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
+        // The cluster edge itself emits one operational WARN. Every quote
+        // rejected during its short safety window remains in the structured
+        // lifecycle recorder, but must not flood the console one order at a
+        // time while the gate is doing exactly what it was designed to do.
+        let aggregated_timeout_cluster_reject =
+            stage == "preflight_rejected" && reason == "timeout cluster safety gate";
+        let warning = (!reason_code.is_empty() && !aggregated_timeout_cluster_reject)
+            || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
         let trace = traces.get(client_order_id).cloned();
         let (
