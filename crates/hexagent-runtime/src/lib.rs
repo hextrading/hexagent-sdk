@@ -14,6 +14,7 @@ pub mod async_rt;
 pub mod background_jobs;
 pub mod cold_rpc_jobs;
 pub mod http1_pool;
+pub mod instrumented_http1;
 pub mod latency;
 pub mod latency_record;
 pub mod memory;

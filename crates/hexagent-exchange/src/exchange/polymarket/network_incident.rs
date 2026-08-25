@@ -9,6 +9,7 @@ const INCIDENT_CORRELATION_WINDOW: Duration = Duration::from_secs(10);
 const CONNECTION_FAILURE_CLUSTER_WINDOW_NS: u64 = 750_000_000;
 const CONNECTION_FAILURE_CLUSTER_CONNECTIONS: u32 = 2;
 const CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
+pub(crate) const HTTP_SLOW_SUCCESS_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionFailureKind {
@@ -50,14 +51,18 @@ impl ConnectionFailureClusterGate {
                 break;
             }
         }
-        let role_offset = match role {
-            crate::http1_pool::Role::Fast => 0,
-            crate::http1_pool::Role::Cancel => 24,
-            crate::http1_pool::Role::Reconcile => 40,
-            crate::http1_pool::Role::GapReplay => 48,
-            crate::http1_pool::Role::Query => 56,
+        // The fixed mask covers the configured admission topology without a
+        // mutex or growable global map. Saturation folds only slots beyond a
+        // role's documented mask width into its final bit; ordinary account
+        // pools retain exact role/slot identity, including Fast slots > 7.
+        let (role_offset, role_width) = match role {
+            crate::http1_pool::Role::Fast => (0, 24),
+            crate::http1_pool::Role::Cancel => (24, 16),
+            crate::http1_pool::Role::Reconcile => (40, 8),
+            crate::http1_pool::Role::GapReplay => (48, 8),
+            crate::http1_pool::Role::Query => (56, 8),
         };
-        let bit = 1u64 << (role_offset + slot.min(7));
+        let bit = 1u64 << (role_offset + slot.min(role_width - 1));
         let mask = self.connection_mask.fetch_or(bit, Ordering::AcqRel) | bit;
         let connections = mask.count_ones();
         if connections < CONNECTION_FAILURE_CLUSTER_CONNECTIONS {
@@ -96,6 +101,34 @@ pub(crate) fn note_http_connection_failure(
             kind.name(),
             role,
             slot,
+        );
+    }
+}
+
+/// A response can prove that its connection is alive and still be unsafe for
+/// fresh placement admission. Correlate slow *successful* requests through
+/// the same role/slot window as hard failures: two independent connections
+/// above the threshold briefly stop new place requests, while cancel and
+/// reconcile continue to run on their isolated, idempotent lanes.
+pub(crate) fn note_http_slow_success(
+    role: crate::http1_pool::Role,
+    slot: usize,
+    elapsed: Duration,
+) {
+    if elapsed < HTTP_SLOW_SUCCESS_THRESHOLD {
+        return;
+    }
+    let now_ns = crate::types::now_ns();
+    let (connections, entered) = connection_failure_gate().note(now_ns, role, slot);
+    if entered {
+        warn!(
+            "[connection_health_cluster] connections={} window_ms={} place_block_ms={} action=pause_new_place_allow_cancel_reconcile trigger_kind=slow_success trigger_role={:?} trigger_slot={} elapsed_ms={}",
+            connections,
+            CONNECTION_FAILURE_CLUSTER_WINDOW_NS / 1_000_000,
+            CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS / 1_000_000,
+            role,
+            slot,
+            elapsed.as_millis(),
         );
     }
 }
@@ -296,5 +329,24 @@ mod tests {
         assert_eq!(gate.note(4, crate::http1_pool::Role::Cancel, 1), (3, false));
         assert!(gate.place_blocked(5));
         assert!(!gate.place_blocked(4 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS));
+    }
+
+    #[test]
+    fn slow_success_uses_distinct_role_slot_evidence() {
+        let gate = ConnectionFailureClusterGate::default();
+        assert_eq!(gate.note(1, crate::http1_pool::Role::Fast, 2), (1, false));
+        assert_eq!(gate.note(2, crate::http1_pool::Role::Fast, 2), (1, false));
+        assert_eq!(
+            gate.note(3, crate::http1_pool::Role::Reconcile, 2),
+            (2, true)
+        );
+        assert!(gate.place_blocked(4));
+    }
+
+    #[test]
+    fn fast_slots_above_seven_remain_distinct_cluster_evidence() {
+        let gate = ConnectionFailureClusterGate::default();
+        assert_eq!(gate.note(1, crate::http1_pool::Role::Fast, 8), (1, false));
+        assert_eq!(gate.note(2, crate::http1_pool::Role::Fast, 9), (2, true));
     }
 }

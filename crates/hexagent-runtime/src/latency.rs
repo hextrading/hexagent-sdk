@@ -225,6 +225,17 @@ pub fn prepare_polymarket_order_stages() {
         "polymarket.order.response_handler",
         "polymarket.order.response_parse",
         "polymarket.order.signed_to_reserve",
+        "polymarket.http.body",
+        "polymarket.http.connect",
+        "polymarket.http.dns",
+        "polymarket.http.initial_connect",
+        "polymarket.http.reuse",
+        "polymarket.http.slot_serialization_wait",
+        "polymarket.http.tcp",
+        "polymarket.http.tls",
+        "polymarket.http.total_segmented",
+        "polymarket.http.transparent_reconnect",
+        "polymarket.http.ttfb",
     ]);
 }
 
@@ -261,7 +272,17 @@ pub fn prepare_polymarket_clob_stages() {
     prepare_thread_stages(&[
         "market.root_overflow_drop",
         "polymarket.ws.clob_parse",
+        "polymarket.ws.clob_bbo_settle",
+        "polymarket.ws.clob_book_apply",
+        "polymarket.ws.clob_book_canonicalization",
+        "polymarket.ws.clob_event_construction",
+        "polymarket.ws.clob_parse_apply",
+        "polymarket.ws.clob_parse_apply_cpu",
+        "polymarket.ws.clob_parse_apply_preempted",
+        "polymarket.ws.clob_price_change_apply",
+        "polymarket.ws.clob_quote_canonicalization",
         "polymarket.ws.clob_runtime_scheduler_lag",
+        "polymarket.ws.clob_simd_json",
     ]);
 }
 

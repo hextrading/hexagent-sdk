@@ -1844,6 +1844,62 @@ struct AccountEconomicState {
     instances: BTreeMap<String, EconomicBalance>,
 }
 
+/// Immutable cold-owner publication used by wallet observation and periodic
+/// monitoring. Readers never borrow the durable aggregate mutex; the unified
+/// wallet/onchain owner replaces this snapshot after each committed cold
+/// transaction.
+#[derive(Debug, Clone, Default)]
+struct PublishedEconomicSnapshot {
+    physical_cash: f64,
+    physical_positions: HashMap<String, f64>,
+    unallocated_cash: f64,
+    unallocated_positions: HashMap<String, f64>,
+    provisional_position_owners: HashMap<String, String>,
+    uncertain_reason: Option<String>,
+    uncertain_since_ms: Option<u64>,
+    gap_replay_last_pages: u64,
+    gap_replay_max_pages: u64,
+    gap_replay_total_pages: u64,
+    maintenance_queue_last_wait_ms: u64,
+    maintenance_queue_max_wait_ms: u64,
+    maintenance_queue_jobs: u64,
+    pending_maintenance_operations: usize,
+    verified_trade_replay_recoveries: u64,
+}
+
+impl PublishedEconomicSnapshot {
+    fn from_state(state: &SharedAccountState) -> Self {
+        Self {
+            physical_cash: state.physical_cash,
+            physical_positions: state.physical_positions.clone(),
+            unallocated_cash: state.unallocated_cash,
+            unallocated_positions: state.unallocated_positions.clone(),
+            provisional_position_owners: state.provisional_position_owners.clone(),
+            uncertain_reason: state.uncertain_reason.clone(),
+            uncertain_since_ms: state.uncertain_since_ms,
+            gap_replay_last_pages: state.gap_replay_last_pages,
+            gap_replay_max_pages: state.gap_replay_max_pages,
+            gap_replay_total_pages: state.gap_replay_total_pages,
+            maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
+            maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
+            maintenance_queue_jobs: state.maintenance_queue_jobs,
+            pending_maintenance_operations: state
+                .maintenance_ops
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .count(),
+            verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct AccountSeedBaseline {
     captured_at_ms: u64,
@@ -5183,6 +5239,7 @@ pub struct SharedAccount {
     /// durable authorities used by `token_event_has_ended`.
     ended_token_ids_fast: ArcSwap<HashSet<String>>,
     uncertain_reason_fast: ArcSwapOption<String>,
+    economic_snapshot_fast: ArcSwap<PublishedEconomicSnapshot>,
     ledger_generation_fast: AtomicU64,
     /// Cached after startup and every settled-history GC transaction. Reading
     /// monitoring data must not walk tens of thousands of tombstones while
@@ -6141,6 +6198,8 @@ impl SharedAccount {
     }
 
     fn publish_economic_snapshots(&self, state: &SharedAccountState) {
+        self.economic_snapshot_fast
+            .store(Arc::new(PublishedEconomicSnapshot::from_state(state)));
         let current_reason = self.uncertain_reason_fast.load_full();
         if current_reason.as_deref().map(String::as_str) != state.uncertain_reason.as_deref() {
             self.uncertain_reason_fast
@@ -6237,6 +6296,7 @@ impl SharedAccount {
             settled_token_values_generation_fast: AtomicU64::new(0),
             ended_token_ids_fast: ArcSwap::from_pointee(HashSet::new()),
             uncertain_reason_fast: ArcSwapOption::empty(),
+            economic_snapshot_fast: ArcSwap::from_pointee(PublishedEconomicSnapshot::default()),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(0),
             settled_gc_candidates: Mutex::new(BTreeMap::new()),
@@ -6584,6 +6644,7 @@ impl SharedAccount {
         let initial_settled_generation = Self::effective_settled_token_values_generation(&state);
         let initial_settled_values = state.settled_token_values.clone();
         let initial_retired_order_audit_tombstones = state.retired_order_audit_tombstones.clone();
+        let initial_economic_snapshot = PublishedEconomicSnapshot::from_state(&state);
         let persistence = AccountPersistence::start(
             path,
             account_id.clone(),
@@ -6670,6 +6731,7 @@ impl SharedAccount {
             settled_token_values_generation_fast: AtomicU64::new(initial_settled_generation),
             ended_token_ids_fast: ArcSwap::from_pointee(HashSet::new()),
             uncertain_reason_fast: ArcSwapOption::empty(),
+            economic_snapshot_fast: ArcSwap::from_pointee(initial_economic_snapshot),
             ledger_generation_fast: AtomicU64::new(0),
             retired_trade_tombstone_count_fast: AtomicUsize::new(initial_retired_trade_tombstones),
             settled_gc_candidates: Mutex::new(initial_settled_gc_candidates),
@@ -10078,14 +10140,11 @@ impl SharedAccount {
             return false;
         }
         // The periodic wallet poll normally observes no difference. Keep that
-        // common case on the lightweight persisted aggregate. Divergence is
-        // reconciled only by the cold wallet worker on the account's sole
-        // writer; the quote and private-event lanes never execute this scan.
+        // common case on the immutable publication from the wallet/onchain
+        // owner. Divergence is reconciled only by that sole writer; polling
+        // and monitoring never wait behind a long cold transaction.
         let has_observable_divergence = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.economic_snapshot_fast.load();
             state.unallocated_cash < -reconciliation_tolerance(state.physical_cash, observed_cash)
                 || authoritative_tokens.iter().any(|token| {
                     state
@@ -10929,10 +10988,7 @@ impl SharedAccount {
                 reserved_positions: instance_reserved_positions,
             });
         }
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.economic_snapshot_fast.load();
         // Operational monitoring never borrows the mutable private lifecycle.
         // Counts are owner-published atomics and may lag by at most one owner
         // mutation; they are observability-only.
@@ -10961,18 +11017,7 @@ impl SharedAccount {
             maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
             maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
             maintenance_queue_jobs: state.maintenance_queue_jobs,
-            pending_maintenance_operations: state
-                .maintenance_ops
-                .values()
-                .filter(|operation| {
-                    matches!(
-                        operation.status,
-                        MaintenanceOperationStatus::Reserved
-                            | MaintenanceOperationStatus::Submitted
-                            | MaintenanceOperationStatus::Uncertain
-                    )
-                })
-                .count(),
+            pending_maintenance_operations: state.pending_maintenance_operations,
             recovery_pending_orders,
             routine_cancel_audits,
             retired_trade_ownership_tombstones: self
@@ -20246,7 +20291,9 @@ mod tests {
         let account = SharedAccount::new("acct");
         account.register_instance("a", 1.0);
         account.register_instance("b", 3.0);
-        account.apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]));
+        account
+            .apply_physical_snapshot(400.0, HashMap::from([("UP".into(), 40.0)]))
+            .unwrap();
         account
     }
 
@@ -27728,6 +27775,23 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             0,
             "instance reservation must not acquire the account control gate",
         );
+    }
+
+    #[test]
+    fn fast_monitoring_uses_owner_publication_without_waiting_for_cold_state() {
+        let account = Arc::new(seeded_account());
+        let cold_state = account.state.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_account = Arc::clone(&account);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_account.monitoring_snapshot_fast()).unwrap();
+        });
+        let snapshot = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fast monitoring must not wait for the durable state mutex");
+        assert_eq!(snapshot.physical_cash, 400.0);
+        drop(cold_state);
+        worker.join().unwrap();
     }
 
     #[test]

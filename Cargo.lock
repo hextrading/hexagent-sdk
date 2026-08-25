@@ -1176,17 +1176,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "bytes",
  "chrono",
  "core_affinity",
  "crossbeam-channel",
  "futures-util",
  "hdrhistogram",
  "hexagent-config",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "libc",
  "log",
  "quanta",
  "reqwest",
  "tokio",
+ "tower-service",
  "tracing",
 ]
 

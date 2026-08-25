@@ -12,6 +12,12 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-roots", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tower-service = "0.3"
 futures-util = "0.3"
 crossbeam-channel = "0.5"
 arc-swap = "1"

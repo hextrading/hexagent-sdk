@@ -1120,31 +1120,6 @@ impl HttpErr {
     }
 }
 
-/// Classify a reqwest HTTP-I/O error into our `HttpErr` taxonomy without
-/// relying on its human-readable message.
-fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
-    if e.is_timeout() {
-        HttpErr::Timeout
-    } else if e.is_connect() {
-        // Preserve connect failures as transport evidence so the cluster
-        // diagnostic distinguishes them from deadline expiry. Both kinds
-        // share the same fail-closed placement gate.
-        HttpErr::Transport(e.to_string())
-    } else if let Some(status) = e.status() {
-        HttpErr::Status(status.as_u16(), e.to_string())
-    } else if e.is_request() || e.is_body() {
-        // `is_request` is reqwest's structured category for a failure while
-        // sending the request; `is_body` covers a response-body I/O failure.
-        HttpErr::Transport(e.to_string())
-    } else if e.is_builder() || e.is_redirect() || e.is_decode() {
-        // These fail locally or while decoding a response; they are not the
-        // status-less HTTP I/O failure covered by the placement fix.
-        HttpErr::Other(e.to_string())
-    } else {
-        HttpErr::Other(e.to_string())
-    }
-}
-
 /// Outcome of mapping a `not_canceled` reason returned by Polymarket
 /// CLOB. Three categories: definite Cancelled, definite Filled, or
 /// **Uncertain** (server's own wording is ambiguous — both states are
@@ -2104,6 +2079,82 @@ async fn prewarm_clients_staggered(
     summary
 }
 
+async fn prewarm_instrumented_clients_staggered(
+    label: &'static str,
+    clients: Vec<crate::http1_pool::PooledClient>,
+    url: String,
+) -> PrewarmSummary {
+    let total = clients.len();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(PREWARM_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, client) in clients.into_iter().enumerate() {
+        let semaphore = Arc::clone(&semaphore);
+        let url = url.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(
+                PREWARM_STAGGER_MS.saturating_mul(idx as u64),
+            ))
+            .await;
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("prewarm semaphore open");
+            let response = client
+                .instrumented_request(
+                    reqwest::Method::GET,
+                    &url,
+                    reqwest::header::HeaderMap::new(),
+                    Bytes::new(),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map_err(|error| error.message)?;
+            record_http1_phase_timings(client.role(), client.slot(), response.timings);
+            Ok::<u16, String>(response.status.as_u16())
+        });
+    }
+    let mut summary = PrewarmSummary {
+        total,
+        ..Default::default()
+    };
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(status)) if (200..400).contains(&status) => summary.ok += 1,
+            Ok(Ok(429)) => {
+                summary.rate_limited += 1;
+                summary.first_error.get_or_insert_with(|| "HTTP 429".into());
+            }
+            Ok(Ok(status)) => {
+                summary
+                    .first_error
+                    .get_or_insert_with(|| format!("HTTP {status}"));
+            }
+            Ok(Err(error)) => {
+                summary.first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                summary.first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    if summary.ok == summary.total {
+        info!(
+            "[PolymarketTrade] Pre-warm {} {}/{} ok",
+            label, summary.ok, summary.total,
+        );
+    } else {
+        warn!(
+            "[PolymarketTrade] Pre-warm {} {}/{} ok rate_limited={} first_error={}",
+            label,
+            summary.ok,
+            summary.total,
+            summary.rate_limited,
+            summary.first_error.as_deref().unwrap_or("unknown"),
+        );
+    }
+    summary
+}
+
 static TRANSPORT_PREWARMED: OnceLock<()> = OnceLock::new();
 
 /// Account-scoped heartbeat loop. Each tick sends exactly one signed
@@ -2140,27 +2191,43 @@ async fn heartbeat_loop(
         let prewarm_url = format!("{}/time", base_url.trim_end_matches('/'));
 
         let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
-        let mut request = client
-            .client()
-            .request(reqwest::Method::POST, &url)
-            .header("Content-Type", "application/json")
-            .body(String::new());
+        let mut request_headers = reqwest::header::HeaderMap::with_capacity(8);
+        request_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
         for (name, value) in headers.as_pairs() {
-            request = request.header(name, value);
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                request_headers.insert(name, value);
+            }
         }
-        let result = send_and_drain(request).await;
+        let result = client
+            .instrumented_request(
+                reqwest::Method::POST,
+                &url,
+                request_headers,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await;
         let (err_n, first_err) = match result {
-            Ok(status) if (200..400).contains(&status) => {
+            Ok(response) if response.status.is_success() => {
+                record_http1_phase_timings(client.role(), client.slot(), response.timings);
                 client.note_transport_success();
                 (0usize, None)
             }
-            Ok(status) => {
+            Ok(response) => {
+                record_http1_phase_timings(client.role(), client.slot(), response.timings);
                 client.note_transport_success();
-                (1, Some(format!("HTTP {}", status)))
+                (1, Some(format!("HTTP {}", response.status)))
             }
             Err(error) => {
-                client.note_transport_failure(prewarm_url);
-                (1, Some(error.to_string()))
+                record_http1_phase_timings(client.role(), client.slot(), error.timings);
+                client.note_instrumented_transport_failure(prewarm_url);
+                (1, Some(error.message))
             }
         };
 
@@ -2334,63 +2401,122 @@ async fn execute_http_on(
             })
             .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string())
     };
-    let req_timeout = per_request_timeout(&method, &path);
-    let mut req = client
-        .client()
-        .request(method.clone(), url.as_ref())
-        .header("Content-Type", "application/json")
-        .body(body);
-    // Per-request timeout override (FAST / CANCEL paths only). The pool
-    // client is built with a 2 s ceiling; this narrows it to the
-    // configured flat value (default 1000 ms — see
-    // `async_rt::init_http_timeout`).
-    if let Some(t) = req_timeout {
-        req = req.timeout(t);
-    }
-    // Attach Poly-Auth headers (POLY_ADDRESS / POLY_SIGNATURE /
-    // POLY_TIMESTAMP / POLY_API_KEY / POLY_PASSPHRASE).
-    for (k, v) in headers.as_pairs() {
-        req = req.header(k, v);
-    }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            client.note_transport_failure(prewarm_url(url.as_ref()));
-            return Err(map_reqwest_err(e));
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        return match resp.text().await {
-            Ok(body) => {
-                client.note_transport_success();
-                Err(HttpErr::Status(status.as_u16(), body))
-            }
-            Err(error) => {
-                client.note_transport_failure(prewarm_url(url.as_ref()));
-                Err(map_reqwest_err(error))
-            }
+    let req_timeout =
+        per_request_timeout(method, path).unwrap_or_else(|| std::time::Duration::from_secs(5));
+    let mut request_headers = reqwest::header::HeaderMap::with_capacity(8);
+    request_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    for (name, value) in headers.as_pairs() {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            return Err(HttpErr::Other(format!("invalid auth header name {name}")));
         };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            return Err(HttpErr::Other(format!(
+                "invalid auth header value for {name}"
+            )));
+        };
+        request_headers.insert(name, value);
     }
-    // Split response-body transport from JSON syntax/shape errors. Using
-    // `Response::json` would wrap both in `reqwest::Error`, losing the exact
-    // distinction needed by placement reconciliation.
-    let bytes = match resp.bytes().await {
-        Ok(bytes) => {
-            client.note_transport_success();
-            bytes
-        }
+    let response = match client
+        .instrumented_request(
+            method.clone(),
+            url.as_ref(),
+            request_headers,
+            body,
+            req_timeout,
+        )
+        .await
+    {
+        Ok(response) => response,
         Err(error) => {
-            client.note_transport_failure(prewarm_url(url.as_ref()));
-            return Err(map_reqwest_err(error));
+            record_http1_phase_timings(client.role(), client.slot(), error.timings);
+            client.note_instrumented_transport_failure(prewarm_url(url.as_ref()));
+            return Err(match error.kind {
+                crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => HttpErr::Timeout,
+                crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
+                    HttpErr::Transport(error.message)
+                }
+                crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest => {
+                    HttpErr::Other(error.message)
+                }
+            });
         }
     };
+    record_http1_phase_timings(client.role(), client.slot(), response.timings);
+    client.note_transport_success();
+    let status = response.status;
+    let bytes = response.body;
+    if !status.is_success() {
+        return Err(HttpErr::Status(
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         let raw_body = String::from_utf8_lossy(&bytes);
         HttpErr::InvalidResponse(compact_order_lookup_evidence_text(&format!(
             "json_parse_error={error} raw_body={raw_body}"
         )))
     })
+}
+
+fn record_http1_phase_timings(
+    role: crate::http1_pool::Role,
+    slot: usize,
+    timings: crate::instrumented_http1::Http1PhaseTimings,
+) {
+    crate::latency::record_ns("polymarket.http.ttfb", timings.ttfb_ns);
+    crate::latency::record_ns("polymarket.http.body", timings.body_ns);
+    crate::latency::record_ns("polymarket.http.total_segmented", timings.total_ns);
+    crate::latency::record_ns(
+        "polymarket.http.slot_serialization_wait",
+        timings.slot_wait_ns,
+    );
+    if timings.connect_attempted {
+        crate::latency::record_ns("polymarket.http.dns", timings.dns_ns);
+        crate::latency::record_ns("polymarket.http.tcp", timings.tcp_ns);
+        crate::latency::record_ns("polymarket.http.tls", timings.tls_ns);
+        crate::latency::record_ns("polymarket.http.connect", 1);
+        let disposition = if timings.transparent_reconnect() {
+            crate::latency::record_ns("polymarket.http.transparent_reconnect", 1);
+            "transparent_reconnect"
+        } else {
+            crate::latency::record_ns("polymarket.http.initial_connect", 1);
+            "initial_connect"
+        };
+        log::info!(
+            "[http_connection_generation] role={:?} slot={} disposition={} generation_before={} generation_after={} slot_wait_us={} dns_us={} tcp_us={} tls_us={} ttfb_us={} body_us={} total_us={}",
+            role,
+            slot,
+            disposition,
+            timings.connect_generation_before,
+            timings.connect_generation_after,
+            timings.slot_wait_ns / 1_000,
+            timings.dns_ns / 1_000,
+            timings.tcp_ns / 1_000,
+            timings.tls_ns / 1_000,
+            timings.ttfb_ns / 1_000,
+            timings.body_ns / 1_000,
+            timings.total_ns / 1_000,
+        );
+    } else if timings.reused_connection() {
+        crate::latency::record_ns("polymarket.http.reuse", 1);
+        if timings.first_reuse_for_generation {
+            log::info!(
+                "[http_connection_generation] role={:?} slot={} disposition=reuse generation_before={} generation_after={} slot_wait_us={} ttfb_us={} body_us={} total_us={}",
+                role,
+                slot,
+                timings.connect_generation_before,
+                timings.connect_generation_after,
+                timings.slot_wait_ns / 1_000,
+                timings.ttfb_ns / 1_000,
+                timings.body_ns / 1_000,
+                timings.total_ns / 1_000,
+            );
+        }
+    }
 }
 
 /// DELETE is idempotent by order ID. If its primary connection times out or
@@ -2411,7 +2537,11 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let role = client.role();
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
+    let first_started = std::time::Instant::now();
     let first = execute_http_on(client, attempt_id, method, url, path, headers, body).await;
+    if first.is_ok() {
+        super::network_incident::note_http_slow_success(role, slot, first_started.elapsed());
+    }
     let failure_kind = match &first {
         Err(HttpErr::Timeout) => super::network_incident::ConnectionFailureKind::Timeout,
         Err(HttpErr::Transport(_)) => super::network_incident::ConnectionFailureKind::Transport,
@@ -2432,6 +2562,7 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let hedge_slot = hedge_client.slot();
     let hedge_attempt = hedge_client.allocate_attempt_id();
     crate::latency::record_ns("polymarket.http.cancel.connection_failure_hedge", 1);
+    let hedge_started = std::time::Instant::now();
     let hedged = execute_http_on(
         hedge_client,
         hedge_attempt,
@@ -2442,6 +2573,13 @@ async fn execute_http_with_cancel_connection_failure_hedge(
         hedge_body,
     )
     .await;
+    if hedged.is_ok() {
+        super::network_incident::note_http_slow_success(
+            hedge_role,
+            hedge_slot,
+            hedge_started.elapsed(),
+        );
+    }
     drop(hedge_permit);
     if let Some(kind) = match &hedged {
         Err(HttpErr::Timeout) => Some(super::network_incident::ConnectionFailureKind::Timeout),
@@ -6034,7 +6172,7 @@ impl PolymarketTrade {
         let start = std::time::Instant::now();
         let clob_base_url = self.shared.clob_base_url.clone();
         TRANSPORT_PREWARMED.get_or_init(|| {
-            let clob_clients = crate::async_rt::http_clients_all();
+            let clob_clients = crate::http1_pool::pooled_clients_all();
             let query_clients =
                 crate::http1_pool::clients_for_role(crate::http1_pool::Role::Query);
             info!(
@@ -6045,7 +6183,7 @@ impl PolymarketTrade {
                 PREWARM_STAGGER_MS,
             );
             async_rt::block_on_order_runtime(async move {
-                prewarm_clients_staggered(
+                prewarm_instrumented_clients_staggered(
                     "clob",
                     clob_clients,
                     format!("{}/time", clob_base_url.trim_end_matches('/')),
@@ -6068,16 +6206,35 @@ impl PolymarketTrade {
             "{}/heartbeats",
             self.shared.clob_base_url.trim_end_matches('/')
         );
-        let client = crate::async_rt::http_client_query();
+        let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
         let heartbeat_status = async_rt::block_on_order_runtime(async move {
-            let mut request = client
-                .post(&heartbeat_url)
-                .header("Content-Type", "application/json")
-                .body(String::new());
+            let mut request_headers = reqwest::header::HeaderMap::with_capacity(8);
+            request_headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
             for (name, value) in headers.as_pairs() {
-                request = request.header(name, value);
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    request_headers.insert(name, value);
+                }
             }
-            send_and_drain(request).await
+            client
+                .instrumented_request(
+                    reqwest::Method::POST,
+                    &heartbeat_url,
+                    request_headers,
+                    Bytes::new(),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map(|response| {
+                    record_http1_phase_timings(client.role(), client.slot(), response.timings);
+                    response.status.as_u16()
+                })
+                .map_err(|error| error.message)
         });
         match heartbeat_status {
             Ok(status) if (200..400).contains(&status) => {
