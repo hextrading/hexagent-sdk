@@ -11392,7 +11392,10 @@ impl SharedAccount {
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return FillAuditPendingTransition::NotTracked;
         };
+        let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
         let mut lifecycle = account.lifecycle.lock().unwrap();
+        drop(lock_wait);
+        let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(order) = lifecycle.orders.get_mut(client_order_id) else {
             return FillAuditPendingTransition::NotTracked;
         };
@@ -11419,7 +11422,6 @@ impl SharedAccount {
             client_order_id,
             &token_id,
         );
-        self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         let transition = if !pending {
             FillAuditPendingTransition::Resolved
         } else if already_pending {
@@ -11427,6 +11429,12 @@ impl SharedAccount {
         } else {
             FillAuditPendingTransition::NewlyPending
         };
+        drop(mutation);
+        let persist_enqueue =
+            DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
+        self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
+        drop(persist_enqueue);
+        drop(lifecycle);
         if transition.newly_pending() {
             self.notify_order_audit_worker();
         }
@@ -26454,6 +26462,26 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!(cancelled_timing.lock_wait_ns > 0);
         assert!(cancelled_timing.mutation_ns > 0);
         assert!(cancelled_timing.persist_enqueue_ns > 0);
+
+        account
+            .reserve_order(
+                "a",
+                "a-deferred-filled",
+                "oid-deferred-filled",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let (filled, filled_timing) = measure_deferred_lifecycle_stages(|| {
+            account.mark_filled_pending_audit("a-deferred-filled")
+        });
+        assert!(filled.pending());
+        assert!(filled_timing.lock_wait_ns > 0);
+        assert!(filled_timing.mutation_ns > 0);
+        assert!(filled_timing.persist_enqueue_ns > 0);
 
         account.begin_order_recovery(["a-deferred-stages"]);
         let ((), rejected_timing) = measure_deferred_lifecycle_stages(|| {

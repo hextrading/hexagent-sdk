@@ -284,6 +284,21 @@ fn retired_market_terminalization_allowed(
         && audit_error_count == absent_order_count
 }
 
+fn retired_market_parallel_absence_fast_path_allowed(
+    allow_expired_market_terminalization: bool,
+    remote_clean: bool,
+    audit_error_count: usize,
+    absent_orders: &[RuntimeMissingOrder],
+) -> bool {
+    allow_expired_market_terminalization
+        && remote_clean
+        && !absent_orders.is_empty()
+        && audit_error_count == absent_orders.len()
+        && absent_orders
+            .iter()
+            .all(|missing| missing.evidence.starts_with("parallel_reconcile_absence"))
+}
+
 fn is_cancels_disabled_error(text: &str) -> bool {
     text.to_ascii_lowercase().contains("cancels are disabled")
 }
@@ -447,6 +462,62 @@ enum FetchOrderResult {
     Unavailable(FetchUnavailable),
 }
 
+fn fetch_order_result_name(result: &FetchOrderResult) -> &'static str {
+    match result {
+        FetchOrderResult::Found(_) => "found",
+        FetchOrderResult::NotFound(_) => "parallel_not_found",
+        FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => {
+            "parallel_absence"
+        }
+        FetchOrderResult::Unavailable(_) => "unavailable",
+    }
+}
+
+fn order_lookup_is_absent(result: &FetchOrderResult) -> bool {
+    matches!(result, FetchOrderResult::NotFound(_))
+        || matches!(result, FetchOrderResult::Unavailable(kind) if kind.is_json_null())
+}
+
+fn combine_parallel_order_lookups(
+    primary: FetchOrderResult,
+    secondary: FetchOrderResult,
+    primary_location: (crate::http1_pool::Role, usize),
+    secondary_location: (crate::http1_pool::Role, usize),
+) -> FetchOrderResult {
+    let primary = match primary {
+        FetchOrderResult::Found(order) => return FetchOrderResult::Found(order),
+        other => other,
+    };
+    let secondary = match secondary {
+        FetchOrderResult::Found(order) => return FetchOrderResult::Found(order),
+        other => other,
+    };
+    if order_lookup_is_absent(&primary) && order_lookup_is_absent(&secondary) {
+        let evidence = format!(
+            "parallel_reconcile_absence primary={:?}/{} secondary={:?}/{}",
+            primary_location.0,
+            primary_location.1,
+            secondary_location.0,
+            secondary_location.1,
+        );
+        return if matches!(primary, FetchOrderResult::NotFound(_))
+            && matches!(secondary, FetchOrderResult::NotFound(_))
+        {
+            FetchOrderResult::NotFound(evidence)
+        } else {
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(evidence))
+        };
+    }
+    // A single replica's absence cannot override the other slot's transport,
+    // service or schema failure. Preserve the non-absence result so no local
+    // reservation is released without cross-slot agreement.
+    match (primary, secondary) {
+        (FetchOrderResult::NotFound(_), other) => other,
+        (other, FetchOrderResult::NotFound(_)) => other,
+        (primary, _) => primary,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FetchUnavailable {
     Timeout,
@@ -460,7 +531,11 @@ impl FetchUnavailable {
     /// event has closed. The general lookup path deliberately keeps that
     /// response unavailable; only durable-order recovery may terminalize it.
     fn is_json_null(&self) -> bool {
-        matches!(self, Self::InvalidResponse(body) if body.trim() == "null")
+        matches!(self, Self::InvalidResponse(body) if body.trim() == "null" || body.starts_with("parallel_reconcile_absence"))
+    }
+
+    fn is_parallel_absence(&self) -> bool {
+        matches!(self, Self::InvalidResponse(body) if body.starts_with("parallel_reconcile_absence"))
     }
 }
 
@@ -581,6 +656,10 @@ impl FetchOrderResult {
 
     fn is_explicit_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
+    }
+
+    fn has_parallel_not_found_evidence(&self) -> bool {
+        matches!(self, Self::NotFound(evidence) if evidence.starts_with("parallel_reconcile_absence"))
     }
 }
 
@@ -972,10 +1051,6 @@ impl HttpErr {
         matches!(self, HttpErr::Status(404, _))
     }
 
-    fn is_transport_failure(&self) -> bool {
-        matches!(self, HttpErr::Timeout | HttpErr::Transport(_))
-    }
-
     fn fetch_unavailable(&self) -> FetchUnavailable {
         match self {
             HttpErr::Timeout => FetchUnavailable::Timeout,
@@ -997,7 +1072,7 @@ impl HttpErr {
     /// HTTP 4xx (other than 425) is a definitive server response. Local
     /// errors and response parse errors are also excluded here. A
     /// status-less transport error is deliberately handled by the separate
-    /// placement-only classifier below, so cancel/GET behavior is unchanged.
+    /// placement classifier and the idempotent cancel hedge.
     ///
     /// **425 Too Early** is treated as unknown_state (transient server
     /// backpressure, NOT a definitive rejection). Polymarket emits 425 at
@@ -1050,10 +1125,13 @@ impl HttpErr {
 /// Classify a reqwest HTTP-I/O error into our `HttpErr` taxonomy without
 /// relying on its human-readable message.
 fn map_reqwest_err(e: reqwest::Error) -> HttpErr {
-    if e.is_timeout() || e.is_connect() {
-        // connect-timeout is functionally equivalent to a read timeout
-        // for our purposes: the server never got to respond.
+    if e.is_timeout() {
         HttpErr::Timeout
+    } else if e.is_connect() {
+        // Preserve connect failures as transport evidence so the cluster
+        // diagnostic distinguishes them from deadline expiry. Both kinds
+        // share the same fail-closed placement gate.
+        HttpErr::Transport(e.to_string())
     } else if let Some(status) = e.status() {
         HttpErr::Status(status.as_u16(), e.to_string())
     } else if e.is_request() || e.is_body() {
@@ -2317,11 +2395,12 @@ async fn execute_http_on(
     })
 }
 
-/// DELETE is idempotent by order ID. If its primary connection times out,
+/// DELETE is idempotent by order ID. If its primary connection times out or
+/// fails at the transport layer (reset, broken pipe, TLS EOF, connect failure),
 /// retry exactly once on a different account Cancel slot while new placement
 /// admission remains cluster-gated. Place requests never enter this helper's
 /// alternate-connection branch.
-async fn execute_http_with_cancel_timeout_hedge(
+async fn execute_http_with_cancel_connection_failure_hedge(
     client: crate::http1_pool::PooledClient,
     attempt_id: u64,
     account_id: &str,
@@ -2335,10 +2414,12 @@ async fn execute_http_with_cancel_timeout_hedge(
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
     let first = execute_http_on(client, attempt_id, method, url, path, headers, body).await;
-    if !matches!(first, Err(HttpErr::Timeout)) {
-        return first;
-    }
-    super::network_incident::note_http_connection_timeout(role, slot);
+    let failure_kind = match &first {
+        Err(HttpErr::Timeout) => super::network_incident::ConnectionFailureKind::Timeout,
+        Err(HttpErr::Transport(_)) => super::network_incident::ConnectionFailureKind::Transport,
+        _ => return first,
+    };
+    super::network_incident::note_http_connection_failure(role, slot, failure_kind);
     let Some(hedge_body) = hedge_body else {
         return first;
     };
@@ -2354,7 +2435,7 @@ async fn execute_http_with_cancel_timeout_hedge(
     let hedge_role = hedge_client.role();
     let hedge_slot = hedge_client.slot();
     let hedge_attempt = hedge_client.allocate_attempt_id();
-    crate::latency::record_ns("polymarket.http.cancel.timeout_hedge", 1);
+    crate::latency::record_ns("polymarket.http.cancel.connection_failure_hedge", 1);
     let hedged = execute_http_on(
         hedge_client,
         hedge_attempt,
@@ -2366,8 +2447,14 @@ async fn execute_http_with_cancel_timeout_hedge(
     )
     .await;
     drop(hedge_permit);
-    if matches!(hedged, Err(HttpErr::Timeout)) {
-        super::network_incident::note_http_connection_timeout(hedge_role, hedge_slot);
+    if let Some(kind) = match &hedged {
+        Err(HttpErr::Timeout) => Some(super::network_incident::ConnectionFailureKind::Timeout),
+        Err(HttpErr::Transport(_)) => {
+            Some(super::network_incident::ConnectionFailureKind::Transport)
+        }
+        _ => None,
+    } {
+        super::network_incident::note_http_connection_failure(hedge_role, hedge_slot, kind);
     }
     hedged
 }
@@ -2815,9 +2902,19 @@ pub(crate) struct ReconcileAttemptCounters {
 }
 
 impl ReconcileAttemptCounters {
+    #[cfg(test)]
     fn next_placement(&self, coid: &str) -> u32 {
+        self.next_placement_with_evidence(coid, 1)
+    }
+
+    fn next_placement_with_evidence(&self, coid: &str, observations: u32) -> u32 {
         self.placement.update(coid, |attempt| {
-            Some(attempt.copied().unwrap_or(0).saturating_add(1))
+            Some(
+                attempt
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(observations.max(1)),
+            )
         });
         self.placement.get(coid).unwrap_or(0)
     }
@@ -2838,12 +2935,11 @@ impl ReconcileAttemptCounters {
     }
 }
 
-/// Number of consecutive explicit server not-found observations required to
-/// resolve any placement orphan as Rejected. The rule is provenance-agnostic:
-/// timeout, HTTP 5xx (including DeadlineExceeded), HTTP 425/service-not-ready,
-/// and status-less transport failures all use the same four-result terminal
-/// policy. Any unavailable, found, or otherwise non-not-found lookup resets
-/// the run.
+/// A single-slot reconcile needs four consecutive explicit server not-found
+/// observations. When two distinct account Reconcile slots independently
+/// return 404 in the same pass, two passes contain the same four observations
+/// and may converge without the extra exponential-backoff delay. Any
+/// unavailable, found, or otherwise non-not-found lookup resets the run.
 pub(crate) const RECONCILE_NOT_FOUND_RETRY_LIMIT: u32 = 4;
 
 fn shutdown_absent_placement_phantom_is_terminal(status: OrderStatus, streak: u32) -> bool {
@@ -3435,6 +3531,13 @@ impl SharedState {
             "polymarket.account.lifecycle_apply.lock_wait",
             timing.lock_wait_ns.max(1),
         );
+        let branch_lock_wait_stage = match job.status {
+            OrderStatus::Filled => "polymarket.account.lifecycle_apply.lock_wait.filled",
+            OrderStatus::Cancelled => "polymarket.account.lifecycle_apply.lock_wait.cancelled",
+            OrderStatus::Rejected => "polymarket.account.lifecycle_apply.lock_wait.rejected",
+            _ => "polymarket.account.lifecycle_apply.lock_wait.status_update",
+        };
+        crate::latency::record_ns(branch_lock_wait_stage, timing.lock_wait_ns.max(1));
         crate::latency::record_ns(
             "polymarket.account.lifecycle_apply.mutation",
             timing.mutation_ns.max(1),
@@ -4099,9 +4202,9 @@ impl SharedState {
         // rejected during its short safety window remains in the structured
         // lifecycle recorder, but must not flood the console one order at a
         // time while the gate is doing exactly what it was designed to do.
-        let aggregated_timeout_cluster_reject =
-            stage == "preflight_rejected" && reason == "timeout cluster safety gate";
-        let warning = (!reason_code.is_empty() && !aggregated_timeout_cluster_reject)
+        let aggregated_connection_failure_cluster_reject = stage == "preflight_rejected"
+            && reason == "connection failure cluster safety gate";
+        let warning = (!reason_code.is_empty() && !aggregated_connection_failure_cluster_reject)
             || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
         let trace = traces.get(client_order_id).cloned();
@@ -5083,7 +5186,7 @@ impl SharedState {
             async_rt::order_handle().spawn(async move {
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
-                let reply = execute_http_with_cancel_timeout_hedge(
+                let reply = execute_http_with_cancel_connection_failure_hedge(
                     request_client,
                     attempt_id,
                     &account_id,
@@ -5217,7 +5320,7 @@ impl SharedState {
                 // recovered and returned to the startup-filled pool after
                 // reqwest drops its request body.
                 let recyclable = body_a.clone();
-                let reply = execute_http_with_cancel_timeout_hedge(
+                let reply = execute_http_with_cancel_connection_failure_hedge(
                     client,
                     attempt_id,
                     &account_id,
@@ -6074,7 +6177,7 @@ impl PolymarketTrade {
                 }
             }
             let coid = anomaly.client_order_id.as_deref().unwrap_or("");
-            let fetched = self.fetch_order_by_id(coid, &anomaly.order_id, None);
+            let fetched = self.fetch_order_by_id(coid, &anomaly.order_id, None, false);
             let (fetched, absent_evidence) = match fetched {
                 FetchOrderResult::Found(fetched) => (Some(fetched), None),
                 FetchOrderResult::NotFound(evidence) => (None, Some(evidence)),
@@ -6510,7 +6613,7 @@ impl PolymarketTrade {
                     // not issue another order GET for identical metadata.
                     continue;
                 }
-                match self.fetch_order_by_id(&coid, &order_id, None) {
+                match self.fetch_order_by_id(&coid, &order_id, None, false) {
                     FetchOrderResult::Found(order) => {
                         match order.status.as_str() {
                             "LIVE" => {
@@ -6944,7 +7047,17 @@ impl PolymarketTrade {
                 updates.push(self.close_recovered_order(&ownership, &order_id, reason.as_str()));
                 continue;
             }
-            let fetched = match self.fetch_order_by_id(&coid, &order_id, None) {
+            let parallel_evidence = ownership.status == OrderStatus::NewOrderTimeout
+                || self
+                    .shared
+                    .account_state
+                    .token_event_has_ended(&ownership.token_id);
+            let fetched = match self.fetch_order_by_id(
+                &coid,
+                &order_id,
+                None,
+                parallel_evidence,
+            ) {
                 FetchOrderResult::Found(order) => order,
                 FetchOrderResult::NotFound(evidence) => {
                     errors.push(format!(
@@ -6980,7 +7093,11 @@ impl PolymarketTrade {
                             client_order_id: coid,
                             tracked,
                             order_id,
-                            evidence: "single_order_lookup_json_null".to_string(),
+                            evidence: if kind.is_parallel_absence() {
+                                "parallel_reconcile_absence_json_null".to_string()
+                            } else {
+                                "single_order_lookup_json_null".to_string()
+                            },
                         });
                     }
                     continue;
@@ -7567,7 +7684,15 @@ impl PolymarketTrade {
             } else {
                 retired_market_evidence_streak = 0;
             }
-            let retired_market_terminal = retired_market_terminalization_allowed(
+            let parallel_absence_fast_path =
+                retired_market_parallel_absence_fast_path_allowed(
+                    allow_expired_market_terminalization,
+                    remote_clean,
+                    audit.errors.len(),
+                    &audit.retired_market_absent,
+                );
+            let retired_market_terminal = parallel_absence_fast_path
+                || retired_market_terminalization_allowed(
                 retired_market_evidence_streak,
                 tokens.len(),
                 terminal_token_responses,
@@ -7612,7 +7737,7 @@ impl PolymarketTrade {
                 audit.errors.is_empty() && open_orders == 0 && recovery_pending == 0
             };
             last_detail = format!(
-                "attempt={} remote=[{}] invalid_token_responses={} cancels_disabled_responses={} terminal_token_responses={}/{} retired_evidence_streak={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
+                "attempt={} remote=[{}] invalid_token_responses={} cancels_disabled_responses={} terminal_token_responses={}/{} retired_evidence_streak={} parallel_absence_fast_path={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
                 attempt_idx + 1,
                 remote_details.join(", "),
                 invalid_token_responses,
@@ -7620,6 +7745,7 @@ impl PolymarketTrade {
                 terminal_token_responses,
                 tokens.len(),
                 retired_market_evidence_streak,
+                parallel_absence_fast_path,
                 retired_market_terminal,
                 retired_closed,
                 retired_absent_count,
@@ -8160,10 +8286,12 @@ impl PolymarketTrade {
         self.reconcile_orphans_with_permit(None, pending_places, pending_cancels, pending_trade_ids)
     }
 
-    /// Admission-bound reconcile path used by the live engine. Every order
-    /// lookup starts on the exact per-instance Reconcile slot held by `permit`;
-    /// timeout/status-less transport failures retry once on a disjoint client,
-    /// and repeated slot failures replace that pool slot permanently.
+    /// Admission-bound reconcile path used by the live engine. New-order
+    /// timeout lookups start on the exact Reconcile slot held by `permit` and
+    /// concurrently collect evidence from a second account slot. Cancel
+    /// lookups remain single-slot because absence never releases their
+    /// worst-case reservation; repeated transport failures still rebuild the
+    /// affected pool slot.
     pub fn reconcile_orphans_on(
         &self,
         permit: &crate::http1_pool::Permit,
@@ -8222,7 +8350,7 @@ impl PolymarketTrade {
                 if self.shared.in_http_425_backoff(coid) {
                     continue;
                 }
-                let fetch_result = self.fetch_order_by_id(coid, oid, permit);
+                let fetch_result = self.fetch_order_by_id(coid, oid, permit, true);
                 // A 425 from this GET is not a not-found answer. Keep this
                 // orphan parked without affecting the rest of the batch.
                 if matches!(&fetch_result, FetchOrderResult::Unavailable(_))
@@ -8242,13 +8370,26 @@ impl PolymarketTrade {
                 // status-less transport error. Only uninterrupted explicit
                 // server not-found responses advance the counter.
                 if fetch_result.is_explicit_not_found() {
-                    let attempts = self.shared.reconcile_attempts.next_placement(coid);
+                    let parallel_evidence = fetch_result.has_parallel_not_found_evidence();
+                    let observations = if parallel_evidence {
+                        2
+                    } else {
+                        1
+                    };
+                    let attempts = self
+                        .shared
+                        .reconcile_attempts
+                        .next_placement_with_evidence(coid, observations);
                     if attempts >= RECONCILE_NOT_FOUND_RETRY_LIMIT {
                         self.shared.reconcile_attempts.clear_placement(coid);
                         self.shared.placement_reconcile_next_retry_ns.remove(coid);
                         warn!(
-                            "[orphan_metric] placement_not_found_terminal=1 coid={} orderID={} consecutive_not_found={} terminal=Rejected lock_release=allowed",
-                            coid, oid, attempts,
+                            "[orphan_metric] placement_not_found_terminal=1 coid={} orderID={} consecutive_not_found_observations={} required_not_found_observations={} parallel_evidence={} terminal=Rejected lock_release=allowed",
+                            coid,
+                            oid,
+                            attempts,
+                            RECONCILE_NOT_FOUND_RETRY_LIMIT,
+                            parallel_evidence,
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
@@ -8268,7 +8409,7 @@ impl PolymarketTrade {
                             trade_id: None,
                             order_audit: None,
                             error: Some(format!(
-                                "placement orphan followed by {} consecutive reconcile not-found responses",
+                                "placement orphan followed by {} consecutive reconcile not-found observations",
                                 attempts,
                             )),
                         });
@@ -8594,7 +8735,7 @@ impl PolymarketTrade {
             if self.shared.in_http_425_backoff(coid) {
                 continue;
             }
-            let fetch_result = self.fetch_order_by_id(coid, order_id, permit);
+            let fetch_result = self.fetch_order_by_id(coid, order_id, permit, false);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
             let http_425_backoff_active = matches!(&fetch_result, FetchOrderResult::Unavailable(_),)
@@ -8975,34 +9116,99 @@ impl PolymarketTrade {
         coid: &str,
         order_id: &str,
         permit: Option<&crate::http1_pool::Permit>,
+        parallel_evidence: bool,
     ) -> FetchOrderResult {
         let path = format!("/data/order/{}", order_id);
-        let mut reply = permit.map_or_else(
+        if parallel_evidence {
+            let mut held_permits = Vec::with_capacity(2);
+            let primary_client = if let Some(permit) = permit {
+                permit.current_pooled_client()
+            } else if let Some(owned) = crate::http1_pool::try_borrow_account(
+                self.shared.account_state.account_id(),
+                crate::http1_pool::Role::Reconcile,
+            ) {
+                let client = owned.current_pooled_client();
+                held_permits.push(owned);
+                client
+            } else {
+                crate::http1_pool::pooled_client(crate::http1_pool::Role::Reconcile)
+            };
+            let secondary_permit = crate::http1_pool::try_borrow_account(
+                self.shared.account_state.account_id(),
+                crate::http1_pool::Role::Reconcile,
+            );
+            if let Some(secondary_permit) = secondary_permit {
+                let secondary_client = secondary_permit.current_pooled_client();
+                if (primary_client.role(), primary_client.slot())
+                    != (secondary_client.role(), secondary_client.slot())
+                {
+                    let primary_location = (primary_client.role(), primary_client.slot());
+                    let secondary_location = (secondary_client.role(), secondary_client.slot());
+                    let primary_rx =
+                        self.shared
+                            .http_call_async_on(primary_client, "GET", &path, "");
+                    let secondary_rx =
+                        self.shared
+                            .http_call_async_on(secondary_client, "GET", &path, "");
+                    held_permits.push(secondary_permit);
+                    let primary = primary_rx.recv().unwrap_or_else(|_| {
+                        Err(HttpErr::Transport("async reply dropped".to_string()))
+                    });
+                    let secondary = secondary_rx.recv().unwrap_or_else(|_| {
+                        Err(HttpErr::Transport("async reply dropped".to_string()))
+                    });
+                    let primary = self.classify_order_lookup_reply(coid, order_id, primary);
+                    let secondary = self.classify_order_lookup_reply(coid, order_id, secondary);
+                    let combined = combine_parallel_order_lookups(
+                        primary,
+                        secondary,
+                        primary_location,
+                        secondary_location,
+                    );
+                    log::info!(
+                        "[orphan_metric] parallel_reconcile_evidence=1 coid={} orderID={} primary_role={:?} primary_slot={} secondary_role={:?} secondary_slot={} outcome={}",
+                        coid,
+                        order_id,
+                        primary_location.0,
+                        primary_location.1,
+                        secondary_location.0,
+                        secondary_location.1,
+                        fetch_order_result_name(&combined),
+                    );
+                    return combined;
+                }
+                held_permits.push(secondary_permit);
+            }
+            log::debug!(
+                "[orphan_metric] parallel_reconcile_evidence=0 coid={} orderID={} reason=second_account_slot_unavailable primary_role={:?} primary_slot={}",
+                coid,
+                order_id,
+                primary_client.role(),
+                primary_client.slot(),
+            );
+            let reply = self
+                .shared
+                .http_call_sync_on(primary_client, "GET", &path, "");
+            drop(held_permits);
+            return self.classify_order_lookup_reply(coid, order_id, reply);
+        }
+
+        let reply = permit.map_or_else(
             || self.shared.http_call_sync("GET", &path, ""),
             |permit| {
                 self.shared
                     .http_call_sync_on(permit.current_pooled_client(), "GET", &path, "")
             },
         );
+        self.classify_order_lookup_reply(coid, order_id, reply)
+    }
 
-        if let (Some(_), Err(error)) = (permit, &reply) {
-            if error.is_transport_failure() {
-                let failure_kind = error.fetch_unavailable();
-                let retry_client =
-                    crate::http1_pool::pooled_client(crate::http1_pool::Role::Reconcile);
-                warn!(
-                    "[orphan_metric] reconcile_transport_fallback=1 coid={} orderID={} primary_failure={:?} retry_source={}",
-                    coid,
-                    order_id,
-                    failure_kind,
-                    "global_reconcile_fallback",
-                );
-                reply = self
-                    .shared
-                    .http_call_sync_on(retry_client, "GET", &path, "");
-            }
-        }
-
+    fn classify_order_lookup_reply(
+        &self,
+        coid: &str,
+        order_id: &str,
+        reply: HttpReply,
+    ) -> FetchOrderResult {
         let json = match reply {
             Ok(j) => j,
             Err(e) => {
@@ -9379,8 +9585,11 @@ impl PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Err(Self::make_rejected(order, "trading disabled backoff"));
         }
-        if super::network_incident::place_blocked_by_timeout_cluster() {
-            return Err(Self::make_rejected(order, "timeout cluster safety gate"));
+        if super::network_incident::place_blocked_by_connection_failure_cluster() {
+            return Err(Self::make_rejected(
+                order,
+                "connection failure cluster safety gate",
+            ));
         }
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Err(Self::make_rejected(order, "balance backoff"));
@@ -10305,10 +10514,11 @@ impl ExchangeTrade for PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Ok(self.make_logged_preflight_rejections(orders, "trading disabled backoff"));
         }
-        if super::network_incident::place_blocked_by_timeout_cluster() {
-            return Ok(
-                self.make_logged_preflight_rejections(orders, "timeout cluster safety gate")
-            );
+        if super::network_incident::place_blocked_by_connection_failure_cluster() {
+            return Ok(self.make_logged_preflight_rejections(
+                orders,
+                "connection failure cluster safety gate",
+            ));
         }
         // Balance-backoff short-circuit (see `submit_order` for rationale).
         if self.shared.in_balance_backoff(&self.instance_id) {
@@ -11035,11 +11245,13 @@ impl ExchangeTrade for PolymarketTrade {
             return Ok(pre);
         }
 
-        if super::network_incident::place_blocked_by_timeout_cluster()
+        if super::network_incident::place_blocked_by_connection_failure_cluster()
             && !place_orders.is_empty()
         {
-            let mut pre = self
-                .make_logged_preflight_rejections(place_orders, "timeout cluster safety gate");
+            let mut pre = self.make_logged_preflight_rejections(
+                place_orders,
+                "connection failure cluster safety gate",
+            );
             let rest =
                 self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
             pre.extend(rest);
@@ -12843,6 +13055,77 @@ mod tests {
         assert!(!retired_market_terminalization_allowed(3, 2, 2, 2, 1));
         assert!(retired_market_terminalization_allowed(3, 2, 2, 1, 1));
         assert!(retired_market_terminalization_allowed(3, 2, 2, 0, 0));
+    }
+
+    #[test]
+    fn parallel_reconcile_absence_requires_both_slots() {
+        let combined = combine_parallel_order_lookups(
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse("null".into())),
+            FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse("null".into())),
+            (crate::http1_pool::Role::Reconcile, 0),
+            (crate::http1_pool::Role::Reconcile, 1),
+        );
+        assert!(matches!(
+            combined,
+            FetchOrderResult::Unavailable(ref kind) if kind.is_parallel_absence()
+        ));
+
+        let incomplete = combine_parallel_order_lookups(
+            FetchOrderResult::NotFound("404".into()),
+            FetchOrderResult::Unavailable(FetchUnavailable::Transport),
+            (crate::http1_pool::Role::Reconcile, 0),
+            (crate::http1_pool::Role::Reconcile, 1),
+        );
+        assert!(matches!(
+            incomplete,
+            FetchOrderResult::Unavailable(FetchUnavailable::Transport)
+        ));
+
+        let dual_404 = combine_parallel_order_lookups(
+            FetchOrderResult::NotFound("primary 404".into()),
+            FetchOrderResult::NotFound("secondary 404".into()),
+            (crate::http1_pool::Role::Reconcile, 0),
+            (crate::http1_pool::Role::Reconcile, 1),
+        );
+        assert!(dual_404.has_parallel_not_found_evidence());
+        let attempts = ReconcileAttemptCounters::default();
+        assert_eq!(attempts.next_placement_with_evidence("coid", 2), 2);
+        assert_eq!(attempts.next_placement_with_evidence("coid", 2), 4);
+    }
+
+    #[test]
+    fn expired_market_fast_path_requires_remote_clean_and_parallel_absence() {
+        let missing = RuntimeMissingOrder {
+            client_order_id: "coid".into(),
+            tracked: TrackedOrder {
+                order_slot: Default::default(),
+                symbol: "token".into(),
+                side: Side::Buy,
+                instance_id: "instance".into(),
+            },
+            order_id: "order".into(),
+            evidence: "parallel_reconcile_absence_json_null".into(),
+        };
+        assert!(retired_market_parallel_absence_fast_path_allowed(
+            true,
+            true,
+            1,
+            std::slice::from_ref(&missing),
+        ));
+        assert!(!retired_market_parallel_absence_fast_path_allowed(
+            true,
+            false,
+            1,
+            std::slice::from_ref(&missing),
+        ));
+        let mut single = missing;
+        single.evidence = "single_order_lookup_json_null".into();
+        assert!(!retired_market_parallel_absence_fast_path_allowed(
+            true,
+            true,
+            1,
+            std::slice::from_ref(&single),
+        ));
     }
 
     #[test]
