@@ -18,6 +18,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use hexagent_account::account::shared_account::{
     measure_deferred_lifecycle_stages, normalize_order_id, OrderOwnership,
+    SharedAccountLifecycleOwnerState,
 };
 use hexagent_runtime::shutdown::{ShutdownPhase, ShutdownToken};
 use log::{debug, info, warn};
@@ -3285,6 +3286,7 @@ impl SharedState {
         initial_execution_state: ExecutionStateSnapshot,
         initial_live_position: LivePositionManager,
         lifecycle_rx: crossbeam_channel::Receiver<AccountLifecycleJob>,
+        lifecycle_account_owner: SharedAccountLifecycleOwnerState,
         account_owner: hexagent_account::account::shared_account::SharedAccountOwnerState,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
@@ -3303,7 +3305,6 @@ impl SharedState {
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(2);
         let cold_ready_tx = ready_tx.clone();
         let lifecycle_account_id = account_id.clone();
-        let lifecycle_account_state = Arc::clone(&shared.account_state);
         let cold_handle = std::thread::Builder::new()
             .name(format!("poly-account-owner-{}", shared.instance_id))
             .spawn(move || {
@@ -3366,7 +3367,7 @@ impl SharedState {
                     "polymarket-lifecycle-owner",
                     &lifecycle_account_id,
                 );
-                if let Err(error) = lifecycle_account_state.mark_account_lifecycle_thread() {
+                if let Err(error) = lifecycle_account_owner.mark_current_thread() {
                     log::error!("[PolymarketTrade] lifecycle owner binding failed: {error}");
                     return;
                 }
@@ -3385,6 +3386,10 @@ impl SharedState {
                         // first, then maintenance. GC is coalesced and runs
                         // last; cold account commands have their own worker.
                         loop {
+                            if let Ok(command) = lifecycle_account_owner.receiver().try_recv() {
+                                lifecycle_account_owner.execute(command);
+                                continue;
+                            }
                             if let Ok(job) = lifecycle_rx.try_recv() {
                                 shared.apply_account_lifecycle_job(
                                     &mut execution,
@@ -3407,6 +3412,10 @@ impl SharedState {
                         break;
                     }
                     crossbeam_channel::select_biased! {
+                        recv(lifecycle_account_owner.receiver()) -> command => match command {
+                            Ok(command) => lifecycle_account_owner.execute(command),
+                            Err(_) => break,
+                        },
                         recv(lifecycle_rx) -> job => match job {
                             Ok(job) => shared.apply_account_lifecycle_job(
                                 &mut execution,
@@ -5806,6 +5815,9 @@ impl PolymarketTrade {
         let (account_owner_handle, account_owner_state) = account_state
             .bind_account_owner()
             .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
+        let lifecycle_account_owner = account_state
+            .bind_account_lifecycle_owner()
+            .map_err(|error| anyhow!("Polymarket lifecycle owner bind failed: {error}"))?;
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
             crossbeam_channel::bounded(EXECUTION_AUDIT_QUEUE_CAPACITY);
@@ -5872,14 +5884,15 @@ impl PolymarketTrade {
         });
         let (account_owner, lifecycle_owner, account_owner_ready) =
             SharedState::spawn_account_owner_workers(
-            &shared,
-            initial_execution_state,
-            initial_live_position,
-            account_lifecycle_rx,
-            account_owner_state,
-            account_maintenance_rx,
-            settled_gc_rx,
-        );
+                &shared,
+                initial_execution_state,
+                initial_live_position,
+                account_lifecycle_rx,
+                lifecycle_account_owner,
+                account_owner_state,
+                account_maintenance_rx,
+                settled_gc_rx,
+            );
         for worker in ["cold account owner", "private lifecycle owner"] {
             account_owner_ready
                 .recv_timeout(std::time::Duration::from_secs(2))

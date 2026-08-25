@@ -57,6 +57,10 @@ const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
 const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
+/// Private order/trade lifecycle is lossless and outranks wallet calibration
+/// and all other cold account work. Saturation fails closed at the producer;
+/// the consumer is the dedicated private lifecycle owner.
+const ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY: usize = 16_384;
 /// Runtime wallet observations are replaceable control-plane snapshots. Keep
 /// only one wake in flight and merge a newer generation into the pending slot;
 /// the lossless private-lifecycle lane must never queue behind every poller.
@@ -234,6 +238,28 @@ pub struct SharedAccountOwnerState {
     wallet_rx: crossbeam_channel::Receiver<()>,
 }
 
+/// Receiving half of the lossless account-lifecycle lane. The exchange moves
+/// this value into its private lifecycle worker; it cannot be cloned or polled
+/// by the calibration/cold owner.
+pub struct SharedAccountLifecycleOwnerState {
+    account: Arc<SharedAccount>,
+    rx: crossbeam_channel::Receiver<AccountOwnerCommand>,
+}
+
+impl SharedAccountLifecycleOwnerState {
+    pub fn mark_current_thread(&self) -> Result<(), String> {
+        self.account.mark_account_lifecycle_thread()
+    }
+
+    pub fn receiver(&self) -> &crossbeam_channel::Receiver<AccountOwnerCommand> {
+        &self.rx
+    }
+
+    pub fn execute(&self, command: AccountOwnerCommand) {
+        command.execute(&self.account);
+    }
+}
+
 impl SharedAccountOwnerState {
     pub fn mark_current_thread(&self) -> Result<(), String> {
         self.account.mark_account_owner_thread()
@@ -310,6 +336,9 @@ enum AccountOwnerOperation {
     ClearRiskBlocker {
         source: String,
         reply: crossbeam_channel::Sender<bool>,
+    },
+    ClearCancelAuditAnomaly {
+        client_order_id: String,
     },
     BeginOrderRecovery {
         client_order_ids: Vec<String>,
@@ -511,6 +540,9 @@ impl AccountOwnerCommand {
             }
             ClearRiskBlocker { source, reply } => {
                 let _ = reply.send(account.clear_risk_blocker(&source));
+            }
+            ClearCancelAuditAnomaly { client_order_id } => {
+                account.clear_cancel_audit_anomaly(&client_order_id);
             }
             BeginOrderRecovery { client_order_ids } => {
                 account.begin_order_recovery(client_order_ids.iter().map(String::as_str));
@@ -1839,6 +1871,9 @@ struct VirtualAccount {
     /// cross-thread telemetry consumes only these published counts.
     recovery_pending_count: AtomicUsize,
     routine_cancel_audit_count: AtomicUsize,
+    /// Immutable pending-physical projection published by the lifecycle
+    /// owner. Wallet calibration reads this without borrowing lifecycle rows.
+    pending_physical_fast: ArcSwap<PendingPhysicalDeltas>,
 }
 
 impl VirtualAccount {
@@ -1886,6 +1921,7 @@ impl VirtualAccount {
             trade_epoch: AtomicU64::new(0),
             recovery_pending_count: AtomicUsize::new(0),
             routine_cancel_audit_count: AtomicUsize::new(0),
+            pending_physical_fast: ArcSwap::from_pointee(PendingPhysicalDeltas::default()),
         }
     }
 
@@ -1894,6 +1930,8 @@ impl VirtualAccount {
             .store(lifecycle.recovery_pending_orders.len(), Ordering::Release);
         self.routine_cancel_audit_count
             .store(lifecycle.routine_cancel_audits.len(), Ordering::Release);
+        self.pending_physical_fast
+            .store(Arc::new(lifecycle.pending_physical.snapshot()));
     }
 
     fn position(&self, token: &str) -> Arc<VirtualPositionQuota> {
@@ -4701,9 +4739,14 @@ pub struct SharedAccount {
     state: Arc<Mutex<SharedAccountState>>,
     account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
     account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
+    account_lifecycle_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
+    account_lifecycle_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
+    account_lifecycle_lane_bound: AtomicBool,
+    account_lifecycle_queue_high_water: AtomicUsize,
+    account_lifecycle_queue_overflows: AtomicU64,
     wallet_calibration_wake_tx: crossbeam_channel::Sender<()>,
     wallet_calibration_wake_rx: Mutex<Option<crossbeam_channel::Receiver<()>>>,
-    wallet_calibration_pending: Mutex<Option<WalletCalibrationRequest>>,
+    wallet_calibration_pending: ArcSwapOption<WalletCalibrationRequest>,
     wallet_calibration_coalesced: AtomicU64,
     account_owner_lane_bound: Arc<AtomicBool>,
     account_owner_thread_id: OnceLock<std::thread::ThreadId>,
@@ -5000,6 +5043,31 @@ impl SharedAccount {
         Ok((handle, owner))
     }
 
+    /// Bind the high-priority lossless lifecycle lane to the exchange's
+    /// private-event worker. This receiver is intentionally independent from
+    /// the cold/calibration owner receiver.
+    pub fn bind_account_lifecycle_owner(
+        self: &Arc<Self>,
+    ) -> Result<SharedAccountLifecycleOwnerState, String> {
+        let receiver = self
+            .account_lifecycle_task_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                format!(
+                    "account {} lifecycle task lane already bound",
+                    self.account_id
+                )
+            })?;
+        self.account_lifecycle_lane_bound
+            .store(true, Ordering::Release);
+        Ok(SharedAccountLifecycleOwnerState {
+            account: Arc::clone(self),
+            rx: receiver,
+        })
+    }
+
     /// Bind the fixed-capacity cold-control lane to the one account writer.
     /// Binding twice is rejected because two consumers would violate ordered
     /// single-writer ownership.
@@ -5060,9 +5128,8 @@ impl SharedAccount {
         self.account_owner_lane_bound.load(Ordering::Acquire) && !self.is_account_owner_thread()
     }
 
-    fn must_dispatch_lifecycle_to_account_owner(&self) -> bool {
-        self.account_owner_lane_bound.load(Ordering::Acquire)
-            && !self.is_account_owner_thread()
+    fn must_dispatch_lifecycle_to_owner(&self) -> bool {
+        self.account_lifecycle_lane_bound.load(Ordering::Acquire)
             && !self.is_account_lifecycle_thread()
     }
 
@@ -5088,6 +5155,37 @@ impl SharedAccount {
                     self.account_id,
                 )
             })
+    }
+
+    fn try_submit_account_lifecycle_command(
+        &self,
+        command: AccountOwnerCommand,
+    ) -> Result<(), String> {
+        if self.is_account_lifecycle_thread() {
+            command.execute(self);
+            return Ok(());
+        }
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            return Err(format!(
+                "account {} lifecycle task lane is not bound",
+                self.account_id
+            ));
+        }
+        match self.account_lifecycle_task_tx.try_send(command) {
+            Ok(()) => {
+                self.account_lifecycle_queue_high_water
+                    .fetch_max(self.account_lifecycle_task_tx.len(), Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.account_lifecycle_queue_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(format!(
+                    "account {} lifecycle task enqueue failed: {error}",
+                    self.account_id,
+                ))
+            }
+        }
     }
 
     /// Transfer a compatibility-only cold mutation to the account writer and
@@ -5119,6 +5217,31 @@ impl SharedAccount {
                     self.account_id,
                 )
             })
+    }
+
+    fn request_account_lifecycle_owner<T, F>(&self, build: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(crossbeam_channel::Sender<T>) -> AccountOwnerCommand,
+    {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.try_submit_account_lifecycle_command(build(reply_tx))?;
+        reply_rx
+            .recv_timeout(ACCOUNT_OWNER_REQUEST_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "account {} lifecycle task completion timed out: {error}",
+                    self.account_id,
+                )
+            })
+    }
+
+    pub fn account_lifecycle_queue_metrics(&self) -> (usize, usize, u64) {
+        (
+            self.account_lifecycle_task_tx.len(),
+            self.account_lifecycle_queue_high_water.load(Ordering::Relaxed),
+            self.account_lifecycle_queue_overflows.load(Ordering::Relaxed),
+        )
     }
 
     pub fn submit_register_token_interest(
@@ -5248,51 +5371,80 @@ impl SharedAccount {
             ));
         }
         let (reply, completion) = crossbeam_channel::bounded(1);
-        let mut pending = self.wallet_calibration_pending.lock().unwrap();
-        match pending.as_mut() {
-            Some(request) => {
-                if generation >= request.generation {
-                    request.generation = generation;
-                    request.cash = cash;
-                    request.positions = positions;
-                    request.authoritative_tokens = authoritative_tokens;
-                }
-                request.include_token_interests |= include_token_interests;
-                if request.replies.len() >= WALLET_CALIBRATION_WAITER_CAPACITY {
-                    let superseded = request.replies.remove(0);
-                    let error = format!(
-                        "account {} wallet calibration waiter capacity {} exceeded; oldest waiter superseded by generation {}",
-                        self.account_id, WALLET_CALIBRATION_WAITER_CAPACITY, generation,
-                    );
-                    let _ = superseded.send(Err(error.clone()));
-                    log::warn!("[wallet_calibration_overflow] {error}");
-                }
-                request.replies.push(reply);
+        loop {
+            let current = self.wallet_calibration_pending.load_full();
+            let mut replies = current
+                .as_ref()
+                .map(|request| request.replies.clone())
+                .unwrap_or_default();
+            let superseded = (replies.len() >= WALLET_CALIBRATION_WAITER_CAPACITY)
+                .then(|| replies.remove(0));
+            replies.push(reply.clone());
+            let (next_generation, next_cash, next_positions, next_authoritative_tokens) = current
+                .as_ref()
+                .filter(|request| request.generation > generation)
+                .map(|request| {
+                    (
+                        request.generation,
+                        request.cash,
+                        request.positions.clone(),
+                        request.authoritative_tokens.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        generation,
+                        cash,
+                        positions.clone(),
+                        authoritative_tokens.clone(),
+                    )
+                });
+            let next = Some(Arc::new(WalletCalibrationRequest {
+                generation: next_generation,
+                cash: next_cash,
+                positions: next_positions,
+                authoritative_tokens: next_authoritative_tokens,
+                include_token_interests: include_token_interests
+                    || current
+                        .as_ref()
+                        .is_some_and(|request| request.include_token_interests),
+                replies,
+            }));
+            let observed = self
+                .wallet_calibration_pending
+                .compare_and_swap(&current, next);
+            let unchanged = match (&*observed, &current) {
+                (Some(observed), Some(current)) => Arc::ptr_eq(observed, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged {
+                continue;
+            }
+            if current.is_some() {
                 self.wallet_calibration_coalesced
                     .fetch_add(1, Ordering::Relaxed);
             }
-            None => {
-                *pending = Some(WalletCalibrationRequest {
-                    generation,
-                    cash,
-                    positions,
-                    authoritative_tokens,
-                    include_token_interests,
-                    replies: vec![reply],
-                });
+            if let Some(superseded) = superseded {
+                let error = format!(
+                    "account {} wallet calibration waiter capacity {} exceeded; oldest waiter superseded by generation {}",
+                    self.account_id, WALLET_CALIBRATION_WAITER_CAPACITY, generation,
+                );
+                let _ = superseded.send(Err(error.clone()));
+                log::warn!("[wallet_calibration_overflow] {error}");
             }
+            break;
         }
         match self.wallet_calibration_wake_tx.try_send(()) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(completion),
             Err(crossbeam_channel::TrySendError::Disconnected(())) => {
-                let request = pending.take();
-                drop(pending);
+                let request = self.wallet_calibration_pending.swap(None);
                 let error = format!(
                     "account {} owner wallet lane is disconnected",
                     self.account_id
                 );
                 if let Some(request) = request {
-                    for reply in request.replies {
+                    for reply in &request.replies {
                         let _ = reply.send(Err(error.clone()));
                     }
                 }
@@ -5306,7 +5458,7 @@ impl SharedAccount {
     }
 
     fn execute_pending_wallet_calibration(&self) {
-        let Some(request) = self.wallet_calibration_pending.lock().unwrap().take() else {
+        let Some(request) = self.wallet_calibration_pending.swap(None) else {
             return;
         };
         let result = self
@@ -5335,13 +5487,13 @@ impl SharedAccount {
                         .then(|| self.token_interests()),
                 })
             });
-        for reply in request.replies {
+        for reply in &request.replies {
             let _ = reply.send(result.clone());
         }
         // A producer can install a newer payload after the slot is taken but
         // before this command finishes. Its wake may have coalesced with the
         // one we just consumed, so re-arm explicitly when work remains.
-        if self.wallet_calibration_pending.lock().unwrap().is_some() {
+        if self.wallet_calibration_pending.load().is_some() {
             let _ = self.wallet_calibration_wake_tx.try_send(());
         }
     }
@@ -5451,6 +5603,8 @@ impl SharedAccount {
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let (account_owner_task_tx, account_owner_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        let (account_lifecycle_task_tx, account_lifecycle_task_rx) =
+            crossbeam_channel::bounded(ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY);
         let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
@@ -5458,9 +5612,14 @@ impl SharedAccount {
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            account_lifecycle_task_tx,
+            account_lifecycle_task_rx: Mutex::new(Some(account_lifecycle_task_rx)),
+            account_lifecycle_lane_bound: AtomicBool::new(false),
+            account_lifecycle_queue_high_water: AtomicUsize::new(0),
+            account_lifecycle_queue_overflows: AtomicU64::new(0),
             wallet_calibration_wake_tx,
             wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
-            wallet_calibration_pending: Mutex::new(None),
+            wallet_calibration_pending: ArcSwapOption::empty(),
             wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
@@ -5856,6 +6015,8 @@ impl SharedAccount {
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let (account_owner_task_tx, account_owner_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        let (account_lifecycle_task_tx, account_lifecycle_task_rx) =
+            crossbeam_channel::bounded(ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY);
         let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
@@ -5863,9 +6024,14 @@ impl SharedAccount {
             state,
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            account_lifecycle_task_tx,
+            account_lifecycle_task_rx: Mutex::new(Some(account_lifecycle_task_rx)),
+            account_lifecycle_lane_bound: AtomicBool::new(false),
+            account_lifecycle_queue_high_water: AtomicUsize::new(0),
+            account_lifecycle_queue_overflows: AtomicU64::new(0),
             wallet_calibration_wake_tx,
             wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
-            wallet_calibration_pending: Mutex::new(None),
+            wallet_calibration_pending: ArcSwapOption::empty(),
             wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
@@ -6025,12 +6191,10 @@ impl SharedAccount {
         let mut pending = PendingPhysicalDeltas::default();
         let mut instance_baseline = BTreeMap::new();
         for (instance_id, account) in accounts.iter() {
-            // The lifecycle mutex pairs the scoped atomic economic snapshot
-            // with the corresponding physical-booking flags. Historical zero
-            // positions, orders, trades and ownership metadata remain on the
-            // strategy shard and are not cloned by wallet calibration.
-            let lifecycle = account.lifecycle.lock().unwrap();
-            let instance_pending = lifecycle.pending_physical.snapshot();
+            // The lifecycle owner publishes physical-booking deltas after
+            // every mutation. Calibration consumes that immutable projection;
+            // it never borrows orders/trades or waits for the lifecycle mutex.
+            let instance_pending = account.pending_physical_fast.load_full();
             let cash = account.cash.load();
             let positions = account.positions.read().unwrap();
             let mut scoped_positions = HashMap::with_capacity(scoped_tokens.len());
@@ -6044,8 +6208,8 @@ impl SharedAccount {
             drop(positions);
             pending.cash += instance_pending.cash;
             pending.unsettled |= instance_pending.unsettled;
-            for (token, quantity) in instance_pending.positions {
-                *pending.positions.entry(token).or_insert(0.0) += quantity;
+            for (token, quantity) in &instance_pending.positions {
+                *pending.positions.entry(token.clone()).or_insert(0.0) += *quantity;
             }
             let Some(ledger) = state.instances.get_mut(instance_id) else {
                 continue;
@@ -7310,6 +7474,19 @@ impl SharedAccount {
     }
 
     fn clear_cancel_audit_anomaly(&self, client_order_id: &str) {
+        if self.must_dispatch_to_account_owner() {
+            let client_order_id = client_order_id.to_string();
+            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+                AccountOwnerOperation::ClearCancelAuditAnomaly { client_order_id },
+            )) {
+                log::error!(
+                    "[shared_account] cancel-audit anomaly clear dispatch failed: {error}"
+                );
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+            }
+            return;
+        }
         let mut state = self.lock_state();
         if state
             .ownership_anomalies
@@ -9516,13 +9693,13 @@ impl SharedAccount {
     /// balance-changing maintenance remains fail-closed until authoritative
     /// terminal metadata arrives.
     pub fn begin_order_recovery<'a>(&self, client_order_ids: impl IntoIterator<Item = &'a str>) {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_ids: Vec<String> = client_order_ids
                 .into_iter()
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .collect();
-            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+            if let Err(error) = self.try_submit_account_lifecycle_command(AccountOwnerCommand(
                 AccountOwnerOperation::BeginOrderRecovery { client_order_ids },
             )) {
                 log::error!("[shared_account] begin-recovery owner dispatch failed: {error}");
@@ -9565,9 +9742,9 @@ impl SharedAccount {
     }
 
     pub fn finish_order_recovery(&self, client_order_id: &str) {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
-            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+            if let Err(error) = self.try_submit_account_lifecycle_command(AccountOwnerCommand(
                 AccountOwnerOperation::FinishOrderRecovery { client_order_id },
             )) {
                 log::error!("[shared_account] finish-recovery owner dispatch failed: {error}");
@@ -10523,11 +10700,11 @@ impl SharedAccount {
     }
 
     pub fn rebind_order_id(&self, client_order_id: &str, order_id: &str) -> bool {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
             let order_id = order_id.to_string();
             return self
-                .request_account_owner(|reply| {
+                .request_account_lifecycle_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::RebindOrderId {
                         client_order_id,
                         order_id,
@@ -11180,10 +11357,10 @@ impl SharedAccount {
     /// idempotent and raises reservation counters only to the conservative
     /// minimum implied by all retained orders, so it cannot double-reserve.
     pub fn backfill_order_ownership(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let ownership = ownership.clone();
             return self
-                .request_account_owner(|reply| {
+                .request_account_lifecycle_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::BackfillOrderOwnership {
                         ownership,
                         reply,
@@ -11273,11 +11450,11 @@ impl SharedAccount {
         client_order_id: &str,
         status: OrderStatus,
     ) -> Option<OrderStatus> {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
             let diagnostic_coid = client_order_id.clone();
             return self
-                .request_account_owner(|reply| {
+                .request_account_lifecycle_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::MarkOrderStatusEffective {
                         client_order_id,
                         status,
@@ -11418,10 +11595,10 @@ impl SharedAccount {
     /// the sticky audit gate until those fills are booked. The edge result lets
     /// callers suppress duplicate WARNs from repeated Filled lifecycle rows.
     pub fn mark_filled_pending_audit(&self, client_order_id: &str) -> FillAuditPendingTransition {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
             return self
-                .request_account_owner(|reply| {
+                .request_account_lifecycle_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::MarkFilledPendingAudit {
                         client_order_id,
                         reply,
@@ -11491,10 +11668,10 @@ impl SharedAccount {
         status: OrderStatus,
         audit: &AuthoritativeOrderAudit,
     ) -> Result<FillAuditPendingTransition, String> {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
             let audit = audit.clone();
-            return self.request_account_owner(|reply| {
+            return self.request_account_lifecycle_owner(|reply| {
                 AccountOwnerCommand(AccountOwnerOperation::ApplyAuthoritativeOrderAudit {
                     client_order_id,
                     status,
@@ -11732,10 +11909,10 @@ impl SharedAccount {
     /// residual lock until an order-specific audit arrives, without globally
     /// pausing unrelated instances on the same account.
     pub fn mark_cancelled_pending_audit(&self, client_order_id: &str) -> bool {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
             return self
-                .request_account_owner(|reply| {
+                .request_account_lifecycle_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::MarkCancelledPendingAudit {
                         client_order_id,
                         reply,
@@ -11786,9 +11963,9 @@ impl SharedAccount {
     /// Release the still-unfilled reservation after an authoritative terminal
     /// order outcome. Ownership is retained for late fill attribution.
     pub fn release_order(&self, client_order_id: &str, status: OrderStatus) {
-        if self.must_dispatch_lifecycle_to_account_owner() {
+        if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
-            if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
+            if let Err(error) = self.try_submit_account_lifecycle_command(AccountOwnerCommand(
                 AccountOwnerOperation::ReleaseOrder {
                     client_order_id,
                     status,
@@ -18527,6 +18704,164 @@ mod tests {
         let snapshot = account.monitoring_snapshot_fast();
         assert!((snapshot.physical_cash - 125.0).abs() < EPS);
         assert_eq!(account.wallet_calibration_wake_tx.len(), 0);
+    }
+
+    #[test]
+    fn lifecycle_owner_stays_responsive_while_calibration_is_parked() {
+        const EVENTS: usize = 1_000;
+        let account = Arc::new(SharedAccount::new("split-lifecycle-calibration"));
+        account.register_instance("maker-a", 1.0);
+        account.register_instance("maker-b", 1.0);
+        account
+            .apply_physical_snapshot(200.0, HashMap::new())
+            .unwrap();
+        account
+            .reserve_order(
+                "maker-a",
+                "maker-a-order",
+                "maker-a-oid",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        account
+            .reserve_order(
+                "maker-b",
+                "maker-b-order",
+                "maker-b-oid",
+                "DOWN",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let (_handle, calibration_owner) = account.bind_account_owner().unwrap();
+        let lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let lifecycle_thread = std::thread::spawn(move || {
+            lifecycle_owner.mark_current_thread().unwrap();
+            loop {
+                crossbeam_channel::select_biased! {
+                    recv(lifecycle_owner.receiver()) -> command => match command {
+                        Ok(command) => lifecycle_owner.execute(command),
+                        Err(_) => break,
+                    },
+                    recv(stop_rx) -> _ => break,
+                }
+            }
+        });
+
+        // Leave this wake deliberately parked on the cold/calibration owner.
+        // It must not share a queue or consumer turn with private lifecycle.
+        let calibration = account
+            .submit_wallet_calibration(1, 210.0, HashMap::new(), HashSet::new(), false)
+            .unwrap();
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = Instant::now();
+            assert_eq!(
+                account.mark_order_status_effective("maker-a-order", OrderStatus::Accepted),
+                Some(OrderStatus::Accepted),
+            );
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        // Ordered and duplicate lifecycle inputs remain monotonic, and the
+        // sibling instance is untouched.
+        assert_eq!(
+            account.mark_order_status_effective("maker-a-order", OrderStatus::PartiallyFilled),
+            Some(OrderStatus::PartiallyFilled),
+        );
+        assert_eq!(
+            account.mark_order_status_effective("maker-a-order", OrderStatus::Accepted),
+            Some(OrderStatus::PartiallyFilled),
+        );
+        assert_eq!(
+            account.order("maker-b-order").unwrap().status,
+            OrderStatus::Pending,
+        );
+        let queue = account.account_lifecycle_queue_metrics();
+        let summary = latency_summary_ns(&mut samples);
+        eprintln!(
+            "split lifecycle owner n={EVENTS} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
+            summary.0, summary.1, summary.2, summary.3, queue.1, queue.2,
+        );
+        assert_eq!(queue.2, 0);
+        assert!(summary.3 < 50_000_000);
+
+        stop_tx.send(()).unwrap();
+        lifecycle_thread.join().unwrap();
+        calibration_owner.mark_current_thread().unwrap();
+        calibration_owner.wallet_receiver().try_recv().unwrap();
+        calibration_owner.execute_wallet_calibration();
+        assert!(calibration.recv().unwrap().unwrap().account_ready);
+    }
+
+    #[test]
+    fn lifecycle_owner_lane_is_bounded_lossless_and_single_consumer() {
+        let account = Arc::new(SharedAccount::new("lifecycle-lane-capacity"));
+        let _owner = account.bind_account_lifecycle_owner().unwrap();
+        assert!(account.bind_account_lifecycle_owner().is_err());
+        let (reply_tx, _reply_rx) = crossbeam_channel::bounded(1);
+        for _ in 0..ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY {
+            account
+                .try_submit_account_lifecycle_command(AccountOwnerCommand::barrier(
+                    reply_tx.clone(),
+                ))
+                .unwrap();
+        }
+        assert!(account
+            .try_submit_account_lifecycle_command(AccountOwnerCommand::barrier(reply_tx))
+            .unwrap_err()
+            .contains("full"));
+        assert_eq!(
+            account.account_lifecycle_queue_metrics(),
+            (
+                ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY,
+                ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY,
+                1,
+            ),
+        );
+    }
+
+    #[test]
+    fn concurrent_wallet_calibration_publish_keeps_every_waiter_and_latest_generation() {
+        const PRODUCERS: usize = 16;
+        let account = Arc::new(SharedAccount::new("wallet-calibration-cas"));
+        account.register_instance("maker", 1.0);
+        let (_handle, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let mut producers = Vec::with_capacity(PRODUCERS);
+        for generation in 1..=PRODUCERS {
+            let account = Arc::clone(&account);
+            producers.push(std::thread::spawn(move || {
+                account
+                    .submit_wallet_calibration(
+                        generation as u64,
+                        100.0 + generation as f64,
+                        HashMap::new(),
+                        HashSet::new(),
+                        generation == PRODUCERS,
+                    )
+                    .unwrap()
+            }));
+        }
+        let completions: Vec<_> = producers
+            .into_iter()
+            .map(|producer| producer.join().unwrap())
+            .collect();
+        owner.wallet_receiver().try_recv().unwrap();
+        owner.execute_wallet_calibration();
+        for completion in completions {
+            let result = completion.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+            assert!(result.account_ready);
+            assert!(result.token_interests.is_some());
+        }
+        assert_eq!(account.wallet_calibration_coalesced(), (PRODUCERS - 1) as u64);
+        assert!((account.monitoring_snapshot_fast().physical_cash - 116.0).abs() < EPS);
     }
 
     #[test]
