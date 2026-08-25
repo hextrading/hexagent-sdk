@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, Stream, StreamExt};
 use log::{debug, info, warn};
@@ -12,7 +13,7 @@ use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
@@ -141,9 +142,14 @@ pub struct PolymarketLiveness {
     first_raw_frame_seen: AtomicBool,
     ready_seen: AtomicBool,
     recovery_started_ns: AtomicU64,
-    reconnect_requested: AtomicBool,
-    reconnect_reason: Mutex<String>,
-    clob_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    reconnect: ArcSwap<ReconnectControl>,
+    clob_abort: ArcSwapOption<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone, Default)]
+struct ReconnectControl {
+    requested: bool,
+    reason: String,
 }
 
 impl Default for PolymarketLiveness {
@@ -164,9 +170,8 @@ impl Default for PolymarketLiveness {
             first_raw_frame_seen: AtomicBool::new(false),
             ready_seen: AtomicBool::new(false),
             recovery_started_ns: AtomicU64::new(0),
-            reconnect_requested: AtomicBool::new(false),
-            reconnect_reason: Mutex::new(String::new()),
-            clob_abort: Mutex::new(None),
+            reconnect: ArcSwap::from_pointee(ReconnectControl::default()),
+            clob_abort: ArcSwapOption::empty(),
         }
     }
 }
@@ -221,31 +226,30 @@ impl PolymarketLiveness {
     /// async reader immediately. The synchronous feed observes the request and
     /// rebuilds the connection on its next iteration.
     pub fn request_reconnect(&self, reason: impl Into<String>) -> bool {
-        if self.reconnect_requested.swap(true, Ordering::AcqRel) {
-            return false;
+        let reason = reason.into();
+        loop {
+            let current = self.reconnect.load_full();
+            if current.requested {
+                return false;
+            }
+            let next = Arc::new(ReconnectControl {
+                requested: true,
+                reason: reason.clone(),
+            });
+            let observed = self.reconnect.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&observed, &current) {
+                break;
+            }
         }
-        *self
-            .reconnect_reason
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason.into();
-        if let Some(abort) = self
-            .clob_abort
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
+        if let Some(abort) = self.clob_abort.load_full() {
             abort.abort();
         }
         true
     }
 
     fn reconnect_reason(&self) -> Option<String> {
-        self.reconnect_requested.load(Ordering::Acquire).then(|| {
-            self.reconnect_reason
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        })
+        let reconnect = self.reconnect.load();
+        reconnect.requested.then(|| reconnect.reason.clone())
     }
 
     fn begin_connection(&self, active: bool) {
@@ -253,11 +257,8 @@ impl PolymarketLiveness {
         self.connection_started_ns.store(now, Ordering::Release);
         self.last_raw_frame_ns.store(0, Ordering::Release);
         self.last_market_data_ns.store(0, Ordering::Release);
-        self.reconnect_requested.store(false, Ordering::Release);
-        self.reconnect_reason
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.reconnect
+            .store(Arc::new(ReconnectControl::default()));
         self.connected.store(true, Ordering::Release);
         self.active.store(active, Ordering::Release);
         if active {
@@ -283,20 +284,14 @@ impl PolymarketLiveness {
     }
 
     fn install_abort(&self, abort: tokio::task::AbortHandle) {
-        *self
-            .clob_abort
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(abort);
+        self.clob_abort.store(Some(Arc::new(abort)));
     }
 
     fn end_connection(&self) {
         self.connected.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.connection_started_ns.store(0, Ordering::Release);
-        self.clob_abort
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        self.clob_abort.store(None);
     }
 
     fn record_raw_frame(&self, now_ns: u64) {
@@ -703,7 +698,8 @@ struct CachedGammaEvent {
 /// and end-date threshold. There is intentionally no in-flight/singleflight
 /// state: simultaneous first misses may each call Gamma, while every completed
 /// result is immediately reusable by the other accounts and by rotation.
-static GAMMA_EVENT_CACHE: OnceLock<Mutex<HashMap<String, CachedGammaEvent>>> = OnceLock::new();
+const GAMMA_EVENT_CACHE_CAPACITY: usize = 1_024;
+static GAMMA_EVENT_CACHE: OnceLock<ArcSwap<HashMap<String, CachedGammaEvent>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct RestFutureEventCandidate {
@@ -716,26 +712,30 @@ struct RestFutureEventCandidate {
 /// deliberately a channel rather than another cache poll: discovery wakes the
 /// feed on its next 1 ms loop and registers the future instrument before the
 /// current event expires.
+#[derive(Clone)]
 struct RestFutureEventSubscriber {
     tx: crossbeam_channel::Sender<RestFutureEventCandidate>,
     replace_rx: crossbeam_channel::Receiver<RestFutureEventCandidate>,
 }
 
-static REST_FUTURE_EVENT_SUBSCRIBERS: OnceLock<Mutex<Vec<RestFutureEventSubscriber>>> =
+static REST_FUTURE_EVENT_SUBSCRIBERS: OnceLock<ArcSwap<Vec<RestFutureEventSubscriber>>> =
     OnceLock::new();
 
 fn subscribe_rest_future_events() -> crossbeam_channel::Receiver<RestFutureEventCandidate> {
     // Discovery is replaceable state. A slow adapter needs only the newest
     // candidate; one-slot mailboxes bound memory and publisher latency.
     let (tx, rx) = crossbeam_channel::bounded(1);
-    REST_FUTURE_EVENT_SUBSCRIBERS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(RestFutureEventSubscriber {
+    let subscribers = REST_FUTURE_EVENT_SUBSCRIBERS
+        .get_or_init(|| ArcSwap::from_pointee(Vec::new()));
+    let subscriber = RestFutureEventSubscriber {
             tx,
             replace_rx: rx.clone(),
-        });
+        };
+    subscribers.rcu(|current| {
+        let mut next = (**current).clone();
+        next.push(subscriber.clone());
+        Arc::new(next)
+    });
     rx
 }
 
@@ -747,21 +747,31 @@ fn publish_rest_future_event(series_id: &str, event: &PolymarketEvent) {
         series_id: series_id.to_string(),
         event: event.clone(),
     };
-    subscribers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .retain(|subscriber| match subscriber.tx.try_send(candidate.clone()) {
+    let mut disconnected = Vec::new();
+    for subscriber in subscribers.load().iter() {
+        match subscriber.tx.try_send(candidate.clone()) {
             Ok(()) => true,
             Err(crossbeam_channel::TrySendError::Full(candidate)) => {
                 let _ = subscriber.replace_rx.try_recv();
                 subscriber.tx.try_send(candidate).is_ok()
             }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
-        });
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                disconnected.push(subscriber.tx.clone());
+                false
+            }
+        };
+    }
+    if !disconnected.is_empty() {
+        subscribers.rcu(|current| Arc::new(current.iter()
+            .filter(|subscriber| !disconnected.iter()
+                .any(|dead| dead.same_channel(&subscriber.tx)))
+            .cloned()
+            .collect()));
+    }
 }
 
-fn gamma_event_cache() -> &'static Mutex<HashMap<String, CachedGammaEvent>> {
-    GAMMA_EVENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn gamma_event_cache() -> &'static ArcSwap<HashMap<String, CachedGammaEvent>> {
+    GAMMA_EVENT_CACHE.get_or_init(|| ArcSwap::from_pointee(HashMap::new()))
 }
 
 fn cache_entry_is_fresh(entry: &CachedGammaEvent, now: Instant) -> bool {
@@ -771,28 +781,30 @@ fn cache_entry_is_fresh(entry: &CachedGammaEvent, now: Instant) -> bool {
 }
 
 fn cache_gamma_events_at(
-    cache: &Mutex<HashMap<String, CachedGammaEvent>>,
+    cache: &ArcSwap<HashMap<String, CachedGammaEvent>>,
     series_id: &str,
     events: &[PolymarketEvent],
     now: Instant,
 ) {
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
-    for event in events {
-        if event.id.is_empty() {
-            continue;
+    cache.rcu(|current| {
+        let mut next = (**current).clone();
+        next.retain(|_, entry| cache_entry_is_fresh(entry, now));
+        for event in events {
+            if !event.id.is_empty() {
+                next.insert(event.id.clone(), CachedGammaEvent {
+                    series_id: series_id.to_string(),
+                    event: event.clone(),
+                    cached_at: now,
+                });
+            }
         }
-        cache.insert(
-            event.id.clone(),
-            CachedGammaEvent {
-                series_id: series_id.to_string(),
-                event: event.clone(),
-                cached_at: now,
-            },
-        );
-    }
+        while next.len() > GAMMA_EVENT_CACHE_CAPACITY {
+            let Some(oldest) = next.iter().min_by_key(|(_, entry)| entry.cached_at)
+                .map(|(id, _)| id.clone()) else { break };
+            next.remove(&oldest);
+        }
+        Arc::new(next)
+    });
 }
 
 fn cache_gamma_events(series_id: &str, events: &[PolymarketEvent]) {
@@ -800,18 +812,15 @@ fn cache_gamma_events(series_id: &str, events: &[PolymarketEvent]) {
 }
 
 fn cached_gamma_event_after_at(
-    cache: &Mutex<HashMap<String, CachedGammaEvent>>,
+    cache: &ArcSwap<HashMap<String, CachedGammaEvent>>,
     series_id: &str,
     end_date_min_secs: u64,
     now: Instant,
 ) -> Option<PolymarketEvent> {
     let min_end_ns = end_date_min_secs.saturating_mul(1_000_000_000);
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.retain(|_, entry| cache_entry_is_fresh(entry, now));
-    cache
+    cache.load()
         .values()
+        .filter(|entry| cache_entry_is_fresh(entry, now))
         .filter(|entry| entry.series_id == series_id)
         .filter_map(|entry| {
             let end_ns = parse_date_ns(&entry.event.end_date).ok()?;
@@ -8094,7 +8103,7 @@ mod pick_current_event_tests {
 
     #[test]
     fn gamma_event_cache_is_keyed_by_event_id_and_selects_earliest_match() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = ArcSwap::from_pointee(HashMap::new());
         let inserted_at = Instant::now();
         let base = now();
         let first = mk_event(base, base + 300);
@@ -8108,7 +8117,7 @@ mod pick_current_event_tests {
         );
 
         assert_eq!(
-            cache.lock().unwrap().len(),
+            cache.load().len(),
             2,
             "duplicate event ids must replace rather than grow the cache",
         );
@@ -8127,7 +8136,7 @@ mod pick_current_event_tests {
 
     #[test]
     fn gamma_event_cache_expires_without_blocking_on_a_refresh() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = ArcSwap::from_pointee(HashMap::new());
         let now_instant = Instant::now();
         let inserted_at = now_instant
             .checked_sub(GAMMA_EVENT_CACHE_TTL + Duration::from_secs(1))
@@ -8140,7 +8149,8 @@ mod pick_current_event_tests {
             cached_gamma_event_after_at(&cache, "series-1", base, now_instant).is_none(),
             "expired entries must fall through to a normal Gamma request",
         );
-        assert!(cache.lock().unwrap().is_empty());
+        cache_gamma_events_at(&cache, "series-1", &[], now_instant);
+        assert!(cache.load().is_empty());
     }
 
     #[test]

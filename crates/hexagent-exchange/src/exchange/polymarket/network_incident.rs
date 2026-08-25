@@ -1,7 +1,8 @@
+use arc_swap::ArcSwap;
 use log::warn;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const INCIDENT_CORRELATION_WINDOW: Duration = Duration::from_secs(10);
@@ -136,7 +137,7 @@ struct PeerContext {
     standby: Option<SocketAddr>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Incident {
     id: u64,
     started_at: Instant,
@@ -144,7 +145,7 @@ struct Incident {
     signals: u8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct NetworkIncidentTracker {
     next_id: u64,
     peers: PeerContext,
@@ -189,19 +190,30 @@ impl NetworkIncidentTracker {
     }
 }
 
-fn tracker() -> &'static Mutex<NetworkIncidentTracker> {
-    // This lock is used only on connection-state changes and anomaly paths;
-    // no successful quote or order path touches it.
-    static TRACKER: OnceLock<Mutex<NetworkIncidentTracker>> = OnceLock::new();
-    TRACKER.get_or_init(|| Mutex::new(NetworkIncidentTracker::default()))
+fn tracker() -> &'static ArcSwap<NetworkIncidentTracker> {
+    static TRACKER: OnceLock<ArcSwap<NetworkIncidentTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| ArcSwap::from_pointee(NetworkIncidentTracker::default()))
 }
 
 pub(crate) fn update_ws_peers(active: Option<SocketAddr>, standby: Option<SocketAddr>) {
-    tracker().lock().unwrap().update_peers(active, standby);
+    tracker().rcu(|current| {
+        let mut next = (**current).clone();
+        next.update_peers(active, standby);
+        std::sync::Arc::new(next)
+    });
 }
 
 pub(crate) fn record(signal: NetworkSignal, detail: &str) {
-    let snapshot = tracker().lock().unwrap().record(Instant::now(), signal);
+    let tracker = tracker();
+    let snapshot = loop {
+        let current = tracker.load_full();
+        let mut next = (*current).clone();
+        let snapshot = next.record(Instant::now(), signal);
+        let observed = tracker.compare_and_swap(&current, std::sync::Arc::new(next));
+        if std::sync::Arc::ptr_eq(&observed, &current) {
+            break snapshot;
+        }
+    };
     let peer_ip_collision = match (snapshot.peers.active, snapshot.peers.standby) {
         (Some(active), Some(standby)) => active.ip() == standby.ip(),
         _ => false,

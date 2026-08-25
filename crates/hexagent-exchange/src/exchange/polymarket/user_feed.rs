@@ -5661,6 +5661,16 @@ mod tests {
         assert_eq!(corrected.updates.len(), 1);
         assert!(corrected.rejection_reason.is_none());
         assert!(!shared.account_state.is_uncertain());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared
+            .account_state
+            .monitoring_snapshot()
+            .recovery_pending_orders
+            != 0
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
         assert_eq!(
             shared
                 .account_state

@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 
 use super::auth::PolyAuth;
 use super::deploy_wallet::{
@@ -289,7 +290,7 @@ impl WalletInfo {
 }
 
 /// Result of one maintenance run (one redeem-all pass + one split for
-/// next event). Surfaced via `Arc<Mutex<MaintenanceStatus>>` to the
+/// next event). Published as an immutable ArcSwap snapshot to the
 /// strategy so the RTT gate can force PROBE when seed inventory wasn't
 /// successfully prepared.
 ///
@@ -345,14 +346,25 @@ impl MaintenanceStatus {
     }
 }
 
-/// Thread-safe handle to the current maintenance status. Maintenance
-/// thread holds an `Arc` and writes; strategy holds an `Arc` and reads
-/// at `lock_in_next_event_mode` time.
-pub type MaintenanceStatusHandle = std::sync::Arc<std::sync::Mutex<MaintenanceStatus>>;
+/// Thread-safe lock-free handle to the current maintenance status.
+#[derive(Clone)]
+pub struct MaintenanceStatusHandle(std::sync::Arc<ArcSwap<MaintenanceStatus>>);
+
+impl MaintenanceStatusHandle {
+    pub fn load(&self) -> MaintenanceStatus {
+        self.0.load_full().as_ref().clone()
+    }
+
+    pub fn store(&self, status: MaintenanceStatus) {
+        self.0.store(std::sync::Arc::new(status));
+    }
+}
 
 /// Build a new `MaintenanceStatusHandle` starting in `NotStarted`.
 pub fn new_maintenance_status_handle() -> MaintenanceStatusHandle {
-    std::sync::Arc::new(std::sync::Mutex::new(MaintenanceStatus::NotStarted))
+    MaintenanceStatusHandle(std::sync::Arc::new(ArcSwap::from_pointee(
+        MaintenanceStatus::NotStarted,
+    )))
 }
 
 /// Positive, condition-scoped proof that a maintenance split reached finality
@@ -478,8 +490,12 @@ struct AccountWalletCreds {
 }
 
 static ACCOUNT_WALLETS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, AccountWalletCreds>>,
+    ArcSwap<std::collections::HashMap<String, AccountWalletCreds>>,
 > = std::sync::OnceLock::new();
+
+fn account_wallets() -> &'static ArcSwap<std::collections::HashMap<String, AccountWalletCreds>> {
+    ACCOUNT_WALLETS.get_or_init(|| ArcSwap::from_pointee(std::collections::HashMap::new()))
+}
 
 /// Register an account's split/redeem creds so the maintenance thread
 /// can resolve the RIGHT wallet under multi-account live (no global-env
@@ -493,16 +509,17 @@ pub fn register_account_wallet(
     if account_id.is_empty() {
         return;
     }
-    let map =
-        ACCOUNT_WALLETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    map.lock().unwrap().insert(
-        account_id.to_string(),
-        AccountWalletCreds {
-            private_key: private_key.to_string(),
-            signature_type: signature_type.to_string(),
-            funder: funder.to_string(),
-        },
-    );
+    let account_id = account_id.to_string();
+    let creds = AccountWalletCreds {
+        private_key: private_key.to_string(),
+        signature_type: signature_type.to_string(),
+        funder: funder.to_string(),
+    };
+    account_wallets().rcu(|current| {
+        let mut next = (**current).clone();
+        next.insert(account_id.clone(), creds.clone());
+        std::sync::Arc::new(next)
+    });
 }
 
 /// Resolve a `WalletInfo` for a specific account. Uses the per-account
@@ -510,11 +527,8 @@ pub fn register_account_wallet(
 /// global POLY_* env (`load_wallet`) for single-account / CLI paths.
 pub(crate) fn load_wallet_for_account(account_id: &str) -> Result<WalletInfo> {
     if !account_id.is_empty() {
-        if let Some(map) = ACCOUNT_WALLETS.get() {
-            let creds = map.lock().unwrap().get(account_id).cloned();
-            if let Some(c) = creds {
-                return load_wallet_from(&c.private_key, &c.signature_type, &c.funder);
-            }
+        if let Some(c) = account_wallets().load().get(account_id).cloned() {
+            return load_wallet_from(&c.private_key, &c.signature_type, &c.funder);
         }
     }
     load_wallet()
@@ -4956,9 +4970,7 @@ impl WalletActorCommand {
 }
 
 static WALLET_ACTOR_QUEUES: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, crossbeam_channel::Sender<WalletActorCommand>>,
-    >,
+    ArcSwap<std::collections::HashMap<String, crossbeam_channel::Sender<WalletActorCommand>>>,
 > = std::sync::OnceLock::new();
 static WALLET_ACTOR_QUEUE_HIGH_WATER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -4988,30 +5000,40 @@ pub fn wallet_actor_queue_metrics() -> WalletActorQueueMetrics {
 }
 
 fn wallet_actor_sender(account: &str) -> crossbeam_channel::Sender<WalletActorCommand> {
-    let queues = WALLET_ACTOR_QUEUES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    map.entry(account.to_string()).or_insert_with(|| {
-        let (tx, rx) = crossbeam_channel::bounded(WALLET_ACTOR_QUEUE_CAPACITY);
-        let worker_label = if account.is_empty() { "env".to_string() } else { account.to_string() };
-        let worker_name = format!("poly-wallet-{}", worker_label);
-        std::thread::Builder::new().name(worker_name.clone()).spawn(move || {
-            crate::os_tune::pin_background(&worker_name);
-            while let Ok(first) = rx.recv() {
-                let mut burst = vec![first];
-                let started = std::time::Instant::now();
-                while started.elapsed() < MAINTENANCE_COALESCE_MAX {
-                    let remaining = MAINTENANCE_COALESCE_MAX.saturating_sub(started.elapsed());
-                    match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
-                        Ok(next) => burst.push(next),
-                        Err(_) => break,
-                    }
+    let routes = WALLET_ACTOR_QUEUES
+        .get_or_init(|| ArcSwap::from_pointee(std::collections::HashMap::new()));
+    if let Some(sender) = routes.load().get(account).cloned() {
+        return sender;
+    }
+    let (candidate_tx, rx) = crossbeam_channel::bounded(WALLET_ACTOR_QUEUE_CAPACITY);
+    let worker_label = if account.is_empty() { "env".to_string() } else { account.to_string() };
+    let worker_name = format!("poly-wallet-{}", worker_label);
+    std::thread::Builder::new().name(worker_name.clone()).spawn(move || {
+        crate::os_tune::pin_background(&worker_name);
+        while let Ok(first) = rx.recv() {
+            let mut burst = vec![first];
+            let started = std::time::Instant::now();
+            while started.elapsed() < MAINTENANCE_COALESCE_MAX {
+                let remaining = MAINTENANCE_COALESCE_MAX.saturating_sub(started.elapsed());
+                match rx.recv_timeout(MAINTENANCE_COALESCE_IDLE.min(remaining)) {
+                    Ok(next) => burst.push(next),
+                    Err(_) => break,
                 }
-                run_wallet_actor_burst(burst);
             }
-        }).expect("Failed to spawn wallet/on-chain actor");
-        tx
-    }).clone()
+            run_wallet_actor_burst(burst);
+        }
+    }).expect("Failed to spawn wallet/on-chain actor");
+    let account = account.to_string();
+    routes.rcu(|current| {
+        if current.contains_key(&account) {
+            return std::sync::Arc::clone(current);
+        }
+        let mut next = (**current).clone();
+        next.insert(account.clone(), candidate_tx.clone());
+        std::sync::Arc::new(next)
+    });
+    routes.load().get(&account).cloned()
+        .expect("wallet actor route must be published")
 }
 
 fn partition_wallet_actor_runs(burst: Vec<WalletActorCommand>) -> Vec<Vec<WalletActorCommand>> {
@@ -5090,7 +5112,7 @@ fn run_merge_actor_batch(burst: Vec<MergeQueueItem>) {
 /// strategy's grace-window poll must not see `NotStarted` and resume early.
 fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Sender<()>>) {
     if let Some(ref s) = job.status {
-        *s.lock().unwrap() = MaintenanceStatus::Running;
+        s.store(MaintenanceStatus::Running);
     }
     let account = job.account_id.clone();
     let tx = wallet_actor_sender(&account);
@@ -5109,12 +5131,9 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
         };
         let (job, done, _) = item;
         if let Some(status) = &job.status {
-            *status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                MaintenanceStatus::SplitFailedOrPending {
-                    reason: reason.clone(),
-                };
+            status.store(MaintenanceStatus::SplitFailedOrPending {
+                reason: reason.clone(),
+            });
         }
         if let Some(done) = done {
             let _ = done.try_send(());
@@ -5222,22 +5241,121 @@ struct ResolvedMaintenanceTarget {
     execute_before_secs: Option<u64>,
 }
 
-enum MaintenanceTargetCacheEntry {
-    Fetching,
-    Ready {
-        fetched_at: std::time::Instant,
-        target: Option<ResolvedMaintenanceTarget>,
+type MaintenanceTargetKey = (String, u64, Option<u64>, Option<u64>);
+type MaintenanceTargetResult = std::result::Result<Option<ResolvedMaintenanceTarget>, String>;
+
+struct MaintenanceTargetCacheEntry {
+    fetched_at: std::time::Instant,
+    target: Option<ResolvedMaintenanceTarget>,
+}
+
+enum MaintenanceTargetOwnerCommand {
+    Resolve {
+        key: MaintenanceTargetKey,
+        reply: crossbeam_channel::Sender<MaintenanceTargetResult>,
     },
 }
 
-type MaintenanceTargetKey = (String, u64, Option<u64>, Option<u64>);
-type MaintenanceTargetCache = (
-    std::sync::Mutex<std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>>,
-    std::sync::Condvar,
-);
+const MAINTENANCE_TARGET_OWNER_CAPACITY: usize = 64;
+const MAINTENANCE_TARGET_CACHE_CAPACITY: usize = 256;
+static MAINTENANCE_TARGET_OWNER: std::sync::OnceLock<
+    crossbeam_channel::Sender<MaintenanceTargetOwnerCommand>,
+> = std::sync::OnceLock::new();
+static MAINTENANCE_TARGET_QUEUE_HIGH_WATER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static MAINTENANCE_TARGET_QUEUE_OVERFLOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-static MAINTENANCE_TARGET_CACHE: std::sync::OnceLock<MaintenanceTargetCache> =
-    std::sync::OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceTargetOwnerMetrics {
+    pub queue_capacity: usize,
+    pub cache_capacity: usize,
+    pub queue_high_water: usize,
+    pub queue_overflow: u64,
+}
+
+pub fn maintenance_target_owner_metrics() -> MaintenanceTargetOwnerMetrics {
+    MaintenanceTargetOwnerMetrics {
+        queue_capacity: MAINTENANCE_TARGET_OWNER_CAPACITY,
+        cache_capacity: MAINTENANCE_TARGET_CACHE_CAPACITY,
+        queue_high_water: MAINTENANCE_TARGET_QUEUE_HIGH_WATER
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queue_overflow: MAINTENANCE_TARGET_QUEUE_OVERFLOW
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+fn maintenance_target_owner() -> crossbeam_channel::Sender<MaintenanceTargetOwnerCommand> {
+    MAINTENANCE_TARGET_OWNER.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded(MAINTENANCE_TARGET_OWNER_CAPACITY);
+        std::thread::Builder::new().name("poly-target-owner".to_string()).spawn(move || {
+            crate::os_tune::pin_background("poly-target-owner");
+            let mut cache = std::collections::HashMap::<
+                MaintenanceTargetKey,
+                MaintenanceTargetCacheEntry,
+            >::new();
+            while let Ok(MaintenanceTargetOwnerCommand::Resolve { key, reply }) = rx.recv() {
+                cache.retain(|_, entry| maintenance_target_cache_fresh(entry));
+                if let Some(entry) = cache.get(&key) {
+                    let _ = reply.try_send(Ok(entry.target.clone()));
+                    continue;
+                }
+                let fetched = fetch_maintenance_target(&key);
+                if let Ok(target) = &fetched {
+                    if cache.len() >= MAINTENANCE_TARGET_CACHE_CAPACITY {
+                        if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.fetched_at)
+                            .map(|(key, _)| key.clone())
+                        {
+                            cache.remove(&oldest);
+                        }
+                    }
+                    cache.insert(key, MaintenanceTargetCacheEntry {
+                        fetched_at: std::time::Instant::now(),
+                        target: target.clone(),
+                    });
+                }
+                let _ = reply.try_send(fetched);
+            }
+        }).expect("failed to spawn maintenance target owner");
+        tx
+    }).clone()
+}
+
+fn maintenance_target_cache_fresh(entry: &MaintenanceTargetCacheEntry) -> bool {
+    let ttl = if entry.target.is_some() {
+        std::time::Duration::from_secs(15)
+    } else {
+        std::time::Duration::from_secs(1)
+    };
+    entry.fetched_at.elapsed() < ttl
+}
+
+fn fetch_maintenance_target(key: &MaintenanceTargetKey) -> MaintenanceTargetResult {
+    let (series_id, end_date_min_secs, expected_start_secs, expected_duration_secs) = key;
+    match (*expected_start_secs, *expected_duration_secs) {
+        (Some(expected_start), Some(expected_duration)) => {
+            super::market::fetch_contiguous_next_event(
+                series_id,
+                *end_date_min_secs,
+                expected_start,
+                expected_duration,
+            )
+        }
+        _ => super::market::fetch_next_event(series_id, *end_date_min_secs),
+    }
+    .map_err(|error| error.to_string())
+    .map(|event| event.and_then(|event| {
+        event.markets.first()
+            .filter(|market| !market.condition_id.is_empty())
+            .map(|market| ResolvedMaintenanceTarget {
+                condition_id: market.condition_id.clone(),
+                token_ids: market.clob_token_ids.clone(),
+                execute_before_secs: chrono::DateTime::parse_from_rfc3339(
+                    &market.event_start_time,
+                ).ok().and_then(|start| u64::try_from(start.timestamp()).ok()),
+            })
+    }))
+}
 
 fn cached_maintenance_split_target(
     series_id: &str,
@@ -5245,99 +5363,29 @@ fn cached_maintenance_split_target(
     expected_start_secs: Option<u64>,
     expected_duration_secs: Option<u64>,
 ) -> std::result::Result<Option<ResolvedMaintenanceTarget>, String> {
-    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
     let key = (
         series_id.to_string(),
         end_date_min_secs,
         expected_start_secs,
         expected_duration_secs,
     );
-    let (cache, ready) = MAINTENANCE_TARGET_CACHE.get_or_init(|| {
-        (
-            std::sync::Mutex::new(std::collections::HashMap::new()),
-            std::sync::Condvar::new(),
-        )
-    });
-    loop {
-        let mut entries = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, entry| match entry {
-            MaintenanceTargetCacheEntry::Fetching => true,
-            MaintenanceTargetCacheEntry::Ready { fetched_at, target } => {
-                let ttl = if target.is_some() {
-                    CACHE_TTL
-                } else {
-                    std::time::Duration::from_secs(1)
-                };
-                fetched_at.elapsed() < ttl
-            }
-        });
-        match entries.get(&key) {
-            Some(MaintenanceTargetCacheEntry::Ready { target, .. }) => return Ok(target.clone()),
-            Some(MaintenanceTargetCacheEntry::Fetching) => {
-                drop(
-                    ready
-                        .wait(entries)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                );
-                continue;
-            }
-            None => {
-                entries.insert(key.clone(), MaintenanceTargetCacheEntry::Fetching);
-                break;
-            }
-        }
-    }
-
-    let fetched = match (expected_start_secs, expected_duration_secs) {
-        (Some(expected_start), Some(expected_duration)) => {
-            super::market::fetch_contiguous_next_event(
-                series_id,
-                end_date_min_secs,
-                expected_start,
-                expected_duration,
-            )
-        }
-        _ => super::market::fetch_next_event(series_id, end_date_min_secs),
-    }
-    .map_err(|error| error.to_string())
-    .map(|event| {
-        event.and_then(|event| {
-            event
-                .markets
-                .first()
-                .filter(|market| !market.condition_id.is_empty())
-                .map(|market| ResolvedMaintenanceTarget {
-                    condition_id: market.condition_id.clone(),
-                    token_ids: market.clob_token_ids.clone(),
-                    execute_before_secs: chrono::DateTime::parse_from_rfc3339(
-                        &market.event_start_time,
-                    )
-                    .ok()
-                    .and_then(|start| u64::try_from(start.timestamp()).ok()),
-                })
-        })
-    });
-    let mut entries = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match &fetched {
-        Ok(target) => {
-            entries.insert(
-                key,
-                MaintenanceTargetCacheEntry::Ready {
-                    fetched_at: std::time::Instant::now(),
-                    target: target.clone(),
-                },
-            );
-        }
-        Err(_) => {
-            entries.remove(&key);
-        }
-    }
-    ready.notify_all();
-    fetched
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let owner = maintenance_target_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(MAINTENANCE_TARGET_OWNER_CAPACITY);
+    owner.send_timeout(
+        MaintenanceTargetOwnerCommand::Resolve { key, reply: reply_tx },
+        std::time::Duration::from_secs(2),
+    ).map_err(|error| {
+        MAINTENANCE_TARGET_QUEUE_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("maintenance target owner saturated: {error}")
+    })?;
+    MAINTENANCE_TARGET_QUEUE_HIGH_WATER.fetch_max(
+        admitted_depth,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    reply_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .map_err(|error| format!("maintenance target owner reply unavailable: {error}"))?
 }
 
 /// Fire-and-forget submit (live strategy). Returns immediately; the
@@ -5430,12 +5478,10 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     let ready_condition_id = job.split_target_condition_id.clone();
     let ready_token_ids = job.split_target_token_ids.clone();
     run_maintenance_job(job, allocations);
-    let terminal = statuses
-        .first()
-        .map(|status| status.lock().unwrap().clone());
+    let terminal = statuses.first().map(MaintenanceStatusHandle::load);
     if let Some(ref terminal) = terminal {
         for status in statuses.iter().skip(1) {
-            *status.lock().unwrap() = terminal.clone();
+            status.store(terminal.clone());
         }
     }
     if terminal
@@ -5912,7 +5958,7 @@ fn run_maintenance_job(
         // "in-progress" — the gap is normally <1ms but worth being
         // explicit about.
         if let Some(ref s) = status {
-            *s.lock().unwrap() = MaintenanceStatus::Running;
+            s.store(MaintenanceStatus::Running);
         }
 
         if let Err(reason) = validate_maintenance_split_target(
@@ -5923,7 +5969,7 @@ fn run_maintenance_job(
         ) {
             log::warn!("[Maintenance] Split rejected before execution: {}", reason);
             if let Some(s) = status {
-                *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending { reason };
+                s.store(MaintenanceStatus::SplitFailedOrPending { reason });
             }
             return;
         }
@@ -5937,9 +5983,9 @@ fn run_maintenance_job(
             Err(e) => {
                 log::warn!("[Maintenance] load_wallet failed: {}", e);
                 if let Some(s) = status.as_ref() {
-                    *s.lock().unwrap() = MaintenanceStatus::RedeemFailed {
+                    s.store(MaintenanceStatus::RedeemFailed {
                         reason: format!("load_wallet: {}", e),
-                    };
+                    });
                 }
                 return;
             }
@@ -5952,9 +5998,9 @@ fn run_maintenance_job(
                     error,
                 );
                 if let Some(s) = status {
-                    *s.lock().unwrap() = MaintenanceStatus::SplitFailedOrPending {
+                    s.store(MaintenanceStatus::SplitFailedOrPending {
                         reason: format!("maintenance recovery: {error}"),
-                    };
+                    });
                 }
                 return;
             }
@@ -6213,7 +6259,7 @@ fn run_maintenance_job(
                 final_status.label(),
                 redeem_result.summary(),
             );
-            *s.lock().unwrap() = final_status;
+            s.store(final_status);
         } else {
             log::info!("[Maintenance] Complete.");
         }
@@ -6616,17 +6662,42 @@ mod maintenance_status_tests {
     #[test]
     fn status_handle_is_thread_safe_and_starts_not_started() {
         let h = new_maintenance_status_handle();
-        assert_eq!(*h.lock().unwrap(), MaintenanceStatus::NotStarted);
+        assert_eq!(h.load(), MaintenanceStatus::NotStarted);
 
         // Simulate maintenance thread updating it.
         let h2 = h.clone();
         let t = std::thread::spawn(move || {
-            *h2.lock().unwrap() = MaintenanceStatus::Running;
+            h2.store(MaintenanceStatus::Running);
             std::thread::sleep(std::time::Duration::from_millis(5));
-            *h2.lock().unwrap() = MaintenanceStatus::Succeeded;
+            h2.store(MaintenanceStatus::Succeeded);
         });
         t.join().unwrap();
-        assert_eq!(*h.lock().unwrap(), MaintenanceStatus::Succeeded);
+        assert_eq!(h.load(), MaintenanceStatus::Succeeded);
+    }
+
+    #[test]
+    fn status_snapshot_reports_lock_free_read_tail() {
+        const EVENTS: usize = 20_000;
+        let status = new_maintenance_status_handle();
+        status.store(MaintenanceStatus::Running);
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = std::time::Instant::now();
+            std::hint::black_box(status.load());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        eprintln!(
+            "maintenance status snapshot: boundary=arc_swap_load_and_clone n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water=0 overflow=0",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+        );
     }
 
     #[test]

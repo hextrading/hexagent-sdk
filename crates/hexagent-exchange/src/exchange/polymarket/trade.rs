@@ -9,7 +9,9 @@ use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -2762,7 +2764,12 @@ pub struct SharedState {
     /// This lane has no replay because attempt timing is operational telemetry.
     attempt_audit_tx: crossbeam_channel::Sender<AuditJob>,
     shutdown_token: ShutdownToken,
-    background_worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    background_worker_control_tx: crossbeam_channel::Sender<BackgroundWorkerControl>,
+    background_workers_joined: std::sync::atomic::AtomicBool,
+}
+
+enum BackgroundWorkerControl {
+    Join(crossbeam_channel::Sender<usize>),
 }
 
 /// Retry accounting for mixed placement/cancel orphans. Placement is a
@@ -3625,22 +3632,38 @@ impl SharedState {
             self.shutdown_token.is_finished(),
             "background workers must only join after producer shutdown",
         );
-        let handles = std::mem::take(
-            &mut *self
-                .background_worker_handles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        let worker_count = handles.len();
-        for handle in handles {
-            if handle.join().is_err() {
-                log::error!(
-                    "[PolymarketTrade] background worker panicked account={}",
-                    self.account_state.account_id(),
-                );
-            }
+        if self
+            .background_workers_joined
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return 0;
         }
-        worker_count
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        if let Err(error) = self
+            .background_worker_control_tx
+            .send(BackgroundWorkerControl::Join(reply_tx))
+        {
+            log::error!(
+                "[PolymarketTrade] background worker join owner unavailable account={}: {}",
+                self.account_state.account_id(),
+                error,
+            );
+            return 0;
+        }
+        reply_rx.recv().unwrap_or_else(|error| {
+                log::error!(
+                    "[PolymarketTrade] background worker join owner stopped account={}: {}",
+                    self.account_state.account_id(),
+                    error,
+                );
+                0
+            })
     }
 
     pub(crate) fn request_filled_order_cleanup(&self, client_order_id: &str) {
@@ -5821,6 +5844,8 @@ impl PolymarketTrade {
         let (account_maintenance_tx, account_maintenance_rx) = crossbeam_channel::bounded(16_384);
         let (attempt_audit_tx, attempt_audit_rx) =
             crossbeam_channel::bounded(EXECUTION_AUDIT_QUEUE_CAPACITY);
+        let (background_worker_control_tx, background_worker_control_rx) =
+            crossbeam_channel::bounded(1);
         let initial_execution_state = ExecutionStateSnapshot {
             open_orders: ExecutionReadMap::from_hash_map(recovered_open),
             coid_to_oid: ExecutionReadMap::from_hash_map(recovered_coid_to_oid),
@@ -5880,7 +5905,8 @@ impl PolymarketTrade {
             account_lifecycle_tx,
             attempt_audit_tx,
             shutdown_token,
-            background_worker_handles: Mutex::new(Vec::with_capacity(3)),
+            background_worker_control_tx,
+            background_workers_joined: std::sync::atomic::AtomicBool::new(false),
         });
         let (account_owner, lifecycle_owner, account_owner_ready) =
             SharedState::spawn_account_owner_workers(
@@ -5912,11 +5938,30 @@ impl PolymarketTrade {
         // an unrelated private trade to provide the first wake after restart.
         shared.request_settled_gc();
         let attempt_audit = SharedState::spawn_attempt_audit_worker(&shared, attempt_audit_rx);
-        shared
-            .background_worker_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend([account_owner, lifecycle_owner, attempt_audit]);
+        let account_id = shared.account_state.account_id().to_string();
+        std::thread::Builder::new()
+            .name("poly-worker-join-owner".to_string())
+            .spawn(move || {
+                crate::os_tune::pin_background("poly-worker-join-owner");
+                let reply = match background_worker_control_rx.recv() {
+                    Ok(BackgroundWorkerControl::Join(reply)) => Some(reply),
+                    Err(_) => None,
+                };
+                let mut joined = 0usize;
+                for handle in [account_owner, lifecycle_owner, attempt_audit] {
+                    if handle.join().is_err() {
+                        log::error!(
+                            "[PolymarketTrade] background worker panicked account={}",
+                            account_id,
+                        );
+                    }
+                    joined += 1;
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.try_send(joined);
+                }
+            })
+            .map_err(|error| anyhow!("spawn Polymarket worker-join owner failed: {error}"))?;
         Ok(Self {
             shared,
             owner: api_key.to_string(),
@@ -12181,14 +12226,12 @@ mod tests {
         let shared = trade.shared_state();
 
         shutdown.request();
-        assert_eq!(
-            shared.background_worker_handles.lock().unwrap().len(),
-            3,
-            "cold account, private lifecycle, and audit each have one worker",
-        );
+        assert!(!shared
+            .background_workers_joined
+            .load(std::sync::atomic::Ordering::Acquire));
         shutdown.finish();
         assert_eq!(shared.join_background_workers(), 3);
-        assert!(shared.background_worker_handles.lock().unwrap().is_empty());
+        assert_eq!(shared.join_background_workers(), 0);
     }
 
     #[test]

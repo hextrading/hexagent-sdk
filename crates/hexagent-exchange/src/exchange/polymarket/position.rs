@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use log::info;
+use log::{info, warn};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde::Deserialize;
@@ -215,7 +216,10 @@ fn authoritative_resolution(
 enum SettlementLookupEntry {
     InFlight { lease_until: Instant },
     RetryAt(Instant),
-    Ready(HashMap<String, f64>),
+    Ready {
+        values: HashMap<String, f64>,
+        cached_at: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -235,7 +239,7 @@ struct SettlementLookupState {
 
 impl SettlementLookupState {
     fn claim(&mut self, condition_id: &str, now: Instant) -> SettlementLookupDecision {
-        if let Some(SettlementLookupEntry::Ready(values)) = self.entries.get(condition_id) {
+        if let Some(SettlementLookupEntry::Ready { values, .. }) = self.entries.get(condition_id) {
             return SettlementLookupDecision::Cached(values.clone());
         }
         if self.global_retry_at.is_some_and(|retry_at| retry_at > now) {
@@ -301,7 +305,10 @@ impl SettlementLookupState {
         now: Instant,
     ) {
         let entry = match resolution {
-            Some(values) => SettlementLookupEntry::Ready(values),
+            Some(values) => SettlementLookupEntry::Ready {
+                values,
+                cached_at: now,
+            },
             None => SettlementLookupEntry::RetryAt(now + ACTIVE_MARKET_RECHECK),
         };
         self.entries.insert(condition_id.to_string(), entry);
@@ -331,7 +338,7 @@ impl SettlementLookupState {
         // the batch instead of allowing every CID to hit the same limit.
         for entry in self.entries.values_mut() {
             match entry {
-                SettlementLookupEntry::Ready(_) => {}
+                SettlementLookupEntry::Ready { .. } => {}
                 SettlementLookupEntry::InFlight { .. } => {
                     *entry = SettlementLookupEntry::RetryAt(global_retry_at);
                 }
@@ -342,18 +349,229 @@ impl SettlementLookupState {
             }
         }
     }
+
+    fn make_room_for(&mut self, condition_id: &str) -> bool {
+        if self.entries.contains_key(condition_id)
+            || self.entries.len() < SETTLEMENT_CACHE_CAPACITY
+        {
+            return true;
+        }
+        let oldest_ready = self
+            .entries
+            .iter()
+            .filter_map(|(condition_id, entry)| match entry {
+                SettlementLookupEntry::Ready { cached_at, .. } => {
+                    Some((condition_id.clone(), *cached_at))
+                }
+                SettlementLookupEntry::InFlight { .. } | SettlementLookupEntry::RetryAt(_) => {
+                    None
+                }
+            })
+            .min_by_key(|(_, cached_at)| *cached_at)
+            .map(|(condition_id, _)| condition_id);
+        if let Some(oldest_ready) = oldest_ready {
+            self.entries.remove(&oldest_ready);
+        }
+        self.entries.len() < SETTLEMENT_CACHE_CAPACITY
+    }
 }
 
-fn settlement_lookup_state() -> &'static Mutex<SettlementLookupState> {
-    static STATE: OnceLock<Mutex<SettlementLookupState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(SettlementLookupState::default()))
+enum SettlementOwnerCommand {
+    Claim {
+        condition_id: String,
+        now: Instant,
+        reply: crossbeam_channel::Sender<SettlementLookupDecision>,
+    },
+    ReserveDelay {
+        now: Instant,
+        reply: crossbeam_channel::Sender<Duration>,
+    },
+    RequestAllowed {
+        condition_id: String,
+        now: Instant,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    Complete {
+        condition_id: String,
+        resolution: Option<HashMap<String, f64>>,
+        now: Instant,
+    },
+    Defer {
+        condition_id: String,
+        retry_after: Duration,
+        rate_limited: bool,
+        now: Instant,
+    },
 }
 
-fn with_settlement_lookup_state<T>(f: impl FnOnce(&mut SettlementLookupState) -> T) -> T {
-    let mut state = settlement_lookup_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    f(&mut state)
+const SETTLEMENT_OWNER_CAPACITY: usize = 256;
+const SETTLEMENT_CACHE_CAPACITY: usize = 4_096;
+static SETTLEMENT_OWNER: OnceLock<crossbeam_channel::Sender<SettlementOwnerCommand>> =
+    OnceLock::new();
+static SETTLEMENT_QUEUE_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+static SETTLEMENT_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementOwnerMetrics {
+    pub queue_capacity: usize,
+    pub cache_capacity: usize,
+    pub queue_high_water: usize,
+    pub queue_overflow: u64,
+}
+
+pub fn settlement_owner_metrics() -> SettlementOwnerMetrics {
+    SettlementOwnerMetrics {
+        queue_capacity: SETTLEMENT_OWNER_CAPACITY,
+        cache_capacity: SETTLEMENT_CACHE_CAPACITY,
+        queue_high_water: SETTLEMENT_QUEUE_HIGH_WATER.load(Ordering::Relaxed),
+        queue_overflow: SETTLEMENT_QUEUE_OVERFLOW.load(Ordering::Relaxed),
+    }
+}
+
+fn settlement_owner() -> crossbeam_channel::Sender<SettlementOwnerCommand> {
+    SETTLEMENT_OWNER.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded(SETTLEMENT_OWNER_CAPACITY);
+        std::thread::Builder::new().name("poly-settlement-owner".to_string()).spawn(move || {
+            crate::os_tune::pin_background("poly-settlement-owner");
+            let mut state = SettlementLookupState::default();
+            while let Ok(command) = rx.recv() {
+                match command {
+                    SettlementOwnerCommand::Claim { condition_id, now, reply } => {
+                        state.entries.retain(|_, entry| match entry {
+                            SettlementLookupEntry::Ready { .. } => true,
+                            SettlementLookupEntry::InFlight { lease_until } => *lease_until > now,
+                            SettlementLookupEntry::RetryAt(retry_at) => *retry_at > now,
+                        });
+                        let decision = if state.make_room_for(&condition_id) {
+                            state.claim(&condition_id, now)
+                        } else {
+                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                            SettlementLookupDecision::Deferred
+                        };
+                        let _ = reply.try_send(decision);
+                    }
+                    SettlementOwnerCommand::ReserveDelay { now, reply } => {
+                        let _ = reply.try_send(state.reserve_request_delay(now));
+                    }
+                    SettlementOwnerCommand::RequestAllowed { condition_id, now, reply } => {
+                        let _ = reply.try_send(state.request_allowed(&condition_id, now));
+                    }
+                    SettlementOwnerCommand::Complete { condition_id, resolution, now } => {
+                        if state.make_room_for(&condition_id) {
+                            state.complete(&condition_id, resolution, now);
+                        } else {
+                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    SettlementOwnerCommand::Defer {
+                        condition_id,
+                        retry_after,
+                        rate_limited,
+                        now,
+                    } => {
+                        if state.make_room_for(&condition_id) {
+                            state.defer_after_error(
+                                &condition_id,
+                                retry_after,
+                                rate_limited,
+                                now,
+                            );
+                        } else {
+                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }).expect("failed to spawn settlement owner");
+        tx
+    }).clone()
+}
+
+fn settlement_claim(condition_id: &str, now: Instant) -> SettlementLookupDecision {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let owner = settlement_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
+    if owner.send_timeout(SettlementOwnerCommand::Claim {
+        condition_id: condition_id.to_string(),
+        now,
+        reply: tx,
+    }, Duration::from_secs(2)).is_err() {
+        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return SettlementLookupDecision::Deferred;
+    }
+    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    rx.recv().unwrap_or(SettlementLookupDecision::Deferred)
+}
+
+fn settlement_reserve_delay(now: Instant) -> Duration {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let owner = settlement_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
+    if owner.send_timeout(
+        SettlementOwnerCommand::ReserveDelay { now, reply: tx },
+        Duration::from_secs(2),
+    ).is_err() {
+        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return DEFAULT_SETTLEMENT_RETRY;
+    }
+    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    rx.recv().unwrap_or(DEFAULT_SETTLEMENT_RETRY)
+}
+
+fn settlement_request_allowed(condition_id: &str, now: Instant) -> bool {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let owner = settlement_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
+    if owner.send_timeout(SettlementOwnerCommand::RequestAllowed {
+        condition_id: condition_id.to_string(),
+        now,
+        reply: tx,
+    }, Duration::from_secs(2)).is_err() {
+        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    rx.recv().unwrap_or(false)
+}
+
+fn settlement_complete(
+    condition_id: &str,
+    resolution: Option<HashMap<String, f64>>,
+    now: Instant,
+) {
+    let owner = settlement_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
+    if let Err(error) = owner.send_timeout(SettlementOwnerCommand::Complete {
+        condition_id: condition_id.to_string(),
+        resolution,
+        now,
+    }, Duration::from_secs(2)) {
+        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        warn!("[position] settlement owner saturated while completing {condition_id}: {error}");
+    } else {
+        SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    }
+}
+
+fn settlement_defer(
+    condition_id: &str,
+    retry_after: Duration,
+    rate_limited: bool,
+    now: Instant,
+) {
+    let owner = settlement_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
+    if let Err(error) = owner.send_timeout(SettlementOwnerCommand::Defer {
+        condition_id: condition_id.to_string(),
+        retry_after,
+        rate_limited,
+        now,
+    }, Duration::from_secs(2)) {
+        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        warn!("[position] settlement owner saturated while deferring {condition_id}: {error}");
+    } else {
+        SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    }
 }
 
 fn settlement_request_limiter() -> &'static tokio::sync::Semaphore {
@@ -433,8 +651,7 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
     let client = crate::async_rt::http_client();
     let mut values = HashMap::new();
     for condition_id in condition_ids {
-        let decision =
-            with_settlement_lookup_state(|state| state.claim(&condition_id, Instant::now()));
+        let decision = settlement_claim(&condition_id, Instant::now());
         match decision {
             SettlementLookupDecision::Cached(resolution) => {
                 values.extend(resolution);
@@ -445,24 +662,19 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
         }
 
         let Ok(_permit) = settlement_request_limiter().acquire().await else {
-            with_settlement_lookup_state(|state| {
-                state.defer_after_error(
-                    &condition_id,
-                    DEFAULT_SETTLEMENT_RETRY,
-                    false,
-                    Instant::now(),
-                );
-            });
+            settlement_defer(
+                &condition_id,
+                DEFAULT_SETTLEMENT_RETRY,
+                false,
+                Instant::now(),
+            );
             continue;
         };
-        let delay =
-            with_settlement_lookup_state(|state| state.reserve_request_delay(Instant::now()));
+        let delay = settlement_reserve_delay(Instant::now());
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let allowed = with_settlement_lookup_state(|state| {
-            state.request_allowed(&condition_id, Instant::now())
-        });
+        let allowed = settlement_request_allowed(&condition_id, Instant::now());
         if !allowed {
             continue;
         }
@@ -473,19 +685,15 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
                 if let Some(resolution) = resolution.as_ref() {
                     values.extend(resolution.clone());
                 }
-                with_settlement_lookup_state(|state| {
-                    state.complete(&condition_id, resolution, Instant::now());
-                });
+                settlement_complete(&condition_id, resolution, Instant::now());
             }
             Err(error) => {
-                with_settlement_lookup_state(|state| {
-                    state.defer_after_error(
-                        &condition_id,
-                        error.retry_after,
-                        error.rate_limited,
-                        Instant::now(),
-                    );
-                });
+                settlement_defer(
+                    &condition_id,
+                    error.retry_after,
+                    error.rate_limited,
+                    Instant::now(),
+                );
                 log::warn!(
                     "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value and suppressing duplicate requests for {:?} global_cooldown={}: {}",
                     error.retry_after,
@@ -908,6 +1116,56 @@ mod tests {
             SettlementLookupDecision::Fetch
         ));
         assert!(state.request_allowed("condition-b", now + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn settlement_owner_reports_cached_roundtrip_tail_and_bounded_overflow() {
+        const EVENTS: usize = 4_096;
+        let condition_id = format!("condition-owner-latency-{}", std::process::id());
+        let now = Instant::now();
+        assert!(matches!(
+            settlement_claim(&condition_id, now),
+            SettlementLookupDecision::Fetch
+        ));
+        let expected = HashMap::from([("winner".to_string(), 1.0)]);
+        settlement_complete(&condition_id, Some(expected.clone()), now);
+        settlement_complete(&condition_id, Some(expected.clone()), now);
+
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = Instant::now();
+            assert!(matches!(
+                settlement_claim(&condition_id, Instant::now()),
+                SettlementLookupDecision::Cached(values) if values == expected
+            ));
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let metrics = settlement_owner_metrics();
+        eprintln!(
+            "settlement owner: boundary=claim_send_to_cached_reply n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+            metrics.queue_high_water,
+            metrics.queue_overflow,
+        );
+        assert!(metrics.queue_high_water > 0);
+        assert_eq!(metrics.queue_overflow, 0);
+
+        let (full_tx, _full_rx) = crossbeam_channel::bounded::<u8>(SETTLEMENT_OWNER_CAPACITY);
+        for _ in 0..SETTLEMENT_OWNER_CAPACITY {
+            full_tx.try_send(1).unwrap();
+        }
+        assert!(matches!(
+            full_tx.try_send(1),
+            Err(crossbeam_channel::TrySendError::Full(1))
+        ));
     }
 
     fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
