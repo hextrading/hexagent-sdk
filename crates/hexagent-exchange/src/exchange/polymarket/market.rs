@@ -1371,6 +1371,9 @@ fn fetch_active_event_by_series_id_with_attempts(
 
 /// Control signal sent from the sync engine thread to the async WS task.
 enum WsCtrl {
+    /// Establish and L2-seed this current+next union without changing the
+    /// logical token set forwarded to strategies.
+    Prepare(ClobSubscription),
     /// Subscribe (or resubscribe) with this exact set of CLOB token IDs.
     /// The async task should close its current connection and reconnect so
     /// the server's subscription matches. We do it this way (reconnect
@@ -1807,6 +1810,41 @@ impl PolymarketMarket {
         }
     }
 
+    fn current_and_future_clob_subscription(&self) -> ClobSubscription {
+        let mut subscription = self.current_clob_subscription();
+        for event in self.future_events.values() {
+            for market in accepted_binary_markets(&event.markets, true) {
+                subscription.tokens.extend(market.clob_token_ids.iter().cloned());
+                let mut up_token = None;
+                let mut down_token = None;
+                for (token, outcome) in market.clob_token_ids.iter().zip(&market.outcomes) {
+                    match outcome.trim().to_ascii_lowercase().as_str() {
+                        "up" | "yes" => up_token = Some(token.clone()),
+                        "down" | "no" => down_token = Some(token.clone()),
+                        _ => {}
+                    }
+                }
+                if let (Some(up_token), Some(down_token)) = (up_token, down_token) {
+                    subscription.canonical_events.push(CanonicalEventSpec {
+                        condition_id: market.condition_id.clone(),
+                        up_token,
+                        down_token,
+                        tick_size: market.tick_size,
+                    });
+                }
+            }
+        }
+        subscription.tokens.sort();
+        subscription.tokens.dedup();
+        subscription
+            .canonical_events
+            .sort_by(|left, right| left.condition_id.cmp(&right.condition_id));
+        subscription
+            .canonical_events
+            .dedup_by(|left, right| left.condition_id == right.condition_id);
+        subscription
+    }
+
     fn update_liveness_subscription(&self) {
         let active = !self.current_tokens().is_empty();
         let current_event_end_ns = self
@@ -1834,6 +1872,7 @@ impl PolymarketMarket {
     }
 
     fn drain_rest_future_events(&mut self) {
+        let mut prewarm_changed = false;
         while let Ok(candidate) = self.rest_future_event_rx.try_recv() {
             let Some(series_idx) = self.series.iter().position(|series| {
                 series.series_id.as_deref() == Some(candidate.series_id.as_str())
@@ -1913,16 +1952,31 @@ impl PolymarketMarket {
                     candidate.event.slug,
                     candidate.event.end_date,
                 );
+                prewarm_changed = true;
             }
+        }
+        if prewarm_changed {
+            self.prepare_ws_with(self.current_and_future_clob_subscription());
         }
     }
 
     /// Send a Resubscribe message to the async WS task. No-op if the task
     /// hasn't been started yet (e.g. rotation fires before connect()).
     fn resubscribe_ws(&self) {
+        self.resubscribe_ws_with(self.current_clob_subscription());
+    }
+
+    fn resubscribe_ws_with(&self, subscription: ClobSubscription) {
+        self.send_ws_subscription(WsCtrl::Resubscribe(subscription));
+    }
+
+    fn prepare_ws_with(&self, subscription: ClobSubscription) {
+        self.send_ws_subscription(WsCtrl::Prepare(subscription));
+    }
+
+    fn send_ws_subscription(&self, command: WsCtrl) {
         if let Some(tx) = &self.ws_ctrl_tx {
-            let subscription = self.current_clob_subscription();
-            if tx.try_send(WsCtrl::Resubscribe(subscription)).is_err() {
+            if tx.try_send(command).is_err() {
                 // A stale resubscription must never win merely because the
                 // bounded control lane is full. Fail this generation closed;
                 // the supervisor will rebuild it from the current state.
@@ -3109,14 +3163,14 @@ fn sample_tcp_socket(fd: Option<i32>) -> TcpSocketMetrics {
 
 #[derive(Debug)]
 struct ClobDiagnostic {
-    key: String,
+    key: &'static str,
     detail: String,
 }
 
 #[derive(Default)]
 struct ClobDiagnosticSampler {
-    last_logged: HashMap<String, Instant>,
-    suppressed: HashMap<String, u64>,
+    last_logged: HashMap<&'static str, Instant>,
+    suppressed: HashMap<&'static str, u64>,
 }
 
 impl ClobDiagnosticSampler {
@@ -3247,6 +3301,123 @@ fn spawn_clob_standby_connect(
     })
 }
 
+struct ClobSeededCandidate {
+    lane: ClobConnection,
+    books: ClobLocalBooks,
+    seed_events: Vec<MarketEvent>,
+    warmup: Duration,
+}
+
+fn spawn_clob_seeded_candidate(
+    subscription: ClobSubscription,
+    lane_id: u64,
+    delay: Duration,
+) -> tokio::task::JoinHandle<std::result::Result<ClobSeededCandidate, String>> {
+    tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let started = Instant::now();
+        let mut lane = connect_clob_lane(&subscription.tokens, lane_id).await?;
+        let mut books = ClobLocalBooks::new(&subscription.canonical_events);
+        let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let message = tokio::time::timeout_at(deadline, lane.read.next())
+                .await
+                .map_err(|_| "candidate L2 seed timed out".to_string())?
+                .ok_or_else(|| "candidate socket closed before L2 seed".to_string())?
+                .map_err(|error| format!("candidate socket read failed: {error}"))?;
+            let received_at = Instant::now();
+            match message {
+                Message::Text(text) => {
+                    lane.record_raw(received_at);
+                    let body = text.trim();
+                    if body.eq_ignore_ascii_case("PONG") {
+                        continue;
+                    }
+                    if body.eq_ignore_ascii_case("PING") {
+                        let _ = timed_clob_ws_send(
+                            &mut lane.write,
+                            Message::Text("PONG".to_string()),
+                            "polymarket.ws.clob_candidate_send.text_pong",
+                            &mut lane.diagnostics,
+                        )
+                        .await;
+                        continue;
+                    }
+                    let frame_len = text.len();
+                    // Consuming String into Vec transfers its allocation;
+                    // simd-json can parse it in place without a per-frame
+                    // memcpy into a second scratch buffer.
+                    let mut frame_bytes = text.into_bytes();
+                    let batch = process_clob_frame_in_place(
+                        &mut frame_bytes,
+                        &mut books,
+                        &subscription.tokens,
+                        received_at,
+                        now_ns(),
+                    );
+                    lane.burst.record_frame(received_at, frame_len);
+                    lane.diagnostics.record_frame(received_at, frame_len, &batch);
+                    for event in batch.events {
+                        match &event {
+                            MarketEvent::OrderBook(_) => {
+                                push_latest_order_book(&mut seed_events, event)
+                            }
+                            MarketEvent::Quote(incoming) => {
+                                if let Some(index) = seed_events.iter().position(|existing| {
+                                    matches!(existing, MarketEvent::Quote(quote) if quote.symbol == incoming.symbol)
+                                }) {
+                                    seed_events.remove(index);
+                                }
+                                seed_events.push(event);
+                            }
+                            MarketEvent::TickSizeChange(incoming) => {
+                                if let Some(index) = seed_events.iter().position(|existing| {
+                                    matches!(existing, MarketEvent::TickSizeChange(change) if change.symbol == incoming.symbol)
+                                }) {
+                                    seed_events.remove(index);
+                                }
+                                seed_events.push(event);
+                            }
+                            // Candidate trades and other transient diagnostics
+                            // predate activation and must not leak into the
+                            // logical stream. Keeping only one book/quote/tick
+                            // record per token also makes the seed handoff
+                            // strictly bounded by subscription cardinality.
+                            _ => {}
+                        }
+                    }
+                    if books.has_all_seeded(&subscription.tokens) {
+                        return Ok(ClobSeededCandidate {
+                            lane,
+                            books,
+                            seed_events,
+                            warmup: started.elapsed(),
+                        });
+                    }
+                }
+                Message::Ping(payload) => {
+                    lane.record_raw(received_at);
+                    let _ = timed_clob_ws_send(
+                        &mut lane.write,
+                        Message::Pong(payload),
+                        "polymarket.ws.clob_candidate_send.frame_pong",
+                        &mut lane.diagnostics,
+                    )
+                    .await;
+                }
+                Message::Pong(_) => lane.record_raw(received_at),
+                Message::Close(frame) => {
+                    return Err(format!("candidate socket closed before L2 seed: {frame:?}"));
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 impl ClobLifecycle {
     /// A successful subscription proves only transport setup, not usable
     /// market state.  Initial startup and every reconnect remain NOT_READY
@@ -3297,6 +3468,17 @@ fn is_usable_subscribed_book_event(event: &MarketEvent, tokens: &[String]) -> bo
     tokens.iter().any(|token| token == symbol)
 }
 
+fn should_forward_clob_event(event: &MarketEvent, tokens: &[String]) -> bool {
+    let symbol = match event {
+        MarketEvent::OrderBook(book) => Some(&book.symbol),
+        MarketEvent::Quote(quote) => Some(&quote.symbol),
+        MarketEvent::Trade(trade) => Some(&trade.symbol),
+        MarketEvent::TickSizeChange(change) => Some(&change.symbol),
+        _ => None,
+    };
+    symbol.is_none_or(|symbol| tokens.iter().any(|token| token == symbol))
+}
+
 fn has_complete_clob_subscription(tokens: &[String]) -> bool {
     // The subscription frame contains the full token set for every current
     // event. Sending that frame is atomic: there is no per-token ACK in the
@@ -3343,11 +3525,15 @@ fn forward_clob_events(
     let mut forwarded = 0usize;
     let has_usable_book = events
         .iter()
+        .filter(|event| should_forward_clob_event(event, tokens))
         .any(|event| is_usable_subscribed_book_event(event, tokens));
     if has_usable_book {
         health.record_usable_book(now);
     }
     for event in events {
+        if !should_forward_clob_event(&event, tokens) {
+            continue;
+        }
         let was_full = event_tx.is_full();
         let send_started = Instant::now();
         let send_result = event_tx.send(event);
@@ -3715,6 +3901,7 @@ async fn clob_ws_task(
         }
     });
     let mut subscription = initial_subscription;
+    let mut wire_subscription = subscription.clone();
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
     let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
@@ -3746,7 +3933,11 @@ async fn clob_ws_task(
         loop {
             match ctrl_rx.try_recv() {
                 Ok(WsCtrl::Resubscribe(new_subscription)) => {
-                    subscription = new_subscription;
+                    subscription = new_subscription.clone();
+                    wire_subscription = new_subscription;
+                }
+                Ok(WsCtrl::Prepare(new_subscription)) => {
+                    wire_subscription = new_subscription;
                 }
                 Ok(WsCtrl::Shutdown) => break 'outer,
                 Err(_) => break,
@@ -3757,11 +3948,11 @@ async fn clob_ws_task(
         info!(
             "[Polymarket] Connecting to {} ({} tokens)",
             POLYMARKET_WS_URL,
-            subscription.tokens.len()
+            wire_subscription.tokens.len()
         );
         let active_lane_id = next_lane_id;
         next_lane_id = next_lane_id.saturating_add(1);
-        let mut active = match connect_clob_lane(&subscription.tokens, active_lane_id).await {
+        let mut active = match connect_clob_lane(&wire_subscription.tokens, active_lane_id).await {
             Ok(lane) => lane,
             Err(error) => {
                 announce_clob_not_ready(
@@ -3783,7 +3974,7 @@ async fn clob_ws_task(
         backoff.reset();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
-        let mut books = ClobLocalBooks::new(&subscription.canonical_events);
+        let mut books = ClobLocalBooks::new(&wire_subscription.canonical_events);
         let (repair_tx, mut repair_rx) =
             tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
         let mut repair_tx = repair_tx;
@@ -3793,14 +3984,18 @@ async fn clob_ws_task(
         next_lane_id = next_lane_id.saturating_add(1);
         let mut standby = None;
         let mut standby_connect = Some(spawn_clob_standby_connect(
-            subscription.tokens.clone(),
+            wire_subscription.tokens.clone(),
             standby_lane_id,
             Duration::ZERO,
         ));
+        let mut pending_cutover: Option<(ClobSubscription, bool)> = None;
+        let mut candidate_connect: Option<
+            tokio::task::JoinHandle<std::result::Result<ClobSeededCandidate, String>>,
+        > = None;
         info!(
             "[Polymarket] Subscribed to {} tokens across {} canonical events",
-            subscription.tokens.len(),
-            subscription.canonical_events.len(),
+            wire_subscription.tokens.len(),
+            wire_subscription.canonical_events.len(),
         );
         if !has_complete_clob_subscription(&subscription.tokens) {
             announce_clob_not_ready(
@@ -3853,26 +4048,142 @@ async fn clob_ws_task(
 
                 ctrl = ctrl_rx.recv() => {
                     match ctrl {
-                        Some(WsCtrl::Resubscribe(new_subscription)) => {
-                            subscription = new_subscription;
-                            announce_clob_not_ready(
-                                &event_tx,
-                                &mut lifecycle,
-                                "CLOB resubscribe requested",
+                        Some(command) => {
+                            let (new_subscription, activate) = match command {
+                                WsCtrl::Resubscribe(subscription) => (subscription, true),
+                                WsCtrl::Prepare(subscription) => (subscription, false),
+                                WsCtrl::Shutdown => break 'outer,
+                            };
+                            let already_seeded = new_subscription.tokens.iter().all(|token| {
+                                wire_subscription.tokens.iter().any(|active_token| active_token == token)
+                            }) && books.has_all_seeded(&new_subscription.tokens);
+                            if already_seeded {
+                                // Boundary commit after an ahead-of-time union
+                                // subscription: the target tokens already have
+                                // L2 state, so only the logical routing set
+                                // changes. The next candidate refresh drops the
+                                // now-stale socket tokens.
+                                wire_subscription = new_subscription.clone();
+                                if activate {
+                                    subscription = new_subscription;
+                                }
+                                info!(
+                                    "[clob_atomic_cutover] mode=preseeded_subset wire_tokens={} logical_tokens={} activate={} not_ready_ms=0",
+                                    wire_subscription.tokens.len(),
+                                    subscription.tokens.len(),
+                                    activate,
+                                );
+                                continue;
+                            }
+                            if let Some(connect) = candidate_connect.take() {
+                                connect.abort();
+                            }
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            pending_cutover = Some((new_subscription.clone(), activate));
+                            candidate_connect = Some(spawn_clob_seeded_candidate(
+                                new_subscription,
+                                lane_id,
+                                Duration::ZERO,
+                            ));
+                            info!(
+                                "[clob_cutover_prepare] lane_id={} current_tokens={} target_tokens={} action=keep_active_until_l2_seed",
+                                lane_id,
+                                subscription.tokens.len(),
+                                pending_cutover.as_ref().map_or(0, |(pending, _)| pending.tokens.len()),
                             );
-                            info!("[Polymarket] Resubscribe requested ({} tokens) — reconnecting", subscription.tokens.len());
-                            let _ = timed_clob_ws_send(
-                                &mut active.write,
-                                Message::Close(None),
-                                "polymarket.ws.clob_send.close",
-                                &mut active.diagnostics,
-                            ).await;
+                        }
+                        None => break 'outer,
+                    }
+                }
+
+                candidate_result = async {
+                    candidate_connect
+                        .as_mut()
+                        .expect("candidate branch is guarded")
+                        .await
+                }, if candidate_connect.is_some() => {
+                    candidate_connect = None;
+                    match candidate_result {
+                        Ok(Ok(mut candidate)) => {
+                            let Some((target, activate)) = pending_cutover.take() else {
+                                drop(candidate);
+                                continue;
+                            };
                             if let Some(connect) = standby_connect.take() {
                                 connect.abort();
                             }
-                            continue 'outer;
+                            standby = None;
+                            wire_subscription = target.clone();
+                            if activate {
+                                subscription = target;
+                            }
+                            let cutover_at = Instant::now();
+                            active = candidate.lane;
+                            books = candidate.books;
+                            health = WsHealth::new(cutover_at);
+                            repairs_in_flight.clear();
+                            repair_superseded_attempts.clear();
+                            let (new_repair_tx, new_repair_rx) =
+                                tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
+                            repair_tx = new_repair_tx;
+                            repair_rx = new_repair_rx;
+                            super::network_incident::update_ws_peers(active.peer_addr, None);
+                            liveness.mark_subscribed();
+                            liveness.record_market_data(clob_monotonic_now_ns());
+                            if !forward_clob_events(
+                                std::mem::take(&mut candidate.seed_events),
+                                &event_tx,
+                                &mut lifecycle,
+                                &mut health,
+                                &mut active.diagnostics,
+                                &books,
+                                &subscription.tokens,
+                                cutover_at,
+                            ) {
+                                break 'outer;
+                            }
+                            info!(
+                                "[clob_atomic_cutover] mode=seeded_candidate lane_id={} peer={:?} wire_tokens={} logical_tokens={} activate={} l2_seed_ms={:.3} not_ready_ms=0",
+                                active.lane_id,
+                                active.peer_addr,
+                                wire_subscription.tokens.len(),
+                                subscription.tokens.len(),
+                                activate,
+                                candidate.warmup.as_secs_f64() * 1_000.0,
+                            );
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                wire_subscription.tokens.clone(),
+                                lane_id,
+                                Duration::ZERO,
+                            ));
                         }
-                        Some(WsCtrl::Shutdown) | None => break 'outer,
+                        Ok(Err(error)) => {
+                            warn!("[clob_cutover_prepare_failed] error={error}; active lane retained");
+                            if let Some((target, _)) = pending_cutover.as_ref().cloned() {
+                                let lane_id = next_lane_id;
+                                next_lane_id = next_lane_id.saturating_add(1);
+                                candidate_connect = Some(spawn_clob_seeded_candidate(
+                                    target,
+                                    lane_id,
+                                    CLOB_STANDBY_RECONNECT_DELAY,
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            warn!("[clob_cutover_prepare_failed] join_error={error}; active lane retained");
+                            if let Some((target, _)) = pending_cutover.as_ref().cloned() {
+                                let lane_id = next_lane_id;
+                                next_lane_id = next_lane_id.saturating_add(1);
+                                candidate_connect = Some(spawn_clob_seeded_candidate(
+                                    target,
+                                    lane_id,
+                                    CLOB_STANDBY_RECONNECT_DELAY,
+                                ));
+                            }
+                        }
                     }
                 }
 
@@ -3913,7 +4224,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                subscription.tokens.clone(),
+                                wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY,
                             ));
@@ -3923,7 +4234,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                subscription.tokens.clone(),
+                                wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY,
                             ));
@@ -3933,7 +4244,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                subscription.tokens.clone(),
+                                wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY,
                             ));
@@ -4021,7 +4332,7 @@ async fn clob_ws_task(
                                 *attempts = attempts.saturating_add(1);
                                 let retry = *attempts <= CLOB_BBO_MAX_SUPERSEDED_REPAIRS;
                                 diagnostic_sampler.observe(now, ClobDiagnostic {
-                                    key: "bbo_repair_superseded_by_ws".to_string(),
+                                    key: "bbo_repair_superseded_by_ws",
                                     detail: format!(
                                         "token={} repair_ts={} ws_ts={} attempt={} action={}",
                                         repair.token,
@@ -4067,7 +4378,7 @@ async fn clob_ws_task(
                             Err(error) => {
                                 repair_superseded_attempts.remove(&repair.token);
                                 diagnostic_sampler.observe(now, ClobDiagnostic {
-                                    key: "bbo_repair_failed".to_string(),
+                                    key: "bbo_repair_failed",
                                     detail: format!("token={} reason={error}", repair.token),
                                 });
                                 if let Some(event) = books.mark_repair_failed(
@@ -4095,7 +4406,7 @@ async fn clob_ws_task(
                         Err(error) => {
                             repair_superseded_attempts.remove(&repair.token);
                             diagnostic_sampler.observe(now, ClobDiagnostic {
-                                key: "bbo_repair_failed".to_string(),
+                                key: "bbo_repair_failed",
                                 detail: format!("token={} reason={error}", repair.token),
                             });
                             if let Some(event) = books.mark_repair_failed(
@@ -4212,7 +4523,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                subscription.tokens.clone(),
+                                wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY,
                             ));
@@ -4275,7 +4586,7 @@ async fn clob_ws_task(
                         active.peer_addr,
                         "active",
                         active.lane_id,
-                        subscription.tokens.len(),
+                        wire_subscription.tokens.len(),
                         &event_tx,
                         &active.diagnostics,
                     );
@@ -4287,7 +4598,7 @@ async fn clob_ws_task(
                             lane.peer_addr,
                             "standby",
                             lane.lane_id,
-                            subscription.tokens.len(),
+                            wire_subscription.tokens.len(),
                             &event_tx,
                             &lane.diagnostics,
                         );
@@ -4337,7 +4648,7 @@ async fn clob_ws_task(
                     // `has_complete_clob_subscription` is the in-task equivalent
                     // of that check, so reuse it rather than churning the socket
                     // every 90 s while nothing is trading.
-                    if has_complete_clob_subscription(&subscription.tokens)
+                    if has_complete_clob_subscription(&wire_subscription.tokens)
                         && health.topic_is_stale(now, CLOB_TOPIC_STALL_THRESHOLD)
                     {
                         announce_clob_not_ready(
@@ -4392,14 +4703,14 @@ async fn clob_ws_task(
                             if handle_clob_standby_read(
                                 lane,
                                 result,
-                                subscription.tokens.len(),
+                                wire_subscription.tokens.len(),
                             ).await {
                                 standby = None;
                                 super::network_incident::update_ws_peers(active.peer_addr, None);
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 standby_connect = Some(spawn_clob_standby_connect(
-                                    subscription.tokens.clone(),
+                                    wire_subscription.tokens.clone(),
                                     lane_id,
                                     CLOB_STANDBY_RECONNECT_DELAY,
                                 ));
@@ -4425,7 +4736,7 @@ async fn clob_ws_task(
                                 &mut standby,
                                 &mut standby_connect,
                                 &mut next_lane_id,
-                                &subscription,
+                                &wire_subscription,
                                 &mut health,
                                 &mut books,
                                 &mut repair_tx,
@@ -4452,7 +4763,7 @@ async fn clob_ws_task(
                                 &mut standby,
                                 &mut standby_connect,
                                 &mut next_lane_id,
-                                &subscription,
+                                &wire_subscription,
                                 &mut health,
                                 &mut books,
                                 &mut repair_tx,
@@ -4497,10 +4808,12 @@ async fn clob_ws_task(
                                 continue;
                             }
                             let t_parse = crate::latency::Instant::now();
-                            let batch = process_clob_frame(
-                                &text,
+                            let frame_len = text.len();
+                            let mut frame_bytes = text.into_bytes();
+                            let batch = process_clob_frame_in_place(
+                                &mut frame_bytes,
                                 &mut books,
-                                &subscription.tokens,
+                                &wire_subscription.tokens,
                                 received_at,
                                 now_ns(),
                             );
@@ -4510,8 +4823,8 @@ async fn clob_ws_task(
                                 "polymarket.ws.clob_parse_apply",
                                 parse_apply_elapsed.as_nanos().min(u64::MAX as u128) as u64,
                             );
-                            active.burst.record_frame(received_at, text.len());
-                            active.diagnostics.record_frame(received_at, text.len(), &batch);
+                            active.burst.record_frame(received_at, frame_len);
+                            active.diagnostics.record_frame(received_at, frame_len, &batch);
                             if batch.recognized_topic {
                                 health.record_topic_frame(received_at);
                                 liveness.record_market_data(clob_monotonic_now_ns());
@@ -4585,7 +4898,7 @@ async fn clob_ws_task(
                                         "[clob_close_metric] lane_role=active lane_id={} peer={:?} subscription_tokens={} code={:?} reason={:?} server_slow_consumer={} tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {} {}",
                                         active.lane_id,
                                         active.peer_addr,
-                                        subscription.tokens.len(),
+                                        wire_subscription.tokens.len(),
                                         frame.code,
                                         frame.reason,
                                         server_slow_consumer,
@@ -4606,7 +4919,7 @@ async fn clob_ws_task(
                                         "[clob_close_metric] lane_role=active lane_id={} peer={:?} subscription_tokens={} code=none reason=none server_slow_consumer=false tcp_unread_bytes={} tcp_rcv_space={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {} {} {}",
                                         active.lane_id,
                                         active.peer_addr,
-                                        subscription.tokens.len(),
+                                        wire_subscription.tokens.len(),
                                         tcp.unread_bytes.map(i64::from).unwrap_or(-1),
                                         tcp.rcv_space.map(i64::from).unwrap_or(-1),
                                         tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
@@ -4664,6 +4977,15 @@ async fn clob_ws_task(
         // reconnecting or shutting down this subscription generation.
         if let Some(connect) = standby_connect.take() {
             connect.abort();
+        }
+        if let Some(connect) = candidate_connect.take() {
+            connect.abort();
+        }
+        if let Some((target, activate)) = pending_cutover.take() {
+            wire_subscription = target.clone();
+            if activate {
+                subscription = target;
+            }
         }
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -5858,7 +6180,7 @@ impl ClobLocalBooks {
             }
             if pending.awaiting_tick_change {
                 diagnostics.push(ClobDiagnostic {
-                    key: "tick_size_change_lag".to_string(),
+                    key: "tick_size_change_lag",
                     detail: format!(
                         "token={token} ts={} publication_released_after={}ms",
                         pending.exchange_timestamp_ns,
@@ -5884,7 +6206,7 @@ impl ClobLocalBooks {
             counters.bbo_tick_distance_max = counters.bbo_tick_distance_max.max(distance);
         }
         diagnostics.push(ClobDiagnostic {
-            key: "price_change_bbo_mismatch".to_string(),
+            key: "price_change_bbo_mismatch",
             detail: format!(
                 "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={} frames={:?}",
                 pending.exchange_timestamp_ns,
@@ -6093,7 +6415,7 @@ impl ClobLocalBooks {
                 continue;
             };
             batch.diagnostics.push(ClobDiagnostic {
-                key: "tick_size_change_lag".to_string(),
+                key: "tick_size_change_lag",
                 detail: format!(
                     "market={key} quote_ts={} publication_released_after={}ms",
                     pending.quote.exchange_timestamp_ns,
@@ -6138,7 +6460,7 @@ impl ClobLocalBooks {
             let Some(price) = change.price.decimal() else {
                 counters.ignored = counters.ignored.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change".to_string(),
+                    key: "invalid_price_change",
                     detail: format!("token={token} reason=invalid_price"),
                 });
                 continue;
@@ -6146,7 +6468,7 @@ impl ClobLocalBooks {
             let Some(size) = change.size.decimal() else {
                 counters.ignored = counters.ignored.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change".to_string(),
+                    key: "invalid_price_change",
                     detail: format!("token={token} reason=invalid_size"),
                 });
                 continue;
@@ -6154,7 +6476,7 @@ impl ClobLocalBooks {
             if price <= Decimal::ZERO || price >= Decimal::ONE || size < Decimal::ZERO {
                 counters.ignored = counters.ignored.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change".to_string(),
+                    key: "invalid_price_change",
                     detail: format!("token={token} price={price} size={size}"),
                 });
                 continue;
@@ -6166,7 +6488,7 @@ impl ClobLocalBooks {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
                 counters.ignored = counters.ignored.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
-                    key: "unseeded_price_change".to_string(),
+                    key: "unseeded_price_change",
                     detail: format!("token={token} ts={exchange_timestamp_ns}"),
                 });
                 continue;
@@ -6174,7 +6496,7 @@ impl ClobLocalBooks {
             if exchange_timestamp_ns < current_book.exchange_timestamp_ns {
                 counters.ignored = counters.ignored.saturating_add(1);
                 diagnostics.push(ClobDiagnostic {
-                    key: "stale_price_change".to_string(),
+                    key: "stale_price_change",
                     detail: format!(
                         "token={token} incoming_ts={} current_ts={}",
                         exchange_timestamp_ns, current_book.exchange_timestamp_ns,
@@ -6197,7 +6519,7 @@ impl ClobLocalBooks {
                 _ => {
                     counters.ignored = counters.ignored.saturating_add(1);
                     diagnostics.push(ClobDiagnostic {
-                        key: "invalid_price_change".to_string(),
+                        key: "invalid_price_change",
                         detail: format!("token={token} reason=unknown_side side={side}"),
                     });
                     continue;
@@ -6223,7 +6545,7 @@ impl ClobLocalBooks {
                 match value.decimal() {
                     Some(price) => reported.bid = Some(normalize_reported_bbo(price)),
                     None => diagnostics.push(ClobDiagnostic {
-                        key: "invalid_price_change_bbo".to_string(),
+                        key: "invalid_price_change_bbo",
                         detail: format!("token={token} side=bid"),
                     }),
                 }
@@ -6232,7 +6554,7 @@ impl ClobLocalBooks {
                 match value.decimal() {
                     Some(price) => reported.ask = Some(normalize_reported_bbo(price)),
                     None => diagnostics.push(ClobDiagnostic {
-                        key: "invalid_price_change_bbo".to_string(),
+                        key: "invalid_price_change_bbo",
                         detail: format!("token={token} side=ask"),
                     }),
                 }
@@ -6441,6 +6763,7 @@ fn diagnostic_preview(value: &serde_json::Value) -> String {
     value.to_string().chars().take(300).collect()
 }
 
+#[cfg(test)]
 fn process_clob_frame(
     text: &str,
     books: &mut ClobLocalBooks,
@@ -6448,27 +6771,51 @@ fn process_clob_frame(
     received_at: Instant,
     local_now: u64,
 ) -> ClobParsedBatch {
+    let mut parse_buffer = text.as_bytes().to_vec();
+    process_clob_frame_in_place(
+        &mut parse_buffer,
+        books,
+        tokens,
+        received_at,
+        local_now,
+    )
+}
+
+fn process_clob_frame_in_place(
+    parse_buffer: &mut [u8],
+    books: &mut ClobLocalBooks,
+    tokens: &[String],
+    received_at: Instant,
+    local_now: u64,
+) -> ClobParsedBatch {
     let mut batch = ClobParsedBatch::default();
-    if text.is_empty() {
+    if parse_buffer.is_empty() {
         return batch;
     }
-    let mut buf = text.as_bytes().to_vec();
-    let is_array = buf.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'[');
+    let is_array = parse_buffer
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'[');
     let frames = if is_array {
-        simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut buf)
+        simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut *parse_buffer)
     } else {
-        simd_json::serde::from_slice::<ClobFrame>(&mut buf).map(|frame| vec![frame])
+        simd_json::serde::from_slice::<ClobFrame>(&mut *parse_buffer)
+            .map(|frame| vec![frame])
     };
     let frames = match frames {
         Ok(frames) => frames,
         Err(error) => {
             batch.wire.parse_errors = 1;
             batch.diagnostics.push(ClobDiagnostic {
-                key: "parse_error".to_string(),
+                key: "parse_error",
                 detail: format!(
                     "error={} raw={}",
                     error,
-                    text.chars().take(300).collect::<String>(),
+                    String::from_utf8_lossy(parse_buffer)
+                        .chars()
+                        .take(300)
+                        .collect::<String>(),
                 ),
             });
             return batch;
@@ -6502,7 +6849,7 @@ fn process_clob_frame(
                     }) => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
                         batch.diagnostics.push(ClobDiagnostic {
-                            key: "stale_book".to_string(),
+                            key: "stale_book",
                             detail: format!(
                                 "incoming_ts={incoming_timestamp_ns} current_ts={current_timestamp_ns}"
                             ),
@@ -6511,7 +6858,7 @@ fn process_clob_frame(
                     Err(detail) => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
                         batch.diagnostics.push(ClobDiagnostic {
-                            key: "invalid_book".to_string(),
+                            key: "invalid_book",
                             detail,
                         });
                     }
@@ -6565,7 +6912,7 @@ fn process_clob_frame(
                     _ => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
                         batch.diagnostics.push(ClobDiagnostic {
-                            key: "invalid_best_bid_ask".to_string(),
+                            key: "invalid_best_bid_ask",
                             detail: format!("ts={exchange_timestamp_ns}"),
                         });
                     }
@@ -6627,14 +6974,21 @@ fn process_clob_frame(
                 } else {
                     batch.wire.unknown = batch.wire.unknown.saturating_add(1);
                 }
-                batch.diagnostics.push(ClobDiagnostic {
-                    key: if known_ignored {
-                        format!("ignored_{event_type}")
-                    } else {
-                        format!("unknown_{event_type}")
-                    },
-                    detail: diagnostic_preview(&value),
-                });
+                // `new_market` and `market_resolved` are expected control
+                // frames. They were previously formatted into diagnostic
+                // strings even when the sampler suppressed them; count them
+                // without allocating. Truly unknown frames share one static
+                // key and format a bounded preview only on the anomaly path.
+                if !known_ignored {
+                    batch.diagnostics.push(ClobDiagnostic {
+                        key: "unknown_event",
+                        detail: format!(
+                            "event_type={} raw={}",
+                            event_type,
+                            diagnostic_preview(&value),
+                        ),
+                    });
+                }
             }
         }
     }
@@ -7908,6 +8262,8 @@ mod pick_current_event_tests {
             refresh_idling_logged: false,
             rotation_refresh: None,
         });
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(4);
+        market.ws_ctrl_tx = Some(ctrl_tx);
 
         let discovered = fetch_next_event(&series_id, current_end_secs)
             .unwrap()
@@ -7917,6 +8273,13 @@ mod pick_current_event_tests {
 
         assert_eq!(market.series[0].market.event_id, "current-event");
         assert_eq!(market.current_tokens(), vec!["old-up".to_string()]);
+        let WsCtrl::Prepare(subscription) = ctrl_rx.try_recv().unwrap() else {
+            panic!("future discovery must prewarm without activating");
+        };
+        assert!(subscription.tokens.contains(&"old-up".to_string()));
+        for token in &next_event.markets[0].clob_token_ids {
+            assert!(subscription.tokens.contains(token));
+        }
         assert!(market.pending_events.iter().any(|event| {
             matches!(
                 event,

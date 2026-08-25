@@ -1,9 +1,84 @@
 use log::warn;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const INCIDENT_CORRELATION_WINDOW: Duration = Duration::from_secs(10);
+const TIMEOUT_CLUSTER_WINDOW_NS: u64 = 750_000_000;
+const TIMEOUT_CLUSTER_CONNECTIONS: u32 = 2;
+const TIMEOUT_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
+
+#[derive(Debug, Default)]
+struct TimeoutClusterGate {
+    window_started_ns: AtomicU64,
+    connection_mask: AtomicU64,
+    place_blocked_until_ns: AtomicU64,
+}
+
+impl TimeoutClusterGate {
+    fn note(&self, now_ns: u64, role: crate::http1_pool::Role, slot: usize) -> (u32, bool) {
+        loop {
+            let started = self.window_started_ns.load(Ordering::Acquire);
+            if started != 0 && now_ns.saturating_sub(started) <= TIMEOUT_CLUSTER_WINDOW_NS {
+                break;
+            }
+            if self
+                .window_started_ns
+                .compare_exchange(started, now_ns.max(1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.connection_mask.store(0, Ordering::Release);
+                break;
+            }
+        }
+        let role_offset = match role {
+            crate::http1_pool::Role::Fast => 0,
+            crate::http1_pool::Role::Cancel => 24,
+            crate::http1_pool::Role::Reconcile => 40,
+            crate::http1_pool::Role::GapReplay => 48,
+            crate::http1_pool::Role::Query => 56,
+        };
+        let bit = 1u64 << (role_offset + slot.min(7));
+        let mask = self.connection_mask.fetch_or(bit, Ordering::AcqRel) | bit;
+        let connections = mask.count_ones();
+        if connections < TIMEOUT_CLUSTER_CONNECTIONS {
+            return (connections, false);
+        }
+        let until = now_ns.saturating_add(TIMEOUT_CLUSTER_PLACE_BLOCK_NS);
+        let previous = self.place_blocked_until_ns.fetch_max(until, Ordering::AcqRel);
+        (connections, previous <= now_ns)
+    }
+
+    fn place_blocked(&self, now_ns: u64) -> bool {
+        now_ns < self.place_blocked_until_ns.load(Ordering::Acquire)
+    }
+}
+
+fn timeout_gate() -> &'static TimeoutClusterGate {
+    static GATE: OnceLock<TimeoutClusterGate> = OnceLock::new();
+    GATE.get_or_init(TimeoutClusterGate::default)
+}
+
+pub(crate) fn note_http_connection_timeout(role: crate::http1_pool::Role, slot: usize) {
+    let now_ns = crate::types::now_ns();
+    let (connections, entered) = timeout_gate().note(now_ns, role, slot);
+    if entered {
+        warn!(
+            "[timeout_cluster] connections={} window_ms={} place_block_ms={} action=pause_new_place_allow_cancel_reconcile trigger_role={:?} trigger_slot={}",
+            connections,
+            TIMEOUT_CLUSTER_WINDOW_NS / 1_000_000,
+            TIMEOUT_CLUSTER_PLACE_BLOCK_NS / 1_000_000,
+            role,
+            slot,
+        );
+    }
+}
+
+#[inline]
+pub(crate) fn place_blocked_by_timeout_cluster() -> bool {
+    timeout_gate().place_blocked(crate::types::now_ns())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NetworkSignal {
@@ -157,5 +232,18 @@ mod tests {
             NetworkSignal::HttpCancelTimeout,
         );
         assert_ne!(first.id, next.id);
+    }
+
+    #[test]
+    fn distinct_connection_timeouts_gate_only_after_threshold_and_expire() {
+        let gate = TimeoutClusterGate::default();
+        assert_eq!(gate.note(1, crate::http1_pool::Role::Fast, 0), (1, false));
+        assert_eq!(gate.note(2, crate::http1_pool::Role::Fast, 0), (1, false));
+        assert_eq!(gate.note(3, crate::http1_pool::Role::Cancel, 0), (2, true));
+        assert_eq!(gate.note(4, crate::http1_pool::Role::Cancel, 1), (3, false));
+        assert!(gate.place_blocked(5));
+        assert!(!gate.place_blocked(
+            4 + TIMEOUT_CLUSTER_PLACE_BLOCK_NS
+        ));
     }
 }

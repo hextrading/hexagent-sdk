@@ -990,6 +990,14 @@ impl PooledClient {
         &self.client
     }
 
+    pub fn role(&self) -> Role {
+        self.attempt_trace.role
+    }
+
+    pub fn slot(&self) -> usize {
+        self.attempt_trace.slot
+    }
+
     /// Allocate the process-monotonic identity used by non-admission HTTP
     /// paths. Admission-owned order attempts should call [`Self::begin_attempt`]
     /// so the same ID is also published in the slot trace.

@@ -56,6 +56,11 @@ const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
 const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
+/// Runtime wallet observations are replaceable control-plane snapshots. Keep
+/// only one wake in flight and merge a newer generation into the pending slot;
+/// the lossless private-lifecycle lane must never queue behind every poller.
+const WALLET_CALIBRATION_WAKE_CAPACITY: usize = 1;
+const WALLET_CALIBRATION_WAITER_CAPACITY: usize = 64;
 #[cfg(not(test))]
 const ACCOUNT_OWNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -78,6 +83,24 @@ pub struct SharedAccountHandle {
     bound: Arc<AtomicBool>,
     admission_fast: Arc<AtomicBool>,
     passive_admission_fast: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalletCalibrationResult {
+    pub startup_snapshot_newly_applied: bool,
+    pub automatic_redeem_attributed: bool,
+    pub account_ready: bool,
+    pub token_interests: Option<Vec<TokenInterest>>,
+}
+
+#[derive(Debug)]
+struct WalletCalibrationRequest {
+    generation: u64,
+    cash: f64,
+    positions: HashMap<String, f64>,
+    authoritative_tokens: HashSet<String>,
+    include_token_interests: bool,
+    replies: Vec<crossbeam_channel::Sender<Result<WalletCalibrationResult, String>>>,
 }
 
 impl SharedAccountHandle {
@@ -207,6 +230,7 @@ impl SharedAccountHandle {
 pub struct SharedAccountOwnerState {
     account: Arc<SharedAccount>,
     rx: crossbeam_channel::Receiver<AccountOwnerCommand>,
+    wallet_rx: crossbeam_channel::Receiver<()>,
 }
 
 impl SharedAccountOwnerState {
@@ -218,8 +242,18 @@ impl SharedAccountOwnerState {
         &self.rx
     }
 
+    /// Low-priority, latest-value wallet calibration wake lane. The payload is
+    /// stored in the account-scoped coalescing slot, never in this channel.
+    pub fn wallet_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.wallet_rx
+    }
+
     pub fn execute(&self, command: AccountOwnerCommand) {
         command.execute(&self.account);
+    }
+
+    pub fn execute_wallet_calibration(&self) {
+        self.account.execute_pending_wallet_calibration();
     }
 }
 
@@ -4636,6 +4670,10 @@ pub struct SharedAccount {
     state: Arc<Mutex<SharedAccountState>>,
     account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
     account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
+    wallet_calibration_wake_tx: crossbeam_channel::Sender<()>,
+    wallet_calibration_wake_rx: Mutex<Option<crossbeam_channel::Receiver<()>>>,
+    wallet_calibration_pending: Mutex<Option<WalletCalibrationRequest>>,
+    wallet_calibration_coalesced: AtomicU64,
     account_owner_lane_bound: Arc<AtomicBool>,
     account_owner_thread_id: OnceLock<std::thread::ThreadId>,
     /// Cold account-wide mutations (wallet snapshots, maintenance and explicit
@@ -4779,6 +4817,51 @@ struct AccountStateGuard<'a> {
     acquired_at: Instant,
 }
 
+/// Narrow cold transaction for absolute wallet calibration. It mirrors only
+/// per-instance economic ledgers and pending physical trade deltas; historical
+/// order/trade maps stay in their owner-local lifecycle shards.
+struct EconomicStateGuard<'a> {
+    account: &'a SharedAccount,
+    _control: RwLockWriteGuard<'a, ()>,
+    state: MutexGuard<'a, SharedAccountState>,
+    pending: PendingPhysicalDeltas,
+    acquired_at: Instant,
+}
+
+impl Deref for EconomicStateGuard<'_> {
+    type Target = SharedAccountState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for EconomicStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for EconomicStateGuard<'_> {
+    fn drop(&mut self) {
+        let accounts = self.account.virtual_accounts.read().unwrap();
+        for (instance_id, account) in accounts.iter() {
+            if let Some(ledger) = self.state.instances.get(instance_id) {
+                account.replace_ledger(ledger);
+            }
+        }
+        drop(accounts);
+        self.account.publish_economic_snapshots(&self.state);
+        let hold_us = self.acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.account
+            .account_lock_hold_last_us
+            .store(hold_us, Ordering::Relaxed);
+        self.account
+            .account_lock_hold_max_us
+            .fetch_max(hold_us, Ordering::Relaxed);
+    }
+}
+
 impl Deref for AccountStateGuard<'_> {
     type Target = SharedAccountState;
 
@@ -4838,6 +4921,17 @@ impl SharedAccount {
         self: &Arc<Self>,
     ) -> Result<(SharedAccountHandle, SharedAccountOwnerState), String> {
         let receiver = self.bind_account_owner_task_lane()?;
+        let wallet_receiver = self
+            .wallet_calibration_wake_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                format!(
+                    "account {} wallet calibration lane already bound",
+                    self.account_id
+                )
+            })?;
         let handle = SharedAccountHandle {
             account_id: Arc::from(self.account_id.as_str()),
             tx: self.account_owner_task_tx.clone(),
@@ -4848,6 +4942,7 @@ impl SharedAccount {
         let owner = SharedAccountOwnerState {
             account: Arc::clone(self),
             rx: receiver,
+            wallet_rx: wallet_receiver,
         };
         Ok((handle, owner))
     }
@@ -5048,6 +5143,128 @@ impl SharedAccount {
         self.account_owner_task_tx.len()
     }
 
+    /// Submit a complete wallet observation to the replaceable low-priority
+    /// lane. A newer generation replaces the pending payload while all
+    /// waiters are retained; applying the latest absolute snapshot satisfies
+    /// every superseded request because calibration is condition-scoped and
+    /// idempotent.
+    pub fn submit_wallet_calibration(
+        &self,
+        generation: u64,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+        include_token_interests: bool,
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<WalletCalibrationResult, String>>,
+        String,
+    > {
+        validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
+        if !self.account_owner_lane_bound.load(Ordering::Acquire) {
+            return Err(format!(
+                "account {} owner wallet lane is not bound",
+                self.account_id
+            ));
+        }
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        let mut pending = self.wallet_calibration_pending.lock().unwrap();
+        match pending.as_mut() {
+            Some(request) => {
+                if generation >= request.generation {
+                    request.generation = generation;
+                    request.cash = cash;
+                    request.positions = positions;
+                    request.authoritative_tokens = authoritative_tokens;
+                }
+                request.include_token_interests |= include_token_interests;
+                if request.replies.len() >= WALLET_CALIBRATION_WAITER_CAPACITY {
+                    let superseded = request.replies.remove(0);
+                    let error = format!(
+                        "account {} wallet calibration waiter capacity {} exceeded; oldest waiter superseded by generation {}",
+                        self.account_id, WALLET_CALIBRATION_WAITER_CAPACITY, generation,
+                    );
+                    let _ = superseded.send(Err(error.clone()));
+                    log::warn!("[wallet_calibration_overflow] {error}");
+                }
+                request.replies.push(reply);
+                self.wallet_calibration_coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                *pending = Some(WalletCalibrationRequest {
+                    generation,
+                    cash,
+                    positions,
+                    authoritative_tokens,
+                    include_token_interests,
+                    replies: vec![reply],
+                });
+            }
+        }
+        match self.wallet_calibration_wake_tx.try_send(()) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(completion),
+            Err(crossbeam_channel::TrySendError::Disconnected(())) => {
+                let request = pending.take();
+                drop(pending);
+                let error = format!(
+                    "account {} owner wallet lane is disconnected",
+                    self.account_id
+                );
+                if let Some(request) = request {
+                    for reply in request.replies {
+                        let _ = reply.send(Err(error.clone()));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn wallet_calibration_coalesced(&self) -> u64 {
+        self.wallet_calibration_coalesced.load(Ordering::Relaxed)
+    }
+
+    fn execute_pending_wallet_calibration(&self) {
+        let Some(request) = self.wallet_calibration_pending.lock().unwrap().take() else {
+            return;
+        };
+        let result = self
+            .apply_scoped_physical_snapshot_versioned(
+                request.generation,
+                request.cash,
+                request.positions.clone(),
+                request.authoritative_tokens.clone(),
+            )
+            .and_then(|applied| {
+                let attributed = if !applied && self.is_seeded() {
+                    self.observe_platform_binary_redeem(
+                        request.cash,
+                        &request.positions,
+                        &request.authoritative_tokens,
+                    )
+                } else {
+                    false
+                };
+                Ok(WalletCalibrationResult {
+                    startup_snapshot_newly_applied: applied,
+                    automatic_redeem_attributed: attributed,
+                    account_ready: self.startup_snapshot_applied(),
+                    token_interests: request
+                        .include_token_interests
+                        .then(|| self.token_interests()),
+                })
+            });
+        for reply in request.replies {
+            let _ = reply.send(result.clone());
+        }
+        // A producer can install a newer payload after the slot is taken but
+        // before this command finishes. Its wake may have coalesced with the
+        // one we just consumed, so re-arm explicitly when work remains.
+        if self.wallet_calibration_pending.lock().unwrap().is_some() {
+            let _ = self.wallet_calibration_wake_tx.try_send(());
+        }
+    }
+
     fn effective_settled_token_values_generation(state: &SharedAccountState) -> u64 {
         if state.settled_token_values.is_empty() {
             state.settled_token_values_generation
@@ -5118,6 +5335,21 @@ impl SharedAccount {
         // historical audit cardinality.
     }
 
+    fn publish_economic_snapshots(&self, state: &SharedAccountState) {
+        let current_reason = self.uncertain_reason_fast.load_full();
+        if current_reason.as_deref().map(String::as_str) != state.uncertain_reason.as_deref() {
+            self.uncertain_reason_fast
+                .store(state.uncertain_reason.clone().map(Arc::new));
+        }
+        let seeded = state.seeded;
+        let passive = seeded && (!state.uncertain || fee_degradation_is_only_uncertainty(state));
+        self.seeded_fast.store(seeded, Ordering::Release);
+        self.uncertain_fast.store(state.uncertain, Ordering::Release);
+        self.admission_fast
+            .store(seeded && !state.uncertain, Ordering::Release);
+        self.passive_admission_fast.store(passive, Ordering::Release);
+    }
+
     fn publish_retired_order_audit_tombstones(&self, state: &SharedAccountState) {
         self.retired_order_audit_tombstones_fast
             .store(Arc::new(state.retired_order_audit_tombstones.clone()));
@@ -5138,11 +5370,17 @@ impl SharedAccount {
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let (account_owner_task_tx, account_owner_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
+            crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id: account_id.into(),
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            wallet_calibration_wake_tx,
+            wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
+            wallet_calibration_pending: Mutex::new(None),
+            wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
@@ -5524,11 +5762,17 @@ impl SharedAccount {
             crossbeam_channel::bounded(SETTLED_GC_COMPLETION_QUEUE_CAPACITY);
         let (account_owner_task_tx, account_owner_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
+            crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id,
             state,
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
+            wallet_calibration_wake_tx,
+            wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
+            wallet_calibration_pending: Mutex::new(None),
+            wallet_calibration_coalesced: AtomicU64::new(0),
             account_owner_lane_bound: Arc::new(AtomicBool::new(false)),
             account_owner_thread_id: OnceLock::new(),
             control_gate: RwLock::new(()),
@@ -5660,6 +5904,52 @@ impl SharedAccount {
             instance_scope: None,
             reservation_epochs,
             trade_epochs,
+            acquired_at,
+        }
+    }
+
+    fn lock_economic_state(&self) -> EconomicStateGuard<'_> {
+        let wait_started = Instant::now();
+        let control = self.control_gate.write().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let acquired_at = Instant::now();
+        let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.account_lock_wait_last_us
+            .store(wait_us, Ordering::Relaxed);
+        self.account_lock_wait_max_us
+            .fetch_max(wait_us, Ordering::Relaxed);
+        self.account_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+
+        let accounts = self.virtual_accounts.read().unwrap();
+        let mut pending = PendingPhysicalDeltas::default();
+        for (instance_id, account) in accounts.iter() {
+            // The lifecycle mutex pairs the atomic economic snapshot with the
+            // corresponding physical-booking flags. No lifecycle collection
+            // is cloned or installed into the cold aggregate.
+            let lifecycle = account.lifecycle.lock().unwrap();
+            state
+                .instances
+                .insert(instance_id.clone(), account.ledger_snapshot());
+            let instance_pending =
+                pending_physical_deltas_from_trades(lifecycle.trades.values());
+            pending.cash += instance_pending.cash;
+            pending.unsettled |= instance_pending.unsettled;
+            for (token, quantity) in instance_pending.positions {
+                *pending.positions.entry(token).or_insert(0.0) += quantity;
+            }
+        }
+        drop(accounts);
+        recompute_reconciliation_with_pending(
+            &mut state,
+            "economic control-plane aggregate refresh",
+            &pending,
+        );
+        EconomicStateGuard {
+            account: self,
+            _control: control,
+            state,
+            pending,
             acquired_at,
         }
     }
@@ -6500,6 +6790,94 @@ impl SharedAccount {
                 persistence.schedule();
             }
         }
+    }
+
+    fn schedule_wallet_calibration_persist(
+        &self,
+        state: &SharedAccountState,
+        authoritative_tokens: &HashSet<String>,
+        adjustment_sequence_before: u64,
+    ) {
+        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+            let mut changes = Vec::with_capacity(
+                12 + authoritative_tokens.len() + state.instances.len(),
+            );
+            persistence_wal_set(
+                &mut changes,
+                ["physical_cash".to_string()],
+                &state.physical_cash,
+            )?;
+            for token in authoritative_tokens {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "physical_positions",
+                    token,
+                    state.physical_positions.get(token),
+                )?;
+            }
+            persistence_wal_set(
+                &mut changes,
+                ["unallocated_cash".to_string()],
+                &state.unallocated_cash,
+            )?;
+            persistence_wal_set(
+                &mut changes,
+                ["unallocated_positions".to_string()],
+                &state.unallocated_positions,
+            )?;
+            for (instance_id, ledger) in &state.instances {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "instances",
+                    instance_id,
+                    Some(ledger),
+                )?;
+            }
+            for (field, value) in [
+                (
+                    "uncertain",
+                    serde_json::to_value(state.uncertain).map_err(|error| error.to_string())?,
+                ),
+                (
+                    "uncertain_reason",
+                    serde_json::to_value(&state.uncertain_reason)
+                        .map_err(|error| error.to_string())?,
+                ),
+                (
+                    "uncertain_since_ms",
+                    serde_json::to_value(state.uncertain_since_ms)
+                        .map_err(|error| error.to_string())?,
+                ),
+                (
+                    "internal_adjustment_sequence",
+                    serde_json::to_value(state.internal_adjustment_sequence)
+                        .map_err(|error| error.to_string())?,
+                ),
+            ] {
+                changes.push(PersistenceWalChange::Set {
+                    path: vec![field.to_string()],
+                    value,
+                });
+            }
+            for (operation_id, adjustment) in &state.external_adjustments {
+                let sequence = operation_id
+                    .rsplit(':')
+                    .nth(1)
+                    .and_then(|value| value.parse::<u64>().ok());
+                if operation_id.starts_with("internal:")
+                    && sequence.is_some_and(|sequence| sequence > adjustment_sequence_before)
+                {
+                    persistence_wal_map_entry(
+                        &mut changes,
+                        "external_adjustments",
+                        operation_id,
+                        Some(adjustment),
+                    )?;
+                }
+            }
+            Ok(changes)
+        })();
+        self.schedule_typed_persist(state, changes);
     }
 
     fn schedule_virtual_changes(
@@ -8682,8 +9060,9 @@ impl SharedAccount {
         if !has_observable_divergence {
             return false;
         }
-        let mut state = self.lock_state();
-        let unsettled_trade = has_unsettled_trade_lifecycle(&state);
+        let mut state = self.lock_economic_state();
+        let pending = state.pending.clone();
+        let unsettled_trade = pending.unsettled;
         let unsettled_maintenance = has_unsettled_maintenance_operation(&state);
         if !state.seeded || unsettled_trade || unsettled_maintenance {
             let reason = if !state.seeded {
@@ -8741,9 +9120,22 @@ impl SharedAccount {
         }
         changed_tokens.sort_by(|left, right| left.0.cmp(&right.0));
         state.physical_cash = observed_cash;
-        recompute_reconciliation(&mut state, "runtime authoritative wallet calibration");
-        let attributed = try_attribute_binary_redeem(&mut state, &self.account_id);
-        self.schedule_persist(&state);
+        recompute_reconciliation_with_pending(
+            &mut state,
+            "runtime authoritative wallet calibration",
+            &pending,
+        );
+        let adjustment_sequence_before = state.internal_adjustment_sequence;
+        let attributed = try_attribute_binary_redeem_with_pending(
+            &mut state,
+            &self.account_id,
+            Some(&pending),
+        );
+        self.schedule_wallet_calibration_persist(
+            &state,
+            authoritative_tokens,
+            adjustment_sequence_before,
+        );
         let examples: Vec<_> = changed_tokens.iter().take(16).collect();
         log::info!(
             "[shared_account_wallet_calibration] account={} conditions={:?} cash={:.9}->{:.9} token_count={} differences={:?} suppressed={} redeem_attributed={}",
@@ -15839,7 +16231,57 @@ fn fee_degradation_is_only_uncertainty(state: &SharedAccountState) -> bool {
     !without_fees.uncertain
 }
 
-fn recompute_reconciliation(state: &mut SharedAccountState, _deficit_context: &str) {
+#[derive(Debug, Default, Clone)]
+struct PendingPhysicalDeltas {
+    cash: f64,
+    positions: HashMap<String, f64>,
+    unsettled: bool,
+}
+
+fn pending_physical_deltas_from_trades<'a>(
+    trades: impl IntoIterator<Item = &'a AppliedTrade>,
+) -> PendingPhysicalDeltas {
+    let mut pending = PendingPhysicalDeltas::default();
+    for trade in trades {
+        if !trade.booked || trade.failed {
+            continue;
+        }
+        if !trade.physical_booked {
+            pending.unsettled = true;
+            let ownership = &trade.ownership;
+            let sign = if ownership.side == Side::Buy {
+                1.0
+            } else {
+                -1.0
+            };
+            pending.cash += -sign * ownership.quantity * ownership.price;
+            *pending
+                .positions
+                .entry(ownership.token_id.clone())
+                .or_insert(0.0) += sign * ownership.quantity;
+        }
+        if trade.virtual_fee_booked && !trade.physical_fee_booked {
+            pending.unsettled = true;
+            pending.cash -= trade.usdc_fee;
+            *pending
+                .positions
+                .entry(trade.ownership.token_id.clone())
+                .or_insert(0.0) -= trade.shares_fee;
+        }
+    }
+    pending
+}
+
+fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &str) {
+    let pending = pending_physical_deltas_from_trades(state.trades.values());
+    recompute_reconciliation_with_pending(state, deficit_context, &pending);
+}
+
+fn recompute_reconciliation_with_pending(
+    state: &mut SharedAccountState,
+    _deficit_context: &str,
+    pending: &PendingPhysicalDeltas,
+) {
     state.provisional_position_owners.retain(|token, owner| {
         state
             .instances
@@ -15852,44 +16294,7 @@ fn recompute_reconciliation(state: &mut SharedAccountState, _deficit_context: &s
     // Polygon wallet does not change until MINED/CONFIRMED. Exclude those
     // explicitly pending physical deltas from reconciliation so a perfectly
     // healthy in-flight settlement does not look like missing cash/shares.
-    let mut pending_cash_delta = 0.0;
-    let mut pending_position_deltas = HashMap::<String, f64>::new();
-    for trade in state
-        .trades
-        .values()
-        .filter(|trade| trade.booked && !trade.physical_booked && !trade.failed)
-    {
-        let ownership = &trade.ownership;
-        let sign = if ownership.side == Side::Buy {
-            1.0
-        } else {
-            -1.0
-        };
-        pending_cash_delta += -sign * ownership.quantity * ownership.price;
-        *pending_position_deltas
-            .entry(ownership.token_id.clone())
-            .or_insert(0.0) += sign * ownership.quantity;
-        if trade.virtual_fee_booked && !trade.physical_fee_booked {
-            pending_cash_delta -= trade.usdc_fee;
-            *pending_position_deltas
-                .entry(ownership.token_id.clone())
-                .or_insert(0.0) -= trade.shares_fee;
-        }
-    }
-    // Fees can become known after the base trade was already marked physical.
-    for trade in state.trades.values().filter(|trade| {
-        trade.booked
-            && trade.physical_booked
-            && !trade.failed
-            && trade.virtual_fee_booked
-            && !trade.physical_fee_booked
-    }) {
-        pending_cash_delta -= trade.usdc_fee;
-        *pending_position_deltas
-            .entry(trade.ownership.token_id.clone())
-            .or_insert(0.0) -= trade.shares_fee;
-    }
-    state.unallocated_cash = state.physical_cash - (virtual_cash - pending_cash_delta);
+    state.unallocated_cash = state.physical_cash - (virtual_cash - pending.cash);
     state.unallocated_positions.clear();
     let mut all_tokens: HashSet<String> = state.physical_positions.keys().cloned().collect();
     all_tokens.extend(
@@ -15905,8 +16310,8 @@ fn recompute_reconciliation(state: &mut SharedAccountState, _deficit_context: &s
             .values()
             .map(|instance| instance.positions.get(&token).copied().unwrap_or(0.0))
             .sum();
-        let pending = pending_position_deltas.get(&token).copied().unwrap_or(0.0);
-        let expected_virtual = virtual_qty - pending;
+        let pending_quantity = pending.positions.get(&token).copied().unwrap_or(0.0);
+        let expected_virtual = virtual_qty - pending_quantity;
         let delta = physical - expected_virtual;
         let tolerance = reconciliation_tolerance(physical, expected_virtual);
         if delta.abs() > tolerance {
@@ -17366,6 +17771,14 @@ fn log_wallet_reconciliation_alerts(
 /// another event. Any additional positive cash remains unallocated instead of
 /// being assigned to strategy inventory.
 fn try_attribute_binary_redeem(state: &mut SharedAccountState, account_id: &str) -> bool {
+    try_attribute_binary_redeem_with_pending(state, account_id, None)
+}
+
+fn try_attribute_binary_redeem_with_pending(
+    state: &mut SharedAccountState,
+    account_id: &str,
+    pending: Option<&PendingPhysicalDeltas>,
+) -> bool {
     let negative_tokens: BTreeSet<String> = state
         .unallocated_positions
         .iter()
@@ -17637,7 +18050,15 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState, account_id: &str)
         conditions,
         applied_removed,
     );
-    recompute_reconciliation(state, "inferred condition-scoped platform binary redeem");
+    if let Some(pending) = pending {
+        recompute_reconciliation_with_pending(
+            state,
+            "inferred condition-scoped platform binary redeem",
+            pending,
+        );
+    } else {
+        recompute_reconciliation(state, "inferred condition-scoped platform binary redeem");
+    }
     true
 }
 
@@ -17793,6 +18214,34 @@ mod tests {
             .try_submit_account_owner_command(AccountOwnerCommand::barrier(reply_tx))
             .unwrap_err()
             .contains("full"));
+    }
+
+    #[test]
+    fn wallet_calibration_lane_coalesces_latest_absolute_snapshot() {
+        let account = Arc::new(SharedAccount::new("wallet-coalesce"));
+        account.register_instance("maker-1", 1.0);
+        let (_handle, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+
+        let first = account
+            .submit_wallet_calibration(1, 100.0, HashMap::new(), HashSet::new(), false)
+            .unwrap();
+        let second = account
+            .submit_wallet_calibration(2, 125.0, HashMap::new(), HashSet::new(), true)
+            .unwrap();
+        assert_eq!(account.wallet_calibration_coalesced(), 1);
+        owner.wallet_receiver().try_recv().unwrap();
+        owner.execute_wallet_calibration();
+
+        for completion in [first, second] {
+            let result = completion.recv().unwrap().unwrap();
+            assert!(result.startup_snapshot_newly_applied);
+            assert!(result.account_ready);
+            assert!(result.token_interests.is_some());
+        }
+        let snapshot = account.monitoring_snapshot_fast();
+        assert!((snapshot.physical_cash - 125.0).abs() < EPS);
+        assert_eq!(account.wallet_calibration_wake_tx.len(), 0);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -1773,6 +1775,81 @@ enum AuditJob {
     PrivateDiagnostic(PrivateDiagnosticJob),
 }
 
+struct OrderAttemptRecorder {
+    directory: PathBuf,
+    hour: i64,
+    writer: Option<BufWriter<std::fs::File>>,
+}
+
+impl OrderAttemptRecorder {
+    fn new() -> Self {
+        Self {
+            directory: std::env::var_os("HEXBOT_ORDER_AUDIT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("data/record/order_audit")),
+            hour: -1,
+            writer: None,
+        }
+    }
+
+    fn ensure_writer(&mut self, hour: i64) -> std::io::Result<&mut BufWriter<std::fs::File>> {
+        if self.writer.is_none() || self.hour != hour {
+            std::fs::create_dir_all(&self.directory)?;
+            let path = self.directory.join(format!("order-audit-{hour}.jsonl"));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+            self.hour = hour;
+        }
+        Ok(self.writer.as_mut().expect("writer installed"))
+    }
+
+    fn write_attempt(&mut self, job: &AttemptAuditJob) -> std::io::Result<()> {
+        let attempt = job.attempt;
+        let order = job.order.as_ref();
+        let record = serde_json::json!({
+                "attempt_id": attempt.attempt_id,
+                "kind": job.kind,
+                "role": format!("{:?}", attempt.role),
+                "slot": attempt.slot,
+                "iid": order.map(|order| order.instance_id.as_str()).filter(|value| !value.is_empty()).unwrap_or(job.route_instance_id.as_str()),
+                "event_id": order.map(|order| order.event_id.as_str()).filter(|value| !value.is_empty()),
+                "token": order.map(|order| order.token.as_str()).filter(|value| !value.is_empty()),
+                "side": order.map(|order| order.side.to_string()),
+                "order_type": order.map(|order| format!("{:?}", order.order_type)),
+                "price": order.and_then(|order| order.price),
+                "quantity": order.map(|order| order.quantity),
+                "post_only": order.map(|order| order.post_only),
+                "reduce_only": order.map(|order| order.reduce_only),
+                "fee_rate_bps": order.map(|order| order.fee_rate_bps),
+                "trigger_source": order.map(|order| order.trigger_source.to_string()),
+                "trigger_exchange_ns": order.map(|order| order.trigger_exchange_ns),
+                "trigger_local_ns": order.map(|order| order.trigger_local_ns),
+                "coid": job.client_order_id,
+                "oid": job.exchange_order_id,
+                "status": format!("{:?}", job.status),
+                "error": job.error,
+                "signal_ns": attempt.signal_ns,
+                "prep_ns": attempt.prep_ns,
+                "signed_ns": attempt.signed_ns,
+                "account_recorded_ns": attempt.account_recorded_ns,
+                "dispatched_ns": attempt.dispatched_ns,
+                "completed_ns": job.completed_ns,
+                "dispatch_to_done_ns": job.completed_ns.saturating_sub(attempt.dispatched_ns),
+        });
+        self.write_record(&record)
+    }
+
+    fn write_record(&mut self, record: &serde_json::Value) -> std::io::Result<()> {
+        let hour = chrono::Utc::now().timestamp().div_euclid(3600);
+        let writer = self.ensure_writer(hour)?;
+        serde_json::to_writer(&mut *writer, record)?;
+        writer.write_all(b"\n")
+    }
+}
+
 /// Order-level inputs required to replay a live placement in sim_v2.
 ///
 /// This is deliberately an audit payload, not mutable runtime authority.  It
@@ -2162,10 +2239,10 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
 async fn execute_http_on(
     client: crate::http1_pool::PooledClient,
     attempt_id: u64,
-    method: reqwest::Method,
-    url: Arc<str>,
-    path: String,
-    headers: super::auth::AuthHeaders,
+    method: &reqwest::Method,
+    url: &Arc<str>,
+    path: &str,
+    headers: &super::auth::AuthHeaders,
     body: Bytes,
 ) -> HttpReply {
     debug_assert_ne!(attempt_id, 0, "every HTTP dispatch requires an attempt ID");
@@ -2214,7 +2291,7 @@ async fn execute_http_on(
                 Err(HttpErr::Status(status.as_u16(), body))
             }
             Err(error) => {
-                client.note_transport_failure(prewarm_url(&url));
+                client.note_transport_failure(prewarm_url(url.as_ref()));
                 Err(map_reqwest_err(error))
             }
         };
@@ -2228,7 +2305,7 @@ async fn execute_http_on(
             bytes
         }
         Err(error) => {
-            client.note_transport_failure(prewarm_url(&url));
+            client.note_transport_failure(prewarm_url(url.as_ref()));
             return Err(map_reqwest_err(error));
         }
     };
@@ -2238,6 +2315,61 @@ async fn execute_http_on(
             "json_parse_error={error} raw_body={raw_body}"
         )))
     })
+}
+
+/// DELETE is idempotent by order ID. If its primary connection times out,
+/// retry exactly once on a different account Cancel slot while new placement
+/// admission remains cluster-gated. Place requests never enter this helper's
+/// alternate-connection branch.
+async fn execute_http_with_cancel_timeout_hedge(
+    client: crate::http1_pool::PooledClient,
+    attempt_id: u64,
+    account_id: &str,
+    method: &reqwest::Method,
+    url: &Arc<str>,
+    path: &str,
+    headers: &super::auth::AuthHeaders,
+    body: Bytes,
+) -> HttpReply {
+    let role = client.role();
+    let slot = client.slot();
+    let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
+    let first = execute_http_on(client, attempt_id, method, url, path, headers, body).await;
+    if !matches!(first, Err(HttpErr::Timeout)) {
+        return first;
+    }
+    super::network_incident::note_http_connection_timeout(role, slot);
+    let Some(hedge_body) = hedge_body else {
+        return first;
+    };
+
+    let hedge_permit = crate::http1_pool::try_borrow_account(
+        account_id,
+        crate::http1_pool::Role::Cancel,
+    );
+    let hedge_client = hedge_permit
+        .as_ref()
+        .map(crate::http1_pool::Permit::pooled_client)
+        .unwrap_or_else(|| crate::http1_pool::pooled_client(crate::http1_pool::Role::Cancel));
+    let hedge_role = hedge_client.role();
+    let hedge_slot = hedge_client.slot();
+    let hedge_attempt = hedge_client.allocate_attempt_id();
+    crate::latency::record_ns("polymarket.http.cancel.timeout_hedge", 1);
+    let hedged = execute_http_on(
+        hedge_client,
+        hedge_attempt,
+        method,
+        url,
+        path,
+        headers,
+        hedge_body,
+    )
+    .await;
+    drop(hedge_permit);
+    if matches!(hedged, Err(HttpErr::Timeout)) {
+        super::network_incident::note_http_connection_timeout(hedge_role, hedge_slot);
+    }
+    hedged
 }
 
 /// Typed `POST /order` wire bodies. Serialized in one pass with
@@ -3111,6 +3243,10 @@ impl SharedState {
                                 shared.run_settled_gc_pass(&mut execution, &mut live_position);
                                 continue;
                             }
+                            if account_owner.wallet_receiver().try_recv().is_ok() {
+                                account_owner.execute_wallet_calibration();
+                                continue;
+                            }
                             break;
                         }
                         break;
@@ -3138,6 +3274,13 @@ impl SharedState {
                                 &mut execution,
                                 &mut live_position,
                             ),
+                            Err(_) => break,
+                        },
+                        // Absolute wallet snapshots are coalesced and lower
+                        // priority than lossless private lifecycle, explicit
+                        // owner control, maintenance and settled-history GC.
+                        recv(account_owner.wallet_receiver()) -> wake => match wake {
+                            Ok(()) => account_owner.execute_wallet_calibration(),
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> phase => {
@@ -3169,6 +3312,7 @@ impl SharedState {
             .name(format!("poly-execution-audit-{}", shared.instance_id))
             .spawn(move || {
                 let mut lifecycle_traces = HashMap::new();
+                let mut structured_recorder = OrderAttemptRecorder::new();
                 // Audit formatting/export is explicitly lower priority than
                 // lifecycle/account mutation and has its own bounded lane.
                 crate::os_tune::pin_background("polymarket-execution-audit");
@@ -3178,13 +3322,21 @@ impl SharedState {
                     };
                     if shutdown.is_finished() {
                         while let Ok(job) = rx.try_recv() {
-                            shared.write_audit_job(&mut lifecycle_traces, job);
+                            shared.write_audit_job(
+                                &mut lifecycle_traces,
+                                &mut structured_recorder,
+                                job,
+                            );
                         }
                         break;
                     }
                     crossbeam_channel::select_biased! {
                         recv(rx) -> job => match job {
-                            Ok(job) => shared.write_audit_job(&mut lifecycle_traces, job),
+                            Ok(job) => shared.write_audit_job(
+                                &mut lifecycle_traces,
+                                &mut structured_recorder,
+                                job,
+                            ),
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> _ => continue,
@@ -3594,11 +3746,14 @@ impl SharedState {
     fn write_audit_job(
         &self,
         lifecycle_traces: &mut HashMap<String, OrderLifecycleTrace>,
+        structured_recorder: &mut OrderAttemptRecorder,
         job: AuditJob,
     ) {
         match job {
-            AuditJob::Attempt(job) => self.write_attempt_audit(job),
-            AuditJob::Lifecycle(job) => self.write_lifecycle_trace(lifecycle_traces, job),
+            AuditJob::Attempt(job) => self.write_attempt_audit(structured_recorder, job),
+            AuditJob::Lifecycle(job) => {
+                self.write_lifecycle_trace(lifecycle_traces, structured_recorder, job)
+            }
             AuditJob::PrivateDiagnostic(job) => {
                 let enqueued_ns = match &job {
                     PrivateDiagnosticJob::FailedTradeWithoutReason { enqueued_ns, .. }
@@ -3664,44 +3819,22 @@ impl SharedState {
         }
     }
 
-    fn write_attempt_audit(&self, job: AttemptAuditJob) {
+    fn write_attempt_audit(
+        &self,
+        structured_recorder: &mut OrderAttemptRecorder,
+        job: AttemptAuditJob,
+    ) {
         crate::latency::record_ns(
             "polymarket.account.attempt_audit_queue",
             now_ns().saturating_sub(job.enqueued_ns),
         );
-        let attempt = job.attempt;
-        let elapsed_ns = job.completed_ns.saturating_sub(attempt.dispatched_ns);
-        let order = job.order.as_ref();
-        info!(
-            "[order_attempt] attempt_id={} kind={} role={:?} slot={} iid={} event_id={} token={} side={} order_type={} price={} quantity={} post_only={} reduce_only={} fee_rate_bps={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} coid={} oid={} status={:?} signal_ns={} prep_ns={} signed_ns={} account_recorded_ns={} dispatched_ns={} completed_ns={} dispatch_to_done_ms={:.3}",
-            attempt.attempt_id,
-            job.kind,
-            attempt.role,
-            attempt.slot,
-            order.map(|order| order.instance_id.as_str()).filter(|value| !value.is_empty()).unwrap_or(job.route_instance_id.as_str()),
-            order.map(|order| order.event_id.as_str()).filter(|value| !value.is_empty()).unwrap_or("-"),
-            order.map(|order| order.token.as_str()).filter(|value| !value.is_empty()).unwrap_or("-"),
-            order.map(|order| order.side.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| format!("{:?}", order.order_type)).as_deref().unwrap_or("-"),
-            order.and_then(|order| order.price).map(|price| price.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.quantity.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.post_only.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.reduce_only.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.fee_rate_bps.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.trigger_source.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.trigger_exchange_ns.to_string()).as_deref().unwrap_or("-"),
-            order.map(|order| order.trigger_local_ns.to_string()).as_deref().unwrap_or("-"),
-            job.client_order_id,
-            job.exchange_order_id.as_deref().unwrap_or(""),
-            job.status,
-            attempt.signal_ns,
-            attempt.prep_ns,
-            attempt.signed_ns,
-            attempt.account_recorded_ns,
-            attempt.dispatched_ns,
-            job.completed_ns,
-            elapsed_ns as f64 / 1_000_000.0,
-        );
+        if let Err(error) = structured_recorder.write_attempt(&job) {
+            log::error!(
+                "[order_attempt_recorder] write failed coid={}: {}",
+                job.client_order_id,
+                error,
+            );
+        }
         if job.status == OrderStatus::Rejected {
             warn!(
                 "[PolymarketTrade] {} rejected off completion lane: {} coid={}",
@@ -3764,6 +3897,7 @@ impl SharedState {
     fn write_lifecycle_trace(
         &self,
         traces: &mut HashMap<String, OrderLifecycleTrace>,
+        structured_recorder: &mut OrderAttemptRecorder,
         job: LifecycleTraceJob,
     ) {
         match job {
@@ -3798,6 +3932,7 @@ impl SharedState {
                 stage_ns,
             } => self.write_order_lifecycle_detail(
                 traces,
+                structured_recorder,
                 &client_order_id,
                 stage,
                 exchange_order_id.as_deref(),
@@ -3814,6 +3949,7 @@ impl SharedState {
     fn write_order_lifecycle_detail(
         &self,
         traces: &mut HashMap<String, OrderLifecycleTrace>,
+        structured_recorder: &mut OrderAttemptRecorder,
         client_order_id: &str,
         stage: &str,
         exchange_order_id: Option<&str>,
@@ -3913,19 +4049,6 @@ impl SharedState {
         };
         let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
-        let normal_info = !warning && !slow && matches!(stage, "http_response" | "cancel_response");
-        let enabled = if warning || slow {
-            log::log_enabled!(log::Level::Warn)
-        } else if normal_info {
-            log::log_enabled!(log::Level::Info)
-        } else {
-            log::log_enabled!(log::Level::Debug)
-        };
-        if !enabled {
-            // The producer timestamp preserves the exact measured boundary;
-            // metric aggregation and log decisions stay on this audit owner.
-            return;
-        }
         let trace = traces.get(client_order_id).cloned();
         let (
             iid,
@@ -3958,13 +4081,51 @@ impl SharedState {
                 0,
             ),
         };
+        let status_name = status.map(|value| format!("{value:?}")).unwrap_or_default();
+        let trigger_exchange_to_stage_ms = lifecycle_delta_ms(stage_ns, trigger_exchange_ns);
+        let trigger_local_to_stage_ms = lifecycle_delta_ms(stage_ns, trigger_local_ns);
+        let quote_to_stage_ms = lifecycle_delta_ms(stage_ns, quote_emit_ns);
+        let record = serde_json::json!({
+            "kind": "order_lifecycle",
+            "stage": stage,
+            "coid": client_order_id,
+            "oid": exchange_order_id,
+            "trade_id": trade_id,
+            "status": status_name,
+            "iid": iid,
+            "event": event,
+            "symbol": symbol,
+            "side": side,
+            "trigger_source": source.to_string(),
+            "trigger_exchange_ns": trigger_exchange_ns,
+            "trigger_local_ns": trigger_local_ns,
+            "quote_emit_ns": quote_emit_ns,
+            "stage_ns": stage_ns,
+            "segment": segment_name,
+            "segment_ns": segment_ns,
+            "trigger_exchange_to_stage_ms": trigger_exchange_to_stage_ms,
+            "trigger_local_to_stage_ms": trigger_local_to_stage_ms,
+            "quote_to_stage_ms": quote_to_stage_ms,
+            "reason_code": reason_code,
+            "reason": reason,
+        });
+        if let Err(error) = structured_recorder.write_record(&record) {
+            log::error!(
+                "[order_lifecycle_recorder] write failed coid={}: {}",
+                client_order_id,
+                error,
+            );
+        }
+        if !warning && !slow && !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
         let message = format!(
             "[order_lifecycle] stage={} coid={} oid={} trade_id={} status={} iid={} event={} symbol={} side={} trigger_source={} trigger_exchange_ns={} trigger_local_ns={} quote_emit_ns={} stage_ns={} segment={} segment_ms={:.3} trigger_exchange_to_stage_ms={:.3} trigger_local_to_stage_ms={:.3} quote_to_stage_ms={:.3} reason_code={} reason={}",
             stage,
             client_order_id,
             exchange_order_id.unwrap_or(""),
             trade_id.unwrap_or(""),
-            status.map(|value| format!("{value:?}")).unwrap_or_default(),
+            status_name,
             iid,
             event,
             symbol,
@@ -3976,9 +4137,9 @@ impl SharedState {
             stage_ns,
             segment_name,
             segment_ns as f64 / 1_000_000.0,
-            lifecycle_delta_ms(stage_ns, trigger_exchange_ns),
-            lifecycle_delta_ms(stage_ns, trigger_local_ns),
-            lifecycle_delta_ms(stage_ns, quote_emit_ns),
+            trigger_exchange_to_stage_ms,
+            trigger_local_to_stage_ms,
+            quote_to_stage_ms,
             reason_code,
             serde_json::to_string(reason).unwrap_or_else(|_| "\"unserializable\"".to_string()),
         );
@@ -3990,8 +4151,6 @@ impl SharedState {
                 slow_threshold_ns as f64 / 1_000_000.0,
                 message
             );
-        } else if normal_info {
-            info!("{}", message);
         } else {
             debug!("{}", message);
         }
@@ -4279,7 +4438,7 @@ impl SharedState {
                 .account_state
                 .mark_cancelled_pending_audit(client_order_id)
             {
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancelled coid={} queued routine size_matched audit; preserving reservation without blocking account",
                     client_order_id,
                 );
@@ -4783,9 +4942,9 @@ impl SharedState {
     /// slot from the account pool; a busy/missing account pool spills to the
     /// fixed global fallback-order pool.
     ///
-    /// Exactly one HTTP request is sent. Retries and speculative duplicate
-    /// requests are deliberately left to explicit reconciliation so place
-    /// and cancel traffic cannot be multiplied during an upstream slowdown.
+    /// Place sends exactly one HTTP request. An idempotent DELETE may use one
+    /// alternate Cancel connection only after the primary connection timed
+    /// out; all other ambiguity remains owned by explicit reconciliation.
     pub(crate) fn http_call_async(
         &self,
         method: &str,
@@ -4862,17 +5021,19 @@ impl SharedState {
             let method_owned = method.clone();
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
+            let account_id = self.account_state.account_id().to_string();
             let enqueued_at = crate::latency::Instant::now();
             async_rt::order_handle().spawn(async move {
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
-                let reply = execute_http_on(
+                let reply = execute_http_with_cancel_timeout_hedge(
                     request_client,
                     attempt_id,
-                    method_owned.clone(),
-                    url_owned,
-                    path_owned.clone(),
-                    headers,
+                    &account_id,
+                    &method_owned,
+                    &url_owned,
+                    &path_owned,
+                    &headers,
                     body_owned,
                 )
                 .await;
@@ -4988,6 +5149,7 @@ impl SharedState {
             let url_a = url.clone();
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
+            let account_id = self.account_state.account_id().to_string();
             let request_buffers = Arc::clone(&self.request_buffers);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
@@ -4998,13 +5160,14 @@ impl SharedState {
                 // recovered and returned to the startup-filled pool after
                 // reqwest drops its request body.
                 let recyclable = body_a.clone();
-                let reply = execute_http_on(
+                let reply = execute_http_with_cancel_timeout_hedge(
                     client,
                     attempt_id,
-                    method_a.clone(),
-                    url_a,
-                    path_a.clone(),
-                    headers,
+                    &account_id,
+                    &method_a,
+                    &url_a,
+                    &path_a,
+                    &headers,
                     body_a,
                 )
                 .await;
@@ -9156,6 +9319,9 @@ impl PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Err(Self::make_rejected(order, "trading disabled backoff"));
         }
+        if super::network_incident::place_blocked_by_timeout_cluster() {
+            return Err(Self::make_rejected(order, "timeout cluster safety gate"));
+        }
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Err(Self::make_rejected(order, "balance backoff"));
         }
@@ -9645,7 +9811,7 @@ impl PolymarketTrade {
                 // this route just before the call). Pairs this cancel with its
                 // quote for offline on_quote→dispatch latency analysis
                 // (dispatch wall-clock − gen_ns). 0 = non-quote origin.
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancel request orderID={}... coid={} gen_ns={}",
                     oid_short, client_order_id, self.gen_ns_hint
                 );
@@ -9719,7 +9885,7 @@ impl PolymarketTrade {
                         let canceled_n = canceled.map(|a| a.len()).unwrap_or(0);
                         let not_canceled = resp.get("not_canceled").and_then(|v| v.as_object());
                         let nc_n = not_canceled.map(|o| o.len()).unwrap_or(0);
-                        info!(
+                        debug!(
                         "[PolymarketTrade] Cancel result orderID={}... coid={} canceled={} not_canceled={}",
                         oid_short, client_order_id, canceled_n, nc_n,
                     );
@@ -9732,7 +9898,7 @@ impl PolymarketTrade {
                         if let Some(nc) = not_canceled {
                             for (id, reason) in nc {
                                 let reason_str = reason.as_str().unwrap_or("");
-                                info!(
+                                debug!(
                                     "[PolymarketTrade] Cancel rejected: {} reason={} coid={}",
                                     id, reason_str, client_order_id
                                 );
@@ -10079,6 +10245,11 @@ impl ExchangeTrade for PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Ok(self.make_logged_preflight_rejections(orders, "trading disabled backoff"));
         }
+        if super::network_incident::place_blocked_by_timeout_cluster() {
+            return Ok(
+                self.make_logged_preflight_rejections(orders, "timeout cluster safety gate")
+            );
+        }
         // Balance-backoff short-circuit (see `submit_order` for rationale).
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Ok(self.make_logged_preflight_rejections(orders, "balance backoff"));
@@ -10249,7 +10420,7 @@ impl ExchangeTrade for PolymarketTrade {
             let chunk_coids: Vec<String> =
                 chunk.iter().map(|o| o.client_order_id.clone()).collect();
             let details: Vec<String> = chunk.iter().map(|o| format_order_brief(o)).collect();
-            info!(
+            debug!(
                 "[PolymarketTrade] Submit request: {} orders [{}]",
                 bodies.len(),
                 details.join(", "),
@@ -10411,7 +10582,7 @@ impl ExchangeTrade for PolymarketTrade {
                             error: (!success && !error_msg.is_empty()).then_some(error_msg),
                         });
                     }
-                    info!(
+                    debug!(
                         "[PolymarketTrade] Submit result: accepted={:?} rejected={:?}",
                         accepted_coids, rejected_coids,
                     );
@@ -10570,13 +10741,13 @@ impl ExchangeTrade for PolymarketTrade {
                 )
             };
             if unmapped_coids.is_empty() {
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancel request: {} orders coids={:?}",
                     sent_coids.len(),
                     sent_coids,
                 );
             } else {
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancel request: {} orders coids={:?} (+ {} unmapped coids={:?})",
                     sent_coids.len(), sent_coids,
                     unmapped_coids.len(), unmapped_coids,
@@ -10628,7 +10799,7 @@ impl ExchangeTrade for PolymarketTrade {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    info!(
+                    debug!(
                         "[PolymarketTrade] Cancel result: canceled={:?} not_canceled={:?}",
                         canceled_coids, not_canceled_coids,
                     );
@@ -10639,7 +10810,7 @@ impl ExchangeTrade for PolymarketTrade {
                                 .cloned()
                                 .unwrap_or_default();
                             let reason_str = reason.as_str().unwrap_or("");
-                            info!(
+                            debug!(
                                 "[PolymarketTrade] Cancel rejected: orderID={} reason={} coid={}",
                                 id, reason_str, coid,
                             );
@@ -10798,6 +10969,17 @@ impl ExchangeTrade for PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() && !place_orders.is_empty() {
             let mut pre =
                 self.make_logged_preflight_rejections(place_orders, "trading disabled backoff");
+            let rest =
+                self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
+            pre.extend(rest);
+            return Ok(pre);
+        }
+
+        if super::network_incident::place_blocked_by_timeout_cluster()
+            && !place_orders.is_empty()
+        {
+            let mut pre = self
+                .make_logged_preflight_rejections(place_orders, "timeout cluster safety gate");
             let rest =
                 self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
             pre.extend(rest);
@@ -11112,12 +11294,12 @@ impl ExchangeTrade for PolymarketTrade {
         let batch_cancel_coids: Vec<String> = cancel_client_order_ids.to_vec();
         let cancel_rx = cancel_req.as_ref().map(|(path, body)| {
             if unmapped_coids.is_empty() {
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancel request: {} orders coids={:?}",
                     sent_coids.len(), sent_coids,
                 );
             } else {
-                info!(
+                debug!(
                     "[PolymarketTrade] Cancel request: {} orders coids={:?} (+ {} unmapped coids={:?})",
                     sent_coids.len(), sent_coids,
                     unmapped_coids.len(), unmapped_coids,
@@ -11141,7 +11323,7 @@ impl ExchangeTrade for PolymarketTrade {
         }
         let place_rx = place_req.as_ref().map(|(path, body)| {
             let details: Vec<String> = place_chunk.iter().map(|o| format_order_brief(o)).collect();
-            info!(
+            debug!(
                 "[PolymarketTrade] Submit request: {} orders [{}]",
                 place_chunk.len(),
                 details.join(", "),
@@ -11174,7 +11356,7 @@ impl ExchangeTrade for PolymarketTrade {
         let cancel_outcome: Option<(OrderStatus, std::collections::HashMap<String, OrderStatus>)> =
             match cancel_rx {
                 None if !cancel_client_order_ids.is_empty() => {
-                    info!(
+                    debug!(
                     "[PolymarketTrade] Cancel request: 0 orders ({} unmapped coids={:?}) → keep live for retry",
                     unmapped_coids.len(), unmapped_coids,
                 );
@@ -11241,7 +11423,7 @@ impl ExchangeTrade for PolymarketTrade {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            info!(
+                            debug!(
                                 "[PolymarketTrade] Cancel result: canceled={:?} not_canceled={:?}",
                                 canceled_coids, not_canceled_coids,
                             );
@@ -11252,7 +11434,7 @@ impl ExchangeTrade for PolymarketTrade {
                                         .cloned()
                                         .unwrap_or_default();
                                     let reason_str = reason.as_str().unwrap_or("");
-                                    info!(
+                                    debug!(
                                     "[PolymarketTrade] Cancel rejected: orderID={} reason={} coid={}",
                                     id, reason_str, coid,
                                 );
@@ -11560,7 +11742,7 @@ impl ExchangeTrade for PolymarketTrade {
                             error: err_field,
                         });
                     }
-                    info!(
+                    debug!(
                         "[PolymarketTrade] Submit result: accepted={:?} rejected={:?}",
                         accepted_coids, rejected_coids,
                     );
