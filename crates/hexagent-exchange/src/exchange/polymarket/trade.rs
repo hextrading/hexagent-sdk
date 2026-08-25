@@ -9,9 +9,9 @@ use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -469,9 +469,7 @@ fn fetch_order_result_name(result: &FetchOrderResult) -> &'static str {
     match result {
         FetchOrderResult::Found(_) => "found",
         FetchOrderResult::NotFound(_) => "parallel_not_found",
-        FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => {
-            "parallel_absence"
-        }
+        FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => "parallel_absence",
         FetchOrderResult::Unavailable(_) => "unavailable",
     }
 }
@@ -498,10 +496,7 @@ fn combine_parallel_order_lookups(
     if order_lookup_is_absent(&primary) && order_lookup_is_absent(&secondary) {
         let evidence = format!(
             "parallel_reconcile_absence primary={:?}/{} secondary={:?}/{}",
-            primary_location.0,
-            primary_location.1,
-            secondary_location.0,
-            secondary_location.1,
+            primary_location.0, primary_location.1, secondary_location.0, secondary_location.1,
         );
         return if matches!(primary, FetchOrderResult::NotFound(_))
             && matches!(secondary, FetchOrderResult::NotFound(_))
@@ -2427,10 +2422,8 @@ async fn execute_http_with_cancel_connection_failure_hedge(
         return first;
     };
 
-    let hedge_permit = crate::http1_pool::try_borrow_account(
-        account_id,
-        crate::http1_pool::Role::Cancel,
-    );
+    let hedge_permit =
+        crate::http1_pool::try_borrow_account(account_id, crate::http1_pool::Role::Cancel);
     let hedge_client = hedge_permit
         .as_ref()
         .map(crate::http1_pool::Permit::pooled_client)
@@ -3321,6 +3314,7 @@ impl SharedState {
                     return;
                 }
                 let _ = cold_ready_tx.send(());
+                let wallet_grace_tick = crossbeam_channel::tick(Duration::from_millis(10));
                 loop {
                     let Some(_shared) = cold_weak.upgrade() else {
                         break;
@@ -3329,6 +3323,10 @@ impl SharedState {
                         // Cold control remains single-writer and drains its
                         // explicit commands before the coalesced wallet wake.
                         loop {
+                            if account_owner.lifecycle_mirror_receiver().try_recv().is_ok() {
+                                account_owner.execute_lifecycle_mirror();
+                                continue;
+                            }
                             if let Ok(command) = account_owner.receiver().try_recv() {
                                 account_owner.execute(command);
                                 continue;
@@ -3342,6 +3340,10 @@ impl SharedState {
                         break;
                     }
                     crossbeam_channel::select_biased! {
+                        recv(account_owner.lifecycle_mirror_receiver()) -> wake => match wake {
+                            Ok(()) => account_owner.execute_lifecycle_mirror(),
+                            Err(_) => break,
+                        },
                         recv(account_owner.receiver()) -> command => match command {
                             Ok(command) => account_owner.execute(command),
                             Err(_) => break,
@@ -3353,6 +3355,9 @@ impl SharedState {
                         recv(account_owner.wallet_receiver()) -> wake => match wake {
                             Ok(()) => account_owner.execute_wallet_calibration(),
                             Err(_) => break,
+                        },
+                        recv(wallet_grace_tick) -> _ => {
+                            account_owner.execute_wallet_calibration();
                         },
                         recv(cold_shutdown_rx) -> phase => {
                             if matches!(phase, Ok(ShutdownPhase::Finished) | Err(_)) {
@@ -3657,13 +3662,13 @@ impl SharedState {
             return 0;
         }
         reply_rx.recv().unwrap_or_else(|error| {
-                log::error!(
-                    "[PolymarketTrade] background worker join owner stopped account={}: {}",
-                    self.account_state.account_id(),
-                    error,
-                );
-                0
-            })
+            log::error!(
+                "[PolymarketTrade] background worker join owner stopped account={}: {}",
+                self.account_state.account_id(),
+                error,
+            );
+            0
+        })
     }
 
     pub(crate) fn request_filled_order_cleanup(&self, client_order_id: &str) {
@@ -4234,8 +4239,8 @@ impl SharedState {
         // rejected during its short safety window remains in the structured
         // lifecycle recorder, but must not flood the console one order at a
         // time while the gate is doing exactly what it was designed to do.
-        let aggregated_connection_failure_cluster_reject = stage == "preflight_rejected"
-            && reason == "connection failure cluster safety gate";
+        let aggregated_connection_failure_cluster_reject =
+            stage == "preflight_rejected" && reason == "connection failure cluster safety gate";
         let warning = (!reason_code.is_empty() && !aggregated_connection_failure_cluster_reject)
             || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
@@ -7122,12 +7127,7 @@ impl PolymarketTrade {
                     .shared
                     .account_state
                     .token_event_has_ended(&ownership.token_id);
-            let fetched = match self.fetch_order_by_id(
-                &coid,
-                &order_id,
-                None,
-                parallel_evidence,
-            ) {
+            let fetched = match self.fetch_order_by_id(&coid, &order_id, None, parallel_evidence) {
                 FetchOrderResult::Found(order) => order,
                 FetchOrderResult::NotFound(evidence) => {
                     errors.push(format!(
@@ -7754,21 +7754,20 @@ impl PolymarketTrade {
             } else {
                 retired_market_evidence_streak = 0;
             }
-            let parallel_absence_fast_path =
-                retired_market_parallel_absence_fast_path_allowed(
-                    allow_expired_market_terminalization,
-                    remote_clean,
-                    audit.errors.len(),
-                    &audit.retired_market_absent,
-                );
+            let parallel_absence_fast_path = retired_market_parallel_absence_fast_path_allowed(
+                allow_expired_market_terminalization,
+                remote_clean,
+                audit.errors.len(),
+                &audit.retired_market_absent,
+            );
             let retired_market_terminal = parallel_absence_fast_path
                 || retired_market_terminalization_allowed(
-                retired_market_evidence_streak,
-                tokens.len(),
-                terminal_token_responses,
-                audit.errors.len(),
-                audit.retired_market_absent.len(),
-            );
+                    retired_market_evidence_streak,
+                    tokens.len(),
+                    terminal_token_responses,
+                    audit.errors.len(),
+                    audit.retired_market_absent.len(),
+                );
             let retired_absent_count = audit.retired_market_absent.len();
             let mut retired_closed = 0usize;
             if retired_market_terminal {
@@ -8441,11 +8440,7 @@ impl PolymarketTrade {
                 // server not-found responses advance the counter.
                 if fetch_result.is_explicit_not_found() {
                     let parallel_evidence = fetch_result.has_parallel_not_found_evidence();
-                    let observations = if parallel_evidence {
-                        2
-                    } else {
-                        1
-                    };
+                    let observations = if parallel_evidence { 2 } else { 1 };
                     let attempts = self
                         .shared
                         .reconcile_attempts
@@ -12558,7 +12553,10 @@ mod tests {
             leased.push(buffer);
         }
         assert_eq!(leased.len(), REQUEST_BUFFER_SLOTS);
-        assert!(pool.pop().is_none(), "pool must not allocate a fallback buffer");
+        assert!(
+            pool.pop().is_none(),
+            "pool must not allocate a fallback buffer"
+        );
         for buffer in leased {
             pool.push(buffer).unwrap();
         }

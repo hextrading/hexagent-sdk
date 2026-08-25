@@ -42,8 +42,11 @@ const CLOB_SOCKET_RCVBUF_BYTES: libc::c_int = 8 * 1024 * 1024;
 /// covering the venue's observed microburst slow-consumer closes.
 const CLOB_STANDBY_MAX_RAW_AGE: Duration = Duration::from_secs(15);
 const CLOB_STANDBY_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const CLOB_STANDBY_SLOW_CONSUMER_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CLOB_STANDBY_HEALTHY_RESET: Duration = Duration::from_secs(60);
 const CLOB_DUAL_SILENCE_WINDOWS: u8 = 2;
 const CLOB_RARE_HANDLER_TAIL: Duration = Duration::from_millis(10);
+const CLOB_RESOURCE_BASELINE_FRAMES: u64 = 256;
 
 fn clob_standby_is_hot(observed_data: bool, last_raw_at: Instant, now: Instant) -> bool {
     observed_data && now.saturating_duration_since(last_raw_at) <= CLOB_STANDBY_MAX_RAW_AGE
@@ -54,6 +57,21 @@ fn clob_peers_are_anti_affine(
     standby_peer: Option<SocketAddr>,
 ) -> bool {
     matches!((active_peer, standby_peer), (Some(active), Some(standby)) if active.ip() != standby.ip())
+}
+
+fn clob_standby_slow_consumer_delay(streak: u32, lane_id: u64) -> Duration {
+    let exponent = streak.saturating_sub(1).min(6);
+    let base_ms = CLOB_STANDBY_RECONNECT_DELAY
+        .as_millis()
+        .saturating_mul(1_u128 << exponent);
+    // Deterministic per-lane jitter avoids a new allocator/RNG dependency and
+    // prevents several account feeds from reconnecting on the same boundary.
+    let jitter_ms = lane_id.wrapping_mul(1_103_515_245).wrapping_add(12_345) % 251;
+    Duration::from_millis(
+        base_ms
+            .saturating_add(u128::from(jitter_ms))
+            .min(CLOB_STANDBY_SLOW_CONSUMER_MAX_BACKOFF.as_millis()) as u64,
+    )
 }
 
 /// The synchronous Polymarket feed's externally visible phase.  This lives in
@@ -257,8 +275,7 @@ impl PolymarketLiveness {
         self.connection_started_ns.store(now, Ordering::Release);
         self.last_raw_frame_ns.store(0, Ordering::Release);
         self.last_market_data_ns.store(0, Ordering::Release);
-        self.reconnect
-            .store(Arc::new(ReconnectControl::default()));
+        self.reconnect.store(Arc::new(ReconnectControl::default()));
         self.connected.store(true, Ordering::Release);
         self.active.store(active, Ordering::Release);
         if active {
@@ -725,12 +742,12 @@ fn subscribe_rest_future_events() -> crossbeam_channel::Receiver<RestFutureEvent
     // Discovery is replaceable state. A slow adapter needs only the newest
     // candidate; one-slot mailboxes bound memory and publisher latency.
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let subscribers = REST_FUTURE_EVENT_SUBSCRIBERS
-        .get_or_init(|| ArcSwap::from_pointee(Vec::new()));
+    let subscribers =
+        REST_FUTURE_EVENT_SUBSCRIBERS.get_or_init(|| ArcSwap::from_pointee(Vec::new()));
     let subscriber = RestFutureEventSubscriber {
-            tx,
-            replace_rx: rx.clone(),
-        };
+        tx,
+        replace_rx: rx.clone(),
+    };
     subscribers.rcu(|current| {
         let mut next = (**current).clone();
         next.push(subscriber.clone());
@@ -762,11 +779,19 @@ fn publish_rest_future_event(series_id: &str, event: &PolymarketEvent) {
         };
     }
     if !disconnected.is_empty() {
-        subscribers.rcu(|current| Arc::new(current.iter()
-            .filter(|subscriber| !disconnected.iter()
-                .any(|dead| dead.same_channel(&subscriber.tx)))
-            .cloned()
-            .collect()));
+        subscribers.rcu(|current| {
+            Arc::new(
+                current
+                    .iter()
+                    .filter(|subscriber| {
+                        !disconnected
+                            .iter()
+                            .any(|dead| dead.same_channel(&subscriber.tx))
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        });
     }
 }
 
@@ -791,16 +816,24 @@ fn cache_gamma_events_at(
         next.retain(|_, entry| cache_entry_is_fresh(entry, now));
         for event in events {
             if !event.id.is_empty() {
-                next.insert(event.id.clone(), CachedGammaEvent {
-                    series_id: series_id.to_string(),
-                    event: event.clone(),
-                    cached_at: now,
-                });
+                next.insert(
+                    event.id.clone(),
+                    CachedGammaEvent {
+                        series_id: series_id.to_string(),
+                        event: event.clone(),
+                        cached_at: now,
+                    },
+                );
             }
         }
         while next.len() > GAMMA_EVENT_CACHE_CAPACITY {
-            let Some(oldest) = next.iter().min_by_key(|(_, entry)| entry.cached_at)
-                .map(|(id, _)| id.clone()) else { break };
+            let Some(oldest) = next
+                .iter()
+                .min_by_key(|(_, entry)| entry.cached_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
             next.remove(&oldest);
         }
         Arc::new(next)
@@ -818,7 +851,8 @@ fn cached_gamma_event_after_at(
     now: Instant,
 ) -> Option<PolymarketEvent> {
     let min_end_ns = end_date_min_secs.saturating_mul(1_000_000_000);
-    cache.load()
+    cache
+        .load()
         .values()
         .filter(|entry| cache_entry_is_fresh(entry, now))
         .filter(|entry| entry.series_id == series_id)
@@ -1824,7 +1858,9 @@ impl PolymarketMarket {
         let mut subscription = self.current_clob_subscription();
         for event in self.future_events.values() {
             for market in accepted_binary_markets(&event.markets, true) {
-                subscription.tokens.extend(market.clob_token_ids.iter().cloned());
+                subscription
+                    .tokens
+                    .extend(market.clob_token_ids.iter().cloned());
                 let mut up_token = None;
                 let mut down_token = None;
                 for (token, outcome) in market.clob_token_ids.iter().zip(&market.outcomes) {
@@ -3177,6 +3213,154 @@ struct ClobDiagnostic {
     detail: String,
 }
 
+fn clob_diagnostic_token(detail: &str) -> Option<&str> {
+    detail
+        .strip_prefix("token=")
+        .and_then(|tail| tail.split_ascii_whitespace().next())
+}
+
+/// The wire lane can temporarily carry the current and next event together.
+/// Continue applying both so the next event stays pre-seeded, but discard
+/// diagnostics and REST repair requests for tokens outside the logical active
+/// generation before they reach formatting/logging or the network worker.
+fn retain_active_clob_diagnostics(batch: &mut ClobParsedBatch, active_tokens: &[String]) {
+    batch.diagnostics.retain(|diagnostic| {
+        clob_diagnostic_token(&diagnostic.detail)
+            .is_none_or(|token| subscribed_token(active_tokens, token))
+    });
+    batch
+        .repair_tokens
+        .retain(|token| subscribed_token(active_tokens, token));
+}
+
+fn retain_active_clob_deferred_diagnostics(
+    batch: &mut ClobDeferredBatch,
+    active_tokens: &[String],
+) {
+    batch.diagnostics.retain(|diagnostic| {
+        clob_diagnostic_token(&diagnostic.detail)
+            .is_none_or(|token| subscribed_token(active_tokens, token))
+    });
+    batch
+        .repair_tokens
+        .retain(|token| subscribed_token(active_tokens, token));
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClobThreadResourceSnapshot {
+    cpu_ns: u64,
+    voluntary_switches: u64,
+    involuntary_switches: u64,
+    minor_faults: u64,
+    major_faults: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn clob_thread_cpu_ns() -> u64 {
+    unsafe {
+        let mut clock: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut clock) == 0 {
+            (clock.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(clock.tv_nsec as u64)
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clob_thread_cpu_ns() -> u64 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn clob_thread_resource_snapshot() -> ClobThreadResourceSnapshot {
+    unsafe {
+        let cpu_ns = clob_thread_cpu_ns();
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_THREAD, &mut usage) != 0 {
+            return ClobThreadResourceSnapshot {
+                cpu_ns,
+                ..ClobThreadResourceSnapshot::default()
+            };
+        }
+        ClobThreadResourceSnapshot {
+            cpu_ns,
+            voluntary_switches: usage.ru_nvcsw.max(0) as u64,
+            involuntary_switches: usage.ru_nivcsw.max(0) as u64,
+            minor_faults: usage.ru_minflt.max(0) as u64,
+            major_faults: usage.ru_majflt.max(0) as u64,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clob_thread_resource_snapshot() -> ClobThreadResourceSnapshot {
+    ClobThreadResourceSnapshot::default()
+}
+
+#[derive(Debug)]
+struct ClobThreadResourceSampler {
+    frames: u64,
+    baseline_frame: u64,
+    baseline: ClobThreadResourceSnapshot,
+}
+
+impl Default for ClobThreadResourceSampler {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            baseline_frame: 0,
+            baseline: clob_thread_resource_snapshot(),
+        }
+    }
+}
+
+impl ClobThreadResourceSampler {
+    fn begin_frame(&mut self) -> ClobThreadResourceSnapshot {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames.saturating_sub(self.baseline_frame) >= CLOB_RESOURCE_BASELINE_FRAMES {
+            self.baseline = clob_thread_resource_snapshot();
+            self.baseline_frame = self.frames;
+        }
+        // CLOCK_THREAD_CPUTIME_ID is vDSO-backed on Linux and gives an exact
+        // wall-vs-CPU split without adding two getrusage syscalls per frame.
+        let mut snapshot = ClobThreadResourceSnapshot::default();
+        snapshot.cpu_ns = clob_thread_cpu_ns();
+        snapshot
+    }
+
+    fn tail_delta(
+        &self,
+        frame_start: ClobThreadResourceSnapshot,
+        wall: Duration,
+    ) -> (u64, u64, ClobThreadResourceSnapshot, u64) {
+        let now = clob_thread_resource_snapshot();
+        let cpu_ns = now.cpu_ns.saturating_sub(frame_start.cpu_ns);
+        let wall_ns = wall.as_nanos().min(u64::MAX as u128) as u64;
+        let resource_delta = ClobThreadResourceSnapshot {
+            cpu_ns,
+            voluntary_switches: now
+                .voluntary_switches
+                .saturating_sub(self.baseline.voluntary_switches),
+            involuntary_switches: now
+                .involuntary_switches
+                .saturating_sub(self.baseline.involuntary_switches),
+            minor_faults: now.minor_faults.saturating_sub(self.baseline.minor_faults),
+            major_faults: now.major_faults.saturating_sub(self.baseline.major_faults),
+        };
+        (
+            cpu_ns,
+            wall_ns.saturating_sub(cpu_ns),
+            resource_delta,
+            self.frames
+                .saturating_sub(self.baseline_frame)
+                .saturating_add(1),
+        )
+    }
+}
+
 #[derive(Default)]
 struct ClobDiagnosticSampler {
     last_logged: HashMap<&'static str, Instant>,
@@ -3365,11 +3549,13 @@ fn spawn_clob_seeded_candidate(
                         &mut frame_bytes,
                         &mut books,
                         &subscription.tokens,
+                        &subscription.tokens,
                         received_at,
                         now_ns(),
                     );
                     lane.burst.record_frame(received_at, frame_len);
-                    lane.diagnostics.record_frame(received_at, frame_len, &batch);
+                    lane.diagnostics
+                        .record_frame(received_at, frame_len, &batch);
                     for event in batch.events {
                         match &event {
                             MarketEvent::OrderBook(_) => {
@@ -3737,11 +3923,19 @@ fn reset_clob_books_for_failover(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClobStandbyReadDisposition {
+    Keep,
+    Reconnect,
+    SlowConsumerReconnect,
+}
+
 async fn handle_clob_standby_read(
     lane: &mut ClobConnection,
     result: ClobSocketReadResult,
     subscription_tokens: usize,
-) -> bool {
+    log_slow_consumer_incident: bool,
+) -> ClobStandbyReadDisposition {
     let received_at = Instant::now();
     match result {
         Some(Ok(Message::Text(text))) => {
@@ -3760,7 +3954,7 @@ async fn handle_clob_standby_read(
                         "[clob_standby_send_failed] lane_id={} peer={:?} error={}",
                         lane.lane_id, lane.peer_addr, error,
                     );
-                    return true;
+                    return ClobStandbyReadDisposition::Reconnect;
                 }
             } else if body.eq_ignore_ascii_case("PONG") {
                 lane.record_raw(received_at);
@@ -3768,7 +3962,7 @@ async fn handle_clob_standby_read(
                 lane.record_data_frame(received_at);
                 lane.burst.record_frame(received_at, text.len());
             }
-            false
+            ClobStandbyReadDisposition::Keep
         }
         Some(Ok(Message::Ping(payload))) => {
             lane.record_raw(received_at);
@@ -3784,9 +3978,9 @@ async fn handle_clob_standby_read(
                     "[clob_standby_send_failed] lane_id={} peer={:?} error={}",
                     lane.lane_id, lane.peer_addr, error,
                 );
-                return true;
+                return ClobStandbyReadDisposition::Reconnect;
             }
-            false
+            ClobStandbyReadDisposition::Keep
         }
         Some(Ok(Message::Close(reason))) => {
             let normalized_reason = reason
@@ -3798,38 +3992,44 @@ async fn handle_clob_standby_read(
                 .any(|needle| normalized_reason.contains(needle));
             let tcp = sample_tcp_socket(lane.tcp_fd);
             let burst_summary = lane.burst.close_summary(received_at);
-            warn!(
-                "[clob_close_metric] lane_role=standby lane_id={} peer={:?} subscription_tokens={} reason={:?} server_slow_consumer={} tcp_unread_bytes={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {}",
-                lane.lane_id,
-                lane.peer_addr,
-                subscription_tokens,
-                reason,
-                slow_consumer,
-                tcp.unread_bytes.map(i64::from).unwrap_or(-1),
-                tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
-                tcp.total_retrans.map(i64::from).unwrap_or(-1),
-                tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
-                burst_summary,
-            );
-            true
+            if !slow_consumer || log_slow_consumer_incident {
+                warn!(
+                    "[clob_close_metric] lane_role=standby lane_id={} peer={:?} subscription_tokens={} reason={:?} server_slow_consumer={} tcp_unread_bytes={} tcp_rcv_wnd={} tcp_total_retrans={} so_rcvbuf={} {}",
+                    lane.lane_id,
+                    lane.peer_addr,
+                    subscription_tokens,
+                    reason,
+                    slow_consumer,
+                    tcp.unread_bytes.map(i64::from).unwrap_or(-1),
+                    tcp.rcv_wnd.map(i64::from).unwrap_or(-1),
+                    tcp.total_retrans.map(i64::from).unwrap_or(-1),
+                    tcp.so_rcvbuf.map(i64::from).unwrap_or(-1),
+                    burst_summary,
+                );
+            }
+            if slow_consumer {
+                ClobStandbyReadDisposition::SlowConsumerReconnect
+            } else {
+                ClobStandbyReadDisposition::Reconnect
+            }
         }
         Some(Ok(_)) => {
             lane.record_raw(received_at);
-            false
+            ClobStandbyReadDisposition::Keep
         }
         Some(Err(error)) => {
             warn!(
                 "[clob_standby_read_failed] lane_id={} peer={:?} error={}",
                 lane.lane_id, lane.peer_addr, error,
             );
-            true
+            ClobStandbyReadDisposition::Reconnect
         }
         None => {
             warn!(
                 "[clob_standby_closed] lane_id={} peer={:?}",
                 lane.lane_id, lane.peer_addr,
             );
-            true
+            ClobStandbyReadDisposition::Reconnect
         }
     }
 }
@@ -3971,6 +4171,7 @@ async fn clob_ws_task(
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
     let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
+    let mut thread_resource_sampler = ClobThreadResourceSampler::default();
     let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
@@ -4046,14 +4247,15 @@ async fn clob_ws_task(
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
         let mut books = ClobLocalBooks::new(&wire_subscription.canonical_events);
-        let (repair_tx, mut repair_rx) =
-            tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
+        let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
         let mut repair_tx = repair_tx;
         let mut repairs_in_flight = HashSet::new();
         let mut repair_superseded_attempts: HashMap<String, u8> = HashMap::new();
         let standby_lane_id = next_lane_id;
         next_lane_id = next_lane_id.saturating_add(1);
         let mut standby = None;
+        let mut standby_ready_at: Option<Instant> = None;
+        let mut standby_slow_consumer_streak = 0_u32;
         let mut standby_connect = Some(spawn_clob_standby_connect(
             wire_subscription.tokens.clone(),
             standby_lane_id,
@@ -4283,6 +4485,7 @@ async fn clob_ws_task(
                                 active.peer_addr,
                             );
                             super::network_incident::update_ws_peers(active.peer_addr, lane.peer_addr);
+                            standby_ready_at = Some(Instant::now());
                             standby = Some(lane);
                         }
                         Ok(Ok(lane)) => {
@@ -4333,7 +4536,9 @@ async fn clob_ws_task(
 
                 _ = &mut deferred_sleep => {
                     let now = Instant::now();
-                    let batch = books.flush_deferred_due(now, now_ns());
+                    let mut batch =
+                        books.flush_deferred_due(now, now_ns(), &subscription.tokens);
+                    retain_active_clob_deferred_diagnostics(&mut batch, &subscription.tokens);
                     active.diagnostics.record_deferred(&batch);
                     for diagnostic in batch.diagnostics {
                         diagnostic_sampler.observe(now, diagnostic);
@@ -4343,7 +4548,7 @@ async fn clob_ws_task(
                     }
                     request_clob_book_repairs(
                         batch.repair_tokens,
-                        &wire_subscription.tokens,
+                        &subscription.tokens,
                         repair_generation,
                         &repair_generation_epoch,
                         &mut repairs_in_flight,
@@ -4368,7 +4573,7 @@ async fn clob_ws_task(
                         continue;
                     };
                     if repair.generation != repair_generation
-                        || !wire_subscription.tokens.contains(&repair.token)
+                        || !subscription.tokens.contains(&repair.token)
                     {
                         log::debug!(
                             "[clob_bbo_repair_skipped] token={} result_generation={} active_generation={} reason=stale_or_retired_result",
@@ -4443,7 +4648,7 @@ async fn clob_ws_task(
                                     request_clob_book_repair_after(
                                         repair.token,
                                         delay,
-                                        &wire_subscription.tokens,
+                                        &subscription.tokens,
                                         repair_generation,
                                         &repair_generation_epoch,
                                         &mut repairs_in_flight,
@@ -4796,19 +5001,53 @@ async fn clob_ws_task(
                                 .as_mut()
                                 .expect("standby read result requires a standby lane");
                             lane.burst.record_socket_polls(lane.read.take_poll_window());
-                            if handle_clob_standby_read(
+                            let disposition = handle_clob_standby_read(
                                 lane,
                                 result,
                                 wire_subscription.tokens.len(),
-                            ).await {
+                                standby_slow_consumer_streak == 0,
+                            ).await;
+                            if disposition != ClobStandbyReadDisposition::Keep {
+                                if standby_ready_at.is_some_and(|ready_at| {
+                                    ready_at.elapsed() >= CLOB_STANDBY_HEALTHY_RESET
+                                }) {
+                                    standby_slow_consumer_streak = 0;
+                                }
+                                let reconnect_delay = if disposition
+                                    == ClobStandbyReadDisposition::SlowConsumerReconnect
+                                {
+                                    standby_slow_consumer_streak =
+                                        standby_slow_consumer_streak.saturating_add(1);
+                                    let delay = clob_standby_slow_consumer_delay(
+                                        standby_slow_consumer_streak,
+                                        lane.lane_id,
+                                    );
+                                    super::network_incident::suppress_peer_collision_for(
+                                        delay + CLOB_STANDBY_RECONNECT_DELAY,
+                                    );
+                                    if standby_slow_consumer_streak == 1
+                                        || standby_slow_consumer_streak.is_power_of_two()
+                                    {
+                                        warn!(
+                                            "[clob_standby_backoff] reason=server_slow_consumer streak={} dedup_repeats={} delay_ms={} active_lane_retained=true",
+                                            standby_slow_consumer_streak,
+                                            standby_slow_consumer_streak.saturating_sub(1),
+                                            delay.as_millis(),
+                                        );
+                                    }
+                                    delay
+                                } else {
+                                    CLOB_STANDBY_RECONNECT_DELAY
+                                };
                                 standby = None;
+                                standby_ready_at = None;
                                 super::network_incident::update_ws_peers(active.peer_addr, None);
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 standby_connect = Some(spawn_clob_standby_connect(
                                     wire_subscription.tokens.clone(),
                                     lane_id,
-                                    CLOB_STANDBY_RECONNECT_DELAY,
+                                    reconnect_delay,
                                 ));
                             }
                             continue;
@@ -4907,17 +5146,34 @@ async fn clob_ws_task(
                                 ).await;
                                 continue;
                             }
+                            let resource_start = thread_resource_sampler.begin_frame();
                             let t_parse = crate::latency::Instant::now();
                             let frame_len = text.len();
                             let mut frame_bytes = text.into_bytes();
-                            let batch = process_clob_frame_in_place(
+                            let mut batch = process_clob_frame_in_place(
                                 &mut frame_bytes,
                                 &mut books,
                                 &wire_subscription.tokens,
+                                &subscription.tokens,
                                 received_at,
                                 now_ns(),
                             );
                             let parse_apply_elapsed = t_parse.elapsed();
+                            let parse_cpu_ns = clob_thread_cpu_ns()
+                                .saturating_sub(resource_start.cpu_ns);
+                            let parse_wall_ns = parse_apply_elapsed
+                                .as_nanos()
+                                .min(u64::MAX as u128) as u64;
+                            let parse_preempted_ns = parse_wall_ns.saturating_sub(parse_cpu_ns);
+                            crate::latency::record_ns(
+                                "polymarket.ws.clob_parse_apply_cpu",
+                                parse_cpu_ns,
+                            );
+                            crate::latency::record_ns(
+                                "polymarket.ws.clob_parse_apply_preempted",
+                                parse_preempted_ns,
+                            );
+                            retain_active_clob_diagnostics(&mut batch, &subscription.tokens);
                             active.diagnostics.record_parse_apply(parse_apply_elapsed);
                             crate::latency::record_ns(
                                 "polymarket.ws.clob_parse_apply",
@@ -4937,7 +5193,7 @@ async fn clob_ws_task(
                             }
                             request_clob_book_repairs(
                                 batch.repair_tokens,
-                                &wire_subscription.tokens,
+                                &subscription.tokens,
                                 repair_generation,
                                 &repair_generation_epoch,
                                 &mut repairs_in_flight,
@@ -4961,16 +5217,28 @@ async fn clob_ws_task(
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
                             let read_handler_elapsed = received_at.elapsed();
                             if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
+                                let (cpu_ns, preempted_ns, resources, resource_span_frames) =
+                                    thread_resource_sampler.tail_delta(
+                                        resource_start,
+                                        parse_apply_elapsed,
+                                    );
                                 diagnostic_sampler.observe(received_at, ClobDiagnostic {
                                     key: "clob_read_handler_tail",
                                     detail: format!(
-                                        "frame_bytes={} total_us={} parse_apply_us={} non_parse_us={} runtime_scheduler_max_us={}",
+                                        "frame_bytes={} total_us={} parse_apply_us={} parse_cpu_us={} preempted_us={} non_parse_us={} voluntary_cs_delta={} involuntary_cs_delta={} minor_fault_delta={} major_fault_delta={} resource_span_frames={} runtime_scheduler_max_us={}",
                                         frame_len,
                                         read_handler_elapsed.as_micros(),
                                         parse_apply_elapsed.as_micros(),
+                                        cpu_ns / 1_000,
+                                        preempted_ns / 1_000,
                                         read_handler_elapsed
                                             .saturating_sub(parse_apply_elapsed)
                                             .as_micros(),
+                                        resources.voluntary_switches,
+                                        resources.involuntary_switches,
+                                        resources.minor_faults,
+                                        resources.major_faults,
+                                        resource_span_frames,
                                         runtime_scheduler_max_us.load(Ordering::Relaxed),
                                     ),
                                 });
@@ -6277,6 +6545,7 @@ impl ClobLocalBooks {
         local_now: u64,
         counters: &mut ClobWireCounters,
         diagnostics: &mut Vec<ClobDiagnostic>,
+        emit_diagnostic: bool,
     ) -> (Option<MarketEvent>, Option<String>) {
         let Some(pending) = self.pending_bbo.remove(token) else {
             return (None, None);
@@ -6299,7 +6568,7 @@ impl ClobLocalBooks {
                         counters.bbo_recovery_same_timestamp.saturating_add(1);
                 }
             }
-            if pending.awaiting_tick_change {
+            if pending.awaiting_tick_change && emit_diagnostic {
                 diagnostics.push(ClobDiagnostic {
                     key: "tick_size_change_lag",
                     detail: format!(
@@ -6326,24 +6595,26 @@ impl ClobLocalBooks {
                 counters.bbo_tick_distance_total.saturating_add(distance);
             counters.bbo_tick_distance_max = counters.bbo_tick_distance_max.max(distance);
         }
-        diagnostics.push(ClobDiagnostic {
-            key: "price_change_bbo_mismatch",
-            detail: format!(
-                "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={} frames={:?}",
-                pending.exchange_timestamp_ns,
-                pending.expected.bid,
-                pending.expected.ask,
-                actual.0,
-                actual.1,
-                CLOB_BBO_SETTLE_INTERVAL.as_millis(),
-                pending.frame_summaries,
-            ),
-        });
+        if emit_diagnostic {
+            diagnostics.push(ClobDiagnostic {
+                key: "price_change_bbo_mismatch",
+                detail: format!(
+                    "token={token} ts={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?} settled_ms={} frames={:?}",
+                    pending.exchange_timestamp_ns,
+                    pending.expected.bid,
+                    pending.expected.ask,
+                    actual.0,
+                    actual.1,
+                    CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+                    pending.frame_summaries,
+                ),
+            });
+        }
         self.quarantined_tokens.insert(token.to_string());
         self.repair_started_at
             .entry(token.to_string())
             .or_insert(finished_at);
-        (None, Some(token.to_string()))
+        (None, emit_diagnostic.then(|| token.to_string()))
     }
 
     fn resolve_pending_if_ready(
@@ -6483,7 +6754,12 @@ impl ClobLocalBooks {
             .min()
     }
 
-    fn flush_deferred_due(&mut self, now: Instant, local_now: u64) -> ClobDeferredBatch {
+    fn flush_deferred_due(
+        &mut self,
+        now: Instant,
+        local_now: u64,
+        active_tokens: &[String],
+    ) -> ClobDeferredBatch {
         let mut batch = ClobDeferredBatch::default();
         let mut tokens: Vec<_> = self
             .pending_bbo
@@ -6495,17 +6771,19 @@ impl ClobLocalBooks {
             .collect();
         tokens.sort();
         for token in tokens {
+            let active = subscribed_token(active_tokens, &token);
             let (event, repair) = self.finalize_pending_bbo(
                 &token,
                 now,
                 local_now,
                 &mut batch.wire,
                 &mut batch.diagnostics,
+                active,
             );
             if let Some(event) = event {
                 push_latest_order_book(&mut batch.events, event);
             }
-            if let Some(token) = repair {
+            if let Some(token) = repair.filter(|_| active) {
                 batch.repair_tokens.push(token);
             }
             if let Some(event) = self.reconcile_health(
@@ -6535,14 +6813,17 @@ impl ClobLocalBooks {
             let Some(pending) = self.pending_quotes.remove(&key) else {
                 continue;
             };
-            batch.diagnostics.push(ClobDiagnostic {
-                key: "tick_size_change_lag",
-                detail: format!(
-                    "market={key} quote_ts={} publication_released_after={}ms",
-                    pending.quote.exchange_timestamp_ns,
-                    CLOB_BBO_SETTLE_INTERVAL.as_millis(),
-                ),
-            });
+            if subscribed_token(active_tokens, &pending.quote.symbol) {
+                batch.diagnostics.push(ClobDiagnostic {
+                    key: "tick_size_change_lag",
+                    detail: format!(
+                        "token={} market={key} quote_ts={} publication_released_after={}ms",
+                        pending.quote.symbol,
+                        pending.quote.exchange_timestamp_ns,
+                        CLOB_BBO_SETTLE_INTERVAL.as_millis(),
+                    ),
+                });
+            }
             if let Some(event) = self.canonicalize_quote_ready(pending.quote) {
                 batch.events.push(event);
             }
@@ -6560,6 +6841,7 @@ impl ClobLocalBooks {
         local_now: u64,
         counters: &mut ClobWireCounters,
         diagnostics: &mut Vec<ClobDiagnostic>,
+        active_tokens: &[String],
     ) -> (Vec<MarketEvent>, usize, Vec<String>) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
         let mut immediate = Vec::new();
@@ -6578,28 +6860,35 @@ impl ClobLocalBooks {
         for change in fields.price_changes {
             counters.price_change_entries = counters.price_change_entries.saturating_add(1);
             let token = change.asset_id;
+            let emit_diagnostic = subscribed_token(active_tokens, &token);
             let Some(price) = change.price.decimal() else {
                 counters.ignored = counters.ignored.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change",
-                    detail: format!("token={token} reason=invalid_price"),
-                });
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change",
+                        detail: format!("token={token} reason=invalid_price"),
+                    });
+                }
                 continue;
             };
             let Some(size) = change.size.decimal() else {
                 counters.ignored = counters.ignored.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change",
-                    detail: format!("token={token} reason=invalid_size"),
-                });
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change",
+                        detail: format!("token={token} reason=invalid_size"),
+                    });
+                }
                 continue;
             };
             if price <= Decimal::ZERO || price >= Decimal::ONE || size < Decimal::ZERO {
                 counters.ignored = counters.ignored.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "invalid_price_change",
-                    detail: format!("token={token} price={price} size={size}"),
-                });
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change",
+                        detail: format!("token={token} price={price} size={size}"),
+                    });
+                }
                 continue;
             }
             if !self.price_is_on_current_tick(&token, price) {
@@ -6608,21 +6897,25 @@ impl ClobLocalBooks {
             let Some(current_book) = self.token_books.get(&token) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
                 counters.ignored = counters.ignored.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "unseeded_price_change",
-                    detail: format!("token={token} ts={exchange_timestamp_ns}"),
-                });
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "unseeded_price_change",
+                        detail: format!("token={token} ts={exchange_timestamp_ns}"),
+                    });
+                }
                 continue;
             };
             if exchange_timestamp_ns < current_book.exchange_timestamp_ns {
                 counters.ignored = counters.ignored.saturating_add(1);
-                diagnostics.push(ClobDiagnostic {
-                    key: "stale_price_change",
-                    detail: format!(
-                        "token={token} incoming_ts={} current_ts={}",
-                        exchange_timestamp_ns, current_book.exchange_timestamp_ns,
-                    ),
-                });
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "stale_price_change",
+                        detail: format!(
+                            "token={token} incoming_ts={} current_ts={}",
+                            exchange_timestamp_ns, current_book.exchange_timestamp_ns,
+                        ),
+                    });
+                }
                 continue;
             }
             let sequence = self.next_sequence();
@@ -6639,10 +6932,12 @@ impl ClobLocalBooks {
                 "SELL" => &mut book.asks,
                 _ => {
                     counters.ignored = counters.ignored.saturating_add(1);
-                    diagnostics.push(ClobDiagnostic {
-                        key: "invalid_price_change",
-                        detail: format!("token={token} reason=unknown_side side={side}"),
-                    });
+                    if emit_diagnostic {
+                        diagnostics.push(ClobDiagnostic {
+                            key: "invalid_price_change",
+                            detail: format!("token={token} reason=unknown_side side={side}"),
+                        });
+                    }
                     continue;
                 }
             };
@@ -6665,19 +6960,21 @@ impl ClobLocalBooks {
             if let Some(value) = change.best_bid.as_ref() {
                 match value.decimal() {
                     Some(price) => reported.bid = Some(normalize_reported_bbo(price)),
-                    None => diagnostics.push(ClobDiagnostic {
+                    None if emit_diagnostic => diagnostics.push(ClobDiagnostic {
                         key: "invalid_price_change_bbo",
                         detail: format!("token={token} side=bid"),
                     }),
+                    None => {}
                 }
             }
             if let Some(value) = change.best_ask.as_ref() {
                 match value.decimal() {
                     Some(price) => reported.ask = Some(normalize_reported_bbo(price)),
-                    None => diagnostics.push(ClobDiagnostic {
+                    None if emit_diagnostic => diagnostics.push(ClobDiagnostic {
                         key: "invalid_price_change_bbo",
                         detail: format!("token={token} side=ask"),
                     }),
+                    None => {}
                 }
             }
         }
@@ -6701,15 +6998,17 @@ impl ClobLocalBooks {
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
             let off_tick = off_tick_tokens.contains(&token);
-            let summary = format!(
-                "ts={} entries={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
-                exchange_timestamp_ns,
-                entry_counts.get(&token).copied().unwrap_or(0),
-                newer_expected.bid,
-                newer_expected.ask,
-                actual.0,
-                actual.1,
-            );
+            let summary = subscribed_token(active_tokens, &token).then(|| {
+                format!(
+                    "ts={} entries={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
+                    exchange_timestamp_ns,
+                    entry_counts.get(&token).copied().unwrap_or(0),
+                    newer_expected.bid,
+                    newer_expected.ask,
+                    actual.0,
+                    actual.1,
+                )
+            });
             let pending =
                 self.pending_bbo
                     .entry(token.clone())
@@ -6739,9 +7038,11 @@ impl ClobLocalBooks {
                 pending.awaiting_tick_change |= off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
             }
-            pending.frame_summaries.push_back(summary);
-            while pending.frame_summaries.len() > CLOB_BBO_DIAGNOSTIC_FRAMES {
-                pending.frame_summaries.pop_front();
+            if let Some(summary) = summary {
+                pending.frame_summaries.push_back(summary);
+                while pending.frame_summaries.len() > CLOB_BBO_DIAGNOSTIC_FRAMES {
+                    pending.frame_summaries.pop_front();
+                }
             }
             let advertised_l1 = if !pending.expected.matches(actual) {
                 match (
@@ -6897,6 +7198,7 @@ fn process_clob_frame(
         &mut parse_buffer,
         books,
         tokens,
+        tokens,
         received_at,
         local_now,
     )
@@ -6906,6 +7208,7 @@ fn process_clob_frame_in_place(
     parse_buffer: &mut [u8],
     books: &mut ClobLocalBooks,
     tokens: &[String],
+    active_tokens: &[String],
     received_at: Instant,
     local_now: u64,
 ) -> ClobParsedBatch {
@@ -6921,8 +7224,7 @@ fn process_clob_frame_in_place(
     let frames = if is_array {
         simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut *parse_buffer)
     } else {
-        simd_json::serde::from_slice::<ClobFrame>(&mut *parse_buffer)
-            .map(|frame| vec![frame])
+        simd_json::serde::from_slice::<ClobFrame>(&mut *parse_buffer).map(|frame| vec![frame])
     };
     let frames = match frames {
         Ok(frames) => frames,
@@ -6948,6 +7250,8 @@ fn process_clob_frame_in_place(
             ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
                 batch.wire.books = batch.wire.books.saturating_add(1);
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
+                let diagnostic_token = fields.asset_id.clone();
                 match books.apply_book(
                     fields,
                     received_at,
@@ -6969,19 +7273,24 @@ fn process_clob_frame_in_place(
                         current_timestamp_ns,
                     }) => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
-                        batch.diagnostics.push(ClobDiagnostic {
-                            key: "stale_book",
-                            detail: format!(
-                                "incoming_ts={incoming_timestamp_ns} current_ts={current_timestamp_ns}"
-                            ),
-                        });
+                        if emit_diagnostic {
+                            batch.diagnostics.push(ClobDiagnostic {
+                                key: "stale_book",
+                                detail: format!(
+                                    "token={} incoming_ts={incoming_timestamp_ns} current_ts={current_timestamp_ns}",
+                                    diagnostic_token,
+                                ),
+                            });
+                        }
                     }
                     Err(detail) => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
-                        batch.diagnostics.push(ClobDiagnostic {
-                            key: "invalid_book",
-                            detail,
-                        });
+                        if emit_diagnostic {
+                            batch.diagnostics.push(ClobDiagnostic {
+                                key: "invalid_book",
+                                detail,
+                            });
+                        }
                     }
                 }
             }
@@ -6997,6 +7306,7 @@ fn process_clob_frame_in_place(
                     local_now,
                     &mut batch.wire,
                     &mut batch.diagnostics,
+                    active_tokens,
                 );
                 batch.bbo_change_snapshots =
                     batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
@@ -7008,6 +7318,8 @@ fn process_clob_frame_in_place(
             ClobFrame::Tagged(TaggedMessage::BestBidAsk(fields)) => {
                 batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
+                let diagnostic_token = fields.asset_id.clone();
                 let exchange_timestamp_ns =
                     timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
                 if is_non_tradeable_bbo(fields.best_bid, fields.best_ask) {
@@ -7032,10 +7344,15 @@ fn process_clob_frame_in_place(
                     }
                     _ => {
                         batch.wire.ignored = batch.wire.ignored.saturating_add(1);
-                        batch.diagnostics.push(ClobDiagnostic {
-                            key: "invalid_best_bid_ask",
-                            detail: format!("ts={exchange_timestamp_ns}"),
-                        });
+                        if emit_diagnostic {
+                            batch.diagnostics.push(ClobDiagnostic {
+                                key: "invalid_best_bid_ask",
+                                detail: format!(
+                                    "token={} ts={exchange_timestamp_ns}",
+                                    diagnostic_token,
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -9049,6 +9366,7 @@ mod pick_current_event_tests {
         let settled = books.flush_deferred_due(
             received_at + CLOB_BBO_SETTLE_INTERVAL + Duration::from_millis(1),
             16_105_000_000,
+            &tokens,
         );
         assert!(settled.events.is_empty());
         assert_eq!(settled.wire.bbo_mismatches, 1);
@@ -9059,6 +9377,7 @@ mod pick_current_event_tests {
         let again = books.flush_deferred_due(
             received_at + CLOB_BBO_SETTLE_INTERVAL + Duration::from_millis(2),
             16_106_000_000,
+            &tokens,
         );
         assert!(
             again.repair_tokens.is_empty(),
@@ -9132,6 +9451,7 @@ mod pick_current_event_tests {
         let stable = books.flush_deferred_due(
             received_at + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL + Duration::from_millis(10),
             17_510_000_000,
+            &tokens,
         );
         assert!(
             stable.events.iter().any(|event| matches!(
@@ -9195,8 +9515,11 @@ mod pick_current_event_tests {
             received_at + Duration::from_millis(1),
             17_301_000_000,
         );
-        let repairing =
-            books.flush_deferred_due(received_at + Duration::from_millis(52), 17_352_000_000);
+        let repairing = books.flush_deferred_due(
+            received_at + Duration::from_millis(52),
+            17_352_000_000,
+            &tokens,
+        );
         assert_eq!(repairing.repair_tokens, vec!["up".to_string()]);
 
         let fields: BookFields = serde_json::from_str(
@@ -9231,6 +9554,7 @@ mod pick_current_event_tests {
                 + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL
                 + Duration::from_millis(10),
             17_870_000_000,
+            &tokens,
         );
         assert!(stable.events.iter().any(|event| matches!(
             event,
@@ -9629,6 +9953,51 @@ mod pick_current_event_tests {
         assert!(clob_peers_are_anti_affine(active_v6, other_v6));
         assert!(!clob_peers_are_anti_affine(active_v4, None));
         assert!(!clob_peers_are_anti_affine(None, other_v4));
+    }
+
+    #[test]
+    fn standby_slow_consumer_backoff_is_jittered_monotonic_and_capped() {
+        let first = clob_standby_slow_consumer_delay(1, 7);
+        let second = clob_standby_slow_consumer_delay(2, 7);
+        let saturated = clob_standby_slow_consumer_delay(u32::MAX, 7);
+        assert!(first >= CLOB_STANDBY_RECONNECT_DELAY);
+        assert!(second > first);
+        assert_eq!(saturated, CLOB_STANDBY_SLOW_CONSUMER_MAX_BACKOFF);
+        assert_ne!(
+            clob_standby_slow_consumer_delay(1, 7),
+            clob_standby_slow_consumer_delay(1, 8),
+            "independent lanes must not reconnect on one deterministic boundary",
+        );
+    }
+
+    #[test]
+    fn retired_token_diagnostics_are_filtered_before_publication() {
+        let wire_tokens = vec!["current".to_string(), "retired".to_string()];
+        let active_tokens = vec!["current".to_string()];
+        let mut books = ClobLocalBooks::default();
+        let mut retired = br#"{"event_type":"price_change","price_changes":[{"asset_id":"retired","price":"0.40","size":"-1","side":"BUY"}],"timestamp":"1000"}"#.to_vec();
+        let retired_batch = process_clob_frame_in_place(
+            &mut retired,
+            &mut books,
+            &wire_tokens,
+            &active_tokens,
+            Instant::now(),
+            1_000_000_000,
+        );
+        assert!(retired_batch.diagnostics.is_empty());
+
+        let mut current = br#"{"event_type":"price_change","price_changes":[{"asset_id":"current","price":"0.40","size":"-1","side":"BUY"}],"timestamp":"1000"}"#.to_vec();
+        let current_batch = process_clob_frame_in_place(
+            &mut current,
+            &mut books,
+            &wire_tokens,
+            &active_tokens,
+            Instant::now(),
+            1_000_000_000,
+        );
+        assert_eq!(current_batch.diagnostics.len(), 1);
+        assert_eq!(current_batch.diagnostics[0].key, "invalid_price_change");
+        assert!(current_batch.diagnostics[0].detail.starts_with("token=current "));
     }
 
     #[test]
