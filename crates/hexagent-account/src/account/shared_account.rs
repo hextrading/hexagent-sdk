@@ -4829,6 +4829,8 @@ struct EconomicStateGuard<'a> {
     _control: RwLockWriteGuard<'a, ()>,
     state: MutexGuard<'a, SharedAccountState>,
     pending: PendingPhysicalDeltas,
+    instance_baseline: BTreeMap<String, EconomicBalance>,
+    scoped_tokens: Vec<String>,
     acquired_at: Instant,
 }
 
@@ -4850,8 +4852,27 @@ impl Drop for EconomicStateGuard<'_> {
     fn drop(&mut self) {
         let accounts = self.account.virtual_accounts.read().unwrap();
         for (instance_id, account) in accounts.iter() {
-            if let Some(ledger) = self.state.instances.get(instance_id) {
-                account.replace_ledger(ledger);
+            let (Some(ledger), Some(baseline)) = (
+                self.state.instances.get(instance_id),
+                self.instance_baseline.get(instance_id),
+            ) else {
+                continue;
+            };
+            // Apply only the cold transaction's economic delta. Private fills
+            // deliberately do not take `control_gate`, so publishing absolute
+            // copies here could overwrite a lifecycle mutation that committed
+            // after the scoped snapshot was captured.
+            let cash_delta = ledger.cash - baseline.cash;
+            if cash_delta.abs() > EPS {
+                account.cash.add(cash_delta);
+            }
+            for token in &self.scoped_tokens {
+                let before = baseline.positions.get(token).copied().unwrap_or(0.0);
+                let after = ledger.positions.get(token).copied().unwrap_or(0.0);
+                let delta = after - before;
+                if delta.abs() > EPS {
+                    account.position(token).balance.add(delta);
+                }
             }
         }
         drop(accounts);
@@ -5912,7 +5933,10 @@ impl SharedAccount {
         }
     }
 
-    fn lock_economic_state(&self) -> EconomicStateGuard<'_> {
+    fn lock_economic_state(
+        &self,
+        authoritative_tokens: &HashSet<String>,
+    ) -> EconomicStateGuard<'_> {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
         let mut state = self.state.lock().unwrap();
@@ -5925,22 +5949,48 @@ impl SharedAccount {
         self.account_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
 
+        let mut scoped_tokens: Vec<String> = authoritative_tokens.iter().cloned().collect();
+        scoped_tokens.sort_unstable();
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending = PendingPhysicalDeltas::default();
+        let mut instance_baseline = BTreeMap::new();
         for (instance_id, account) in accounts.iter() {
-            // The lifecycle mutex pairs the atomic economic snapshot with the
-            // corresponding physical-booking flags. No lifecycle collection
-            // is cloned or installed into the cold aggregate.
+            // The lifecycle mutex pairs the scoped atomic economic snapshot
+            // with the corresponding physical-booking flags. Historical zero
+            // positions, orders, trades and ownership metadata remain on the
+            // strategy shard and are not cloned by wallet calibration.
             let lifecycle = account.lifecycle.lock().unwrap();
-            state
-                .instances
-                .insert(instance_id.clone(), account.ledger_snapshot());
             let instance_pending = lifecycle.pending_physical.snapshot();
+            let cash = account.cash.load();
+            let positions = account.positions.read().unwrap();
+            let mut scoped_positions = HashMap::with_capacity(scoped_tokens.len());
+            for token in &scoped_tokens {
+                let quantity = positions
+                    .get(token)
+                    .map(|position| position.balance.load())
+                    .unwrap_or(0.0);
+                scoped_positions.insert(token.clone(), quantity);
+            }
+            drop(positions);
             pending.cash += instance_pending.cash;
             pending.unsettled |= instance_pending.unsettled;
             for (token, quantity) in instance_pending.positions {
                 *pending.positions.entry(token).or_insert(0.0) += quantity;
             }
+            let Some(ledger) = state.instances.get_mut(instance_id) else {
+                continue;
+            };
+            ledger.cash = cash;
+            for (token, quantity) in &scoped_positions {
+                ledger.positions.insert(token.clone(), *quantity);
+            }
+            instance_baseline.insert(
+                instance_id.clone(),
+                EconomicBalance {
+                    cash,
+                    positions: scoped_positions,
+                },
+            );
         }
         drop(accounts);
         recompute_reconciliation_with_pending(
@@ -5953,6 +6003,8 @@ impl SharedAccount {
             _control: control,
             state,
             pending,
+            instance_baseline,
+            scoped_tokens,
             acquired_at,
         }
     }
@@ -6816,10 +6868,11 @@ impl SharedAccount {
         state: &SharedAccountState,
         authoritative_tokens: &HashSet<String>,
         adjustment_sequence_before: u64,
+        instance_baseline: &BTreeMap<String, EconomicBalance>,
     ) {
         let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
             let mut changes = Vec::with_capacity(
-                12 + authoritative_tokens.len() + state.instances.len(),
+                12 + authoritative_tokens.len() + state.instances.len() * 2,
             );
             persistence_wal_set(
                 &mut changes,
@@ -6844,13 +6897,46 @@ impl SharedAccount {
                 ["unallocated_positions".to_string()],
                 &state.unallocated_positions,
             )?;
-            for (instance_id, ledger) in &state.instances {
-                persistence_wal_map_entry(
-                    &mut changes,
-                    "instances",
-                    instance_id,
-                    Some(ledger),
-                )?;
+            // Ordinary wallet calibration changes only physical state. A
+            // condition-scoped inferred redeem additionally changes virtual
+            // cash and the removed outcome tokens; persist only those nested
+            // leaves instead of serializing every historical position and
+            // token-interest row in the instance ledger.
+            if state.internal_adjustment_sequence > adjustment_sequence_before {
+                for (instance_id, before) in instance_baseline {
+                    let Some(after) = state.instances.get(instance_id) else {
+                        continue;
+                    };
+                    if after.cash != before.cash {
+                        persistence_wal_set(
+                            &mut changes,
+                            [
+                                "instances".to_string(),
+                                instance_id.clone(),
+                                "cash".to_string(),
+                            ],
+                            &after.cash,
+                        )?;
+                    }
+                    for token in authoritative_tokens {
+                        let before_quantity =
+                            before.positions.get(token).copied().unwrap_or(0.0);
+                        let after_quantity =
+                            after.positions.get(token).copied().unwrap_or(0.0);
+                        if after_quantity != before_quantity {
+                            persistence_wal_set(
+                                &mut changes,
+                                [
+                                    "instances".to_string(),
+                                    instance_id.clone(),
+                                    "positions".to_string(),
+                                    token.clone(),
+                                ],
+                                &after_quantity,
+                            )?;
+                        }
+                    }
+                }
             }
             for (field, value) in [
                 (
@@ -9079,7 +9165,7 @@ impl SharedAccount {
         if !has_observable_divergence {
             return false;
         }
-        let mut state = self.lock_economic_state();
+        let mut state = self.lock_economic_state(authoritative_tokens);
         let pending = state.pending.clone();
         let unsettled_trade = pending.unsettled;
         let unsettled_maintenance = has_unsettled_maintenance_operation(&state);
@@ -9151,9 +9237,10 @@ impl SharedAccount {
             Some(&pending),
         );
         self.schedule_wallet_calibration_persist(
-            &state,
+            &state.state,
             authoritative_tokens,
             adjustment_sequence_before,
+            &state.instance_baseline,
         );
         let examples: Vec<_> = changed_tokens.iter().take(16).collect();
         log::info!(
@@ -18502,6 +18589,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scoped_wallet_calibration_merges_only_its_virtual_delta() {
+        let account = SharedAccount::new("scoped-wallet-delta");
+        account.register_instance("maker", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([("UP".into(), 20.0)]))
+            .unwrap();
+        let virtual_account = account.virtual_account("maker").unwrap();
+        let position = virtual_account.position("UP");
+        let authoritative_tokens = HashSet::from(["UP".to_string()]);
+
+        let mut state = account.lock_economic_state(&authoritative_tokens);
+        // Model a private fill committing after the scoped snapshot. The cold
+        // transaction must add its own adjustment without publishing the old
+        // absolute cash/position copy over this newer lifecycle mutation.
+        virtual_account.cash.add(-0.5);
+        position.balance.add(1.0);
+        state.instances.get_mut("maker").unwrap().cash += 10.0;
+        *state
+            .instances
+            .get_mut("maker")
+            .unwrap()
+            .positions
+            .get_mut("UP")
+            .unwrap() -= 2.0;
+        drop(state);
+
+        assert!((virtual_account.cash.load() - 109.5).abs() <= EPS);
+        assert!((position.balance.load() - 19.0).abs() <= EPS);
+        assert!(Arc::ptr_eq(&position, &virtual_account.position("UP")));
+    }
+
+    #[test]
+    #[ignore = "focused condition-scoped wallet calibration latency benchmark"]
+    fn benchmark_scoped_wallet_calibration_with_historical_positions() {
+        const HISTORICAL_POSITIONS: usize = 3_400;
+        const EVENTS: usize = 40;
+        let account = SharedAccount::new("scoped-wallet-benchmark");
+        account.register_instance("maker", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([("UP".into(), 20.0)]))
+            .unwrap();
+        let virtual_account = account.virtual_account("maker").unwrap();
+        {
+            let mut positions = virtual_account.positions.write().unwrap();
+            let mut state = account.state.lock().unwrap();
+            let ledger = state.instances.get_mut("maker").unwrap();
+            for index in 0..HISTORICAL_POSITIONS {
+                let token = format!("historical-token-{index:04}");
+                positions.insert(token.clone(), Arc::new(VirtualPositionQuota::new(0.0, 0.0)));
+                ledger.positions.insert(token, 0.0);
+            }
+        }
+
+        let authoritative_tokens = HashSet::from(["UP".to_string(), "DOWN".to_string()]);
+        let position = virtual_account.position("UP");
+        let mut observed_cash = 100.0;
+        let mut observed_position = 20.0;
+        let mut samples = Vec::with_capacity(EVENTS);
+        for index in 0..EVENTS {
+            let direction = if index % 2 == 0 { 1.0 } else { -1.0 };
+            observed_cash -= direction * 0.5;
+            observed_position += direction;
+            virtual_account.cash.add(-direction * 0.5);
+            position.balance.add(direction);
+            let started = Instant::now();
+            assert!(!account.observe_platform_binary_redeem(
+                observed_cash,
+                &HashMap::from([("UP".to_string(), observed_position)]),
+                &authoritative_tokens,
+            ));
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let summary = latency_summary_ns(&mut samples);
+        eprintln!(
+            "scoped wallet calibration (historical_positions={HISTORICAL_POSITIONS}, events={EVENTS}, queue_depth=0, overflow=0) ns median/p99/p999/max={}/{}/{}/{} account_hold_last_us={}",
+            summary.0,
+            summary.1,
+            summary.2,
+            summary.3,
+            account.account_lock_hold_last_us.load(Ordering::Relaxed),
+        );
+        assert!(summary.2 < 20_000_000);
+    }
+
     fn persistence_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -23146,6 +23318,54 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!((account.instance_snapshot("a").unwrap().cash - 89.975).abs() <= EPS);
         assert!((account.instance_snapshot("b").unwrap().cash - 89.975).abs() <= EPS);
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn condition_scoped_wallet_delta_survives_persistence_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-scoped-wallet-delta-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = SharedAccount::new_persistent("scoped-wallet-restart", &path).unwrap();
+            account.register_instance("btc", 1.0);
+            account
+                .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([("BTC-WIN".into(), 30.0), ("BTC-LOSE".into(), 30.0)]),
+                )
+                .unwrap();
+            account.record_settled_token_values(&HashMap::from([
+                ("BTC-WIN".into(), 1.0),
+                ("BTC-LOSE".into(), 0.0),
+            ]));
+            assert!(account.observe_platform_binary_redeem(
+                130.0,
+                &HashMap::new(),
+                &HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+            ));
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent("scoped-wallet-restart", &path).unwrap();
+        let instance = restored.instance_snapshot("btc").unwrap();
+        assert!((instance.cash - 130.0).abs() <= EPS);
+        assert!(instance
+            .positions
+            .values()
+            .all(|quantity| quantity.abs() <= EPS));
+        let metric = restored.monitoring_snapshot();
+        assert!((metric.physical_cash - 130.0).abs() <= EPS);
+        assert!(metric.physical_positions.is_empty());
+        assert!(metric.unallocated_cash.abs() <= EPS);
+        assert!(metric.unallocated_positions.is_empty());
+        drop(restored);
+        remove_persistence_test_files(&path);
     }
 
     #[test]
