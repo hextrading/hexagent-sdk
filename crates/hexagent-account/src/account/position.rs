@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use log::info;
+use log::{debug, info, warn};
 
 use crate::account::orderbook::OrderbookManager;
 use crate::account::shared_account::RestoredTrade;
@@ -626,26 +626,46 @@ impl PositionManager {
             else { self.taker_volume += notional; }
         }
 
-        // Tail-append `error="..."` ONLY when the upstream supplied a
-        // non-empty reason. Keeps the happy-path log shape identical
-        // for downstream parsers that key on the legacy fields.
+        // The exchange order-audit recorder is the durable per-trade stream.
+        // Keep ordinary transitions off the console; only an upstream error
+        // remains operationally visible. Using the disabled debug lane also
+        // avoids allocating and formatting an `error_part` string here.
         if log_transition {
-            let error_part = match error {
-                Some(s) if !s.is_empty() => format!(" error=\"{}\"", s),
-                _ => String::new(),
+            let transition = match outcome.accumulator_sign {
+                1 => "new",
+                -1 => "rev",
+                _ => "upd",
             };
-            info!(
-                "[PositionManager] {} {} {} {:.4} @ {:.4} ({}) status={:?} fee_usdc={:.4} fee_shares={:.4} sign={:+}{}",
-                match outcome.accumulator_sign {
-                    1 => "new",
-                    -1 => "rev",
-                    _ => "upd",
-                },
-                asset_id, side, size, price,
-                if is_maker { "maker" } else { "taker" },
-                status, usdc_fee, shares_fee, outcome.accumulator_sign,
-                error_part,
-            );
+            let liquidity = if is_maker { "maker" } else { "taker" };
+            match error {
+                Some(reason) if !reason.is_empty() => warn!(
+                    "[PositionManager] {} {} {} {:.4} @ {:.4} ({}) status={:?} fee_usdc={:.4} fee_shares={:.4} sign={:+} error={:?}",
+                    transition,
+                    asset_id,
+                    side,
+                    size,
+                    price,
+                    liquidity,
+                    status,
+                    usdc_fee,
+                    shares_fee,
+                    outcome.accumulator_sign,
+                    reason,
+                ),
+                _ => debug!(
+                    "[PositionManager] {} {} {} {:.4} @ {:.4} ({}) status={:?} fee_usdc={:.4} fee_shares={:.4} sign={:+}",
+                    transition,
+                    asset_id,
+                    side,
+                    size,
+                    price,
+                    liquidity,
+                    status,
+                    usdc_fee,
+                    shares_fee,
+                    outcome.accumulator_sign,
+                ),
+            }
         }
 
         outcome
