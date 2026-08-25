@@ -44,6 +44,7 @@ const MAINTENANCE_ADMISSION_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(
 const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
+const ACCOUNT_PERSISTENCE_QUEUE_CAPACITY: usize = 65_536;
 const ROUTE_SHARD_COUNT: usize = 64;
 const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
 /// One request can be executing while one retry waits behind it. The GC
@@ -1089,6 +1090,7 @@ pub struct AccountMonitoringSnapshot {
     pub persistence_generation_lag: u64,
     pub persistence_pending_jobs: usize,
     pub persistence_pending_high_water: usize,
+    pub persistence_queue_overflows: u64,
     /// Settled-history deletion is routed to dedicated cold owner tasks.
     /// These counters make a missing/stalled cold mailbox distinguishable
     /// from persistence or account-lock latency.
@@ -2319,9 +2321,10 @@ struct PersistenceJob {
 
 #[derive(Debug, Clone)]
 enum PersistenceJobPayload {
-    /// Compatibility fallback for cold/complex mutations. The writer snapshots
-    /// those under the account lock.
-    FullSnapshot,
+    /// Owned compatibility fallback for cold/complex mutations. The cold
+    /// account owner clones while it already owns the state; the WAL writer
+    /// never reaches back into live account state.
+    FullSnapshot(Box<SharedAccountState>),
     Changes(Vec<PersistenceWalChange>),
     /// Raw reservation data is converted to JSON only on the WAL writer. This
     /// keeps path allocation and serde work off the signed-to-dispatch lane.
@@ -2384,18 +2387,9 @@ struct VirtualTradePersistenceDelta {
 }
 
 #[derive(Debug)]
-enum PersistenceSignal {
-    Wake,
-    Shutdown,
-}
-
-#[derive(Debug)]
-struct PersistenceProgress {
-    completed_generation: u64,
-    last_error: Option<String>,
-    writes: u64,
-    write_last_us: u64,
-    write_max_us: u64,
+enum PersistenceCommand {
+    Job(PersistenceJob),
+    Shutdown { target_generation: u64 },
 }
 
 /// Single-writer incremental WAL. Hot order/trade mutations enqueue typed
@@ -2407,10 +2401,16 @@ struct PersistenceProgress {
 struct AccountPersistence {
     path: PathBuf,
     _lock_file: std::fs::File,
-    pending: Arc<Mutex<Vec<PersistenceJob>>>,
-    wake: std::sync::mpsc::SyncSender<PersistenceSignal>,
+    tx: crossbeam_channel::Sender<PersistenceCommand>,
+    progress_rx: crossbeam_channel::Receiver<()>,
     next_generation: Arc<AtomicU64>,
-    progress: Arc<(Mutex<PersistenceProgress>, Condvar)>,
+    completed_generation: Arc<AtomicU64>,
+    last_error: Arc<ArcSwapOption<String>>,
+    enqueue_failed: Arc<AtomicBool>,
+    writes: Arc<AtomicU64>,
+    write_last_us: Arc<AtomicU64>,
+    write_max_us: Arc<AtomicU64>,
+    queue_overflows: AtomicU64,
     flushes: AtomicU64,
     flush_last_us: AtomicU64,
     flush_max_us: AtomicU64,
@@ -2422,30 +2422,40 @@ struct AccountPersistence {
 
 impl AccountPersistence {
     fn enqueue(&self, payload: PersistenceJobPayload) {
-        // Generation assignment and queue insertion are one critical section.
-        // Route sharding permits concurrent instance writers; assigning the
-        // generation before taking this lock could publish [N+1, N] and make
-        // the WAL writer replay absolute virtual-account counters backwards.
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.enqueue_failed.load(Ordering::Acquire) {
+            // Once one generation is missing, accepting later work can only
+            // grow the reorder buffer: it can never become durable. Keep the
+            // lane bounded and leave admission fail-closed until restart.
+            self.queue_overflows.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        pending.push(PersistenceJob {
+        let job = PersistenceJob {
             generation,
             payload,
-        });
+        };
+        if let Err(error) = self.tx.try_send(PersistenceCommand::Job(job)) {
+            // A missing generation intentionally stops ordered replay. Health
+            // probes fail closed and expose the queue overflow; silently
+            // skipping it would allow a later absolute delta to become durable
+            // ahead of the lost lifecycle mutation.
+            self.enqueue_failed.store(true, Ordering::Release);
+            self.queue_overflows.fetch_add(1, Ordering::Relaxed);
+            self.last_error.store(Some(Arc::new(format!(
+                "account persistence queue overflow at generation {generation}: {error}"
+            ))));
+            return;
+        }
         self.pending_high_water
-            .fetch_max(pending.len(), Ordering::Relaxed);
-        drop(pending);
-        let _ = self.wake.try_send(PersistenceSignal::Wake);
+            .fetch_max(self.tx.len(), Ordering::Relaxed);
     }
 
     fn start(
         path: PathBuf,
         account_id: String,
-        state: Arc<Mutex<SharedAccountState>>,
+        initial_state: SharedAccountState,
         initial_generation: u64,
+        queue_capacity: usize,
     ) -> Result<Self, String> {
         #[cfg(test)]
         let write_delay_ms = Arc::new(AtomicU64::new(0));
@@ -2477,7 +2487,6 @@ impl AccountPersistence {
         // Startup is the only full-snapshot commit. It folds every recovered
         // WAL record and any schema/reconciliation migration into one atomic
         // image, then resets the incremental log before live workers start.
-        let initial_state = state.lock().unwrap().clone();
         let initial_snapshot = PersistedAccount {
             version: PERSISTENCE_VERSION,
             account_id: account_id.clone(),
@@ -2494,23 +2503,22 @@ impl AccountPersistence {
             initial_generation,
         );
 
-        let progress = Arc::new((
-            Mutex::new(PersistenceProgress {
-                completed_generation: initial_generation,
-                last_error: None,
-                writes: 0,
-                write_last_us: 0,
-                write_max_us: 0,
-            }),
-            Condvar::new(),
-        ));
         let next_generation = Arc::new(AtomicU64::new(initial_generation));
-        let pending = Arc::new(Mutex::new(Vec::<PersistenceJob>::new()));
-        let (wake, rx) = std::sync::mpsc::sync_channel::<PersistenceSignal>(1);
-        let thread_pending = Arc::clone(&pending);
-        let thread_progress = Arc::clone(&progress);
+        let completed_generation = Arc::new(AtomicU64::new(initial_generation));
+        let last_error = Arc::new(ArcSwapOption::empty());
+        let enqueue_failed = Arc::new(AtomicBool::new(false));
+        let writes = Arc::new(AtomicU64::new(0));
+        let write_last_us = Arc::new(AtomicU64::new(0));
+        let write_max_us = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = crossbeam_channel::bounded::<PersistenceCommand>(queue_capacity);
+        let (progress_tx, progress_rx) = crossbeam_channel::bounded::<()>(1);
+        let thread_completed_generation = Arc::clone(&completed_generation);
+        let thread_last_error = Arc::clone(&last_error);
+        let thread_enqueue_failed = Arc::clone(&enqueue_failed);
+        let thread_writes = Arc::clone(&writes);
+        let thread_write_last_us = Arc::clone(&write_last_us);
+        let thread_write_max_us = Arc::clone(&write_max_us);
         let thread_path = path.clone();
-        let thread_state = Arc::clone(&state);
         let mut durable_state = serde_json::to_value(initial_state).map_err(|error| {
             format!(
                 "serialize account ledger WAL baseline {}: {error}",
@@ -2527,20 +2535,52 @@ impl AccountPersistence {
             .spawn(move || {
                 hexagent_runtime::os_tune::pin_background("account-ledger-writer");
                 let mut durable_wal_len = 0u64;
-                while let Ok(signal) = rx.recv() {
-                    loop {
-                        // Detach the batch so producers append to a fresh Vec
-                        // while JSON and disk work proceeds.
-                        let mut jobs = {
-                            let mut pending = thread_pending
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            std::mem::take(&mut *pending)
-                        };
-                        let Some(last) = jobs.last() else {
-                            break;
-                        };
-                        let generation = last.generation;
+                let mut reordered = BTreeMap::<u64, PersistenceJob>::new();
+                let mut next_expected_generation = initial_generation.saturating_add(1);
+                let mut shutdown_target = None;
+                loop {
+                    let command = if reordered.is_empty() && shutdown_target.is_none() {
+                        rx.recv().ok()
+                    } else {
+                        match rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(command) => Some(command),
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    };
+                    if let Some(command) = command {
+                        match command {
+                            PersistenceCommand::Job(job) => {
+                                reordered.insert(job.generation, job);
+                            }
+                            PersistenceCommand::Shutdown { target_generation } => {
+                                shutdown_target = Some(target_generation);
+                            }
+                        }
+                    }
+                    while let Ok(command) = rx.try_recv() {
+                        match command {
+                            PersistenceCommand::Job(job) => {
+                                reordered.insert(job.generation, job);
+                            }
+                            PersistenceCommand::Shutdown { target_generation } => {
+                                shutdown_target = Some(target_generation);
+                            }
+                        }
+                    }
+
+                    // Atomic ticket assignment can race channel publication
+                    // across producers. Hold later tickets until the missing
+                    // predecessor arrives, then persist one contiguous batch.
+                    let mut jobs = Vec::new();
+                    while let Some(job) = reordered.remove(&next_expected_generation) {
+                        next_expected_generation = next_expected_generation.saturating_add(1);
+                        jobs.push(job);
+                    }
+                    if !jobs.is_empty() {
+                        let first_generation = jobs[0].generation;
+                        let generation = jobs.last().map(|job| job.generation).unwrap_or(0);
+                        let retry_jobs = jobs.clone();
                         jobs = coalesce_persistence_jobs(jobs);
                         let started = std::time::Instant::now();
                         #[cfg(test)]
@@ -2552,28 +2592,27 @@ impl AccountPersistence {
                         }
                         let result = (|| -> Result<(), String> {
                             let last_full_snapshot = jobs.iter().rposition(|job| {
-                                matches!(job.payload, PersistenceJobPayload::FullSnapshot)
+                                matches!(job.payload, PersistenceJobPayload::FullSnapshot(_))
                             });
                             let changes = if let Some(full_index) = last_full_snapshot {
-                                // schedule_persist() runs while the same state
-                                // mutex is held, so once the writer acquires it
-                                // this clone includes every queued generation.
-                                let snapshot = thread_state
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clone();
-                                let mut next_state =
-                                    serde_json::to_value(snapshot).map_err(|error| {
+                                let snapshot = match &jobs[full_index].payload {
+                                    PersistenceJobPayload::FullSnapshot(snapshot) => snapshot,
+                                    _ => unreachable!("full snapshot index must name a snapshot"),
+                                };
+                                let mut next_state = serde_json::to_value(snapshot).map_err(
+                                    |error| {
                                         format!(
                                             "serialize account ledger WAL fallback {}: {error}",
                                             thread_path.display()
                                         )
-                                    })?;
+                                    },
+                                )?;
                                 // Virtual-account hot deltas scheduled after
                                 // the latest cold snapshot are not present in
-                                // `thread_state`. Replay only that suffix on top
-                                // of the snapshot; earlier absolute deltas were
-                                // already folded by the cold control transaction.
+                                // the owned cold snapshot. Replay only that
+                                // suffix on top of the snapshot; earlier
+                                // absolute deltas were already folded by the
+                                // cold control transaction.
                                 for job in jobs.iter().skip(full_index + 1) {
                                     for change in materialize_persistence_job(job)? {
                                         apply_persistence_wal_change(&mut next_state, change)?;
@@ -2639,36 +2678,38 @@ impl AccountPersistence {
                             Ok(())
                         })();
                         let error = match result {
-                            Ok(_) => None,
+                            Ok(_) => {
+                                thread_completed_generation.store(generation, Ordering::Release);
+                                if !thread_enqueue_failed.load(Ordering::Acquire) {
+                                    thread_last_error.store(None);
+                                }
+                                None
+                            }
                             Err(error) => {
-                                // Failed jobs must stay ahead of work queued
-                                // while this batch was being written.
-                                let mut pending = thread_pending
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                jobs.append(&mut *pending);
-                                *pending = jobs;
+                                next_expected_generation = first_generation;
+                                for job in retry_jobs {
+                                    reordered.insert(job.generation, job);
+                                }
+                                thread_last_error.store(Some(Arc::new(error.clone())));
                                 Some(error)
                             }
                         };
                         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                        let (lock, cv) = &*thread_progress;
-                        let mut progress =
-                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if error.is_none() {
-                            progress.completed_generation =
-                                progress.completed_generation.max(generation);
-                        }
-                        progress.last_error = error;
-                        progress.writes = progress.writes.saturating_add(1);
-                        progress.write_last_us = elapsed_us;
-                        progress.write_max_us = progress.write_max_us.max(elapsed_us);
-                        cv.notify_all();
-                        if progress.last_error.is_some() {
+                        thread_writes.fetch_add(1, Ordering::Relaxed);
+                        thread_write_last_us.store(elapsed_us, Ordering::Relaxed);
+                        thread_write_max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+                        let _ = progress_tx.try_send(());
+                        if error.is_some() && shutdown_target.is_some() {
                             break;
                         }
                     }
-                    if matches!(signal, PersistenceSignal::Shutdown) {
+
+                    if thread_enqueue_failed.load(Ordering::Acquire) && shutdown_target.is_some() {
+                        break;
+                    }
+                    if shutdown_target.is_some_and(|target| {
+                        thread_completed_generation.load(Ordering::Acquire) >= target
+                    }) {
                         break;
                     }
                 }
@@ -2677,10 +2718,16 @@ impl AccountPersistence {
         Ok(Self {
             path,
             _lock_file: lock_file,
-            pending,
-            wake,
+            tx,
+            progress_rx,
             next_generation,
-            progress,
+            completed_generation,
+            last_error,
+            enqueue_failed,
+            writes,
+            write_last_us,
+            write_max_us,
+            queue_overflows: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             flush_last_us: AtomicU64::new(0),
             flush_max_us: AtomicU64::new(0),
@@ -2691,8 +2738,12 @@ impl AccountPersistence {
         })
     }
 
-    fn schedule(&self) {
-        self.enqueue(PersistenceJobPayload::FullSnapshot);
+    fn schedule(&self, state: &SharedAccountState) {
+        if self.enqueue_failed.load(Ordering::Acquire) {
+            self.queue_overflows.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.enqueue(PersistenceJobPayload::FullSnapshot(Box::new(state.clone())));
     }
 
     fn schedule_delta(&self, changes: Vec<PersistenceWalChange>) {
@@ -2733,13 +2784,8 @@ impl AccountPersistence {
         if generation == 0 {
             return true;
         }
-        self.progress
-            .0
-            .lock()
-            .map(|progress| {
-                progress.completed_generation >= generation && progress.last_error.is_none()
-            })
-            .unwrap_or(false)
+        self.last_error.load().is_none()
+            && self.completed_generation.load(Ordering::Acquire) >= generation
     }
 
     fn flush(&self, timeout: Duration) -> Result<(), String> {
@@ -2755,70 +2801,52 @@ impl AccountPersistence {
             record_latency();
             return Ok(());
         }
-        let _ = self.wake.try_send(PersistenceSignal::Wake);
-        let (lock, cv) = &*self.progress;
-        let progress = lock.lock().unwrap();
-        let (progress, wait) = cv
-            .wait_timeout_while(progress, timeout, |p| {
-                p.completed_generation < target && p.last_error.is_none()
-            })
-            .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
-        if progress.completed_generation < target && wait.timed_out() {
-            record_latency();
-            return Err(format!(
-                "timed out persisting generation {target} to {}",
-                self.path.display()
-            ));
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(error) = self.last_error() {
+                record_latency();
+                return Err(error);
+            }
+            if self.completed_generation.load(Ordering::Acquire) >= target {
+                record_latency();
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                record_latency();
+                return Err(format!(
+                    "timed out persisting generation {target} to {}",
+                    self.path.display()
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let _ = self
+                .progress_rx
+                .recv_timeout(remaining.min(Duration::from_millis(10)));
         }
-        if let Some(error) = &progress.last_error {
-            record_latency();
-            return Err(error.clone());
-        }
-        record_latency();
-        Ok(())
     }
 
     fn last_error(&self) -> Option<String> {
-        self.progress
-            .0
-            .lock()
-            .ok()
-            .and_then(|p| p.last_error.clone())
+        self.last_error.load_full().map(|error| (*error).clone())
     }
 
     fn is_current(&self) -> Result<bool, String> {
         let target = self.scheduled_generation();
-        let progress = self
-            .progress
-            .0
-            .lock()
-            .map_err(|_| "account ledger writer progress lock poisoned".to_string())?;
-        if let Some(error) = &progress.last_error {
-            return Err(error.clone());
+        if let Some(error) = self.last_error() {
+            return Err(error);
         }
-        Ok(progress.completed_generation >= target)
+        Ok(self.completed_generation.load(Ordering::Acquire) >= target)
     }
 
-    fn metrics(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, usize, usize) {
+    fn metrics(
+        &self,
+    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, usize, usize, u64) {
         let scheduled_generation = self.scheduled_generation();
-        let (writes, write_last_us, write_max_us, completed_generation) = self
-            .progress
-            .0
-            .lock()
-            .map(|progress| {
-                (
-                    progress.writes,
-                    progress.write_last_us,
-                    progress.write_max_us,
-                    progress.completed_generation,
-                )
-            })
-            .unwrap_or_default();
-        let pending_jobs = self
-            .pending
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or_default();
+        let writes = self.writes.load(Ordering::Relaxed);
+        let write_last_us = self.write_last_us.load(Ordering::Relaxed);
+        let write_max_us = self.write_max_us.load(Ordering::Relaxed);
+        let completed_generation = self.completed_generation.load(Ordering::Acquire);
+        let pending_jobs = self.tx.len();
         (
             writes,
             write_last_us,
@@ -2831,16 +2859,15 @@ impl AccountPersistence {
             scheduled_generation.saturating_sub(completed_generation),
             pending_jobs,
             self.pending_high_water.load(Ordering::Relaxed),
+            self.queue_overflows.load(Ordering::Relaxed),
         )
     }
 }
 
 impl Drop for AccountPersistence {
     fn drop(&mut self) {
-        // A blocking shutdown send cannot lose a coalesced wake: if the queue
-        // is full, the writer first consumes that wake and drains the latest
-        // generation before receiving Shutdown.
-        let _ = self.wake.send(PersistenceSignal::Shutdown);
+        let target_generation = self.next_generation.load(Ordering::Acquire);
+        let _ = self.tx.send(PersistenceCommand::Shutdown { target_generation });
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
@@ -2958,7 +2985,7 @@ fn persistence_wal_set_membership<T: Serialize>(
 
 fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWalChange>, String> {
     match &job.payload {
-        PersistenceJobPayload::FullSnapshot => {
+        PersistenceJobPayload::FullSnapshot(_) => {
             Err("full snapshot persistence job cannot be materialized as a typed delta".to_string())
         }
         PersistenceJobPayload::Changes(changes) => Ok(changes.clone()),
@@ -3171,7 +3198,7 @@ fn coalesce_persistence_jobs(jobs: Vec<PersistenceJob>) -> Vec<PersistenceJob> {
             PersistenceJobPayload::UnresolvedTradeMatchTime { trade_key, .. } => {
                 unresolved.insert(trade_key.clone())
             }
-            PersistenceJobPayload::FullSnapshot | PersistenceJobPayload::Changes(_) => true,
+            PersistenceJobPayload::FullSnapshot(_) | PersistenceJobPayload::Changes(_) => true,
         };
         if keep {
             retained.push(job);
@@ -5504,7 +5531,12 @@ impl SharedAccount {
         account_id: impl Into<String>,
         path: impl Into<PathBuf>,
     ) -> Result<Self, String> {
-        Self::new_persistent_inner(account_id.into(), path.into(), false)
+        Self::new_persistent_inner(
+            account_id.into(),
+            path.into(),
+            false,
+            ACCOUNT_PERSISTENCE_QUEUE_CAPACITY,
+        )
     }
 
     /// Open a durable live-trading ledger while admitting only the narrow
@@ -5518,13 +5550,19 @@ impl SharedAccount {
         account_id: impl Into<String>,
         path: impl Into<PathBuf>,
     ) -> Result<Self, String> {
-        Self::new_persistent_inner(account_id.into(), path.into(), true)
+        Self::new_persistent_inner(
+            account_id.into(),
+            path.into(),
+            true,
+            ACCOUNT_PERSISTENCE_QUEUE_CAPACITY,
+        )
     }
 
     fn new_persistent_inner(
         account_id: String,
         path: PathBuf,
         allow_query_repair: bool,
+        persistence_queue_capacity: usize,
     ) -> Result<Self, String> {
         let (state, initial_generation, startup_aggregate_repairs) = if path.exists() {
             let bytes = std::fs::read(&path)
@@ -5799,13 +5837,14 @@ impl SharedAccount {
         let initial_settled_generation = Self::effective_settled_token_values_generation(&state);
         let initial_settled_values = state.settled_token_values.clone();
         let initial_retired_order_audit_tombstones = state.retired_order_audit_tombstones.clone();
-        let state = Arc::new(Mutex::new(state));
         let persistence = AccountPersistence::start(
             path,
             account_id.clone(),
-            Arc::clone(&state),
+            state.clone(),
             initial_generation,
+            persistence_queue_capacity,
         )?;
+        let state = Arc::new(Mutex::new(state));
         if !startup_aggregate_repairs.is_empty() {
             log::warn!(
                 "[shared_account] account={} startup repaired under-reserved instance aggregate(s) from durable roots before admission: {:?}",
@@ -6865,9 +6904,9 @@ impl SharedAccount {
         *current
     }
 
-    fn schedule_persist(&self, _state: &SharedAccountState) {
+    fn schedule_persist(&self, state: &SharedAccountState) {
         if let Some(persistence) = &self.persistence {
-            persistence.schedule();
+            persistence.schedule(state);
         }
     }
 
@@ -6888,8 +6927,7 @@ impl SharedAccount {
                     self.account_id,
                     error,
                 );
-                let _ = state;
-                persistence.schedule();
+                persistence.schedule(state);
             }
         }
     }
@@ -9857,6 +9895,7 @@ impl SharedAccount {
             persistence_generation_lag: persistence_metrics.8,
             persistence_pending_jobs: persistence_metrics.9,
             persistence_pending_high_water: persistence_metrics.10,
+            persistence_queue_overflows: persistence_metrics.11,
             settled_gc_candidates: settled_gc_metrics.0,
             settled_gc_inflight_requests: settled_gc_metrics.1,
             settled_gc_request_queue_depth: settled_gc_metrics.2,
@@ -10002,6 +10041,7 @@ impl SharedAccount {
             persistence_generation_lag: persistence_metrics.8,
             persistence_pending_jobs: persistence_metrics.9,
             persistence_pending_high_water: persistence_metrics.10,
+            persistence_queue_overflows: persistence_metrics.11,
             settled_gc_candidates: settled_gc_metrics.0,
             settled_gc_inflight_requests: settled_gc_metrics.1,
             settled_gc_request_queue_depth: settled_gc_metrics.2,
@@ -23896,6 +23936,59 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert!(compacted.persistence_generation > 0);
             assert!(compacted.state.orders.contains_key("a-wal"));
+        }
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn bounded_persistence_lane_reports_overflow_without_blocking_cold_owner() {
+        const EVENTS: usize = 128;
+        const CAPACITY: usize = 2;
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-persistence-overflow-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let mut samples = Vec::with_capacity(EVENTS);
+        {
+            let persistence = AccountPersistence::start(
+                path.clone(),
+                "persistence-overflow".to_string(),
+                SharedAccountState::default(),
+                0,
+                CAPACITY,
+            )
+            .unwrap();
+            persistence
+                .write_delay_ms
+                .store(250, Ordering::Relaxed);
+
+            for index in 0..EVENTS {
+                let started = Instant::now();
+                persistence.schedule_delta(vec![PersistenceWalChange::Set {
+                    path: vec!["ledger_generation".to_string()],
+                    value: serde_json::json!(index),
+                }]);
+                samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            }
+
+            let metrics = persistence.metrics();
+            assert!(persistence.last_error().is_some());
+            assert!(metrics.11 > 0);
+            assert!(metrics.10 <= CAPACITY);
+            assert!(persistence.is_current().is_err());
+            let summary = latency_summary_ns(&mut samples);
+            eprintln!(
+                "bounded persistence ingress n={EVENTS} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
+                summary.0,
+                summary.1,
+                summary.2,
+                summary.3,
+                metrics.10,
+                metrics.11,
+            );
+            assert!(summary.3 < 50_000_000);
         }
         remove_persistence_test_files(&path);
     }

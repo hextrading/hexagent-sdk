@@ -8,8 +8,8 @@
 use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 // ════════════════════════════════════════════════════════════════
 // Constants
@@ -120,8 +120,9 @@ pub struct OrderSigner {
     /// EIP-712 domain separator — constant per (exchange, chain), so it is
     /// computed once here instead of 4 keccaks per signed order.
     domain_sep: [u8; 32],
-    /// Pre-lowercased maker key for `account_salt_prekeyed`.
-    salt_key: String,
+    /// Account-scoped salt owner injected at construction. Live order signing
+    /// never consults a process-global map or takes a lock.
+    salt_sequence: Arc<AccountSaltSequence>,
 }
 
 impl OrderSigner {
@@ -131,6 +132,20 @@ impl OrderSigner {
         private_key_hex: &str,
         neg_risk: bool,
         sig_type: SignatureType,
+    ) -> Result<Self> {
+        Self::new_with_salt_sequence(
+            private_key_hex,
+            neg_risk,
+            sig_type,
+            Arc::new(AccountSaltSequence::new()),
+        )
+    }
+
+    pub(crate) fn new_with_salt_sequence(
+        private_key_hex: &str,
+        neg_risk: bool,
+        sig_type: SignatureType,
+        salt_sequence: Arc<AccountSaltSequence>,
     ) -> Result<Self> {
         let hex_clean = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
         let key_bytes = hex::decode(hex_clean)
@@ -148,8 +163,15 @@ impl OrderSigner {
         };
 
         let domain_sep = compute_domain_separator(&exchange_address);
-        let salt_key = maker_address.to_ascii_lowercase();
-        Ok(Self { signing_key, signer_address, maker_address, exchange_address, signature_type: sig_type, domain_sep, salt_key })
+        Ok(Self {
+            signing_key,
+            signer_address,
+            maker_address,
+            exchange_address,
+            signature_type: sig_type,
+            domain_sep,
+            salt_sequence,
+        })
     }
 
     /// Sign an order, returning the hex-encoded signature with 0x prefix.
@@ -223,7 +245,7 @@ impl OrderSigner {
         };
 
         let order = ClobOrder {
-            salt: account_salt_prekeyed(&self.salt_key),
+            salt: self.salt_sequence.next_decimal(),
             maker: self.maker_address.clone(),   // Safe proxy or EOA
             signer: self.signer_address.clone(), // always EOA
             taker: ZERO_ADDRESS.to_string(),
@@ -389,31 +411,46 @@ fn startup_secs() -> u32 {
     })
 }
 
-/// Per-account monotonic order counters, keyed by lowercased maker address.
-fn salt_counters() -> &'static Mutex<HashMap<String, u64>> {
-    static COUNTERS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Monotonic salt source owned by one live account route. V1 and V2 signers
+/// for that route share the same instance, so their order streams cannot reuse
+/// a counter without a global registry or a contended cache line.
+#[derive(Debug)]
+pub(crate) struct AccountSaltSequence {
+    counter: AtomicU64,
 }
 
-/// Per-account salt as a decimal string (fits in u64, so the submission layer's
+impl AccountSaltSequence {
+    pub(crate) fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn next_decimal(&self) -> String {
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+        let salt = ((startup_secs() as u64) << 32) | (counter & 0xFFFF_FFFF);
+        salt.to_string()
+    }
+}
+
+/// Compatibility salt as a decimal string (fits in u64, so the submission layer's
 /// `as u64` downcast is lossless and the server-recomputed EIP-712 hash matches
 /// the locally-signed one).
 ///
 /// Layout (64 bits): `[ high 32: startup Unix seconds | low 32: counter ]`
 ///   - high 32 = process start second → differs across restarts, and is
 ///     directly readable (`salt >> 32` = run start second)
-///   - low 32  = per-account counter, incremented once per order within a run
+///   - low 32  = compatibility counter, incremented once per call within a run
 ///
 /// Guarantees:
-///   - within one run an account never reuses a salt (counter strictly ++),
+///   - within one run this helper never reuses a salt (counter strictly ++),
 ///     and its salts increase monotonically;
 ///   - two runs started in different seconds produce disjoint salts.
 ///
 /// Notes:
-///   - The counter is per-account (keyed by maker), so two accounts in one run
-///     share the same high half and can emit equal salts. That is harmless:
-///     the orderID hashes the full struct including `maker`, so distinct
-///     wallets always get distinct orderIDs.
+///   - Live account routes do not call this helper; both signers share their
+///     injected [`AccountSaltSequence`].
 ///   - Two runs started within the *same* second would overlap salt sequences;
 ///     an actual orderID collision would additionally require the same account,
 ///     same counter, same order params, and (v2) same ms `timestamp` field —
@@ -424,21 +461,15 @@ pub fn account_salt(maker: &str) -> String {
     account_salt_prekeyed(&maker.to_ascii_lowercase())
 }
 
-/// [`account_salt`] for an already-lowercased maker key. Hot-path
-/// variant: the signers cache the lowercased key so the per-order
-/// allocation + case-fold disappear; the map key is only allocated on
-/// an account's first order.
+/// [`account_salt`] for an already-lowercased maker key. Retained for legacy
+/// one-off callers; live signers use an injected owner-local sequence.
 pub fn account_salt_prekeyed(key_lower: &str) -> String {
-    let counter = {
-        let mut map = salt_counters().lock().unwrap_or_else(|e| e.into_inner());
-        if !map.contains_key(key_lower) {
-            map.insert(key_lower.to_string(), 0);
-        }
-        let c = map.get_mut(key_lower).expect("key inserted above");
-        let v = *c;
-        *c = c.wrapping_add(1);
-        v
-    };
+    // Compatibility-only helper for one-off callers. Live signers use their
+    // injected `AccountSaltSequence`; keeping this counter global but lock-free
+    // preserves uniqueness for legacy helpers without reintroducing a map.
+    let _ = key_lower;
+    static COMPAT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COMPAT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let salt = ((startup_secs() as u64) << 32) | (counter & 0xFFFF_FFFF);
     salt.to_string()
 }
@@ -790,13 +821,57 @@ mod tests {
         let s3: u64 = account_salt(&a.to_uppercase()).parse().unwrap();
         assert_eq!(s3, s2 + 1);
 
-        // Different account: independent counter, but shares the startup-second
-        // high half (harmless — orderID is differentiated by the maker field).
+        // Compatibility callers share one lock-free sequence. Account-scoped
+        // live signers use their injected sequence instead.
         let sb: u64 = account_salt(b).parse().unwrap();
         assert_eq!(sb >> 32, s0 >> 32, "accounts share the startup-second high half");
-        assert_eq!(sb & 0xFFFF_FFFF, 0, "account b's own counter starts at 0");
+        assert_eq!(sb, s3 + 1, "compatibility sequence remains globally unique");
 
         // Fits in u64 (the submission layer downcasts salt to u64 — must be lossless).
         assert!(account_salt(a).parse::<u128>().unwrap() <= u64::MAX as u128);
+    }
+
+    #[test]
+    fn account_owned_salt_sequence_is_duplicate_free_under_parallel_dispatch() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 4_096;
+        let sequence = Arc::new(AccountSaltSequence::new());
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let sequence = Arc::clone(&sequence);
+            handles.push(std::thread::spawn(move || {
+                let mut samples = Vec::with_capacity(PER_THREAD);
+                for _ in 0..PER_THREAD {
+                    let started = std::time::Instant::now();
+                    let salt = sequence.next_decimal().parse::<u64>().unwrap();
+                    samples.push((salt, started.elapsed().as_nanos() as u64));
+                }
+                samples
+            }));
+        }
+        let mut salts = Vec::with_capacity(THREADS * PER_THREAD);
+        let mut latency_ns = Vec::with_capacity(THREADS * PER_THREAD);
+        for handle in handles {
+            for (salt, elapsed) in handle.join().unwrap() {
+                salts.push(salt);
+                latency_ns.push(elapsed);
+            }
+        }
+        salts.sort_unstable();
+        assert_eq!(salts.len(), THREADS * PER_THREAD);
+        assert!(salts.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+
+        latency_ns.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            latency_ns[(latency_ns.len() - 1) * numerator / denominator]
+        };
+        eprintln!(
+            "account_salt_sequence n={} p50_ns={} p99_ns={} p999_ns={} max_ns={}",
+            latency_ns.len(),
+            percentile(50, 100),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            latency_ns.last().copied().unwrap_or(0),
+        );
     }
 }

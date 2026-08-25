@@ -28,14 +28,14 @@ use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
 
 use super::signer::{
+    AccountSaltSequence,
     SignatureType,
     compute_amounts,
-    account_salt_prekeyed,
     derive_addresses,
     validate_signing_inputs,
     validate_u256_decimal,
 };
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // ════════════════════════════════════════════════════════════════
 // v2 Exchange addresses + domain
@@ -150,9 +150,9 @@ pub struct OrderSignerV2 {
     domain_sep: [u8; 32],
     /// `builder_code` in wire form (`0x…` hex), formatted once.
     builder_hex: String,
-    /// Pre-lowercased maker key for `account_salt_prekeyed`. Kept in
-    /// sync by `with_funder` (POLY_1271 salts key off the funder).
-    salt_key: String,
+    /// Shared with the account route's v1 signer. The order hot path performs
+    /// one relaxed fetch-add and never enters a global registry.
+    salt_sequence: Arc<AccountSaltSequence>,
 }
 
 impl OrderSignerV2 {
@@ -161,6 +161,22 @@ impl OrderSignerV2 {
         neg_risk: bool,
         sig_type: SignatureType,
         builder_code_hex: &str,
+    ) -> Result<Self> {
+        Self::new_with_salt_sequence(
+            private_key_hex,
+            neg_risk,
+            sig_type,
+            builder_code_hex,
+            Arc::new(AccountSaltSequence::new()),
+        )
+    }
+
+    pub(crate) fn new_with_salt_sequence(
+        private_key_hex: &str,
+        neg_risk: bool,
+        sig_type: SignatureType,
+        builder_code_hex: &str,
+        salt_sequence: Arc<AccountSaltSequence>,
     ) -> Result<Self> {
         let hex_clean = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
         let key_bytes = hex::decode(hex_clean)
@@ -181,12 +197,11 @@ impl OrderSignerV2 {
 
         let domain_sep = compute_domain_separator_v2(&exchange_address);
         let builder_hex = format!("0x{}", hex::encode(builder_code));
-        let salt_key = maker_address.to_ascii_lowercase();
         Ok(Self {
             signing_key, signer_address, maker_address,
             exchange_address, builder_code, signature_type: sig_type,
             funder: None,
-            domain_sep, builder_hex, salt_key,
+            domain_sep, builder_hex, salt_sequence,
         })
     }
 
@@ -212,7 +227,6 @@ impl OrderSignerV2 {
     pub fn with_funder(mut self, funder: &str) -> Self {
         if !funder.trim().is_empty() {
             let f = funder.trim().to_string();
-            self.salt_key = f.to_ascii_lowercase();
             self.maker_address = f.clone();
             self.funder = Some(f);
         }
@@ -295,7 +309,7 @@ impl OrderSignerV2 {
             .unwrap_or(0);
 
         let order = OrderV2 {
-            salt: account_salt_prekeyed(&self.salt_key),
+            salt: self.salt_sequence.next_decimal(),
             maker: self.maker_address.clone(),
             signer: self.signer_address.clone(),
             token_id: token_id.to_string(),
@@ -342,14 +356,7 @@ impl OrderSignerV2 {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // `salt_key` was derived from the funder in `with_funder`; guard
-        // against a direct call with a different funder (dispatch always
-        // passes `self.funder`, which matches).
-        let salt = if funder.eq_ignore_ascii_case(&self.salt_key) {
-            account_salt_prekeyed(&self.salt_key)
-        } else {
-            super::signer::account_salt(funder)
-        };
+        let salt = self.salt_sequence.next_decimal();
         let order = OrderV2 {
             salt,
             maker: funder.to_string(),
