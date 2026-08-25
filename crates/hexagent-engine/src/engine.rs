@@ -56,6 +56,12 @@ const LIFECYCLE_OWNER_OUTBOX_CAPACITY: usize = CHANNEL_CAPACITY;
 // the time an already-enqueued market trigger can sit behind the biased lane.
 // At the private-apply target (<=1 ms p95), 32 permitted a 32 ms quote stall.
 const PRIVATE_UPDATE_BURST_BUDGET: usize = 4;
+// The production polymaker callback owns several fixed-capacity quote/order
+// scratch values and can enter cold event-start rebuilds before its first
+// quote. Rust's 2 MiB spawned-thread default was exhausted in live recovery on
+// 2026-08-25. Reserve virtual stack up front; selective mlock still touches and
+// locks only the bounded 512 KiB strategy working set plus guard margin.
+const STRATEGY_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 const STRATEGY_WORKER_STALL_NS: u64 = 5_000_000_000;
 const WATCHDOG_MAX_DEFERRAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ACCOUNT_METRIC_POSITION_EPS: f64 = 1e-9;
@@ -7261,6 +7267,7 @@ impl Engine {
                     let ack_tx = shutdown_ack_tx.clone();
                     let h = thread::Builder::new()
                         .name(format!("strategy-{}", if iid.is_empty() { idx.to_string() } else { iid.clone() }))
+                        .stack_size(STRATEGY_WORKER_STACK_BYTES)
                         .spawn(move || {
                             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 Self::run_strategy_worker(
