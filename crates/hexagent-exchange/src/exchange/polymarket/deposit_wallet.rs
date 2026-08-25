@@ -20,8 +20,8 @@
 
 use anyhow::{anyhow, Result};
 use k256::ecdsa::SigningKey;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 use super::auth::PolyAuth;
 use super::deploy_wallet::{
@@ -170,63 +170,178 @@ struct Call {
     data: String, // 0x-hex calldata; value is always 0
 }
 
-static WALLET_SUBMIT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-static PENDING_WALLET_ACTIONS: OnceLock<Mutex<HashMap<String, PendingWalletAction>>> =
-    OnceLock::new();
-// The relayer ultimately broadcasts WALLET maintenance actions through its own
-// Polygon transaction pipeline. Keep cross-account maintenance bursts out of
-// that pipeline: after one action is accepted, no other maintenance signer may
-// submit until the accepted action has left STATE_NEW. Per-signer locks below
-// still protect each wallet's action nonce for the remainder of its lifecycle.
-static WALLET_NEW_STATE_SUBMIT_GATE: OnceLock<Mutex<()>> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 struct PendingWalletAction {
     transaction_id: String,
     nonce: u128,
 }
 
-fn wallet_submit_lock(signer: &str) -> Result<Arc<Mutex<()>>> {
-    let locks = WALLET_SUBMIT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .map_err(|_| anyhow!("WALLET submit lock registry poisoned"))?;
-    Ok(locks
-        .entry(signer.to_ascii_lowercase())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone())
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum WalletOnchainResource { Signer(String), RelayerNewState }
+
+enum WalletOnchainOwnerCommand {
+    Acquire { resource: WalletOnchainResource, granted: crossbeam_channel::Sender<std::result::Result<(), String>> },
+    Release(WalletOnchainResource),
+    Pending { signer: String, reply: crossbeam_channel::Sender<Option<PendingWalletAction>> },
+    Remember { signer: String, action: PendingWalletAction, reply: crossbeam_channel::Sender<std::result::Result<(), String>> },
+    Forget { signer: String, reply: crossbeam_channel::Sender<()> },
+    AllocateNonce { signer: String, chain_pending: u64, reply: crossbeam_channel::Sender<std::result::Result<u64, String>> },
+    ResetNonce { signer: String, reply: crossbeam_channel::Sender<()> },
+}
+
+const WALLET_ONCHAIN_OWNER_CAPACITY: usize = 256;
+const WALLET_ONCHAIN_WAITER_CAPACITY: usize = 256;
+const WALLET_ONCHAIN_RESOURCE_CAPACITY: usize = 1_024;
+const WALLET_ONCHAIN_PENDING_CAPACITY: usize = 1_024;
+const WALLET_ONCHAIN_NONCE_CAPACITY: usize = 1_024;
+static WALLET_ONCHAIN_OWNER: OnceLock<crossbeam_channel::Sender<WalletOnchainOwnerCommand>> = OnceLock::new();
+static WALLET_ONCHAIN_OWNER_HIGH_WATER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WALLET_ONCHAIN_OWNER_OVERFLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalletOnchainOwnerMetrics { pub capacity: usize, pub high_water: usize, pub overflow: u64 }
+
+pub fn wallet_onchain_owner_metrics() -> WalletOnchainOwnerMetrics {
+    WalletOnchainOwnerMetrics {
+        capacity: WALLET_ONCHAIN_OWNER_CAPACITY,
+        high_water: WALLET_ONCHAIN_OWNER_HIGH_WATER.load(std::sync::atomic::Ordering::Relaxed),
+        overflow: WALLET_ONCHAIN_OWNER_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+fn wallet_onchain_owner() -> crossbeam_channel::Sender<WalletOnchainOwnerCommand> {
+    WALLET_ONCHAIN_OWNER.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded(WALLET_ONCHAIN_OWNER_CAPACITY);
+        std::thread::Builder::new().name("poly-onchain-owner".to_string()).spawn(move || {
+            crate::os_tune::pin_background("poly-onchain-owner");
+            let mut busy = HashSet::<WalletOnchainResource>::new();
+            let mut waiters = HashMap::<WalletOnchainResource, VecDeque<crossbeam_channel::Sender<std::result::Result<(), String>>>>::new();
+            let mut waiter_count = 0usize;
+            let mut pending = HashMap::<String, PendingWalletAction>::new();
+            let mut local_nonces = HashMap::<String, u64>::new();
+            while let Ok(command) = rx.recv() {
+                match command {
+                    WalletOnchainOwnerCommand::Acquire { resource, granted } => {
+                        if !busy.contains(&resource) && busy.len() >= WALLET_ONCHAIN_RESOURCE_CAPACITY {
+                            WALLET_ONCHAIN_OWNER_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = granted.try_send(Err(format!("wallet/on-chain active resource capacity {} exhausted", WALLET_ONCHAIN_RESOURCE_CAPACITY)));
+                        } else if busy.insert(resource.clone()) {
+                            if granted.try_send(Ok(())).is_err() { busy.remove(&resource); }
+                        } else if waiter_count >= WALLET_ONCHAIN_WAITER_CAPACITY {
+                            WALLET_ONCHAIN_OWNER_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = granted.try_send(Err(format!("wallet/on-chain permit waiter capacity {} exhausted", WALLET_ONCHAIN_WAITER_CAPACITY)));
+                        } else {
+                            waiters.entry(resource).or_default().push_back(granted);
+                            waiter_count += 1;
+                        }
+                    }
+                    WalletOnchainOwnerCommand::Release(resource) => {
+                        busy.remove(&resource);
+                        let mut granted_next = false;
+                        let mut remove_entry = false;
+                        if let Some(resource_waiters) = waiters.get_mut(&resource) {
+                            while let Some(granted) = resource_waiters.pop_front() {
+                                waiter_count = waiter_count.saturating_sub(1);
+                                if granted.try_send(Ok(())).is_ok() {
+                                    busy.insert(resource.clone());
+                                    granted_next = true;
+                                    break;
+                                }
+                            }
+                            remove_entry = resource_waiters.is_empty();
+                        }
+                        if remove_entry { waiters.remove(&resource); }
+                        if !granted_next { busy.remove(&resource); }
+                    }
+                    WalletOnchainOwnerCommand::Pending { signer, reply } => { let _ = reply.try_send(pending.get(&signer).cloned()); }
+                    WalletOnchainOwnerCommand::Remember { signer, action, reply } => {
+                        if !pending.contains_key(&signer) && pending.len() >= WALLET_ONCHAIN_PENDING_CAPACITY {
+                            WALLET_ONCHAIN_OWNER_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = reply.try_send(Err(format!("pending wallet action capacity {} exhausted", WALLET_ONCHAIN_PENDING_CAPACITY)));
+                        } else {
+                            pending.insert(signer, action);
+                            let _ = reply.try_send(Ok(()));
+                        }
+                    }
+                    WalletOnchainOwnerCommand::Forget { signer, reply } => { pending.remove(&signer); let _ = reply.try_send(()); }
+                    WalletOnchainOwnerCommand::AllocateNonce { signer, chain_pending, reply } => {
+                        if !local_nonces.contains_key(&signer) && local_nonces.len() >= WALLET_ONCHAIN_NONCE_CAPACITY {
+                            WALLET_ONCHAIN_OWNER_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = reply.try_send(Err(format!("wallet/on-chain nonce capacity {} exhausted", WALLET_ONCHAIN_NONCE_CAPACITY)));
+                        } else {
+                            let local = local_nonces.get(&signer).copied().map(|value| value.saturating_add(1)).unwrap_or(0);
+                            let chosen = chain_pending.max(local);
+                            local_nonces.insert(signer, chosen);
+                            let _ = reply.try_send(Ok(chosen));
+                        }
+                    }
+                    WalletOnchainOwnerCommand::ResetNonce { signer, reply } => { local_nonces.remove(&signer); let _ = reply.try_send(()); }
+                }
+            }
+        }).expect("failed to spawn wallet/on-chain owner");
+        tx
+    }).clone()
+}
+
+fn send_wallet_onchain_owner(command: WalletOnchainOwnerCommand) -> Result<()> {
+    let tx = wallet_onchain_owner();
+    let admitted_depth = tx.len().saturating_add(1).min(WALLET_ONCHAIN_OWNER_CAPACITY);
+    tx.send_timeout(command, std::time::Duration::from_secs(2)).map_err(|error| {
+        WALLET_ONCHAIN_OWNER_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow!("wallet/on-chain owner unavailable or saturated: {error}")
+    })?;
+    WALLET_ONCHAIN_OWNER_HIGH_WATER.fetch_max(admitted_depth, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+struct WalletOnchainPermit { resource: Option<WalletOnchainResource> }
+impl Drop for WalletOnchainPermit {
+    fn drop(&mut self) {
+        if let Some(resource) = self.resource.take() {
+            if wallet_onchain_owner().send(WalletOnchainOwnerCommand::Release(resource)).is_err() {
+                log::error!("wallet/on-chain owner stopped before permit release");
+            }
+        }
+    }
+}
+
+fn acquire_wallet_onchain(resource: WalletOnchainResource) -> Result<WalletOnchainPermit> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::Acquire { resource: resource.clone(), granted: tx })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped before grant: {error}"))?.map_err(anyhow::Error::msg)?;
+    Ok(WalletOnchainPermit { resource: Some(resource) })
 }
 
 fn pending_wallet_action(signer: &str) -> Result<Option<PendingWalletAction>> {
-    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let actions = actions
-        .lock()
-        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
-    Ok(actions.get(&signer.to_ascii_lowercase()).cloned())
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::Pending { signer: signer.to_ascii_lowercase(), reply: tx })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped during pending lookup: {error}"))
 }
 
 fn remember_wallet_action(signer: &str, transaction_id: String, nonce: u128) -> Result<()> {
-    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut actions = actions
-        .lock()
-        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
-    actions.insert(
-        signer.to_ascii_lowercase(),
-        PendingWalletAction {
-            transaction_id,
-            nonce,
-        },
-    );
-    Ok(())
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::Remember {
+        signer: signer.to_ascii_lowercase(), action: PendingWalletAction { transaction_id, nonce }, reply: tx,
+    })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped during remember: {error}"))?.map_err(anyhow::Error::msg)
 }
 
 fn forget_wallet_action(signer: &str) -> Result<()> {
-    let actions = PENDING_WALLET_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut actions = actions
-        .lock()
-        .map_err(|_| anyhow!("pending WALLET action registry poisoned"))?;
-    actions.remove(&signer.to_ascii_lowercase());
-    Ok(())
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::Forget { signer: signer.to_ascii_lowercase(), reply: tx })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped during forget: {error}"))
+}
+
+pub(super) fn allocate_onchain_nonce(signer: &str, chain_pending: u64) -> Result<u64> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::AllocateNonce { signer: signer.to_ascii_lowercase(), chain_pending, reply: tx })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped during nonce allocation: {error}"))?.map_err(anyhow::Error::msg)
+}
+
+pub(super) fn reset_onchain_nonce(signer: &str) -> Result<()> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    send_wallet_onchain_owner(WalletOnchainOwnerCommand::ResetNonce { signer: signer.to_ascii_lowercase(), reply: tx })?;
+    rx.recv().map_err(|error| anyhow!("wallet/on-chain owner stopped during nonce reset: {error}"))
 }
 
 fn deposit_wallet_domain_separator(dw: &str) -> [u8; 32] {
@@ -928,12 +1043,9 @@ fn submit_wallet_batch_with_hook<F>(
 where
     F: FnMut(&str) -> Result<()>,
 {
-    // Serialize only this signer. Different accounts remain concurrent, while
-    // two strategies sharing one signer cannot race on the same fresh nonce.
-    let submit_lock = wallet_submit_lock(eoa)?;
-    let _submit_guard = submit_lock
-        .lock()
-        .map_err(|_| anyhow!("WALLET submit lock poisoned for {}", eoa))?;
+    // The owner grants one lossless lease per signer. Different accounts stay
+    // concurrent; network I/O no longer runs while holding a mutex.
+    let _submit_permit = acquire_wallet_onchain(WalletOnchainResource::Signer(eoa.to_ascii_lowercase()))?;
 
     if !dry_run {
         // This nonce is only an exact fallback key for reconciliation. The
@@ -946,15 +1058,10 @@ where
     // For maintenance calls, serialize only the acceptance phase across every
     // signer. Once this action leaves STATE_NEW the guard is dropped and its
     // confirmation poll continues concurrently with the next account's submit.
-    let global_submit_gate = WALLET_NEW_STATE_SUBMIT_GATE.get_or_init(|| Mutex::new(()));
     let global_submit_guard = if dry_run || !gate_maintenance_until_started {
         None
     } else {
-        Some(
-            global_submit_gate
-                .lock()
-                .map_err(|_| anyhow!("global WALLET STATE_NEW submit gate poisoned"))?,
-        )
+        Some(acquire_wallet_onchain(WalletOnchainResource::RelayerNewState)?)
     };
 
     // The relayer's wallet registry can lag WALLET-CREATE by a few seconds
@@ -1984,6 +2091,68 @@ fn relayer_get(
 #[cfg(test)]
 mod derive_tests {
     use super::*;
+
+    fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+        let index = sorted.len().saturating_mul(numerator).div_ceil(denominator)
+            .saturating_sub(1).min(sorted.len().saturating_sub(1));
+        sorted[index]
+    }
+
+    #[test]
+    fn wallet_onchain_owner_serializes_signer_and_isolates_other_signers() {
+        let prefix = format!("owner-permit-{}", std::process::id());
+        let left = WalletOnchainResource::Signer(format!("{prefix}-left"));
+        let right = WalletOnchainResource::Signer(format!("{prefix}-right"));
+        let first = acquire_wallet_onchain(left.clone()).unwrap();
+        let (acquired_tx, acquired_rx) = crossbeam_channel::bounded(1);
+        let waiter = std::thread::spawn(move || {
+            let permit = acquire_wallet_onchain(left).unwrap();
+            acquired_tx.send(()).unwrap();
+            permit
+        });
+        assert!(matches!(acquired_rx.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+        drop(acquire_wallet_onchain(right).unwrap());
+        drop(first);
+        acquired_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        drop(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn wallet_onchain_owner_pending_state_is_idempotent_and_recoverable() {
+        let signer = format!("0xOwnerState{:x}", std::process::id());
+        forget_wallet_action(&signer).unwrap();
+        remember_wallet_action(&signer, "tx-one".to_string(), 10).unwrap();
+        remember_wallet_action(&signer.to_ascii_uppercase(), "tx-two".to_string(), 11).unwrap();
+        let remembered = pending_wallet_action(&signer).unwrap().unwrap();
+        assert_eq!((remembered.transaction_id.as_str(), remembered.nonce), ("tx-two", 11));
+        forget_wallet_action(&signer).unwrap();
+        assert!(pending_wallet_action(&signer).unwrap().is_none());
+        forget_wallet_action(&signer).unwrap();
+    }
+
+    #[test]
+    fn wallet_onchain_owner_roundtrip_has_bounded_tail_and_no_overflow() {
+        const EVENTS: usize = 2_048;
+        let signer = format!("owner-latency-{}", std::process::id());
+        let overflow_before = wallet_onchain_owner_metrics().overflow;
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = std::time::Instant::now();
+            assert!(pending_wallet_action(&signer).unwrap().is_none());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let (p50, p99, p999, max) = (
+            percentile(&samples, 50, 100), percentile(&samples, 99, 100),
+            percentile(&samples, 999, 1_000), *samples.last().unwrap(),
+        );
+        let metrics = wallet_onchain_owner_metrics();
+        eprintln!("wallet/onchain owner boundary=request_reply n={EVENTS} p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} queue_high_water={} overflow={}", metrics.high_water, metrics.overflow.saturating_sub(overflow_before));
+        assert_eq!(metrics.capacity, WALLET_ONCHAIN_OWNER_CAPACITY);
+        assert_eq!(metrics.overflow, overflow_before);
+        assert!(metrics.high_water > 0);
+    }
 
     #[test]
     fn wallet_nonce_response_accepts_string_and_number() {

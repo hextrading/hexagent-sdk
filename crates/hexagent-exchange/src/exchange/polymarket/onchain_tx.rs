@@ -159,18 +159,14 @@ impl BroadcastError {
 /// thread can both get the same nonce back from `eth_getTransactionCount`
 /// and race into "replacement underpriced".
 ///
-/// This cache holds the *last nonce we submitted* per address. The
+/// The wallet/on-chain actor holds the *last nonce we submitted* per address.
+/// This keeps signer sequencing with relayer submission leases. The
 /// effective nonce for the next submit is:
 ///   ```text
 ///   nonce = max(chain_pending, local_last + 1)
 ///   ```
-/// On successful broadcast we advance `local_last`. On `NonceTooLow`
-/// we reset `local_last` to `chain_pending - 1` so the next attempt
-/// re-queries. On other errors we don't touch the cache.
-fn local_nonce_map() -> &'static Mutex<HashMap<String, u64>> {
-    static MAP: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// On allocation the actor advances `local_last`. On `NonceTooLow` we reset
+/// it so the next attempt re-queries. Other errors leave it conservative.
 
 /// Resolve the nonce to use for the next broadcast from `signer`.
 ///
@@ -179,23 +175,16 @@ fn local_nonce_map() -> &'static Mutex<HashMap<String, u64>> {
 /// chain's or our local view.
 fn next_nonce_for(signer: &str) -> Result<u64> {
     let chain_pending = get_eth_nonce(signer)?;
-    let key = signer.to_lowercase();
-    let mut map = local_nonce_map().lock().unwrap();
-    let from_local = map.get(&key).copied().map(|n| n + 1).unwrap_or(0);
-    let chosen = chain_pending.max(from_local);
-    // Record the chosen value so the *next* call jumps past it even
-    // if RPC's pending view hasn't caught up yet.
-    map.insert(key, chosen);
-    Ok(chosen)
+    super::deposit_wallet::allocate_onchain_nonce(signer, chain_pending)
 }
 
 /// Reset the local nonce cache for `signer` when chain says our local
 /// view is stale (e.g. on `NonceTooLow`). Forces the next call to
 /// re-fetch from chain.
 fn reset_local_nonce(signer: &str) {
-    let key = signer.to_lowercase();
-    let mut map = local_nonce_map().lock().unwrap();
-    map.remove(&key);
+    if let Err(error) = super::deposit_wallet::reset_onchain_nonce(signer) {
+        warn!("[OnchainTx] failed to reset actor-owned nonce signer={}: {}", signer, error);
+    }
 }
 
 /// Submit a Safe transaction directly on-chain via the signer EOA.
@@ -1167,10 +1156,7 @@ mod tests {
 
     // ── Local nonce manager ────────────────────────────────────────
     //
-    // We can't easily test the real `next_nonce_for` because it calls
-    // out to `get_eth_nonce` (network). The helpers below test the
-    // pure HashMap-keyed cache semantics, which is the bit that
-    // actually prevents the same-nonce race.
+    // Feed chain-pending input directly into the shared owner to avoid RPC.
 
     #[test]
     fn local_nonce_cache_isolates_addresses() {
@@ -1178,26 +1164,21 @@ mod tests {
         // session state.
         let addr_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
         let addr_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
-        {
-            let mut map = local_nonce_map().lock().unwrap();
-            map.insert(addr_a.to_lowercase(), 42);
-            map.insert(addr_b.to_lowercase(), 999);
-        }
-        let map = local_nonce_map().lock().unwrap();
-        assert_eq!(map.get(&addr_a.to_lowercase()).copied(), Some(42));
-        assert_eq!(map.get(&addr_b.to_lowercase()).copied(), Some(999));
+        super::super::deposit_wallet::reset_onchain_nonce(addr_a).unwrap();
+        super::super::deposit_wallet::reset_onchain_nonce(addr_b).unwrap();
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr_a, 42).unwrap(), 42);
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr_b, 999).unwrap(), 999);
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr_a, 1).unwrap(), 43);
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr_b, 1).unwrap(), 1_000);
     }
 
     #[test]
     fn local_nonce_reset_drops_entry() {
         let addr = "0xcccccccccccccccccccccccccccccccccccccc03";
-        {
-            let mut map = local_nonce_map().lock().unwrap();
-            map.insert(addr.to_lowercase(), 100);
-        }
+        super::super::deposit_wallet::reset_onchain_nonce(addr).unwrap();
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr, 100).unwrap(), 100);
         reset_local_nonce(addr);
-        let map = local_nonce_map().lock().unwrap();
-        assert!(map.get(&addr.to_lowercase()).is_none(),
+        assert_eq!(super::super::deposit_wallet::allocate_onchain_nonce(addr, 7).unwrap(), 7,
             "reset must remove the entry so next call re-syncs from chain");
     }
 }
