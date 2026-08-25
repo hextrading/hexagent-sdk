@@ -5639,14 +5639,26 @@ impl PolymarketTrade {
         shutdown_token: ShutdownToken,
         startup_query_repair: bool,
     ) -> Result<Self> {
-        let signer = OrderSigner::new(private_key, neg_risk, sig_type)?;
+        let salt_sequence = Arc::new(super::signer::AccountSaltSequence::new());
+        let signer = OrderSigner::new_with_salt_sequence(
+            private_key,
+            neg_risk,
+            sig_type,
+            Arc::clone(&salt_sequence),
+        )?;
         // Build v2 signer eagerly iff v2 mode — it's tiny (a few keys +
         // strings) and keeps the sign-hot-path branch a simple Option
         // check rather than constructing per-call. For POLY_1271 the
         // deposit-wallet `funder` is the order maker/signer.
         let signer_v2 = Some(
-            super::signer_v2::OrderSignerV2::new(private_key, neg_risk, sig_type, builder_code)?
-                .with_funder(funder),
+            super::signer_v2::OrderSignerV2::new_with_salt_sequence(
+                private_key,
+                neg_risk,
+                sig_type,
+                builder_code,
+                salt_sequence,
+            )?
+            .with_funder(funder),
         );
 
         // POLY_ADDRESS must be the signer (EOA) address, matching the API key
