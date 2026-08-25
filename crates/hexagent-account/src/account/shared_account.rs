@@ -8607,8 +8607,12 @@ impl SharedAccount {
         self.startup_snapshot_deferred_fast.load(Ordering::Acquire)
     }
 
-    /// Attribute only a proven 1:1 platform redemption. This deliberately
-    /// does not turn a runtime wallet observation into a position snapshot.
+    /// Install a complete cold wallet observation on the account owner, then
+    /// attribute any resulting settled binary redemption by condition. The
+    /// physical calibration is idempotent and deliberately happens before
+    /// attribution: ordinary fills already reflected in the virtual ledger
+    /// must not be mistaken for platform redemption merely because the prior
+    /// physical snapshot predates those fills.
     pub fn observe_platform_binary_redeem(
         &self,
         observed_cash: f64,
@@ -8659,6 +8663,14 @@ impl SharedAccount {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.unallocated_cash < -reconciliation_tolerance(state.physical_cash, observed_cash)
+                || authoritative_tokens.iter().any(|token| {
+                    state
+                        .unallocated_positions
+                        .get(token)
+                        .copied()
+                        .unwrap_or(0.0)
+                        < -EPS
+                })
                 || (observed_cash - state.physical_cash).abs()
                     > reconciliation_tolerance(observed_cash, state.physical_cash)
                 || authoritative_tokens.iter().any(|token| {
@@ -8695,130 +8707,54 @@ impl SharedAccount {
             );
             return false;
         }
-        let cash_delta = observed_cash - state.physical_cash;
-        let analysis = analyze_condition_scoped_binary_redeems(
-            &state,
-            observed_positions,
-            authoritative_tokens,
-            cash_delta,
-        );
-        for failure in &analysis.failures {
-            log::warn!(
-                "[shared_account_redeem_attribution_failed] account={} condition={} reason={} detail={:?}",
-                self.account_id,
-                failure.condition_id,
-                failure.reason,
-                failure.detail,
-            );
-        }
-        if analysis.selected.is_empty() {
-            log_wallet_reconciliation_alerts(
-                &self.account_id,
-                &state,
-                observed_cash,
-                observed_positions,
-                authoritative_tokens,
-            );
-            return false;
-        }
-
-        let expected_payout: f64 = analysis
-            .selected
-            .iter()
-            .map(|candidate| candidate.expected_payout)
-            .sum();
-        // Polymarket can settle a redeem a few cents below its proven binary
-        // payout (for example, because the platform deducted a redeem fee).
-        // The physical side already contains the authoritative wallet delta,
-        // so cap virtual attribution at that amount and spread the shortfall
-        // pro rata across every winning token/owner. Positive excess cash is
-        // intentionally left unallocated, preserving the existing deposit
-        // safety boundary.
-        let attributed_payout = cash_delta.max(0.0).min(expected_payout);
-        let payout_scale = if expected_payout > EPS {
-            attributed_payout / expected_payout
-        } else {
-            1.0
-        };
-        let residual_cash = cash_delta - expected_payout;
-        if expected_payout > EPS {
-            state.physical_cash = observed_cash;
-        }
-        let mut applied_conditions = Vec::with_capacity(analysis.selected.len());
-        let mut applied_removed = Vec::new();
-        for candidate in analysis.selected {
-            let adjustment_label = format!("observed_platform_redeem:{}", candidate.condition_id);
-            for removed in candidate.removed {
-                if removed.observed <= EPS {
-                    state.physical_positions.remove(&removed.token_id);
-                } else {
-                    state
-                        .physical_positions
-                        .insert(removed.token_id.clone(), removed.observed);
-                }
-                let virtual_total: f64 = state
-                    .instances
-                    .values()
-                    .map(|instance| {
-                        instance
-                            .positions
-                            .get(&removed.token_id)
-                            .copied()
-                            .unwrap_or(0.0)
-                    })
-                    .sum();
-                if virtual_total <= EPS {
-                    continue;
-                }
-                let mut attributed = Vec::new();
-                for (instance_id, instance) in &mut state.instances {
-                    let owned = instance
-                        .positions
-                        .get(&removed.token_id)
-                        .copied()
-                        .unwrap_or(0.0);
-                    if owned <= EPS {
-                        continue;
-                    }
-                    let burned = (owned * removed.quantity / virtual_total).min(owned);
-                    *instance
-                        .positions
-                        .entry(removed.token_id.clone())
-                        .or_insert(0.0) -= burned;
-                    let instance_cash_delta = burned * removed.value * payout_scale;
-                    instance.cash += instance_cash_delta;
-                    attributed.push((instance_id.clone(), burned, instance_cash_delta));
-                }
-                for (instance_id, burned, instance_cash_delta) in attributed {
-                    record_internal_external_adjustment(
-                        &mut state,
-                        &adjustment_label,
-                        &instance_id,
-                        instance_cash_delta,
-                        HashMap::from([(removed.token_id.clone(), -burned)]),
-                    );
-                }
-                applied_removed.push((
-                    candidate.condition_id.clone(),
-                    removed.token_id,
-                    removed.quantity,
-                    removed.value,
-                ));
+        let prior_cash = state.physical_cash;
+        let condition_pairs = registered_binary_condition_pairs(&state);
+        let mut token_conditions = BTreeMap::<String, BTreeSet<String>>::new();
+        for (condition_id, pairs) in condition_pairs {
+            for (up_token_id, down_token_id) in pairs {
+                token_conditions
+                    .entry(up_token_id)
+                    .or_default()
+                    .insert(condition_id.clone());
+                token_conditions
+                    .entry(down_token_id)
+                    .or_default()
+                    .insert(condition_id.clone());
             }
-            applied_conditions.push(candidate.condition_id);
         }
-        recompute_reconciliation(&mut state, "platform automatic binary redeem");
+        let mut changed_conditions = BTreeSet::new();
+        let mut changed_tokens = Vec::new();
+        for token in authoritative_tokens {
+            let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
+            let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+            if (observed - prior).abs() > reconciliation_tolerance(observed, prior) {
+                if let Some(conditions) = token_conditions.get(token) {
+                    changed_conditions.extend(conditions.iter().cloned());
+                }
+                changed_tokens.push((token.clone(), prior, observed, observed - prior));
+            }
+            if observed > EPS {
+                state.physical_positions.insert(token.clone(), observed);
+            } else {
+                state.physical_positions.remove(token);
+            }
+        }
+        changed_tokens.sort_by(|left, right| left.0.cmp(&right.0));
+        state.physical_cash = observed_cash;
+        recompute_reconciliation(&mut state, "runtime authoritative wallet calibration");
+        let attributed = try_attribute_binary_redeem(&mut state, &self.account_id);
         self.schedule_persist(&state);
+        let examples: Vec<_> = changed_tokens.iter().take(16).collect();
         log::info!(
-            "[shared_account] attributed platform automatic redeem account={} payout={:.6} attributed_payout={:.6} payout_scale={:.9} observed_cash_delta={:.6} residual_cash={:+.6} conditions={:?} removed={:?}",
+            "[shared_account_wallet_calibration] account={} conditions={:?} cash={:.9}->{:.9} token_count={} differences={:?} suppressed={} redeem_attributed={}",
             self.account_id,
-            expected_payout,
-            attributed_payout,
-            payout_scale,
-            cash_delta,
-            residual_cash,
-            applied_conditions,
-            applied_removed,
+            changed_conditions,
+            prior_cash,
+            observed_cash,
+            changed_tokens.len(),
+            examples,
+            changed_tokens.len().saturating_sub(examples.len()),
+            attributed,
         );
         log_wallet_reconciliation_alerts(
             &self.account_id,
@@ -8827,7 +8763,7 @@ impl SharedAccount {
             observed_positions,
             authoritative_tokens,
         );
-        true
+        attributed
     }
     pub fn is_uncertain(&self) -> bool {
         self.refresh_trade_persistence_blocker();
@@ -17076,7 +17012,6 @@ fn set_ownership_anomaly(state: &mut SharedAccountState, key: String, reason: St
 struct ConditionRedeemRemoval {
     token_id: String,
     quantity: f64,
-    observed: f64,
     value: f64,
 }
 
@@ -17088,6 +17023,7 @@ struct ConditionRedeemCandidate {
     expected_payout: f64,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 struct ConditionRedeemFailure {
     condition_id: String,
@@ -17095,6 +17031,7 @@ struct ConditionRedeemFailure {
     detail: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ConditionRedeemAnalysis {
     selected: Vec<ConditionRedeemCandidate>,
@@ -17135,6 +17072,7 @@ fn registered_binary_condition_pairs(
 /// one condition must not prevent an independently proven condition from being
 /// repaired. The caller applies the returned candidates in one account-writer
 /// transaction, making a repeated identical snapshot an idempotent no-op.
+#[cfg(test)]
 fn analyze_condition_scoped_binary_redeems(
     state: &SharedAccountState,
     observed_positions: &HashMap<String, f64>,
@@ -17301,7 +17239,6 @@ fn analyze_condition_scoped_binary_redeems(
             removed.push(ConditionRedeemRemoval {
                 token_id: token.clone(),
                 quantity,
-                observed,
                 value,
             });
         }
@@ -17547,7 +17484,6 @@ fn try_attribute_binary_redeem(state: &mut SharedAccountState, account_id: &str)
             removed.push(ConditionRedeemRemoval {
                 token_id: token.clone(),
                 quantity,
-                observed: state.physical_positions.get(token).copied().unwrap_or(0.0),
                 value,
             });
         }
@@ -22135,7 +22071,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
-    fn runtime_platform_redeem_is_attributed_without_applying_a_snapshot() {
+    fn runtime_platform_redeem_is_attributed_after_authoritative_calibration() {
         let account = SharedAccount::new("runtime-platform-redeem");
         account.register_instance("btc", 1.0);
         account.register_instance("eth", 1.0);
@@ -22228,7 +22164,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let metric = account.monitoring_snapshot();
         assert_eq!(metric.physical_cash, 130.0);
         assert_eq!(metric.physical_positions.get("BTC-WIN"), None);
-        assert_eq!(metric.physical_positions.get("ETH-WIN"), Some(&20.0));
+        assert_eq!(metric.physical_positions.get("ETH-WIN"), Some(&25.0));
+        assert_eq!(metric.unallocated_positions.get("ETH-WIN"), Some(&5.0));
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 80.0);
         assert_eq!(account.instance_snapshot("eth").unwrap().cash, 50.0);
 
@@ -22297,8 +22234,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         ));
         let metric = account.monitoring_snapshot();
         assert_eq!(metric.physical_cash, 120.0);
-        assert_eq!(metric.physical_positions.get("LARGE-WIN"), Some(&100.0));
+        assert_eq!(metric.physical_positions.get("LARGE-WIN"), None);
         assert_eq!(metric.physical_positions.get("SMALL-WIN"), None);
+        assert_eq!(metric.unallocated_positions.get("LARGE-WIN"), Some(&-100.0));
         assert_eq!(account.instance_snapshot("large").unwrap().cash, 50.0);
         assert_eq!(account.instance_snapshot("small").unwrap().cash, 70.0);
     }
@@ -22402,6 +22340,80 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             100.0,
             &HashMap::new(),
             &HashSet::from(["BTC-WIN".into(), "BTC-LOSE".into()]),
+        ));
+    }
+
+    #[test]
+    fn runtime_wallet_calibration_does_not_misattribute_an_ordinary_fill() {
+        let account = SharedAccount::new("runtime-fill-calibration");
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "btc-event", "BTC-UP", "BTC-DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("BTC-UP".into(), 80.0), ("BTC-DOWN".into(), 80.0)]),
+            )
+            .unwrap();
+        account
+            .reserve_order(
+                "btc",
+                "sell-up",
+                "oid-sell-up",
+                "BTC-UP",
+                Side::Sell,
+                10.0,
+                0.7,
+                0,
+            )
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-sell-up",
+                "MATCHED",
+                "sell-up",
+                "oid-sell-up",
+                "BTC-UP",
+                Side::Sell,
+                10.0,
+                0.7,
+            )
+            .unwrap();
+        account
+            .apply_trade_transition(
+                "trade-sell-up",
+                "CONFIRMED",
+                "sell-up",
+                "oid-sell-up",
+                "BTC-UP",
+                Side::Sell,
+                10.0,
+                0.7,
+            )
+            .unwrap();
+
+        let observed_positions = HashMap::from([
+            ("BTC-UP".into(), 70.0),
+            ("BTC-DOWN".into(), 80.0),
+        ]);
+        let authoritative_tokens = HashSet::from(["BTC-UP".into(), "BTC-DOWN".into()]);
+        assert!(!account.observe_platform_binary_redeem(
+            107.0,
+            &observed_positions,
+            &authoritative_tokens,
+        ));
+        let metric = account.monitoring_snapshot();
+        assert_eq!(metric.physical_cash, 107.0);
+        assert_eq!(metric.physical_positions.get("BTC-UP"), Some(&70.0));
+        assert_eq!(metric.physical_positions.get("BTC-DOWN"), Some(&80.0));
+        assert!(metric.unallocated_cash.abs() <= EPS);
+        assert!(metric.unallocated_positions.values().all(|qty| qty.abs() <= EPS));
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 107.0);
+        assert!(!account.observe_platform_binary_redeem(
+            107.0,
+            &observed_positions,
+            &authoritative_tokens,
         ));
     }
 
