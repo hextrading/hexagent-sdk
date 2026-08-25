@@ -16,11 +16,13 @@
 //! costs ≈ 0.01 MATIC on Polygon.
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use k256::ecdsa::SigningKey;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::deploy_wallet::{
@@ -590,17 +592,16 @@ fn describe_err<E: Error + ?Sized>(e: &E) -> String {
 const RPC_NODE_COOLDOWN: Duration = Duration::from_secs(30);
 const RPC_NODE_MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RpcNodeHealth {
     consecutive_failures: u32,
     retry_at: Option<Instant>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RpcPoolHealth {
     nodes: HashMap<String, RpcNodeHealth>,
     preferred: Option<String>,
-    round_robin: usize,
 }
 
 impl RpcPoolHealth {
@@ -608,7 +609,7 @@ impl RpcPoolHealth {
     /// then nodes whose circuit is still cooling down. A cooled node remains
     /// at the tail so the current request can still recover if every healthy
     /// candidate fails.
-    fn attempt_order(&mut self, urls: &[String], now: Instant) -> Vec<usize> {
+    fn attempt_order(&self, urls: &[String], now: Instant, start: usize) -> Vec<usize> {
         let is_available = |url: &String| self.nodes
             .get(url)
             .and_then(|node| node.retry_at)
@@ -618,8 +619,7 @@ impl RpcPoolHealth {
             .filter(|index| is_available(&urls[*index]));
 
         let n = urls.len();
-        let start = self.round_robin % n;
-        self.round_robin = self.round_robin.wrapping_add(1);
+        let start = start % n;
         let mut available = Vec::with_capacity(n);
         let mut cooling = Vec::with_capacity(n);
         for step in 0..n {
@@ -660,27 +660,39 @@ impl RpcPoolHealth {
     }
 }
 
-fn rpc_pool_health() -> &'static Mutex<RpcPoolHealth> {
-    static HEALTH: OnceLock<Mutex<RpcPoolHealth>> = OnceLock::new();
-    HEALTH.get_or_init(|| Mutex::new(RpcPoolHealth::default()))
+fn rpc_pool_health() -> &'static ArcSwap<RpcPoolHealth> {
+    static HEALTH: OnceLock<ArcSwap<RpcPoolHealth>> = OnceLock::new();
+    HEALTH.get_or_init(|| ArcSwap::from_pointee(RpcPoolHealth::default()))
 }
 
 fn rpc_attempt_order(urls: &[String]) -> Vec<usize> {
-    rpc_pool_health().lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .attempt_order(urls, Instant::now())
+    static ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
+    rpc_pool_health().load().attempt_order(
+        urls,
+        Instant::now(),
+        ROUND_ROBIN.fetch_add(1, Ordering::Relaxed),
+    )
 }
 
 fn record_rpc_success(url: &str) {
-    rpc_pool_health().lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .record_success(url);
+    rpc_pool_health().rcu(|current| {
+        let mut next = (**current).clone();
+        next.record_success(url);
+        std::sync::Arc::new(next)
+    });
 }
 
 fn record_rpc_failure(url: &str) -> Duration {
-    rpc_pool_health().lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .record_failure(url, Instant::now())
+    let health = rpc_pool_health();
+    loop {
+        let current = health.load_full();
+        let mut next = (*current).clone();
+        let cooldown = next.record_failure(url, Instant::now());
+        let observed = health.compare_and_swap(&current, std::sync::Arc::new(next));
+        if std::sync::Arc::ptr_eq(&observed, &current) {
+            return cooldown;
+        }
+    }
 }
 
 /// POST a JSON-RPC request across the RPC pool, with two layers of retry:
@@ -1036,7 +1048,7 @@ mod tests {
         health.record_success("rpc-c");
         health.record_failure("rpc-a", now);
         health.record_failure("rpc-b", now);
-        assert_eq!(health.attempt_order(&urls, now), vec![2, 0, 1]);
+        assert_eq!(health.attempt_order(&urls, now, 0), vec![2, 0, 1]);
     }
 
     #[test]
@@ -1046,8 +1058,8 @@ mod tests {
         let mut health = RpcPoolHealth::default();
         assert_eq!(health.record_failure("rpc-a", now), Duration::from_secs(30));
         assert_eq!(health.record_failure("rpc-a", now), Duration::from_secs(60));
-        assert_eq!(health.attempt_order(&urls, now)[0], 1);
-        assert!(health.attempt_order(&urls, now + Duration::from_secs(60)).contains(&0));
+        assert_eq!(health.attempt_order(&urls, now, 0)[0], 1);
+        assert!(health.attempt_order(&urls, now + Duration::from_secs(60), 0).contains(&0));
     }
 
     #[test]

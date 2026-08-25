@@ -4774,7 +4774,7 @@ pub struct SharedAccount {
     /// Exact private-event anomaly keys mirrored from the durable account.
     /// Successful ordinary events can skip the account-wide reconciliation
     /// lock unless their own key is known to need repair.
-    anomalous_private_event_keys: RwLock<HashSet<String>>,
+    anomalous_private_event_keys: ArcSwap<HashSet<String>>,
     /// Immutable replay guards for retired zero-fill order lifecycle rows.
     /// Polymarket emits an order row for every ordinary lifecycle edge, so a
     /// membership check must never materialize the aggregate account merely
@@ -4785,7 +4785,7 @@ pub struct SharedAccount {
     /// private fills clear a trade-scoped blocker defensively even though one
     /// was almost never installed.  Missing in this set is authoritative, so
     /// that common no-op never materialises/clones the aggregate account.
-    risk_blocker_sources_fast: RwLock<HashSet<String>>,
+    risk_blocker_sources_fast: ArcSwap<HashSet<String>>,
     /// Only trade ids whose replay watermark still needs cold-ledger repair
     /// are present. A normal private fill therefore misses in one route shard
     /// instead of taking `control_gate` and cloning/publishing the full
@@ -4794,13 +4794,13 @@ pub struct SharedAccount {
     /// Authoritative live rewind anchors. MATCHED trade edges update this
     /// small map and enqueue one typed WAL row; they never wait for, clone or
     /// reconcile the aggregate account.
-    unresolved_trade_match_times_fast: RwLock<BTreeMap<String, u64>>,
+    unresolved_trade_match_times_fast: ArcSwap<BTreeMap<String, u64>>,
     /// Serializes the rare mark/resolve transition so a corrected replay
     /// cannot race between the fast anomaly index and its durable row.
     private_anomaly_transition: Mutex<()>,
     /// Fee curves are account-scoped control data but read on every taker-fill
     /// hot path. The cold account transaction refreshes this read-mostly copy.
-    token_fee_configs_fast: RwLock<HashMap<String, TokenFeeConfig>>,
+    token_fee_configs_fast: ArcSwap<HashMap<String, TokenFeeConfig>>,
     seeded_fast: AtomicBool,
     uncertain_fast: AtomicBool,
     admission_fast: Arc<AtomicBool>,
@@ -4981,8 +4981,8 @@ impl Drop for AccountStateGuard<'_> {
         self.state.unresolved_trade_match_times = self
             .account
             .unresolved_trade_match_times_fast
-            .read()
-            .unwrap()
+            .load()
+            .as_ref()
             .clone();
         if let Some(instance_id) = self.instance_scope.as_deref() {
             self.account.sync_state_to_virtual_account(
@@ -5631,13 +5631,13 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
-            anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            anomalous_private_event_keys: ArcSwap::from_pointee(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
-            risk_blocker_sources_fast: RwLock::new(HashSet::new()),
+            risk_blocker_sources_fast: ArcSwap::from_pointee(HashSet::new()),
             unresolved_trade_keys: ShardedRouteMap::new(),
-            unresolved_trade_match_times_fast: RwLock::new(BTreeMap::new()),
+            unresolved_trade_match_times_fast: ArcSwap::from_pointee(BTreeMap::new()),
             private_anomaly_transition: Mutex::new(()),
-            token_fee_configs_fast: RwLock::new(HashMap::new()),
+            token_fee_configs_fast: ArcSwap::from_pointee(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
             admission_fast: Arc::new(AtomicBool::new(false)),
@@ -6043,15 +6043,17 @@ impl SharedAccount {
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
             anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
-            anomalous_private_event_keys: RwLock::new(HashSet::new()),
+            anomalous_private_event_keys: ArcSwap::from_pointee(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(
                 initial_retired_order_audit_tombstones,
             ),
-            risk_blocker_sources_fast: RwLock::new(initial_risk_blocker_sources),
+            risk_blocker_sources_fast: ArcSwap::from_pointee(initial_risk_blocker_sources),
             unresolved_trade_keys: ShardedRouteMap::new(),
-            unresolved_trade_match_times_fast: RwLock::new(initial_unresolved_trade_match_times),
+            unresolved_trade_match_times_fast: ArcSwap::from_pointee(
+                initial_unresolved_trade_match_times,
+            ),
             private_anomaly_transition: Mutex::new(()),
-            token_fee_configs_fast: RwLock::new(HashMap::new()),
+            token_fee_configs_fast: ArcSwap::from_pointee(HashMap::new()),
             seeded_fast: AtomicBool::new(false),
             uncertain_fast: AtomicBool::new(false),
             admission_fast: Arc::new(AtomicBool::new(false)),
@@ -6117,8 +6119,8 @@ impl SharedAccount {
         let mut state = self.state.lock().unwrap();
         state.unresolved_trade_match_times = self
             .unresolved_trade_match_times_fast
-            .read()
-            .unwrap()
+            .load()
+            .as_ref()
             .clone();
         let acquired_at = Instant::now();
         let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -6249,8 +6251,8 @@ impl SharedAccount {
         let mut state = self.state.lock().unwrap();
         state.unresolved_trade_match_times = self
             .unresolved_trade_match_times_fast
-            .read()
-            .unwrap()
+            .load()
+            .as_ref()
             .clone();
         let acquired_at = Instant::now();
         let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -6850,12 +6852,14 @@ impl SharedAccount {
                 .map(str::to_string)
                 .collect(),
         ));
-        *self.anomalous_private_event_keys.write().unwrap() = state
-            .ownership_anomalies
-            .keys()
-            .filter_map(|key| key.strip_prefix("private_event:"))
-            .map(str::to_string)
-            .collect();
+        self.anomalous_private_event_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("private_event:"))
+                .map(str::to_string)
+                .collect(),
+        ));
         let seeded = state.seeded;
         let passive = seeded && (!state.uncertain || fee_degradation_is_only_uncertainty(state));
         self.seeded_fast.store(seeded, Ordering::Release);
@@ -6867,7 +6871,8 @@ impl SharedAccount {
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
             .fetch_max(state.ledger_generation, Ordering::AcqRel);
-        *self.token_fee_configs_fast.write().unwrap() = state.token_fee_configs.clone();
+        self.token_fee_configs_fast
+            .store(Arc::new(state.token_fee_configs.clone()));
     }
 
     fn sync_state_to_virtual_account(
@@ -6998,12 +7003,14 @@ impl SharedAccount {
                 .map(str::to_string)
                 .collect(),
         ));
-        *self.anomalous_private_event_keys.write().unwrap() = state
-            .ownership_anomalies
-            .keys()
-            .filter_map(|key| key.strip_prefix("private_event:"))
-            .map(str::to_string)
-            .collect();
+        self.anomalous_private_event_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("private_event:"))
+                .map(str::to_string)
+                .collect(),
+        ));
         self.seeded_fast.store(state.seeded, Ordering::Release);
         self.uncertain_fast
             .store(state.uncertain, Ordering::Release);
@@ -7015,7 +7022,8 @@ impl SharedAccount {
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
             .fetch_max(state.ledger_generation, Ordering::AcqRel);
-        *self.token_fee_configs_fast.write().unwrap() = state.token_fee_configs.clone();
+        self.token_fee_configs_fast
+            .store(Arc::new(state.token_fee_configs.clone()));
     }
 
     /// Query-repair orders that still lack authoritative terminal/live
@@ -8789,12 +8797,13 @@ impl SharedAccount {
         if !committed {
             return Vec::new();
         }
-        {
-            let mut fast_fee_configs = self.token_fee_configs_fast.write().unwrap();
+        self.token_fee_configs_fast.rcu(|current| {
+            let mut next = (**current).clone();
             for token in tokens.iter() {
-                fast_fee_configs.remove(token);
+                next.remove(token);
             }
-        }
+            Arc::new(next)
+        });
         vec![tokens.as_ref().clone()]
     }
 
@@ -9609,10 +9618,11 @@ impl SharedAccount {
                 since_ms,
             },
         );
-        self.risk_blocker_sources_fast
-            .write()
-            .unwrap()
-            .insert(source.to_string());
+        self.risk_blocker_sources_fast.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(source.to_string());
+            Arc::new(next)
+        });
         set_uncertain(&mut state, format!("{source}: {reason}"));
         self.schedule_persist(&state);
     }
@@ -9663,26 +9673,24 @@ impl SharedAccount {
         }
         let source = source.trim();
         if source.is_empty()
-            || !self
-                .risk_blocker_sources_fast
-                .read()
-                .unwrap()
-                .contains(source)
+            || !self.risk_blocker_sources_fast.load().contains(source)
         {
             return false;
         }
         let mut state = self.lock_state();
         if state.risk_blockers.remove(source).is_none() {
-            self.risk_blocker_sources_fast
-                .write()
-                .unwrap()
-                .remove(source);
+            self.risk_blocker_sources_fast.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(source);
+                Arc::new(next)
+            });
             return false;
         }
-        self.risk_blocker_sources_fast
-            .write()
-            .unwrap()
-            .remove(source);
+        self.risk_blocker_sources_fast.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(source);
+            Arc::new(next)
+        });
         recompute_reconciliation(&mut state, "risk blocker cleared");
         self.schedule_persist(&state);
         true
@@ -10862,8 +10870,7 @@ impl SharedAccount {
         let _transition = self.private_anomaly_transition.lock().unwrap();
         if self
             .anomalous_private_event_keys
-            .read()
-            .unwrap()
+            .load()
             .contains(payload_key)
         {
             return;
@@ -11121,11 +11128,17 @@ impl SharedAccount {
         if payload_key.is_empty() {
             return;
         }
+        if !self
+            .anomalous_private_event_keys
+            .load()
+            .contains(payload_key)
+        {
+            return;
+        }
         let _transition = self.private_anomaly_transition.lock().unwrap();
         if !self
             .anomalous_private_event_keys
-            .read()
-            .unwrap()
+            .load()
             .contains(payload_key)
         {
             return;
@@ -11153,15 +11166,19 @@ impl SharedAccount {
         // AccountStateGuard folds this map into concurrent cold full
         // snapshots. The typed writer makes the exact entry durable while the
         // virtual trade WAL independently persists lifecycle/economics.
-        let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
-        if anchors
+        if self
+            .unresolved_trade_match_times_fast
+            .load()
             .get(trade_key)
             .is_some_and(|existing| *existing == match_time_secs)
         {
             return;
         }
-        anchors.insert(trade_key.to_string(), match_time_secs);
-        drop(anchors);
+        self.unresolved_trade_match_times_fast.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(trade_key.to_string(), match_time_secs);
+            Arc::new(next)
+        });
         self.startup_snapshot_deferred_fast
             .store(true, Ordering::Release);
         self.unresolved_trade_keys
@@ -11177,10 +11194,17 @@ impl SharedAccount {
             return;
         }
         self.unresolved_trade_keys.remove(trade_key);
-        let mut anchors = self.unresolved_trade_match_times_fast.write().unwrap();
-        if anchors.remove(trade_key).is_some() {
-            let all_trades_resolved = anchors.is_empty();
-            drop(anchors);
+        if self
+            .unresolved_trade_match_times_fast
+            .load()
+            .contains_key(trade_key)
+        {
+            self.unresolved_trade_match_times_fast.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(trade_key);
+                Arc::new(next)
+            });
+            let all_trades_resolved = self.unresolved_trade_match_times_fast.load().is_empty();
             if all_trades_resolved && !self.unsettled_maintenance_fast.load(Ordering::Acquire) {
                 self.startup_snapshot_deferred_fast
                     .store(false, Ordering::Release);
@@ -11193,8 +11217,7 @@ impl SharedAccount {
 
     pub fn earliest_unresolved_trade_match_time(&self) -> Option<u64> {
         self.unresolved_trade_match_times_fast
-            .read()
-            .unwrap()
+            .load()
             .values()
             .copied()
             .min()
@@ -12761,11 +12784,13 @@ impl SharedAccount {
         if cleared.is_empty() {
             return 0;
         }
-        let mut fast_sources = self.risk_blocker_sources_fast.write().unwrap();
-        for source in &cleared {
-            fast_sources.remove(source);
-        }
-        drop(fast_sources);
+        self.risk_blocker_sources_fast.rcu(|current| {
+            let mut next = (**current).clone();
+            for source in &cleared {
+                next.remove(source);
+            }
+            Arc::new(next)
+        });
         recompute_reconciliation(&mut state, "confirmed maintenance blocker recovery");
         self.schedule_persist(&state);
         cleared.len()
@@ -13016,10 +13041,13 @@ impl SharedAccount {
         }
         let cleared = clear_confirmed_maintenance_risk_blockers(&mut state);
         if !cleared.is_empty() {
-            let mut fast_sources = self.risk_blocker_sources_fast.write().unwrap();
-            for source in cleared {
-                fast_sources.remove(&source);
-            }
+            self.risk_blocker_sources_fast.rcu(|current| {
+                let mut next = (**current).clone();
+                for source in &cleared {
+                    next.remove(source);
+                }
+                Arc::new(next)
+            });
         }
         recompute_reconciliation(&mut state, "confirmed maintenance operation");
         self.schedule_persist(&state);
@@ -13340,8 +13368,7 @@ impl SharedAccount {
                     let config = (!is_maker)
                         .then(|| {
                             self.token_fee_configs_fast
-                                .read()
-                                .unwrap()
+                                .load()
                                 .get(token_id)
                                 .cloned()
                         })
@@ -13427,8 +13454,7 @@ impl SharedAccount {
                 let config = (!is_maker)
                     .then(|| {
                         self.token_fee_configs_fast
-                            .read()
-                            .unwrap()
+                            .load()
                             .get(token_id)
                             .cloned()
                     })
@@ -13500,8 +13526,7 @@ impl SharedAccount {
                 let config = (!is_maker)
                     .then(|| {
                         self.token_fee_configs_fast
-                            .read()
-                            .unwrap()
+                            .load()
                             .get(token_id)
                             .cloned()
                     })
@@ -13703,8 +13728,7 @@ impl SharedAccount {
             let config = (!is_maker)
                 .then(|| {
                     self.token_fee_configs_fast
-                        .read()
-                        .unwrap()
+                        .load()
                         .get(token_id)
                         .cloned()
                 })
@@ -24811,6 +24835,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
 
     #[test]
     fn read_mostly_control_snapshots_do_not_take_the_account_lock() {
+        const EVENTS: usize = 20_000;
         let account = SharedAccount::new("lock-free-control-snapshots");
         {
             let mut state = account.lock_state();
@@ -24834,6 +24859,16 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let outcomes = account.settled_token_values_snapshot_arc();
         assert_eq!(outcomes.generation, 7);
         assert_eq!(outcomes.values.get("winner-token"), Some(&1.0));
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = Instant::now();
+            account.resolve_private_event_anomaly("order:ordinary-fast-miss");
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+        eprintln!(
+            "read-mostly account control: boundary=private_anomaly_arc_swap_miss n={EVENTS} p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} queue_high_water=0 overflow=0 account_lock_acquisitions=0",
+        );
         assert_eq!(
             account.account_lock_acquisitions.load(Ordering::Acquire),
             acquisitions,

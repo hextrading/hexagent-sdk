@@ -8,7 +8,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::types::{now_ns, OrderUpdate, Side};
 use hexagent_account::account::shared_account::RestoredTrade;
@@ -17,6 +18,11 @@ use hexagent_account::account::shared_account::RestoredTrade;
 /// is deliberately synchronous). Keep that race bounded without reconnecting
 /// a healthy private socket merely because no strategy consumer exists yet.
 const STARTUP_RECOVERY_BUFFER_CAPACITY: usize = 4_096;
+/// Recovery enrollment/acknowledgement is lossless account control traffic.
+/// It uses a dedicated FIFO owner rather than sharing either the quote lane or
+/// the lower-priority calibration/cache actors.
+const RECOVERY_DELIVERY_OWNER_CAPACITY: usize = 16_384;
+const RECOVERY_PENDING_CAPACITY: usize = 16_384;
 
 // ════════════════════════════════════════════════════════════════
 // User-feed health (narrow cross-thread handle)
@@ -56,10 +62,13 @@ pub struct UserFeedHealth {
     strategy_consumer_ready_fast: AtomicBool,
     strategy_consumer_ready_notify: tokio::sync::Notify,
     /// Common-path membership guard for ordinary private updates. Only a
-    /// reconnect epoch with enrolled, unacknowledged updates can enter the
-    /// cold recovery-delivery mutex below.
-    recovery_pending_fast: AtomicUsize,
-    recovery_delivery: Mutex<RecoveryDeliveryState>,
+    /// reconnect epoch with enrolled, unacknowledged updates needs an owner
+    /// query.
+    recovery_pending_fast: Arc<AtomicUsize>,
+    recovery_generation_fast: Arc<AtomicU64>,
+    recovery_delivery_tx: crossbeam_channel::Sender<RecoveryDeliveryCommand>,
+    recovery_queue_high_water: AtomicUsize,
+    recovery_queue_overflow: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,8 +102,194 @@ impl RecoveryUpdateKey {
 struct RecoveryDeliveryState {
     generation: u64,
     enrolling: bool,
+    consumer_ready: bool,
     pending: HashMap<RecoveryUpdateKey, usize>,
+    pending_count: usize,
     startup_buffer: VecDeque<(u64, OrderUpdate)>,
+}
+
+enum RecoveryDeliveryCommand {
+    Begin {
+        reply: crossbeam_channel::Sender<u64>,
+    },
+    Register {
+        generation: u64,
+        key: RecoveryUpdateKey,
+        update: OrderUpdate,
+        reply: crossbeam_channel::Sender<Result<bool, String>>,
+    },
+    ConsumerReady {
+        reply: crossbeam_channel::Sender<()>,
+    },
+    TakeStartup {
+        generation: u64,
+        reply: crossbeam_channel::Sender<Result<Vec<OrderUpdate>, String>>,
+    },
+    FinishEnrollment {
+        generation: u64,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    Acknowledge {
+        generation: Option<u64>,
+        key: RecoveryUpdateKey,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    AcknowledgeAsync {
+        generation: u64,
+        key: RecoveryUpdateKey,
+    },
+    Progress {
+        generation: u64,
+        reply: crossbeam_channel::Sender<Option<(bool, usize)>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryDeliveryMetrics {
+    pub queue_capacity: usize,
+    pub pending_capacity: usize,
+    pub queue_high_water: usize,
+    pub queue_overflow: u64,
+}
+
+fn spawn_recovery_delivery_owner(
+    pending_fast: Arc<AtomicUsize>,
+    generation_fast: Arc<AtomicU64>,
+) -> crossbeam_channel::Sender<RecoveryDeliveryCommand> {
+    let (tx, rx) = crossbeam_channel::bounded(RECOVERY_DELIVERY_OWNER_CAPACITY);
+    std::thread::Builder::new()
+        .name("poly-recovery-owner".to_string())
+        .spawn(move || {
+            crate::os_tune::pin_background("poly-recovery-owner");
+            let mut delivery = RecoveryDeliveryState::default();
+            while let Ok(command) = rx.recv() {
+                match command {
+                    RecoveryDeliveryCommand::Begin { reply } => {
+                        delivery.generation = delivery.generation.wrapping_add(1).max(1);
+                        delivery.enrolling = true;
+                        delivery.pending.clear();
+                        delivery.pending_count = 0;
+                        delivery.startup_buffer.clear();
+                        pending_fast.store(0, Ordering::Release);
+                        generation_fast.store(delivery.generation, Ordering::Release);
+                        let _ = reply.try_send(delivery.generation);
+                    }
+                    RecoveryDeliveryCommand::Register {
+                        generation,
+                        key,
+                        update,
+                        reply,
+                    } => {
+                        let buffer_update = !delivery.consumer_ready;
+                        let result = if delivery.generation != generation || !delivery.enrolling {
+                            Err(format!(
+                                "recovery delivery generation {generation} is no longer accepting updates"
+                            ))
+                        } else if buffer_update
+                            && delivery.startup_buffer.len()
+                                >= STARTUP_RECOVERY_BUFFER_CAPACITY
+                        {
+                            Err(format!(
+                                "startup recovery buffer is full ({STARTUP_RECOVERY_BUFFER_CAPACITY} updates)"
+                            ))
+                        } else if delivery.pending_count >= RECOVERY_PENDING_CAPACITY {
+                            Err(format!(
+                                "recovery pending set is full ({RECOVERY_PENDING_CAPACITY} updates)"
+                            ))
+                        } else {
+                            *delivery.pending.entry(key).or_insert(0) += 1;
+                            delivery.pending_count += 1;
+                            pending_fast.store(delivery.pending_count, Ordering::Release);
+                            if buffer_update {
+                                delivery.startup_buffer.push_back((generation, update));
+                            }
+                            Ok(buffer_update)
+                        };
+                        let _ = reply.try_send(result);
+                    }
+                    RecoveryDeliveryCommand::ConsumerReady { reply } => {
+                        delivery.consumer_ready = true;
+                        let _ = reply.try_send(());
+                    }
+                    RecoveryDeliveryCommand::TakeStartup {
+                        generation,
+                        reply,
+                    } => {
+                        let result = if delivery.generation != generation {
+                            Err(format!(
+                                "recovery delivery generation {generation} was superseded"
+                            ))
+                        } else if !delivery.consumer_ready {
+                            Ok(Vec::new())
+                        } else {
+                            let mut updates = Vec::with_capacity(delivery.startup_buffer.len());
+                            while let Some((buffered_generation, update)) =
+                                delivery.startup_buffer.pop_front()
+                            {
+                                if buffered_generation == generation {
+                                    updates.push(update);
+                                }
+                            }
+                            Ok(updates)
+                        };
+                        let _ = reply.try_send(result);
+                    }
+                    RecoveryDeliveryCommand::FinishEnrollment { generation, reply } => {
+                        let finished = delivery.generation == generation;
+                        if finished {
+                            delivery.enrolling = false;
+                        }
+                        let _ = reply.try_send(finished);
+                    }
+                    RecoveryDeliveryCommand::Acknowledge {
+                        generation,
+                        key,
+                        reply,
+                    } => {
+                        let generation_matches =
+                            generation.is_none_or(|generation| generation == delivery.generation);
+                        let acknowledged = if generation_matches {
+                            if let Some(count) = delivery.pending.get_mut(&key) {
+                                if *count > 1 {
+                                    *count -= 1;
+                                } else {
+                                    delivery.pending.remove(&key);
+                                }
+                                delivery.pending_count = delivery.pending_count.saturating_sub(1);
+                                pending_fast.store(delivery.pending_count, Ordering::Release);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        let _ = reply.try_send(acknowledged);
+                    }
+                    RecoveryDeliveryCommand::AcknowledgeAsync { generation, key } => {
+                        if generation == delivery.generation {
+                            if let Some(count) = delivery.pending.get_mut(&key) {
+                                if *count > 1 {
+                                    *count -= 1;
+                                } else {
+                                    delivery.pending.remove(&key);
+                                }
+                                delivery.pending_count = delivery.pending_count.saturating_sub(1);
+                                pending_fast.store(delivery.pending_count, Ordering::Release);
+                            }
+                        }
+                    }
+                    RecoveryDeliveryCommand::Progress { generation, reply } => {
+                        let progress = (delivery.generation == generation).then(|| {
+                            (!delivery.enrolling, delivery.pending_count)
+                        });
+                        let _ = reply.try_send(progress);
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn recovery-delivery owner");
+    tx
 }
 
 /// Completion token held across one strategy `on_order_update` call. It only
@@ -104,20 +299,16 @@ struct RecoveryDeliveryState {
 pub struct RecoveryUpdateAck {
     health: Arc<UserFeedHealth>,
     generation: u64,
-    instance_id: String,
-    update: OrderUpdate,
+    key: Option<RecoveryUpdateKey>,
 }
 
 impl Drop for RecoveryUpdateAck {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            let _ = self
-                .health
-                .acknowledge_recovery_update_generation(
-                    self.generation,
-                    &self.instance_id,
-                    &self.update,
-                );
+            if let Some(key) = self.key.take() {
+                self.health
+                    .enqueue_recovery_ack(self.generation, key);
+            }
         }
     }
 }
@@ -126,6 +317,12 @@ impl UserFeedHealth {
     /// Starts `recovering=true`: until the feed's first connect + gap replay
     /// completes, the ledger isn't trustworthy and the strategy should wait.
     pub fn new() -> Self {
+        let recovery_pending_fast = Arc::new(AtomicUsize::new(0));
+        let recovery_generation_fast = Arc::new(AtomicU64::new(0));
+        let recovery_delivery_tx = spawn_recovery_delivery_owner(
+            Arc::clone(&recovery_pending_fast),
+            Arc::clone(&recovery_generation_fast),
+        );
         Self {
             recovering: AtomicBool::new(true),
             recovering_since_ns: AtomicU64::new(now_ns()),
@@ -135,8 +332,76 @@ impl UserFeedHealth {
             last_valid_business_event_ns: AtomicU64::new(0),
             strategy_consumer_ready_fast: AtomicBool::new(false),
             strategy_consumer_ready_notify: tokio::sync::Notify::new(),
-            recovery_pending_fast: AtomicUsize::new(0),
-            recovery_delivery: Mutex::new(RecoveryDeliveryState::default()),
+            recovery_pending_fast,
+            recovery_generation_fast,
+            recovery_delivery_tx,
+            recovery_queue_high_water: AtomicUsize::new(0),
+            recovery_queue_overflow: AtomicU64::new(0),
+        }
+    }
+
+    fn send_recovery_command(&self, command: RecoveryDeliveryCommand) -> Result<(), String> {
+        let admitted_depth = self
+            .recovery_delivery_tx
+            .len()
+            .saturating_add(1)
+            .min(RECOVERY_DELIVERY_OWNER_CAPACITY);
+        self.recovery_delivery_tx
+            .send_timeout(command, Duration::from_secs(2))
+            .map_err(|error| {
+                self.recovery_queue_overflow.fetch_add(1, Ordering::Relaxed);
+                self.set_inventory_uncertain(true);
+                format!("recovery-delivery owner unavailable: {error}")
+            })?;
+        self.recovery_queue_high_water
+            .fetch_max(admitted_depth, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn receive_recovery_reply<T>(
+        &self,
+        reply: crossbeam_channel::Receiver<T>,
+    ) -> Result<T, String> {
+        reply.recv_timeout(Duration::from_secs(2)).map_err(|error| {
+            self.recovery_queue_overflow.fetch_add(1, Ordering::Relaxed);
+            self.set_inventory_uncertain(true);
+            format!("recovery-delivery owner reply unavailable: {error}")
+        })
+    }
+
+    /// Strategy-side completion is deliberately one-way: it never waits for
+    /// the recovery owner. Saturation leaves the pending item enrolled and
+    /// forces inventory uncertain, so quoting cannot resume on a lost ACK.
+    fn enqueue_recovery_ack(&self, generation: u64, key: RecoveryUpdateKey) {
+        let admitted_depth = self
+            .recovery_delivery_tx
+            .len()
+            .saturating_add(1)
+            .min(RECOVERY_DELIVERY_OWNER_CAPACITY);
+        match self
+            .recovery_delivery_tx
+            .try_send(RecoveryDeliveryCommand::AcknowledgeAsync { generation, key })
+        {
+            Ok(()) => {
+                self.recovery_queue_high_water
+                    .fetch_max(admitted_depth, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.recovery_queue_overflow.fetch_add(1, Ordering::Relaxed);
+                self.set_inventory_uncertain(true);
+                log::error!(
+                    "[user_feed_health] recovery ACK owner unavailable; inventory forced uncertain: {error}"
+                );
+            }
+        }
+    }
+
+    pub fn recovery_delivery_metrics(&self) -> RecoveryDeliveryMetrics {
+        RecoveryDeliveryMetrics {
+            queue_capacity: RECOVERY_DELIVERY_OWNER_CAPACITY,
+            pending_capacity: RECOVERY_PENDING_CAPACITY,
+            queue_high_water: self.recovery_queue_high_water.load(Ordering::Relaxed),
+            queue_overflow: self.recovery_queue_overflow.load(Ordering::Relaxed),
         }
     }
     pub fn is_recovering(&self) -> bool {
@@ -197,13 +462,20 @@ impl UserFeedHealth {
     /// enqueued while their PositionManager is still stale.
     pub fn begin_recovery_delivery(&self) -> u64 {
         self.set_recovering(true);
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        delivery.generation = delivery.generation.wrapping_add(1).max(1);
-        delivery.enrolling = true;
-        delivery.pending.clear();
-        delivery.startup_buffer.clear();
-        self.recovery_pending_fast.store(0, Ordering::Release);
-        delivery.generation
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send_recovery_command(RecoveryDeliveryCommand::Begin {
+            reply: reply_tx,
+        }) {
+            log::error!("[user_feed_health] {error}");
+            return 0;
+        }
+        match self.receive_recovery_reply(reply_rx) {
+            Ok(generation) => generation,
+            Err(error) => {
+                log::error!("[user_feed_health] {error}");
+                0
+            }
+        }
     }
 
     pub fn register_recovery_update(
@@ -218,40 +490,28 @@ impl UserFeedHealth {
                 update.client_order_id,
             ));
         }
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        if delivery.generation != generation || !delivery.enrolling {
-            return Err(format!(
-                "recovery delivery generation {} is no longer accepting updates",
-                generation,
-            ));
-        }
-        // `mark_strategy_consumer_ready` publishes while holding this same
-        // mutex, so an update is either wholly buffered before the edge or
-        // wholly sent after it; the startup drain cannot miss the race.
-        let buffer_update = !self.strategy_consumer_ready_fast.load(Ordering::Acquire);
-        if buffer_update && delivery.startup_buffer.len() >= STARTUP_RECOVERY_BUFFER_CAPACITY {
-            return Err(format!(
-                "startup recovery buffer is full ({STARTUP_RECOVERY_BUFFER_CAPACITY} updates)",
-            ));
-        }
-        *delivery
-            .pending
-            .entry(RecoveryUpdateKey::new(instance_id, update))
-            .or_insert(0) += 1;
-        self.recovery_pending_fast.fetch_add(1, Ordering::Release);
-        if buffer_update {
-            delivery
-                .startup_buffer
-                .push_back((generation, update.clone()));
-        }
-        Ok(buffer_update)
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send_recovery_command(RecoveryDeliveryCommand::Register {
+            generation,
+            key: RecoveryUpdateKey::new(instance_id, update),
+            update: update.clone(),
+            reply: reply_tx,
+        })?;
+        self.receive_recovery_reply(reply_rx)?
     }
 
     /// Publish the engine's order-update consumer after strategy construction.
     /// Buffered updates are drained by the user-feed recovery task, preserving
     /// its single enrollment/delivery ordering.
     pub fn mark_strategy_consumer_ready(&self) {
-        let _delivery = self.recovery_delivery.lock().unwrap();
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        if let Err(error) = self
+            .send_recovery_command(RecoveryDeliveryCommand::ConsumerReady { reply: reply_tx })
+            .and_then(|()| self.receive_recovery_reply(reply_rx))
+        {
+            log::error!("[user_feed_health] cannot publish strategy consumer: {error}");
+            return;
+        }
         self.strategy_consumer_ready_fast
             .store(true, Ordering::Release);
         self.strategy_consumer_ready_notify.notify_one();
@@ -271,71 +531,48 @@ impl UserFeedHealth {
         &self,
         generation: u64,
     ) -> Result<Vec<OrderUpdate>, String> {
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        if delivery.generation != generation {
-            return Err(format!(
-                "recovery delivery generation {generation} was superseded",
-            ));
-        }
-        if !self.strategy_consumer_ready_fast.load(Ordering::Acquire) {
-            return Ok(Vec::new());
-        }
-        let mut updates = Vec::with_capacity(delivery.startup_buffer.len());
-        while let Some((buffered_generation, update)) = delivery.startup_buffer.pop_front() {
-            if buffered_generation == generation {
-                updates.push(update);
-            }
-        }
-        Ok(updates)
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send_recovery_command(RecoveryDeliveryCommand::TakeStartup {
+            generation,
+            reply: reply_tx,
+        })?;
+        self.receive_recovery_reply(reply_rx)?
     }
 
     pub fn finish_recovery_delivery_enrollment(&self, generation: u64) -> bool {
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        if delivery.generation != generation {
-            return false;
-        }
-        delivery.enrolling = false;
-        true
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send_recovery_command(RecoveryDeliveryCommand::FinishEnrollment {
+            generation,
+            reply: reply_tx,
+        })
+        .and_then(|()| self.receive_recovery_reply(reply_rx))
+        .unwrap_or(false)
     }
 
     /// Called by the owning strategy after it has fully processed an update.
     /// Broadcast siblings cannot consume the acknowledgement because the
     /// instance id is part of the key.
     pub fn acknowledge_recovery_update(&self, instance_id: &str, update: &OrderUpdate) -> bool {
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        Self::acknowledge_recovery_update_locked(self, &mut delivery, instance_id, update)
+        self.acknowledge_recovery_update_key(
+            None,
+            RecoveryUpdateKey::new(instance_id, update),
+        )
     }
 
-    fn acknowledge_recovery_update_generation(
+    fn acknowledge_recovery_update_key(
         &self,
-        generation: u64,
-        instance_id: &str,
-        update: &OrderUpdate,
+        generation: Option<u64>,
+        key: RecoveryUpdateKey,
     ) -> bool {
-        let mut delivery = self.recovery_delivery.lock().unwrap();
-        if delivery.generation != generation {
-            return false;
-        }
-        Self::acknowledge_recovery_update_locked(self, &mut delivery, instance_id, update)
-    }
-
-    fn acknowledge_recovery_update_locked(
-        &self,
-        delivery: &mut RecoveryDeliveryState,
-        instance_id: &str,
-        update: &OrderUpdate,
-    ) -> bool {
-        let key = RecoveryUpdateKey::new(instance_id, update);
-        let Some(count) = delivery.pending.get_mut(&key) else {
-            return false;
-        };
-        if *count > 1 {
-            *count -= 1;
-        } else {
-            delivery.pending.remove(&key);
-        }
-        self.recovery_pending_fast.fetch_sub(1, Ordering::Release);
-        true
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self
+            .send_recovery_command(RecoveryDeliveryCommand::Acknowledge {
+                generation,
+                key,
+                reply: reply_tx,
+            })
+            .and_then(|()| self.receive_recovery_reply(reply_rx))
+            .unwrap_or(false)
     }
 
     pub fn recovery_update_ack(
@@ -346,32 +583,29 @@ impl UserFeedHealth {
         if self.recovery_pending_fast.load(Ordering::Acquire) == 0 {
             return None;
         }
-        let delivery = self.recovery_delivery.lock().unwrap();
-        if delivery.pending.is_empty() {
+        let generation = self.recovery_generation_fast.load(Ordering::Acquire);
+        if generation == 0 {
             return None;
         }
         let key = RecoveryUpdateKey::new(instance_id, update);
-        delivery
-            .pending
-            .contains_key(&key)
-            .then(|| RecoveryUpdateAck {
-                health: Arc::clone(self),
-                generation: delivery.generation,
-                instance_id: instance_id.to_string(),
-                update: update.clone(),
-            })
+        Some(RecoveryUpdateAck {
+            health: Arc::clone(self),
+            generation,
+            key: Some(key),
+        })
     }
 
     /// Returns `None` if a newer reconnect superseded this generation;
     /// otherwise `(enrollment_finished, pending_update_count)`.
     pub fn recovery_delivery_progress(&self, generation: u64) -> Option<(bool, usize)> {
-        let delivery = self.recovery_delivery.lock().unwrap();
-        (delivery.generation == generation).then(|| {
-            (
-                !delivery.enrolling,
-                delivery.pending.values().copied().sum(),
-            )
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send_recovery_command(RecoveryDeliveryCommand::Progress {
+            generation,
+            reply: reply_tx,
         })
+        .and_then(|()| self.receive_recovery_reply(reply_rx))
+        .ok()
+        .flatten()
     }
 }
 
@@ -671,7 +905,7 @@ impl LivePositionManager {
 
 #[cfg(test)]
 mod user_feed_health_tests {
-    use super::UserFeedHealth;
+    use super::{UserFeedHealth, RECOVERY_DELIVERY_OWNER_CAPACITY};
     use crate::types::{now_ns, Exchange, OrderStatus, OrderUpdate, Side};
 
     fn recovery_update(coid: &str) -> OrderUpdate {
@@ -831,6 +1065,68 @@ mod user_feed_health_tests {
             h.recovery_delivery_progress(new_generation),
             Some((true, 0)),
         );
+    }
+
+    #[test]
+    fn recovery_owner_preserves_duplicates_order_isolation_and_bounded_tail() {
+        const EVENTS: usize = 4_096;
+        let h = std::sync::Arc::new(UserFeedHealth::new());
+        h.mark_strategy_consumer_ready();
+        let generation = h.begin_recovery_delivery();
+
+        let duplicate = recovery_update("btc01-duplicate");
+        assert!(!h
+            .register_recovery_update(generation, "btc01", &duplicate)
+            .unwrap());
+        assert!(!h
+            .register_recovery_update(generation, "btc01", &duplicate)
+            .unwrap());
+        assert_eq!(h.recovery_delivery_progress(generation), Some((false, 2)));
+        assert!(!h.acknowledge_recovery_update("btc02", &duplicate));
+        assert!(h.acknowledge_recovery_update("btc01", &duplicate));
+        assert_eq!(h.recovery_delivery_progress(generation), Some((false, 1)));
+        assert!(h.acknowledge_recovery_update("btc01", &duplicate));
+
+        let mut samples = Vec::with_capacity(EVENTS);
+        for sequence in 0..EVENTS {
+            let update = recovery_update(&format!("btc01-owner-{sequence}"));
+            let started = std::time::Instant::now();
+            assert!(!h
+                .register_recovery_update(generation, "btc01", &update)
+                .unwrap());
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            assert!(h.acknowledge_recovery_update("btc01", &update));
+        }
+        assert!(h.finish_recovery_delivery_enrollment(generation));
+        assert_eq!(h.recovery_delivery_progress(generation), Some((true, 0)));
+
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let metrics = h.recovery_delivery_metrics();
+        eprintln!(
+            "recovery owner: boundary=register_send_to_owner_reply n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+            metrics.queue_high_water,
+            metrics.queue_overflow,
+        );
+        assert!(metrics.queue_high_water > 0);
+        assert_eq!(metrics.queue_overflow, 0);
+
+        let (full_tx, _full_rx) =
+            crossbeam_channel::bounded::<u8>(RECOVERY_DELIVERY_OWNER_CAPACITY);
+        for _ in 0..RECOVERY_DELIVERY_OWNER_CAPACITY {
+            full_tx.try_send(1).unwrap();
+        }
+        assert!(matches!(
+            full_tx.try_send(1),
+            Err(crossbeam_channel::TrySendError::Full(1))
+        ));
     }
 
     #[test]

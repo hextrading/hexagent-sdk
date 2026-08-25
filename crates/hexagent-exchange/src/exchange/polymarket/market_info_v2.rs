@@ -29,7 +29,8 @@ use anyhow::{anyhow, Result};
 use log::{info, warn};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Parsed per-market fee / flags from the v2 CLOB.
@@ -92,8 +93,136 @@ enum MarketInfoFlight {
     },
 }
 
-static MARKET_INFO_FLIGHTS: OnceLock<Mutex<HashMap<MarketInfoKey, MarketInfoFlight>>> =
+enum MarketInfoOwnerCommand {
+    Subscribe {
+        key: MarketInfoKey,
+        subscriber: crossbeam_channel::Sender<Option<MarketInfoV2>>,
+        leader: crossbeam_channel::Sender<bool>,
+    },
+    Finish {
+        key: MarketInfoKey,
+        result: Option<MarketInfoV2>,
+    },
+}
+
+const MARKET_INFO_OWNER_CAPACITY: usize = 256;
+const MARKET_INFO_CACHE_CAPACITY: usize = 1_024;
+const MARKET_INFO_WAITER_CAPACITY: usize = 4_096;
+static MARKET_INFO_OWNER: OnceLock<crossbeam_channel::Sender<MarketInfoOwnerCommand>> =
     OnceLock::new();
+static MARKET_INFO_QUEUE_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+static MARKET_INFO_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketInfoOwnerMetrics {
+    pub queue_capacity: usize,
+    pub cache_capacity: usize,
+    pub waiter_capacity: usize,
+    pub queue_high_water: usize,
+    pub queue_overflow: u64,
+}
+
+pub fn market_info_owner_metrics() -> MarketInfoOwnerMetrics {
+    MarketInfoOwnerMetrics {
+        queue_capacity: MARKET_INFO_OWNER_CAPACITY,
+        cache_capacity: MARKET_INFO_CACHE_CAPACITY,
+        waiter_capacity: MARKET_INFO_WAITER_CAPACITY,
+        queue_high_water: MARKET_INFO_QUEUE_HIGH_WATER.load(Ordering::Relaxed),
+        queue_overflow: MARKET_INFO_QUEUE_OVERFLOW.load(Ordering::Relaxed),
+    }
+}
+
+fn market_info_owner() -> crossbeam_channel::Sender<MarketInfoOwnerCommand> {
+    MARKET_INFO_OWNER.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded(MARKET_INFO_OWNER_CAPACITY);
+        std::thread::Builder::new().name("poly-market-info-owner".to_string()).spawn(move || {
+            crate::os_tune::pin_background("poly-market-info-owner");
+            let mut entries = HashMap::<MarketInfoKey, MarketInfoFlight>::new();
+            let mut waiter_count = 0usize;
+            while let Ok(command) = rx.recv() {
+                entries.retain(|_, entry| match entry {
+                    MarketInfoFlight::Fetching(_) => true,
+                    MarketInfoFlight::Ready { fetched_at, .. } => {
+                        fetched_at.elapsed() < Duration::from_secs(2 * 60 * 60)
+                    }
+                });
+                match command {
+                    MarketInfoOwnerCommand::Subscribe { key, subscriber, leader } => {
+                        if !entries.contains_key(&key)
+                            && entries.len() >= MARKET_INFO_CACHE_CAPACITY
+                        {
+                            let oldest_ready = entries
+                                .iter()
+                                .filter_map(|(key, entry)| match entry {
+                                    MarketInfoFlight::Ready { fetched_at, .. } => {
+                                        Some((key.clone(), *fetched_at))
+                                    }
+                                    MarketInfoFlight::Fetching(_) => None,
+                                })
+                                .min_by_key(|(_, fetched_at)| *fetched_at)
+                                .map(|(key, _)| key);
+                            if let Some(oldest_ready) = oldest_ready {
+                                entries.remove(&oldest_ready);
+                            }
+                        }
+                        let has_entry_capacity = entries.len() < MARKET_INFO_CACHE_CAPACITY;
+                        match entries.get_mut(&key) {
+                            Some(MarketInfoFlight::Fetching(waiters))
+                                if waiter_count < MARKET_INFO_WAITER_CAPACITY =>
+                            {
+                                waiters.push(subscriber);
+                                waiter_count += 1;
+                                let _ = leader.try_send(false);
+                            }
+                            Some(MarketInfoFlight::Fetching(_)) => {
+                                MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                                let _ = subscriber.try_send(None);
+                                let _ = leader.try_send(false);
+                            }
+                            Some(MarketInfoFlight::Ready { value, .. }) => {
+                                let _ = subscriber.try_send(Some(value.clone()));
+                                let _ = leader.try_send(false);
+                            }
+                            None if has_entry_capacity => {
+                                entries.insert(key, MarketInfoFlight::Fetching(vec![subscriber]));
+                                waiter_count += 1;
+                                let _ = leader.try_send(true);
+                            }
+                            None => {
+                                MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                                let _ = subscriber.try_send(None);
+                                let _ = leader.try_send(false);
+                            }
+                        }
+                    }
+                    MarketInfoOwnerCommand::Finish { key, result } => {
+                        let (waiters, accept_result) = match entries.remove(&key) {
+                            Some(MarketInfoFlight::Fetching(waiters)) => (waiters, true),
+                            Some(ready @ MarketInfoFlight::Ready { .. }) => {
+                                entries.insert(key.clone(), ready);
+                                (Vec::new(), false)
+                            }
+                            None => (Vec::new(), false),
+                        };
+                        waiter_count = waiter_count.saturating_sub(waiters.len());
+                        if accept_result {
+                            if let Some(value) = result.as_ref() {
+                            entries.insert(key, MarketInfoFlight::Ready {
+                                fetched_at: Instant::now(),
+                                value: value.clone(),
+                            });
+                            }
+                        }
+                        for waiter in waiters {
+                            let _ = waiter.try_send(result.clone());
+                        }
+                    }
+                }
+            }
+        }).expect("failed to spawn market-info owner");
+        tx
+    }).clone()
+}
 
 fn market_info_key(
     api_url_prefix: String,
@@ -114,49 +243,35 @@ fn market_info_key(
 fn subscribe_market_info(
     key: &MarketInfoKey,
 ) -> (crossbeam_channel::Receiver<Option<MarketInfoV2>>, bool) {
-    const CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let flights = MARKET_INFO_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut entries = flights.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    entries.retain(|_, entry| match entry {
-        MarketInfoFlight::Fetching(_) => true,
-        MarketInfoFlight::Ready { fetched_at, .. } => fetched_at.elapsed() < CACHE_TTL,
-    });
-    match entries.get_mut(key) {
-        Some(MarketInfoFlight::Fetching(waiters)) => {
-            waiters.push(tx);
-            (rx, false)
-        }
-        Some(MarketInfoFlight::Ready { value, .. }) => {
-            let _ = tx.send(Some(value.clone()));
-            (rx, false)
-        }
-        None => {
-            entries.insert(key.clone(), MarketInfoFlight::Fetching(vec![tx]));
-            (rx, true)
-        }
+    let (leader_tx, leader_rx) = crossbeam_channel::bounded(1);
+    let owner = market_info_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(MARKET_INFO_OWNER_CAPACITY);
+    if owner.send_timeout(MarketInfoOwnerCommand::Subscribe {
+        key: key.clone(),
+        subscriber: tx.clone(),
+        leader: leader_tx,
+    }, Duration::from_secs(2)).is_err() {
+        MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        let _ = tx.try_send(None);
+        return (rx, false);
     }
+    MARKET_INFO_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    let leader = leader_rx.recv().unwrap_or(false);
+    (rx, leader)
 }
 
 fn finish_market_info_fetch(key: &MarketInfoKey, result: Option<MarketInfoV2>) {
-    let flights = MARKET_INFO_FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut entries = flights.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let waiters = match entries.remove(key) {
-        Some(MarketInfoFlight::Fetching(waiters)) => waiters,
-        Some(MarketInfoFlight::Ready { .. }) | None => Vec::new(),
-    };
-    if let Some(value) = result.as_ref() {
-        // Successful market metadata is immutable for the event. Keep a
-        // bounded time cache so an instance that starts seconds later does
-        // not launch another request after the original flight completed.
-        entries.insert(key.clone(), MarketInfoFlight::Ready {
-            fetched_at: Instant::now(),
-            value: value.clone(),
-        });
-    }
-    drop(entries);
-    for waiter in waiters {
-        let _ = waiter.send(result.clone());
+    let owner = market_info_owner();
+    let admitted_depth = owner.len().saturating_add(1).min(MARKET_INFO_OWNER_CAPACITY);
+    if let Err(error) = owner.send_timeout(MarketInfoOwnerCommand::Finish {
+        key: key.clone(),
+        result,
+    }, Duration::from_secs(2)) {
+        MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        warn!("[market_info_v2] owner saturated while finishing fetch: {error}");
+    } else {
+        MARKET_INFO_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
     }
 }
 
@@ -568,5 +683,63 @@ mod tests {
         let (cached, cached_is_leader) = subscribe_market_info(&key);
         assert!(!cached_is_leader);
         assert_eq!(cached.recv().unwrap().unwrap().fee_rate_bps, 100);
+    }
+
+    #[test]
+    fn market_info_owner_reports_cached_roundtrip_tail_and_bounded_overflow() {
+        const EVENTS: usize = 4_096;
+        let key = market_info_key(
+            "https://example.invalid/".to_string(),
+            format!("0xOWNER-LATENCY-{}", std::process::id()),
+            String::new(),
+        );
+        let (initial, leader) = subscribe_market_info(&key);
+        assert!(leader);
+        finish_market_info_fetch(
+            &key,
+            Some(MarketInfoV2 {
+                fee_rate: 0.01,
+                fee_exponent: 1.0,
+                fee_rate_bps: 100,
+                taker_only: true,
+                raw: serde_json::Value::Null,
+            }),
+        );
+        assert_eq!(initial.recv().unwrap().unwrap().fee_rate_bps, 100);
+
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            let started = Instant::now();
+            let (cached, is_leader) = subscribe_market_info(&key);
+            assert!(!is_leader);
+            assert_eq!(cached.recv().unwrap().unwrap().fee_rate_bps, 100);
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        let metrics = market_info_owner_metrics();
+        eprintln!(
+            "market-info owner: boundary=subscribe_send_to_cached_reply n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
+            samples.len(),
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or_default(),
+            metrics.queue_high_water,
+            metrics.queue_overflow,
+        );
+        assert!(metrics.queue_high_water > 0);
+        assert_eq!(metrics.queue_overflow, 0);
+
+        let (full_tx, _full_rx) = crossbeam_channel::bounded::<u8>(MARKET_INFO_OWNER_CAPACITY);
+        for _ in 0..MARKET_INFO_OWNER_CAPACITY {
+            full_tx.try_send(1).unwrap();
+        }
+        assert!(matches!(
+            full_tx.try_send(1),
+            Err(crossbeam_channel::TrySendError::Full(1))
+        ));
     }
 }
