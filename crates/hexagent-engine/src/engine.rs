@@ -11,7 +11,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -89,9 +89,7 @@ enum ExecutionDiagnostic {
         detail: String,
     },
     #[cfg(test)]
-    FixedLifecycleOverflow {
-        client_order_id: String,
-    },
+    FixedLifecycleOverflow { client_order_id: String },
 }
 
 #[inline]
@@ -121,9 +119,9 @@ fn spawn_execution_diagnostics(
                         "[Executor] venue={exchange:?} operation={operation} failed: {detail}"
                     ),
                     #[cfg(test)]
-                    ExecutionDiagnostic::FixedLifecycleOverflow { client_order_id } => error!(
-                        "[Executor] fixed lifecycle scratch overflow coid={client_order_id}"
-                    ),
+                    ExecutionDiagnostic::FixedLifecycleOverflow { client_order_id } => {
+                        error!("[Executor] fixed lifecycle scratch overflow coid={client_order_id}")
+                    }
                 }
             }
         })?)
@@ -1802,6 +1800,7 @@ struct LatestMarketSlot {
     /// old queued marker distinguishable after ID/physical-slot reuse.
     tag: AtomicU64,
     enqueued_ns: AtomicU64,
+    queue_depth: AtomicUsize,
     event: std::sync::atomic::AtomicPtr<MarketEvent>,
 }
 
@@ -1811,6 +1810,7 @@ impl Default for LatestMarketSlot {
             state: std::sync::atomic::AtomicU8::new(LATEST_IDLE),
             tag: AtomicU64::new(0),
             enqueued_ns: AtomicU64::new(0),
+            queue_depth: AtomicUsize::new(0),
             event: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
@@ -10556,6 +10556,7 @@ impl Engine {
                     PolyAccountConnectionRoutes,
                 >::new();
                 let mut poly_connection_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_connection_metrics: Vec<Arc<PolyConnectionLaneMetrics>> = Vec::new();
                 let mut poly_completion_txs = HashMap::<String, Sender<RoutedOrderUpdate>>::new();
                 let mut poly_completion_handles: Vec<thread::JoinHandle<()>> = Vec::new();
                 // Admission-control observability (component 7): a stop flag +
@@ -10631,14 +10632,24 @@ impl Engine {
                             )
                         });
                         let (tx, rx) = bounded::<PolyConnectionCommand>(capacity);
+                        let lane_metrics = Arc::new(PolyConnectionLaneMetrics::new(
+                            &account_id,
+                            role,
+                            slot,
+                        ));
+                        poly_connection_metrics.push(Arc::clone(&lane_metrics));
+                        let lane = PolyConnectionLane {
+                            tx,
+                            metrics: Arc::clone(&lane_metrics),
+                        };
                         let routes = poly_connection_routes
                             .entry(account_id.clone())
                             .or_default();
                         match role {
-                            Role::Fast => routes.fast.push(tx),
-                            Role::Cancel if safety_cancel_slot => routes.safety_cancel.push(tx),
-                            Role::Cancel => routes.cancel.push(tx),
-                            Role::Reconcile => routes.reconcile.push(tx),
+                            Role::Fast => routes.fast.push(lane),
+                            Role::Cancel if safety_cancel_slot => routes.safety_cancel.push(lane),
+                            Role::Cancel => routes.cancel.push(lane),
+                            Role::Reconcile => routes.reconcile.push(lane),
                             Role::Query | Role::GapReplay => unreachable!(),
                         }
                         let router = LiveRouter::new_with_poly_map(&config, &poly_states);
@@ -10666,7 +10677,13 @@ impl Engine {
                                     };
                                     crate::os_tune::pin_execution_role(&thread_name, execution_role);
                                 }
-                                run_poly_connection_owner(router, permit, role, rx);
+                                run_poly_connection_owner(
+                                    router,
+                                    permit,
+                                    role,
+                                    rx,
+                                    lane_metrics,
+                                );
                             })
                             .unwrap();
                         poly_connection_handles.push(h);
@@ -10684,6 +10701,7 @@ impl Engine {
                     {
                         let stop = poly_stats_stop.clone();
                         let stats_shutdown_rx = shutdown_token.subscribe();
+                        let connection_metrics = poly_connection_metrics.clone();
                         let mut seen_accounts = HashSet::new();
                         let monitoring_accounts: Vec<_> = poly_states.values()
                             .filter_map(|shared| {
@@ -10758,6 +10776,29 @@ impl Engine {
                                                 gap_slots,
                                             );
                                         }
+                                    }
+                                    for lane in &connection_metrics {
+                                        let occupied = lane.occupied.load(Ordering::Acquire);
+                                        let enqueued_ns = lane.enqueued_ns.load(Ordering::Acquire);
+                                        let request_age_ms = if occupied && enqueued_ns > 0 {
+                                            now_ns().saturating_sub(enqueued_ns) / 1_000_000
+                                        } else {
+                                            0
+                                        };
+                                        info!(
+                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={}",
+                                            lane.account_id,
+                                            lane.role,
+                                            lane.slot,
+                                            occupied,
+                                            lane.queue_depth.load(Ordering::Relaxed),
+                                            lane.queue_high_water.load(Ordering::Relaxed),
+                                            lane.busy_skips.load(Ordering::Relaxed),
+                                            lane.send_failures.load(Ordering::Relaxed),
+                                            lane.completed.load(Ordering::Relaxed),
+                                            request_age_ms,
+                                            lane.request_age_max_ns.load(Ordering::Relaxed) / 1_000_000,
+                                        );
                                     }
                                     for account in &monitoring_accounts {
                                         let snapshot = account.monitoring_snapshot_fast();
@@ -11593,8 +11634,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             && now_ns().saturating_sub(timestamp_ns) / 1_000_000 > stale_threshold_ms
     };
     let mut fixed = OrderUpdateBatch::new();
-    let drain_fixed = |fixed: &mut OrderUpdateBatch,
-                       emit: &mut dyn FnMut(OrderUpdate) -> bool| {
+    let drain_fixed = |fixed: &mut OrderUpdateBatch, emit: &mut dyn FnMut(OrderUpdate) -> bool| {
         for update in fixed.drain(..) {
             if !emit(update) {
                 return false;
@@ -11604,8 +11644,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
     };
     match signal {
         Signal::NewOrder(order)
-            if is_stale(order.timestamp_ns)
-                || is_stale(order.quote_trigger_local_timestamp_ns) =>
+            if is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns) =>
         {
             let _ = emit(exec_rejected_place(&order));
         }
@@ -11700,8 +11739,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             instance_id,
         } => {
             if orders.iter().any(|order| {
-                is_stale(order.timestamp_ns)
-                    || is_stale(order.quote_trigger_local_timestamp_ns)
+                is_stale(order.timestamp_ns) || is_stale(order.quote_trigger_local_timestamp_ns)
             }) {
                 for order in &orders {
                     if !emit(exec_rejected_place(order)) {
@@ -11745,12 +11783,9 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             instance_id,
             timestamp_ns,
         } => {
-            if let Err(error) = worker.batch_cancel_orders_into(
-                exchange,
-                &market_id,
-                &client_order_ids,
-                &mut fixed,
-            ) {
+            if let Err(error) =
+                worker.batch_cancel_orders_into(exchange, &market_id, &client_order_ids, &mut fixed)
+            {
                 let detail = error.to_string();
                 try_submit_execution_diagnostic(
                     diagnostics,
@@ -11925,9 +11960,12 @@ struct VenueExecutionRoutes {
 #[inline]
 fn stable_connection_slot(key: &str, connection_count: usize) -> usize {
     debug_assert!(connection_count > 0);
-    let hash = key.as_bytes().iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
+    let hash = key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
     (hash as usize) % connection_count
 }
 
@@ -12096,9 +12134,7 @@ impl HexmarketCoidRouteTable {
             let Ok(key) = HexmarketCoidRouteKey::new(client_order_id) else {
                 return false;
             };
-            if self.get(client_order_id).is_none()
-                && !pending[..pending_len].contains(&Some(key))
-            {
+            if self.get(client_order_id).is_none() && !pending[..pending_len].contains(&Some(key)) {
                 if pending_len == pending.len() {
                     return false;
                 }
@@ -12293,9 +12329,7 @@ fn rejected_venue_signal(signal: &Signal, detail: &str) -> Vec<OrderUpdate> {
     };
     match signal {
         Signal::NewOrder(order) => vec![exec_rejected_place(order)],
-        Signal::BatchNewOrders { orders, .. } => {
-            orders.iter().map(exec_rejected_place).collect()
-        }
+        Signal::BatchNewOrders { orders, .. } => orders.iter().map(exec_rejected_place).collect(),
         Signal::CancelOrder {
             exchange,
             client_order_id,
@@ -12340,8 +12374,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
     root_update_tx: Sender<RoutedOrderUpdate>,
     diagnostics: Sender<ExecutionDiagnostic>,
 ) -> (VenueExecutionRoutes, Vec<thread::JoinHandle<()>>) {
-    let (fast_tx, fast_rx) =
-        bounded::<VenueExecutionCommand>(VENUE_FAST_OWNER_QUEUE_CAPACITY);
+    let (fast_tx, fast_rx) = bounded::<VenueExecutionCommand>(VENUE_FAST_OWNER_QUEUE_CAPACITY);
     let (cancel_tx, cancel_rx) =
         bounded::<VenueExecutionCommand>(VENUE_CANCEL_OWNER_QUEUE_CAPACITY);
     let (completion_tx, completion_rx) =
@@ -12507,11 +12540,127 @@ enum PolyTypedCompletion {
     },
 }
 
+/// Producer-visible occupancy for one physical HTTP/1.1 connection owner.
+/// One connection cannot multiplex requests, so admitting a second command
+/// while this flag is set can only create cross-order head-of-line blocking.
+/// The sender claims the slot before enqueue and the owner releases it only
+/// after the response handler completes.
+#[derive(Debug)]
+struct PolyConnectionLaneMetrics {
+    account_id: Arc<str>,
+    role: hexagent_runtime::http1_pool::Role,
+    slot: usize,
+    occupied: AtomicBool,
+    enqueued_ns: AtomicU64,
+    queue_depth: AtomicUsize,
+    queue_high_water: AtomicUsize,
+    busy_skips: AtomicU64,
+    send_failures: AtomicU64,
+    completed: AtomicU64,
+    request_age_max_ns: AtomicU64,
+}
+
+impl PolyConnectionLaneMetrics {
+    fn new(account_id: &str, role: hexagent_runtime::http1_pool::Role, slot: usize) -> Self {
+        Self {
+            account_id: Arc::from(account_id),
+            role,
+            slot,
+            occupied: AtomicBool::new(false),
+            enqueued_ns: AtomicU64::new(0),
+            queue_depth: AtomicUsize::new(0),
+            queue_high_water: AtomicUsize::new(0),
+            busy_skips: AtomicU64::new(0),
+            send_failures: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            request_age_max_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn release(&self) {
+        let enqueued_ns = self.enqueued_ns.swap(0, Ordering::AcqRel);
+        self.queue_depth.store(0, Ordering::Release);
+        if enqueued_ns > 0 {
+            self.request_age_max_ns
+                .fetch_max(now_ns().saturating_sub(enqueued_ns), Ordering::Relaxed);
+        }
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.occupied.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct PolyConnectionLane {
+    tx: Sender<PolyConnectionCommand>,
+    metrics: Arc<PolyConnectionLaneMetrics>,
+}
+
+impl PolyConnectionLane {
+    #[cfg(test)]
+    fn for_test(
+        tx: Sender<PolyConnectionCommand>,
+        role: hexagent_runtime::http1_pool::Role,
+        slot: usize,
+    ) -> Self {
+        Self {
+            tx,
+            metrics: Arc::new(PolyConnectionLaneMetrics::new("test", role, slot)),
+        }
+    }
+
+    fn try_send(
+        &self,
+        command: PolyConnectionCommand,
+    ) -> Result<(), crossbeam_channel::TrySendError<PolyConnectionCommand>> {
+        if self
+            .metrics
+            .occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.metrics.busy_skips.fetch_add(1, Ordering::Relaxed);
+            return Err(crossbeam_channel::TrySendError::Full(command));
+        }
+        self.metrics.enqueued_ns.store(now_ns(), Ordering::Release);
+        match self.tx.try_send(command) {
+            Ok(()) => {
+                self.metrics.queue_depth.store(1, Ordering::Release);
+                self.metrics
+                    .queue_high_water
+                    .fetch_max(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
+                self.metrics.enqueued_ns.store(0, Ordering::Release);
+                self.metrics.queue_depth.store(0, Ordering::Release);
+                self.metrics.occupied.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn send_shutdown(
+        &self,
+        command: PolyConnectionCommand,
+    ) -> Result<(), crossbeam_channel::SendError<PolyConnectionCommand>> {
+        self.tx.send(command)
+    }
+}
+
+struct PolyConnectionOccupancyGuard(Arc<PolyConnectionLaneMetrics>);
+
+impl Drop for PolyConnectionOccupancyGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 struct PolyAccountConnectionRoutes {
-    fast: Vec<Sender<PolyConnectionCommand>>,
-    cancel: Vec<Sender<PolyConnectionCommand>>,
-    safety_cancel: Vec<Sender<PolyConnectionCommand>>,
-    reconcile: Vec<Sender<PolyConnectionCommand>>,
+    fast: Vec<PolyConnectionLane>,
+    cancel: Vec<PolyConnectionLane>,
+    safety_cancel: Vec<PolyConnectionLane>,
+    reconcile: Vec<PolyConnectionLane>,
     fast_rr: usize,
     cancel_rr: usize,
     safety_cancel_rr: usize,
@@ -12547,7 +12696,7 @@ impl PolyAccountConnectionRoutes {
     fn lanes_mut(
         &mut self,
         role: hexagent_runtime::http1_pool::Role,
-    ) -> (&[Sender<PolyConnectionCommand>], &mut usize) {
+    ) -> (&[PolyConnectionLane], &mut usize) {
         use hexagent_runtime::http1_pool::Role;
         match role {
             Role::Fast => (&self.fast, &mut self.fast_rr),
@@ -12637,7 +12786,7 @@ fn drain_poly_cancel_outbox_for_shutdown(
             routes.safety_cancel_outbox.push_front(command);
             return Err(routes.safety_cancel_outbox.len() + routes.cancel_outbox.len());
         };
-        if let Err(error) = lane.send(command) {
+        if let Err(error) = lane.send_shutdown(command) {
             routes.safety_cancel_outbox.push_front(error.0);
             return Err(routes.safety_cancel_outbox.len() + routes.cancel_outbox.len());
         }
@@ -12649,7 +12798,7 @@ fn drain_poly_cancel_outbox_for_shutdown(
             routes.cancel_outbox.push_front(command);
             return Err(routes.cancel_outbox.len());
         };
-        if let Err(error) = lane.send(command) {
+        if let Err(error) = lane.send_shutdown(command) {
             routes.cancel_outbox.push_front(error.0);
             return Err(routes.cancel_outbox.len());
         }
@@ -12749,10 +12898,13 @@ fn run_poly_connection_owner(
     permit: hexagent_runtime::http1_pool::Permit,
     role: hexagent_runtime::http1_pool::Role,
     rx: Receiver<PolyConnectionCommand>,
+    lane_metrics: Arc<PolyConnectionLaneMetrics>,
 ) {
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
     while let Ok(command) = rx.recv() {
+        lane_metrics.queue_depth.store(0, Ordering::Release);
+        let _occupancy = PolyConnectionOccupancyGuard(Arc::clone(&lane_metrics));
         match command {
             PolyConnectionCommand::Place {
                 instance_id,
@@ -15170,7 +15322,7 @@ mod market_router_tests {
         execution.join().unwrap();
         shutdown.request();
         shutdown.finish();
-        assert_eq!(shared.join_background_workers(), 2);
+        assert_eq!(shared.join_background_workers(), 3);
         assert_thread_exits(&latency_dump, "latency worker");
         latency_dump.join().unwrap();
         assert_thread_exits(&memory_telemetry, "memory worker");
@@ -15817,20 +15969,13 @@ mod market_router_tests {
         order.exchange = Exchange::Hexmarket;
         order.symbol = "ETH-USD".into();
         let place = Signal::NewOrder(order);
-        let mut routes = HashMap::from([(
-            "instance-0".to_string(),
-            HexmarketCoidRouteTable::default(),
-        )]);
+        let mut routes =
+            HashMap::from([("instance-0".to_string(), HexmarketCoidRouteTable::default())]);
         let owner = hexmarket_connection_slot(&place, "instance-0", &routes, 4);
         record_hexmarket_coid_routes(&place, "instance-0", owner, &mut routes).unwrap();
 
-        let duplicate = record_hexmarket_coid_routes(
-            &place,
-            "instance-0",
-            owner,
-            &mut routes,
-        )
-        .unwrap();
+        let duplicate =
+            record_hexmarket_coid_routes(&place, "instance-0", owner, &mut routes).unwrap();
         duplicate.rollback(routes.get_mut("instance-0").unwrap());
         assert_eq!(
             routes.get("instance-0").unwrap().get("hex-coid-1"),
@@ -15870,10 +16015,7 @@ mod market_router_tests {
             table.len, 1,
             "cancel admission retains routing until typed completion"
         );
-        table.remove_if_generation(
-            "hex-coid-1",
-            OrderSlot::with_generation(7, 9),
-        );
+        table.remove_if_generation("hex-coid-1", OrderSlot::with_generation(7, 9));
         assert_eq!(table.len, 1, "late generation cannot remove active route");
         let (_, active_slot) = table.get_entry("hex-coid-1").unwrap();
         table.remove_if_generation("hex-coid-1", active_slot);
@@ -15913,13 +16055,11 @@ mod market_router_tests {
             Err(anyhow::anyhow!("cancel transport unavailable"))
         }
 
-        fn cancel_all(
-            &mut self,
-            _exchange: Exchange,
-            _symbol: &str,
-        ) -> Result<Vec<OrderUpdate>> {
+        fn cancel_all(&mut self, _exchange: Exchange, _symbol: &str) -> Result<Vec<OrderUpdate>> {
             (0..=ORDER_UPDATE_BATCH_CAPACITY)
-                .map(|index| self.submit_order(&order_req(&format!("cancel-{index}"), "instance-0")))
+                .map(|index| {
+                    self.submit_order(&order_req(&format!("cancel-{index}"), "instance-0"))
+                })
                 .collect()
         }
 
@@ -15976,22 +16116,13 @@ mod market_router_tests {
         let mut worker = FixedVenueTestTrade;
         let (diagnostics, _diagnostic_rx) = bounded(4);
         let mut coids = Vec::new();
-        execute_venue_signal_with(
-            &mut worker,
-            signal,
-            0,
-            &diagnostics,
-            &mut |update| {
-                coids.push(update.client_order_id);
-                true
-            },
-        );
+        execute_venue_signal_with(&mut worker, signal, 0, &diagnostics, &mut |update| {
+            coids.push(update.client_order_id);
+            true
+        });
         assert_eq!(coids.len(), ORDER_UPDATE_BATCH_CAPACITY + 1);
         assert_eq!(coids.first().map(String::as_str), Some("cancel-0"));
-        assert_eq!(
-            coids.last().map(String::as_str),
-            Some("cancel-64"),
-        );
+        assert_eq!(coids.last().map(String::as_str), Some("cancel-64"),);
     }
 
     #[test]
@@ -16219,8 +16350,16 @@ mod market_router_tests {
             })
             .is_ok());
         let mut routes = PolyAccountConnectionRoutes {
-            fast: vec![fast_tx],
-            cancel: vec![cancel_tx],
+            fast: vec![PolyConnectionLane::for_test(
+                fast_tx,
+                hexagent_runtime::http1_pool::Role::Fast,
+                0,
+            )],
+            cancel: vec![PolyConnectionLane::for_test(
+                cancel_tx,
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
         dispatch_poly_signal_to_connection_owner(
@@ -16261,7 +16400,11 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            cancel: vec![cancel_tx],
+            cancel: vec![PolyConnectionLane::for_test(
+                cancel_tx,
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
         let command = |coid: &str| PolyConnectionCommand::Cancel {
@@ -16291,12 +16434,96 @@ mod market_router_tests {
             cancel_rx.recv().unwrap(),
             PolyConnectionCommand::Cancel { client_order_id, .. } if client_order_id == "first"
         ));
+        // The test consumes the physical-owner command directly, so emulate
+        // the owner's completion guard before flushing the next lossless item.
+        routes.cancel[0].metrics.release();
         flush_poly_cancel_outbox(&mut routes);
         assert!(matches!(
             cancel_rx.recv().unwrap(),
             PolyConnectionCommand::Cancel { client_order_id, .. } if client_order_id == "second"
         ));
         assert!(routes.cancel_outbox.is_empty());
+    }
+
+    #[test]
+    fn connection_owner_slots_expose_age_and_skip_busy_slots_without_hol() {
+        let (slot_zero_tx, slot_zero_rx) = bounded(1);
+        let (slot_one_tx, slot_one_rx) = bounded(1);
+        let (raw_update_tx, _update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 4,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            fast: vec![
+                PolyConnectionLane::for_test(
+                    slot_zero_tx,
+                    hexagent_runtime::http1_pool::Role::Fast,
+                    0,
+                ),
+                PolyConnectionLane::for_test(
+                    slot_one_tx,
+                    hexagent_runtime::http1_pool::Role::Fast,
+                    1,
+                ),
+            ],
+            ..Default::default()
+        };
+        let command = |coid: &str| PolyConnectionCommand::Place {
+            instance_id: "zhu-03".into(),
+            order: order_req(coid, "zhu-03"),
+            stale_ms: 100,
+            update_tx: update_tx.clone(),
+            enqueued_at: std::time::Instant::now(),
+        };
+
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Fast,
+            command("first"),
+        )
+        .is_ok());
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Fast,
+            command("second"),
+        )
+        .is_ok());
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Fast,
+            command("third"),
+        )
+        .is_err());
+
+        assert_eq!(routes.fast[0].metrics.queue_depth.load(Ordering::Acquire), 1);
+        assert_eq!(routes.fast[1].metrics.queue_depth.load(Ordering::Acquire), 1);
+        assert!(routes.fast[0].metrics.enqueued_ns.load(Ordering::Acquire) > 0);
+        assert!(routes.fast[1].metrics.enqueued_ns.load(Ordering::Acquire) > 0);
+        assert_eq!(routes.fast[0].metrics.queue_high_water.load(Ordering::Relaxed), 1);
+        assert_eq!(routes.fast[1].metrics.queue_high_water.load(Ordering::Relaxed), 1);
+        assert_eq!(routes.fast[0].metrics.busy_skips.load(Ordering::Relaxed), 1);
+        assert_eq!(routes.fast[1].metrics.busy_skips.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            slot_zero_rx.try_recv().unwrap(),
+            PolyConnectionCommand::Place { order, .. } if order.client_order_id == "first"
+        ));
+        assert!(matches!(
+            slot_one_rx.try_recv().unwrap(),
+            PolyConnectionCommand::Place { order, .. } if order.client_order_id == "second"
+        ));
+
+        routes.fast[0].metrics.release();
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Fast,
+            command("third"),
+        )
+        .is_ok());
+        assert!(matches!(
+            slot_zero_rx.try_recv().unwrap(),
+            PolyConnectionCommand::Place { order, .. } if order.client_order_id == "third"
+        ));
     }
 
     #[test]
@@ -16309,8 +16536,16 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            cancel: vec![cancel_tx],
-            safety_cancel: vec![safety_tx],
+            cancel: vec![PolyConnectionLane::for_test(
+                cancel_tx,
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
+            safety_cancel: vec![PolyConnectionLane::for_test(
+                safety_tx,
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
 
@@ -16346,7 +16581,11 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            safety_cancel: vec![safety_tx.clone()],
+            safety_cancel: vec![PolyConnectionLane::for_test(
+                safety_tx.clone(),
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
         safety_tx
@@ -16406,7 +16645,11 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            cancel: vec![cancel_tx.clone()],
+            cancel: vec![PolyConnectionLane::for_test(
+                cancel_tx.clone(),
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
         cancel_tx
@@ -16480,7 +16723,11 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            cancel: vec![cancel_tx.clone()],
+            cancel: vec![PolyConnectionLane::for_test(
+                cancel_tx.clone(),
+                hexagent_runtime::http1_pool::Role::Cancel,
+                0,
+            )],
             ..Default::default()
         };
         cancel_tx
@@ -16543,8 +16790,30 @@ mod market_router_tests {
             tx: raw_update_tx,
         };
         let mut routes = PolyAccountConnectionRoutes {
-            fast: vec![fast_tx],
-            cancel: vec![cancel_tx],
+            fast: vec![
+                PolyConnectionLane::for_test(
+                    fast_tx.clone(),
+                    hexagent_runtime::http1_pool::Role::Fast,
+                    0,
+                ),
+                PolyConnectionLane::for_test(
+                    fast_tx,
+                    hexagent_runtime::http1_pool::Role::Fast,
+                    1,
+                ),
+            ],
+            cancel: vec![
+                PolyConnectionLane::for_test(
+                    cancel_tx.clone(),
+                    hexagent_runtime::http1_pool::Role::Cancel,
+                    0,
+                ),
+                PolyConnectionLane::for_test(
+                    cancel_tx,
+                    hexagent_runtime::http1_pool::Role::Cancel,
+                    1,
+                ),
+            ],
             ..Default::default()
         };
         dispatch_poly_signal_to_connection_owner(
@@ -16882,10 +17151,19 @@ mod market_router_tests {
         }
 
         assert_eq!(outboxes.queues[0].len(), 1);
-        assert_eq!(owner1_rx.recv().unwrap().update.client_order_id, "owner1-live");
-        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "owner0-occupied");
+        assert_eq!(
+            owner1_rx.recv().unwrap().update.client_order_id,
+            "owner1-live"
+        );
+        assert_eq!(
+            owner0_rx.recv().unwrap().update.client_order_id,
+            "owner0-occupied"
+        );
         outboxes.try_flush_one(&[owner0_tx, owner1_tx]).unwrap();
-        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "owner0-pending");
+        assert_eq!(
+            owner0_rx.recv().unwrap().update.client_order_id,
+            "owner0-pending"
+        );
     }
 
     #[test]

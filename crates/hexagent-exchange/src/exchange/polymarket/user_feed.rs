@@ -4582,7 +4582,11 @@ mod tests {
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].client_order_id, "owner-1");
-        assert!(!shared.account_state.is_uncertain());
+        assert!(
+            !shared.account_state.is_uncertain(),
+            "{:?}",
+            shared.account_state.monitoring_snapshot()
+        );
         assert_eq!(
             shared.account_state.earliest_unresolved_trade_match_time(),
             Some(123),
@@ -5919,7 +5923,11 @@ mod tests {
         event["match_time"] = serde_json::json!("123");
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
-        assert!(!shared.account_state.is_uncertain());
+        assert!(
+            !shared.account_state.is_uncertain(),
+            "{:?}",
+            shared.account_state.monitoring_snapshot()
+        );
         assert!(!shared.user_feed_health.inventory_uncertain());
         assert_eq!(
             shared.account_state.earliest_unresolved_trade_match_time(),

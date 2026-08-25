@@ -9,6 +9,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderSlot, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -61,6 +62,16 @@ const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
 /// and all other cold account work. Saturation fails closed at the producer;
 /// the consumer is the dedicated private lifecycle owner.
 const ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY: usize = 16_384;
+/// Owner-authored lifecycle deltas are mirrored to the cold account worker.
+/// This lane is lossless in normal operation; saturation disables admission
+/// and leaves the unapplied watermark visible so calibration cannot race past
+/// a missing lifecycle mutation.
+const LIFECYCLE_MIRROR_QUEUE_CAPACITY: usize = 65_536;
+const LIFECYCLE_MIRROR_WAKE_CAPACITY: usize = 1;
+#[cfg(not(test))]
+const WALLET_LIFECYCLE_GRACE_MS: u64 = 50;
+#[cfg(test)]
+const WALLET_LIFECYCLE_GRACE_MS: u64 = 0;
 /// Runtime wallet observations are replaceable control-plane snapshots. Keep
 /// only one wake in flight and merge a newer generation into the pending slot;
 /// the lossless private-lifecycle lane must never queue behind every poller.
@@ -104,6 +115,8 @@ struct WalletCalibrationRequest {
     cash: f64,
     positions: HashMap<String, f64>,
     authoritative_tokens: HashSet<String>,
+    lifecycle_watermark: u64,
+    submitted_ms: u64,
     include_token_interests: bool,
     replies: Vec<crossbeam_channel::Sender<Result<WalletCalibrationResult, String>>>,
 }
@@ -236,6 +249,8 @@ pub struct SharedAccountOwnerState {
     account: Arc<SharedAccount>,
     rx: crossbeam_channel::Receiver<AccountOwnerCommand>,
     wallet_rx: crossbeam_channel::Receiver<()>,
+    lifecycle_mirror_rx: crossbeam_channel::Receiver<LifecycleMirrorDelta>,
+    lifecycle_mirror_wake_rx: crossbeam_channel::Receiver<()>,
 }
 
 /// Receiving half of the lossless account-lifecycle lane. The exchange moves
@@ -275,12 +290,24 @@ impl SharedAccountOwnerState {
         &self.wallet_rx
     }
 
+    /// Highest-priority cold-owner wake. The payload stays on a separate
+    /// bounded lane so lifecycle publication never queues behind a wallet
+    /// snapshot and the exchange worker need not know the private delta type.
+    pub fn lifecycle_mirror_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.lifecycle_mirror_wake_rx
+    }
+
     pub fn execute(&self, command: AccountOwnerCommand) {
         command.execute(&self.account);
     }
 
     pub fn execute_wallet_calibration(&self) {
         self.account.execute_pending_wallet_calibration();
+    }
+
+    pub fn execute_lifecycle_mirror(&self) {
+        self.account
+            .apply_lifecycle_mirror_batch(&self.lifecycle_mirror_rx);
     }
 }
 
@@ -342,14 +369,60 @@ enum AccountOwnerOperation {
     },
     BeginOrderRecovery {
         client_order_ids: Vec<String>,
+        reply: crossbeam_channel::Sender<()>,
     },
     FinishOrderRecovery {
         client_order_id: String,
+        reply: crossbeam_channel::Sender<()>,
     },
     RecordMaintenanceQueueWait {
         wait: Duration,
     },
     MonitoringSnapshot(crossbeam_channel::Sender<AccountMonitoringSnapshot>),
+    ReserveOrder {
+        instance_id: String,
+        client_order_id: String,
+        order_id: String,
+        token_id: String,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        fee_rate_bps: u32,
+        allow_fee_degraded: bool,
+        reply: crossbeam_channel::Sender<Result<OrderOwnership, ReservationError>>,
+    },
+    ApplyTradeTransition {
+        trade_key: String,
+        status: String,
+        client_order_id: String,
+        order_id: String,
+        token_id: String,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        is_maker: bool,
+        match_time_secs: u64,
+        reply: crossbeam_channel::Sender<TradeTransitionResult>,
+    },
+    ApplyTradeTransitionLegacy {
+        trade_key: String,
+        status: String,
+        client_order_id: String,
+        order_id: String,
+        token_id: String,
+        side: Side,
+        quantity: f64,
+        price: f64,
+        reply: crossbeam_channel::Sender<Option<TradeOwnership>>,
+    },
+    PruneTerminalHistory {
+        tokens: HashSet<String>,
+        reply: crossbeam_channel::Sender<(usize, usize)>,
+    },
+    ProcessSettledGcDelete {
+        request: SettledGcDeleteRequest,
+        reply: crossbeam_channel::Sender<Result<SettledGcDeleteAttempt, String>>,
+    },
     RebindOrderId {
         client_order_id: String,
         order_id: String,
@@ -376,6 +449,11 @@ enum AccountOwnerOperation {
     },
     MarkCancelledPendingAudit {
         client_order_id: String,
+        reply: crossbeam_channel::Sender<bool>,
+    },
+    MarkCancelledPendingTradeAudit {
+        client_order_id: String,
+        size_matched: f64,
         reply: crossbeam_channel::Sender<bool>,
     },
     ReleaseOrder {
@@ -544,17 +622,103 @@ impl AccountOwnerCommand {
             ClearCancelAuditAnomaly { client_order_id } => {
                 account.clear_cancel_audit_anomaly(&client_order_id);
             }
-            BeginOrderRecovery { client_order_ids } => {
+            BeginOrderRecovery {
+                client_order_ids,
+                reply,
+            } => {
                 account.begin_order_recovery(client_order_ids.iter().map(String::as_str));
+                let _ = reply.send(());
             }
-            FinishOrderRecovery { client_order_id } => {
+            FinishOrderRecovery {
+                client_order_id,
+                reply,
+            } => {
                 account.finish_order_recovery(&client_order_id);
+                let _ = reply.send(());
             }
             RecordMaintenanceQueueWait { wait } => {
                 account.record_maintenance_queue_wait(wait);
             }
             MonitoringSnapshot(reply) => {
                 let _ = reply.send(account.monitoring_snapshot());
+            }
+            ReserveOrder {
+                instance_id,
+                client_order_id,
+                order_id,
+                token_id,
+                side,
+                quantity,
+                price,
+                fee_rate_bps,
+                allow_fee_degraded,
+                reply,
+            } => {
+                let _ = reply.send(account.reserve_order_with_fee_policy(
+                    &instance_id,
+                    &client_order_id,
+                    &order_id,
+                    &token_id,
+                    side,
+                    quantity,
+                    price,
+                    fee_rate_bps,
+                    allow_fee_degraded,
+                ));
+            }
+            ApplyTradeTransition {
+                trade_key,
+                status,
+                client_order_id,
+                order_id,
+                token_id,
+                side,
+                quantity,
+                price,
+                is_maker,
+                match_time_secs,
+                reply,
+            } => {
+                let _ = reply.send(account.apply_trade_transition_with_context(
+                    &trade_key,
+                    &status,
+                    &client_order_id,
+                    &order_id,
+                    &token_id,
+                    side,
+                    quantity,
+                    price,
+                    is_maker,
+                    match_time_secs,
+                ));
+            }
+            ApplyTradeTransitionLegacy {
+                trade_key,
+                status,
+                client_order_id,
+                order_id,
+                token_id,
+                side,
+                quantity,
+                price,
+                reply,
+            } => {
+                let _ = reply.send(account.apply_trade_transition(
+                    &trade_key,
+                    &status,
+                    &client_order_id,
+                    &order_id,
+                    &token_id,
+                    side,
+                    quantity,
+                    price,
+                ));
+            }
+            PruneTerminalHistory { tokens, reply } => {
+                let _ = reply.send(account.prune_terminal_history_on_lifecycle_owner(&tokens));
+            }
+            ProcessSettledGcDelete { request, reply } => {
+                let _ = reply.send(account.process_settled_gc_delete_request(request));
             }
             RebindOrderId {
                 client_order_id,
@@ -596,6 +760,15 @@ impl AccountOwnerCommand {
                 reply,
             } => {
                 let _ = reply.send(account.mark_cancelled_pending_audit(&client_order_id));
+            }
+            MarkCancelledPendingTradeAudit {
+                client_order_id,
+                size_matched,
+                reply,
+            } => {
+                let _ = reply.send(
+                    account.mark_cancelled_pending_trade_audit(&client_order_id, size_matched),
+                );
             }
             ReleaseOrder {
                 client_order_id,
@@ -1123,6 +1296,11 @@ pub struct AccountMonitoringSnapshot {
     pub persistence_pending_jobs: usize,
     pub persistence_pending_high_water: usize,
     pub persistence_queue_overflows: u64,
+    pub lifecycle_mirror_queue_depth: usize,
+    pub lifecycle_mirror_queue_high_water: usize,
+    pub lifecycle_mirror_queue_overflows: u64,
+    pub lifecycle_mirror_published_watermark: u64,
+    pub lifecycle_mirror_applied_watermark: u64,
     /// Settled-history deletion is routed to dedicated cold owner tasks.
     /// These counters make a missing/stalled cold mailbox distinguishable
     /// from persistence or account-lock latency.
@@ -1834,6 +2012,43 @@ struct VirtualLifecycle {
     pending_physical: PendingPhysicalTracker,
 }
 
+/// Mutable lifecycle storage with no synchronization primitive. After the
+/// lifecycle lane is bound, only `account_lifecycle_thread_id` may dereference
+/// this cell. Before binding, startup/tests are single-threaded and may build
+/// the initial shard directly. Cross-thread consumers use typed messages or
+/// immutable atomics; they never borrow this value.
+struct LifecycleOwnerCell<T> {
+    value: UnsafeCell<T>,
+}
+
+impl<T> LifecycleOwnerCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    unsafe fn get(&self) -> &T {
+        &*self.value.get()
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        &mut *self.value.get()
+    }
+}
+
+// SAFETY: SharedAccount gates all access after binding with the immutable
+// lifecycle owner thread identity. The cell is never exposed publicly.
+unsafe impl<T: Send> Send for LifecycleOwnerCell<T> {}
+unsafe impl<T: Send> Sync for LifecycleOwnerCell<T> {}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for LifecycleOwnerCell<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LifecycleOwnerCell(<owner-local>)")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct VirtualTradeMutationHint {
     epoch: u64,
@@ -1856,7 +2071,7 @@ struct VirtualAccount {
     maintenance_reserved_positions: RwLock<HashMap<String, f64>>,
     token_interests: Mutex<BTreeMap<String, TokenInterest>>,
     market_scopes: Mutex<HashSet<String>>,
-    lifecycle: Mutex<VirtualLifecycle>,
+    lifecycle: LifecycleOwnerCell<VirtualLifecycle>,
     reservation_publish: Mutex<()>,
     /// Published after a new order row and both route entries are installed.
     /// Cold account snapshots use it to retain reservations admitted while a
@@ -1915,7 +2130,7 @@ impl VirtualAccount {
             ),
             token_interests: Mutex::new(ledger.token_interests.clone()),
             market_scopes: Mutex::new(ledger.market_scopes.clone()),
-            lifecycle: Mutex::new(VirtualLifecycle::default()),
+            lifecycle: LifecycleOwnerCell::new(VirtualLifecycle::default()),
             reservation_publish: Mutex::new(()),
             reservation_epoch: AtomicU64::new(0),
             trade_epoch: AtomicU64::new(0),
@@ -2424,6 +2639,121 @@ struct VirtualTradePersistenceDelta {
     ledger_generation: u64,
 }
 
+/// Compact owner-to-owner projection. Only the lifecycle thread constructs
+/// these values after binding; only the cold account thread applies them.
+/// Persistence consumes an independent clone of the same typed delta, so the
+/// durable WAL and in-memory aggregate advance from identical evidence.
+#[derive(Debug, Clone)]
+enum LifecycleMirrorDelta {
+    Lifecycle {
+        watermark: u64,
+        delta: VirtualLifecyclePersistenceDelta,
+    },
+    Trade {
+        watermark: u64,
+        delta: VirtualTradePersistenceDelta,
+    },
+}
+
+impl LifecycleMirrorDelta {
+    fn watermark(&self) -> u64 {
+        match self {
+            Self::Lifecycle { watermark, .. } | Self::Trade { watermark, .. } => *watermark,
+        }
+    }
+}
+
+fn apply_lifecycle_projection(
+    state: &mut SharedAccountState,
+    delta: VirtualLifecyclePersistenceDelta,
+) {
+    if let Some(instance) = state.instances.get_mut(&delta.instance_id) {
+        instance.reserved_cash = delta.reserved_cash;
+        if let Some((token_id, reserved)) = &delta.reserved_position {
+            instance
+                .reserved_positions
+                .insert(token_id.clone(), *reserved);
+        }
+    }
+    if let Some(previous) = state.orders.get(&delta.client_order_id) {
+        let old_oid = normalize_order_id(&previous.order_id);
+        if state
+            .oid_to_coid
+            .get(&old_oid)
+            .is_some_and(|coid| coid == &delta.client_order_id)
+        {
+            state.oid_to_coid.remove(&old_oid);
+        }
+    }
+    if let Some(order) = delta.order {
+        state.oid_to_coid.insert(
+            normalize_order_id(&order.order_id),
+            delta.client_order_id.clone(),
+        );
+        state.orders.insert(delta.client_order_id.clone(), order);
+    } else {
+        state.orders.remove(&delta.client_order_id);
+    }
+    set_membership(
+        &mut state.recovery_pending_orders,
+        &delta.client_order_id,
+        delta.recovery_pending,
+    );
+    set_membership(
+        &mut state.startup_query_repair_orders,
+        &delta.client_order_id,
+        delta.startup_query_repair,
+    );
+    set_membership(
+        &mut state.routine_cancel_audits,
+        &delta.client_order_id,
+        delta.routine_cancel_audit,
+    );
+}
+
+fn apply_trade_projection(state: &mut SharedAccountState, delta: VirtualTradePersistenceDelta) {
+    if let Some(instance) = state.instances.get_mut(&delta.instance_id) {
+        instance.cash = delta.cash;
+        instance.reserved_cash = delta.reserved_cash;
+        instance
+            .positions
+            .insert(delta.token_id.clone(), delta.position);
+        instance
+            .reserved_positions
+            .insert(delta.token_id.clone(), delta.reserved_position);
+    }
+    let lifecycle = VirtualLifecyclePersistenceDelta {
+        instance_id: delta.instance_id,
+        reserved_cash: delta.reserved_cash,
+        client_order_id: delta.client_order_id,
+        order: delta.order,
+        reserved_position: Some((delta.token_id, delta.reserved_position)),
+        recovery_pending: delta.recovery_pending,
+        startup_query_repair: false,
+        routine_cancel_audit: delta.routine_cancel_audit,
+    };
+    apply_lifecycle_projection(state, lifecycle);
+    if let Some(trade) = delta.trade {
+        state.trades.insert(delta.trade_key.clone(), trade);
+    } else {
+        state.trades.remove(&delta.trade_key);
+    }
+    set_membership(
+        &mut state.fee_attribution_pending,
+        &delta.trade_key,
+        delta.fee_attribution_pending,
+    );
+    state.ledger_generation = state.ledger_generation.max(delta.ledger_generation);
+}
+
+fn set_membership(set: &mut HashSet<String>, key: &str, present: bool) {
+    if present {
+        set.insert(key.to_string());
+    } else {
+        set.remove(key);
+    }
+}
+
 #[derive(Debug)]
 enum PersistenceCommand {
     Job(PersistenceJob),
@@ -2878,7 +3208,20 @@ impl AccountPersistence {
 
     fn metrics(
         &self,
-    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, usize, usize, u64) {
+    ) -> (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        usize,
+        usize,
+        u64,
+    ) {
         let scheduled_generation = self.scheduled_generation();
         let writes = self.writes.load(Ordering::Relaxed);
         let write_last_us = self.write_last_us.load(Ordering::Relaxed);
@@ -2905,7 +3248,9 @@ impl AccountPersistence {
 impl Drop for AccountPersistence {
     fn drop(&mut self) {
         let target_generation = self.next_generation.load(Ordering::Acquire);
-        let _ = self.tx.send(PersistenceCommand::Shutdown { target_generation });
+        let _ = self
+            .tx
+            .send(PersistenceCommand::Shutdown { target_generation });
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
@@ -4744,6 +5089,16 @@ pub struct SharedAccount {
     account_lifecycle_lane_bound: AtomicBool,
     account_lifecycle_queue_high_water: AtomicUsize,
     account_lifecycle_queue_overflows: AtomicU64,
+    lifecycle_mirror_tx: crossbeam_channel::Sender<LifecycleMirrorDelta>,
+    lifecycle_mirror_rx: Mutex<Option<crossbeam_channel::Receiver<LifecycleMirrorDelta>>>,
+    lifecycle_mirror_wake_tx: crossbeam_channel::Sender<()>,
+    lifecycle_mirror_wake_rx: Mutex<Option<crossbeam_channel::Receiver<()>>>,
+    lifecycle_mirror_published_watermark: AtomicU64,
+    lifecycle_mirror_applied_watermark: AtomicU64,
+    lifecycle_mirror_last_published_ms: AtomicU64,
+    lifecycle_mirror_queue_high_water: AtomicUsize,
+    lifecycle_mirror_queue_overflows: AtomicU64,
+    lifecycle_mirror_incident_active: AtomicBool,
     wallet_calibration_wake_tx: crossbeam_channel::Sender<()>,
     wallet_calibration_wake_rx: Mutex<Option<crossbeam_channel::Receiver<()>>>,
     wallet_calibration_pending: ArcSwapOption<WalletCalibrationRequest>,
@@ -4984,19 +5339,31 @@ impl Drop for AccountStateGuard<'_> {
             .load()
             .as_ref()
             .clone();
-        if let Some(instance_id) = self.instance_scope.as_deref() {
-            self.account.sync_state_to_virtual_account(
-                &mut self.state,
-                instance_id,
-                self.reservation_epochs.get(instance_id).copied(),
-                self.trade_epochs.get(instance_id).copied(),
-            );
-        } else {
-            self.account.sync_state_to_virtual_accounts(
-                &mut self.state,
-                Some(&self.reservation_epochs),
-                Some(&self.trade_epochs),
-            );
+        // Once live ownership is bound, the cold account writer never reaches
+        // into owner-local lifecycle storage. The lifecycle thread publishes
+        // typed mirror deltas instead. Pre-bind recovery and the lifecycle
+        // owner's own rare fallback transaction may still perform the legacy
+        // two-way bootstrap publication safely.
+        if !self
+            .account
+            .account_lifecycle_lane_bound
+            .load(Ordering::Acquire)
+            || self.account.is_account_lifecycle_thread()
+        {
+            if let Some(instance_id) = self.instance_scope.as_deref() {
+                self.account.sync_state_to_virtual_account(
+                    &mut self.state,
+                    instance_id,
+                    self.reservation_epochs.get(instance_id).copied(),
+                    self.trade_epochs.get(instance_id).copied(),
+                );
+            } else {
+                self.account.sync_state_to_virtual_accounts(
+                    &mut self.state,
+                    Some(&self.reservation_epochs),
+                    Some(&self.trade_epochs),
+                );
+            }
         }
         let hold_us = self.acquired_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account
@@ -5006,6 +5373,7 @@ impl Drop for AccountStateGuard<'_> {
             .account_lock_hold_max_us
             .fetch_max(hold_us, Ordering::Relaxed);
         self.account.publish_control_snapshots(&self.state);
+        self.account.publish_economic_snapshots(&self.state);
     }
 }
 
@@ -5028,6 +5396,28 @@ impl SharedAccount {
                     self.account_id
                 )
             })?;
+        let lifecycle_mirror_rx =
+            self.lifecycle_mirror_rx
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| {
+                    format!(
+                        "account {} lifecycle mirror lane already bound",
+                        self.account_id
+                    )
+                })?;
+        let lifecycle_mirror_wake_rx = self
+            .lifecycle_mirror_wake_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                format!(
+                    "account {} lifecycle mirror wake lane already bound",
+                    self.account_id
+                )
+            })?;
         let handle = SharedAccountHandle {
             account_id: Arc::from(self.account_id.as_str()),
             tx: self.account_owner_task_tx.clone(),
@@ -5039,6 +5429,8 @@ impl SharedAccount {
             account: Arc::clone(self),
             rx: receiver,
             wallet_rx: wallet_receiver,
+            lifecycle_mirror_rx,
+            lifecycle_mirror_wake_rx,
         };
         Ok((handle, owner))
     }
@@ -5060,6 +5452,12 @@ impl SharedAccount {
                     self.account_id
                 )
             })?;
+        // Fold every pre-bind startup/reservation mutation into the cold
+        // aggregate once. From the next release store onward, only typed
+        // lifecycle deltas advance that mirror.
+        {
+            let _bootstrap = self.lock_state();
+        }
         self.account_lifecycle_lane_bound
             .store(true, Ordering::Release);
         Ok(SharedAccountLifecycleOwnerState {
@@ -5239,9 +5637,124 @@ impl SharedAccount {
     pub fn account_lifecycle_queue_metrics(&self) -> (usize, usize, u64) {
         (
             self.account_lifecycle_task_tx.len(),
-            self.account_lifecycle_queue_high_water.load(Ordering::Relaxed),
-            self.account_lifecycle_queue_overflows.load(Ordering::Relaxed),
+            self.account_lifecycle_queue_high_water
+                .load(Ordering::Relaxed),
+            self.account_lifecycle_queue_overflows
+                .load(Ordering::Relaxed),
         )
+    }
+
+    pub fn lifecycle_mirror_queue_metrics(&self) -> (usize, usize, u64, u64, u64) {
+        (
+            self.lifecycle_mirror_tx.len(),
+            self.lifecycle_mirror_queue_high_water
+                .load(Ordering::Relaxed),
+            self.lifecycle_mirror_queue_overflows
+                .load(Ordering::Relaxed),
+            self.lifecycle_mirror_published_watermark
+                .load(Ordering::Acquire),
+            self.lifecycle_mirror_applied_watermark
+                .load(Ordering::Acquire),
+        )
+    }
+
+    fn publish_lifecycle_mirror(&self, build: impl FnOnce(u64) -> LifecycleMirrorDelta) {
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            return;
+        }
+        debug_assert!(self.is_account_lifecycle_thread());
+        let watermark = self
+            .lifecycle_mirror_published_watermark
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let delta = build(watermark);
+        match self.lifecycle_mirror_tx.try_send(delta) {
+            Ok(()) => {
+                self.lifecycle_mirror_last_published_ms
+                    .store(wall_clock_ms(), Ordering::Release);
+                self.lifecycle_mirror_queue_high_water
+                    .fetch_max(self.lifecycle_mirror_tx.len(), Ordering::Relaxed);
+                let _ = self.lifecycle_mirror_wake_tx.try_send(());
+            }
+            Err(error) => {
+                self.lifecycle_mirror_queue_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+                self.passive_admission_fast.store(false, Ordering::Release);
+                if !self
+                    .lifecycle_mirror_incident_active
+                    .swap(true, Ordering::AcqRel)
+                {
+                    log::error!(
+                        "[lifecycle_mirror_overflow] account={} watermark={} capacity={} error={}; admission disabled until restart/reconciliation",
+                        self.account_id,
+                        watermark,
+                        LIFECYCLE_MIRROR_QUEUE_CAPACITY,
+                        error,
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_lifecycle_mirror_batch(
+        &self,
+        receiver: &crossbeam_channel::Receiver<LifecycleMirrorDelta>,
+    ) {
+        let mut deltas = Vec::with_capacity(receiver.len().min(4_096).max(1));
+        while let Ok(delta) = receiver.try_recv() {
+            deltas.push(delta);
+            if deltas.len() == 4_096 {
+                break;
+            }
+        }
+        if deltas.is_empty() {
+            return;
+        }
+        let _control = self.control_gate.write().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let mut contiguous = self
+            .lifecycle_mirror_applied_watermark
+            .load(Ordering::Acquire);
+        for delta in deltas {
+            let watermark = delta.watermark();
+            if watermark == contiguous.saturating_add(1) {
+                contiguous = watermark;
+            } else {
+                self.uncertain_fast.store(true, Ordering::Release);
+                self.admission_fast.store(false, Ordering::Release);
+                self.passive_admission_fast.store(false, Ordering::Release);
+                if !self
+                    .lifecycle_mirror_incident_active
+                    .swap(true, Ordering::AcqRel)
+                {
+                    log::error!(
+                        "[lifecycle_mirror_gap] account={} expected={} observed={}; admission disabled until restart/reconciliation",
+                        self.account_id,
+                        contiguous.saturating_add(1),
+                        watermark,
+                    );
+                }
+            }
+            match delta {
+                LifecycleMirrorDelta::Lifecycle { delta, .. } => {
+                    apply_lifecycle_projection(&mut state, delta);
+                }
+                LifecycleMirrorDelta::Trade { delta, .. } => {
+                    apply_trade_projection(&mut state, delta);
+                }
+            }
+        }
+        recompute_reconciliation(&mut state, "lifecycle owner delta mirror");
+        self.lifecycle_mirror_applied_watermark
+            .store(contiguous, Ordering::Release);
+        self.publish_control_snapshots(&state);
+        drop(state);
+        drop(_control);
+        if !receiver.is_empty() {
+            let _ = self.lifecycle_mirror_wake_tx.try_send(());
+        }
     }
 
     pub fn submit_register_token_interest(
@@ -5359,10 +5872,7 @@ impl SharedAccount {
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
         include_token_interests: bool,
-    ) -> Result<
-        crossbeam_channel::Receiver<Result<WalletCalibrationResult, String>>,
-        String,
-    > {
+    ) -> Result<crossbeam_channel::Receiver<Result<WalletCalibrationResult, String>>, String> {
         validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
         if !self.account_owner_lane_bound.load(Ordering::Acquire) {
             return Err(format!(
@@ -5377,10 +5887,17 @@ impl SharedAccount {
                 .as_ref()
                 .map(|request| request.replies.clone())
                 .unwrap_or_default();
-            let superseded = (replies.len() >= WALLET_CALIBRATION_WAITER_CAPACITY)
-                .then(|| replies.remove(0));
+            let superseded =
+                (replies.len() >= WALLET_CALIBRATION_WAITER_CAPACITY).then(|| replies.remove(0));
             replies.push(reply.clone());
-            let (next_generation, next_cash, next_positions, next_authoritative_tokens) = current
+            let (
+                next_generation,
+                next_cash,
+                next_positions,
+                next_authoritative_tokens,
+                lifecycle_watermark,
+                submitted_ms,
+            ) = current
                 .as_ref()
                 .filter(|request| request.generation > generation)
                 .map(|request| {
@@ -5389,6 +5906,8 @@ impl SharedAccount {
                         request.cash,
                         request.positions.clone(),
                         request.authoritative_tokens.clone(),
+                        request.lifecycle_watermark,
+                        request.submitted_ms,
                     )
                 })
                 .unwrap_or_else(|| {
@@ -5397,6 +5916,9 @@ impl SharedAccount {
                         cash,
                         positions.clone(),
                         authoritative_tokens.clone(),
+                        self.lifecycle_mirror_published_watermark
+                            .load(Ordering::Acquire),
+                        wall_clock_ms(),
                     )
                 });
             let next = Some(Arc::new(WalletCalibrationRequest {
@@ -5404,6 +5926,8 @@ impl SharedAccount {
                 cash: next_cash,
                 positions: next_positions,
                 authoritative_tokens: next_authoritative_tokens,
+                lifecycle_watermark,
+                submitted_ms,
                 include_token_interests: include_token_interests
                     || current
                         .as_ref()
@@ -5458,9 +5982,37 @@ impl SharedAccount {
     }
 
     fn execute_pending_wallet_calibration(&self) {
-        let Some(request) = self.wallet_calibration_pending.swap(None) else {
+        let current = self.wallet_calibration_pending.load_full();
+        let Some(request) = current.as_ref() else {
             return;
         };
+        let published = self
+            .lifecycle_mirror_published_watermark
+            .load(Ordering::Acquire);
+        let applied = self
+            .lifecycle_mirror_applied_watermark
+            .load(Ordering::Acquire);
+        let grace_from = request.submitted_ms.max(
+            self.lifecycle_mirror_last_published_ms
+                .load(Ordering::Acquire),
+        );
+        if applied < published.max(request.lifecycle_watermark)
+            || wall_clock_ms() < grace_from.saturating_add(WALLET_LIFECYCLE_GRACE_MS)
+        {
+            return;
+        }
+        let observed = self
+            .wallet_calibration_pending
+            .compare_and_swap(&current, None);
+        let claimed = match (&*observed, &current) {
+            (Some(observed), Some(current)) => Arc::ptr_eq(observed, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !claimed {
+            return;
+        }
+        let request = Arc::clone(request);
         let result = self
             .apply_scoped_physical_snapshot_versioned(
                 request.generation,
@@ -5529,6 +6081,22 @@ impl SharedAccount {
     /// while the transaction still owns the state guard, so readers observing
     /// a new generation also observe the matching immutable values map.
     fn publish_control_snapshots(&self, state: &SharedAccountState) {
+        self.anomalous_trade_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("trade:"))
+                .map(str::to_string)
+                .collect(),
+        ));
+        self.anomalous_private_event_keys.store(Arc::new(
+            state
+                .ownership_anomalies
+                .keys()
+                .filter_map(|key| key.strip_prefix("private_event:"))
+                .map(str::to_string)
+                .collect(),
+        ));
         self.startup_snapshot_applied_fast.store(
             state.startup_snapshot_applied_this_process,
             Ordering::Release,
@@ -5561,6 +6129,10 @@ impl SharedAccount {
         }
         self.ended_token_ids_fast
             .store(Arc::new(Self::ended_token_ids(state)));
+        self.ledger_generation_fast
+            .fetch_max(state.ledger_generation, Ordering::AcqRel);
+        self.token_fee_configs_fast
+            .store(Arc::new(state.token_fee_configs.clone()));
         // `retired_order_audit_tombstones` is append-only and can contain
         // tens of thousands of historical rows. Its immutable replay index is
         // published only by the two mutation sites below; cloning it on every
@@ -5577,10 +6149,12 @@ impl SharedAccount {
         let seeded = state.seeded;
         let passive = seeded && (!state.uncertain || fee_degradation_is_only_uncertainty(state));
         self.seeded_fast.store(seeded, Ordering::Release);
-        self.uncertain_fast.store(state.uncertain, Ordering::Release);
+        self.uncertain_fast
+            .store(state.uncertain, Ordering::Release);
         self.admission_fast
             .store(seeded && !state.uncertain, Ordering::Release);
-        self.passive_admission_fast.store(passive, Ordering::Release);
+        self.passive_admission_fast
+            .store(passive, Ordering::Release);
     }
 
     fn publish_retired_order_audit_tombstones(&self, state: &SharedAccountState) {
@@ -5605,6 +6179,10 @@ impl SharedAccount {
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
         let (account_lifecycle_task_tx, account_lifecycle_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY);
+        let (lifecycle_mirror_tx, lifecycle_mirror_rx) =
+            crossbeam_channel::bounded(LIFECYCLE_MIRROR_QUEUE_CAPACITY);
+        let (lifecycle_mirror_wake_tx, lifecycle_mirror_wake_rx) =
+            crossbeam_channel::bounded(LIFECYCLE_MIRROR_WAKE_CAPACITY);
         let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
@@ -5617,6 +6195,16 @@ impl SharedAccount {
             account_lifecycle_lane_bound: AtomicBool::new(false),
             account_lifecycle_queue_high_water: AtomicUsize::new(0),
             account_lifecycle_queue_overflows: AtomicU64::new(0),
+            lifecycle_mirror_tx,
+            lifecycle_mirror_rx: Mutex::new(Some(lifecycle_mirror_rx)),
+            lifecycle_mirror_wake_tx,
+            lifecycle_mirror_wake_rx: Mutex::new(Some(lifecycle_mirror_wake_rx)),
+            lifecycle_mirror_published_watermark: AtomicU64::new(0),
+            lifecycle_mirror_applied_watermark: AtomicU64::new(0),
+            lifecycle_mirror_last_published_ms: AtomicU64::new(0),
+            lifecycle_mirror_queue_high_water: AtomicUsize::new(0),
+            lifecycle_mirror_queue_overflows: AtomicU64::new(0),
+            lifecycle_mirror_incident_active: AtomicBool::new(false),
             wallet_calibration_wake_tx,
             wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
             wallet_calibration_pending: ArcSwapOption::empty(),
@@ -6017,6 +6605,10 @@ impl SharedAccount {
             crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
         let (account_lifecycle_task_tx, account_lifecycle_task_rx) =
             crossbeam_channel::bounded(ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY);
+        let (lifecycle_mirror_tx, lifecycle_mirror_rx) =
+            crossbeam_channel::bounded(LIFECYCLE_MIRROR_QUEUE_CAPACITY);
+        let (lifecycle_mirror_wake_tx, lifecycle_mirror_wake_rx) =
+            crossbeam_channel::bounded(LIFECYCLE_MIRROR_WAKE_CAPACITY);
         let (wallet_calibration_wake_tx, wallet_calibration_wake_rx) =
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
@@ -6029,6 +6621,16 @@ impl SharedAccount {
             account_lifecycle_lane_bound: AtomicBool::new(false),
             account_lifecycle_queue_high_water: AtomicUsize::new(0),
             account_lifecycle_queue_overflows: AtomicU64::new(0),
+            lifecycle_mirror_tx,
+            lifecycle_mirror_rx: Mutex::new(Some(lifecycle_mirror_rx)),
+            lifecycle_mirror_wake_tx,
+            lifecycle_mirror_wake_rx: Mutex::new(Some(lifecycle_mirror_wake_rx)),
+            lifecycle_mirror_published_watermark: AtomicU64::new(0),
+            lifecycle_mirror_applied_watermark: AtomicU64::new(0),
+            lifecycle_mirror_last_published_ms: AtomicU64::new(0),
+            lifecycle_mirror_queue_high_water: AtomicUsize::new(0),
+            lifecycle_mirror_queue_overflows: AtomicU64::new(0),
+            lifecycle_mirror_incident_active: AtomicBool::new(false),
             wallet_calibration_wake_tx,
             wallet_calibration_wake_rx: Mutex::new(Some(wallet_calibration_wake_rx)),
             wallet_calibration_pending: ArcSwapOption::empty(),
@@ -6155,7 +6757,11 @@ impl SharedAccount {
                 .collect();
             (reservation_epochs, trade_epochs)
         };
-        self.sync_virtual_accounts_to_state(&mut state);
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+            || self.is_account_lifecycle_thread()
+        {
+            self.sync_virtual_accounts_to_state(&mut state);
+        }
         // Account snapshots/reconcile workers own aggregate reconciliation.
         // Keeping this on the already-cold control transaction means hot fills
         // never pay for an account-wide scan while readers see fresh residuals.
@@ -6277,7 +6883,11 @@ impl SharedAccount {
                 )
             })
             .unwrap_or_default();
-        self.sync_virtual_account_to_state(&mut state, instance_id);
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+            || self.is_account_lifecycle_thread()
+        {
+            self.sync_virtual_account_to_state(&mut state, instance_id);
+        }
         AccountStateGuard {
             account: self,
             _control: control,
@@ -6330,6 +6940,31 @@ impl SharedAccount {
         self.virtual_account(&instance_id)
     }
 
+    #[inline]
+    fn lifecycle<'a>(&self, account: &'a VirtualAccount) -> &'a VirtualLifecycle {
+        assert!(
+            !self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+                || self.is_account_lifecycle_thread(),
+            "account {} lifecycle read attempted outside its owner thread",
+            self.account_id,
+        );
+        // SAFETY: the assertion above enforces single-thread access after
+        // binding; pre-bind construction and recovery are single-threaded.
+        unsafe { account.lifecycle.get() }
+    }
+
+    #[inline]
+    fn lifecycle_mut<'a>(&self, account: &'a VirtualAccount) -> &'a mut VirtualLifecycle {
+        assert!(
+            !self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+                || self.is_account_lifecycle_thread(),
+            "account {} lifecycle mutation attempted outside its owner thread",
+            self.account_id,
+        );
+        // SAFETY: only the lifecycle owner can reach this branch after bind.
+        unsafe { account.lifecycle.get_mut() }
+    }
+
     fn sync_virtual_accounts_to_state(&self, state: &mut SharedAccountState) {
         let accounts = self.virtual_accounts.read().unwrap();
         if accounts.is_empty() {
@@ -6346,10 +6981,10 @@ impl SharedAccount {
         let mut known_sidecars = HashMap::new();
         for (instance_id, account) in accounts.iter() {
             // Private-trade economics and the matching lifecycle root are
-            // mutated while holding this owner-local mutex. Take it before
-            // reading the atomic ledger so a cold full-account snapshot cannot
-            // pair a pre-trade balance with a post-trade row (or vice versa).
-            let lifecycle = account.lifecycle.lock().unwrap();
+            // mutated by the lifecycle owner. Read the lifecycle projection
+            // before the atomic ledger while bootstrapping the cold mirror so
+            // the initial image cannot pair mismatched generations.
+            let lifecycle = self.lifecycle(account);
             instances.insert(instance_id.clone(), account.ledger_snapshot());
             orders.extend(lifecycle.orders.clone());
             trades.extend(lifecycle.trades.clone());
@@ -6390,7 +7025,7 @@ impl SharedAccount {
         let Some(account) = self.virtual_account(instance_id) else {
             return;
         };
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         let mut owned: HashSet<String> = state
             .orders
             .iter()
@@ -6715,7 +7350,7 @@ impl SharedAccount {
         let mut merged_concurrent_trade = false;
         for (instance_id, account) in &accounts {
             let _publication = account.reservation_publish.lock().unwrap();
-            let mut lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle_mut(account);
             Self::merge_concurrent_reservations(
                 state,
                 &account,
@@ -6725,7 +7360,7 @@ impl SharedAccount {
             merged_concurrent_trade |= Self::merge_concurrent_trade_mutations(
                 state,
                 &account,
-                &mut lifecycle,
+                lifecycle,
                 trade_epochs.and_then(|epochs| epochs.get(instance_id).copied()),
             );
             if let Some(ledger) = state.instances.get(instance_id) {
@@ -6798,7 +7433,7 @@ impl SharedAccount {
         let route_snapshots: Vec<_> = accounts
             .iter()
             .map(|(instance_id, account)| {
-                let lifecycle = account.lifecycle.lock().unwrap();
+                let lifecycle = self.lifecycle(account);
                 let coids: HashSet<String> = lifecycle.orders.keys().cloned().collect();
                 let oids: HashSet<String> = lifecycle
                     .orders
@@ -6893,7 +7528,7 @@ impl SharedAccount {
                 .clone()
         };
         let _publication = account.reservation_publish.lock().unwrap();
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         Self::merge_concurrent_reservations(
             state,
             &account,
@@ -6903,7 +7538,7 @@ impl SharedAccount {
         let merged_concurrent_trade = Self::merge_concurrent_trade_mutations(
             state,
             &account,
-            &mut lifecycle,
+            lifecycle,
             observed_trade_epoch,
         );
         if let Some(ledger) = state.instances.get(instance_id) {
@@ -6973,7 +7608,6 @@ impl SharedAccount {
             .collect();
         let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
         let trade_epoch = account.trade_epoch.load(Ordering::Acquire);
-        drop(lifecycle);
 
         // Route retirement is explicit and event-scoped. Destructively
         // removing every route for an instance makes lock-free private reads
@@ -7029,15 +7663,23 @@ impl SharedAccount {
     /// Query-repair orders that still lack authoritative terminal/live
     /// resolution. An empty result is the live-startup admission condition.
     pub fn startup_query_repair_pending_order_ids(&self) -> Vec<String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let mut pending = self.read_cold_state(|state| {
+                state
+                    .startup_query_repair_orders
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            pending.sort();
+            return pending;
+        }
         let _control = self.control_gate.read().unwrap();
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending: Vec<String> = accounts
             .values()
             .flat_map(|account| {
-                account
-                    .lifecycle
-                    .lock()
-                    .unwrap()
+                self.lifecycle(account)
                     .startup_query_repair_orders
                     .iter()
                     .cloned()
@@ -7112,9 +7754,8 @@ impl SharedAccount {
         instance_baseline: &BTreeMap<String, EconomicBalance>,
     ) {
         let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::with_capacity(
-                12 + authoritative_tokens.len() + state.instances.len() * 2,
-            );
+            let mut changes =
+                Vec::with_capacity(12 + authoritative_tokens.len() + state.instances.len() * 2);
             persistence_wal_set(
                 &mut changes,
                 ["physical_cash".to_string()],
@@ -7133,11 +7774,14 @@ impl SharedAccount {
                 ["unallocated_cash".to_string()],
                 &state.unallocated_cash,
             )?;
-            persistence_wal_set(
-                &mut changes,
-                ["unallocated_positions".to_string()],
-                &state.unallocated_positions,
-            )?;
+            for token in authoritative_tokens {
+                persistence_wal_map_entry(
+                    &mut changes,
+                    "unallocated_positions",
+                    token,
+                    state.unallocated_positions.get(token),
+                )?;
+            }
             // Ordinary wallet calibration changes only physical state. A
             // condition-scoped inferred redeem additionally changes virtual
             // cash and the removed outcome tokens; persist only those nested
@@ -7160,10 +7804,8 @@ impl SharedAccount {
                         )?;
                     }
                     for token in authoritative_tokens {
-                        let before_quantity =
-                            before.positions.get(token).copied().unwrap_or(0.0);
-                        let after_quantity =
-                            after.positions.get(token).copied().unwrap_or(0.0);
+                        let before_quantity = before.positions.get(token).copied().unwrap_or(0.0);
+                        let after_quantity = after.positions.get(token).copied().unwrap_or(0.0);
                         if after_quantity != before_quantity {
                             persistence_wal_set(
                                 &mut changes,
@@ -7262,9 +7904,6 @@ impl SharedAccount {
         lifecycle: &VirtualLifecycle,
         client_order_id: &str,
     ) {
-        let Some(persistence) = &self.persistence else {
-            return;
-        };
         let order = lifecycle.orders.get(client_order_id).cloned();
         let reserved_position = order.as_ref().map(|order| {
             let reserved = account
@@ -7276,7 +7915,7 @@ impl SharedAccount {
                 .unwrap_or(0.0);
             (order.token_id.clone(), reserved)
         });
-        persistence.schedule_virtual_lifecycle(VirtualLifecyclePersistenceDelta {
+        let delta = VirtualLifecyclePersistenceDelta {
             instance_id: account.instance_id.clone(),
             reserved_cash: account.reserved_cash.load(),
             client_order_id: client_order_id.to_string(),
@@ -7287,7 +7926,14 @@ impl SharedAccount {
                 .startup_query_repair_orders
                 .contains(client_order_id),
             routine_cancel_audit: lifecycle.routine_cancel_audits.contains(client_order_id),
+        };
+        self.publish_lifecycle_mirror(|watermark| LifecycleMirrorDelta::Lifecycle {
+            watermark,
+            delta: delta.clone(),
         });
+        if let Some(persistence) = &self.persistence {
+            persistence.schedule_virtual_lifecycle(delta);
+        }
     }
 
     fn schedule_virtual_sidecar_persist(
@@ -7319,9 +7965,10 @@ impl SharedAccount {
         client_order_id: &str,
         old_order_id: &str,
     ) {
-        if self.persistence.is_none() {
+        self.schedule_virtual_lifecycle_persist(account, lifecycle, client_order_id);
+        let Some(_persistence) = &self.persistence else {
             return;
-        }
+        };
         let instance_id = account.instance_id.as_str();
         let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
             let mut changes = Vec::with_capacity(4);
@@ -7357,11 +8004,8 @@ impl SharedAccount {
         client_order_id: &str,
         token_id: &str,
     ) {
-        let Some(persistence) = &self.persistence else {
-            return;
-        };
         let position = account.position(token_id);
-        persistence.schedule_virtual_trade(VirtualTradePersistenceDelta {
+        let delta = VirtualTradePersistenceDelta {
             instance_id: account.instance_id.clone(),
             cash: account.cash.load(),
             reserved_cash: account.reserved_cash.load(),
@@ -7376,7 +8020,14 @@ impl SharedAccount {
             recovery_pending: lifecycle.recovery_pending_orders.contains(client_order_id),
             routine_cancel_audit: lifecycle.routine_cancel_audits.contains(client_order_id),
             ledger_generation: self.ledger_generation_fast.load(Ordering::Acquire),
+        };
+        self.publish_lifecycle_mirror(|watermark| LifecycleMirrorDelta::Trade {
+            watermark,
+            delta: delta.clone(),
         });
+        if let Some(persistence) = &self.persistence {
+            persistence.schedule_virtual_trade(delta);
+        }
     }
 
     fn schedule_settled_prune_persist(
@@ -7487,9 +8138,7 @@ impl SharedAccount {
             if let Err(error) = self.try_submit_account_owner_command(AccountOwnerCommand(
                 AccountOwnerOperation::ClearCancelAuditAnomaly { client_order_id },
             )) {
-                log::error!(
-                    "[shared_account] cancel-audit anomaly clear dispatch failed: {error}"
-                );
+                log::error!("[shared_account] cancel-audit anomaly clear dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
             }
@@ -7763,9 +8412,15 @@ impl SharedAccount {
     }
 
     pub fn sidecar_checkpoint(&self, sidecar_id: &str) -> Option<DurableSidecarCheckpoint> {
+        if self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+            && !self.is_account_lifecycle_thread()
+        {
+            return self
+                .read_cold_state(|state| state.sidecar_checkpoints.get(sidecar_id).cloned());
+        }
         let control = self.control_gate.read().unwrap();
         if let Some(account) = self.virtual_account(sidecar_id) {
-            return account.lifecycle.lock().unwrap().sidecar_checkpoint.clone();
+            return self.lifecycle(&account).sidecar_checkpoint.clone();
         }
         drop(control);
         self.lock_state()
@@ -7803,18 +8458,23 @@ impl SharedAccount {
             );
         }
         let control = self.control_gate.read().unwrap();
-        if let Some(account) = self.virtual_account(sidecar_id) {
-            let mut lifecycle = account.lifecycle.lock().unwrap();
-            if lifecycle
-                .sidecar_checkpoint
-                .as_ref()
-                .is_some_and(|existing| existing.generation >= checkpoint.generation)
-            {
-                return Ok(false);
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            if let Some(account) = self.virtual_account(sidecar_id) {
+                let lifecycle = self.lifecycle_mut(&account);
+                if lifecycle
+                    .sidecar_checkpoint
+                    .as_ref()
+                    .is_some_and(|existing| existing.generation >= checkpoint.generation)
+                {
+                    return Ok(false);
+                }
+                lifecycle.sidecar_checkpoint = Some(checkpoint);
+                self.schedule_virtual_sidecar_persist(
+                    &account,
+                    lifecycle.sidecar_checkpoint.as_ref(),
+                );
+                return Ok(true);
             }
-            lifecycle.sidecar_checkpoint = Some(checkpoint);
-            self.schedule_virtual_sidecar_persist(&account, lifecycle.sidecar_checkpoint.as_ref());
-            return Ok(true);
         }
         drop(control);
         let mut state = self.lock_state();
@@ -7855,18 +8515,23 @@ impl SharedAccount {
             );
         }
         let control = self.control_gate.read().unwrap();
-        if let Some(account) = self.virtual_account(sidecar_id) {
-            let mut lifecycle = account.lifecycle.lock().unwrap();
-            if lifecycle
-                .sidecar_checkpoint
-                .as_ref()
-                .is_none_or(|existing| existing.generation != invalid_generation)
-            {
-                return Ok(false);
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            if let Some(account) = self.virtual_account(sidecar_id) {
+                let lifecycle = self.lifecycle_mut(&account);
+                if lifecycle
+                    .sidecar_checkpoint
+                    .as_ref()
+                    .is_none_or(|existing| existing.generation != invalid_generation)
+                {
+                    return Ok(false);
+                }
+                lifecycle.sidecar_checkpoint = Some(replacement);
+                self.schedule_virtual_sidecar_persist(
+                    &account,
+                    lifecycle.sidecar_checkpoint.as_ref(),
+                );
+                return Ok(true);
             }
-            lifecycle.sidecar_checkpoint = Some(replacement);
-            self.schedule_virtual_sidecar_persist(&account, lifecycle.sidecar_checkpoint.as_ref());
-            return Ok(true);
         }
         drop(control);
         let mut state = self.lock_state();
@@ -7918,6 +8583,16 @@ impl SharedAccount {
             });
             recompute_reconciliation(&mut state, "account membership changed");
         }
+        let ledger = state
+            .instances
+            .get(instance_id)
+            .expect("registered instance ledger")
+            .clone();
+        self.virtual_accounts
+            .write()
+            .unwrap()
+            .entry(instance_id.to_string())
+            .or_insert_with(|| Arc::new(VirtualAccount::new(instance_id.to_string(), &ledger)));
         self.schedule_persist(&state);
     }
 
@@ -9294,6 +9969,17 @@ impl SharedAccount {
                 .map(|(token, qty)| (token.clone(), *qty))
                 .collect();
             redistribute_all(&mut state);
+            // Initial seeding precedes live order/trade admission. Publish the
+            // one-time allocation into each virtual economic shard without
+            // touching its owner-local lifecycle root.
+            {
+                let accounts = self.virtual_accounts.read().unwrap();
+                for (instance_id, account) in accounts.iter() {
+                    if let Some(ledger) = state.instances.get(instance_id) {
+                        account.replace_ledger(ledger);
+                    }
+                }
+            }
             state.seed_baseline = Some(capture_seed_baseline(&state, false));
             self.schedule_persist(&state);
             return Ok(true);
@@ -9425,6 +10111,24 @@ impl SharedAccount {
         let unsettled_trade = pending.unsettled;
         let unsettled_maintenance = has_unsettled_maintenance_operation(&state);
         if !state.seeded || unsettled_trade || unsettled_maintenance {
+            let condition_pairs = registered_binary_condition_pairs(&state);
+            let mut failed_conditions = BTreeSet::new();
+            let mut failed_tokens = BTreeSet::new();
+            for (condition_id, pairs) in condition_pairs {
+                for (up_token_id, down_token_id) in pairs {
+                    for token in [up_token_id, down_token_id] {
+                        if !authoritative_tokens.contains(&token) {
+                            continue;
+                        }
+                        let prior = state.physical_positions.get(&token).copied().unwrap_or(0.0);
+                        let observed = observed_positions.get(&token).copied().unwrap_or(0.0);
+                        if (observed - prior).abs() > reconciliation_tolerance(observed, prior) {
+                            failed_conditions.insert(condition_id.clone());
+                            failed_tokens.insert(token);
+                        }
+                    }
+                }
+            }
             let reason = if !state.seeded {
                 "account_not_seeded"
             } else if unsettled_trade {
@@ -9433,9 +10137,13 @@ impl SharedAccount {
                 "unsettled_maintenance_operation"
             };
             log::warn!(
-                "[shared_account_redeem_attribution_failed] account={} condition=<snapshot> reason={}",
+                "[shared_account_redeem_attribution_failed] account={} conditions={:?} tokens={:?} reason={} lifecycle_watermark={}/{}",
                 self.account_id,
+                failed_conditions,
+                failed_tokens,
                 reason,
+                self.lifecycle_mirror_applied_watermark.load(Ordering::Acquire),
+                self.lifecycle_mirror_published_watermark.load(Ordering::Acquire),
             );
             log_wallet_reconciliation_alerts(
                 &self.account_id,
@@ -9486,11 +10194,8 @@ impl SharedAccount {
             &pending,
         );
         let adjustment_sequence_before = state.internal_adjustment_sequence;
-        let attributed = try_attribute_binary_redeem_with_pending(
-            &mut state,
-            &self.account_id,
-            Some(&pending),
-        );
+        let attributed =
+            try_attribute_binary_redeem_with_pending(&mut state, &self.account_id, Some(&pending));
         self.schedule_wallet_calibration_persist(
             &state.state,
             authoritative_tokens,
@@ -9672,9 +10377,7 @@ impl SharedAccount {
                 .unwrap_or(false);
         }
         let source = source.trim();
-        if source.is_empty()
-            || !self.risk_blocker_sources_fast.load().contains(source)
-        {
+        if source.is_empty() || !self.risk_blocker_sources_fast.load().contains(source) {
             return false;
         }
         let mut state = self.lock_state();
@@ -9707,9 +10410,12 @@ impl SharedAccount {
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .collect();
-            if let Err(error) = self.try_submit_account_lifecycle_command(AccountOwnerCommand(
-                AccountOwnerOperation::BeginOrderRecovery { client_order_ids },
-            )) {
+            if let Err(error) = self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::BeginOrderRecovery {
+                    client_order_ids,
+                    reply,
+                })
+            }) {
                 log::error!("[shared_account] begin-recovery owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -9721,7 +10427,7 @@ impl SharedAccount {
             let Some(account) = self.virtual_account_for_coid(client_order_id) else {
                 continue;
             };
-            let mut lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle_mut(&account);
             let Some(token_id) = lifecycle
                 .orders
                 .get(client_order_id)
@@ -9736,7 +10442,7 @@ impl SharedAccount {
                 newly_pending = true;
                 Self::record_virtual_trade_mutation(
                     &account,
-                    &mut lifecycle,
+                    lifecycle,
                     "",
                     client_order_id,
                     &token_id,
@@ -9752,9 +10458,12 @@ impl SharedAccount {
     pub fn finish_order_recovery(&self, client_order_id: &str) {
         if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
-            if let Err(error) = self.try_submit_account_lifecycle_command(AccountOwnerCommand(
-                AccountOwnerOperation::FinishOrderRecovery { client_order_id },
-            )) {
+            if let Err(error) = self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::FinishOrderRecovery {
+                    client_order_id,
+                    reply,
+                })
+            }) {
                 log::error!("[shared_account] finish-recovery owner dispatch failed: {error}");
                 self.uncertain_fast.store(true, Ordering::Release);
                 self.admission_fast.store(false, Ordering::Release);
@@ -9765,7 +10474,7 @@ impl SharedAccount {
             return;
         };
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         drop(lock_wait);
         let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let token_id = lifecycle
@@ -9780,7 +10489,7 @@ impl SharedAccount {
         if recovery_removed || query_repair_removed {
             Self::record_virtual_trade_mutation(
                 &account,
-                &mut lifecycle,
+                lifecycle,
                 "",
                 client_order_id,
                 &token_id,
@@ -9794,14 +10503,22 @@ impl SharedAccount {
     }
 
     pub fn recovery_pending_order_ids(&self) -> Vec<String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let mut pending = self.read_cold_state(|state| {
+                state
+                    .recovery_pending_orders
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            pending.sort();
+            return pending;
+        }
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending: Vec<String> = accounts
             .values()
             .flat_map(|account| {
-                account
-                    .lifecycle
-                    .lock()
-                    .unwrap()
+                self.lifecycle(account)
                     .recovery_pending_orders
                     .iter()
                     .cloned()
@@ -9817,10 +10534,21 @@ impl SharedAccount {
     /// for their owner instance; quote admission continues under retained
     /// reservations while the worker retries metadata and exact private trades.
     pub fn pending_order_audit_ids(&self) -> Vec<String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let mut pending = self.read_cold_state(|state| {
+                state
+                    .recovery_pending_orders
+                    .union(&state.routine_cancel_audits)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            pending.sort();
+            return pending;
+        }
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending = HashSet::new();
         for account in accounts.values() {
-            let lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle(account);
             pending.extend(lifecycle.recovery_pending_orders.iter().cloned());
             pending.extend(lifecycle.routine_cancel_audits.iter().cloned());
         }
@@ -9834,9 +10562,17 @@ impl SharedAccount {
     /// safety work queue must not clone durable trade history or publish state
     /// back into the private-event owner lane.
     pub fn pending_order_audit_counts(&self) -> (usize, usize) {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                (
+                    state.recovery_pending_orders.len(),
+                    state.routine_cancel_audits.len(),
+                )
+            });
+        }
         let accounts = self.virtual_accounts.read().unwrap();
         accounts.values().fold((0usize, 0usize), |counts, account| {
-            let lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle(account);
             (
                 counts
                     .0
@@ -9853,9 +10589,26 @@ impl SharedAccount {
     /// use this signal because the original reservation already represents
     /// worst-case exposure; balance-changing maintenance remains blocked.
     pub fn order_audit_instance_blocker(&self, instance_id: &str) -> Option<Vec<String>> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                let mut pending = state
+                    .recovery_pending_orders
+                    .iter()
+                    .filter(|coid| {
+                        state.orders.get(*coid).is_some_and(|order| {
+                            order.instance_id == instance_id
+                                && !order.terminal_trade_ids_authoritative
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                pending.sort();
+                (!pending.is_empty()).then_some(pending)
+            });
+        }
         let _control = self.control_gate.read().unwrap();
         let account = self.virtual_account(instance_id)?;
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         let mut pending: Vec<String> = lifecycle
             .recovery_pending_orders
             .iter()
@@ -10081,6 +10834,19 @@ impl SharedAccount {
             persistence_pending_jobs: persistence_metrics.9,
             persistence_pending_high_water: persistence_metrics.10,
             persistence_queue_overflows: persistence_metrics.11,
+            lifecycle_mirror_queue_depth: self.lifecycle_mirror_tx.len(),
+            lifecycle_mirror_queue_high_water: self
+                .lifecycle_mirror_queue_high_water
+                .load(Ordering::Relaxed),
+            lifecycle_mirror_queue_overflows: self
+                .lifecycle_mirror_queue_overflows
+                .load(Ordering::Relaxed),
+            lifecycle_mirror_published_watermark: self
+                .lifecycle_mirror_published_watermark
+                .load(Ordering::Acquire),
+            lifecycle_mirror_applied_watermark: self
+                .lifecycle_mirror_applied_watermark
+                .load(Ordering::Acquire),
             settled_gc_candidates: settled_gc_metrics.0,
             settled_gc_inflight_requests: settled_gc_metrics.1,
             settled_gc_request_queue_depth: settled_gc_metrics.2,
@@ -10227,6 +10993,19 @@ impl SharedAccount {
             persistence_pending_jobs: persistence_metrics.9,
             persistence_pending_high_water: persistence_metrics.10,
             persistence_queue_overflows: persistence_metrics.11,
+            lifecycle_mirror_queue_depth: self.lifecycle_mirror_tx.len(),
+            lifecycle_mirror_queue_high_water: self
+                .lifecycle_mirror_queue_high_water
+                .load(Ordering::Relaxed),
+            lifecycle_mirror_queue_overflows: self
+                .lifecycle_mirror_queue_overflows
+                .load(Ordering::Relaxed),
+            lifecycle_mirror_published_watermark: self
+                .lifecycle_mirror_published_watermark
+                .load(Ordering::Acquire),
+            lifecycle_mirror_applied_watermark: self
+                .lifecycle_mirror_applied_watermark
+                .load(Ordering::Acquire),
             settled_gc_candidates: settled_gc_metrics.0,
             settled_gc_inflight_requests: settled_gc_metrics.1,
             settled_gc_request_queue_depth: settled_gc_metrics.2,
@@ -10249,14 +11028,14 @@ impl SharedAccount {
     }
 
     pub fn orders(&self) -> Vec<OrderOwnership> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| state.orders.values().cloned().collect());
+        }
         let accounts = self.virtual_accounts.read().unwrap();
         accounts
             .values()
             .flat_map(|account| {
-                account
-                    .lifecycle
-                    .lock()
-                    .unwrap()
+                self.lifecycle(account)
                     .orders
                     .values()
                     .cloned()
@@ -10551,6 +11330,24 @@ impl SharedAccount {
         fee_rate_bps: u32,
         allow_fee_degraded: bool,
     ) -> Result<OrderOwnership, ReservationError> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ReserveOrder {
+                        instance_id: instance_id.to_string(),
+                        client_order_id: client_order_id.to_string(),
+                        order_id: order_id.to_string(),
+                        token_id: token_id.to_string(),
+                        side,
+                        quantity,
+                        price,
+                        fee_rate_bps,
+                        allow_fee_degraded,
+                        reply,
+                    })
+                })
+                .map_err(ReservationError::PersistenceUnavailable)?;
+        }
         self.refresh_trade_persistence_blocker();
         if client_order_id.is_empty()
             || order_id.is_empty()
@@ -10579,12 +11376,12 @@ impl SharedAccount {
             .virtual_account(instance_id)
             .ok_or_else(|| ReservationError::UnknownInstance(instance_id.into()))?;
         // Reservation is entirely instance-scoped. The narrow publication
-        // mutex only coordinates this shard with the final snapshot-copy
-        // phase; it never waits for an account control transaction.
+        // guard coordinates the ledger's atomic publication only; lifecycle
+        // state itself remains single-writer and lock-free on this owner.
         let _publication = account.reservation_publish.lock().unwrap();
         let normalized_order_id = normalize_order_id(order_id);
         let lifecycle_wait = Instant::now();
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         let lifecycle_metric = self.reservation_lifecycle_lock.acquired(lifecycle_wait);
         if let Some(existing) = lifecycle.orders.get(client_order_id) {
             if normalize_order_id(&existing.order_id) == normalize_order_id(order_id)
@@ -10694,11 +11491,24 @@ impl SharedAccount {
                 reserved_position: persisted_reserved_position,
             });
         }
+        let mirror_delta = VirtualLifecyclePersistenceDelta {
+            instance_id: instance_id.to_string(),
+            reserved_cash: persisted_reserved_cash,
+            client_order_id: client_order_id.to_string(),
+            order: Some(ownership.clone()),
+            reserved_position: Some((token_id.to_string(), persisted_reserved_position)),
+            recovery_pending: false,
+            startup_query_repair: false,
+            routine_cancel_audit: false,
+        };
+        self.publish_lifecycle_mirror(|watermark| LifecycleMirrorDelta::Lifecycle {
+            watermark,
+            delta: mirror_delta,
+        });
 
         // End every admission lock before allocating WAL paths or invoking
         // serde. The writer materializes this raw command into typed JSON.
         drop(lifecycle_metric);
-        drop(lifecycle);
         // Deliberately asynchronous: startup exchange reconciliation is the
         // recovery authority for the crash window between POST acceptance and
         // this WAL generation reaching disk. In-process reservations remain
@@ -10725,13 +11535,12 @@ impl SharedAccount {
             return false;
         }
         if let Some(account) = self.virtual_account_for_coid(client_order_id) {
-            let mut lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle_mut(&account);
             let Some(old_order_id) = lifecycle
                 .orders
                 .get(client_order_id)
                 .map(|order| order.order_id.clone())
             else {
-                drop(lifecycle);
                 return self.record_order_binding_anomaly(
                     client_order_id,
                     format!("cannot bind oid `{order_id}` to unknown coid `{client_order_id}`"),
@@ -10753,7 +11562,6 @@ impl SharedAccount {
                 .get(&normalized)
                 .is_some_and(|owner| owner != account.instance_id);
             if conflicts || routed_elsewhere {
-                drop(lifecycle);
                 return self.record_order_binding_anomaly(
                     client_order_id,
                     format!(
@@ -10777,7 +11585,7 @@ impl SharedAccount {
             self.oid_routes.remove(&normalized_old);
             Self::record_virtual_trade_mutation(
                 &account,
-                &mut lifecycle,
+                lifecycle,
                 "",
                 client_order_id,
                 &token_id,
@@ -11259,9 +12067,12 @@ impl SharedAccount {
     }
 
     pub fn order(&self, client_order_id: &str) -> Option<OrderOwnership> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| state.orders.get(client_order_id).cloned());
+        }
         if let Some(account) = self.virtual_account_for_coid(client_order_id) {
             let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-            let lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle(&account);
             drop(lock_wait);
             if let Some(order) = lifecycle.orders.get(client_order_id).cloned() {
                 return Some(order);
@@ -11280,10 +12091,9 @@ impl SharedAccount {
             .collect();
         for account in accounts {
             let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-            let lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle(&account);
             drop(lock_wait);
             let order = lifecycle.orders.get(client_order_id).cloned();
-            drop(lifecycle);
             if let Some(order) = order {
                 self.coid_routes
                     .insert(client_order_id.to_string(), account.instance_id.clone());
@@ -11308,6 +12118,12 @@ impl SharedAccount {
         if normalized.is_empty() {
             return None;
         }
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                let coid = state.oid_to_coid.get(&normalized)?;
+                state.orders.get(coid).cloned()
+            });
+        }
         let accounts: Vec<Arc<VirtualAccount>> = self
             .virtual_accounts
             .read()
@@ -11317,7 +12133,7 @@ impl SharedAccount {
             .collect();
         let mut recovered: Option<(String, OrderOwnership)> = None;
         for account in accounts {
-            let lifecycle = account.lifecycle.lock().unwrap();
+            let lifecycle = self.lifecycle(&account);
             for order in lifecycle
                 .orders
                 .values()
@@ -11344,10 +12160,23 @@ impl SharedAccount {
     /// `control_gate`: the order row, exact terminal ids, applied trades and
     /// reservation residuals all live in the same virtual lifecycle shard.
     pub fn filled_order_ready_for_retirement(&self, client_order_id: &str) -> bool {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                let Some(order) = state.orders.get(client_order_id) else {
+                    return false;
+                };
+                order.status == OrderStatus::Filled
+                    && if order.terminal_trade_ids_authoritative {
+                        terminal_order_audit_complete_locked(state, client_order_id)
+                    } else {
+                        order.reserved_cash <= EPS && order.reserved_quantity <= EPS
+                    }
+            });
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         let Some(order) = lifecycle.orders.get(client_order_id) else {
             return false;
         };
@@ -11399,7 +12228,7 @@ impl SharedAccount {
         }
         let account = self.virtual_account(&ownership.instance_id)?;
         let _publication = account.reservation_publish.lock().unwrap();
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         let normalized = normalize_order_id(&ownership.order_id);
         let existing = lifecycle.orders.get(&ownership.client_order_id).cloned();
         if existing.as_ref().is_some_and(|existing| {
@@ -11455,7 +12284,6 @@ impl SharedAccount {
                 &ownership.client_order_id,
             );
         }
-        drop(lifecycle);
         drop(_publication);
         self.resolve_private_event_anomaly(&format!("order:{normalized}"));
         Some(existing.unwrap_or_else(|| ownership.clone()))
@@ -11497,7 +12325,7 @@ impl SharedAccount {
         }
         let account = self.virtual_account_for_coid(client_order_id)?;
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         drop(lock_wait);
         let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         if let Some(current_status) = lifecycle
@@ -11568,7 +12396,7 @@ impl SharedAccount {
                 let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
                 Self::record_virtual_trade_mutation(
                     &account,
-                    &mut lifecycle,
+                    lifecycle,
                     "",
                     client_order_id,
                     &token_id,
@@ -11578,7 +12406,6 @@ impl SharedAccount {
                     DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
                 self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
                 drop(persist_enqueue);
-                drop(lifecycle);
                 if clear_cancel_anomaly {
                     self.clear_cancel_audit_anomaly(client_order_id);
                 }
@@ -11597,7 +12424,7 @@ impl SharedAccount {
                     .status = status;
                 Self::record_virtual_trade_mutation(
                     &account,
-                    &mut lifecycle,
+                    lifecycle,
                     "",
                     client_order_id,
                     &token_id,
@@ -11633,7 +12460,7 @@ impl SharedAccount {
             return FillAuditPendingTransition::NotTracked;
         };
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         drop(lock_wait);
         let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(order) = lifecycle.orders.get_mut(client_order_id) else {
@@ -11655,13 +12482,7 @@ impl SharedAccount {
                 .recovery_pending_orders
                 .insert(client_order_id.to_string());
         }
-        Self::record_virtual_trade_mutation(
-            &account,
-            &mut lifecycle,
-            "",
-            client_order_id,
-            &token_id,
-        );
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", client_order_id, &token_id);
         let transition = if !pending {
             FillAuditPendingTransition::Resolved
         } else if already_pending {
@@ -11674,7 +12495,6 @@ impl SharedAccount {
             DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         drop(persist_enqueue);
-        drop(lifecycle);
         if transition.newly_pending() {
             self.notify_order_audit_worker();
         }
@@ -11735,7 +12555,7 @@ impl SharedAccount {
         };
         crate::latency::record("polymarket.account.terminal_audit_route", route_started);
         let lifecycle_wait_started = crate::latency::Instant::now();
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         crate::latency::record(
             "polymarket.account.terminal_audit_lifecycle_wait",
             lifecycle_wait_started,
@@ -11795,7 +12615,7 @@ impl SharedAccount {
 
         let complete = terminal_order_audit_complete_virtual(&lifecycle, client_order_id);
         if complete {
-            release_virtual_order_reservation(&account, &mut lifecycle, client_order_id);
+            release_virtual_order_reservation(&account, lifecycle, client_order_id);
             lifecycle.recovery_pending_orders.remove(client_order_id);
             lifecycle
                 .startup_query_repair_orders
@@ -11810,13 +12630,7 @@ impl SharedAccount {
         // touched-key epoch as a fill/status edge so a concurrent cold account
         // transaction merges this audit instead of blocking the private lane
         // on the account-wide control gate.
-        Self::record_virtual_trade_mutation(
-            &account,
-            &mut lifecycle,
-            "",
-            client_order_id,
-            &token_id,
-        );
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", client_order_id, &token_id);
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
 
         let transition = if complete {
@@ -11833,7 +12647,6 @@ impl SharedAccount {
             "polymarket.account.terminal_audit_critical",
             critical_started,
         );
-        drop(lifecycle);
         if clear_cancel_anomaly {
             self.clear_cancel_audit_anomaly(client_order_id);
         }
@@ -11841,13 +12654,16 @@ impl SharedAccount {
     }
 
     pub fn terminal_order_audit_complete(&self, client_order_id: &str) -> bool {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                terminal_order_audit_complete_locked(state, client_order_id)
+            });
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
-        let complete = terminal_order_audit_complete_virtual(
-            &account.lifecycle.lock().unwrap(),
-            client_order_id,
-        );
+        let complete =
+            terminal_order_audit_complete_virtual(self.lifecycle(&account), client_order_id);
         complete
     }
 
@@ -11856,10 +12672,22 @@ impl SharedAccount {
         client_order_id: &str,
         size_matched: f64,
     ) -> bool {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let client_order_id = client_order_id.to_string();
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::MarkCancelledPendingTradeAudit {
+                        client_order_id,
+                        size_matched,
+                        reply,
+                    })
+                })
+                .unwrap_or(false);
+        }
         let Some(account) = self.virtual_account_for_coid(client_order_id) else {
             return false;
         };
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         let already_pending = lifecycle.recovery_pending_orders.contains(client_order_id);
         lifecycle.routine_cancel_audits.remove(client_order_id);
         let Some(existing) = lifecycle.orders.get(client_order_id) else {
@@ -11876,7 +12704,6 @@ impl SharedAccount {
             lifecycle
                 .cancel_audit_anomalies
                 .insert(client_order_id.to_string());
-            drop(lifecycle);
             let mut state = self.lock_state();
             set_ownership_anomaly(
                 &mut state,
@@ -11910,18 +12737,11 @@ impl SharedAccount {
             lifecycle.recovery_pending_orders.remove(client_order_id);
         }
         let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
-        Self::record_virtual_trade_mutation(
-            &account,
-            &mut lifecycle,
-            "",
-            client_order_id,
-            &token_id,
-        );
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", client_order_id, &token_id);
         self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
         if pending && !already_pending {
             self.notify_order_audit_worker();
         }
-        drop(lifecycle);
         if clear_cancel_anomaly {
             self.clear_cancel_audit_anomaly(client_order_id);
         }
@@ -11947,7 +12767,7 @@ impl SharedAccount {
             return false;
         };
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         drop(lock_wait);
         let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(order) = lifecycle.orders.get_mut(client_order_id) else {
@@ -11965,13 +12785,7 @@ impl SharedAccount {
         let newly_pending = lifecycle
             .routine_cancel_audits
             .insert(client_order_id.to_string());
-        Self::record_virtual_trade_mutation(
-            &account,
-            &mut lifecycle,
-            "",
-            client_order_id,
-            &token_id,
-        );
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", client_order_id, &token_id);
         drop(mutation);
         let persist_enqueue =
             DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
@@ -12004,7 +12818,7 @@ impl SharedAccount {
             return;
         };
         let lock_wait = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::LockWait);
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         drop(lock_wait);
         let mutation = DeferredLifecycleStageTimer::start(DeferredLifecycleStage::Mutation);
         let Some(mut order) = lifecycle.orders.remove(client_order_id) else {
@@ -12021,13 +12835,7 @@ impl SharedAccount {
         let token_id = order.token_id.clone();
         lifecycle.orders.insert(client_order_id.into(), order);
         lifecycle.routine_cancel_audits.remove(client_order_id);
-        Self::record_virtual_trade_mutation(
-            &account,
-            &mut lifecycle,
-            "",
-            client_order_id,
-            &token_id,
-        );
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", client_order_id, &token_id);
         drop(mutation);
         let persist_enqueue =
             DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
@@ -13068,6 +13876,23 @@ impl SharedAccount {
         quantity: f64,
         price: f64,
     ) -> Option<TradeOwnership> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ApplyTradeTransitionLegacy {
+                        trade_key: trade_key.to_string(),
+                        status: status.to_string(),
+                        client_order_id: client_order_id.to_string(),
+                        order_id: order_id.to_string(),
+                        token_id: token_id.to_string(),
+                        side,
+                        quantity,
+                        price,
+                        reply,
+                    })
+                })
+                .unwrap_or(None);
+        }
         let mut persistence_required = false;
         let mut owned_noop = false;
         self.apply_trade_transition_inner(
@@ -13098,6 +13923,25 @@ impl SharedAccount {
         is_maker: bool,
         match_time_secs: u64,
     ) -> TradeTransitionResult {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ApplyTradeTransition {
+                        trade_key: trade_key.to_string(),
+                        status: status.to_string(),
+                        client_order_id: client_order_id.to_string(),
+                        order_id: order_id.to_string(),
+                        token_id: token_id.to_string(),
+                        side,
+                        quantity,
+                        price,
+                        is_maker,
+                        match_time_secs,
+                        reply,
+                    })
+                })
+                .unwrap_or(TradeTransitionResult::Rejected);
+        }
         let mut persistence_required = false;
         let mut owned_noop = false;
         let applied = self.apply_trade_transition_inner(
@@ -13317,7 +14161,7 @@ impl SharedAccount {
         let Some(account) = self.virtual_account(instance_id) else {
             return VirtualTradeAttempt::Fallback;
         };
-        let mut lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle_mut(&account);
         let normalized_order_id = normalize_order_id(order_id);
         let existing = lifecycle.trades.get(trade_key).cloned();
         // GC publishes this membership before releasing the owner lifecycle
@@ -13366,16 +14210,11 @@ impl SharedAccount {
                         }
                     }
                     let config = (!is_maker)
-                        .then(|| {
-                            self.token_fee_configs_fast
-                                .load()
-                                .get(token_id)
-                                .cloned()
-                        })
+                        .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                         .flatten();
                     match apply_trade_fee_transition_virtual(
                         &account,
-                        &mut lifecycle,
+                        &mut *lifecycle,
                         trade_key,
                         if normalized == "FAILED" {
                             OrderStatus::Failed
@@ -13395,7 +14234,7 @@ impl SharedAccount {
                 if changed {
                     Self::record_virtual_trade_mutation(
                         &account,
-                        &mut lifecycle,
+                        &mut *lifecycle,
                         trade_key,
                         &applied.ownership.client_order_id,
                         token_id,
@@ -13452,12 +14291,7 @@ impl SharedAccount {
                     return VirtualTradeAttempt::Fallback;
                 }
                 let config = (!is_maker)
-                    .then(|| {
-                        self.token_fee_configs_fast
-                            .load()
-                            .get(token_id)
-                            .cloned()
-                    })
+                    .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                     .flatten();
                 if is_maker || config.is_some() {
                     let (expected_usdc, expected_shares) =
@@ -13524,16 +14358,11 @@ impl SharedAccount {
             }
             if let Some((is_maker, _)) = trade_context {
                 let config = (!is_maker)
-                    .then(|| {
-                        self.token_fee_configs_fast
-                            .load()
-                            .get(token_id)
-                            .cloned()
-                    })
+                    .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                     .flatten();
                 if apply_trade_fee_transition_virtual(
                     &account,
-                    &mut lifecycle,
+                    &mut *lifecycle,
                     trade_key,
                     if is_failed {
                         OrderStatus::Failed
@@ -13553,7 +14382,7 @@ impl SharedAccount {
             }
             Self::record_virtual_trade_mutation(
                 &account,
-                &mut lifecycle,
+                &mut *lifecycle,
                 trade_key,
                 &resolved_coid,
                 token_id,
@@ -13726,16 +14555,11 @@ impl SharedAccount {
         let mut fee_economics_changed = false;
         if let Some((is_maker, _)) = trade_context {
             let config = (!is_maker)
-                .then(|| {
-                    self.token_fee_configs_fast
-                        .load()
-                        .get(token_id)
-                        .cloned()
-                })
+                .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                 .flatten();
             match apply_trade_fee_transition_virtual(
                 &account,
-                &mut lifecycle,
+                &mut *lifecycle,
                 trade_key,
                 if is_failed {
                     OrderStatus::Failed
@@ -13756,7 +14580,7 @@ impl SharedAccount {
         }
 
         if terminal_order_audit_complete_virtual(&lifecycle, &resolved_coid) {
-            release_virtual_order_reservation(&account, &mut lifecycle, &resolved_coid);
+            release_virtual_order_reservation(&account, &mut *lifecycle, &resolved_coid);
             lifecycle.recovery_pending_orders.remove(&resolved_coid);
         } else if order_fully_filled
             && !lifecycle
@@ -13778,7 +14602,7 @@ impl SharedAccount {
         }
         Self::record_virtual_trade_mutation(
             &account,
-            &mut lifecycle,
+            &mut *lifecycle,
             trade_key,
             &resolved_coid,
             token_id,
@@ -14630,12 +15454,23 @@ impl SharedAccount {
         if trade_key.is_empty() {
             return None;
         }
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                state
+                    .trades
+                    .get(trade_key)
+                    .map(|trade| trade.ownership.clone())
+                    .or_else(|| {
+                        let tombstone = state.retired_trade_ownership_tombstones.get(trade_key)?;
+                        retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                            .then(|| tombstone.ownership.clone())
+                    })
+            });
+        }
         if let Some(instance_id) = self.trade_routes.get(trade_key) {
             if let Some(account) = self.virtual_account(&instance_id) {
-                if let Some(ownership) = account
-                    .lifecycle
-                    .lock()
-                    .unwrap()
+                if let Some(ownership) = self
+                    .lifecycle(&account)
                     .trades
                     .get(trade_key)
                     .map(|trade| trade.ownership.clone())
@@ -14688,6 +15523,25 @@ impl SharedAccount {
                 )
                 .is_ok()
         };
+        if self.must_dispatch_lifecycle_to_owner() {
+            let Ok(state) = self.state.try_lock() else {
+                return false;
+            };
+            return state
+                .trades
+                .get(trade_key)
+                .map(|trade| covered(&trade.ownership, trade.is_maker))
+                .or_else(|| {
+                    state
+                        .retired_trade_ownership_tombstones
+                        .get(trade_key)
+                        .map(|tombstone| {
+                            covered(&tombstone.ownership, tombstone.is_maker)
+                                && retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                        })
+                })
+                .unwrap_or(false);
+        }
         let instance_id = match self.trade_routes.try_get(trade_key) {
             Ok(instance_id) => instance_id,
             Err(()) => return false,
@@ -14700,12 +15554,12 @@ impl SharedAccount {
             let Some(account) = account else {
                 return false;
             };
-            if let Some(covered) = account.lifecycle.try_lock().ok().and_then(|lifecycle| {
-                lifecycle
-                    .trades
-                    .get(trade_key)
-                    .map(|trade| covered(&trade.ownership, trade.is_maker))
-            }) {
+            if let Some(covered) = self
+                .lifecycle(&account)
+                .trades
+                .get(trade_key)
+                .map(|trade| covered(&trade.ownership, trade.is_maker))
+            {
                 return covered;
             }
             // A stale active route can briefly outlive its compacted shard
@@ -14769,10 +15623,21 @@ impl SharedAccount {
         if instance_id.trim().is_empty() || token_ids.is_empty() {
             return Vec::new();
         }
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                state
+                    .trades
+                    .values()
+                    .filter(|trade| trade.ownership.instance_id == instance_id)
+                    .filter(|trade| token_ids.contains(&trade.ownership.token_id))
+                    .filter_map(restored_trade_from_applied)
+                    .collect()
+            });
+        }
         let Some(account) = self.virtual_account(instance_id) else {
             return Vec::new();
         };
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         lifecycle
             .trades
             .values()
@@ -14807,8 +15672,17 @@ impl SharedAccount {
         if instance_id.trim().is_empty() || trade_key.trim().is_empty() {
             return None;
         }
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                state
+                    .trades
+                    .get(trade_key)
+                    .filter(|trade| trade.ownership.instance_id == instance_id)
+                    .map(|trade| trade.ledger_generation)
+            });
+        }
         let account = self.virtual_account(instance_id)?;
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         lifecycle
             .trades
             .get(trade_key)
@@ -14820,6 +15694,17 @@ impl SharedAccount {
     /// nonterminal trades are retained; only fully terminal rows for the
     /// retired token scope are removed.
     pub fn prune_terminal_history(&self, tokens: &HashSet<String>) -> (usize, usize) {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let tokens = tokens.clone();
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::PruneTerminalHistory {
+                        tokens,
+                        reply,
+                    })
+                })
+                .unwrap_or_default();
+        }
         self.prune_terminal_history_scoped(None, tokens)
     }
 
@@ -14834,11 +15719,23 @@ impl SharedAccount {
         if instance_id.is_empty() || tokens.is_empty() {
             return HashSet::new();
         }
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.read_cold_state(|state| {
+                state
+                    .orders
+                    .iter()
+                    .filter(|(_, order)| {
+                        order.instance_id == instance_id && tokens.contains(&order.token_id)
+                    })
+                    .map(|(coid, _)| coid.clone())
+                    .collect()
+            });
+        }
         let _control = self.control_gate.read().unwrap();
         let Some(account) = self.virtual_account(instance_id) else {
             return HashSet::new();
         };
-        let lifecycle = account.lifecycle.lock().unwrap();
+        let lifecycle = self.lifecycle(&account);
         lifecycle
             .orders
             .iter()
@@ -14854,6 +15751,18 @@ impl SharedAccount {
         &self,
         request: SettledGcDeleteRequest,
     ) -> Result<SettledGcDeleteAttempt, String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self
+                .request_account_lifecycle_owner(|reply| {
+                    AccountOwnerCommand(AccountOwnerOperation::ProcessSettledGcDelete {
+                        request,
+                        reply,
+                    })
+                })
+                .unwrap_or_else(|_| {
+                    Err("settled GC lifecycle owner lane unavailable".to_string())
+                });
+        }
         // Hold the route generation read guard for the whole deletion turn.
         // Re-registration takes the write side, so once it returns an old
         // stale cold mailbox can no longer mutate the replacement owner's
@@ -14918,14 +15827,7 @@ impl SharedAccount {
             state_wait_started,
         );
         let lifecycle_wait_started = crate::latency::Instant::now();
-        let mut lifecycle = match account.lifecycle.try_lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                crate::latency::record_ns("polymarket.account.settled_gc_owner_lifecycle_busy", 1);
-                return Ok(SettledGcDeleteAttempt::Busy(request));
-            }
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        };
+        let lifecycle = self.lifecycle_mut(&account);
         crate::latency::record(
             "polymarket.account.settled_gc_owner_lifecycle_wait",
             lifecycle_wait_started,
@@ -15118,7 +16020,6 @@ impl SharedAccount {
             "polymarket.account.settled_gc_owner_critical",
             critical_started,
         );
-        drop(lifecycle);
         drop(state);
         drop(control);
         drop(owner_routes);
@@ -15149,6 +16050,181 @@ impl SharedAccount {
         let pruned_trades = outcome.trades.len();
         if !outcome.is_empty() {
             self.schedule_settled_prune_persist(&state, &[outcome], &[]);
+        }
+        (pruned_orders, pruned_trades)
+    }
+
+    fn prune_terminal_history_on_lifecycle_owner(
+        &self,
+        tokens: &HashSet<String>,
+    ) -> (usize, usize) {
+        debug_assert!(self.is_account_lifecycle_thread());
+        if tokens.is_empty() {
+            return (0, 0);
+        }
+        // Compatibility-only test/operator path. Live settled retirement uses
+        // bounded per-instance GC mailboxes. Traverse the authoritative owner
+        // shards directly, then publish typed removals; never acquire the cold
+        // control writer or rebuild a full lifecycle snapshot on this lane.
+        let accounts: Vec<Arc<VirtualAccount>> = self
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let mut retired_orders = Vec::<(Arc<VirtualAccount>, String, String)>::new();
+        let mut retired_trades = Vec::<(Arc<VirtualAccount>, String, AppliedTrade)>::new();
+        let mut protected_fee_tokens = HashSet::new();
+        for account in &accounts {
+            let lifecycle = self.lifecycle_mut(account);
+            let protected_coids: HashSet<String> = lifecycle
+                .trades
+                .iter()
+                .filter(|(trade_key, trade)| {
+                    !trade.failed
+                        && (trade.ownership.status != "CONFIRMED"
+                            || lifecycle.fee_attribution_pending.contains(*trade_key))
+                })
+                .map(|(_, trade)| trade.ownership.client_order_id.clone())
+                .collect();
+            protected_fee_tokens.extend(
+                lifecycle
+                    .trades
+                    .iter()
+                    .filter(|(trade_key, trade)| {
+                        !trade.failed
+                            && (trade.ownership.status != "CONFIRMED"
+                                || lifecycle.fee_attribution_pending.contains(*trade_key))
+                    })
+                    .map(|(_, trade)| trade.ownership.token_id.clone()),
+            );
+            let stale_orders: Vec<(String, String)> = lifecycle
+                .orders
+                .iter()
+                .filter(|(coid, order)| {
+                    tokens.contains(&order.token_id)
+                        && !protected_coids.contains(*coid)
+                        && !lifecycle.recovery_pending_orders.contains(*coid)
+                        && !lifecycle.routine_cancel_audits.contains(*coid)
+                        && order.reserved_cash <= EPS
+                        && order.reserved_quantity <= EPS
+                        && matches!(
+                            order.status,
+                            OrderStatus::Cancelled
+                                | OrderStatus::Rejected
+                                | OrderStatus::Filled
+                                | OrderStatus::Failed
+                        )
+                })
+                .map(|(coid, order)| (coid.clone(), order.order_id.clone()))
+                .collect();
+            for (coid, order_id) in stale_orders {
+                lifecycle.orders.remove(&coid);
+                lifecycle.recovery_pending_orders.remove(&coid);
+                lifecycle.startup_query_repair_orders.remove(&coid);
+                lifecycle.routine_cancel_audits.remove(&coid);
+                lifecycle.cancel_audit_anomalies.remove(&coid);
+                self.schedule_virtual_lifecycle_persist(account, lifecycle, &coid);
+                retired_orders.push((Arc::clone(account), coid, order_id));
+            }
+            let stale_trade_keys: Vec<String> = lifecycle
+                .trades
+                .iter()
+                .filter(|(trade_key, trade)| {
+                    tokens.contains(&trade.ownership.token_id)
+                        && !lifecycle.fee_attribution_pending.contains(*trade_key)
+                        && (trade.failed || trade.ownership.status == "CONFIRMED")
+                })
+                .map(|(trade_key, _)| trade_key.clone())
+                .collect();
+            for trade_key in stale_trade_keys {
+                let Some(trade) = lifecycle.trades.remove(&trade_key) else {
+                    continue;
+                };
+                lifecycle
+                    .pending_physical
+                    .apply_transition(Some(&trade), None);
+                lifecycle.fee_attribution_pending.remove(&trade_key);
+                self.schedule_virtual_trade_persist(
+                    account,
+                    lifecycle,
+                    &trade_key,
+                    &trade.ownership.client_order_id,
+                    &trade.ownership.token_id,
+                );
+                retired_trades.push((Arc::clone(account), trade_key, trade));
+            }
+            account.publish_lifecycle_counts(lifecycle);
+        }
+
+        let retired_at_ms = wall_clock_ms();
+        let mut state = self.state.lock().unwrap();
+        for (_, coid, order_id) in &retired_orders {
+            state.orders.remove(coid);
+            state.oid_to_coid.remove(&normalize_order_id(order_id));
+            state.recovery_pending_orders.remove(coid);
+            state.startup_query_repair_orders.remove(coid);
+            state.routine_cancel_audits.remove(coid);
+        }
+        for (_, trade_key, trade) in &retired_trades {
+            state.trades.remove(trade_key);
+            state.fee_attribution_pending.remove(trade_key);
+            state.retired_trade_ownership_tombstones.insert(
+                trade_key.clone(),
+                RetiredTradeOwnershipTombstone {
+                    ownership: trade.ownership.clone(),
+                    is_maker: trade.is_maker,
+                    authenticated_terminal_noop: false,
+                    retired_at_ms,
+                },
+            );
+            add_economic_state(
+                &mut state.compacted_economic_effects,
+                &trade_economic_effect(trade),
+                1.0,
+            );
+            self.retired_trade_routes
+                .insert(trade_key.clone(), trade.ownership.instance_id.clone());
+        }
+        let expired_tombstones =
+            prune_retired_trade_ownership_tombstones(&mut state, retired_at_ms);
+        let fee_tokens = tokens
+            .iter()
+            .filter(|token| !protected_fee_tokens.contains(*token))
+            .filter_map(|token| state.token_fee_configs.remove(token).map(|_| token.clone()))
+            .collect();
+        let outcome = SettledPruneOutcome {
+            orders: retired_orders
+                .iter()
+                .map(|(_, coid, oid)| (coid.clone(), oid.clone()))
+                .collect(),
+            trades: retired_trades
+                .iter()
+                .map(|(_, trade_key, _)| trade_key.clone())
+                .collect(),
+            fee_tokens,
+            expired_tombstones,
+        };
+        self.retired_trade_tombstone_count_fast.store(
+            state.retired_trade_ownership_tombstones.len(),
+            Ordering::Relaxed,
+        );
+        let pruned_orders = retired_orders.len();
+        let pruned_trades = retired_trades.len();
+        if !outcome.is_empty() {
+            self.schedule_settled_prune_persist(&state, &[outcome], &[]);
+        }
+        recompute_reconciliation(&mut state, "terminal lifecycle owner history prune");
+        self.publish_control_snapshots(&state);
+        self.publish_economic_snapshots(&state);
+        drop(state);
+        for (_, coid, order_id) in retired_orders {
+            self.coid_routes.remove(&coid);
+            self.oid_routes.remove(&normalize_order_id(&order_id));
+        }
+        for (_, trade_key, _) in retired_trades {
+            self.trade_routes.remove(&trade_key);
         }
         (pruned_orders, pruned_trades)
     }
@@ -15818,6 +16894,27 @@ fn terminal_order_audit_complete_locked(state: &SharedAccountState, client_order
     };
     let tolerance = target.abs().max(1.0) * 1e-8;
     (covered - target).abs() <= tolerance
+}
+
+fn restored_trade_from_applied(trade: &AppliedTrade) -> Option<RestoredTrade> {
+    Some(RestoredTrade {
+        ownership: trade.ownership.clone(),
+        booked: trade.booked,
+        usdc_fee: if trade.virtual_fee_booked {
+            trade.usdc_fee
+        } else {
+            0.0
+        },
+        shares_fee: if trade.virtual_fee_booked {
+            trade.shares_fee
+        } else {
+            0.0
+        },
+        virtual_fee_booked: trade.virtual_fee_booked,
+        is_maker: trade.is_maker?,
+        match_time_secs: trade.match_time_secs,
+        ledger_generation: trade.ledger_generation,
+    })
 }
 
 fn terminal_order_audit_complete_virtual(
@@ -18819,6 +19916,28 @@ mod tests {
         stop_tx.send(()).unwrap();
         lifecycle_thread.join().unwrap();
         calibration_owner.mark_current_thread().unwrap();
+        calibration_owner
+            .lifecycle_mirror_receiver()
+            .try_recv()
+            .unwrap();
+        calibration_owner.execute_lifecycle_mirror();
+        let mirror = account.lifecycle_mirror_queue_metrics();
+        assert_eq!(mirror.0, 0, "cold mirror drains the complete ordered batch");
+        assert_eq!(mirror.2, 0, "lossless lifecycle mirror must not overflow");
+        assert_eq!(
+            mirror.3, mirror.4,
+            "wallet calibration may proceed only at the lifecycle watermark",
+        );
+        assert_eq!(
+            account.read_cold_state(|state| state.orders["maker-a-order"].status),
+            OrderStatus::PartiallyFilled,
+            "duplicate/out-of-order status input is idempotent in the cold projection",
+        );
+        assert_eq!(
+            account.read_cold_state(|state| state.orders["maker-b-order"].status),
+            OrderStatus::Pending,
+            "one instance's lifecycle deltas must not alter its sibling",
+        );
         calibration_owner.wallet_receiver().try_recv().unwrap();
         calibration_owner.execute_wallet_calibration();
         assert!(calibration.recv().unwrap().unwrap().account_ready);
@@ -18880,11 +19999,17 @@ mod tests {
         owner.wallet_receiver().try_recv().unwrap();
         owner.execute_wallet_calibration();
         for completion in completions {
-            let result = completion.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+            let result = completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
             assert!(result.account_ready);
             assert!(result.token_interests.is_some());
         }
-        assert_eq!(account.wallet_calibration_coalesced(), (PRODUCERS - 1) as u64);
+        assert_eq!(
+            account.wallet_calibration_coalesced(),
+            (PRODUCERS - 1) as u64
+        );
         assert!((account.monitoring_snapshot_fast().physical_cash - 116.0).abs() < EPS);
     }
 
@@ -18997,15 +20122,13 @@ mod tests {
 
     #[test]
     fn fast_monitoring_never_borrows_private_lifecycle() {
-        let account = SharedAccount::new("fast-monitoring");
+        let account = Arc::new(SharedAccount::new("fast-monitoring"));
         account.register_instance("maker", 1.0);
-        let virtual_account = account.virtual_account("maker").unwrap();
-        let lifecycle = virtual_account.lifecycle.lock().unwrap();
+        let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
 
         let snapshot = account.monitoring_snapshot_fast();
 
         assert_eq!(snapshot.account_id, "fast-monitoring");
-        drop(lifecycle);
     }
 
     #[test]
@@ -19171,7 +20294,7 @@ mod tests {
 
     fn assert_virtual_pending_tracker_matches_scan(account: &SharedAccount, instance_id: &str) {
         let virtual_account = account.virtual_account(instance_id).unwrap();
-        let lifecycle = virtual_account.lifecycle.lock().unwrap();
+        let lifecycle = account.lifecycle(&virtual_account);
         assert_pending_physical_equal(
             &lifecycle.pending_physical.snapshot(),
             &pending_physical_deltas_from_trades(lifecycle.trades.values()),
@@ -19253,8 +20376,7 @@ mod tests {
 
             let started = Instant::now();
             std::hint::black_box(tracker.snapshot());
-            incremental_snapshot
-                .push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            incremental_snapshot.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
         let scan = latency_summary_ns(&mut history_scan);
         let snapshot = latency_summary_ns(&mut incremental_snapshot);
@@ -19312,7 +20434,7 @@ mod tests {
             };
             let rows = UNRELATED_ROWS_PER_INSTANCE + if index == 0 { TARGET_ROWS } else { 0 };
             let owner = account.virtual_account(&instance_id).unwrap();
-            let mut lifecycle = owner.lifecycle.lock().unwrap();
+            let lifecycle = account.lifecycle_mut(&owner);
             let mut state = account.state.lock().unwrap();
             for row in 0..rows {
                 let is_target = index == 0 && row >= UNRELATED_ROWS_PER_INSTANCE;
@@ -21739,7 +22861,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             trades.push((trade_key, trade));
         }
         {
-            let mut lifecycle = owner.lifecycle.lock().unwrap();
+            let lifecycle = account.lifecycle_mut(&owner);
             let mut state = account.state.lock().unwrap();
             for (coid, oid, order) in &orders {
                 lifecycle.orders.insert(coid.clone(), order.clone());
@@ -21768,10 +22890,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             ),
             (70, 70),
         );
-        let lifecycle = owner.lifecycle.lock().unwrap();
+        let lifecycle = account.lifecycle(&owner);
         assert!(lifecycle.orders.is_empty());
         assert!(lifecycle.trades.is_empty());
-        drop(lifecycle);
         assert_eq!(
             account
                 .state
@@ -23694,10 +24815,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             )
             .unwrap();
 
-        let observed_positions = HashMap::from([
-            ("BTC-UP".into(), 70.0),
-            ("BTC-DOWN".into(), 80.0),
-        ]);
+        let observed_positions =
+            HashMap::from([("BTC-UP".into(), 70.0), ("BTC-DOWN".into(), 80.0)]);
         let authoritative_tokens = HashSet::from(["BTC-UP".into(), "BTC-DOWN".into()]);
         assert!(!account.observe_platform_binary_redeem(
             107.0,
@@ -23709,7 +24828,10 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert_eq!(metric.physical_positions.get("BTC-UP"), Some(&70.0));
         assert_eq!(metric.physical_positions.get("BTC-DOWN"), Some(&80.0));
         assert!(metric.unallocated_cash.abs() <= EPS);
-        assert!(metric.unallocated_positions.values().all(|qty| qty.abs() <= EPS));
+        assert!(metric
+            .unallocated_positions
+            .values()
+            .all(|qty| qty.abs() <= EPS));
         assert_eq!(account.instance_snapshot("btc").unwrap().cash, 107.0);
         assert!(!account.observe_platform_binary_redeem(
             107.0,
@@ -24319,9 +25441,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 CAPACITY,
             )
             .unwrap();
-            persistence
-                .write_delay_ms
-                .store(250, Ordering::Relaxed);
+            persistence.write_delay_ms.store(250, Ordering::Relaxed);
 
             for index in 0..EVENTS {
                 let started = Instant::now();
@@ -26747,10 +27867,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             "test runtime mapping without lifecycle row",
         );
         let virtual_account = account.virtual_account("a").unwrap();
-        virtual_account
-            .lifecycle
-            .lock()
-            .unwrap()
+        account
+            .lifecycle_mut(&virtual_account)
             .orders
             .remove(&ownership.client_order_id);
 

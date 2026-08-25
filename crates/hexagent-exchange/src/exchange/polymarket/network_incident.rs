@@ -64,7 +64,9 @@ impl ConnectionFailureClusterGate {
             return (connections, false);
         }
         let until = now_ns.saturating_add(CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS);
-        let previous = self.place_blocked_until_ns.fetch_max(until, Ordering::AcqRel);
+        let previous = self
+            .place_blocked_until_ns
+            .fetch_max(until, Ordering::AcqRel);
         (connections, previous <= now_ns)
     }
 
@@ -103,12 +105,24 @@ pub(crate) fn place_blocked_by_connection_failure_cluster() -> bool {
     connection_failure_gate().place_blocked(crate::types::now_ns())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NetworkSignal {
     PeerCollision,
     DualWsSilence,
     HttpPlaceTimeout,
     HttpCancelTimeout,
+}
+
+/// A standby-only slow-consumer close is not evidence that the active market
+/// lane or HTTP cluster is impaired. DNS can immediately return the active
+/// peer for the replacement candidate; suppress that expected peer-collision
+/// edge so it does not manufacture a fresh cross-transport incident.
+static PEER_COLLISION_SUPPRESSED_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn suppress_peer_collision_for(duration: Duration) {
+    let until =
+        crate::types::now_ns().saturating_add(duration.as_nanos().min(u64::MAX as u128) as u64);
+    PEER_COLLISION_SUPPRESSED_UNTIL_NS.fetch_max(until, Ordering::AcqRel);
 }
 
 impl NetworkSignal {
@@ -204,6 +218,11 @@ pub(crate) fn update_ws_peers(active: Option<SocketAddr>, standby: Option<Socket
 }
 
 pub(crate) fn record(signal: NetworkSignal, detail: &str) {
+    if signal == NetworkSignal::PeerCollision
+        && crate::types::now_ns() < PEER_COLLISION_SUPPRESSED_UNTIL_NS.load(Ordering::Acquire)
+    {
+        return;
+    }
     let tracker = tracker();
     let snapshot = loop {
         let current = tracker.load_full();
@@ -276,8 +295,6 @@ mod tests {
         assert_eq!(gate.note(3, crate::http1_pool::Role::Cancel, 0), (2, true));
         assert_eq!(gate.note(4, crate::http1_pool::Role::Cancel, 1), (3, false));
         assert!(gate.place_blocked(5));
-        assert!(!gate.place_blocked(
-            4 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS
-        ));
+        assert!(!gate.place_blocked(4 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS));
     }
 }
