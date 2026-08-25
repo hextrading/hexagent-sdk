@@ -52,10 +52,6 @@ const EXECUTION_DIAGNOSTIC_CAPACITY: usize = 1_024;
 // Per-strategy lossless lifecycle spool. It is allocated once by the router;
 // overflow quarantines only that owner and relies on private replay/reconcile.
 const LIFECYCLE_OWNER_OUTBOX_CAPACITY: usize = CHANNEL_CAPACITY;
-// Four account updates keep fill/cancel feedback responsive while bounding
-// the time an already-enqueued market trigger can sit behind the biased lane.
-// At the private-apply target (<=1 ms p95), 32 permitted a 32 ms quote stall.
-const PRIVATE_UPDATE_BURST_BUDGET: usize = 4;
 // The production polymaker callback owns several fixed-capacity quote/order
 // scratch values and can enter cold event-start rebuilds before its first
 // quote. Rust's 2 MiB spawned-thread default was exhausted in live recovery on
@@ -2131,10 +2127,6 @@ fn retire_latest_market_key(handle: LatestMarketKeyHandle, market_lanes: &[Marke
             }
         }
     }
-}
-
-fn private_update_lane_enabled(private_burst: usize, market_waiting: bool) -> bool {
-    private_burst < PRIVATE_UPDATE_BURST_BUDGET || !market_waiting
 }
 
 fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: usize) -> bool {
@@ -7315,10 +7307,6 @@ impl Engine {
                 let executor_update_rx = executor_update_rx
                     .unwrap_or_else(crossbeam_channel::never);
                 let mut shutdown_in_progress = false;
-                let never_root_update_rx = crossbeam_channel::never::<RoutedOrderUpdate>();
-                let never_executor_update_rx =
-                    crossbeam_channel::never::<RoutedOrderUpdate>();
-                let mut root_private_update_burst = 0usize;
                 let lifecycle_retry_tick =
                     crossbeam_channel::tick(std::time::Duration::from_micros(50));
                 let never_lifecycle_retry_rx =
@@ -7342,33 +7330,18 @@ impl Engine {
                     } else {
                         &never_lifecycle_retry_rx
                     };
-                    // Private/order lifecycle is lossless and higher priority
-                    // than replaceable market data. Bound the priority burst
-                    // so a pathological update storm still permits one public
-                    // event, then immediately return to private-first routing.
-                    let selectable_update_rx = if private_update_lane_enabled(
-                        root_private_update_burst,
-                        !market_rx.is_empty(),
-                    ) {
-                        &update_rx
-                    } else {
-                        &never_root_update_rx
-                    };
-                    let selectable_executor_update_rx = if private_update_lane_enabled(
-                        root_private_update_burst,
-                        !market_rx.is_empty(),
-                    ) {
-                        &executor_update_rx
-                    } else {
-                        &never_executor_update_rx
-                    };
+                    // Private/order lifecycle is lossless and strictly higher
+                    // priority than replaceable market data. The previous
+                    // four-message budget deliberately scheduled a market
+                    // callback while fills were already waiting, producing
+                    // 10–27 ms apply tails. A continuously-ready lifecycle
+                    // lane now drains before quote work; bounded per-owner
+                    // queues and quarantine retain explicit backpressure.
                     crossbeam_channel::select_biased! {
-                        recv(selectable_update_rx) -> msg => match msg {
+                        recv(update_rx) -> msg => match msg {
                             // Cold compatibility route. Once admitted, the
                             // numeric owner is carried in the queue envelope.
                             Ok(u) => {
-                                root_private_update_burst =
-                                    root_private_update_burst.saturating_add(1);
                                 match Self::route_private_update(
                                     u,
                                     &iid_to_idx,
@@ -7389,10 +7362,8 @@ impl Engine {
                             }
                             Err(_) => break,
                         },
-                        recv(selectable_executor_update_rx) -> msg => match msg {
+                        recv(executor_update_rx) -> msg => match msg {
                             Ok(routed) => {
-                                root_private_update_burst =
-                                    root_private_update_burst.saturating_add(1);
                                 match Self::route_executor_update(
                                     routed,
                                     &iid_to_idx,
@@ -7455,7 +7426,6 @@ impl Engine {
                                 }
                             }
                             Ok(event) => {
-                                root_private_update_burst = 0;
                                 if shutdown_in_progress { continue; }
                                 let event = Arc::new(event);
                                 let mut dropped_mask = Self::route_market_event(
@@ -7986,12 +7956,10 @@ impl Engine {
         let mut last_quote_ns: u64 = 0;
         let mut quote_signal_batch = SignalBatch::new();
         let mut callback_signal_batch = SignalBatch::new();
-        let mut private_update_burst = 0usize;
         let mut lifecycle_sequence = 0u64;
         let mut historical_epoch = 0u64;
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
-        let never_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
         let never_private_update_rx = crossbeam_channel::never::<OrderUpdate>();
         let never_private_control_rx =
             crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
@@ -8004,18 +7972,10 @@ impl Engine {
                 heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                 let _ = shutdown_ack_tx.send(idx);
             }
-            // Private lifecycle changes retain priority, but only for a finite
-            // burst. Once market work is waiting, force one public event so a
-            // fill storm cannot indefinitely starve quote freshness.
-            let selectable_update_rx =
-                if !private_update_lane_enabled(private_update_burst, !market_rx.is_empty()) {
-                    &never_update_rx
-                } else {
-                    &update_rx
-                };
-            let selectable_private_update_rx = if private_feed_updates_open
-                && private_update_lane_enabled(private_update_burst, !market_rx.is_empty())
-            {
+            // Lifecycle lanes are lossless and strict-priority. Market state
+            // is replaceable, so it must never be selected while an account
+            // mutation is already queued for this sole-writer strategy.
+            let selectable_private_update_rx = if private_feed_updates_open {
                 &private_feed_update_rx
             } else {
                 &never_private_update_rx
@@ -8058,7 +8018,6 @@ impl Engine {
                 },
                 recv(selectable_private_update_rx) -> msg => match msg {
                     Ok(update) => {
-                        private_update_burst = private_update_burst.saturating_add(1);
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         let callback_started = crate::latency::Instant::now();
@@ -8095,7 +8054,7 @@ impl Engine {
                     }
                     Err(_) => private_feed_updates_open = false,
                 },
-                recv(selectable_update_rx) -> msg => match msg {
+                recv(update_rx) -> msg => match msg {
                     Ok(queued) => {
                         if queued.update.exchange == Exchange::Polymarket {
                             hexagent_runtime::latency::record_ns(
@@ -8104,7 +8063,6 @@ impl Engine {
                                     as u64,
                             );
                         }
-                        private_update_burst = private_update_burst.saturating_add(1);
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         crate::latency::record_ns(
@@ -8194,7 +8152,6 @@ impl Engine {
                 },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) => {
-                        private_update_burst = 0;
                         let Some(queued) = resolve_market_event(queued, &latest_market) else {
                             continue;
                         };
@@ -9873,7 +9830,7 @@ impl Engine {
         // order budget on their next pick. `/time` is free and
         // unauthenticated, same endpoint the prewarm uses.
         if !by_account.is_empty() {
-            hexagent_runtime::http1_pool::spawn_keep_warm(
+            hexagent_runtime::http1_pool::spawn_instrumented_keep_warm(
                 "clob",
                 format!("{}/time", poly_cfg.api_url_prefix.trim_end_matches('/')),
                 std::time::Duration::from_secs(20),
@@ -15177,22 +15134,6 @@ mod market_router_tests {
         ));
         let after_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&after_barrier.event, &second));
-    }
-
-    #[test]
-    fn private_update_priority_yields_after_bounded_burst() {
-        assert!(private_update_lane_enabled(
-            PRIVATE_UPDATE_BURST_BUDGET - 1,
-            true,
-        ));
-        assert!(!private_update_lane_enabled(
-            PRIVATE_UPDATE_BURST_BUDGET,
-            true,
-        ));
-        assert!(private_update_lane_enabled(
-            PRIVATE_UPDATE_BURST_BUDGET,
-            false,
-        ));
     }
 
     #[test]

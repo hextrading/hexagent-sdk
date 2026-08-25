@@ -3269,6 +3269,109 @@ fn clob_thread_cpu_ns() -> u64 {
     }
 }
 
+/// Start a short, bounded perf sample after a genuine CPU-bound CLOB tail.
+/// The hot reader only performs one atomic claim and enqueues a blocking job;
+/// filesystem/process work runs on Tokio's blocking pool. A five-minute
+/// cooldown deduplicates incidents. Set `HEXBOT_CLOB_PERF_TRIGGER=0` to opt
+/// out or tune seconds/frequency/output directory through the adjacent envs.
+#[cfg(target_os = "linux")]
+fn maybe_trigger_clob_perf(elapsed: Duration, frame_len: usize, phases: ClobFramePhaseTimings) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LAST_TRIGGER_NS: AtomicU64 = AtomicU64::new(0);
+    const COOLDOWN_NS: u64 = 300_000_000_000;
+    if elapsed < CLOB_RARE_HANDLER_TAIL {
+        return;
+    }
+    if !*ENABLED.get_or_init(|| {
+        std::env::var("HEXBOT_CLOB_PERF_TRIGGER")
+            .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
+            .unwrap_or(true)
+    }) {
+        return;
+    }
+    let now_ns = now_ns();
+    loop {
+        let previous = LAST_TRIGGER_NS.load(Ordering::Acquire);
+        if previous != 0 && now_ns.saturating_sub(previous) < COOLDOWN_NS {
+            return;
+        }
+        if LAST_TRIGGER_NS
+            .compare_exchange(previous, now_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
+    let seconds = std::env::var("HEXBOT_CLOB_PERF_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=30).contains(value))
+        .unwrap_or(10);
+    let frequency = std::env::var("HEXBOT_CLOB_PERF_FREQUENCY")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (19..=499).contains(value))
+        .unwrap_or(99);
+    let output_dir = std::env::var("HEXBOT_CLOB_PERF_DIR")
+        .unwrap_or_else(|_| "/tmp/hexbot-clob-perf".to_string());
+    crate::async_rt::handle().spawn_blocking(move || {
+        if let Err(error) = std::fs::create_dir_all(&output_dir) {
+            warn!("[clob_perf_trigger] create_dir failed dir={} error={}", output_dir, error);
+            return;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let output = format!("{output_dir}/clob-tid-{tid}-{epoch}.data");
+        warn!(
+            "[clob_perf_trigger] action=start tid={} seconds={} frequency_hz={} output={} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={}",
+            tid,
+            seconds,
+            frequency,
+            output,
+            elapsed.as_micros(),
+            frame_len,
+            phases.simd_json_ns / 1_000,
+            phases.book_apply_ns / 1_000,
+            phases.price_change_apply_ns / 1_000,
+            phases.event_construction_ns / 1_000,
+        );
+        let status = std::process::Command::new("perf")
+            .arg("record")
+            .arg("--freq")
+            .arg(frequency.to_string())
+            .arg("--call-graph")
+            .arg("fp")
+            .arg("--tid")
+            .arg(tid.to_string())
+            .arg("--output")
+            .arg(&output)
+            .arg("--")
+            .arg("sleep")
+            .arg(seconds.to_string())
+            .status();
+        match status {
+            Ok(status) if status.success() => warn!(
+                "[clob_perf_trigger] action=complete tid={} output={} status={}",
+                tid, output, status,
+            ),
+            Ok(status) => warn!(
+                "[clob_perf_trigger] action=failed tid={} output={} status={}",
+                tid, output, status,
+            ),
+            Err(error) => warn!(
+                "[clob_perf_trigger] action=spawn_failed tid={} output={} error={}",
+                tid, output, error,
+            ),
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_trigger_clob_perf(_elapsed: Duration, _frame_len: usize, _phases: ClobFramePhaseTimings) {}
+
 #[cfg(not(target_os = "linux"))]
 fn clob_thread_cpu_ns() -> u64 {
     0
@@ -3545,6 +3648,7 @@ fn spawn_clob_seeded_candidate(
                     // simd-json can parse it in place without a per-frame
                     // memcpy into a second scratch buffer.
                     let mut frame_bytes = text.into_bytes();
+                    let mut frame_phases = ClobFramePhaseTimings::default();
                     let batch = process_clob_frame_in_place(
                         &mut frame_bytes,
                         &mut books,
@@ -3552,7 +3656,9 @@ fn spawn_clob_seeded_candidate(
                         &subscription.tokens,
                         received_at,
                         now_ns(),
+                        &mut frame_phases,
                     );
+                    frame_phases.record();
                     lane.burst.record_frame(received_at, frame_len);
                     lane.diagnostics
                         .record_frame(received_at, frame_len, &batch);
@@ -5150,6 +5256,7 @@ async fn clob_ws_task(
                             let t_parse = crate::latency::Instant::now();
                             let frame_len = text.len();
                             let mut frame_bytes = text.into_bytes();
+                            let mut frame_phases = ClobFramePhaseTimings::default();
                             let mut batch = process_clob_frame_in_place(
                                 &mut frame_bytes,
                                 &mut books,
@@ -5157,7 +5264,9 @@ async fn clob_ws_task(
                                 &subscription.tokens,
                                 received_at,
                                 now_ns(),
+                                &mut frame_phases,
                             );
+                            frame_phases.record();
                             let parse_apply_elapsed = t_parse.elapsed();
                             let parse_cpu_ns = clob_thread_cpu_ns()
                                 .saturating_sub(resource_start.cpu_ns);
@@ -5225,10 +5334,14 @@ async fn clob_ws_task(
                                 diagnostic_sampler.observe(received_at, ClobDiagnostic {
                                     key: "clob_read_handler_tail",
                                     detail: format!(
-                                        "frame_bytes={} total_us={} parse_apply_us={} parse_cpu_us={} preempted_us={} non_parse_us={} voluntary_cs_delta={} involuntary_cs_delta={} minor_fault_delta={} major_fault_delta={} resource_span_frames={} runtime_scheduler_max_us={}",
+                                        "frame_bytes={} total_us={} parse_apply_us={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} parse_cpu_us={} preempted_us={} non_parse_us={} voluntary_cs_delta={} involuntary_cs_delta={} minor_fault_delta={} major_fault_delta={} resource_span_frames={} runtime_scheduler_max_us={}",
                                         frame_len,
                                         read_handler_elapsed.as_micros(),
                                         parse_apply_elapsed.as_micros(),
+                                        frame_phases.simd_json_ns / 1_000,
+                                        frame_phases.book_apply_ns / 1_000,
+                                        frame_phases.price_change_apply_ns / 1_000,
+                                        frame_phases.event_construction_ns / 1_000,
                                         cpu_ns / 1_000,
                                         preempted_ns / 1_000,
                                         read_handler_elapsed
@@ -5242,6 +5355,11 @@ async fn clob_ws_task(
                                         runtime_scheduler_max_us.load(Ordering::Relaxed),
                                     ),
                                 });
+                                maybe_trigger_clob_perf(
+                                    parse_apply_elapsed,
+                                    frame_len,
+                                    frame_phases,
+                                );
                             }
                             active.diagnostics.record_read_handler(read_handler_elapsed);
                         }
@@ -5999,6 +6117,57 @@ struct ClobParsedBatch {
     repair_tokens: Vec<String>,
 }
 
+/// Exclusive top-level CLOB frame phases. Canonicalization and BBO-settle
+/// histograms are additionally recorded at their exact inner boundaries.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClobFramePhaseTimings {
+    simd_json_ns: u64,
+    book_apply_ns: u64,
+    price_change_apply_ns: u64,
+    event_construction_ns: u64,
+}
+
+struct ClobLatencyScope {
+    stage: &'static str,
+    started: crate::latency::Instant,
+}
+
+impl ClobLatencyScope {
+    #[inline]
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            started: crate::latency::Instant::now(),
+        }
+    }
+}
+
+impl Drop for ClobLatencyScope {
+    #[inline]
+    fn drop(&mut self) {
+        crate::latency::record(self.stage, self.started);
+    }
+}
+
+impl ClobFramePhaseTimings {
+    fn record(self) {
+        crate::latency::record_ns("polymarket.ws.clob_simd_json", self.simd_json_ns);
+        if self.book_apply_ns != 0 {
+            crate::latency::record_ns("polymarket.ws.clob_book_apply", self.book_apply_ns);
+        }
+        if self.price_change_apply_ns != 0 {
+            crate::latency::record_ns(
+                "polymarket.ws.clob_price_change_apply",
+                self.price_change_apply_ns,
+            );
+        }
+        crate::latency::record_ns(
+            "polymarket.ws.clob_event_construction",
+            self.event_construction_ns,
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClobCanonicalRole {
     condition_id: String,
@@ -6336,6 +6505,7 @@ impl ClobLocalBooks {
     }
 
     fn canonicalize_token(&mut self, token: &str, local_now: u64) -> Option<MarketEvent> {
+        let _timing = ClobLatencyScope::new("polymarket.ws.clob_book_canonicalization");
         if self.pending_bbo.contains_key(token) || self.market_is_quarantined(token) {
             return None;
         }
@@ -6410,6 +6580,7 @@ impl ClobLocalBooks {
         quote: QuoteTick,
         received_at: Instant,
     ) -> Option<MarketEvent> {
+        let _timing = ClobLatencyScope::new("polymarket.ws.clob_quote_canonicalization");
         let prices_on_tick = [quote.bid_price, quote.ask_price].into_iter().all(|price| {
             Decimal::from_str(&price.to_string())
                 .ok()
@@ -6760,6 +6931,7 @@ impl ClobLocalBooks {
         local_now: u64,
         active_tokens: &[String],
     ) -> ClobDeferredBatch {
+        let _timing = ClobLatencyScope::new("polymarket.ws.clob_bbo_settle");
         let mut batch = ClobDeferredBatch::default();
         let mut tokens: Vec<_> = self
             .pending_bbo
@@ -7194,6 +7366,7 @@ fn process_clob_frame(
     local_now: u64,
 ) -> ClobParsedBatch {
     let mut parse_buffer = text.as_bytes().to_vec();
+    let mut phases = ClobFramePhaseTimings::default();
     process_clob_frame_in_place(
         &mut parse_buffer,
         books,
@@ -7201,6 +7374,7 @@ fn process_clob_frame(
         tokens,
         received_at,
         local_now,
+        &mut phases,
     )
 }
 
@@ -7211,6 +7385,7 @@ fn process_clob_frame_in_place(
     active_tokens: &[String],
     received_at: Instant,
     local_now: u64,
+    phases: &mut ClobFramePhaseTimings,
 ) -> ClobParsedBatch {
     let mut batch = ClobParsedBatch::default();
     if parse_buffer.is_empty() {
@@ -7221,11 +7396,13 @@ fn process_clob_frame_in_place(
         .copied()
         .find(|byte| !byte.is_ascii_whitespace())
         == Some(b'[');
+    let decode_started = crate::latency::Instant::now();
     let frames = if is_array {
         simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut *parse_buffer)
     } else {
         simd_json::serde::from_slice::<ClobFrame>(&mut *parse_buffer).map(|frame| vec![frame])
     };
+    phases.simd_json_ns = decode_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let frames = match frames {
         Ok(frames) => frames,
         Err(error) => {
@@ -7245,6 +7422,7 @@ fn process_clob_frame_in_place(
         }
     };
 
+    let construction_started = crate::latency::Instant::now();
     for frame in frames {
         match frame {
             ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
@@ -7252,13 +7430,19 @@ fn process_clob_frame_in_place(
                 batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
-                match books.apply_book(
+                let apply_started = crate::latency::Instant::now();
+                let apply_result = books.apply_book(
                     fields,
                     received_at,
                     local_now,
                     ClobBookSource::Websocket,
                     &mut batch.wire,
-                ) {
+                );
+                phases.book_apply_ns =
+                    phases.book_apply_ns.saturating_add(
+                        apply_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                match apply_result {
                     Ok(ClobBookApplyOutcome::Applied(events)) => {
                         for event in events {
                             if matches!(event, MarketEvent::OrderBook(_)) {
@@ -7300,6 +7484,7 @@ fn process_clob_frame_in_place(
                     .price_changes
                     .iter()
                     .any(|change| subscribed_token(tokens, &change.asset_id));
+                let apply_started = crate::latency::Instant::now();
                 let (events, bbo_snapshots, repair_tokens) = books.apply_price_change(
                     fields,
                     received_at,
@@ -7308,6 +7493,10 @@ fn process_clob_frame_in_place(
                     &mut batch.diagnostics,
                     active_tokens,
                 );
+                phases.price_change_apply_ns =
+                    phases.price_change_apply_ns.saturating_add(
+                        apply_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
                 batch.bbo_change_snapshots =
                     batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
                 batch.repair_tokens.extend(repair_tokens);
@@ -7430,6 +7619,13 @@ fn process_clob_frame_in_place(
             }
         }
     }
+    let construction_total_ns = construction_started
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    phases.event_construction_ns = construction_total_ns
+        .saturating_sub(phases.book_apply_ns)
+        .saturating_sub(phases.price_change_apply_ns);
     batch
 }
 
@@ -9976,6 +10172,7 @@ mod pick_current_event_tests {
         let active_tokens = vec!["current".to_string()];
         let mut books = ClobLocalBooks::default();
         let mut retired = br#"{"event_type":"price_change","price_changes":[{"asset_id":"retired","price":"0.40","size":"-1","side":"BUY"}],"timestamp":"1000"}"#.to_vec();
+        let mut retired_phases = ClobFramePhaseTimings::default();
         let retired_batch = process_clob_frame_in_place(
             &mut retired,
             &mut books,
@@ -9983,10 +10180,12 @@ mod pick_current_event_tests {
             &active_tokens,
             Instant::now(),
             1_000_000_000,
+            &mut retired_phases,
         );
         assert!(retired_batch.diagnostics.is_empty());
 
         let mut current = br#"{"event_type":"price_change","price_changes":[{"asset_id":"current","price":"0.40","size":"-1","side":"BUY"}],"timestamp":"1000"}"#.to_vec();
+        let mut current_phases = ClobFramePhaseTimings::default();
         let current_batch = process_clob_frame_in_place(
             &mut current,
             &mut books,
@@ -9994,6 +10193,7 @@ mod pick_current_event_tests {
             &active_tokens,
             Instant::now(),
             1_000_000_000,
+            &mut current_phases,
         );
         assert_eq!(current_batch.diagnostics.len(), 1);
         assert_eq!(current_batch.diagnostics[0].key, "invalid_price_change");

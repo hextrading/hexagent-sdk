@@ -552,6 +552,61 @@ fn keep_warm_targets() -> Vec<KeepWarmTarget> {
 /// `warm_url` should be a cheap unauthenticated endpoint such as `/time`.
 /// Repeated calls for the same label are refused.
 pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Duration) {
+    spawn_keep_warm_transport(label, warm_url, full_sweep, KeepWarmTransport::Reqwest);
+}
+
+/// Polymarket variant of [`spawn_keep_warm`] using the measured connector.
+/// It owns the same admission slots and therefore replaces, rather than adds
+/// to, the CLOB prewarm/keep-warm connection set.
+pub fn spawn_instrumented_keep_warm(label: &'static str, warm_url: String, full_sweep: Duration) {
+    spawn_keep_warm_transport(label, warm_url, full_sweep, KeepWarmTransport::Instrumented);
+}
+
+#[derive(Clone, Copy)]
+enum KeepWarmTransport {
+    Reqwest,
+    Instrumented,
+}
+
+async fn run_keep_warm_probe(
+    client: &PooledClient,
+    transport: KeepWarmTransport,
+    url: &str,
+    timeout: Duration,
+) -> Result<u16, String> {
+    match transport {
+        KeepWarmTransport::Reqwest => {
+            let response = client
+                .client()
+                .get(url)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status().as_u16();
+            response.bytes().await.map_err(|error| error.to_string())?;
+            Ok(status)
+        }
+        KeepWarmTransport::Instrumented => client
+            .instrumented_request(
+                reqwest::Method::GET,
+                url,
+                reqwest::header::HeaderMap::new(),
+                bytes::Bytes::new(),
+                timeout,
+            )
+            .await
+            .map(|response| response.status.as_u16())
+            .map_err(|error| error.message),
+    }
+}
+
+fn spawn_keep_warm_transport(
+    label: &'static str,
+    warm_url: String,
+    full_sweep: Duration,
+    transport: KeepWarmTransport,
+) {
     use std::sync::Mutex;
     static SPAWNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     {
@@ -578,16 +633,13 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
         // intentional. Once it completes, every periodic request below is
         // permit-bound and concurrency-limited.
         let t0 = Instant::now();
-        let clients = clients_all();
+        let clients = pooled_clients_all();
         let n = clients.len();
         let mut set = tokio::task::JoinSet::new();
         for client in clients {
             let url = warm_url.clone();
             set.spawn(async move {
-                let response = client.get(&url).send().await?;
-                let status = response.status().as_u16();
-                response.bytes().await?;
-                Ok::<u16, reqwest::Error>(status)
+                run_keep_warm_probe(&client, transport, &url, QUERY_TIMEOUT_CEILING).await
             });
         }
         let mut ok = 0usize;
@@ -654,17 +706,8 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
                 let url = warm_url.clone();
                 tokio::spawn(async move {
                     let client = lease.pooled_client();
-                    let outcome = async {
-                        let response = client
-                            .client()
-                            .get(&url)
-                            .timeout(KEEP_WARM_TIMEOUT)
-                            .send()
-                            .await?;
-                        let status = response.status().as_u16();
-                        response.bytes().await?;
-                        Ok::<u16, reqwest::Error>(status)
-                    }.await;
+                    let outcome =
+                        run_keep_warm_probe(&client, transport, &url, KEEP_WARM_TIMEOUT).await;
                     match outcome {
                         Ok(status) => {
                             client.note_transport_success();
@@ -681,7 +724,14 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
                             }
                         }
                         Err(error) => {
-                            client.note_transport_failure(url.clone());
+                            match transport {
+                                KeepWarmTransport::Reqwest => {
+                                    client.note_transport_failure(url.clone());
+                                }
+                                KeepWarmTransport::Instrumented => {
+                                    client.note_instrumented_transport_failure(url.clone());
+                                }
+                            }
                             log::warn!(
                                 "[http1_pool] {} keep-warm failed role={:?} slot={}: {}",
                                 label, target.pool.role, target.slot, error,
@@ -734,6 +784,9 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
 /// most one in-flight request at a time.
 struct Slot {
     client: Arc<ArcSwap<reqwest::Client>>,
+    /// Polymarket's measured HTTP/1 transport. It shares this slot's
+    /// admission owner and pool cardinality; it is not an additional slot.
+    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
     busy: Arc<AtomicBool>,
     /// True exactly while this free slot has one token in the role lane.
     /// This fences concurrent permit-drop and quarantine-release publication.
@@ -756,6 +809,7 @@ struct ConnectionHealth {
     slot: usize,
     generation_at_pick: u64,
     slot_client: Arc<ArcSwap<reqwest::Client>>,
+    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
     busy: Arc<AtomicBool>,
     available_token: Arc<AtomicBool>,
     quarantined: Arc<AtomicBool>,
@@ -885,6 +939,50 @@ impl ConnectionHealth {
             }
         }
     }
+
+    async fn repair_instrumented(self, prewarm_url: String, failures: usize) {
+        let outcome = self
+            .instrumented
+            .request(
+                reqwest::Method::GET,
+                &prewarm_url,
+                reqwest::header::HeaderMap::new(),
+                bytes::Bytes::new(),
+                KEEP_WARM_TIMEOUT,
+            )
+            .await;
+        match outcome {
+            Ok(response) if response.status.is_success() => {
+                if self.is_current() {
+                    self.transport_failures.store(0, Ordering::Release);
+                    let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    self.release_quarantine();
+                    log::info!(
+                        "[http1_pool] role={:?} slot={} instrumented transport repaired generation={} connect_generation={} url={}",
+                        self.role,
+                        self.slot,
+                        generation,
+                        response.timings.connect_generation_after,
+                        prewarm_url,
+                    );
+                }
+            }
+            Ok(response) => {
+                self.release_quarantine();
+                log::warn!(
+                    "[http1_pool] role={:?} slot={} instrumented repair HTTP {} after {} failures url={}",
+                    self.role, self.slot, response.status, failures, prewarm_url,
+                );
+            }
+            Err(error) => {
+                self.release_quarantine();
+                log::warn!(
+                    "[http1_pool] role={:?} slot={} instrumented repair failed after {} failures: {} url={}",
+                    self.role, self.slot, failures, error.message, prewarm_url,
+                );
+            }
+        }
+    }
 }
 
 /// A selected pool client with a generation-fenced health handle.
@@ -895,6 +993,7 @@ impl ConnectionHealth {
 #[derive(Clone)]
 pub struct PooledClient {
     client: Arc<reqwest::Client>,
+    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
     health: ConnectionHealth,
     attempt_trace: Arc<AttemptTraceSlot>,
     exclusive_admission: bool,
@@ -990,6 +1089,22 @@ impl PooledClient {
         &self.client
     }
 
+    pub async fn instrumented_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        body: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<
+        crate::instrumented_http1::InstrumentedHttp1Response,
+        crate::instrumented_http1::InstrumentedHttp1Error,
+    > {
+        self.instrumented
+            .request(method, url, headers, body, timeout)
+            .await
+    }
+
     pub fn role(&self) -> Role {
         self.attempt_trace.role
     }
@@ -1059,6 +1174,21 @@ impl PooledClient {
         });
         true
     }
+
+    /// Repair the measured HTTP/1 transport in place. The Hyper client owns
+    /// its connection state and reconnects on the same logical slot, so a
+    /// successful probe is sufficient; rebuilding a parallel reqwest client
+    /// here would create an unwanted second CLOB connection.
+    pub fn note_instrumented_transport_failure(&self, prewarm_url: String) -> bool {
+        let Some(failures) = self.health.claim_rebuild(2, Duration::from_secs(30)) else {
+            return false;
+        };
+        let health = self.health.clone();
+        crate::async_rt::order_handle().spawn(async move {
+            health.repair_instrumented(prewarm_url, failures).await;
+        });
+        true
+    }
 }
 
 /// Admission permit: owns an exclusive slot's client for the duration of
@@ -1071,6 +1201,7 @@ pub struct Permit {
     available_token: Arc<AtomicBool>,
     last_activity_ns: Arc<AtomicU64>,
     client: Arc<reqwest::Client>,
+    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
     slot_client: Arc<ArcSwap<reqwest::Client>>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
@@ -1103,6 +1234,7 @@ impl Permit {
             slot: self.slot,
             generation_at_pick,
             slot_client: self.slot_client.clone(),
+            instrumented: Arc::clone(&self.instrumented),
             busy: self.flag.clone(),
             available_token: self.available_token.clone(),
             quarantined: self.quarantined.clone(),
@@ -1117,6 +1249,7 @@ impl Permit {
     pub fn pooled_client(&self) -> PooledClient {
         PooledClient {
             client: self.client.clone(),
+            instrumented: Arc::clone(&self.instrumented),
             health: self.health(self.acquired_generation),
             attempt_trace: Arc::clone(&self.attempt_trace),
             exclusive_admission: true,
@@ -1133,6 +1266,7 @@ impl Permit {
         let generation = self.generation.load(Ordering::Acquire);
         PooledClient {
             client: self.current_client(),
+            instrumented: Arc::clone(&self.instrumented),
             health: self.health(generation),
             attempt_trace: Arc::clone(&self.attempt_trace),
             exclusive_admission: true,
@@ -1209,6 +1343,9 @@ impl RolePool {
         for slot in 0..n {
             slots.push(Slot {
                 client: Arc::new(ArcSwap::from(Arc::new(build_h1_client(timeout)?))),
+                instrumented: Arc::new(crate::instrumented_http1::InstrumentedHttp1Client::new(
+                    Duration::from_millis(2000),
+                )?),
                 busy: Arc::new(AtomicBool::new(false)),
                 available_token: Arc::new(AtomicBool::new(true)),
                 last_activity_ns: Arc::new(AtomicU64::new(activity_now_ns())),
@@ -1346,6 +1483,7 @@ impl RolePool {
             available_token: s.available_token.clone(),
             last_activity_ns: s.last_activity_ns.clone(),
             client: s.client.load_full(),
+            instrumented: Arc::clone(&s.instrumented),
             slot_client: s.client.clone(),
             quarantined: s.quarantined.clone(),
             transport_failures: s.transport_failures.clone(),
@@ -1369,11 +1507,13 @@ impl RolePool {
         let generation = state.generation.load(Ordering::Acquire);
         PooledClient {
             client: state.client.load_full(),
+            instrumented: Arc::clone(&state.instrumented),
             health: ConnectionHealth {
                 role: self.role,
                 slot,
                 generation_at_pick: generation,
                 slot_client: state.client.clone(),
+                instrumented: Arc::clone(&state.instrumented),
                 busy: state.busy.clone(),
                 available_token: state.available_token.clone(),
                 quarantined: state.quarantined.clone(),
