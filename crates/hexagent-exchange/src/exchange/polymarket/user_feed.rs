@@ -269,6 +269,15 @@ impl GapReplayOutcome {
 ///
 fn accept_reconnect_replay(shared: &SharedState, _outcome: GapReplayOutcome) {
     shared.user_feed_health.set_recovering(false);
+    if shared
+        .auth_failure_blocked
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        info!(
+            "[clob_auth_gate] account={} state=recovered evidence=private_gap_replay_complete",
+            shared.account_state.account_id(),
+        );
+    }
     if !shared.account_state.is_uncertain() {
         shared.user_feed_health.set_inventory_uncertain(false);
     }
@@ -1334,10 +1343,7 @@ impl PrivateEventDelta {
         Self::classify_with_timing(payload, LifecycleTiming::default())
     }
 
-    fn classify_with_timing(
-        payload: serde_json::Value,
-        timing: LifecycleTiming,
-    ) -> Option<Self> {
+    fn classify_with_timing(payload: serde_json::Value, timing: LifecycleTiming) -> Option<Self> {
         let kind = match payload
             .get("event_type")
             .or_else(|| payload.get("type"))
@@ -2124,6 +2130,27 @@ fn dispatch_private_update(
     let result = if let Some(generation) = recovery_generation {
         enqueue_recovery_update(shared, update_tx, generation, update)
             .map_err(|error| error.to_string())
+    } else if let Some(direct) = shared.direct_private_route(owner) {
+        let mut timing = timing;
+        timing.root_router_dequeued_ns = crate::types::monotonic_now_ns();
+        let depth = direct.len().saturating_add(1);
+        crate::latency::record_ns(
+            "polymarket.user.direct_private_queue_high_water",
+            depth as u64,
+        );
+        direct
+            .send_timeout(
+                RoutedOrderUpdate {
+                    owner,
+                    update,
+                    timing,
+                },
+                std::time::Duration::from_secs(2),
+            )
+            .map_err(|error| {
+                crate::latency::record_ns("polymarket.user.direct_private_queue_overflow", 1);
+                format!("owner-direct private lifecycle lane unavailable: {error}")
+            })
     } else {
         update_tx
             .try_send(RoutedOrderUpdate {
@@ -4256,6 +4283,72 @@ mod tests {
     }
 
     #[test]
+    fn direct_private_lane_preserves_fifo_duplicates_and_instance_isolation() {
+        let shared = test_shared();
+        let (owner0_tx, owner0_rx) = crossbeam_channel::bounded(4);
+        let (owner1_tx, owner1_rx) = crossbeam_channel::bounded(4);
+        shared.install_strategy_private_routes(HashMap::from([
+            (0, owner0_tx),
+            (1, owner1_tx),
+        ]));
+        let (root_tx, root_rx) = crossbeam_channel::bounded(4);
+        let make = |coid: &str| RoutedOrderUpdate {
+            owner: 0,
+            update: OrderUpdate {
+                order_slot: Default::default(),
+                client_order_id: coid.to_string(),
+                exchange: Exchange::Polymarket,
+                symbol: "TOKEN".into(),
+                side: Side::Buy,
+                exchange_order_id: Some("0xabc".into()),
+                status: OrderStatus::PartiallyFilled,
+                liquidity: None,
+                filled_quantity: 1.0,
+                remaining_quantity: 1.0,
+                avg_fill_price: 0.5,
+                timestamp_ns: now_ns(),
+                exchange_event_timestamp_ns: Some(now_ns()),
+                trade_id: Some("duplicate-id".into()),
+                order_audit: None,
+                error: None,
+            },
+            timing: LifecycleTiming::default(),
+        };
+        dispatch_private_update(&shared, &root_tx, None, make("first")).unwrap();
+        dispatch_private_update(&shared, &root_tx, None, make("first")).unwrap();
+        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "first");
+        assert_eq!(owner0_rx.recv().unwrap().update.client_order_id, "first");
+        assert!(owner1_rx.is_empty());
+        assert!(root_rx.is_empty());
+
+        const EVENTS: usize = 4_096;
+        let mut samples = Vec::with_capacity(EVENTS);
+        let mut queue_high_water = 0usize;
+        for index in 0..EVENTS {
+            let routed = make(&format!("sample-{index}"));
+            let started = std::time::Instant::now();
+            dispatch_private_update(&shared, &root_tx, None, routed).unwrap();
+            queue_high_water = queue_high_water.max(owner0_rx.len());
+            let received = owner0_rx.recv().unwrap();
+            assert_eq!(received.update.client_order_id, format!("sample-{index}"));
+            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        samples.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            samples[(samples.len() - 1) * numerator / denominator]
+        };
+        eprintln!(
+            "private direct lane boundary=owner_route_lookup_to_strategy_lane_receive n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow=0 duplicates_preserved=2 instance_isolation=true",
+            EVENTS,
+            percentile(1, 2),
+            percentile(99, 100),
+            percentile(999, 1_000),
+            samples.last().copied().unwrap_or(0),
+            queue_high_water,
+        );
+    }
+
+    #[test]
     fn private_actor_routes_owned_trade_before_cold_account_apply() {
         let shared = test_shared();
         shared.account_state.register_instance("owner-1", 1.0);
@@ -4281,21 +4374,24 @@ mod tests {
             )
             .unwrap();
         shared.register_order_id("owner-1-1", "0xabc1", "TOKEN");
-        let event = PrivateEventDelta::classify_with_timing(serde_json::json!({
-            "event_type": "trade",
-            "id": "fast-route-trade",
-            "status": "MATCHED",
-            "asset_id": "TOKEN",
-            "side": "BUY",
-            "size": "2",
-            "price": "0.5",
-            "taker_order_id": "0xabc1",
-            "maker_orders": []
-        }), LifecycleTiming {
-            private_ws_received_ns: 10,
-            private_json_parsed_ns: 20,
-            ..LifecycleTiming::default()
-        })
+        let event = PrivateEventDelta::classify_with_timing(
+            serde_json::json!({
+                "event_type": "trade",
+                "id": "fast-route-trade",
+                "status": "MATCHED",
+                "asset_id": "TOKEN",
+                "side": "BUY",
+                "size": "2",
+                "price": "0.5",
+                "taker_order_id": "0xabc1",
+                "maker_orders": []
+            }),
+            LifecycleTiming {
+                private_ws_received_ns: 10,
+                private_json_parsed_ns: 20,
+                ..LifecycleTiming::default()
+            },
+        )
         .unwrap();
 
         let before = shared.account_state.order("owner-1-1").unwrap();
@@ -5086,6 +5182,9 @@ mod tests {
     fn reconnect_health_clears_only_after_a_successful_replay() {
         let shared = test_shared();
         assert!(shared.user_feed_health.is_recovering());
+        shared
+            .auth_failure_blocked
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // A failed REST result never reaches `accept_reconnect_replay`.
         let failed: Result<GapReplayOutcome> = Err(anyhow!("temporary REST failure"));
@@ -5096,10 +5195,16 @@ mod tests {
             shared.user_feed_health.is_recovering(),
             "REST failure must keep quoting paused",
         );
+        assert!(shared
+            .auth_failure_blocked
+            .load(std::sync::atomic::Ordering::Acquire));
 
         accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 3 });
         assert!(!shared.user_feed_health.is_recovering());
         assert!(!shared.user_feed_health.inventory_uncertain());
+        assert!(!shared
+            .auth_failure_blocked
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -5149,10 +5254,12 @@ mod tests {
         checkpoint.pending_page = VecDeque::from([
             PrivateEventDelta::classify(serde_json::json!({
                 "event_type": "trade", "id": "already-applied"
-            })).unwrap(),
+            }))
+            .unwrap(),
             PrivateEventDelta::classify(serde_json::json!({
                 "event_type": "trade", "id": "failed-record"
-            })).unwrap(),
+            }))
+            .unwrap(),
         ]);
         checkpoint.pending_page_records = 2;
         checkpoint.pending_next_cursor = Some("page-2".to_string());

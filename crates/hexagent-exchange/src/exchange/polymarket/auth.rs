@@ -83,13 +83,24 @@ impl PolyAuth {
     /// - `path`: URL path with leading slash (e.g. "/order", "/data/orders")
     /// - `body`: request body string (empty for GET/DELETE without body)
     pub fn sign_request(&self, method: &str, path: &str, body: &str) -> AuthHeaders {
-        let timestamp = format!(
-            "{}",
-            std::time::SystemTime::now()
+        let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs()
-        );
+                .as_secs();
+        self.sign_request_at(method, path, body, timestamp)
+    }
+
+    /// Sign with an explicit exchange timestamp. Credential diagnostics use
+    /// public CLOB server time to distinguish key/account binding failures
+    /// from host clock skew.
+    pub fn sign_request_at(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        timestamp_secs: u64,
+    ) -> AuthHeaders {
+        let timestamp = timestamp_secs.to_string();
 
         let mut mac = HmacSha256::new_from_slice(&self.secret)
             .expect("HMAC accepts any key size");
@@ -154,5 +165,14 @@ mod tests {
         assert_eq!(headers.address.as_ref(), "0x1234");
         assert_eq!(headers.passphrase.as_ref(), "test-pass");
         assert!(!headers.timestamp.is_empty());
+    }
+
+    #[test]
+    fn explicit_timestamp_signing_is_stable() {
+        let auth = PolyAuth::new("key", "c2VjcmV0", "pass", "0xabc").unwrap();
+        let first = auth.sign_request_at("GET", "/auth/api-keys", "", 1_700_000_000);
+        let second = auth.sign_request_at("GET", "/auth/api-keys", "", 1_700_000_000);
+        assert_eq!(first.timestamp, "1700000000");
+        assert_eq!(first.signature, second.signature);
     }
 }

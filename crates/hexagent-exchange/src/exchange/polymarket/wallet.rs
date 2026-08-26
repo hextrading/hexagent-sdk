@@ -4983,6 +4983,13 @@ const MAINTENANCE_COALESCE_MAX: std::time::Duration = std::time::Duration::from_
 /// flight. Overflow fails the requesting strategy closed instead of allowing
 /// a slow chain RPC to grow process memory without limit.
 const WALLET_ACTOR_QUEUE_CAPACITY: usize = 64;
+const MAINTENANCE_TARGET_CACHE_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct WalletActorState {
+    maintenance_targets:
+        std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalletActorQueueMetrics {
@@ -5010,6 +5017,7 @@ fn wallet_actor_sender(account: &str) -> crossbeam_channel::Sender<WalletActorCo
     let worker_name = format!("poly-wallet-{}", worker_label);
     std::thread::Builder::new().name(worker_name.clone()).spawn(move || {
         crate::os_tune::pin_background(&worker_name);
+        let mut state = WalletActorState::default();
         while let Ok(first) = rx.recv() {
             let mut burst = vec![first];
             let started = std::time::Instant::now();
@@ -5020,7 +5028,7 @@ fn wallet_actor_sender(account: &str) -> crossbeam_channel::Sender<WalletActorCo
                     Err(_) => break,
                 }
             }
-            run_wallet_actor_burst(burst);
+            run_wallet_actor_burst(&mut state, burst);
         }
     }).expect("Failed to spawn wallet/on-chain actor");
     let account = account.to_string();
@@ -5048,10 +5056,10 @@ fn partition_wallet_actor_runs(burst: Vec<WalletActorCommand>) -> Vec<Vec<Wallet
     runs
 }
 
-fn run_wallet_actor_burst(burst: Vec<WalletActorCommand>) {
+fn run_wallet_actor_burst(state: &mut WalletActorState, burst: Vec<WalletActorCommand>) {
     for run in partition_wallet_actor_runs(burst) {
         match run[0].kind() {
-            WalletActorCommandKind::Maintenance => run_maintenance_actor_batch(run.into_iter().map(|command| match command {
+            WalletActorCommandKind::Maintenance => run_maintenance_actor_batch(state, run.into_iter().map(|command| match command {
                 WalletActorCommand::Maintenance(item) => item,
                 WalletActorCommand::Merge(_) => unreachable!("mixed wallet actor run"),
             }).collect()),
@@ -5075,8 +5083,10 @@ fn partition_adjacent_maintenance_targets(burst: Vec<MaintenanceQueueItem>) -> V
     groups
 }
 
-fn run_maintenance_actor_batch(mut burst: Vec<MaintenanceQueueItem>) {
-    for (job, _, _) in &mut burst { resolve_maintenance_split_target(job); }
+fn run_maintenance_actor_batch(state: &mut WalletActorState, mut burst: Vec<MaintenanceQueueItem>) {
+    for (job, _, _) in &mut burst {
+        resolve_maintenance_split_target(&mut state.maintenance_targets, job);
+    }
     let mut redeem_claimed = false;
     for mut group in partition_adjacent_maintenance_targets(burst) {
         let wants_redeem = group.iter().any(|item| item.0.redeem_enabled);
@@ -5201,7 +5211,10 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
+fn resolve_maintenance_split_target(
+    cache: &mut std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>,
+    job: &mut MaintenanceJob,
+) {
     if job
         .split_target_condition_id
         .as_deref()
@@ -5213,6 +5226,7 @@ fn resolve_maintenance_split_target(job: &mut MaintenanceJob) {
         return;
     };
     match cached_maintenance_split_target(
+        cache,
         series_id,
         job.split_end_date_min_secs,
         job.split_expected_start_secs,
@@ -5249,23 +5263,6 @@ struct MaintenanceTargetCacheEntry {
     target: Option<ResolvedMaintenanceTarget>,
 }
 
-enum MaintenanceTargetOwnerCommand {
-    Resolve {
-        key: MaintenanceTargetKey,
-        reply: crossbeam_channel::Sender<MaintenanceTargetResult>,
-    },
-}
-
-const MAINTENANCE_TARGET_OWNER_CAPACITY: usize = 64;
-const MAINTENANCE_TARGET_CACHE_CAPACITY: usize = 256;
-static MAINTENANCE_TARGET_OWNER: std::sync::OnceLock<
-    crossbeam_channel::Sender<MaintenanceTargetOwnerCommand>,
-> = std::sync::OnceLock::new();
-static MAINTENANCE_TARGET_QUEUE_HIGH_WATER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static MAINTENANCE_TARGET_QUEUE_OVERFLOW: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceTargetOwnerMetrics {
     pub queue_capacity: usize,
@@ -5276,49 +5273,13 @@ pub struct MaintenanceTargetOwnerMetrics {
 
 pub fn maintenance_target_owner_metrics() -> MaintenanceTargetOwnerMetrics {
     MaintenanceTargetOwnerMetrics {
-        queue_capacity: MAINTENANCE_TARGET_OWNER_CAPACITY,
+        queue_capacity: WALLET_ACTOR_QUEUE_CAPACITY,
         cache_capacity: MAINTENANCE_TARGET_CACHE_CAPACITY,
-        queue_high_water: MAINTENANCE_TARGET_QUEUE_HIGH_WATER
+        queue_high_water: WALLET_ACTOR_QUEUE_HIGH_WATER
             .load(std::sync::atomic::Ordering::Relaxed),
-        queue_overflow: MAINTENANCE_TARGET_QUEUE_OVERFLOW
+        queue_overflow: WALLET_ACTOR_QUEUE_OVERFLOW
             .load(std::sync::atomic::Ordering::Relaxed),
     }
-}
-
-fn maintenance_target_owner() -> crossbeam_channel::Sender<MaintenanceTargetOwnerCommand> {
-    MAINTENANCE_TARGET_OWNER.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::bounded(MAINTENANCE_TARGET_OWNER_CAPACITY);
-        std::thread::Builder::new().name("poly-target-owner".to_string()).spawn(move || {
-            crate::os_tune::pin_background("poly-target-owner");
-            let mut cache = std::collections::HashMap::<
-                MaintenanceTargetKey,
-                MaintenanceTargetCacheEntry,
-            >::new();
-            while let Ok(MaintenanceTargetOwnerCommand::Resolve { key, reply }) = rx.recv() {
-                cache.retain(|_, entry| maintenance_target_cache_fresh(entry));
-                if let Some(entry) = cache.get(&key) {
-                    let _ = reply.try_send(Ok(entry.target.clone()));
-                    continue;
-                }
-                let fetched = fetch_maintenance_target(&key);
-                if let Ok(target) = &fetched {
-                    if cache.len() >= MAINTENANCE_TARGET_CACHE_CAPACITY {
-                        if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.fetched_at)
-                            .map(|(key, _)| key.clone())
-                        {
-                            cache.remove(&oldest);
-                        }
-                    }
-                    cache.insert(key, MaintenanceTargetCacheEntry {
-                        fetched_at: std::time::Instant::now(),
-                        target: target.clone(),
-                    });
-                }
-                let _ = reply.try_send(fetched);
-            }
-        }).expect("failed to spawn maintenance target owner");
-        tx
-    }).clone()
 }
 
 fn maintenance_target_cache_fresh(entry: &MaintenanceTargetCacheEntry) -> bool {
@@ -5358,6 +5319,7 @@ fn fetch_maintenance_target(key: &MaintenanceTargetKey) -> MaintenanceTargetResu
 }
 
 fn cached_maintenance_split_target(
+    cache: &mut std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>,
     series_id: &str,
     end_date_min_secs: u64,
     expected_start_secs: Option<u64>,
@@ -5369,23 +5331,27 @@ fn cached_maintenance_split_target(
         expected_start_secs,
         expected_duration_secs,
     );
-    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-    let owner = maintenance_target_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(MAINTENANCE_TARGET_OWNER_CAPACITY);
-    owner.send_timeout(
-        MaintenanceTargetOwnerCommand::Resolve { key, reply: reply_tx },
-        std::time::Duration::from_secs(2),
-    ).map_err(|error| {
-        MAINTENANCE_TARGET_QUEUE_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("maintenance target owner saturated: {error}")
-    })?;
-    MAINTENANCE_TARGET_QUEUE_HIGH_WATER.fetch_max(
-        admitted_depth,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    reply_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .map_err(|error| format!("maintenance target owner reply unavailable: {error}"))?
+    cache.retain(|_, entry| maintenance_target_cache_fresh(entry));
+    if let Some(entry) = cache.get(&key) {
+        return Ok(entry.target.clone());
+    }
+    let fetched = fetch_maintenance_target(&key);
+    if let Ok(target) = &fetched {
+        if cache.len() >= MAINTENANCE_TARGET_CACHE_CAPACITY {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(key, MaintenanceTargetCacheEntry {
+            fetched_at: std::time::Instant::now(),
+            target: target.clone(),
+        });
+    }
+    fetched
 }
 
 /// Fire-and-forget submit (live strategy). Returns immediately; the

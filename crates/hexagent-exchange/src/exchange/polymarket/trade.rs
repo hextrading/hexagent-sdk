@@ -287,6 +287,15 @@ fn retired_market_terminalization_allowed(
         && audit_error_count == absent_order_count
 }
 
+#[inline]
+fn retired_local_empty_fast_path_allowed(
+    retired_market: bool,
+    open_orders: usize,
+    recovery_pending: usize,
+) -> bool {
+    retired_market && open_orders == 0 && recovery_pending == 0
+}
+
 fn retired_market_parallel_absence_fast_path_allowed(
     allow_expired_market_terminalization: bool,
     remote_clean: bool,
@@ -463,6 +472,13 @@ enum FetchOrderResult {
     Found(FetchedOrder),
     NotFound(String),
     Unavailable(FetchUnavailable),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeReconcileOutcome {
+    Terminal,
+    ParallelAbsent,
+    Pending,
 }
 
 fn fetch_order_result_name(result: &FetchOrderResult) -> &'static str {
@@ -690,6 +706,10 @@ fn preflight_rejection_reason_code(reason: &str) -> &'static str {
         "balance_backoff"
     } else if reason == "invalid token backoff" {
         "invalid_token_backoff"
+    } else if reason == "authenticated CLOB credential safety gate" {
+        "clob_auth_gate"
+    } else if reason == "private gap replay safety gate" {
+        "private_recovery_gate"
     } else if reason.starts_with("body serialize:") {
         "serialization"
     } else if reason.contains("sign") || reason.contains("signature") {
@@ -1323,6 +1343,16 @@ fn cancel_delete_response_outcome(
         // collection mentioning it is an omission. Both remain uncertain.
         (true, Some(_)) | (false, None) => CancelReasonOutcome::Uncertain,
     }
+}
+
+pub(crate) fn probe_cancel_response_is_terminal(
+    response: &serde_json::Value,
+    order_id: &str,
+) -> bool {
+    matches!(
+        cancel_delete_response_outcome(response, order_id),
+        CancelReasonOutcome::Cancelled | CancelReasonOutcome::Filled
+    )
 }
 
 fn validated_cancel_all_counts(json: &serde_json::Value) -> Option<(usize, usize)> {
@@ -2335,6 +2365,21 @@ fn latency_record_status(reply: &HttpReply) -> crate::latency_record::RequestSta
     }
 }
 
+fn observe_authenticated_reply_gate(
+    reply: &HttpReply,
+    account_id: &str,
+    gate: &std::sync::atomic::AtomicBool,
+) {
+    if matches!(reply, Err(HttpErr::Status(401, _)))
+        && !gate.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        warn!(
+            "[clob_auth_gate] account={} state=blocked trigger=http_401 action=pause_place_allow_cancel_reconcile_until_gap_replay",
+            account_id,
+        );
+    }
+}
+
 /// Classify a CLOB request by connection-pool role. Role isolation
 /// ensures a slow query / heartbeat can't back-pressure the hot-path
 /// submit via shared TCP receive windows — each role
@@ -2476,9 +2521,7 @@ fn record_http1_phase_timings(
         "polymarket.http.slot_serialization_wait",
         timings.slot_wait_ns,
     );
-    if timings.incomplete_phase
-        != crate::instrumented_http1::Http1IncompletePhase::None
-    {
+    if timings.incomplete_phase != crate::instrumented_http1::Http1IncompletePhase::None {
         let stage = match timings.incomplete_phase {
             crate::instrumented_http1::Http1IncompletePhase::Dns => {
                 "polymarket.http.incomplete.dns"
@@ -2582,16 +2625,7 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
     let first_started = std::time::Instant::now();
-    let first = execute_http_on(
-        client.clone(),
-        attempt_id,
-        method,
-        url,
-        path,
-        headers,
-        body,
-    )
-    .await;
+    let first = execute_http_on(client.clone(), attempt_id, method, url, path, headers, body).await;
     if first.is_ok() {
         if super::network_incident::note_http_slow_success(role, slot, first_started.elapsed()) {
             // The slow-success cluster has proven that this is not an
@@ -2755,6 +2789,10 @@ pub struct SharedState {
     /// producers resolve the durable instance identity here exactly once and
     /// publish an already-routed lifecycle message to the engine.
     strategy_owner_by_instance: ArcSwap<HashMap<String, u16>>,
+    /// Startup-published numeric owner → dedicated strategy lifecycle lane.
+    /// Live private events bypass the root router; replay and compatibility
+    /// traffic retain the existing root path.
+    strategy_private_routes: ArcSwap<HashMap<u16, crossbeam_channel::Sender<RoutedOrderUpdate>>>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -2775,6 +2813,9 @@ pub struct SharedState {
     /// at zero) and broadcast to every instance. Identified probe
     /// events are logged at DEBUG and NOT forwarded.
     pub(crate) probe_order_ids: ProbeOrderIdRing,
+    /// Account-scoped single-writer persistence for ambiguous synthetic probe
+    /// orders. Separate from StrategyAccount economic reservations.
+    pub(crate) probe_orphan_owner: Option<super::rtt_probe::ProbeOrphanOwner>,
     /// Authentication for REST requests
     pub auth: PolyAuth,
     /// EIP-712 order signer (v1 — pre-2026-04-28-cutover).
@@ -2849,6 +2890,11 @@ pub struct SharedState {
     /// every strategy instance sharing this account from retrying at quote
     /// cadence while the market is administratively disabled.
     pub(crate) trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64,
+    /// Sticky authenticated-CLOB admission gate. Any HTTP 401 proves the L2
+    /// credential/account binding is not currently usable. Cancels and
+    /// reconciliation continue, but fresh places remain blocked until the
+    /// private reconnect gap replay succeeds and clears the gate.
+    pub(crate) auth_failure_blocked: Arc<std::sync::atomic::AtomicBool>,
     /// Per-token (asset_id) `invalid token id` backoff. The CLOB rejects an
     /// order with `invalid token id` when the token isn't registered on the
     /// orderbook — e.g. Gamma lists a 5-min event before its CLOB book is
@@ -2898,6 +2944,11 @@ pub struct SharedState {
     pub(crate) terminal_trade_backfill_noop_total: std::sync::atomic::AtomicU64,
     pub(crate) terminal_trade_backfill_noop_log_silent_until_ns: std::sync::atomic::AtomicU64,
     pub(crate) terminal_trade_backfill_noop_suppressed: std::sync::atomic::AtomicU64,
+    /// Per-condition incident window for repetitive retired-market finality
+    /// failures. Retry state remains lossless; only duplicate console WARNs
+    /// are suppressed.
+    market_cancel_warn_until_ns: PublishedStringMap<u64>,
+    market_cancel_warn_suppressed: PublishedStringMap<u64>,
     /// Per-coid cumulative count of the exact ambiguous DELETE response
     /// "order can't be found - already canceled or matched" returned by
     /// DELETEs issued from the cancel-orphan reconciler. The initial cancel
@@ -3240,11 +3291,67 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    /// Fail-closed admission for every fresh place, including synthetic RTT
+    /// probes. Cancel and reconcile callers deliberately do not consult this
+    /// method so they retain a path to authoritative terminal evidence.
+    #[inline]
+    pub(crate) fn place_admission_block_reason(&self) -> Option<&'static str> {
+        if self.auth_failure_blocked.load(Ordering::Acquire) {
+            return Some("authenticated CLOB credential safety gate");
+        }
+        if self.user_feed_health.is_recovering()
+            || self.user_feed_health.gap_replay_degraded()
+            || self.user_feed_health.inventory_uncertain()
+        {
+            return Some("private gap replay safety gate");
+        }
+        if super::network_incident::place_blocked_by_connection_failure_cluster() {
+            return Some("connection failure cluster safety gate");
+        }
+        None
+    }
+
+    fn claim_market_cancel_warning(&self, condition_id: &str) -> (bool, u64) {
+        let now = now_ns();
+        if self
+            .market_cancel_warn_until_ns
+            .get(condition_id)
+            .is_some_and(|until| now < until)
+        {
+            self.market_cancel_warn_suppressed
+                .update(condition_id, |count| Some(count.copied().unwrap_or(0) + 1));
+            return (false, 0);
+        }
+        self.market_cancel_warn_until_ns.insert(
+            condition_id.to_string(),
+            now.saturating_add(EXPECTED_ORPHAN_WARN_INTERVAL_NS),
+        );
+        let suppressed = self
+            .market_cancel_warn_suppressed
+            .remove(condition_id)
+            .unwrap_or(0);
+        (true, suppressed)
+    }
+
     /// Publish the immutable live strategy-owner directory before the private
     /// feed starts. Replacing it is a startup/reconfiguration operation; reads
     /// on the private owner lane are lock-free.
     pub fn install_strategy_owner_routes(&self, routes: HashMap<String, u16>) {
         self.strategy_owner_by_instance.store(Arc::new(routes));
+    }
+
+    pub fn install_strategy_private_routes(
+        &self,
+        routes: HashMap<u16, crossbeam_channel::Sender<RoutedOrderUpdate>>,
+    ) {
+        self.strategy_private_routes.store(Arc::new(routes));
+    }
+
+    pub(crate) fn direct_private_route(
+        &self,
+        owner: u16,
+    ) -> Option<crossbeam_channel::Sender<RoutedOrderUpdate>> {
+        self.strategy_private_routes.load().get(&owner).cloned()
     }
 
     #[inline]
@@ -5419,6 +5526,7 @@ impl SharedState {
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             let account_id = self.account_state.account_id().to_string();
+            let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
             let enqueued_at = crate::latency::Instant::now();
             async_rt::order_handle().spawn(async move {
                 crate::latency::record(runtime_queue_stage, enqueued_at);
@@ -5434,6 +5542,11 @@ impl SharedState {
                     body_owned,
                 )
                 .await;
+                observe_authenticated_reply_gate(
+                    &reply,
+                    &account_id,
+                    auth_failure_blocked.as_ref(),
+                );
                 crate::latency::record(network_stage, network_started);
                 drop(account_permit);
                 // Capture the CSV status before `reply` is moved into the
@@ -5547,6 +5660,7 @@ impl SharedState {
             let tx_a = reply_tx;
             let iid_a = self.instance_id.clone();
             let account_id = self.account_state.account_id().to_string();
+            let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
             let request_buffers = Arc::clone(&self.request_buffers);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
@@ -5568,6 +5682,11 @@ impl SharedState {
                     body_a,
                 )
                 .await;
+                observe_authenticated_reply_gate(
+                    &reply,
+                    &account_id,
+                    auth_failure_blocked.as_ref(),
+                );
                 if let Ok(mut buffer) = recyclable.try_into_mut() {
                     buffer.clear();
                     let _ = request_buffers.push(buffer);
@@ -6039,6 +6158,16 @@ impl PolymarketTrade {
         }
 
         let (settled_gc_tx, settled_gc_rx) = crossbeam_channel::bounded(1);
+        let (probe_orphan_owner, probe_orphan_owner_join) = if account_ledger_path.is_some() {
+            let (owner, join) = super::rtt_probe::spawn_probe_orphan_owner(
+                account_ledger_path,
+                shutdown_token.clone(),
+            )
+            .map_err(|error| anyhow!("spawn probe orphan owner failed: {error}"))?;
+            (Some(owner), Some(join))
+        } else {
+            (None, None)
+        };
         let (account_lifecycle_tx, account_lifecycle_rx) = crossbeam_channel::bounded(16_384);
         let (account_owner_handle, account_owner_state) = account_state
             .bind_account_owner()
@@ -6066,7 +6195,9 @@ impl PolymarketTrade {
             execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
             runtime_order_ownership: recovered_runtime_ownership,
             strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
+            strategy_private_routes: ArcSwap::from_pointee(HashMap::new()),
             probe_order_ids: ProbeOrderIdRing::default(),
+            probe_orphan_owner,
             auth,
             signer,
             signer_v2,
@@ -6084,6 +6215,7 @@ impl PolymarketTrade {
             rate_limiter: crate::exchange::AtomicRateLimiter::new(rate_limit_per_second.max(1)),
             balance_backoff_until_ns: ArcSwap::from_pointee(HashMap::new()),
             trading_disabled_backoff_until_ns: std::sync::atomic::AtomicU64::new(0),
+            auth_failure_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             invalid_token_backoff: ArcSwap::from_pointee(HashMap::new()),
             http_425_warn_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
             http_425_reconcile_backoff_until_ns: PublishedStringMap::default(),
@@ -6100,6 +6232,8 @@ impl PolymarketTrade {
             terminal_trade_backfill_noop_total: std::sync::atomic::AtomicU64::new(0),
             terminal_trade_backfill_noop_log_silent_until_ns: std::sync::atomic::AtomicU64::new(0),
             terminal_trade_backfill_noop_suppressed: std::sync::atomic::AtomicU64::new(0),
+            market_cancel_warn_until_ns: PublishedStringMap::default(),
+            market_cancel_warn_suppressed: PublishedStringMap::default(),
             reconcile_cancel_not_found_counts: PublishedStringMap::default(),
             reconcile_attempts: ReconcileAttemptCounters::default(),
             placement_reconcile_next_retry_ns: PublishedStringMap::default(),
@@ -6153,7 +6287,11 @@ impl PolymarketTrade {
                     Err(_) => None,
                 };
                 let mut joined = 0usize;
-                for handle in [account_owner, lifecycle_owner, attempt_audit] {
+                let mut handles = vec![account_owner, lifecycle_owner, attempt_audit];
+                if let Some(handle) = probe_orphan_owner_join {
+                    handles.push(handle);
+                }
+                for handle in handles {
                     if handle.join().is_err() {
                         log::error!(
                             "[PolymarketTrade] background worker panicked account={}",
@@ -6839,21 +6977,20 @@ impl PolymarketTrade {
             }
 
             for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
-                let event_has_ended =
-                    if should_lookup_recovered_event_end(is_recovered) {
-                        let event_end_started = crate::latency::Instant::now();
-                        let ended = self
-                            .shared
-                            .account_state
-                            .token_event_has_ended(&ownership.token_id);
-                        crate::latency::record(
-                            "polymarket.recovery.event_end_lookup",
-                            event_end_started,
-                        );
-                        ended
-                    } else {
-                        false
-                    };
+                let event_has_ended = if should_lookup_recovered_event_end(is_recovered) {
+                    let event_end_started = crate::latency::Instant::now();
+                    let ended = self
+                        .shared
+                        .account_state
+                        .token_event_has_ended(&ownership.token_id);
+                    crate::latency::record(
+                        "polymarket.recovery.event_end_lookup",
+                        event_end_started,
+                    );
+                    ended
+                } else {
+                    false
+                };
                 let full_failed_trade_proof = requires_query_repair
                     && event_has_ended
                     && self
@@ -7887,11 +8024,61 @@ impl PolymarketTrade {
             };
         }
 
+        // The caller supplies the retired-market proof. Once both local
+        // lifecycle authorities are empty there is no reservation or order to
+        // release, so another authenticated CLOB call cannot add safety. This
+        // also avoids a 401 storm when old generations are already terminal.
+        if allow_expired_market_terminalization {
+            let open_orders = self
+                .shared
+                .execution_snapshot()
+                .open_orders
+                .values()
+                .filter(|tracked| tokens.contains(&tracked.symbol))
+                .count();
+            // Be deliberately stricter than token scoping here. A recovery
+            // row whose order payload is missing cannot be associated back to
+            // a token safely; any account-level pending recovery therefore
+            // disables the local-empty shortcut.
+            let recovery_pending = self
+                .shared
+                .account_state
+                .monitoring_snapshot()
+                .recovery_pending_orders;
+            if retired_local_empty_fast_path_allowed(
+                allow_expired_market_terminalization,
+                open_orders,
+                recovery_pending,
+            ) {
+                let _ = self
+                    .shared
+                    .market_cancel_warn_until_ns
+                    .remove(market_condition_id);
+                let suppressed = self
+                    .shared
+                    .market_cancel_warn_suppressed
+                    .remove(market_condition_id)
+                    .unwrap_or(0);
+                let detail = format!(
+                    "retired_local_empty_fast_path=true open_orders=0 recovery_pending=0 suppressed_incidents={suppressed}"
+                );
+                info!(
+                    "[PolymarketTrade] market cancel finality confirmed market={}: {}",
+                    market_condition_id, detail,
+                );
+                return MarketCancelFinality {
+                    confirmed: true,
+                    updates: Vec::new(),
+                    detail,
+                };
+            }
+        }
+
         // Keep one executor dispatch bounded; the strategy remains unsettled
         // and re-emits after a pending acknowledgement. This avoids monopolising
         // the shared execution worker during a venue outage while still making
         // settlement strictly dependent on an authoritative success.
-        let retry_delays_ms = [0_u64, 100, 250];
+        let retry_delays_ms = [0_u64, 250, 1_000];
         let mut all_updates = Vec::new();
         let mut last_detail = String::new();
         let mut retired_market_evidence_streak = 0usize;
@@ -8061,10 +8248,19 @@ impl PolymarketTrade {
             }
         }
 
-        warn!(
-            "[PolymarketTrade] market cancel finality pending market={}: {}",
-            market_condition_id, last_detail,
-        );
+        let (emit_warning, suppressed) =
+            self.shared.claim_market_cancel_warning(market_condition_id);
+        if emit_warning {
+            warn!(
+                "[PolymarketTrade] market cancel finality pending market={} suppressed_incidents={}: {}",
+                market_condition_id, suppressed, last_detail,
+            );
+        } else {
+            debug!(
+                "[PolymarketTrade] market cancel finality still pending market={}: {}",
+                market_condition_id, last_detail,
+            );
+        }
 
         MarketCancelFinality {
             confirmed: false,
@@ -8469,7 +8665,7 @@ impl PolymarketTrade {
         orders: &[OrderRequest],
         reason: &str,
     ) -> Vec<OrderUpdate> {
-        if reason == "connection failure cluster safety gate" {
+        if reason.ends_with("safety gate") {
             super::network_incident::note_place_gate_rejections(orders.len());
         }
         orders
@@ -9497,6 +9693,48 @@ impl PolymarketTrade {
         self.classify_order_lookup_reply(coid, order_id, reply)
     }
 
+    /// Reconcile an ambiguous synthetic probe without touching strategy order
+    /// state. A targeted idempotent cancel uses the cancel role first, then a
+    /// dual-slot lookup supplies independent evidence when the delete is not
+    /// terminal. Callers require two separate dual-slot absence observations
+    /// before deleting the durable probe orphan.
+    pub(crate) fn reconcile_probe_order(
+        &self,
+        client_order_id: &str,
+        order_id: &str,
+    ) -> ProbeReconcileOutcome {
+        let body = serde_json::json!({ "orderID": order_id }).to_string();
+        if let Ok(response) = self.shared.http_call_sync_rec(
+            "DELETE",
+            "/order",
+            &body,
+            Some(crate::latency_record::RequestKind::ProbeCancel),
+        ) {
+            if matches!(
+                cancel_delete_response_outcome(&response, order_id),
+                CancelReasonOutcome::Cancelled | CancelReasonOutcome::Filled
+            ) {
+                return ProbeReconcileOutcome::Terminal;
+            }
+        }
+        match self.fetch_order_by_id(client_order_id, order_id, None, true) {
+            FetchOrderResult::Found(order) if order.status != "LIVE" => {
+                ProbeReconcileOutcome::Terminal
+            }
+            FetchOrderResult::NotFound(evidence)
+                if evidence.starts_with("parallel_reconcile_absence") =>
+            {
+                ProbeReconcileOutcome::ParallelAbsent
+            }
+            FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => {
+                ProbeReconcileOutcome::ParallelAbsent
+            }
+            FetchOrderResult::Found(_)
+            | FetchOrderResult::NotFound(_)
+            | FetchOrderResult::Unavailable(_) => ProbeReconcileOutcome::Pending,
+        }
+    }
+
     fn classify_order_lookup_reply(
         &self,
         coid: &str,
@@ -9879,11 +10117,8 @@ impl PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Err(Self::make_rejected(order, "trading disabled backoff"));
         }
-        if super::network_incident::place_blocked_by_connection_failure_cluster() {
-            return Err(Self::make_rejected(
-                order,
-                "connection failure cluster safety gate",
-            ));
+        if let Some(reason) = self.shared.place_admission_block_reason() {
+            return Err(Self::make_rejected(order, reason));
         }
         if self.shared.in_balance_backoff(&self.instance_id) {
             return Err(Self::make_rejected(order, "balance backoff"));
@@ -10808,11 +11043,8 @@ impl ExchangeTrade for PolymarketTrade {
         if self.shared.in_trading_disabled_backoff() {
             return Ok(self.make_logged_preflight_rejections(orders, "trading disabled backoff"));
         }
-        if super::network_incident::place_blocked_by_connection_failure_cluster() {
-            return Ok(self.make_logged_preflight_rejections(
-                orders,
-                "connection failure cluster safety gate",
-            ));
+        if let Some(reason) = self.shared.place_admission_block_reason() {
+            return Ok(self.make_logged_preflight_rejections(orders, reason));
         }
         // Balance-backoff short-circuit (see `submit_order` for rationale).
         if self.shared.in_balance_backoff(&self.instance_id) {
@@ -11539,13 +11771,11 @@ impl ExchangeTrade for PolymarketTrade {
             return Ok(pre);
         }
 
-        if super::network_incident::place_blocked_by_connection_failure_cluster()
-            && !place_orders.is_empty()
+        if let Some(reason) = (!place_orders.is_empty())
+            .then(|| self.shared.place_admission_block_reason())
+            .flatten()
         {
-            let mut pre = self.make_logged_preflight_rejections(
-                place_orders,
-                "connection failure cluster safety gate",
-            );
+            let mut pre = self.make_logged_preflight_rejections(place_orders, reason);
             let rest =
                 self.batch_update_orders(exchange, _market_id, cancel_client_order_ids, &[])?;
             pre.extend(rest);
@@ -13428,6 +13658,14 @@ mod tests {
             1,
             std::slice::from_ref(&single),
         ));
+    }
+
+    #[test]
+    fn retired_local_empty_fast_path_requires_retirement_and_both_empty_authorities() {
+        assert!(retired_local_empty_fast_path_allowed(true, 0, 0));
+        assert!(!retired_local_empty_fast_path_allowed(false, 0, 0));
+        assert!(!retired_local_empty_fast_path_allowed(true, 1, 0));
+        assert!(!retired_local_empty_fast_path_allowed(true, 0, 1));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod active_event;
 pub mod approve_v2;
+pub mod auth_check;
 pub mod cli_account;
 pub mod auth;
 pub mod deploy_wallet;

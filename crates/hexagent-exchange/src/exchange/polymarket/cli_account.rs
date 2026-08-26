@@ -294,6 +294,7 @@ pub fn apply_account_to_env(account_id: &str) -> Result<Option<String>> {
     // ledger repair, etc.).  POLY_* alone identifies credentials but loses
     // the logical account key needed to select the durable shared ledger.
     std::env::set_var("HEXBOT_RESOLVED_ACCOUNT_ID", account_id);
+    std::env::set_var("HEXBOT_RESOLVED_SECRETS_PATH", &path);
     std::env::remove_var("HEXBOT_RESOLVED_INSTANCE_ID");
     eprintln!("[cli] account='{}' (secrets={})", account_id, path.display());
     Ok(Some(account_id.to_string()))
@@ -369,6 +370,7 @@ pub fn apply_instance_to_env(instance_id: &str, config_path: &str) -> Result<Str
     let creds = secrets.poly_for(&account_id)?;
     apply_creds_to_env(creds);
     std::env::set_var("HEXBOT_RESOLVED_ACCOUNT_ID", &account_id);
+    std::env::set_var("HEXBOT_RESOLVED_SECRETS_PATH", &secrets_path);
     std::env::set_var("HEXBOT_RESOLVED_INSTANCE_ID", instance_id);
     eprintln!(
         "[cli] instance='{}' account='{}' (config={}, secrets={})",

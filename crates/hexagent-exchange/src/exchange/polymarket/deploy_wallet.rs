@@ -543,15 +543,55 @@ pub(super) fn build_safe_tx_domain_separator(safe_address: &str) -> [u8; 32] {
 // Step 3: API Credential Generation
 // ════════════════════════════════════════════════════════════════
 
-struct ApiCredentials {
-    api_key: String,
-    secret: String,
-    passphrase: String,
+pub(crate) struct ApiCredentials {
+    pub(crate) api_key: String,
+    pub(crate) secret: String,
+    pub(crate) passphrase: String,
 }
 
-fn derive_api_credentials(key: &SigningKey, signer_address: &str) -> Result<ApiCredentials> {
-    let timestamp = format!("{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+pub(crate) fn fetch_clob_server_time_secs() -> Result<u64> {
+    let text = crate::async_rt::blocking_get_text(&format!("{CLOB_URL}/time"))?;
+    if let Ok(timestamp) = text.trim().trim_matches('"').parse::<u64>() {
+        return Ok(timestamp);
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| anyhow!("parse CLOB /time response: {error}"))?;
+    ["timestamp", "time", "serverTime"]
+        .iter()
+        .find_map(|field| {
+            json.get(*field).and_then(|value| {
+                value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok())
+            })
+        })
+        .ok_or_else(|| anyhow!("CLOB /time response has no integer timestamp"))
+}
+
+pub(crate) fn derive_api_credentials(key: &SigningKey, signer_address: &str) -> Result<ApiCredentials> {
+    derive_api_credentials_inner(key, signer_address, true)
+}
+
+/// Read-only signer binding lookup. Unlike deploy/repair this never calls the
+/// credential-creation endpoint.
+pub(crate) fn derive_existing_api_credentials(
+    key: &SigningKey,
+    signer_address: &str,
+) -> Result<ApiCredentials> {
+    derive_api_credentials_inner(key, signer_address, false)
+}
+
+fn derive_api_credentials_inner(
+    key: &SigningKey,
+    signer_address: &str,
+    allow_create: bool,
+) -> Result<ApiCredentials> {
+    let timestamp = fetch_clob_server_time_secs()
+        .unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
+        .to_string();
     let nonce: u64 = 0;
 
     // EIP-712: ClobAuth(address address, string timestamp, uint256 nonce, string message)
@@ -579,17 +619,22 @@ fn derive_api_credentials(key: &SigningKey, signer_address: &str) -> Result<ApiC
     // with "Could not derive api key!". Mirror py-clob-client's
     // create_or_derive: try CREATE first, fall back to DERIVE when the key
     // already exists (re-running deploy_wallet — CREATE then 400s).
-    let json: serde_json::Value =
+    let json: serde_json::Value = if allow_create {
         match clob_create_api_key(&checksum_addr, &signature, &timestamp, nonce) {
             Ok(j) if has_api_creds(&j) => j,
             _ => clob_derive_api_key(&checksum_addr, &signature, &timestamp, nonce)?,
-        };
+        }
+    } else {
+        clob_derive_api_key(&checksum_addr, &signature, &timestamp, nonce)?
+    };
     let api_key = json.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let secret = json.get("secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let passphrase = json.get("passphrase").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    if api_key.is_empty() || secret.is_empty() {
-        return Err(anyhow!("Failed to derive API credentials: {:?}", json));
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        return Err(anyhow!(
+            "CLOB credential response omitted one or more required fields"
+        ));
     }
 
     Ok(ApiCredentials { api_key, secret, passphrase })
@@ -639,10 +684,10 @@ fn clob_l1_api_key_request(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{} failed ({}): {}", label, status, text));
+            return Err(anyhow!("{} failed ({})", label, status));
         }
         serde_json::from_str::<serde_json::Value>(&text)
-            .map_err(|e| anyhow!("parse {}: {} (body={})", label, e, text))
+            .map_err(|e| anyhow!("parse {} credential response: {}", label, e))
     })
 }
 
@@ -1112,6 +1157,7 @@ pub(crate) fn write_poly_secrets(
             .map_err(|e| anyhow!("open temp {}: {}", tmp.display(), e))?;
         f.write_all(doc.to_string().as_bytes())?;
         f.flush()?;
+        f.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1122,6 +1168,11 @@ pub(crate) fn write_poly_secrets(
         let _ = std::fs::remove_file(&tmp);
         anyhow!("rename {} → {}: {}", tmp.display(), path.display(), e)
     })?;
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_file) = std::fs::File::open(parent) {
+            let _ = parent_file.sync_all();
+        }
+    }
     Ok(existed)
 }
 
