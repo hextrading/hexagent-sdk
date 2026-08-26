@@ -6913,6 +6913,7 @@ impl Engine {
                 recorder_tx,
                 data_dirs,
                 shutdown_done_rx,
+                poly_states,
             );
         }
         drop(executor_update_rx.take());
@@ -7172,6 +7173,7 @@ impl Engine {
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<Receiver<()>>,
+        poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> thread::JoinHandle<()> {
         // Static symbol → instance routing map (lowercased keys). A
         // symbol shared by several instances (e.g. two BTC timeframes on
@@ -7204,13 +7206,15 @@ impl Engine {
         // once per subscribing strategy instance.
         let mut market_lanes: Vec<MarketEventLane> = Vec::with_capacity(strategies.len());
         let mut update_txs: Vec<Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
+        let mut direct_private_routes = HashMap::<u16, Sender<RoutedOrderUpdate>>::new();
         let mut specs: Vec<(
             Box<dyn Strategy>,
             Receiver<QueuedMarketEvent>,
             Arc<LatestMarketStore>,
             Receiver<QueuedOrderUpdate>,
+            Receiver<RoutedOrderUpdate>,
         )> = Vec::with_capacity(strategies.len());
-        for s in strategies.into_iter() {
+        for (owner, s) in strategies.into_iter().enumerate() {
             let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
             let latest = Arc::new(LatestMarketStore::default());
             // One bounded lossless lane per strategy. The router retains the
@@ -7219,13 +7223,18 @@ impl Engine {
             // supervisor work continue independently while bounded upstream
             // channels propagate backpressure to their producers.
             let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
+            let (direct_tx, direct_rx) = bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
             market_lanes.push(MarketEventLane {
                 tx: mtx,
                 latest: Arc::clone(&latest),
                 barrier_epoch: Arc::new(AtomicU64::new(0)),
             });
             update_txs.push(utx);
-            specs.push((s, mrx, latest, urx));
+            direct_private_routes.insert(owner as u16, direct_tx);
+            specs.push((s, mrx, latest, urx, direct_rx));
+        }
+        for (_, shared) in Self::dedup_states_by_account(poly_states) {
+            shared.install_strategy_private_routes(direct_private_routes.clone());
         }
         let supervisor_origin = Arc::new(std::time::Instant::now());
         let worker_heartbeats: Vec<Arc<AtomicU64>> = (0..instance_ids.len())
@@ -7252,7 +7261,9 @@ impl Engine {
                     bounded::<(usize, bool)>(worker_control_capacity);
                 let (shutdown_ack_tx, shutdown_ack_rx) =
                     bounded::<usize>(worker_control_capacity);
-                for (idx, (strategy, mrx, latest, urx)) in specs.into_iter().enumerate() {
+                for (idx, (strategy, mrx, latest, urx, direct_private_rx)) in
+                    specs.into_iter().enumerate()
+                {
                     let stx = signal_tx.with_owner(idx);
                     let dd = data_dirs.clone();
                     let iid = instance_ids[idx].clone();
@@ -7268,7 +7279,7 @@ impl Engine {
                         .spawn(move || {
                             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 Self::run_strategy_worker(
-                                    strategy, mrx, latest, urx, stx, dd, &iid, idx,
+                                    strategy, mrx, latest, urx, direct_private_rx, stx, dd, &iid, idx,
                                     heartbeat, quarantined, shutdown_requested,
                                     ack_tx, clock_origin,
                                 );
@@ -7919,6 +7930,7 @@ impl Engine {
         market_rx: Receiver<QueuedMarketEvent>,
         latest_market: Arc<LatestMarketStore>,
         update_rx: Receiver<QueuedOrderUpdate>,
+        direct_private_rx: Receiver<RoutedOrderUpdate>,
         signal_tx: SignalSender,
         data_dirs: Vec<PathBuf>,
         instance_id: &str,
@@ -8028,6 +8040,57 @@ impl Engine {
                         }
                     }
                     Err(_) => private_feed_control_open = false,
+                },
+                // Polymarket authenticated lifecycle: numeric owner routing
+                // was completed on the private producer, so this dedicated
+                // lossless lane bypasses the root router and is drained before
+                // every compatibility lifecycle or market-data lane.
+                recv(direct_private_rx) -> msg => match msg {
+                    Ok(routed) => {
+                        if routed.owner as usize != idx {
+                            error!(
+                                "[strategy_private_direct] instance={} owner_mismatch expected={} observed={} action=quarantine",
+                                instance_id, idx, routed.owner,
+                            );
+                            quarantined.store(true, Ordering::Release);
+                            break 'worker;
+                        }
+                        if quarantined.load(Ordering::Acquire) { break 'worker; }
+                        heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                        let callback_started = crate::latency::Instant::now();
+                        lifecycle_sequence = lifecycle_sequence.saturating_add(1);
+                        callback_signal_batch.clear();
+                        if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
+                            LifecycleEnvelope {
+                                owner: routed.owner,
+                                order_slot: routed.update.order_slot,
+                                sequence: lifecycle_sequence,
+                                source: LifecycleSource::PrivateFeed,
+                                timing: routed.timing,
+                                update: routed.update,
+                            },
+                            &mut callback_signal_batch,
+                        ) {
+                            callback_signal_batch.clear();
+                            handle_signal_batch_overflow(
+                                overflow,
+                                &signal_tx,
+                                &quarantined,
+                                instance_id,
+                            );
+                            break 'worker;
+                        }
+                        if !shutdown_started {
+                            for sig in callback_signal_batch.drain(..) {
+                                if !emit(sig) { break 'worker; }
+                            }
+                        }
+                        crate::latency::record(
+                            "strategy.private_direct.callback",
+                            callback_started,
+                        );
+                    }
+                    Err(_) => break,
                 },
                 recv(selectable_private_update_rx) -> msg => match msg {
                     Ok(update) => {
@@ -15313,6 +15376,7 @@ mod market_router_tests {
                     market_rx,
                     Arc::new(LatestMarketStore::default()),
                     update_rx,
+                    crossbeam_channel::never(),
                     SignalSender::system(routed_signal_tx).with_owner(0),
                     Vec::new(),
                     "single",
@@ -16460,12 +16524,30 @@ mod market_router_tests {
         )
         .is_err());
 
-        assert_eq!(routes.fast[0].metrics.queue_depth.load(Ordering::Acquire), 1);
-        assert_eq!(routes.fast[1].metrics.queue_depth.load(Ordering::Acquire), 1);
+        assert_eq!(
+            routes.fast[0].metrics.queue_depth.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            routes.fast[1].metrics.queue_depth.load(Ordering::Acquire),
+            1
+        );
         assert!(routes.fast[0].metrics.enqueued_ns.load(Ordering::Acquire) > 0);
         assert!(routes.fast[1].metrics.enqueued_ns.load(Ordering::Acquire) > 0);
-        assert_eq!(routes.fast[0].metrics.queue_high_water.load(Ordering::Relaxed), 1);
-        assert_eq!(routes.fast[1].metrics.queue_high_water.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            routes.fast[0]
+                .metrics
+                .queue_high_water
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            routes.fast[1]
+                .metrics
+                .queue_high_water
+                .load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(routes.fast[0].metrics.busy_skips.load(Ordering::Relaxed), 1);
         assert_eq!(routes.fast[1].metrics.busy_skips.load(Ordering::Relaxed), 1);
         assert!(matches!(
@@ -16760,11 +16842,7 @@ mod market_router_tests {
                     hexagent_runtime::http1_pool::Role::Fast,
                     0,
                 ),
-                PolyConnectionLane::for_test(
-                    fast_tx,
-                    hexagent_runtime::http1_pool::Role::Fast,
-                    1,
-                ),
+                PolyConnectionLane::for_test(fast_tx, hexagent_runtime::http1_pool::Role::Fast, 1),
             ],
             cancel: vec![
                 PolyConnectionLane::for_test(

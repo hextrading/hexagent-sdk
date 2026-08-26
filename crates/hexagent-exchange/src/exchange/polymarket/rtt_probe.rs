@@ -86,15 +86,253 @@
 //! Per-call timeouts are bounded by the FAST h2 client pool ceiling
 //! (typically 1500–2000 ms via `async_rt::current_fast_timeout`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
 
-use super::trade::{HttpErr, SharedState};
+use super::trade::{
+    probe_cancel_response_is_terminal, HttpErr, PolymarketTrade, ProbeReconcileOutcome, SharedState,
+};
+
+const PROBE_ORPHAN_OWNER_CAPACITY: usize = 64;
+
+/// Durable operational state for a synthetic RTT request whose place result
+/// was ambiguous. This intentionally lives outside StrategyAccount's economic
+/// reservations: probes must never make strategy buying power appear spent.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ProbeOrphan {
+    pub instance_id: String,
+    pub client_order_id: String,
+    pub order_id: String,
+    pub token_id: String,
+    pub created_at_ns: u64,
+    /// Probe-only operational collateral in USDC micros. It never enters a
+    /// strategy reservation ledger; resolving this record is the idempotent
+    /// release of the separate probe reservation.
+    #[serde(default)]
+    pub reserved_cash_micros: u64,
+    #[serde(default)]
+    pub parallel_absence_observations: u8,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ProbeOrphanFile {
+    version: u32,
+    pending: Option<ProbeOrphan>,
+}
+
+enum ProbeOrphanCommand {
+    Acquire(ProbeOrphan, Sender<Result<bool, String>>),
+    Current(Sender<Option<ProbeOrphan>>),
+    Resolve {
+        order_id: String,
+        reply: Sender<Result<bool, String>>,
+    },
+    NoteParallelAbsence {
+        order_id: String,
+        reply: Sender<Result<u8, String>>,
+    },
+}
+
+/// Bounded MPSC control handle; a single low-priority owner is the only writer
+/// of the sidecar and in-memory orphan. The account-level singleton is shared
+/// by every strategy instance, so at most one token/account probe is pending.
+#[derive(Clone)]
+pub(crate) struct ProbeOrphanOwner {
+    tx: Sender<ProbeOrphanCommand>,
+    high_water: Arc<AtomicUsize>,
+    overflow: Arc<AtomicU64>,
+}
+
+impl ProbeOrphanOwner {
+    fn request<T>(
+        &self,
+        command: impl FnOnce(Sender<T>) -> ProbeOrphanCommand,
+    ) -> Result<T, String> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let depth = self
+            .tx
+            .len()
+            .saturating_add(1)
+            .min(PROBE_ORPHAN_OWNER_CAPACITY);
+        self.tx
+            .send_timeout(command(reply_tx), Duration::from_secs(2))
+            .map_err(|error| {
+                self.overflow.fetch_add(1, Ordering::Relaxed);
+                format!("probe orphan owner unavailable: {error}")
+            })?;
+        self.high_water.fetch_max(depth, Ordering::Relaxed);
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("probe orphan owner reply unavailable: {error}"))
+    }
+
+    pub(crate) fn acquire(&self, orphan: ProbeOrphan) -> Result<bool, String> {
+        self.request(|reply| ProbeOrphanCommand::Acquire(orphan, reply))?
+    }
+
+    pub(crate) fn current(&self) -> Result<Option<ProbeOrphan>, String> {
+        self.request(ProbeOrphanCommand::Current)
+    }
+
+    pub(crate) fn resolve(&self, order_id: &str) -> Result<bool, String> {
+        let order_id = order_id.to_string();
+        self.request(|reply| ProbeOrphanCommand::Resolve { order_id, reply })?
+    }
+
+    pub(crate) fn note_parallel_absence(&self, order_id: &str) -> Result<u8, String> {
+        let order_id = order_id.to_string();
+        self.request(|reply| ProbeOrphanCommand::NoteParallelAbsence { order_id, reply })?
+    }
+
+    pub(crate) fn metrics(&self) -> (usize, u64) {
+        (
+            self.high_water.load(Ordering::Relaxed),
+            self.overflow.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn probe_orphan_sidecar_path(ledger_path: &Path) -> PathBuf {
+    let name = ledger_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("account-ledger");
+    ledger_path.with_file_name(format!("{name}.probe-orphans.json"))
+}
+
+fn load_probe_orphan(path: Option<&Path>) -> Result<Option<ProbeOrphan>, String> {
+    let Some(path) = path else { return Ok(None) };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let file: ProbeOrphanFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    Ok(file.pending)
+}
+
+fn persist_probe_orphan(path: Option<&Path>, pending: &Option<ProbeOrphan>) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(&ProbeOrphanFile {
+        version: 1,
+        pending: pending.clone(),
+    })
+    .map_err(|error| format!("serialize probe orphan: {error}"))?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("create {}: {error}", temp.display()))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("sync {}: {error}", temp.display()))?;
+    }
+    std::fs::rename(&temp, path).map_err(|error| format!("rename {}: {error}", path.display()))?;
+    if let Ok(parent_file) = std::fs::File::open(parent) {
+        let _ = parent_file.sync_all();
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_probe_orphan_owner(
+    ledger_path: Option<&Path>,
+    shutdown: hexagent_runtime::shutdown::ShutdownToken,
+) -> std::io::Result<(ProbeOrphanOwner, std::thread::JoinHandle<()>)> {
+    let path = ledger_path.map(probe_orphan_sidecar_path);
+    let initial = load_probe_orphan(path.as_deref()).unwrap_or_else(|error| {
+        log::error!("[RttProbe] durable orphan load failed; owner starts blocked: {error}");
+        Some(ProbeOrphan {
+            instance_id: "<load-error>".into(),
+            client_order_id: "probe:load-error".into(),
+            order_id: "<unknown>".into(),
+            token_id: String::new(),
+            created_at_ns: crate::types::now_ns(),
+            reserved_cash_micros: 0,
+            parallel_absence_observations: 0,
+        })
+    });
+    let (tx, rx) = crossbeam_channel::bounded(PROBE_ORPHAN_OWNER_CAPACITY);
+    let owner = ProbeOrphanOwner {
+        tx,
+        high_water: Arc::new(AtomicUsize::new(0)),
+        overflow: Arc::new(AtomicU64::new(0)),
+    };
+    let join = std::thread::Builder::new()
+        .name("poly-probe-orphan-owner".into())
+        .spawn(move || run_probe_orphan_owner(rx, path, initial, shutdown))?;
+    Ok((owner, join))
+}
+
+fn run_probe_orphan_owner(
+    rx: Receiver<ProbeOrphanCommand>,
+    path: Option<PathBuf>,
+    mut pending: Option<ProbeOrphan>,
+    shutdown: hexagent_runtime::shutdown::ShutdownToken,
+) {
+    crate::os_tune::pin_background("poly-probe-orphan-owner");
+    while !shutdown.is_finished() {
+        let command = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(command) => command,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        match command {
+            ProbeOrphanCommand::Acquire(orphan, reply) => {
+                let result = if pending.is_some() {
+                    Ok(false)
+                } else {
+                    let next = Some(orphan);
+                    persist_probe_orphan(path.as_deref(), &next).map(|()| {
+                        pending = next;
+                        true
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            ProbeOrphanCommand::Current(reply) => {
+                let _ = reply.send(pending.clone());
+            }
+            ProbeOrphanCommand::Resolve { order_id, reply } => {
+                let matched = pending
+                    .as_ref()
+                    .is_some_and(|orphan| orphan.order_id.eq_ignore_ascii_case(&order_id));
+                let result = if matched {
+                    persist_probe_orphan(path.as_deref(), &None).map(|()| {
+                        pending = None;
+                        true
+                    })
+                } else {
+                    Ok(false)
+                };
+                let _ = reply.send(result);
+            }
+            ProbeOrphanCommand::NoteParallelAbsence { order_id, reply } => {
+                let result = if let Some(orphan) = pending
+                    .as_mut()
+                    .filter(|orphan| orphan.order_id.eq_ignore_ascii_case(&order_id))
+                {
+                    orphan.parallel_absence_observations =
+                        orphan.parallel_absence_observations.saturating_add(1);
+                    let observations = orphan.parallel_absence_observations;
+                    persist_probe_orphan(path.as_deref(), &pending).map(|()| observations)
+                } else {
+                    Ok(0)
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
 
 /// Probe resting-order parameters. A postOnly `BUY` of the high-priced
 /// side (see [`pick_probe_side`]) at this deep price never crosses the
@@ -347,6 +585,66 @@ fn fire_full_probe(
     active_token: &ActiveTokenHandle,
     instance_id: &str,
 ) -> Option<f64> {
+    // Live accounts always have a persistent ledger and therefore a durable
+    // probe owner. CLI/test states without one skip synthetic placement.
+    let orphan_owner = shared.probe_orphan_owner.as_ref()?;
+    // An ambiguous prior place owns the account's only probe lease. Resolve it
+    // through cancel + two independent reconcile slots; never stack another
+    // synthetic order on top of unknown server state.
+    match orphan_owner.current() {
+        Ok(Some(orphan)) => {
+            shared.probe_order_ids.insert(&orphan.order_id);
+            let route = PolymarketTrade::from_shared(
+                Arc::clone(shared),
+                &shared.auth.api_key,
+                &orphan.instance_id,
+            );
+            let terminal =
+                match route.reconcile_probe_order(&orphan.client_order_id, &orphan.order_id) {
+                    ProbeReconcileOutcome::Terminal => true,
+                    ProbeReconcileOutcome::ParallelAbsent => {
+                    match orphan_owner.note_parallel_absence(&orphan.order_id) {
+                            Ok(observations) => observations >= 2,
+                            Err(error) => {
+                                warn!("[RttProbe] persist parallel evidence failed: {error}");
+                                false
+                            }
+                        }
+                    }
+                    ProbeReconcileOutcome::Pending => false,
+                };
+            if terminal {
+                match orphan_owner.resolve(&orphan.order_id) {
+                    Ok(true) => info!(
+                        "[RttProbe] durable orphan resolved orderID={} age_ms={:.0} probe_reserved_cash_released={:.6}",
+                        orphan.order_id,
+                        crate::types::now_ns().saturating_sub(orphan.created_at_ns) as f64
+                            / 1_000_000.0,
+                        orphan.reserved_cash_micros as f64 / 1_000_000.0,
+                    ),
+                    Ok(false) => {}
+                    Err(error) => warn!("[RttProbe] durable orphan resolution failed: {error}"),
+                }
+            }
+            let (high_water, overflow) = orphan_owner.metrics();
+            crate::latency::record_ns(
+                "polymarket.probe_orphan.queue_high_water",
+                high_water as u64,
+            );
+            crate::latency::record_ns("polymarket.probe_orphan.queue_overflow", overflow);
+            return None;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!("[RttProbe] orphan owner unavailable; probe remains fail-closed: {error}");
+            return None;
+        }
+    }
+
+    if let Some(reason) = shared.place_admission_block_reason() {
+        debug!("[RttProbe] new probe blocked by {reason}");
+        return None;
+    }
     let token = active_token.load()?;
     if token.is_empty() {
         return None;
@@ -379,24 +677,12 @@ fn fire_full_probe(
         .map(|v| v as u64)
         .unwrap_or(0);
     let probe_coid = format!("probe:{}:{}", instance_id, signed.order_hash);
-    let account_reserved = shared.account_state.is_seeded();
-    if account_reserved {
-        if let Err(error) = shared.account_state.reserve_passive_order(
-            instance_id,
-            &probe_coid,
-            &signed.order_hash,
-            &token,
-            crate::types::Side::Buy,
-            FULL_PROBE_SIZE,
-            FULL_PROBE_PRICE,
-            0,
-        ) {
-            warn!(
-                "[RttProbe] shared-account admission rejected (skip): {}",
-                error
-            );
-            return None;
-        }
+    if shared.account_state.is_seeded()
+        && shared.account_state.monitoring_snapshot().unallocated_cash
+            < FULL_PROBE_PRICE * FULL_PROBE_SIZE * 2.0
+    {
+        debug!("[RttProbe] insufficient operational cash slack; probe skipped");
+        return None;
     }
 
     // Wire body mirrors `sign_and_build_body_v2`, but `postOnly: true`
@@ -424,6 +710,24 @@ fn fire_full_probe(
         }
     })
     .to_string();
+
+    let orphan = ProbeOrphan {
+        instance_id: instance_id.to_string(),
+        client_order_id: probe_coid.clone(),
+        order_id: signed.order_hash.clone(),
+        token_id: token.to_string(),
+        created_at_ns: crate::types::now_ns(),
+        reserved_cash_micros: (FULL_PROBE_PRICE * FULL_PROBE_SIZE * 1_000_000.0).round() as u64,
+        parallel_absence_observations: 0,
+    };
+    match orphan_owner.acquire(orphan) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            warn!("[RttProbe] durable orphan lease failed; probe skipped: {error}");
+            return None;
+        }
+    }
 
     // Register the probe's orderID (== local order hash) BEFORE sending
     // so the user feed can identify the resting order's placement /
@@ -461,9 +765,15 @@ fn fire_full_probe(
             // The order's fate is unknown: the request may have rested
             // server-side and only the response was lost. Best-effort
             // cancel via the locally-computed order_hash (== Polymarket
-            // orderID) so a degraded session can't accrue orphaned
-            // resting collateral. A truly-failed place just 404s the
-            // cancel (recorded with status `http_404`, filterable).
+            // orderID) so a degraded session can't accrue orphaned resting
+            // collateral. This includes timeout/transport/malformed replies
+            // and server deadline failures whose acceptance state is not
+            // authoritative.
+            (Some(signed.order_hash.clone()), true)
+        }
+        Err(error @ HttpErr::Status(_, _)) if error.is_submit_unknown_state() => {
+            // Some server deadline/status replies are explicitly classified
+            // as submit-unknown by the normal order path as well.
             (Some(signed.order_hash.clone()), true)
         }
         Err(HttpErr::Status(code, body)) => {
@@ -472,15 +782,12 @@ fn fire_full_probe(
             // to cancel. Rejection is NOT a healthy probe outcome: warn
             // (rate-limited) with the reason.
             warn_probe_place_rejected(*code, body);
-            if account_reserved {
-                shared
-                    .account_state
-                    .release_order(&probe_coid, crate::types::OrderStatus::Rejected);
-            }
+            let _ = orphan_owner.resolve(&signed.order_hash);
             (None, true)
         }
         Err(e @ HttpErr::Other(_)) => {
             warn!("[RttProbe] probe place transport error (skip): {:?}", e);
+            let _ = orphan_owner.resolve(&signed.order_hash);
             (None, false)
         }
     };
@@ -500,10 +807,11 @@ fn fire_full_probe(
             &cbody,
             Some(crate::latency_record::RequestKind::ProbeCancel),
         );
-        if cres.is_ok() && account_reserved {
-            shared
-                .account_state
-                .release_order(&probe_coid, crate::types::OrderStatus::Cancelled);
+        if cres
+            .as_ref()
+            .is_ok_and(|response| probe_cancel_response_is_terminal(response, &oid))
+        {
+            let _ = orphan_owner.resolve(&oid);
         }
         debug!(
             "[RttProbe] probe place={:.1}ms cancel_ok={}",
@@ -535,5 +843,45 @@ mod tests {
 
         writer.store(None);
         assert!(reader.load().is_none());
+    }
+
+    #[test]
+    fn probe_orphan_owner_is_ordered_idempotent_and_restart_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("zhu02.json");
+        let shutdown = hexagent_runtime::shutdown::ShutdownToken::new();
+        let (owner, join) = spawn_probe_orphan_owner(Some(&ledger), shutdown.clone()).unwrap();
+        let orphan = ProbeOrphan {
+            instance_id: "btc01".into(),
+            client_order_id: "probe:btc01:abc".into(),
+            order_id: "0xabc".into(),
+            token_id: "token-a".into(),
+            created_at_ns: 7,
+            reserved_cash_micros: 1_000_000,
+            parallel_absence_observations: 0,
+        };
+        assert!(owner.acquire(orphan.clone()).unwrap());
+        assert!(!owner.acquire(orphan.clone()).unwrap());
+        assert_eq!(owner.current().unwrap(), Some(orphan.clone()));
+        assert_eq!(owner.note_parallel_absence("0xabc").unwrap(), 1);
+        shutdown.finish();
+        join.join().unwrap();
+
+        let restart = hexagent_runtime::shutdown::ShutdownToken::new();
+        let (owner, join) = spawn_probe_orphan_owner(Some(&ledger), restart.clone()).unwrap();
+        assert_eq!(
+            owner
+                .current()
+                .unwrap()
+                .unwrap()
+                .parallel_absence_observations,
+            1
+        );
+        assert!(!owner.resolve("different").unwrap());
+        assert!(owner.resolve("0xABC").unwrap());
+        assert!(!owner.resolve("0xabc").unwrap());
+        assert!(owner.current().unwrap().is_none());
+        restart.finish();
+        join.join().unwrap();
     }
 }
