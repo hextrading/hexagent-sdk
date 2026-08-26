@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, ExchangeConfig, RunMode};
 use crate::exchange::aster::AsterTrade;
@@ -10823,7 +10824,7 @@ impl Engine {
                                             0
                                         };
                                         info!(
-                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={}",
+                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} cooldown_skips={} cooldown_remaining_ms={} slow_requests={} slow_streak={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={}",
                                             lane.account_id,
                                             lane.role,
                                             lane.slot,
@@ -10831,6 +10832,12 @@ impl Engine {
                                             lane.queue_depth.load(Ordering::Relaxed),
                                             lane.queue_high_water.load(Ordering::Relaxed),
                                             lane.busy_skips.load(Ordering::Relaxed),
+                                            lane.cooldown_skips.load(Ordering::Relaxed),
+                                            lane.cooldown_until_ns
+                                                .load(Ordering::Relaxed)
+                                                .saturating_sub(now_ns()) / 1_000_000,
+                                            lane.slow_requests.load(Ordering::Relaxed),
+                                            lane.slow_streak.load(Ordering::Relaxed),
                                             lane.send_failures.load(Ordering::Relaxed),
                                             lane.completed.load(Ordering::Relaxed),
                                             request_age_ms,
@@ -12596,6 +12603,13 @@ struct PolyConnectionLaneMetrics {
     send_failures: AtomicU64,
     completed: AtomicU64,
     request_age_max_ns: AtomicU64,
+    /// A slow physical socket is temporarily removed from ordinary RR
+    /// selection. Cancel remains lossless: this lane is still a last-resort
+    /// fallback when every healthy owner is occupied.
+    cooldown_until_ns: AtomicU64,
+    slow_streak: AtomicU64,
+    slow_requests: AtomicU64,
+    cooldown_skips: AtomicU64,
 }
 
 impl PolyConnectionLaneMetrics {
@@ -12612,10 +12626,44 @@ impl PolyConnectionLaneMetrics {
             send_failures: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             request_age_max_ns: AtomicU64::new(0),
+            cooldown_until_ns: AtomicU64::new(0),
+            slow_streak: AtomicU64::new(0),
+            slow_requests: AtomicU64::new(0),
+            cooldown_skips: AtomicU64::new(0),
         }
     }
 
-    fn release(&self) {
+    fn release(
+        &self,
+        elapsed: Duration,
+        connection: hexagent_runtime::http1_pool::PooledConnectionSnapshot,
+    ) {
+        const SLOW: Duration = Duration::from_millis(500);
+        const HEALTHY_RESET: Duration = Duration::from_millis(100);
+        if elapsed >= SLOW {
+            let streak = self.slow_streak.fetch_add(1, Ordering::AcqRel) + 1;
+            let shift = streak.saturating_sub(1).min(4) as u32;
+            let cooldown_secs = (2_u64 << shift).min(30);
+            let until = now_ns().saturating_add(cooldown_secs * 1_000_000_000);
+            self.cooldown_until_ns.fetch_max(until, Ordering::AcqRel);
+            let slow_requests = self.slow_requests.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                "[poly_connection_owner_slow] account={} role={:?} slot={} elapsed_ms={} slow_streak={} slow_requests={} cooldown_ms={} pool_generation={} connect_generation={} peer={:?} cardinality_unchanged=true",
+                self.account_id,
+                self.role,
+                self.slot,
+                elapsed.as_millis(),
+                streak,
+                slow_requests,
+                cooldown_secs * 1_000,
+                connection.pool_generation,
+                connection.connect_generation,
+                connection.peer,
+            );
+        } else if elapsed <= HEALTHY_RESET {
+            self.slow_streak.store(0, Ordering::Release);
+            self.cooldown_until_ns.store(0, Ordering::Release);
+        }
         let enqueued_ns = self.enqueued_ns.swap(0, Ordering::AcqRel);
         self.queue_depth.store(0, Ordering::Release);
         if enqueued_ns > 0 {
@@ -12624,6 +12672,14 @@ impl PolyConnectionLaneMetrics {
         }
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.occupied.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn release_for_test(&self) {
+        self.release(
+            Duration::ZERO,
+            hexagent_runtime::http1_pool::PooledConnectionSnapshot::default(),
+        );
     }
 }
 
@@ -12686,11 +12742,29 @@ impl PolyConnectionLane {
     }
 }
 
-struct PolyConnectionOccupancyGuard(Arc<PolyConnectionLaneMetrics>);
+struct PolyConnectionOccupancyGuard {
+    metrics: Arc<PolyConnectionLaneMetrics>,
+    started: Instant,
+    connection: hexagent_runtime::http1_pool::PooledConnectionSnapshot,
+}
+
+impl PolyConnectionOccupancyGuard {
+    fn new(
+        metrics: Arc<PolyConnectionLaneMetrics>,
+        connection: hexagent_runtime::http1_pool::PooledConnectionSnapshot,
+    ) -> Self {
+        Self {
+            metrics,
+            started: Instant::now(),
+            connection,
+        }
+    }
+}
 
 impl Drop for PolyConnectionOccupancyGuard {
     fn drop(&mut self) {
-        self.0.release();
+        self.metrics
+            .release(self.started.elapsed(), self.connection);
     }
 }
 
@@ -12855,8 +12929,21 @@ fn try_send_poly_owner(
         return Err(command);
     }
     let start = *rr % lanes.len();
+    let now = now_ns();
     for offset in 0..lanes.len() {
         let index = (start + offset) % lanes.len();
+        if lanes[index]
+            .metrics
+            .cooldown_until_ns
+            .load(Ordering::Acquire)
+            > now
+        {
+            lanes[index]
+                .metrics
+                .cooldown_skips
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         match lanes[index].try_send(command) {
             Ok(()) => {
                 *rr = index.wrapping_add(1);
@@ -12864,6 +12951,34 @@ fn try_send_poly_owner(
             }
             Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
             Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+        }
+    }
+    // Cancel/reconcile work is lossless. A cooling lane remains a bounded
+    // last resort when every healthy connection is occupied; no request is
+    // dropped and no extra socket is created. Fast/place never falls through
+    // to a known-slow generation.
+    if matches!(
+        role,
+        hexagent_runtime::http1_pool::Role::Cancel | hexagent_runtime::http1_pool::Role::Reconcile
+    ) {
+        for offset in 0..lanes.len() {
+            let index = (start + offset) % lanes.len();
+            if lanes[index]
+                .metrics
+                .cooldown_until_ns
+                .load(Ordering::Acquire)
+                <= now
+            {
+                continue;
+            }
+            match lanes[index].try_send(command) {
+                Ok(()) => {
+                    *rr = index.wrapping_add(1);
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+                Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+            }
         }
     }
     Err(command)
@@ -12942,7 +13057,8 @@ fn run_poly_connection_owner(
     crate::latency::prepare_polymarket_order_stages();
     while let Ok(command) = rx.recv() {
         lane_metrics.queue_depth.store(0, Ordering::Release);
-        let _occupancy = PolyConnectionOccupancyGuard(Arc::clone(&lane_metrics));
+        let connection = permit.current_pooled_client().connection_snapshot();
+        let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
         match command {
             PolyConnectionCommand::Place {
                 instance_id,
@@ -16464,7 +16580,7 @@ mod market_router_tests {
         ));
         // The test consumes the physical-owner command directly, so emulate
         // the owner's completion guard before flushing the next lossless item.
-        routes.cancel[0].metrics.release();
+        routes.cancel[0].metrics.release_for_test();
         flush_poly_cancel_outbox(&mut routes);
         assert!(matches!(
             cancel_rx.recv().unwrap(),
@@ -16559,7 +16675,7 @@ mod market_router_tests {
             PolyConnectionCommand::Place { order, .. } if order.client_order_id == "second"
         ));
 
-        routes.fast[0].metrics.release();
+        routes.fast[0].metrics.release_for_test();
         assert!(try_send_poly_owner(
             &mut routes,
             hexagent_runtime::http1_pool::Role::Fast,
@@ -16570,6 +16686,91 @@ mod market_router_tests {
             slot_zero_rx.try_recv().unwrap(),
             PolyConnectionCommand::Place { order, .. } if order.client_order_id == "third"
         ));
+    }
+
+    #[test]
+    fn cancel_owner_cools_slow_slot_without_dropping_lossless_fallback() {
+        let (slow_tx, slow_rx) = bounded(1);
+        let (healthy_tx, healthy_rx) = bounded(1);
+        let (raw_update_tx, _update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender {
+            owner: 9,
+            tx: raw_update_tx,
+        };
+        let mut routes = PolyAccountConnectionRoutes {
+            cancel: vec![
+                PolyConnectionLane::for_test(
+                    slow_tx,
+                    hexagent_runtime::http1_pool::Role::Cancel,
+                    1,
+                ),
+                PolyConnectionLane::for_test(
+                    healthy_tx,
+                    hexagent_runtime::http1_pool::Role::Cancel,
+                    2,
+                ),
+            ],
+            ..Default::default()
+        };
+        routes.cancel[0]
+            .metrics
+            .cooldown_until_ns
+            .store(now_ns().saturating_add(5_000_000_000), Ordering::Release);
+        let command = |coid: &str| PolyConnectionCommand::Cancel {
+            instance_id: "zhu-03".into(),
+            exchange: Exchange::Polymarket,
+            client_order_id: coid.into(),
+            timestamp_ns: 1,
+            update_tx: update_tx.clone(),
+            enqueued_at: std::time::Instant::now(),
+        };
+
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Cancel,
+            command("healthy-first"),
+        )
+        .is_ok());
+        assert!(matches!(
+            healthy_rx.recv().unwrap(),
+            PolyConnectionCommand::Cancel { client_order_id, .. }
+                if client_order_id == "healthy-first"
+        ));
+        // The healthy owner remains occupied. Lossless cancel fallback may
+        // now use the cooling physical slot rather than dropping/reordering
+        // the command or increasing connection count.
+        assert!(try_send_poly_owner(
+            &mut routes,
+            hexagent_runtime::http1_pool::Role::Cancel,
+            command("cooling-fallback"),
+        )
+        .is_ok());
+        assert!(matches!(
+            slow_rx.recv().unwrap(),
+            PolyConnectionCommand::Cancel { client_order_id, .. }
+                if client_order_id == "cooling-fallback"
+        ));
+        assert!(
+            routes.cancel[0]
+                .metrics
+                .cooldown_skips
+                .load(Ordering::Relaxed)
+                >= 2
+        );
+        assert_eq!(
+            routes.cancel[0]
+                .metrics
+                .queue_high_water
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            routes.cancel[1]
+                .metrics
+                .queue_high_water
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

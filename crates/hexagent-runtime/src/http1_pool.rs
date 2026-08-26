@@ -1146,6 +1146,17 @@ impl PooledClient {
         self.attempt_trace.slot
     }
 
+    /// Current logical-pool and physical-socket generations for diagnostics.
+    /// The snapshot is lock-free and does not acquire or create a connection.
+    pub fn connection_snapshot(&self) -> PooledConnectionSnapshot {
+        let socket = self.instrumented.connection_snapshot();
+        PooledConnectionSnapshot {
+            pool_generation: self.health.generation_at_pick,
+            connect_generation: socket.connect_generation,
+            peer: socket.peer,
+        }
+    }
+
     /// Allocate the process-monotonic identity used by non-admission HTTP
     /// paths. Admission-owned order attempts should call [`Self::begin_attempt`]
     /// so the same ID is also published in the slot trace.
@@ -1221,6 +1232,13 @@ impl PooledClient {
         });
         true
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PooledConnectionSnapshot {
+    pub pool_generation: u64,
+    pub connect_generation: u64,
+    pub peer: Option<std::net::SocketAddr>,
 }
 
 /// Admission permit: owns an exclusive slot's client for the duration of
@@ -2333,17 +2351,26 @@ mod tests {
             health.install_instrumented_replacement(Arc::clone(&candidate)),
             Some(1),
         );
-        assert_eq!(p.slots.len(), 1, "replacement must not add a connection slot");
-        assert!(Arc::ptr_eq(&p.slots[0].instrumented.load_full(), &candidate));
+        assert_eq!(
+            p.slots.len(),
+            1,
+            "replacement must not add a connection slot"
+        );
+        assert!(Arc::ptr_eq(
+            &p.slots[0].instrumented.load_full(),
+            &candidate
+        ));
         assert!(!Arc::ptr_eq(&original, &candidate));
         assert!(
             health
-                .install_instrumented_replacement(Arc::new(
-                    crate::instrumented_http1::InstrumentedHttp1Client::new(
-                        Duration::from_secs(2),
+                .install_instrumented_replacement(
+                    Arc::new(
+                        crate::instrumented_http1::InstrumentedHttp1Client::new(
+                            Duration::from_secs(2),
+                        )
+                        .unwrap(),
                     )
-                    .unwrap(),
-                ))
+                )
                 .is_none(),
             "a stale generation must not overwrite the replacement",
         );

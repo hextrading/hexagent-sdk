@@ -2773,6 +2773,10 @@ type ClobSocketReadResult =
 
 struct ClobConnection {
     lane_id: u64,
+    /// Stable identity of the subscribed token set. Active and standby lanes
+    /// may exchange ownership without reseeding only when this generation is
+    /// identical and the current local books are already fully seeded.
+    token_generation: u64,
     write: ClobSocketWriter,
     read: ClobSocketReader,
     tcp_fd: Option<i32>,
@@ -2781,6 +2785,23 @@ struct ClobConnection {
     observed_data: bool,
     diagnostics: ClobWindowMetrics,
     burst: ClobBurstMetrics,
+}
+
+fn clob_token_generation(tokens: &[String]) -> u64 {
+    // Deterministic FNV-1a over length-delimited token identities. This runs
+    // only while constructing a socket lane, never in frame processing.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for token in tokens {
+        for byte in (token.len() as u64)
+            .to_le_bytes()
+            .iter()
+            .chain(token.as_bytes())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash.max(1)
 }
 
 impl ClobConnection {
@@ -3270,11 +3291,144 @@ fn clob_thread_cpu_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
 struct ClobPerfTrigger {
     elapsed: Duration,
-    frame_len: usize,
+    /// The same in-place parser buffer that produced the tail. Ownership is
+    /// transferred only after a >10 ms tail, so ordinary frames retain the
+    /// zero-copy String -> Vec path and perform no capture allocation.
+    frame: Vec<u8>,
     phases: ClobFramePhaseTimings,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ClobReplayDistribution {
+    n: usize,
+    p50_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+    max_ns: u64,
+    cpu_p50_ns: u64,
+    cpu_p99_ns: u64,
+    cpu_p999_ns: u64,
+    cpu_max_ns: u64,
+    errors: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn clob_quantile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = (sorted.len().saturating_sub(1) * numerator + denominator - 1) / denominator;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn replay_clob_simd_json(frame: &[u8], iterations: usize) -> ClobReplayDistribution {
+    let mut wall = Vec::with_capacity(iterations);
+    let mut cpu = Vec::with_capacity(iterations);
+    let mut replay = frame.to_vec();
+    let mut errors = 0usize;
+    for _ in 0..iterations {
+        replay.copy_from_slice(frame);
+        let is_array = replay
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(b'[');
+        let cpu_started = clob_thread_cpu_ns();
+        let started = crate::latency::Instant::now();
+        let decoded = if is_array {
+            simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut replay).map(|frames| frames.len())
+        } else {
+            simd_json::serde::from_slice::<ClobFrame>(&mut replay).map(|_| 1)
+        };
+        let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let cpu_elapsed = clob_thread_cpu_ns().saturating_sub(cpu_started);
+        match decoded {
+            Ok(count) => {
+                std::hint::black_box(count);
+                wall.push(elapsed);
+                cpu.push(cpu_elapsed);
+            }
+            Err(_) => errors = errors.saturating_add(1),
+        }
+    }
+    wall.sort_unstable();
+    cpu.sort_unstable();
+    ClobReplayDistribution {
+        n: wall.len(),
+        p50_ns: clob_quantile(&wall, 50, 100),
+        p99_ns: clob_quantile(&wall, 99, 100),
+        p999_ns: clob_quantile(&wall, 999, 1_000),
+        max_ns: wall.last().copied().unwrap_or(0),
+        cpu_p50_ns: clob_quantile(&cpu, 50, 100),
+        cpu_p99_ns: clob_quantile(&cpu, 99, 100),
+        cpu_p999_ns: clob_quantile(&cpu, 999, 1_000),
+        cpu_max_ns: cpu.last().copied().unwrap_or(0),
+        errors,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn clob_frame_structure_summary(frame: &[u8]) -> serde_json::Value {
+    let mut event_types = std::collections::BTreeMap::<String, u64>::new();
+    let mut price_change_entries = 0_u64;
+    let mut book_bid_levels = 0_u64;
+    let mut book_ask_levels = 0_u64;
+    let parsed = serde_json::from_slice::<serde_json::Value>(frame);
+    if let Ok(root) = &parsed {
+        let items: Vec<&serde_json::Value> = root
+            .as_array()
+            .map(|items| items.iter().collect())
+            .unwrap_or_else(|| vec![root]);
+        for item in &items {
+            let event_type = item
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    if item.get("source").is_some() {
+                        "inline_rtds"
+                    } else {
+                        "missing"
+                    }
+                });
+            *event_types.entry(event_type.to_string()).or_default() += 1;
+            price_change_entries = price_change_entries.saturating_add(
+                item.get("price_changes")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |entries| entries.len() as u64),
+            );
+            book_bid_levels = book_bid_levels.saturating_add(
+                item.get("bids")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |entries| entries.len() as u64),
+            );
+            book_ask_levels = book_ask_levels.saturating_add(
+                item.get("asks")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |entries| entries.len() as u64),
+            );
+        }
+        serde_json::json!({
+            "frame_bytes": frame.len(),
+            "root": if root.is_array() { "array" } else { "object" },
+            "items": items.len(),
+            "event_types": event_types,
+            "price_change_entries": price_change_entries,
+            "book_bid_levels": book_bid_levels,
+            "book_ask_levels": book_ask_levels,
+            "json_valid_after_in_place_parse": true,
+        })
+    } else {
+        serde_json::json!({
+            "frame_bytes": frame.len(),
+            "root": "invalid_after_in_place_parse",
+            "json_valid_after_in_place_parse": false,
+            "parse_error": parsed.err().map(|error| error.to_string()),
+        })
+    }
 }
 
 /// A dedicated housekeeping owner continuously runs a low-frequency,
@@ -3367,18 +3521,65 @@ impl ClobPerfRing {
                     // preceding the trigger.
                     let _ = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
                     let status = child.wait();
+                    let frame_output = format!("{output}.frame.json");
+                    let summary_output = format!("{output}.summary.json");
+                    let structure = clob_frame_structure_summary(&trigger.frame);
+                    let replay = replay_clob_simd_json(&trigger.frame, 1_024);
+                    let summary = serde_json::json!({
+                        "triggering_tail_us": trigger.elapsed.as_micros(),
+                        "phases_us": {
+                            "simd_json": trigger.phases.simd_json_ns / 1_000,
+                            "book_apply": trigger.phases.book_apply_ns / 1_000,
+                            "price_change_apply": trigger.phases.price_change_apply_ns / 1_000,
+                            "event_construction": trigger.phases.event_construction_ns / 1_000,
+                        },
+                        "structure": structure,
+                        "same_frame_simd_json_replay": {
+                            "n": replay.n,
+                            "p50_us": replay.p50_ns / 1_000,
+                            "p99_us": replay.p99_ns / 1_000,
+                            "p999_us": replay.p999_ns / 1_000,
+                            "max_us": replay.max_ns / 1_000,
+                            "cpu_p50_us": replay.cpu_p50_ns / 1_000,
+                            "cpu_p99_us": replay.cpu_p99_ns / 1_000,
+                            "cpu_p999_us": replay.cpu_p999_ns / 1_000,
+                            "cpu_max_us": replay.cpu_max_ns / 1_000,
+                            "errors": replay.errors,
+                        }
+                    });
+                    if let Err(error) = std::fs::write(&frame_output, &trigger.frame) {
+                        warn!("[clob_perf_frame] action=write_frame_failed output={} error={}", frame_output, error);
+                    }
+                    if let Err(error) = std::fs::write(
+                        &summary_output,
+                        serde_json::to_vec_pretty(&summary).unwrap_or_default(),
+                    ) {
+                        warn!("[clob_perf_frame] action=write_summary_failed output={} error={}", summary_output, error);
+                    }
                     warn!(
-                        "[clob_perf_ring] action=frozen tid={} frequency_hz={} output={} status={:?} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={}",
+                        "[clob_perf_ring] action=frozen tid={} frequency_hz={} output={} frame_output={} summary_output={} status={:?} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} replay_n={} replay_p50_us={} replay_p99_us={} replay_p999_us={} replay_max_us={} replay_cpu_p50_us={} replay_cpu_p99_us={} replay_cpu_p999_us={} replay_cpu_max_us={} replay_errors={}",
                         tid,
                         frequency,
                         output,
+                        frame_output,
+                        summary_output,
                         status,
                         trigger.elapsed.as_micros(),
-                        trigger.frame_len,
+                        trigger.frame.len(),
                         trigger.phases.simd_json_ns / 1_000,
                         trigger.phases.book_apply_ns / 1_000,
                         trigger.phases.price_change_apply_ns / 1_000,
                         trigger.phases.event_construction_ns / 1_000,
+                        replay.n,
+                        replay.p50_ns / 1_000,
+                        replay.p99_ns / 1_000,
+                        replay.p999_ns / 1_000,
+                        replay.max_ns / 1_000,
+                        replay.cpu_p50_ns / 1_000,
+                        replay.cpu_p99_ns / 1_000,
+                        replay.cpu_p999_ns / 1_000,
+                        replay.cpu_max_ns / 1_000,
+                        replay.errors,
                     );
                 }
             });
@@ -3392,8 +3593,7 @@ impl ClobPerfRing {
     }
 
     fn trigger(&self, trigger: ClobPerfTrigger) {
-        static HIGH_WATER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static HIGH_WATER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let depth = self.tx.len().saturating_add(1);
         HIGH_WATER.fetch_max(depth.min(2), Ordering::Relaxed);
         crate::latency::record_ns(
@@ -3410,7 +3610,7 @@ impl ClobPerfRing {
 fn maybe_trigger_clob_perf(
     ring: Option<&ClobPerfRing>,
     elapsed: Duration,
-    frame_len: usize,
+    frame: Vec<u8>,
     phases: ClobFramePhaseTimings,
 ) {
     static LAST_TRIGGER_NS: AtomicU64 = AtomicU64::new(0);
@@ -3436,14 +3636,14 @@ fn maybe_trigger_clob_perf(
     }
     ring.trigger(ClobPerfTrigger {
         elapsed,
-        frame_len,
+        frame,
         phases,
     });
 }
 
 #[cfg(test)]
 mod clob_perf_command_tests {
-    use super::clob_perf_record_command;
+    use super::{clob_frame_structure_summary, clob_perf_record_command, replay_clob_simd_json};
 
     #[test]
     fn cpu_sampling_prewindow_uses_overwrite_without_aux_snapshot() {
@@ -3458,6 +3658,24 @@ mod clob_perf_command_tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--output", "/tmp/clob-perf-test.data"]));
+    }
+
+    #[test]
+    fn captured_frame_summary_and_same_frame_replay_are_deterministic() {
+        let frame = br#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9300"},{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"}],"timestamp":"9301"}]"#;
+        let summary = clob_frame_structure_summary(frame);
+        assert_eq!(summary["root"], "array");
+        assert_eq!(summary["items"], 2);
+        assert_eq!(summary["event_types"]["book"], 1);
+        assert_eq!(summary["event_types"]["price_change"], 1);
+        assert_eq!(summary["price_change_entries"], 1);
+        let replay = replay_clob_simd_json(frame, 32);
+        assert_eq!(replay.n, 32);
+        assert_eq!(replay.errors, 0);
+        assert!(replay.max_ns >= replay.p50_ns);
+        assert!(replay.p999_ns >= replay.p99_ns);
+        assert!(replay.cpu_max_ns >= replay.cpu_p50_ns);
+        assert!(replay.cpu_p999_ns >= replay.cpu_p99_ns);
     }
 }
 
@@ -3475,7 +3693,7 @@ impl ClobPerfRing {
 fn maybe_trigger_clob_perf(
     _ring: Option<&ClobPerfRing>,
     _elapsed: Duration,
-    _frame_len: usize,
+    _frame: Vec<u8>,
     _phases: ClobFramePhaseTimings,
 ) {
 }
@@ -3666,6 +3884,7 @@ async fn connect_clob_lane(
     let connected_at = Instant::now();
     let mut lane = ClobConnection {
         lane_id,
+        token_generation: clob_token_generation(tokens),
         write,
         read: ClobPollInstrumentedStream::new(read),
         tcp_fd,
@@ -3685,9 +3904,10 @@ async fn connect_clob_lane(
     .await
     .map_err(|error| format!("subscribe send failed: {error}"))?;
     info!(
-        "[clob_lane_connected] lane_id={} peer={:?} subscription_tokens={}",
+        "[clob_lane_connected] lane_id={} peer={:?} token_generation={} subscription_tokens={}",
         lane_id,
         peer_addr,
+        lane.token_generation,
         tokens.len(),
     );
     Ok(lane)
@@ -4127,16 +4347,12 @@ fn request_clob_book_repair_after(
     });
 }
 
-fn reset_clob_books_for_failover(
-    books: &mut ClobLocalBooks,
-    subscription: &ClobSubscription,
-    now: Instant,
-) {
-    *books = ClobLocalBooks::new(&subscription.canonical_events);
-    for token in &subscription.tokens {
-        books.quarantined_tokens.insert(token.clone());
-        books.repair_started_at.insert(token.clone(), now);
-    }
+fn can_inherit_seeded_clob_generation(
+    active_generation: u64,
+    standby_generation: u64,
+    all_tokens_seeded: bool,
+) -> bool {
+    active_generation != 0 && active_generation == standby_generation && all_tokens_seeded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4287,6 +4503,25 @@ fn promote_clob_standby(
         );
         return false;
     }
+    let expected_generation = clob_token_generation(&subscription.tokens);
+    let all_tokens_seeded = books.has_all_seeded(&subscription.tokens);
+    if !can_inherit_seeded_clob_generation(
+        active.token_generation,
+        promoted.token_generation,
+        all_tokens_seeded,
+    ) {
+        warn!(
+            "[clob_failover_rejected] old_lane_id={} candidate_lane_id={} old_token_generation={} candidate_token_generation={} expected_token_generation={} all_tokens_seeded={} reason={} action=full_reconnect",
+            active.lane_id,
+            promoted.lane_id,
+            active.token_generation,
+            promoted.token_generation,
+            expected_generation,
+            all_tokens_seeded,
+            reason,
+        );
+        return false;
+    }
 
     let old_lane_id = active.lane_id;
     let old_peer = active.peer_addr;
@@ -4298,26 +4533,21 @@ fn promote_clob_standby(
     active.burst = ClobBurstMetrics::new(now);
     *health = WsHealth::new(now);
 
-    // The standby was continuously drained but deliberately not parsed. It
-    // can therefore contain one newer frame that the former active lane never
-    // applied. Fail closed, discard the derived books, and reseed every token
-    // from an authoritative full snapshot before READY is emitted again.
-    reset_clob_books_for_failover(books, subscription, now);
-    let (new_repair_tx, new_repair_rx) = tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
-    *repair_tx = new_repair_tx;
-    *repair_rx = new_repair_rx;
-    *repair_generation = advance_clob_repair_generation(repair_generation_epoch);
-    repairs_in_flight.clear();
-    repair_superseded_attempts.clear();
-    request_clob_book_repairs(
-        subscription.tokens.clone(),
-        &subscription.tokens,
-        *repair_generation,
+    // Both sockets were subscribed to the same token generation, and the
+    // active owner already has complete L2 seeds. The standby has been drained
+    // continuously, so inherit that condition-scoped state and its in-flight
+    // repair generation. A later BBO mismatch still schedules its ordinary
+    // condition-scoped REST repair, but promotion itself never emits
+    // NOT_READY or performs an all-token cold reset.
+    let _ = (
+        repair_tx,
+        repair_rx,
+        repair_generation,
         repair_generation_epoch,
         repairs_in_flight,
-        repair_tx,
+        repair_superseded_attempts,
+        liveness,
     );
-    liveness.mark_subscribed();
 
     if let Some(connect) = standby_connect.take() {
         connect.abort();
@@ -4334,13 +4564,13 @@ fn promote_clob_standby(
         now.elapsed().as_nanos().min(u64::MAX as u128) as u64,
     );
     warn!(
-        "[clob_hot_failover] old_lane_id={} old_peer={:?} promoted_lane_id={} promoted_peer={:?} standby_raw_age_ms={} repair_tokens={} reason={}",
+        "[clob_hot_failover] old_lane_id={} old_peer={:?} promoted_lane_id={} promoted_peer={:?} token_generation={} standby_raw_age_ms={} inherited_seeded_books=true repair_tokens=0 not_ready_ms=0 reason={}",
         old_lane_id,
         old_peer,
         active.lane_id,
         active.peer_addr,
+        active.token_generation,
         standby_raw_age.as_millis(),
-        subscription.tokens.len(),
         reason,
     );
     true
@@ -5276,7 +5506,6 @@ async fn clob_ws_task(
                         Some(Ok(message)) => message,
                         Some(Err(error)) => {
                             let failover_reason = format!("active WS read error: {error}");
-                            announce_clob_not_ready(&event_tx, &mut lifecycle, &failover_reason);
                             let now = Instant::now();
                             warn!(
                                 "[Polymarket] active WS read error: {} — failover/reconnect; {}",
@@ -5302,11 +5531,15 @@ async fn clob_ws_task(
                             ) {
                                 continue;
                             }
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                &failover_reason,
+                            );
                             break;
                         }
                         None => {
                             let failover_reason = "active WS closed";
-                            announce_clob_not_ready(&event_tx, &mut lifecycle, failover_reason);
                             let now = Instant::now();
                             warn!(
                                 "[Polymarket] active WS closed — failover/reconnect; {}",
@@ -5331,6 +5564,11 @@ async fn clob_ws_task(
                             ) {
                                 continue;
                             }
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                failover_reason,
+                            );
                             break;
                         }
                     };
@@ -5469,7 +5707,7 @@ async fn clob_ws_task(
                                 maybe_trigger_clob_perf(
                                     clob_perf_ring.as_ref(),
                                     parse_apply_elapsed,
-                                    frame_len,
+                                    frame_bytes,
                                     frame_phases,
                                 );
                             }
@@ -5558,7 +5796,6 @@ async fn clob_ws_task(
                             } else {
                                 "active server close"
                             };
-                            announce_clob_not_ready(&event_tx, &mut lifecycle, failover_reason);
                             if promote_clob_standby(
                                 &mut active,
                                 &mut standby,
@@ -5578,6 +5815,11 @@ async fn clob_ws_task(
                             ) {
                                 continue;
                             }
+                            announce_clob_not_ready(
+                                &event_tx,
+                                &mut lifecycle,
+                                failover_reason,
+                            );
                             immediate_reconnect = server_slow_consumer;
                             break;
                         }
@@ -8343,8 +8585,14 @@ mod clob_event_lane_tests {
         };
         let change = &fields.price_changes[0];
         assert!(matches!(change.asset_id, std::borrow::Cow::Borrowed(_)));
-        assert!(matches!(change.price, WireDecimal::String(std::borrow::Cow::Borrowed(_))));
-        assert!(matches!(change.size, WireDecimal::String(std::borrow::Cow::Borrowed(_))));
+        assert!(matches!(
+            change.price,
+            WireDecimal::String(std::borrow::Cow::Borrowed(_))
+        ));
+        assert!(matches!(
+            change.size,
+            WireDecimal::String(std::borrow::Cow::Borrowed(_))
+        ));
     }
 
     fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
@@ -8518,18 +8766,20 @@ mod pick_current_event_tests {
     }
 
     #[test]
-    fn failover_reseed_is_not_ready_until_every_token_has_a_full_book() {
-        let subscription = ClobSubscription {
-            tokens: vec!["up".to_string(), "down".to_string()],
-            canonical_events: Vec::new(),
-        };
-        let mut books = ClobLocalBooks::default();
-        reset_clob_books_for_failover(&mut books, &subscription, Instant::now());
-
-        assert!(!books.has_all_seeded(&subscription.tokens));
-        assert!(books.quarantined_tokens.contains("up"));
-        assert!(books.quarantined_tokens.contains("down"));
-        assert_eq!(books.repair_started_at.len(), 2);
+    fn failover_inherits_only_the_same_fully_seeded_token_generation() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let generation = clob_token_generation(&tokens);
+        assert!(can_inherit_seeded_clob_generation(
+            generation, generation, true,
+        ));
+        assert!(!can_inherit_seeded_clob_generation(
+            generation,
+            generation.wrapping_add(1),
+            true,
+        ));
+        assert!(!can_inherit_seeded_clob_generation(
+            generation, generation, false,
+        ));
     }
 
     #[test]
@@ -10394,7 +10644,9 @@ mod pick_current_event_tests {
         );
         assert_eq!(current_batch.diagnostics.len(), 1);
         assert_eq!(current_batch.diagnostics[0].key, "invalid_price_change");
-        assert!(current_batch.diagnostics[0].detail.starts_with("token=current "));
+        assert!(current_batch.diagnostics[0]
+            .detail
+            .starts_with("token=current "));
     }
 
     #[test]

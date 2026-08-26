@@ -487,11 +487,6 @@ enum AccountOwnerOperation {
         detail: String,
     },
     RepairConfirmedMaintenanceRiskBlockers(crossbeam_channel::Sender<usize>),
-    PendingMaintenanceOperations(crossbeam_channel::Sender<Vec<MaintenanceOperation>>),
-    MaintenanceOperation {
-        operation_id: String,
-        reply: crossbeam_channel::Sender<Option<MaintenanceOperation>>,
-    },
     FailMaintenanceOperation {
         operation_id: String,
         detail: String,
@@ -820,15 +815,6 @@ impl AccountOwnerCommand {
             }
             RepairConfirmedMaintenanceRiskBlockers(reply) => {
                 let _ = reply.send(account.repair_confirmed_maintenance_risk_blockers());
-            }
-            PendingMaintenanceOperations(reply) => {
-                let _ = reply.send(account.pending_maintenance_operations());
-            }
-            MaintenanceOperation {
-                operation_id,
-                reply,
-            } => {
-                let _ = reply.send(account.maintenance_operation(&operation_id));
             }
             FailMaintenanceOperation {
                 operation_id,
@@ -1864,6 +1850,10 @@ struct PublishedEconomicSnapshot {
     maintenance_queue_max_wait_ms: u64,
     maintenance_queue_jobs: u64,
     pending_maintenance_operations: usize,
+    /// Immutable wallet/onchain actor projection. External maintenance
+    /// workers query this publication instead of synchronously requesting the
+    /// cold account mutex; mutations remain ordered on the sole owner lane.
+    maintenance_operations: BTreeMap<String, MaintenanceOperation>,
     verified_trade_replay_recoveries: u64,
 }
 
@@ -1895,6 +1885,7 @@ impl PublishedEconomicSnapshot {
                     )
                 })
                 .count(),
+            maintenance_operations: state.maintenance_ops.clone(),
             verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
         }
     }
@@ -8221,10 +8212,7 @@ impl SharedAccount {
     /// an independent event-end marker, the recovery owner can then release
     /// the reservation without depending on an indefinitely slow historical
     /// CLOB order lookup.
-    pub fn startup_query_repair_has_full_failed_trade_proof(
-        &self,
-        client_order_id: &str,
-    ) -> bool {
+    pub fn startup_query_repair_has_full_failed_trade_proof(&self, client_order_id: &str) -> bool {
         self.read_cold_state(|state| {
             startup_query_repair_has_full_failed_trade_proof(state, client_order_id)
         })
@@ -14217,9 +14205,20 @@ impl SharedAccount {
     /// saturation is explicitly retryable and must never unwind the worker.
     pub fn try_pending_maintenance_operations(&self) -> Result<Vec<MaintenanceOperation>, String> {
         if self.must_dispatch_to_account_owner() {
-            return self.request_account_owner(|reply| {
-                AccountOwnerCommand(AccountOwnerOperation::PendingMaintenanceOperations(reply))
-            });
+            let snapshot = self.economic_snapshot_fast.load();
+            return Ok(snapshot
+                .maintenance_operations
+                .values()
+                .filter(|operation| {
+                    matches!(
+                        operation.status,
+                        MaintenanceOperationStatus::Reserved
+                            | MaintenanceOperationStatus::Submitted
+                            | MaintenanceOperationStatus::Uncertain
+                    )
+                })
+                .cloned()
+                .collect());
         }
         Ok(self.pending_maintenance_operations())
     }
@@ -14252,15 +14251,12 @@ impl SharedAccount {
 
     pub fn maintenance_operation(&self, operation_id: &str) -> Option<MaintenanceOperation> {
         if self.must_dispatch_to_account_owner() {
-            let operation_id = operation_id.to_string();
             return self
-                .request_account_owner(|reply| {
-                    AccountOwnerCommand(AccountOwnerOperation::MaintenanceOperation {
-                        operation_id,
-                        reply,
-                    })
-                })
-                .unwrap_or(None);
+                .economic_snapshot_fast
+                .load()
+                .maintenance_operations
+                .get(operation_id)
+                .cloned();
         }
         self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
     }
@@ -16388,9 +16384,9 @@ impl SharedAccount {
                         reply,
                     })
                 })
-                .unwrap_or_else(|_| {
-                    Err("settled GC lifecycle owner lane unavailable".to_string())
-                });
+                .unwrap_or_else(
+                    |_| Err("settled GC lifecycle owner lane unavailable".to_string()),
+                );
         }
         // Hold the route generation read guard for the whole deletion turn.
         // Re-registration takes the write side, so once it returns an old
@@ -17947,9 +17943,11 @@ fn startup_query_repair_has_full_failed_trade_proof(
 
     let mut failed_quantity = 0.0;
     let mut matching_trades = 0usize;
-    for trade in state.trades.values().filter(|trade| {
-        trade_ownership_matches_order_root(&trade.ownership, order)
-    }) {
+    for trade in state
+        .trades
+        .values()
+        .filter(|trade| trade_ownership_matches_order_root(&trade.ownership, order))
+    {
         if !trade.failed
             || !trade.failure_reconciled
             || trade.ownership.status != "FAILED"
@@ -17961,9 +17959,11 @@ fn startup_query_repair_has_full_failed_trade_proof(
         failed_quantity += trade.ownership.quantity;
         matching_trades = matching_trades.saturating_add(1);
     }
-    if state.retired_trade_ownership_tombstones.values().any(|tombstone| {
-        trade_ownership_matches_order_root(&tombstone.ownership, order)
-    }) {
+    if state
+        .retired_trade_ownership_tombstones
+        .values()
+        .any(|tombstone| trade_ownership_matches_order_root(&tombstone.ownership, order))
+    {
         return false;
     }
     matching_trades > 0
@@ -20689,20 +20689,18 @@ mod tests {
     }
 
     #[test]
-    fn owner_snapshot_timeout_is_retryable_and_never_panics() {
-        let account = SharedAccount::new("owner-snapshot-timeout");
+    fn wallet_actor_maintenance_projection_does_not_wait_for_busy_owner() {
+        let account = Arc::new(SharedAccount::new("owner-snapshot-timeout"));
         // Bind the bounded lane but intentionally do not run its consumer.
         // This deterministically models a long account-owner replay turn.
-        let _owner_rx = account.bind_account_owner_task_lane().unwrap();
+        let (_handle, _owner) = account.bind_account_owner().unwrap();
 
-        let maintenance_error = account
+        let started = Instant::now();
+        let maintenance = account
             .try_pending_maintenance_operations()
-            .expect_err("busy owner must return a retryable maintenance error");
-        assert!(maintenance_error.contains("completion timed out"));
-        assert!(
-            account.pending_maintenance_operations().is_empty(),
-            "compatibility wrapper must degrade without unwinding the worker",
-        );
+            .expect("maintenance projection is immutable and lock-free");
+        assert!(maintenance.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(10));
 
         let token_error = account
             .try_token_interests()
@@ -20733,7 +20731,8 @@ mod tests {
 
     #[test]
     fn maintenance_history_reads_skip_full_virtual_publication() {
-        let account = SharedAccount::new("maintenance-cold-read");
+        let account = Arc::new(SharedAccount::new("maintenance-cold-read"));
+        let (_handle, _owner) = account.bind_account_owner().unwrap();
         let ended_tokens = account.ended_token_ids_fast.load_full();
 
         assert!(account.pending_maintenance_operations().is_empty());
@@ -20748,10 +20747,11 @@ mod tests {
     fn benchmark_maintenance_cold_read_vs_full_account_transaction() {
         const INSTANCES: usize = 256;
         const EVENTS_PER_VARIANT: usize = 200;
-        let account = SharedAccount::new("maintenance-cold-read-benchmark");
+        let account = Arc::new(SharedAccount::new("maintenance-cold-read-benchmark"));
         for index in 0..INSTANCES {
             account.register_instance(&format!("instance-{index}"), 1.0);
         }
+        let (_handle, _owner) = account.bind_account_owner().unwrap();
 
         let mut full_transaction = Vec::with_capacity(EVENTS_PER_VARIANT);
         let mut cold_read = Vec::with_capacity(EVENTS_PER_VARIANT);
@@ -27340,11 +27340,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert!(restored.startup_query_repair_has_full_failed_trade_proof(coid));
         {
             let mut cold = restored.state.lock().unwrap();
-            cold.trades
-                .get_mut(trade_key)
-                .unwrap()
-                .ownership
-                .quantity = 39.0;
+            cold.trades.get_mut(trade_key).unwrap().ownership.quantity = 39.0;
             assert!(!startup_query_repair_has_full_failed_trade_proof(
                 &cold, coid,
             ));
@@ -27356,10 +27352,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             assert!(!startup_query_repair_has_full_failed_trade_proof(
                 &cold, coid,
             ));
-            cold.trades
-                .get_mut(trade_key)
-                .unwrap()
-                .failure_reconciled = true;
+            cold.trades.get_mut(trade_key).unwrap().failure_reconciled = true;
         }
         restored.flush_persistence(Duration::from_secs(2)).unwrap();
         drop(restored);
@@ -28592,9 +28585,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 )
                 .ownership()
                 .is_some());
-            account
-                .flush_persistence(Duration::from_secs(2))
-                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
             let before = account.monitoring_snapshot();
             assert!(account
                 .apply_trade_transition_with_context(
