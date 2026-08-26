@@ -140,6 +140,7 @@ pub struct CorePlan {
     pub fifo_execution: u8,
     pub fifo_polymarket_feed: u8,
     pub fifo_completion: u8,
+    pub fifo_private_apply: u8,
 }
 
 impl CorePlan {
@@ -170,6 +171,7 @@ impl CorePlan {
             fifo_execution: DEFAULT_PRIO_EXECUTION,
             fifo_polymarket_feed: DEFAULT_PRIO_EXECUTION,
             fifo_completion: DEFAULT_PRIO_EXECUTION,
+            fifo_private_apply: DEFAULT_PRIO_EXECUTION,
         }
     }
 
@@ -221,6 +223,11 @@ impl CorePlan {
                 .unwrap_or(DEFAULT_PRIO_EXECUTION),
             fifo_completion: cfg
                 .fifo_completion
+                .or(cfg.fifo_execution)
+                .unwrap_or(DEFAULT_PRIO_EXECUTION),
+            fifo_private_apply: cfg
+                .fifo_private_apply
+                .or(cfg.fifo_completion)
                 .or(cfg.fifo_execution)
                 .unwrap_or(DEFAULT_PRIO_EXECUTION),
         }
@@ -578,14 +585,14 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={} allow_strategy_router_on_execution={} allow_private_apply_on_completion={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={} private_apply={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={} allow_strategy_router_on_execution={} allow_private_apply_on_completion={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
         plan.feed_cores, plan.private_apply_cores, plan.private_cold_cores,
         plan.hex_worker_cores,
         plan.poly_exec_cores, plan.poly_cancel_cores, plan.poly_completion_cores,
         plan.background_cores,
         plan.fifo_async_rt, plan.fifo_strategy, plan.fifo_execution,
-        plan.fifo_polymarket_feed, plan.fifo_completion,
+        plan.fifo_polymarket_feed, plan.fifo_completion, plan.fifo_private_apply,
         plan.enable_pin, plan.enable_fifo, plan.strict_core_isolation,
         plan.allow_background_on_execution_core,
         plan.allow_strategy_router_on_execution_core,
@@ -1041,14 +1048,14 @@ fn pretouch_strategy_stack() {
 }
 
 /// Pin the authenticated private account-apply worker to its account-specific
-/// core.  It uses completion priority: private fills should preempt order
-/// signing and housekeeping, while public market-data and strategy decisions
-/// retain their higher priorities.
+/// core. It has an explicit priority: private lifecycle can preempt ordinary
+/// HTTP completion work while public market-data and strategy decisions retain
+/// their higher priorities.
 pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
     let p = plan();
     if let Some(core) = p.private_apply_cores.get(account_id).copied() {
         pin_current(core, thread_name);
-        set_fifo(p.fifo_completion, thread_name);
+        set_fifo(p.fifo_private_apply, thread_name);
     } else {
         pin_background(thread_name);
     }
@@ -1431,10 +1438,12 @@ mod tests {
         cfg.fifo_execution = Some(50);
         cfg.fifo_polymarket_feed = Some(71);
         cfg.fifo_completion = Some(55);
+        cfg.fifo_private_apply = Some(59);
         let plan = CorePlan::from_config(&cfg);
         assert_eq!(plan.fifo_execution, 50);
         assert_eq!(plan.fifo_polymarket_feed, 71);
         assert_eq!(plan.fifo_completion, 55);
+        assert_eq!(plan.fifo_private_apply, 59);
     }
 
     #[test]
