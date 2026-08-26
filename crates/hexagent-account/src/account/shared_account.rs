@@ -8213,6 +8213,23 @@ impl SharedAccount {
         pending
     }
 
+    /// Return whether a startup query-repair order has a complete durable
+    /// FAILED-trade proof for its entire original size. This is deliberately
+    /// narrower than ordinary FAILED recovery: every matching trade must be a
+    /// reconciled failure, their quantities must exactly cover the order, and
+    /// no successful or retired trade root may share the order. Combined with
+    /// an independent event-end marker, the recovery owner can then release
+    /// the reservation without depending on an indefinitely slow historical
+    /// CLOB order lookup.
+    pub fn startup_query_repair_has_full_failed_trade_proof(
+        &self,
+        client_order_id: &str,
+    ) -> bool {
+        self.read_cold_state(|state| {
+            startup_query_repair_has_full_failed_trade_proof(state, client_order_id)
+        })
+    }
+
     pub fn account_id(&self) -> &str {
         &self.account_id
     }
@@ -17909,6 +17926,52 @@ fn failed_trade_keys_by_order_for_query(
     by_order
 }
 
+fn startup_query_repair_has_full_failed_trade_proof(
+    state: &SharedAccountState,
+    client_order_id: &str,
+) -> bool {
+    if !state.startup_query_repair_orders.contains(client_order_id)
+        || !state.recovery_pending_orders.contains(client_order_id)
+    {
+        return false;
+    }
+    let Some(order) = state.orders.get(client_order_id) else {
+        return false;
+    };
+    if order.filled_quantity > EPS
+        || order.terminal_matched_quantity.is_some()
+        || order.terminal_trade_ids_authoritative
+    {
+        return false;
+    }
+
+    let mut failed_quantity = 0.0;
+    let mut matching_trades = 0usize;
+    for trade in state.trades.values().filter(|trade| {
+        trade_ownership_matches_order_root(&trade.ownership, order)
+    }) {
+        if !trade.failed
+            || !trade.failure_reconciled
+            || trade.ownership.status != "FAILED"
+            || !trade.ownership.quantity.is_finite()
+            || trade.ownership.quantity <= EPS
+        {
+            return false;
+        }
+        failed_quantity += trade.ownership.quantity;
+        matching_trades = matching_trades.saturating_add(1);
+    }
+    if state.retired_trade_ownership_tombstones.values().any(|tombstone| {
+        trade_ownership_matches_order_root(&tombstone.ownership, order)
+    }) {
+        return false;
+    }
+    matching_trades > 0
+        && failed_quantity.is_finite()
+        && (failed_quantity - order.quantity).abs()
+            <= reconciliation_tolerance(failed_quantity, order.quantity)
+}
+
 /// Convert only a FAILED-trade order under-reservation into a conservative,
 /// queryable startup-recovery record. FAILED is terminal for the trade but can
 /// return its parent maker order to the book. A crash/racy terminal callback
@@ -27274,6 +27337,30 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let instance = restored.instance_snapshot(instance_id).unwrap();
         assert_eq!(instance.reserved_positions[token], 40.0);
         assert_eq!(restored.monitoring_snapshot().recovery_pending_orders, 1);
+        assert!(restored.startup_query_repair_has_full_failed_trade_proof(coid));
+        {
+            let mut cold = restored.state.lock().unwrap();
+            cold.trades
+                .get_mut(trade_key)
+                .unwrap()
+                .ownership
+                .quantity = 39.0;
+            assert!(!startup_query_repair_has_full_failed_trade_proof(
+                &cold, coid,
+            ));
+            {
+                let failed = cold.trades.get_mut(trade_key).unwrap();
+                failed.ownership.quantity = 40.0;
+                failed.failure_reconciled = false;
+            }
+            assert!(!startup_query_repair_has_full_failed_trade_proof(
+                &cold, coid,
+            ));
+            cold.trades
+                .get_mut(trade_key)
+                .unwrap()
+                .failure_reconciled = true;
+        }
         restored.flush_persistence(Duration::from_secs(2)).unwrap();
         drop(restored);
 
