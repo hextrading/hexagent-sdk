@@ -16,8 +16,8 @@ use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::future::Future;
-use std::pin::Pin;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -230,6 +230,16 @@ pub struct Http1PhaseTimings {
     pub incomplete_phase: Http1IncompletePhase,
 }
 
+/// Lock-free identity of the socket currently resident in one logical HTTP/1
+/// slot. This is intentionally a small value snapshot so connection owners
+/// can attribute a slow request without borrowing the connector or changing
+/// pool cardinality.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Http1ConnectionSnapshot {
+    pub connect_generation: u64,
+    pub peer: Option<SocketAddr>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Http1IncompletePhase {
     #[default]
@@ -415,13 +425,18 @@ impl InstrumentedHttp1Client {
                     kind,
                     message,
                     timings: self.snapshot(
-                    attempts_before,
-                    generation_before,
-                    if headers_ns == 0 { total_ns } else { headers_ns },
-                    total_ns.saturating_sub(headers_ns).min(total_ns) * u64::from(headers_ns != 0),
-                    total_ns,
-                    slot_wait_ns,
-                    self.incomplete_phase(headers_ns),
+                        attempts_before,
+                        generation_before,
+                        if headers_ns == 0 {
+                            total_ns
+                        } else {
+                            headers_ns
+                        },
+                        total_ns.saturating_sub(headers_ns).min(total_ns)
+                            * u64::from(headers_ns != 0),
+                        total_ns,
+                        slot_wait_ns,
+                        self.incomplete_phase(headers_ns),
                     ),
                 })
             }
@@ -432,16 +447,28 @@ impl InstrumentedHttp1Client {
                     kind: InstrumentedHttp1ErrorKind::Timeout,
                     message: format!("HTTP/1.1 request timed out after {}ms", timeout.as_millis()),
                     timings: self.snapshot(
-                    attempts_before,
-                    generation_before,
-                    if headers_ns == 0 { total_ns } else { headers_ns },
-                    total_ns.saturating_sub(headers_ns).min(total_ns) * u64::from(headers_ns != 0),
-                    total_ns,
-                    slot_wait_ns,
-                    self.incomplete_phase(headers_ns),
+                        attempts_before,
+                        generation_before,
+                        if headers_ns == 0 {
+                            total_ns
+                        } else {
+                            headers_ns
+                        },
+                        total_ns.saturating_sub(headers_ns).min(total_ns)
+                            * u64::from(headers_ns != 0),
+                        total_ns,
+                        slot_wait_ns,
+                        self.incomplete_phase(headers_ns),
                     ),
                 })
             }
+        }
+    }
+
+    pub fn connection_snapshot(&self) -> Http1ConnectionSnapshot {
+        Http1ConnectionSnapshot {
+            connect_generation: self.trace.generation.load(Ordering::Acquire),
+            peer: self.trace.peer(),
         }
     }
 
