@@ -568,26 +568,27 @@ fn recovered_order_close_reason(
         .then_some(RecoveredOrderCloseReason::JsonNull)
 }
 
-/// Query-repair rows must receive an actual CLOB order lookup. An event-end
-/// marker can close ordinary recovered orders before I/O, but is only fallback
-/// evidence for query repair after the bounded lookup attempts complete.
+/// Query-repair rows normally require an actual CLOB order lookup. The sole
+/// pre-I/O exception combines an event-end marker with a durable, reconciled
+/// FAILED-trade proof covering the order's complete original size. Neither
+/// proof alone is sufficient.
 fn prequery_recovered_order_close_reason(
     is_recovered: bool,
     event_has_ended: bool,
     requires_query_repair: bool,
+    full_failed_trade_proof: bool,
 ) -> Option<RecoveredOrderCloseReason> {
-    if requires_query_repair {
+    if requires_query_repair && !full_failed_trade_proof {
         None
     } else {
         recovered_order_close_reason(is_recovered, event_has_ended, None)
     }
 }
 
-/// Event-end evidence is only a pre-I/O shortcut for an order restored from
-/// durable recovery. Runtime cancel audits must query the order itself, while
-/// startup query-repair rows are explicitly required to do the same.
-fn should_lookup_recovered_event_end(is_recovered: bool, requires_query_repair: bool) -> bool {
-    is_recovered && !requires_query_repair
+/// Event-end evidence is consulted only for an order restored from durable
+/// recovery. Runtime cancel audits must still query the order itself.
+fn should_lookup_recovered_event_end(is_recovered: bool) -> bool {
+    is_recovered
 }
 
 fn can_reuse_persisted_terminal_audit(
@@ -6839,7 +6840,7 @@ impl PolymarketTrade {
 
             for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
                 let event_has_ended =
-                    if should_lookup_recovered_event_end(is_recovered, requires_query_repair) {
+                    if should_lookup_recovered_event_end(is_recovered) {
                         let event_end_started = crate::latency::Instant::now();
                         let ended = self
                             .shared
@@ -6853,10 +6854,17 @@ impl PolymarketTrade {
                     } else {
                         false
                     };
+                let full_failed_trade_proof = requires_query_repair
+                    && event_has_ended
+                    && self
+                        .shared
+                        .account_state
+                        .startup_query_repair_has_full_failed_trade_proof(&coid);
                 if let Some(reason) = prequery_recovered_order_close_reason(
                     is_recovered,
                     event_has_ended,
                     requires_query_repair,
+                    full_failed_trade_proof,
                 ) {
                     replayed_updates.push(self.close_recovered_order(
                         &ownership,
@@ -12802,16 +12810,23 @@ mod tests {
     }
 
     #[test]
-    fn query_repair_never_uses_event_end_to_skip_the_order_lookup() {
-        assert!(!should_lookup_recovered_event_end(false, false));
-        assert!(should_lookup_recovered_event_end(true, false));
-        assert!(!should_lookup_recovered_event_end(true, true));
+    fn query_repair_requires_complete_failed_trade_and_event_end_proofs() {
+        assert!(!should_lookup_recovered_event_end(false));
+        assert!(should_lookup_recovered_event_end(true));
         assert_eq!(
-            prequery_recovered_order_close_reason(true, true, false),
+            prequery_recovered_order_close_reason(true, true, false, false),
             Some(RecoveredOrderCloseReason::EventEnded),
         );
         assert_eq!(
-            prequery_recovered_order_close_reason(true, true, true),
+            prequery_recovered_order_close_reason(true, true, true, false),
+            None,
+        );
+        assert_eq!(
+            prequery_recovered_order_close_reason(true, true, true, true),
+            Some(RecoveredOrderCloseReason::EventEnded),
+        );
+        assert_eq!(
+            prequery_recovered_order_close_reason(true, false, true, true),
             None,
         );
         assert!(can_reuse_persisted_terminal_audit(true, false));
