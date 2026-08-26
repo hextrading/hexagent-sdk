@@ -17500,19 +17500,45 @@ fn terminal_order_audit_complete_locked(state: &SharedAccountState, client_order
     if order.terminal_trade_ids.is_empty() {
         return target <= EPS;
     }
+    let now_ms = wall_clock_ms();
     let covered = order
         .terminal_trade_ids
         .iter()
         .try_fold(0.0, |covered, expected_id| {
-            state
-                .trades
+            let mut live_matches = state.trades.values().filter(|trade| {
+                terminal_trade_id_matches(&trade.ownership.trade_key, expected_id)
+                    && trade_ownership_matches_order_root(&trade.ownership, order)
+                    && (trade.booked || trade.failed)
+            });
+            let live = live_matches.next();
+            if live_matches.next().is_some() {
+                return None;
+            }
+            let mut retired_matches = state
+                .retired_trade_ownership_tombstones
                 .values()
-                .find(|trade| {
-                    trade.ownership.client_order_id == client_order_id
-                        && terminal_trade_id_matches(&trade.ownership.trade_key, expected_id)
-                        && (trade.booked || trade.failed)
-                })
-                .map(|trade| covered + trade.ownership.quantity)
+                .filter(|tombstone| {
+                    terminal_trade_id_matches(&tombstone.ownership.trade_key, expected_id)
+                        && trade_ownership_matches_order_root(&tombstone.ownership, order)
+                        && !tombstone.authenticated_terminal_noop
+                        && matches!(
+                            tombstone.ownership.status.as_str(),
+                            "CONFIRMED" | "FAILED"
+                        )
+                        && retired_trade_tombstone_is_live(tombstone, now_ms)
+                });
+            let retired = retired_matches.next();
+            if retired_matches.next().is_some() {
+                return None;
+            }
+            // A trade root must have exactly one durable economic source.
+            // Seeing both a live row and its compacted tombstone is a corrupt
+            // overlap, so terminal recovery remains fail-closed.
+            match (live, retired) {
+                (Some(trade), None) => Some(covered + trade.ownership.quantity),
+                (None, Some(tombstone)) => Some(covered + tombstone.ownership.quantity),
+                _ => None,
+            }
         });
     let Some(covered) = covered else {
         return false;
@@ -21743,6 +21769,105 @@ mod tests {
         assert_eq!(audited.reserved_cash, 0.0);
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn terminal_audit_accepts_exact_live_retired_trade_mix_once() {
+        let account_id = "retired-terminal-audit";
+        let instance_id = "btc";
+        let coid = "btc-terminal-1";
+        let oid = "0xTERMINAL";
+        let token = "BTC-UP";
+        let confirmed_id = "trade-confirmed";
+        let failed_id = "trade-failed";
+        let mut state = SharedAccountState::default();
+        state.orders.insert(
+            coid.to_string(),
+            OrderOwnership {
+                order_slot: Default::default(),
+                account_id: account_id.to_string(),
+                instance_id: instance_id.to_string(),
+                client_order_id: coid.to_string(),
+                order_id: oid.to_string(),
+                token_id: token.to_string(),
+                side: Side::Sell,
+                quantity: 10.0,
+                filled_quantity: 4.12,
+                terminal_matched_quantity: Some(10.0),
+                terminal_trade_ids: vec![confirmed_id.to_string(), failed_id.to_string()],
+                terminal_trade_ids_authoritative: true,
+                price: 0.49,
+                fee_rate_bps: 700,
+                reserved_cash: 0.0,
+                reserved_quantity: 5.88,
+                status: OrderStatus::Filled,
+            },
+        );
+        let ownership = |trade_id: &str, quantity: f64, status: &str| TradeOwnership {
+            order_slot: Default::default(),
+            account_id: account_id.to_string(),
+            instance_id: instance_id.to_string(),
+            trade_key: format!("{trade_id}:{oid}"),
+            client_order_id: coid.to_string(),
+            order_id: oid.to_string(),
+            token_id: token.to_string(),
+            side: Side::Sell,
+            quantity,
+            price: 0.49,
+            status: status.to_string(),
+        };
+        state.retired_trade_ownership_tombstones.insert(
+            format!("{confirmed_id}:{oid}"),
+            RetiredTradeOwnershipTombstone {
+                ownership: ownership(confirmed_id, 4.12, "CONFIRMED"),
+                is_maker: Some(true),
+                authenticated_terminal_noop: false,
+                retired_at_ms: wall_clock_ms(),
+            },
+        );
+        state.retired_trade_ownership_tombstones.insert(
+            format!("{failed_id}:{oid}"),
+            RetiredTradeOwnershipTombstone {
+                ownership: ownership(failed_id, 5.88, "FAILED"),
+                is_maker: Some(true),
+                authenticated_terminal_noop: false,
+                retired_at_ms: wall_clock_ms(),
+            },
+        );
+
+        assert!(terminal_order_audit_complete_locked(&state, coid));
+
+        state.trades.insert(
+            format!("{confirmed_id}:{oid}"),
+            AppliedTrade {
+                ownership: ownership(confirmed_id, 4.12, "CONFIRMED"),
+                booked: true,
+                physical_booked: true,
+                usdc_fee: 0.0,
+                shares_fee: 0.0,
+                virtual_fee_booked: false,
+                physical_fee_booked: false,
+                failed: false,
+                failure_reconciled: false,
+                is_maker: Some(true),
+                match_time_secs: 0,
+                ledger_generation: 0,
+            },
+        );
+        assert!(
+            !terminal_order_audit_complete_locked(&state, coid),
+            "a live/retired duplicate must remain fail-closed",
+        );
+        state.trades.clear();
+        state
+            .retired_trade_ownership_tombstones
+            .get_mut(&format!("{failed_id}:{oid}"))
+            .unwrap()
+            .authenticated_terminal_noop = true;
+        assert!(
+            !terminal_order_audit_complete_locked(&state, coid),
+            "a historical no-op never proves economic terminal coverage",
+        );
     }
 
     #[test]
