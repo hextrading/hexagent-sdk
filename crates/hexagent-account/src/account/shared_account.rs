@@ -3996,6 +3996,20 @@ struct StaleVirtualTradeSnapshotWalEvidence {
     position_corrections: BTreeMap<String, f64>,
 }
 
+/// A condition-scoped platform redeem burned inventory that the checksummed
+/// WAL proves was owned immediately before the adjustment. Historical settled
+/// GC used to be able to retire the antecedent acquisition root later without
+/// carrying it into `compacted_economic_effects`; the redeem root then survived
+/// by itself and made immutable replay negative after restart.
+#[derive(Debug, Clone)]
+struct PlatformRedeemAntecedentWalEvidence {
+    generation: u64,
+    operation_id: String,
+    instance_id: String,
+    token_id: String,
+    burned_quantity: f64,
+}
+
 #[derive(Debug, Clone)]
 struct RetiredTradeReplayWalEvidence {
     resurrection_generation: u64,
@@ -4272,6 +4286,214 @@ fn economic_effects_match(left: &AccountEconomicState, right: &AccountEconomicSt
             (left - right).abs() <= reconciliation_tolerance(left, right)
         })
     })
+}
+
+fn platform_redeem_antecedent_wal_evidence(
+    record: &PersistenceWalRecord,
+    state_before: &serde_json::Value,
+) -> Result<Vec<PlatformRedeemAntecedentWalEvidence>, String> {
+    let mut evidence = Vec::new();
+    for change in &record.changes {
+        let PersistenceWalChange::Set { path, value } = change else {
+            continue;
+        };
+        if path.len() != 2 || path[0] != "external_adjustments" {
+            continue;
+        }
+        if json_value_at_path(state_before, path).is_some() {
+            continue;
+        }
+        let adjustment: ExternalAdjustment =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                format!(
+                    "decode external adjustment `{}` in WAL generation {}: {error}",
+                    path[1], record.generation,
+                )
+            })?;
+        if adjustment.operation_id != path[1]
+            || !(adjustment
+                .operation_id
+                .starts_with("internal:platform_redeem:")
+                || adjustment
+                    .operation_id
+                    .starts_with("internal:observed_platform_redeem:"))
+        {
+            continue;
+        }
+        for (token_id, delta) in &adjustment.position_deltas {
+            if *delta >= -EPS {
+                continue;
+            }
+            let position_path = vec![
+                "instances".to_string(),
+                adjustment.instance_id.clone(),
+                "positions".to_string(),
+                token_id.clone(),
+            ];
+            let prior = json_value_at_path(state_before, &position_path)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let burned_quantity = -*delta;
+            if prior + reconciliation_tolerance(prior, burned_quantity) < burned_quantity {
+                continue;
+            }
+            let next = record
+                .changes
+                .iter()
+                .rev()
+                .find_map(|candidate| match candidate {
+                    PersistenceWalChange::Set { path, value } if path == &position_path => {
+                        value.as_f64()
+                    }
+                    PersistenceWalChange::Remove { path } if path == &position_path => Some(0.0),
+                    _ => None,
+                });
+            let expected_next = prior - burned_quantity;
+            let Some(next) = next else {
+                continue;
+            };
+            if (next - expected_next).abs() > reconciliation_tolerance(next, expected_next) {
+                continue;
+            }
+            evidence.push(PlatformRedeemAntecedentWalEvidence {
+                generation: record.generation,
+                operation_id: adjustment.operation_id.clone(),
+                instance_id: adjustment.instance_id.clone(),
+                token_id: token_id.clone(),
+                burned_quantity,
+            });
+        }
+    }
+    Ok(evidence)
+}
+
+/// Restore only an antecedent position root that a later settled-GC frame
+/// dropped after a WAL-proven platform redeem. The current balance is not
+/// changed: adding the missing acquisition to compacted economics cancels the
+/// surviving burn and makes immutable replay agree with the already-zero
+/// virtual position. Every position mismatch must be explained exactly or the
+/// normal startup validator remains fail-closed.
+fn repair_missing_platform_redeem_antecedents_from_wal(
+    account_id: &str,
+    state: &mut SharedAccountState,
+    evidence: &[PlatformRedeemAntecedentWalEvidence],
+) -> bool {
+    if evidence.is_empty() || !state.seeded {
+        return false;
+    }
+    let Ok(replayed) = replay_account_economics(state) else {
+        return false;
+    };
+    let current = current_account_economics(state);
+    let mut candidates = BTreeMap::<(String, String), f64>::new();
+    for item in evidence {
+        *candidates
+            .entry((item.instance_id.clone(), item.token_id.clone()))
+            .or_insert(0.0) += item.burned_quantity;
+    }
+
+    let mut repairs = BTreeMap::<(String, String), f64>::new();
+    let mut instance_ids: HashSet<String> = current.instances.keys().cloned().collect();
+    instance_ids.extend(replayed.instances.keys().cloned());
+    for instance_id in instance_ids {
+        let stored = current.instances.get(&instance_id);
+        let expected = replayed.instances.get(&instance_id);
+        let mut tokens = HashSet::new();
+        if let Some(balance) = stored {
+            tokens.extend(balance.positions.keys().cloned());
+        }
+        if let Some(balance) = expected {
+            tokens.extend(balance.positions.keys().cloned());
+        }
+        for token_id in tokens {
+            let stored_position = stored
+                .and_then(|balance| balance.positions.get(&token_id))
+                .copied()
+                .unwrap_or(0.0);
+            let replayed_position = expected
+                .and_then(|balance| balance.positions.get(&token_id))
+                .copied()
+                .unwrap_or(0.0);
+            let missing_antecedent = stored_position - replayed_position;
+            if missing_antecedent.abs()
+                <= reconciliation_tolerance(stored_position, replayed_position)
+            {
+                continue;
+            }
+            let key = (instance_id.clone(), token_id.clone());
+            let candidate = candidates.get(&key).copied().unwrap_or(0.0);
+            if missing_antecedent <= EPS
+                || (missing_antecedent - candidate).abs()
+                    > reconciliation_tolerance(missing_antecedent, candidate)
+            {
+                return false;
+            }
+            repairs.insert(key, missing_antecedent);
+        }
+    }
+    if repairs.is_empty() {
+        return false;
+    }
+
+    let previous_compacted = state.compacted_economic_effects.clone();
+    for ((instance_id, token_id), quantity) in &repairs {
+        add_position_delta(
+            &mut state.compacted_economic_effects.physical_positions,
+            token_id,
+            *quantity,
+        );
+        let instance = economic_instance_mut(&mut state.compacted_economic_effects, instance_id);
+        add_position_delta(&mut instance.positions, token_id, *quantity);
+    }
+    let Ok(corrected) = replay_account_economics(state) else {
+        state.compacted_economic_effects = previous_compacted;
+        return false;
+    };
+    for (instance_id, stored) in &current.instances {
+        let corrected_balance = corrected.instances.get(instance_id);
+        let empty = HashMap::new();
+        if compare_economic_positions(
+            &format!("instance `{instance_id}` positions after platform redeem WAL recovery"),
+            &stored.positions,
+            corrected_balance.map_or(&empty, |balance| &balance.positions),
+        )
+        .is_err()
+        {
+            state.compacted_economic_effects = previous_compacted;
+            return false;
+        }
+    }
+
+    let repaired_keys: Vec<String> = repairs
+        .keys()
+        .map(|(instance_id, token_id)| format!("{instance_id}:{token_id}"))
+        .collect();
+    let first_generation = evidence
+        .iter()
+        .filter(|item| repairs.contains_key(&(item.instance_id.clone(), item.token_id.clone())))
+        .map(|item| item.generation)
+        .min()
+        .unwrap_or(0);
+    let last_generation = evidence
+        .iter()
+        .filter(|item| repairs.contains_key(&(item.instance_id.clone(), item.token_id.clone())))
+        .map(|item| item.generation)
+        .max()
+        .unwrap_or(0);
+    let operation_ids: BTreeSet<&str> = evidence
+        .iter()
+        .filter(|item| repairs.contains_key(&(item.instance_id.clone(), item.token_id.clone())))
+        .map(|item| item.operation_id.as_str())
+        .collect();
+    log::warn!(
+        "[shared_account] account={} repaired WAL-proven missing platform-redeem antecedent roots generations={}..={} positions={:?} operations={:?}",
+        account_id,
+        first_generation,
+        last_generation,
+        repaired_keys,
+        operation_ids,
+    );
+    true
 }
 
 /// Detect an absolute virtual-account publication that was captured from an
@@ -5077,6 +5299,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
     let snapshot_generation = persisted.persistence_generation;
     let mut applied_generation = snapshot_generation;
     let mut incomplete_maintenance_cash = Vec::new();
+    let mut platform_redeem_antecedents = Vec::new();
     let mut stale_virtual_trade_snapshots = Vec::new();
     let mut retired_trade_replays = Vec::new();
     let mut ledger_generation_regressions = Vec::new();
@@ -5195,6 +5418,8 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
                 line_number
             ));
         }
+        platform_redeem_antecedents
+            .extend(platform_redeem_antecedent_wal_evidence(&record, &state)?);
         stale_virtual_trade_snapshots
             .extend(stale_virtual_trade_snapshot_wal_evidence(&record, &state)?);
         retired_trade_replays.extend(retired_trade_replay_wal_evidence(&record, &state)?);
@@ -5235,6 +5460,11 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         &persisted.account_id,
         &mut persisted.state,
         &incomplete_maintenance_cash,
+    );
+    repair_missing_platform_redeem_antecedents_from_wal(
+        &persisted.account_id,
+        &mut persisted.state,
+        &platform_redeem_antecedents,
     );
     repair_stale_virtual_trade_snapshots_from_wal(
         &persisted.account_id,
@@ -9887,6 +10117,44 @@ impl SharedAccount {
         self.schedule_persist(&state);
     }
 
+    fn settlement_economic_scope(
+        &self,
+        values: &HashMap<String, f64>,
+        exact_condition_id: Option<&str>,
+    ) -> HashSet<String> {
+        let mut scope: HashSet<String> = values.keys().cloned().collect();
+        let accounts = self.virtual_accounts.read().unwrap();
+        let interests: Vec<TokenInterest> = accounts
+            .values()
+            .flat_map(|account| {
+                account
+                    .token_interests
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        drop(accounts);
+        loop {
+            let mut changed = false;
+            for interest in &interests {
+                if exact_condition_id.is_some_and(|condition| condition == interest.condition_id)
+                    || scope.contains(&interest.up_token_id)
+                    || scope.contains(&interest.down_token_id)
+                {
+                    changed |= scope.insert(interest.up_token_id.clone());
+                    changed |= scope.insert(interest.down_token_id.clone());
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        scope
+    }
+
     pub fn record_settled_token_values(&self, values: &HashMap<String, f64>) {
         if self.must_dispatch_to_account_owner() {
             let values = values.clone();
@@ -9902,7 +10170,8 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state();
+        let economic_scope = self.settlement_economic_scope(values, None);
+        let mut state = self.lock_economic_state(&economic_scope);
         let effective_generation = if state.settled_token_values.is_empty() {
             state.settled_token_values_generation
         } else {
@@ -9924,6 +10193,7 @@ impl SharedAccount {
             // lock so the outcome and any resulting virtual redemption are
             // persisted as one state transition.
             try_attribute_binary_redeem(&mut state, &self.account_id);
+            self.publish_control_snapshots(&state);
             self.schedule_persist(&state);
         }
     }
@@ -9958,7 +10228,8 @@ impl SharedAccount {
                 "settlement mutation requires instance and condition identifiers".into(),
             ));
         }
-        let mut state = self.lock_state();
+        let economic_scope = self.settlement_economic_scope(values, Some(condition_id));
+        let mut state = self.lock_economic_state(&economic_scope);
         if !state.instances.contains_key(instance_id) {
             return Err(ReservationError::UnknownInstance(instance_id.to_string()));
         }
@@ -9987,6 +10258,7 @@ impl SharedAccount {
             changed = true;
         }
         if changed {
+            self.publish_control_snapshots(&state);
             self.schedule_persist(&state);
         }
         Ok(())
@@ -10217,28 +10489,46 @@ impl SharedAccount {
         if self.startup_snapshot_applied_fast.load(Ordering::Acquire) {
             return Ok(false);
         }
+        if self.seeded_fast.load(Ordering::Acquire) {
+            return self.apply_seeded_scoped_physical_snapshot_inner(
+                generation,
+                cash,
+                positions,
+                authoritative_tokens,
+            );
+        }
         let mut state = self.lock_state();
         if state.startup_snapshot_applied_this_process {
             return Ok(false);
         }
-        if !state.seeded {
-            let missing = missing_initial_token_interest_owners(&state, &authoritative_tokens);
-            if !missing.is_empty() {
-                let now_ms = wall_clock_ms();
-                let started_ms = *state.initial_token_barrier_started_ms.get_or_insert(now_ms);
-                if now_ms.saturating_sub(started_ms) < INITIAL_TOKEN_BARRIER_TIMEOUT_MS {
-                    log::info!(
-                        "[shared_account] account={} initial allocation waiting for token-interest barrier: {}",
-                        self.account_id, missing.join(", "),
-                    );
-                    return Ok(false);
-                }
-                state.initial_token_barrier_degraded_members = missing.clone();
-                log::warn!(
-                    "[shared_account] account={} token-interest barrier timed out after {}ms; seeding healthy members and degrading missing members: {}",
-                    self.account_id, INITIAL_TOKEN_BARRIER_TIMEOUT_MS, missing.join(", "),
+        // `seeded_fast` and the cold state are published under the same owner
+        // transaction. This fallback covers only a startup observer that read
+        // the old atomic immediately before that publication completed.
+        if state.seeded {
+            drop(state);
+            return self.apply_seeded_scoped_physical_snapshot_inner(
+                generation,
+                cash,
+                positions,
+                authoritative_tokens,
+            );
+        }
+        let missing = missing_initial_token_interest_owners(&state, &authoritative_tokens);
+        if !missing.is_empty() {
+            let now_ms = wall_clock_ms();
+            let started_ms = *state.initial_token_barrier_started_ms.get_or_insert(now_ms);
+            if now_ms.saturating_sub(started_ms) < INITIAL_TOKEN_BARRIER_TIMEOUT_MS {
+                log::info!(
+                    "[shared_account] account={} initial allocation waiting for token-interest barrier: {}",
+                    self.account_id, missing.join(", "),
                 );
+                return Ok(false);
             }
+            state.initial_token_barrier_degraded_members = missing.clone();
+            log::warn!(
+                "[shared_account] account={} token-interest barrier timed out after {}ms; seeding healthy members and degrading missing members: {}",
+                self.account_id, INITIAL_TOKEN_BARRIER_TIMEOUT_MS, missing.join(", "),
+            );
         }
         if let Some(generation) = generation {
             if generation == 0 || generation <= state.last_physical_snapshot_generation {
@@ -10249,33 +10539,49 @@ impl SharedAccount {
             .into_iter()
             .filter(|(_, qty)| *qty > EPS)
             .collect::<HashMap<_, _>>();
-        if !state.seeded {
-            state.seeded = true;
-            state.startup_snapshot_applied_this_process = true;
-            if let Some(generation) = generation {
-                state.last_physical_snapshot_generation = generation;
-            }
-            state.physical_cash = cash;
-            state.physical_positions = positions
-                .iter()
-                .filter(|(token, _)| authoritative_tokens.contains(*token))
-                .map(|(token, qty)| (token.clone(), *qty))
-                .collect();
-            redistribute_all(&mut state);
-            // Initial seeding precedes live order/trade admission. Publish the
-            // one-time allocation into each virtual economic shard without
-            // touching its owner-local lifecycle root.
-            {
-                let accounts = self.virtual_accounts.read().unwrap();
-                for (instance_id, account) in accounts.iter() {
-                    if let Some(ledger) = state.instances.get(instance_id) {
-                        account.replace_ledger(ledger);
-                    }
+        state.seeded = true;
+        state.startup_snapshot_applied_this_process = true;
+        if let Some(generation) = generation {
+            state.last_physical_snapshot_generation = generation;
+        }
+        state.physical_cash = cash;
+        state.physical_positions = positions
+            .iter()
+            .filter(|(token, _)| authoritative_tokens.contains(*token))
+            .map(|(token, qty)| (token.clone(), *qty))
+            .collect();
+        redistribute_all(&mut state);
+        // Initial seeding precedes live order/trade admission. Publish the
+        // one-time allocation into each virtual economic shard without
+        // touching its owner-local lifecycle root.
+        {
+            let accounts = self.virtual_accounts.read().unwrap();
+            for (instance_id, account) in accounts.iter() {
+                if let Some(ledger) = state.instances.get(instance_id) {
+                    account.replace_ledger(ledger);
                 }
             }
-            state.seed_baseline = Some(capture_seed_baseline(&state, false));
-            self.schedule_persist(&state);
-            return Ok(true);
+        }
+        state.seed_baseline = Some(capture_seed_baseline(&state, false));
+        self.schedule_persist(&state);
+        Ok(true)
+    }
+
+    fn apply_seeded_scoped_physical_snapshot_inner(
+        &self,
+        generation: Option<u64>,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+    ) -> Result<bool, String> {
+        let mut state = self.lock_economic_state(&authoritative_tokens);
+        if state.startup_snapshot_applied_this_process {
+            return Ok(false);
+        }
+        if let Some(generation) = generation {
+            if generation == 0 || generation <= state.last_physical_snapshot_generation {
+                return Ok(false);
+            }
         }
 
         // A wallet snapshot has no trade ids. Applying it while a MATCHED trade
@@ -10285,7 +10591,7 @@ impl SharedAccount {
         // guess individual trade finality from aggregate wallet equality. Keep
         // the trade-driven physical ledger unchanged and let the next snapshot
         // retry after every pending lifecycle has resolved.
-        if has_unsettled_trade_lifecycle(&state) || has_unsettled_maintenance_operation(&state) {
+        if state.pending.unsettled || has_unsettled_maintenance_operation(&state) {
             return Ok(false);
         }
 
@@ -10294,6 +10600,10 @@ impl SharedAccount {
             state.last_physical_snapshot_generation = generation;
         }
 
+        let positions = positions
+            .into_iter()
+            .filter(|(_, qty)| *qty > EPS)
+            .collect::<HashMap<_, _>>();
         state.physical_cash = cash;
         for token in &authoritative_tokens {
             let physical = positions.get(token).copied().unwrap_or(0.0);
@@ -10309,6 +10619,7 @@ impl SharedAccount {
         }
         try_attribute_binary_redeem(&mut state, &self.account_id);
         state.startup_snapshot_applied_this_process = true;
+        self.publish_control_snapshots(&state);
         self.schedule_persist(&state);
         Ok(true)
     }
@@ -24832,6 +25143,108 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert_eq!(metric.unallocated_positions.get("ETH-WIN"), Some(&-80.0));
     }
 
+    fn reset_startup_snapshot_for_restart_test(account: &SharedAccount) {
+        account
+            .state
+            .lock()
+            .unwrap()
+            .startup_snapshot_applied_this_process = false;
+        account
+            .startup_snapshot_applied_fast
+            .store(false, Ordering::Release);
+    }
+
+    fn assert_redeem_credit_survives_maintenance_reservation(account: &SharedAccount) {
+        assert!((account.instance_snapshot("maker").unwrap().cash - 110.0).abs() <= EPS);
+        assert!(account
+            .instance_snapshot("maker")
+            .unwrap()
+            .positions
+            .values()
+            .all(|quantity| quantity.abs() <= EPS));
+        account
+            .reserve_maintenance_operation(
+                "split-after-wallet-redeem",
+                MaintenanceOperationKind::Split,
+                "next-condition",
+                "NEXT-UP",
+                "NEXT-DOWN",
+                &HashMap::from([("maker".to_string(), 1.0)]),
+            )
+            .unwrap();
+        assert!(
+            (account.read_cold_state(|state| state.instances["maker"].cash) - 110.0).abs() <= EPS
+        );
+        assert!((account.instance_snapshot("maker").unwrap().cash - 110.0).abs() <= EPS);
+    }
+
+    #[test]
+    fn startup_wallet_redeem_publishes_delta_before_maintenance_owner_reads_hot_shard() {
+        let account = Arc::new(SharedAccount::new("startup-redeem-owner-delta"));
+        account.register_instance("maker", 1.0);
+        account
+            .register_token_interest("maker", "settled-condition", "WIN", "LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("WIN".to_string(), 10.0), ("LOSE".to_string(), 10.0)]),
+            )
+            .unwrap();
+        account.record_settled_token_values(&HashMap::from([
+            ("WIN".to_string(), 1.0),
+            ("LOSE".to_string(), 0.0),
+        ]));
+        reset_startup_snapshot_for_restart_test(&account);
+        let (_handle, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
+
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                110.0,
+                HashMap::new(),
+                HashSet::from(["WIN".to_string(), "LOSE".to_string()]),
+            )
+            .unwrap());
+        assert_redeem_credit_survives_maintenance_reservation(&account);
+    }
+
+    #[test]
+    fn late_settlement_redeem_publishes_delta_before_maintenance_owner_reads_hot_shard() {
+        let account = Arc::new(SharedAccount::new("late-settlement-owner-delta"));
+        account.register_instance("maker", 1.0);
+        account
+            .register_token_interest("maker", "settled-condition", "WIN", "LOSE")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("WIN".to_string(), 10.0), ("LOSE".to_string(), 10.0)]),
+            )
+            .unwrap();
+        reset_startup_snapshot_for_restart_test(&account);
+        let (_handle, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
+
+        assert!(account
+            .apply_scoped_physical_snapshot_versioned(
+                1,
+                110.0,
+                HashMap::new(),
+                HashSet::from(["WIN".to_string(), "LOSE".to_string()]),
+            )
+            .unwrap());
+        assert!((account.instance_snapshot("maker").unwrap().cash - 100.0).abs() <= EPS);
+        account.record_settled_token_values(&HashMap::from([
+            ("WIN".to_string(), 1.0),
+            ("LOSE".to_string(), 0.0),
+        ]));
+        assert_redeem_credit_survives_maintenance_reservation(&account);
+    }
+
     #[test]
     fn runtime_platform_redeem_is_attributed_after_authoritative_calibration() {
         let account = SharedAccount::new("runtime-platform-redeem");
@@ -26147,6 +26560,130 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert_eq!(maker.positions["SPLIT-DOWN"], 10.0);
         assert_eq!(maker.positions["TRADE-UP"], 2.0);
         assert!(!restored.is_uncertain());
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn restart_repairs_wal_proven_redeem_antecedent_before_stale_maintenance_cash() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-redeem-antecedent-recovery-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "redeem-antecedent-recovery";
+        let instance_id = "maker";
+        let token_id = "SETTLED-WIN";
+        let account = SharedAccount::new(account_id);
+        account.register_instance(instance_id, 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .attribute_external_adjustment(
+                "historical-position-root",
+                instance_id,
+                0.0,
+                HashMap::from([(token_id.to_string(), 10.0)]),
+            )
+            .unwrap();
+        let base = account.lock_state().clone();
+        validate_persisted_state(account_id, &base).unwrap();
+
+        account
+            .attribute_external_adjustment(
+                "internal:platform_redeem:condition:1:maker",
+                instance_id,
+                10.0,
+                HashMap::from([(token_id.to_string(), -10.0)]),
+            )
+            .unwrap();
+        let redeemed = account.lock_state().clone();
+        validate_persisted_state(account_id, &redeemed).unwrap();
+
+        // Historical settled GC dropped the position's antecedent root after
+        // the redeem. Current inventory correctly remained zero, while replay
+        // retained only the negative platform-redeem adjustment.
+        let mut missing_antecedent = redeemed.clone();
+        missing_antecedent
+            .external_adjustments
+            .remove("historical-position-root");
+        recompute_reconciliation(
+            &mut missing_antecedent,
+            "test missing platform-redeem antecedent",
+        );
+
+        account
+            .reserve_maintenance_operation(
+                "split-after-redeem",
+                MaintenanceOperationKind::Split,
+                "next-condition",
+                "NEXT-UP",
+                "NEXT-DOWN",
+                &HashMap::from([(instance_id.to_string(), 1.0)]),
+            )
+            .unwrap();
+        let mut stale_reservation = account.lock_state().clone();
+        stale_reservation
+            .external_adjustments
+            .remove("historical-position-root");
+        // Reproduce the old absolute cold-owner publication: reservation is
+        // valid, but the preceding ten-dollar redeem credit is absent.
+        stale_reservation
+            .instances
+            .get_mut(instance_id)
+            .unwrap()
+            .cash = 100.0;
+        recompute_reconciliation(
+            &mut stale_reservation,
+            "test stale maintenance reservation cash",
+        );
+
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.into(),
+                persistence_generation: 0,
+                state: base.clone(),
+            },
+        )
+        .unwrap();
+        reset_persistence_wal(&path).unwrap();
+        let mut wal_len = 0;
+        for (generation, before, after) in [
+            (1, &base, &redeemed),
+            (2, &redeemed, &missing_antecedent),
+            (3, &missing_antecedent, &stale_reservation),
+        ] {
+            append_persistence_wal(
+                &path,
+                &PersistenceWalRecord {
+                    version: PERSISTENCE_WAL_VERSION,
+                    account_id: account_id.into(),
+                    generation,
+                    changes: persistence_json_diff(
+                        &serde_json::to_value(before).unwrap(),
+                        &serde_json::to_value(after).unwrap(),
+                    ),
+                },
+                &mut wal_len,
+            )
+            .unwrap();
+        }
+
+        let restored = SharedAccount::new_persistent(account_id, &path).unwrap();
+        let maker = restored.instance_snapshot(instance_id).unwrap();
+        assert!((maker.cash - 110.0).abs() <= EPS);
+        assert!(maker.positions.get(token_id).copied().unwrap_or(0.0).abs() <= EPS);
+        let cold = restored.lock_state();
+        assert_eq!(
+            cold.compacted_economic_effects.instances[instance_id].positions[token_id],
+            10.0,
+        );
+        assert!(validate_persisted_state(account_id, &cold).is_ok());
+        drop(cold);
         drop(restored);
         remove_persistence_test_files(&path);
     }
@@ -27968,6 +28505,9 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 )
                 .ownership()
                 .is_some());
+            account
+                .flush_persistence(Duration::from_secs(2))
+                .unwrap();
             let before = account.monitoring_snapshot();
             assert!(account
                 .apply_trade_transition_with_context(
