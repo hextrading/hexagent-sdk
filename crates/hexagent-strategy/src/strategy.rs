@@ -1,7 +1,7 @@
 use crate::types::{
     extend_signal_batch, AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument,
     MarketDataHealth, OrderBookSnapshot, OrderSlot, OrderUpdate, QuoteTick, Signal, SignalBatch,
-    SignalBatchOverflow, SpotPrice, TickSizeChange, TradeTick,
+    LifecycleTiming, SignalBatchOverflow, SpotPrice, TickSizeChange, TradeTick,
 };
 use hexagent_exchange::exchange::{PrivateFeedControl, PrivateUpdateLane};
 
@@ -16,6 +16,7 @@ pub struct LifecycleEnvelope {
     pub order_slot: OrderSlot,
     pub sequence: u64,
     pub source: LifecycleSource,
+    pub timing: LifecycleTiming,
     pub update: OrderUpdate,
 }
 

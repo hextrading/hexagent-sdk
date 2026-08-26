@@ -510,12 +510,16 @@ impl OrderManager {
                 // in the map — it's already not on the server, and leaving
                 // it here ensures `refresh()` won't re-emit a cancel signal
                 // for it if a race delivers the update after a quote cycle.
-                log::info!(
-                    "[OrderManager] {} {} {} rejected (kept as Rejected; no cancel)",
-                    self.symbol,
-                    update.client_order_id,
-                    order.side
-                );
+                if update.error.as_deref()
+                    != Some("connection failure cluster safety gate")
+                {
+                    log::info!(
+                        "[OrderManager] {} {} {} rejected (kept as Rejected; no cancel)",
+                        self.symbol,
+                        update.client_order_id,
+                        order.side
+                    );
+                }
                 order.status = LocalOrderStatus::Rejected;
                 self.cancel_intents.remove(&update.client_order_id);
             }

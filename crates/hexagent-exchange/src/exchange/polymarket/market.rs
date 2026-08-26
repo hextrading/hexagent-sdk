@@ -3269,26 +3269,151 @@ fn clob_thread_cpu_ns() -> u64 {
     }
 }
 
-/// Start a short, bounded perf sample after a genuine CPU-bound CLOB tail.
-/// The hot reader only performs one atomic claim and enqueues a blocking job;
-/// filesystem/process work runs on Tokio's blocking pool. A five-minute
-/// cooldown deduplicates incidents. Set `HEXBOT_CLOB_PERF_TRIGGER=0` to opt
-/// out or tune seconds/frequency/output directory through the adjacent envs.
 #[cfg(target_os = "linux")]
-fn maybe_trigger_clob_perf(elapsed: Duration, frame_len: usize, phases: ClobFramePhaseTimings) {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct ClobPerfTrigger {
+    elapsed: Duration,
+    frame_len: usize,
+    phases: ClobFramePhaseTimings,
+}
+
+/// A dedicated housekeeping owner continuously runs a low-frequency,
+/// overwrite-mode perf ring for the CLOB TID. The hot CLOB owner only performs
+/// a bounded try_send. On a tail the worker freezes the ring, so the artifact
+/// contains the lead-up to the spike instead of 34-39 samples collected after
+/// it was already over.
+#[cfg(target_os = "linux")]
+struct ClobPerfRing {
+    tx: crossbeam_channel::Sender<ClobPerfTrigger>,
+}
+
+#[cfg(target_os = "linux")]
+impl ClobPerfRing {
+    fn start() -> Option<Self> {
+        let enabled = std::env::var("HEXBOT_CLOB_PERF_TRIGGER")
+            .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        if !enabled {
+            return None;
+        }
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
+        let frequency = std::env::var("HEXBOT_CLOB_PERF_FREQUENCY")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| (9..=99).contains(value))
+            .unwrap_or(19);
+        let output_dir = std::env::var("HEXBOT_CLOB_PERF_DIR")
+            .unwrap_or_else(|_| "/tmp/hexbot-clob-perf".to_string());
+        let (tx, rx) = crossbeam_channel::bounded::<ClobPerfTrigger>(2);
+        let spawn = std::thread::Builder::new()
+            .name("clob-perf-ring".to_string())
+            .spawn(move || {
+                crate::os_tune::pin_background("clob-perf-ring");
+                if let Err(error) = std::fs::create_dir_all(&output_dir) {
+                    warn!(
+                        "[clob_perf_ring] action=create_dir_failed dir={} error={}",
+                        output_dir, error
+                    );
+                    return;
+                }
+                loop {
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let output = format!("{output_dir}/clob-prewindow-tid-{tid}-{epoch}.data");
+                    let mut child = match std::process::Command::new("perf")
+                        .arg("record")
+                        .arg("--snapshot")
+                        .arg("--overwrite")
+                        .arg("-m")
+                        .arg("32")
+                        .arg("--freq")
+                        .arg(frequency.to_string())
+                        .arg("--call-graph")
+                        .arg("fp")
+                        .arg("--tid")
+                        .arg(tid.to_string())
+                        .arg("--output")
+                        .arg(&output)
+                        .spawn()
+                    {
+                        Ok(child) => child,
+                        Err(error) => {
+                            warn!(
+                                "[clob_perf_ring] action=spawn_failed tid={} output={} error={}",
+                                tid, output, error
+                            );
+                            return;
+                        }
+                    };
+                    let trigger = match rx.recv() {
+                        Ok(trigger) => trigger,
+                        Err(_) => {
+                            let _ = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+                            let _ = child.wait();
+                            return;
+                        }
+                    };
+                    // perf uses SIGUSR2 for snapshot/switch-output control.
+                    let _ = unsafe { libc::kill(child.id() as i32, libc::SIGUSR2) };
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+                    let status = child.wait();
+                    warn!(
+                        "[clob_perf_ring] action=frozen tid={} frequency_hz={} output={} status={:?} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={}",
+                        tid,
+                        frequency,
+                        output,
+                        status,
+                        trigger.elapsed.as_micros(),
+                        trigger.frame_len,
+                        trigger.phases.simd_json_ns / 1_000,
+                        trigger.phases.book_apply_ns / 1_000,
+                        trigger.phases.price_change_apply_ns / 1_000,
+                        trigger.phases.event_construction_ns / 1_000,
+                    );
+                }
+            });
+        match spawn {
+            Ok(_) => Some(Self { tx }),
+            Err(error) => {
+                warn!("[clob_perf_ring] action=thread_spawn_failed error={error}");
+                None
+            }
+        }
+    }
+
+    fn trigger(&self, trigger: ClobPerfTrigger) {
+        static HIGH_WATER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let depth = self.tx.len().saturating_add(1);
+        HIGH_WATER.fetch_max(depth.min(2), Ordering::Relaxed);
+        crate::latency::record_ns(
+            "polymarket.ws.clob_perf_ring_queue_high_water",
+            HIGH_WATER.load(Ordering::Relaxed) as u64,
+        );
+        if self.tx.try_send(trigger).is_err() {
+            crate::latency::record_ns("polymarket.ws.clob_perf_ring_overflow", 1);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_trigger_clob_perf(
+    ring: Option<&ClobPerfRing>,
+    elapsed: Duration,
+    frame_len: usize,
+    phases: ClobFramePhaseTimings,
+) {
     static LAST_TRIGGER_NS: AtomicU64 = AtomicU64::new(0);
     const COOLDOWN_NS: u64 = 300_000_000_000;
     if elapsed < CLOB_RARE_HANDLER_TAIL {
         return;
     }
-    if !*ENABLED.get_or_init(|| {
-        std::env::var("HEXBOT_CLOB_PERF_TRIGGER")
-            .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
-            .unwrap_or(true)
-    }) {
+    let Some(ring) = ring else {
         return;
-    }
+    };
     let now_ns = now_ns();
     loop {
         let previous = LAST_TRIGGER_NS.load(Ordering::Acquire);
@@ -3302,75 +3427,31 @@ fn maybe_trigger_clob_perf(elapsed: Duration, frame_len: usize, phases: ClobFram
             break;
         }
     }
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
-    let seconds = std::env::var("HEXBOT_CLOB_PERF_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (1..=30).contains(value))
-        .unwrap_or(10);
-    let frequency = std::env::var("HEXBOT_CLOB_PERF_FREQUENCY")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| (19..=499).contains(value))
-        .unwrap_or(99);
-    let output_dir = std::env::var("HEXBOT_CLOB_PERF_DIR")
-        .unwrap_or_else(|_| "/tmp/hexbot-clob-perf".to_string());
-    crate::async_rt::handle().spawn_blocking(move || {
-        if let Err(error) = std::fs::create_dir_all(&output_dir) {
-            warn!("[clob_perf_trigger] create_dir failed dir={} error={}", output_dir, error);
-            return;
-        }
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let output = format!("{output_dir}/clob-tid-{tid}-{epoch}.data");
-        warn!(
-            "[clob_perf_trigger] action=start tid={} seconds={} frequency_hz={} output={} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={}",
-            tid,
-            seconds,
-            frequency,
-            output,
-            elapsed.as_micros(),
-            frame_len,
-            phases.simd_json_ns / 1_000,
-            phases.book_apply_ns / 1_000,
-            phases.price_change_apply_ns / 1_000,
-            phases.event_construction_ns / 1_000,
-        );
-        let status = std::process::Command::new("perf")
-            .arg("record")
-            .arg("--freq")
-            .arg(frequency.to_string())
-            .arg("--call-graph")
-            .arg("fp")
-            .arg("--tid")
-            .arg(tid.to_string())
-            .arg("--output")
-            .arg(&output)
-            .arg("--")
-            .arg("sleep")
-            .arg(seconds.to_string())
-            .status();
-        match status {
-            Ok(status) if status.success() => warn!(
-                "[clob_perf_trigger] action=complete tid={} output={} status={}",
-                tid, output, status,
-            ),
-            Ok(status) => warn!(
-                "[clob_perf_trigger] action=failed tid={} output={} status={}",
-                tid, output, status,
-            ),
-            Err(error) => warn!(
-                "[clob_perf_trigger] action=spawn_failed tid={} output={} error={}",
-                tid, output, error,
-            ),
-        }
+    ring.trigger(ClobPerfTrigger {
+        elapsed,
+        frame_len,
+        phases,
     });
 }
 
 #[cfg(not(target_os = "linux"))]
-fn maybe_trigger_clob_perf(_elapsed: Duration, _frame_len: usize, _phases: ClobFramePhaseTimings) {}
+struct ClobPerfRing;
+
+#[cfg(not(target_os = "linux"))]
+impl ClobPerfRing {
+    fn start() -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_trigger_clob_perf(
+    _ring: Option<&ClobPerfRing>,
+    _elapsed: Duration,
+    _frame_len: usize,
+    _phases: ClobFramePhaseTimings,
+) {
+}
 
 #[cfg(not(target_os = "linux"))]
 fn clob_thread_cpu_ns() -> u64 {
@@ -3899,7 +3980,7 @@ fn forward_clob_events(
 struct ClobBookRepairResult {
     token: String,
     generation: u64,
-    result: std::result::Result<BookFields, String>,
+    result: std::result::Result<BookFields<'static>, String>,
 }
 
 fn advance_clob_repair_generation(epoch: &AtomicU64) -> u64 {
@@ -3910,7 +3991,9 @@ fn clob_repair_generation_is_current(epoch: &AtomicU64, generation: u64) -> bool
     epoch.load(Ordering::Acquire) == generation
 }
 
-async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookFields, String> {
+async fn fetch_authoritative_clob_book(
+    token: &str,
+) -> std::result::Result<BookFields<'static>, String> {
     let base = std::env::var("POLYMARKET_V2_API_URL")
         .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
     let url = format!("{}/book", base.trim_end_matches('/'));
@@ -3932,7 +4015,7 @@ async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookF
             text.chars().take(300).collect::<String>(),
         ));
     }
-    let book: BookFields =
+    let book: BookFields<'_> =
         serde_json::from_str(&text).map_err(|error| format!("invalid book response: {error}"))?;
     if book.asset_id != token {
         return Err(format!(
@@ -3940,7 +4023,7 @@ async fn fetch_authoritative_clob_book(token: &str) -> std::result::Result<BookF
             token, book.asset_id,
         ));
     }
-    Ok(book)
+    Ok(book.into_owned())
 }
 
 fn request_clob_book_repairs(
@@ -4278,6 +4361,7 @@ async fn clob_ws_task(
     let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
     let mut thread_resource_sampler = ClobThreadResourceSampler::default();
+    let clob_perf_ring = ClobPerfRing::start();
     let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
@@ -5356,6 +5440,7 @@ async fn clob_ws_task(
                                     ),
                                 });
                                 maybe_trigger_clob_perf(
+                                    clob_perf_ring.as_ref(),
                                     parse_apply_elapsed,
                                     frame_len,
                                     frame_phases,
@@ -5796,54 +5881,94 @@ fn is_btc_symbol(symbol: &str) -> bool {
 // level — hot path wins ~3-5x in practice.
 
 #[derive(serde::Deserialize)]
-struct BookLevel {
-    price: String,
-    size: String,
+struct BookLevel<'a> {
+    #[serde(borrow)]
+    price: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    size: std::borrow::Cow<'a, str>,
 }
 
 #[derive(serde::Deserialize)]
-struct BookFields {
-    asset_id: String,
+struct BookFields<'a> {
+    #[serde(borrow)]
+    asset_id: std::borrow::Cow<'a, str>,
     #[serde(default)]
-    bids: Vec<BookLevel>,
+    bids: Vec<BookLevel<'a>>,
     #[serde(default)]
-    asks: Vec<BookLevel>,
+    asks: Vec<BookLevel<'a>>,
     /// Polymarket normally emits stringified milliseconds; accept JSON
     /// numbers too so server timestamps always drive event-level ordering.
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
 }
 
+impl BookFields<'_> {
+    fn into_owned(self) -> BookFields<'static> {
+        BookFields {
+            asset_id: std::borrow::Cow::Owned(self.asset_id.into_owned()),
+            bids: self
+                .bids
+                .into_iter()
+                .map(|level| BookLevel {
+                    price: std::borrow::Cow::Owned(level.price.into_owned()),
+                    size: std::borrow::Cow::Owned(level.size.into_owned()),
+                })
+                .collect(),
+            asks: self
+                .asks
+                .into_iter()
+                .map(|level| BookLevel {
+                    price: std::borrow::Cow::Owned(level.price.into_owned()),
+                    size: std::borrow::Cow::Owned(level.size.into_owned()),
+                })
+                .collect(),
+            timestamp: self.timestamp,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
-struct TradeFields {
-    asset_id: String,
-    price: String,
-    size: String,
-    side: String, // "BUY" | "SELL"
+struct TradeFields<'a> {
+    #[serde(borrow)]
+    asset_id: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    price: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    size: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    side: std::borrow::Cow<'a, str>, // "BUY" | "SELL"
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
     /// Venue execution identity. A transaction can contain multiple fills, so
     /// its hash alone is deliberately not accepted as a trade id.
-    #[serde(default, alias = "trade_id", alias = "tradeId", alias = "executionId")]
-    execution_id: Option<String>,
-    #[serde(default, alias = "transactionHash")]
-    transaction_hash: Option<String>,
+    #[serde(
+        default,
+        borrow,
+        alias = "trade_id",
+        alias = "tradeId",
+        alias = "executionId"
+    )]
+    execution_id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow, alias = "transactionHash")]
+    transaction_hash: Option<std::borrow::Cow<'a, str>>,
     #[serde(default, alias = "logIndex")]
     log_index: Option<serde_json::Value>,
     /// Only this explicit field authorizes consumers to fold complementary
     /// Up/Down public prints into one economic execution.
     #[serde(
         default,
+        borrow,
         alias = "mirrorId",
         alias = "mirror_trade_id",
         alias = "mirrorTradeId"
     )]
-    mirror_id: Option<String>,
+    mirror_id: Option<std::borrow::Cow<'a, str>>,
 }
 
 #[derive(serde::Deserialize)]
-struct TickSizeFields {
-    asset_id: String,
+struct TickSizeFields<'a> {
+    #[serde(borrow)]
+    asset_id: std::borrow::Cow<'a, str>,
     #[serde(default, deserialize_with = "de_str_or_num_f64")]
     old_tick_size: f64,
     #[serde(default, deserialize_with = "de_str_or_num_f64")]
@@ -5853,8 +5978,9 @@ struct TickSizeFields {
 }
 
 #[derive(serde::Deserialize)]
-struct BestBidAskFields {
-    asset_id: String,
+struct BestBidAskFields<'a> {
+    #[serde(borrow)]
+    asset_id: std::borrow::Cow<'a, str>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
     best_bid: Option<f64>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
@@ -5867,12 +5993,12 @@ struct BestBidAskFields {
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum WireDecimal {
-    String(String),
+enum WireDecimal<'a> {
+    String(#[serde(borrow)] std::borrow::Cow<'a, str>),
     Number(serde_json::Number),
 }
 
-impl WireDecimal {
+impl WireDecimal<'_> {
     fn decimal(&self) -> Option<Decimal> {
         match self {
             Self::String(value) => Decimal::from_str(value.trim()).ok(),
@@ -5882,25 +6008,31 @@ impl WireDecimal {
 }
 
 #[derive(serde::Deserialize)]
-struct PriceChangeEntry {
-    asset_id: String,
-    price: WireDecimal,
-    size: WireDecimal,
-    side: String,
+struct PriceChangeEntry<'a> {
+    #[serde(borrow)]
+    asset_id: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    price: WireDecimal<'a>,
+    #[serde(borrow)]
+    size: WireDecimal<'a>,
+    #[serde(borrow)]
+    side: std::borrow::Cow<'a, str>,
     #[serde(default)]
-    hash: Option<String>,
-    #[serde(default)]
-    best_bid: Option<WireDecimal>,
-    #[serde(default)]
-    best_ask: Option<WireDecimal>,
+    #[serde(borrow)]
+    hash: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    best_bid: Option<WireDecimal<'a>>,
+    #[serde(default, borrow)]
+    best_ask: Option<WireDecimal<'a>>,
 }
 
 #[derive(serde::Deserialize)]
-struct PriceChangeFields {
+struct PriceChangeFields<'a> {
+    #[serde(default, borrow)]
+    market: Option<std::borrow::Cow<'a, str>>,
     #[serde(default)]
-    market: Option<String>,
-    #[serde(default)]
-    price_changes: Vec<PriceChangeEntry>,
+    #[serde(borrow)]
+    price_changes: Vec<PriceChangeEntry<'a>>,
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
 }
@@ -6041,14 +6173,15 @@ fn bbo_tick_distance(
 /// Inline RTDS spot-price record seen on the CLOB socket (distinct from
 /// the dedicated RTDS WS schema, which wraps in `topic`/`payload`).
 #[derive(serde::Deserialize)]
-struct InlineRtdsFields {
-    source: String,
-    #[serde(default)]
-    pair: Option<String>,
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    filter: Option<String>,
+struct InlineRtdsFields<'a> {
+    #[serde(borrow)]
+    source: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    pair: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    symbol: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    filter: Option<std::borrow::Cow<'a, str>>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
     value: Option<f64>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
@@ -6061,22 +6194,22 @@ struct InlineRtdsFields {
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
-enum TaggedMessage {
-    Book(BookFields),
-    Trade(TradeFields),
-    LastTradePrice(TradeFields),
-    TickSizeChange(TickSizeFields),
-    PriceChange(PriceChangeFields),
-    BestBidAsk(BestBidAskFields),
+enum TaggedMessage<'a> {
+    Book(#[serde(borrow)] BookFields<'a>),
+    Trade(#[serde(borrow)] TradeFields<'a>),
+    LastTradePrice(#[serde(borrow)] TradeFields<'a>),
+    TickSizeChange(#[serde(borrow)] TickSizeFields<'a>),
+    PriceChange(#[serde(borrow)] PriceChangeFields<'a>),
+    BestBidAsk(#[serde(borrow)] BestBidAskFields<'a>),
 }
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum ClobFrame {
+enum ClobFrame<'a> {
     /// Matches anything with `event_type` set to a known variant.
-    Tagged(TaggedMessage),
+    Tagged(#[serde(borrow)] TaggedMessage<'a>),
     /// Matches RTDS records inlined on the CLOB socket (no event_type).
-    Rtds(InlineRtdsFields),
+    Rtds(#[serde(borrow)] InlineRtdsFields<'a>),
     /// Preserve unexpected values for rate-limited event-type sampling.
     Unknown(serde_json::Value),
 }
@@ -6257,6 +6390,11 @@ impl ClobLocalBook {
 
 #[derive(Debug, Default)]
 struct ClobLocalBooks {
+    /// Startup-resident token identities. Wire strings are borrowed from the
+    /// parse buffer, resolved once to a compact index, and never inserted into
+    /// a hot-path growable routing map.
+    token_indices: HashMap<Box<str>, u16>,
+    resident_tokens: Vec<Box<str>>,
     token_books: HashMap<String, ClobLocalBook>,
     roles: HashMap<String, ClobCanonicalRole>,
     current_ticks: HashMap<String, Decimal>,
@@ -6308,8 +6446,24 @@ impl ClobLocalBooks {
                     is_down: true,
                 },
             );
+            for token in [&spec.up_token, &spec.down_token] {
+                if !state.token_indices.contains_key(token.as_str()) {
+                    let index = u16::try_from(state.resident_tokens.len())
+                        .expect("CLOB token table exceeds u16 startup capacity");
+                    let resident = token.clone().into_boxed_str();
+                    state.token_indices.insert(resident.clone(), index);
+                    state.resident_tokens.push(resident);
+                }
+            }
         }
         state
+    }
+
+    #[inline]
+    fn token_index(&self, token: &str) -> Option<u16> {
+        let index = self.token_indices.get(token).copied()?;
+        debug_assert_eq!(self.resident_tokens[index as usize].as_ref(), token);
+        Some(index)
     }
 
     fn market_key(&self, token: &str) -> String {
@@ -6602,13 +6756,13 @@ impl ClobLocalBooks {
 
     fn apply_book(
         &mut self,
-        fields: BookFields,
+        fields: BookFields<'_>,
         received_at: Instant,
         local_now: u64,
         source: ClobBookSource,
         counters: &mut ClobWireCounters,
     ) -> std::result::Result<ClobBookApplyOutcome, String> {
-        let symbol = fields.asset_id;
+        let symbol = fields.asset_id.into_owned();
         if symbol.trim().is_empty() {
             return Err("book has empty asset_id".to_string());
         }
@@ -6625,7 +6779,7 @@ impl ClobLocalBooks {
                 });
             }
         }
-        let parse_levels = |levels: Vec<BookLevel>| {
+        let parse_levels = |levels: Vec<BookLevel<'_>>| {
             let mut parsed = BTreeMap::new();
             for level in levels {
                 let price = Decimal::from_str(level.price.trim())
@@ -7008,7 +7162,7 @@ impl ClobLocalBooks {
 
     fn apply_price_change(
         &mut self,
-        fields: PriceChangeFields,
+        fields: PriceChangeFields<'_>,
         received_at: Instant,
         local_now: u64,
         counters: &mut ClobWireCounters,
@@ -7022,7 +7176,7 @@ impl ClobLocalBooks {
                 .price_changes
                 .iter()
                 .fold(HashMap::new(), |mut counts, change| {
-                    *counts.entry(change.asset_id.clone()).or_insert(0) += 1;
+                    *counts.entry(change.asset_id.to_string()).or_insert(0) += 1;
                     counts
                 });
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
@@ -7063,10 +7217,10 @@ impl ClobLocalBooks {
                 }
                 continue;
             }
-            if !self.price_is_on_current_tick(&token, price) {
-                off_tick_tokens.insert(token.clone());
+            if !self.price_is_on_current_tick(token.as_ref(), price) {
+                off_tick_tokens.insert(token.to_string());
             }
-            let Some(current_book) = self.token_books.get(&token) else {
+            let Some(current_book) = self.token_books.get(token.as_ref()) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
                 counters.ignored = counters.ignored.saturating_add(1);
                 if emit_diagnostic {
@@ -7093,25 +7247,25 @@ impl ClobLocalBooks {
             let sequence = self.next_sequence();
             let book = self
                 .token_books
-                .get_mut(&token)
+                .get_mut(token.as_ref())
                 .expect("book existence checked above");
-            if !before.contains_key(&token) {
-                before.insert(token.clone(), book.top());
+            if !before.contains_key(token.as_ref()) {
+                before.insert(token.to_string(), book.top());
             }
-            let side = change.side.trim().to_ascii_uppercase();
-            let levels = match side.as_str() {
-                "BUY" => &mut book.bids,
-                "SELL" => &mut book.asks,
-                _ => {
-                    counters.ignored = counters.ignored.saturating_add(1);
-                    if emit_diagnostic {
-                        diagnostics.push(ClobDiagnostic {
-                            key: "invalid_price_change",
-                            detail: format!("token={token} reason=unknown_side side={side}"),
-                        });
-                    }
-                    continue;
+            let side = change.side.trim();
+            let levels = if side.eq_ignore_ascii_case("BUY") {
+                &mut book.bids
+            } else if side.eq_ignore_ascii_case("SELL") {
+                &mut book.asks
+            } else {
+                counters.ignored = counters.ignored.saturating_add(1);
+                if emit_diagnostic {
+                    diagnostics.push(ClobDiagnostic {
+                        key: "invalid_price_change",
+                        detail: format!("token={token} reason=unknown_side side={side}"),
+                    });
                 }
+                continue;
             };
             if size == Decimal::ZERO {
                 levels.remove(&price);
@@ -7128,7 +7282,7 @@ impl ClobLocalBooks {
             book.dirty_since.get_or_insert(received_at);
             let _ = change.hash;
 
-            let reported = reported_bbo.entry(token.clone()).or_default();
+            let reported = reported_bbo.entry(token.to_string()).or_default();
             if let Some(value) = change.best_bid.as_ref() {
                 match value.decimal() {
                     Some(price) => reported.bid = Some(normalize_reported_bbo(price)),
@@ -7381,7 +7535,7 @@ fn process_clob_frame(
 fn process_clob_frame_in_place(
     parse_buffer: &mut [u8],
     books: &mut ClobLocalBooks,
-    tokens: &[String],
+    _tokens: &[String],
     active_tokens: &[String],
     received_at: Instant,
     local_now: u64,
@@ -7427,7 +7581,7 @@ fn process_clob_frame_in_place(
         match frame {
             ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
                 batch.wire.books = batch.wire.books.saturating_add(1);
-                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let apply_started = crate::latency::Instant::now();
@@ -7483,7 +7637,7 @@ fn process_clob_frame_in_place(
                 batch.recognized_topic |= fields
                     .price_changes
                     .iter()
-                    .any(|change| subscribed_token(tokens, &change.asset_id));
+                    .any(|change| books.token_index(&change.asset_id).is_some());
                 let apply_started = crate::latency::Instant::now();
                 let (events, bbo_snapshots, repair_tokens) = books.apply_price_change(
                     fields,
@@ -7506,7 +7660,7 @@ fn process_clob_frame_in_place(
             }
             ClobFrame::Tagged(TaggedMessage::BestBidAsk(fields)) => {
                 batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);
-                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let exchange_timestamp_ns =
@@ -7520,7 +7674,7 @@ fn process_clob_frame_in_place(
                     continue;
                 }
                 match make_quote_event(
-                    fields.asset_id,
+                    fields.asset_id.into_owned(),
                     fields.best_bid,
                     fields.best_ask,
                     exchange_timestamp_ns,
@@ -7547,7 +7701,7 @@ fn process_clob_frame_in_place(
             }
             ClobFrame::Tagged(TaggedMessage::Trade(fields)) => {
                 batch.wire.trades = batch.wire.trades.saturating_add(1);
-                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
                 match make_trade_event(fields, local_now) {
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
@@ -7555,7 +7709,7 @@ fn process_clob_frame_in_place(
             }
             ClobFrame::Tagged(TaggedMessage::LastTradePrice(fields)) => {
                 batch.wire.last_trade_prices = batch.wire.last_trade_prices.saturating_add(1);
-                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
                 match make_trade_event(fields, local_now) {
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
@@ -7563,7 +7717,7 @@ fn process_clob_frame_in_place(
             }
             ClobFrame::Tagged(TaggedMessage::TickSizeChange(fields)) => {
                 batch.wire.tick_size_changes = batch.wire.tick_size_changes.saturating_add(1);
-                batch.recognized_topic |= subscribed_token(tokens, &fields.asset_id);
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
                 match make_tick_size_event(fields, local_now) {
                     Some(MarketEvent::TickSizeChange(change)) => {
                         let released = books.apply_tick_size_change(
@@ -7716,7 +7870,7 @@ fn make_quote_event(
     }))
 }
 
-fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
+fn make_trade_event(t: TradeFields<'_>, now: u64) -> Option<MarketEvent> {
     let price: f64 = t.price.parse().ok()?;
     let quantity: f64 = t.size.parse().ok()?;
     if t.asset_id.trim().is_empty()
@@ -7728,16 +7882,19 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     {
         return None;
     }
-    let side = match t.side.trim().to_ascii_uppercase().as_str() {
-        "BUY" => Side::Buy,
-        "SELL" => Side::Sell,
-        _ => return None,
+    let side_text = t.side.trim();
+    let side = if side_text.eq_ignore_ascii_case("BUY") {
+        Side::Buy
+    } else if side_text.eq_ignore_ascii_case("SELL") {
+        Side::Sell
+    } else {
+        return None;
     };
     let exchange_timestamp_ns = timestamp_value_to_ns(t.timestamp.as_ref(), now);
     if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
         return None;
     }
-    let clean_id = |value: Option<String>| {
+    let clean_id = |value: Option<std::borrow::Cow<'_, str>>| {
         value
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -7770,7 +7927,7 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
         .or_else(|| execution_id.map(|value| format!("execution:{value}")));
     Some(MarketEvent::Trade(TradeTick {
         exchange: Exchange::Polymarket,
-        symbol: t.asset_id,
+        symbol: t.asset_id.into_owned(),
         exchange_trade_id,
         price,
         quantity,
@@ -7780,7 +7937,7 @@ fn make_trade_event(t: TradeFields, now: u64) -> Option<MarketEvent> {
     }))
 }
 
-fn make_tick_size_event(t: TickSizeFields, now: u64) -> Option<MarketEvent> {
+fn make_tick_size_event(t: TickSizeFields<'_>, now: u64) -> Option<MarketEvent> {
     if t.asset_id.trim().is_empty()
         || !t.old_tick_size.is_finite()
         || t.old_tick_size <= 0.0
@@ -7800,7 +7957,7 @@ fn make_tick_size_event(t: TickSizeFields, now: u64) -> Option<MarketEvent> {
     }
     Some(MarketEvent::TickSizeChange(TickSizeChange {
         exchange: Exchange::Polymarket,
-        symbol: t.asset_id,
+        symbol: t.asset_id.into_owned(),
         old_tick_size: t.old_tick_size,
         new_tick_size: t.new_tick_size,
         exchange_timestamp_ns,
@@ -7808,8 +7965,8 @@ fn make_tick_size_event(t: TickSizeFields, now: u64) -> Option<MarketEvent> {
     }))
 }
 
-fn make_inline_rtds_event(r: InlineRtdsFields, local_now: u64) -> Option<MarketEvent> {
-    let symbol = r.pair.or(r.symbol).or(r.filter)?;
+fn make_inline_rtds_event(r: InlineRtdsFields<'_>, local_now: u64) -> Option<MarketEvent> {
+    let symbol = r.pair.or(r.symbol).or(r.filter)?.into_owned();
     let price = r.value.or(r.price)?;
     // Normalize timestamp (sec / ms / ns) to ns.
     let ts_raw = r.server_timestamp.or(r.timestamp).and_then(|v| {
@@ -8149,6 +8306,19 @@ impl ExchangeMarket for PolymarketMarket {
 #[cfg(test)]
 mod clob_event_lane_tests {
     use super::*;
+
+    #[test]
+    fn simd_clob_schema_borrows_wire_token_and_decimal_strings() {
+        let mut bytes = br#"{"event_type":"price_change","price_changes":[{"asset_id":"resident-token","price":"0.41","size":"2","side":"BUY"}]}"#.to_vec();
+        let frame: ClobFrame<'_> = simd_json::serde::from_slice(&mut bytes).unwrap();
+        let ClobFrame::Tagged(TaggedMessage::PriceChange(fields)) = frame else {
+            panic!("price-change frame expected");
+        };
+        let change = &fields.price_changes[0];
+        assert!(matches!(change.asset_id, std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(change.price, WireDecimal::String(std::borrow::Cow::Borrowed(_))));
+        assert!(matches!(change.size, WireDecimal::String(std::borrow::Cow::Borrowed(_))));
+    }
 
     fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
         samples.sort_unstable();

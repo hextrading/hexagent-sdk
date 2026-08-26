@@ -360,6 +360,22 @@ pub struct OrderUpdate {
     pub error: Option<String>,
 }
 
+/// Monotonic, process-local timestamps carried with one lifecycle update.
+///
+/// Venue wall-clock time remains on [`OrderUpdate::exchange_event_timestamp_ns`].
+/// These boundaries deliberately use the local monotonic clock so network
+/// transit cannot be mistaken for private-owner or strategy scheduling delay.
+/// Zero means that the producer does not expose that boundary (execution,
+/// replay and non-Polymarket adapters use the default trace).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LifecycleTiming {
+    pub private_ws_received_ns: u64,
+    pub private_json_parsed_ns: u64,
+    pub private_owner_dequeued_ns: u64,
+    pub private_producer_ns: u64,
+    pub root_router_dequeued_ns: u64,
+}
+
 /// Strategy-owned lifecycle message used across execution and authenticated
 /// private-feed boundaries. `owner` is the startup-assigned strategy worker
 /// index; normal runtime routing must never recover it by parsing a client
@@ -368,6 +384,8 @@ pub struct OrderUpdate {
 pub struct RoutedOrderUpdate {
     pub owner: u16,
     pub update: OrderUpdate,
+    #[serde(default)]
+    pub timing: LifecycleTiming,
 }
 
 /// Reserved numeric owner for account-wide/cold compatibility operations that

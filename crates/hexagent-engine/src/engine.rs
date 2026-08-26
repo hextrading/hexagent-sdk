@@ -2136,6 +2136,7 @@ fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: us
 #[derive(Debug)]
 struct QueuedOrderUpdate {
     update: OrderUpdate,
+    timing: LifecycleTiming,
     enqueued_at: std::time::Instant,
     source: LifecycleSource,
 }
@@ -6108,7 +6109,11 @@ impl Engine {
                             .get(&u.client_order_id)
                             .copied()
                             .unwrap_or(fallback_owner);
-                        let _ = tx.send(RoutedOrderUpdate { owner, update: u });
+                        let _ = tx.send(RoutedOrderUpdate {
+                            owner,
+                            update: u,
+                            timing: LifecycleTiming::default(),
+                        });
                     }
                 };
 
@@ -7597,12 +7602,13 @@ impl Engine {
     }
 
     fn route_executor_update(
-        routed: RoutedOrderUpdate,
+        mut routed: RoutedOrderUpdate,
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
+        routed.timing.root_router_dequeued_ns = crate::types::monotonic_now_ns();
         if routed.owner == SYSTEM_SIGNAL_OWNER {
             // Account-wide shutdown/recovery operations are not emitted by a
             // strategy instance. Preserve the cold coid recovery route.
@@ -7620,6 +7626,7 @@ impl Engine {
             owner,
             QueuedOrderUpdate {
                 update: routed.update,
+                timing: routed.timing,
                 enqueued_at: std::time::Instant::now(),
                 source: LifecycleSource::Execution,
             },
@@ -7630,12 +7637,13 @@ impl Engine {
     }
 
     fn route_private_update(
-        routed: RoutedOrderUpdate,
+        mut routed: RoutedOrderUpdate,
         iid_to_idx: &HashMap<String, usize>,
         update_txs: &[Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
+        routed.timing.root_router_dequeued_ns = crate::types::monotonic_now_ns();
         if routed.owner == SYSTEM_SIGNAL_OWNER {
             return Self::route_private_update_with_source(
                 routed.update,
@@ -7650,6 +7658,7 @@ impl Engine {
             routed.owner as usize,
             QueuedOrderUpdate {
                 update: routed.update,
+                timing: routed.timing,
                 enqueued_at: std::time::Instant::now(),
                 source: LifecycleSource::PrivateFeed,
             },
@@ -7701,6 +7710,7 @@ impl Engine {
                 i,
                 QueuedOrderUpdate {
                     update,
+                    timing: LifecycleTiming::default(),
                     enqueued_at: std::time::Instant::now(),
                     source,
                 },
@@ -7712,6 +7722,7 @@ impl Engine {
                 owner: Some(i),
                 queued: QueuedOrderUpdate {
                     update,
+                    timing: LifecycleTiming::default(),
                     enqueued_at: std::time::Instant::now(),
                     source,
                 },
@@ -7721,6 +7732,7 @@ impl Engine {
                 owner: Some(i),
                 queued: QueuedOrderUpdate {
                     update,
+                    timing: LifecycleTiming::default(),
                     enqueued_at: std::time::Instant::now(),
                     source,
                 },
@@ -7730,6 +7742,7 @@ impl Engine {
                 owner: None,
                 queued: QueuedOrderUpdate {
                     update,
+                    timing: LifecycleTiming::default(),
                     enqueued_at: std::time::Instant::now(),
                     source,
                 },
@@ -8029,6 +8042,7 @@ impl Engine {
                                 order_slot: update.order_slot,
                                 sequence: lifecycle_sequence,
                                 source: LifecycleSource::PrivateFeed,
+                                timing: LifecycleTiming::default(),
                                 update,
                             },
                             &mut callback_signal_batch,
@@ -8078,6 +8092,7 @@ impl Engine {
                                 order_slot: queued.update.order_slot,
                                 sequence: lifecycle_sequence,
                                 source: queued.source,
+                                timing: queued.timing,
                                 update: queued.update,
                             },
                             &mut callback_signal_batch,
@@ -8335,6 +8350,7 @@ impl Engine {
                     order_slot: update.order_slot,
                     sequence: lifecycle_sequence,
                     source: LifecycleSource::PrivateFeed,
+                    timing: LifecycleTiming::default(),
                     update,
                 },
                 &mut callback_signal_batch,
@@ -8355,6 +8371,7 @@ impl Engine {
                         order_slot: queued.update.order_slot,
                         sequence: lifecycle_sequence,
                         source: queued.source,
+                        timing: queued.timing,
                         update: queued.update,
                     },
                     &mut callback_signal_batch,
@@ -12387,6 +12404,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
                             .send(RoutedOrderUpdate {
                                 owner: command.owner,
                                 update,
+                                timing: LifecycleTiming::default(),
                             })
                             .is_ok();
                         completion_open
@@ -13235,6 +13253,7 @@ fn send_executor_update(
     tx.tx.send(RoutedOrderUpdate {
         owner: tx.owner,
         update,
+        timing: LifecycleTiming::default(),
     })
 }
 
@@ -13246,7 +13265,11 @@ fn send_root_private_update(
     if update.exchange == Exchange::Polymarket {
         update.timestamp_ns = now_ns();
     }
-    tx.send(RoutedOrderUpdate { owner, update })
+    tx.send(RoutedOrderUpdate {
+        owner,
+        update,
+        timing: LifecycleTiming::default(),
+    })
 }
 
 /// ExecutorRejected update for a placement we never sent (admission skip /
@@ -16909,6 +16932,7 @@ mod market_router_tests {
                     order_audit: None,
                     error: None,
                 },
+                timing: LifecycleTiming::default(),
             },
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
@@ -16954,6 +16978,7 @@ mod market_router_tests {
                     order_audit: None,
                     error: None,
                 },
+                timing: LifecycleTiming::default(),
             },
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
@@ -16993,6 +17018,7 @@ mod market_router_tests {
                 order_audit: None,
                 error: None,
             },
+            timing: LifecycleTiming::default(),
             enqueued_at: std::time::Instant::now(),
             source: LifecycleSource::Execution,
         };
@@ -17018,6 +17044,7 @@ mod market_router_tests {
                     order_audit: None,
                     error: None,
                 },
+                timing: LifecycleTiming::default(),
             },
             &HashMap::new(),
             std::slice::from_ref(&owner_tx),
@@ -17072,6 +17099,7 @@ mod market_router_tests {
         owner0_tx
             .send(QueuedOrderUpdate {
                 update: update("owner0-occupied"),
+                timing: LifecycleTiming::default(),
                 enqueued_at: std::time::Instant::now(),
                 source: LifecycleSource::Execution,
             })
@@ -17082,6 +17110,7 @@ mod market_router_tests {
                 RoutedOrderUpdate {
                     owner,
                     update: update(coid),
+                    timing: LifecycleTiming::default(),
                 },
                 &HashMap::new(),
                 &[owner0_tx.clone(), owner1_tx.clone()],
