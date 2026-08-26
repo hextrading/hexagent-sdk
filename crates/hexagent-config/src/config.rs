@@ -134,6 +134,11 @@ pub struct OsTuneConfig {
     /// Priority for `poly-done-*` completion/accounting threads. Unset keeps
     /// `fifo_execution` for backwards compatibility.
     pub fifo_completion: Option<u8>,
+    /// Priority for the authenticated private producer/account-apply owner.
+    /// Unset inherits `fifo_completion`; production may raise it below the
+    /// strategy priority so a private lifecycle wake preempts ordinary HTTP
+    /// completion work without preempting strategy decisions.
+    pub fifo_private_apply: Option<u8>,
 }
 
 impl Default for OsTuneConfig {
@@ -164,6 +169,7 @@ impl Default for OsTuneConfig {
             fifo_execution: None,
             fifo_polymarket_feed: None,
             fifo_completion: None,
+            fifo_private_apply: None,
         }
     }
 }
@@ -186,7 +192,8 @@ mod os_tune_config_tests {
              background_cores = [4]\n\
              fifo_execution = 50\n\
              fifo_polymarket_feed = 71\n\
-             fifo_completion = 55\n",
+             fifo_completion = 55\n\
+             fifo_private_apply = 59\n",
         )
         .unwrap();
         assert!(cfg.allow_background_on_execution_core);
@@ -198,6 +205,7 @@ mod os_tune_config_tests {
         assert_eq!(cfg.background_cores, vec![4]);
         assert_eq!(cfg.fifo_polymarket_feed, Some(71));
         assert_eq!(cfg.fifo_completion, Some(55));
+        assert_eq!(cfg.fifo_private_apply, Some(59));
     }
 }
 

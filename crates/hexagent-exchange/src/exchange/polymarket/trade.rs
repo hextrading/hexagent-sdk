@@ -9515,6 +9515,27 @@ impl PolymarketTrade {
             };
             let records = terminal_trade_records(json, &trade_id);
             if records.is_empty() {
+                match self
+                    .shared
+                    .account_state
+                    .durable_terminal_trade_source_count(&trade_id)
+                {
+                    Ok(source_count) if source_count > 0 => {
+                        info!(
+                            "[orphan_metric] terminal_trade_backfill_durable_source={} trade_id={} authority=live_or_retired_ledger lock_release=subject_to_order_audit",
+                            source_count, trade_id,
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "[orphan_metric] terminal_trade_backfill_durable_source_invalid=1 trade_id={} error={} lock_release=forbidden",
+                            trade_id, error,
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
                 let total = self
                     .shared
                     .terminal_trade_backfill_missing_total
