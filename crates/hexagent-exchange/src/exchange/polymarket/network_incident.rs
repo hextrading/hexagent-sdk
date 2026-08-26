@@ -9,6 +9,7 @@ const INCIDENT_CORRELATION_WINDOW: Duration = Duration::from_secs(10);
 const CONNECTION_FAILURE_CLUSTER_WINDOW_NS: u64 = 750_000_000;
 const CONNECTION_FAILURE_CLUSTER_CONNECTIONS: u32 = 2;
 const CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
+const PLACE_GATE_REJECTION_LOG_INTERVAL_NS: u64 = 1_000_000_000;
 pub(crate) const HTTP_SLOW_SUCCESS_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,9 +115,9 @@ pub(crate) fn note_http_slow_success(
     role: crate::http1_pool::Role,
     slot: usize,
     elapsed: Duration,
-) {
+) -> bool {
     if elapsed < HTTP_SLOW_SUCCESS_THRESHOLD {
-        return;
+        return false;
     }
     let now_ns = crate::types::now_ns();
     let (connections, entered) = connection_failure_gate().note(now_ns, role, slot);
@@ -131,11 +132,42 @@ pub(crate) fn note_http_slow_success(
             elapsed.as_millis(),
         );
     }
+    connections >= CONNECTION_FAILURE_CLUSTER_CONNECTIONS
 }
 
 #[inline]
 pub(crate) fn place_blocked_by_connection_failure_cluster() -> bool {
     connection_failure_gate().place_blocked(crate::types::now_ns())
+}
+
+/// Count admission rejections without emitting one console record per order.
+/// Lifecycle updates remain lossless; this is console-only aggregation.
+pub(crate) fn note_place_gate_rejections(count: usize) {
+    static PENDING: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
+    let count = count as u64;
+    PENDING.fetch_add(count, Ordering::Relaxed);
+    let total = TOTAL.fetch_add(count, Ordering::Relaxed).saturating_add(count);
+    let now_ns = crate::types::now_ns();
+    loop {
+        let last = LAST_LOG_NS.load(Ordering::Acquire);
+        if last != 0 && now_ns.saturating_sub(last) < PLACE_GATE_REJECTION_LOG_INTERVAL_NS {
+            return;
+        }
+        if LAST_LOG_NS
+            .compare_exchange(last, now_ns.max(1), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let rejected = PENDING.swap(0, Ordering::AcqRel);
+            log::info!(
+                "[connection_gate_admission] rejected_orders={} rejected_total={} console_per_order_suppressed=true",
+                rejected,
+                total,
+            );
+            return;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

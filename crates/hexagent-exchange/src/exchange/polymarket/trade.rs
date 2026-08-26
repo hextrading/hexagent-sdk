@@ -2379,6 +2379,17 @@ fn per_request_timeout(method: &reqwest::Method, path: &str) -> Option<std::time
 /// [`http1_pool::Permit`]. Threading the exact connection (rather than a
 /// fresh round-robin pick) is what lets the fire-and-track path guarantee a
 /// request runs on its reserved warm connection instead of opening a cold one.
+fn instrumented_prewarm_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|mut parsed| {
+            parsed.set_path("/time");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string())
+}
+
 async fn execute_http_on(
     client: crate::http1_pool::PooledClient,
     attempt_id: u64,
@@ -2391,16 +2402,6 @@ async fn execute_http_on(
     debug_assert_ne!(attempt_id, 0, "every HTTP dispatch requires an attempt ID");
     // Lazily derived — only the error branches need it, and parsing the
     // URL eagerly cost a full `Url::parse` + allocs on every request.
-    let prewarm_url = |u: &str| {
-        reqwest::Url::parse(u)
-            .map(|mut parsed| {
-                parsed.set_path("/time");
-                parsed.set_query(None);
-                parsed.set_fragment(None);
-                parsed.to_string()
-            })
-            .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string())
-    };
     let req_timeout =
         per_request_timeout(method, path).unwrap_or_else(|| std::time::Duration::from_secs(5));
     let mut request_headers = reqwest::header::HeaderMap::with_capacity(8);
@@ -2432,7 +2433,7 @@ async fn execute_http_on(
         Ok(response) => response,
         Err(error) => {
             record_http1_phase_timings(client.role(), client.slot(), error.timings);
-            client.note_instrumented_transport_failure(prewarm_url(url.as_ref()));
+            client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
             return Err(match error.kind {
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => HttpErr::Timeout,
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
@@ -2474,6 +2475,46 @@ fn record_http1_phase_timings(
         "polymarket.http.slot_serialization_wait",
         timings.slot_wait_ns,
     );
+    if timings.incomplete_phase
+        != crate::instrumented_http1::Http1IncompletePhase::None
+    {
+        let stage = match timings.incomplete_phase {
+            crate::instrumented_http1::Http1IncompletePhase::Dns => {
+                "polymarket.http.incomplete.dns"
+            }
+            crate::instrumented_http1::Http1IncompletePhase::Tcp => {
+                "polymarket.http.incomplete.tcp"
+            }
+            crate::instrumented_http1::Http1IncompletePhase::Tls => {
+                "polymarket.http.incomplete.tls"
+            }
+            crate::instrumented_http1::Http1IncompletePhase::Ttfb => {
+                "polymarket.http.incomplete.ttfb"
+            }
+            crate::instrumented_http1::Http1IncompletePhase::Body => {
+                "polymarket.http.incomplete.body"
+            }
+            crate::instrumented_http1::Http1IncompletePhase::None => unreachable!(),
+        };
+        crate::latency::record_ns(stage, timings.total_ns);
+        log::warn!(
+            "[http_request_incomplete] role={:?} slot={} peer={:?} incomplete_phase={} generation_before={} generation_after={} connect_attempted={} slot_wait_us={} dns_us={} tcp_us={} tls_us={} ttfb_us={} body_us={} total_us={}",
+            role,
+            slot,
+            timings.peer,
+            timings.incomplete_phase.name(),
+            timings.connect_generation_before,
+            timings.connect_generation_after,
+            timings.connect_attempted,
+            timings.slot_wait_ns / 1_000,
+            timings.dns_ns / 1_000,
+            timings.tcp_ns / 1_000,
+            timings.tls_ns / 1_000,
+            timings.ttfb_ns / 1_000,
+            timings.body_ns / 1_000,
+            timings.total_ns / 1_000,
+        );
+    }
     if timings.connect_attempted {
         crate::latency::record_ns("polymarket.http.dns", timings.dns_ns);
         crate::latency::record_ns("polymarket.http.tcp", timings.tcp_ns);
@@ -2487,9 +2528,10 @@ fn record_http1_phase_timings(
             "initial_connect"
         };
         log::info!(
-            "[http_connection_generation] role={:?} slot={} disposition={} generation_before={} generation_after={} slot_wait_us={} dns_us={} tcp_us={} tls_us={} ttfb_us={} body_us={} total_us={}",
+            "[http_connection_generation] role={:?} slot={} peer={:?} disposition={} generation_before={} generation_after={} slot_wait_us={} dns_us={} tcp_us={} tls_us={} ttfb_us={} body_us={} total_us={}",
             role,
             slot,
+            timings.peer,
             disposition,
             timings.connect_generation_before,
             timings.connect_generation_after,
@@ -2505,9 +2547,10 @@ fn record_http1_phase_timings(
         crate::latency::record_ns("polymarket.http.reuse", 1);
         if timings.first_reuse_for_generation {
             log::info!(
-                "[http_connection_generation] role={:?} slot={} disposition=reuse generation_before={} generation_after={} slot_wait_us={} ttfb_us={} body_us={} total_us={}",
+                "[http_connection_generation] role={:?} slot={} peer={:?} disposition=reuse generation_before={} generation_after={} slot_wait_us={} ttfb_us={} body_us={} total_us={}",
                 role,
                 slot,
+                timings.peer,
                 timings.connect_generation_before,
                 timings.connect_generation_after,
                 timings.slot_wait_ns / 1_000,
@@ -2538,9 +2581,24 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
     let first_started = std::time::Instant::now();
-    let first = execute_http_on(client, attempt_id, method, url, path, headers, body).await;
+    let first = execute_http_on(
+        client.clone(),
+        attempt_id,
+        method,
+        url,
+        path,
+        headers,
+        body,
+    )
+    .await;
     if first.is_ok() {
-        super::network_incident::note_http_slow_success(role, slot, first_started.elapsed());
+        if super::network_incident::note_http_slow_success(role, slot, first_started.elapsed()) {
+            // The slow-success cluster has proven that this is not an
+            // isolated exchange response. Retire the exact measured
+            // generation in this logical slot; replacement does not increase
+            // pool cardinality.
+            client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
+        }
     }
     let failure_kind = match &first {
         Err(HttpErr::Timeout) => super::network_incident::ConnectionFailureKind::Timeout,
@@ -2564,7 +2622,7 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     crate::latency::record_ns("polymarket.http.cancel.connection_failure_hedge", 1);
     let hedge_started = std::time::Instant::now();
     let hedged = execute_http_on(
-        hedge_client,
+        hedge_client.clone(),
         hedge_attempt,
         method,
         url,
@@ -2574,11 +2632,14 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     )
     .await;
     if hedged.is_ok() {
-        super::network_incident::note_http_slow_success(
+        if super::network_incident::note_http_slow_success(
             hedge_role,
             hedge_slot,
             hedge_started.elapsed(),
-        );
+        ) {
+            hedge_client
+                .note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
+        }
     }
     drop(hedge_permit);
     if let Some(kind) = match &hedged {
@@ -8400,6 +8461,9 @@ impl PolymarketTrade {
         orders: &[OrderRequest],
         reason: &str,
     ) -> Vec<OrderUpdate> {
+        if reason == "connection failure cluster safety gate" {
+            super::network_incident::note_place_gate_rejections(orders.len());
+        }
         orders
             .iter()
             .map(|order| {

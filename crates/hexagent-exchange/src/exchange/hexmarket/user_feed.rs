@@ -256,7 +256,14 @@ async fn user_ws_task(
                                     update.filled_quantity, update.remaining_quantity,
                                     update.avg_fill_price,
                                 );
-                                if update_tx.send(RoutedOrderUpdate { owner, update }).is_err() {
+                                if update_tx
+                                    .send(RoutedOrderUpdate {
+                                        owner,
+                                        update,
+                                        timing: LifecycleTiming::default(),
+                                    })
+                                    .is_err()
+                                {
                                     return;
                                 }
                             } else {

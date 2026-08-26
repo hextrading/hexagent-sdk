@@ -9,6 +9,8 @@ pub use market::*;
 pub use order::*;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Global simulated clock for backtest mode (0 = not set / live mode).
 static SIM_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +37,20 @@ pub fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+/// Process-local monotonic timestamp for cross-thread latency traces. Values
+/// are meaningful only within one process generation and deliberately never
+/// participate in exchange/business timestamps or persistence.
+#[inline]
+pub fn monotonic_now_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    (EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64)
+        .saturating_add(1)
 }
 
 /// Sim-clock-preferring "now": returns the BT sim clock when one is

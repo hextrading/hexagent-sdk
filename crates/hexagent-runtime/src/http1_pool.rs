@@ -786,7 +786,7 @@ struct Slot {
     client: Arc<ArcSwap<reqwest::Client>>,
     /// Polymarket's measured HTTP/1 transport. It shares this slot's
     /// admission owner and pool cardinality; it is not an additional slot.
-    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
+    instrumented: Arc<ArcSwap<crate::instrumented_http1::InstrumentedHttp1Client>>,
     busy: Arc<AtomicBool>,
     /// True exactly while this free slot has one token in the role lane.
     /// This fences concurrent permit-drop and quarantine-release publication.
@@ -809,7 +809,7 @@ struct ConnectionHealth {
     slot: usize,
     generation_at_pick: u64,
     slot_client: Arc<ArcSwap<reqwest::Client>>,
-    instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
+    slot_instrumented: Arc<ArcSwap<crate::instrumented_http1::InstrumentedHttp1Client>>,
     busy: Arc<AtomicBool>,
     available_token: Arc<AtomicBool>,
     quarantined: Arc<AtomicBool>,
@@ -881,6 +881,18 @@ impl ConnectionHealth {
         Some(generation)
     }
 
+    fn install_instrumented_replacement(
+        &self,
+        replacement: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
+    ) -> Option<u64> {
+        if !self.is_current() {
+            return None;
+        }
+        self.slot_instrumented.store(replacement);
+        self.transport_failures.store(0, Ordering::Release);
+        Some(self.generation.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
     fn release_quarantine(&self) {
         self.quarantined.store(false, Ordering::Release);
         publish_slot_token(
@@ -941,8 +953,32 @@ impl ConnectionHealth {
     }
 
     async fn repair_instrumented(self, prewarm_url: String, failures: usize) {
-        let outcome = self
-            .instrumented
+        let candidate = match crate::instrumented_http1::InstrumentedHttp1Client::new(
+            Duration::from_millis(2000),
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                self.release_quarantine();
+                log::warn!(
+                    "[http1_pool] role={:?} slot={} instrumented generation rebuild failed after {} failures: {}",
+                    self.role, self.slot, failures, error,
+                );
+                return;
+            }
+        };
+        if !self.is_current() {
+            self.release_quarantine();
+            return;
+        }
+        // Retire the affected Hyper pool in this exact logical slot before
+        // prewarming. Quarantine prevents business admission until the fresh
+        // generation has completed its probe; no slot or connection lane is
+        // added and late repair completions are fenced by `generation`.
+        let Some(generation) = self.install_instrumented_replacement(Arc::clone(&candidate)) else {
+            self.release_quarantine();
+            return;
+        };
+        let outcome = candidate
             .request(
                 reqwest::Method::GET,
                 &prewarm_url,
@@ -953,32 +989,29 @@ impl ConnectionHealth {
             .await;
         match outcome {
             Ok(response) if response.status.is_success() => {
-                if self.is_current() {
-                    self.transport_failures.store(0, Ordering::Release);
-                    let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                    self.release_quarantine();
-                    log::info!(
-                        "[http1_pool] role={:?} slot={} instrumented transport repaired generation={} connect_generation={} url={}",
-                        self.role,
-                        self.slot,
-                        generation,
-                        response.timings.connect_generation_after,
-                        prewarm_url,
-                    );
-                }
+                self.release_quarantine();
+                log::info!(
+                    "[http1_pool] role={:?} slot={} retired instrumented generation={} replacement_generation={} connect_generation={} url={}",
+                    self.role,
+                    self.slot,
+                    self.generation_at_pick,
+                    generation,
+                    response.timings.connect_generation_after,
+                    prewarm_url,
+                );
             }
             Ok(response) => {
                 self.release_quarantine();
                 log::warn!(
-                    "[http1_pool] role={:?} slot={} instrumented repair HTTP {} after {} failures url={}",
-                    self.role, self.slot, response.status, failures, prewarm_url,
+                    "[http1_pool] role={:?} slot={} replacement generation={} prewarm HTTP {} after {} failures url={}",
+                    self.role, self.slot, generation, response.status, failures, prewarm_url,
                 );
             }
             Err(error) => {
                 self.release_quarantine();
                 log::warn!(
-                    "[http1_pool] role={:?} slot={} instrumented repair failed after {} failures: {} url={}",
-                    self.role, self.slot, failures, error.message, prewarm_url,
+                    "[http1_pool] role={:?} slot={} replacement generation={} prewarm failed after {} failures: {} url={}",
+                    self.role, self.slot, generation, failures, error.message, prewarm_url,
                 );
             }
         }
@@ -1175,12 +1208,11 @@ impl PooledClient {
         true
     }
 
-    /// Repair the measured HTTP/1 transport in place. The Hyper client owns
-    /// its connection state and reconnects on the same logical slot, so a
-    /// successful probe is sufficient; rebuilding a parallel reqwest client
-    /// here would create an unwanted second CLOB connection.
+    /// Retire the measured HTTP/1 generation and rebuild this exact logical
+    /// slot. A single transport failure already identifies the affected
+    /// generation; cluster gating remains responsible for pausing placement.
     pub fn note_instrumented_transport_failure(&self, prewarm_url: String) -> bool {
-        let Some(failures) = self.health.claim_rebuild(2, Duration::from_secs(30)) else {
+        let Some(failures) = self.health.claim_rebuild(1, Duration::from_secs(30)) else {
             return false;
         };
         let health = self.health.clone();
@@ -1202,6 +1234,7 @@ pub struct Permit {
     last_activity_ns: Arc<AtomicU64>,
     client: Arc<reqwest::Client>,
     instrumented: Arc<crate::instrumented_http1::InstrumentedHttp1Client>,
+    slot_instrumented: Arc<ArcSwap<crate::instrumented_http1::InstrumentedHttp1Client>>,
     slot_client: Arc<ArcSwap<reqwest::Client>>,
     quarantined: Arc<AtomicBool>,
     transport_failures: Arc<AtomicUsize>,
@@ -1234,7 +1267,7 @@ impl Permit {
             slot: self.slot,
             generation_at_pick,
             slot_client: self.slot_client.clone(),
-            instrumented: Arc::clone(&self.instrumented),
+            slot_instrumented: Arc::clone(&self.slot_instrumented),
             busy: self.flag.clone(),
             available_token: self.available_token.clone(),
             quarantined: self.quarantined.clone(),
@@ -1266,7 +1299,7 @@ impl Permit {
         let generation = self.generation.load(Ordering::Acquire);
         PooledClient {
             client: self.current_client(),
-            instrumented: Arc::clone(&self.instrumented),
+            instrumented: self.slot_instrumented.load_full(),
             health: self.health(generation),
             attempt_trace: Arc::clone(&self.attempt_trace),
             exclusive_admission: true,
@@ -1343,9 +1376,11 @@ impl RolePool {
         for slot in 0..n {
             slots.push(Slot {
                 client: Arc::new(ArcSwap::from(Arc::new(build_h1_client(timeout)?))),
-                instrumented: Arc::new(crate::instrumented_http1::InstrumentedHttp1Client::new(
-                    Duration::from_millis(2000),
-                )?),
+                instrumented: Arc::new(ArcSwap::from(Arc::new(
+                    crate::instrumented_http1::InstrumentedHttp1Client::new(
+                        Duration::from_millis(2000),
+                    )?,
+                ))),
                 busy: Arc::new(AtomicBool::new(false)),
                 available_token: Arc::new(AtomicBool::new(true)),
                 last_activity_ns: Arc::new(AtomicU64::new(activity_now_ns())),
@@ -1483,7 +1518,8 @@ impl RolePool {
             available_token: s.available_token.clone(),
             last_activity_ns: s.last_activity_ns.clone(),
             client: s.client.load_full(),
-            instrumented: Arc::clone(&s.instrumented),
+            instrumented: s.instrumented.load_full(),
+            slot_instrumented: Arc::clone(&s.instrumented),
             slot_client: s.client.clone(),
             quarantined: s.quarantined.clone(),
             transport_failures: s.transport_failures.clone(),
@@ -1507,13 +1543,13 @@ impl RolePool {
         let generation = state.generation.load(Ordering::Acquire);
         PooledClient {
             client: state.client.load_full(),
-            instrumented: Arc::clone(&state.instrumented),
+            instrumented: state.instrumented.load_full(),
             health: ConnectionHealth {
                 role: self.role,
                 slot,
                 generation_at_pick: generation,
                 slot_client: state.client.clone(),
-                instrumented: Arc::clone(&state.instrumented),
+                slot_instrumented: Arc::clone(&state.instrumented),
                 busy: state.busy.clone(),
                 available_token: state.available_token.clone(),
                 quarantined: state.quarantined.clone(),
@@ -2280,6 +2316,36 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&original, repaired.client()),
             "the repaired slot must own a fresh reqwest connection pool",
+        );
+    }
+
+    #[test]
+    fn instrumented_rebuild_replaces_generation_in_the_same_logical_slot() {
+        let p = RolePool::new(1, Duration::from_secs(2), Role::Fast).unwrap();
+        let permit = p.try_acquire().unwrap();
+        let original = Arc::clone(&permit.instrumented);
+        let health = permit.health(permit.generation());
+        let candidate = Arc::new(
+            crate::instrumented_http1::InstrumentedHttp1Client::new(Duration::from_secs(2))
+                .unwrap(),
+        );
+        assert_eq!(
+            health.install_instrumented_replacement(Arc::clone(&candidate)),
+            Some(1),
+        );
+        assert_eq!(p.slots.len(), 1, "replacement must not add a connection slot");
+        assert!(Arc::ptr_eq(&p.slots[0].instrumented.load_full(), &candidate));
+        assert!(!Arc::ptr_eq(&original, &candidate));
+        assert!(
+            health
+                .install_instrumented_replacement(Arc::new(
+                    crate::instrumented_http1::InstrumentedHttp1Client::new(
+                        Duration::from_secs(2),
+                    )
+                    .unwrap(),
+                ))
+                .is_none(),
+            "a stale generation must not overwrite the replacement",
         );
     }
 

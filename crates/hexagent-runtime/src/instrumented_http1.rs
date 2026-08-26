@@ -12,12 +12,13 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::dns::{GaiAddrs, GaiResolver, Name};
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -33,6 +34,56 @@ struct ConnectTrace {
     dns_ns: AtomicU64,
     dns_tcp_ns: AtomicU64,
     tls_total_ns: AtomicU64,
+    phase: AtomicU8,
+    peer_family: AtomicU8,
+    peer_port: AtomicU16,
+    peer_words: [AtomicU32; 4],
+}
+
+const PHASE_DNS: u8 = 1;
+const PHASE_TCP: u8 = 2;
+const PHASE_TLS: u8 = 3;
+const PHASE_TTFB: u8 = 4;
+const PHASE_BODY: u8 = 5;
+
+impl ConnectTrace {
+    fn store_peer(&self, peer: SocketAddr) {
+        self.peer_port.store(peer.port(), Ordering::Release);
+        match peer.ip() {
+            IpAddr::V4(ip) => {
+                self.peer_words[0].store(u32::from(ip), Ordering::Relaxed);
+                self.peer_family.store(4, Ordering::Release);
+            }
+            IpAddr::V6(ip) => {
+                let octets = ip.octets();
+                for (word, bytes) in self.peer_words.iter().zip(octets.chunks_exact(4)) {
+                    word.store(
+                        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        Ordering::Relaxed,
+                    );
+                }
+                self.peer_family.store(6, Ordering::Release);
+            }
+        }
+    }
+
+    fn peer(&self) -> Option<SocketAddr> {
+        let port = self.peer_port.load(Ordering::Acquire);
+        match self.peer_family.load(Ordering::Acquire) {
+            4 => Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(self.peer_words[0].load(Ordering::Acquire))),
+                port,
+            )),
+            6 => {
+                let mut octets = [0_u8; 16];
+                for (chunk, word) in octets.chunks_exact_mut(4).zip(self.peer_words.iter()) {
+                    chunk.copy_from_slice(&word.load(Ordering::Acquire).to_be_bytes());
+                }
+                Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,11 +105,13 @@ impl Service<Name> for TimedResolver {
         let mut inner = self.inner.clone();
         let trace = Arc::clone(&self.trace);
         Box::pin(async move {
+            trace.phase.store(PHASE_DNS, Ordering::Release);
             let started = Instant::now();
             let result = inner.call(name).await;
             trace
                 .dns_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
+            trace.phase.store(PHASE_TCP, Ordering::Release);
             result
         })
     }
@@ -83,11 +136,18 @@ impl Service<Uri> for TimedTcpConnector {
         let mut inner = self.inner.clone();
         let trace = Arc::clone(&self.trace);
         Box::pin(async move {
+            trace.phase.store(PHASE_TCP, Ordering::Release);
             let started = Instant::now();
             let result = inner.call(uri).await;
             trace
                 .dns_tcp_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
+            if let Ok(stream) = &result {
+                if let Ok(peer) = stream.inner().peer_addr() {
+                    trace.store_peer(peer);
+                }
+                trace.phase.store(PHASE_TLS, Ordering::Release);
+            }
             result
         })
     }
@@ -112,6 +172,8 @@ impl Service<Uri> for TimedTlsConnector {
         self.trace.dns_ns.store(0, Ordering::Relaxed);
         self.trace.dns_tcp_ns.store(0, Ordering::Relaxed);
         self.trace.tls_total_ns.store(0, Ordering::Relaxed);
+        self.trace.peer_family.store(0, Ordering::Relaxed);
+        self.trace.phase.store(PHASE_TLS, Ordering::Release);
         self.trace.attempts.fetch_add(1, Ordering::AcqRel);
         let mut inner = self.inner.clone();
         let trace = Arc::clone(&self.trace);
@@ -123,6 +185,7 @@ impl Service<Uri> for TimedTlsConnector {
                 .store(duration_ns(started.elapsed()), Ordering::Release);
             if result.is_ok() {
                 trace.generation.fetch_add(1, Ordering::AcqRel);
+                trace.phase.store(PHASE_TTFB, Ordering::Release);
             }
             result
         })
@@ -160,6 +223,35 @@ pub struct Http1PhaseTimings {
     /// connection generation. This supports sparse generation logging without
     /// a process-global mutable sampler.
     pub first_reuse_for_generation: bool,
+    /// Peer of the reused or newly connected socket. Available before headers
+    /// as soon as TCP completes, including TTFB/body timeouts.
+    pub peer: Option<SocketAddr>,
+    /// Stage that had not completed when the request failed or timed out.
+    pub incomplete_phase: Http1IncompletePhase,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Http1IncompletePhase {
+    #[default]
+    None,
+    Dns,
+    Tcp,
+    Tls,
+    Ttfb,
+    Body,
+}
+
+impl Http1IncompletePhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Dns => "dns",
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+            Self::Ttfb => "ttfb",
+            Self::Body => "body",
+        }
+    }
 }
 
 impl Http1PhaseTimings {
@@ -273,6 +365,8 @@ impl InstrumentedHttp1Client {
             }
         };
         let started = Instant::now();
+        let headers_completed_ns = AtomicU64::new(0);
+        self.trace.phase.store(PHASE_TTFB, Ordering::Release);
         let operation = async {
             let headers_started = Instant::now();
             let response = self
@@ -281,6 +375,11 @@ impl InstrumentedHttp1Client {
                 .await
                 .map_err(|error| (InstrumentedHttp1ErrorKind::Transport, error.to_string()))?;
             let headers_ns = duration_ns(headers_started.elapsed());
+            headers_completed_ns.store(headers_ns, Ordering::Release);
+            if let Some(info) = response.extensions().get::<HttpInfo>() {
+                self.trace.store_peer(info.remote_addr());
+            }
+            self.trace.phase.store(PHASE_BODY, Ordering::Release);
             let status = response.status();
             let body_started = Instant::now();
             let body = response
@@ -301,6 +400,7 @@ impl InstrumentedHttp1Client {
                     body_ns,
                     duration_ns(started.elapsed()),
                     slot_wait_ns,
+                    Http1IncompletePhase::None,
                 );
                 Ok(InstrumentedHttp1Response {
                     status,
@@ -308,30 +408,53 @@ impl InstrumentedHttp1Client {
                     timings,
                 })
             }
-            Ok(Err((kind, message))) => Err(InstrumentedHttp1Error {
-                kind,
-                message,
-                timings: self.snapshot(
+            Ok(Err((kind, message))) => {
+                let total_ns = duration_ns(started.elapsed());
+                let headers_ns = headers_completed_ns.load(Ordering::Acquire);
+                Err(InstrumentedHttp1Error {
+                    kind,
+                    message,
+                    timings: self.snapshot(
                     attempts_before,
                     generation_before,
-                    duration_ns(started.elapsed()),
-                    0,
-                    duration_ns(started.elapsed()),
+                    if headers_ns == 0 { total_ns } else { headers_ns },
+                    total_ns.saturating_sub(headers_ns).min(total_ns) * u64::from(headers_ns != 0),
+                    total_ns,
                     slot_wait_ns,
-                ),
-            }),
-            Err(_) => Err(InstrumentedHttp1Error {
-                kind: InstrumentedHttp1ErrorKind::Timeout,
-                message: format!("HTTP/1.1 request timed out after {}ms", timeout.as_millis()),
-                timings: self.snapshot(
+                    self.incomplete_phase(headers_ns),
+                    ),
+                })
+            }
+            Err(_) => {
+                let total_ns = duration_ns(started.elapsed());
+                let headers_ns = headers_completed_ns.load(Ordering::Acquire);
+                Err(InstrumentedHttp1Error {
+                    kind: InstrumentedHttp1ErrorKind::Timeout,
+                    message: format!("HTTP/1.1 request timed out after {}ms", timeout.as_millis()),
+                    timings: self.snapshot(
                     attempts_before,
                     generation_before,
-                    duration_ns(started.elapsed()),
-                    0,
-                    duration_ns(started.elapsed()),
+                    if headers_ns == 0 { total_ns } else { headers_ns },
+                    total_ns.saturating_sub(headers_ns).min(total_ns) * u64::from(headers_ns != 0),
+                    total_ns,
                     slot_wait_ns,
-                ),
-            }),
+                    self.incomplete_phase(headers_ns),
+                    ),
+                })
+            }
+        }
+    }
+
+    fn incomplete_phase(&self, headers_completed_ns: u64) -> Http1IncompletePhase {
+        if headers_completed_ns != 0 {
+            return Http1IncompletePhase::Body;
+        }
+        match self.trace.phase.load(Ordering::Acquire) {
+            PHASE_DNS => Http1IncompletePhase::Dns,
+            PHASE_TCP => Http1IncompletePhase::Tcp,
+            PHASE_TLS => Http1IncompletePhase::Tls,
+            PHASE_BODY => Http1IncompletePhase::Body,
+            _ => Http1IncompletePhase::Ttfb,
         }
     }
 
@@ -343,6 +466,7 @@ impl InstrumentedHttp1Client {
         body_ns: u64,
         total_ns: u64,
         slot_wait_ns: u64,
+        incomplete_phase: Http1IncompletePhase,
     ) -> Http1PhaseTimings {
         let attempts_after = self.trace.attempts.load(Ordering::Acquire);
         let generation_after = self.trace.generation.load(Ordering::Acquire);
@@ -382,6 +506,8 @@ impl InstrumentedHttp1Client {
             total_ns,
             slot_wait_ns,
             first_reuse_for_generation,
+            peer: self.trace.peer(),
+            incomplete_phase,
         }
     }
 }
@@ -507,6 +633,67 @@ mod tests {
         assert_eq!(first.connect_generation_after, 1);
         assert_eq!(second.connect_generation_after, 1);
         assert!(first.slot_wait_ns.max(second.slot_wait_ns) >= 20_000_000);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_retains_peer_generation_and_incomplete_ttfb_stage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let error = client
+            .request(
+                reqwest::Method::GET,
+                &format!("http://{addr}/time"),
+                reqwest::header::HeaderMap::new(),
+                Bytes::new(),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Timeout);
+        assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Ttfb);
+        assert_eq!(error.timings.peer.map(|peer| peer.ip()), Some(addr.ip()));
+        assert_eq!(error.timings.connect_generation_after, 1);
+        assert!(error.timings.ttfb_ns >= 15_000_000);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_after_headers_is_attributed_to_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        });
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let error = client
+            .request(
+                reqwest::Method::GET,
+                &format!("http://{addr}/time"),
+                reqwest::header::HeaderMap::new(),
+                Bytes::new(),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Timeout);
+        assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Body);
+        assert!(error.timings.body_ns >= 15_000_000);
         server.await.unwrap();
     }
 }

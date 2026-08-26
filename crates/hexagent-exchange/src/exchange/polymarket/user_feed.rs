@@ -303,6 +303,7 @@ fn enqueue_recovery_update(
             .send(RoutedOrderUpdate {
                 owner: numeric_owner,
                 update,
+                timing: LifecycleTiming::default(),
             })
             .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
     }
@@ -349,7 +350,11 @@ async fn wait_for_recovery_delivery(
                         )
                     })?;
                     update_tx
-                        .send(RoutedOrderUpdate { owner, update })
+                        .send(RoutedOrderUpdate {
+                            owner,
+                            update,
+                            timing: LifecycleTiming::default(),
+                        })
                         .map_err(|_| {
                             anyhow!("order update channel closed while draining startup recovery")
                         })?;
@@ -1311,38 +1316,56 @@ pub(crate) struct ParsedPrivateEvent {
     pub(crate) rejection_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateEventKind {
+    Order,
+    Trade,
+}
+
 #[derive(Debug, Clone)]
-enum PrivateEventDelta {
-    Order(serde_json::Value),
-    Trade(serde_json::Value),
+struct PrivateEventDelta {
+    kind: PrivateEventKind,
+    payload: serde_json::Value,
+    timing: LifecycleTiming,
 }
 
 impl PrivateEventDelta {
     fn classify(payload: serde_json::Value) -> Option<Self> {
-        match payload
+        Self::classify_with_timing(payload, LifecycleTiming::default())
+    }
+
+    fn classify_with_timing(
+        payload: serde_json::Value,
+        timing: LifecycleTiming,
+    ) -> Option<Self> {
+        let kind = match payload
             .get("event_type")
             .or_else(|| payload.get("type"))
             .and_then(serde_json::Value::as_str)
         {
-            Some("order") => Some(Self::Order(payload)),
-            Some("trade") => Some(Self::Trade(payload)),
-            _ => None,
-        }
+            Some("order") => PrivateEventKind::Order,
+            Some("trade") => PrivateEventKind::Trade,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            payload,
+            timing,
+        })
     }
 
     fn payload(&self) -> &serde_json::Value {
-        match self {
-            Self::Order(payload) | Self::Trade(payload) => payload,
-        }
+        &self.payload
     }
 
     /// Synthetic RTT order pushes are operational measurements, not strategy
     /// lifecycle events.  Remove them on the websocket parser thread before
     /// they consume either the lossless owner lane or the cold account lane.
     fn is_registered_probe_order(&self, shared: &SharedState) -> bool {
-        let Self::Order(payload) = self else {
+        if self.kind != PrivateEventKind::Order {
             return false;
-        };
+        }
+        let payload = &self.payload;
         let Some(order_id) = payload
             .get("order_id")
             .or_else(|| payload.get("orderID"))
@@ -1377,9 +1400,10 @@ impl PrivateEventDelta {
     }
 
     fn terminal_trade_key(&self) -> Option<String> {
-        let Self::Trade(payload) = self else {
+        if self.kind != PrivateEventKind::Trade {
             return None;
-        };
+        }
+        let payload = &self.payload;
         let status = payload
             .get("status")
             .and_then(serde_json::Value::as_str)?
@@ -1563,6 +1587,7 @@ struct FastPrivateUpdate {
     owner: u16,
     update: OrderUpdate,
     identity: PrivateRouteIdentity,
+    timing: LifecycleTiming,
 }
 
 #[derive(Debug)]
@@ -1686,8 +1711,8 @@ fn route_private_event_fast(
     shared: &SharedState,
 ) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
     let data = event.payload();
-    match event {
-        PrivateEventDelta::Order(_) => {
+    match event.kind {
+        PrivateEventKind::Order => {
             let order_id = required_string(data, &["order_id", "orderID", "id"], "order_id")?;
             let asset_id = required_string(data, &["asset_id", "token_id"], "asset_id")?;
             let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
@@ -1780,6 +1805,9 @@ fn route_private_event_fast(
                 fingerprint: private_route_fingerprint(b'o', &[order_id]),
                 rank,
             };
+            let produced_ns = now_ns();
+            let mut timing = event.timing;
+            timing.private_producer_ns = crate::types::monotonic_now_ns();
             Ok(vec![FastPrivateUpdate {
                 owner: shared
                     .strategy_owner(&ownership.instance_id)
@@ -1801,7 +1829,7 @@ fn route_private_event_fast(
                     filled_quantity: 0.0,
                     remaining_quantity: (original_size - size_matched).max(0.0),
                     avg_fill_price: price,
-                    timestamp_ns: now_ns(),
+                    timestamp_ns: produced_ns,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
                     order_audit: Some(AuthoritativeOrderAudit {
@@ -1812,9 +1840,10 @@ fn route_private_event_fast(
                     error: None,
                 },
                 identity,
+                timing,
             }])
         }
-        PrivateEventDelta::Trade(_) => {
+        PrivateEventKind::Trade => {
             let (status_name, status, rank) = private_status(data);
             // REST history commonly returns MATCHED even after the durable
             // ledger has advanced the same trade to MINED/CONFIRMED. Treat a
@@ -1891,6 +1920,9 @@ fn route_private_event_fast(
                             ));
                         }
                         let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
+                        let produced_ns = now_ns();
+                        let mut timing = event.timing;
+                        timing.private_producer_ns = crate::types::monotonic_now_ns();
                         routed.push(FastPrivateUpdate {
                             owner: shared.strategy_owner(&ownership.instance_id).ok_or_else(
                                 || {
@@ -1912,7 +1944,7 @@ fn route_private_event_fast(
                                 filled_quantity: quantity,
                                 remaining_quantity: 0.0,
                                 avg_fill_price: price,
-                                timestamp_ns: now_ns(),
+                                timestamp_ns: produced_ns,
                                 exchange_event_timestamp_ns: exchange_timestamp_ns,
                                 trade_id: Some(key.clone()),
                                 order_audit: None,
@@ -1922,6 +1954,7 @@ fn route_private_event_fast(
                                 fingerprint: private_route_fingerprint(b'm', &[trade_id, order_id]),
                                 rank,
                             },
+                            timing,
                         });
                     }
                 }
@@ -1954,6 +1987,9 @@ fn route_private_event_fast(
                             "taker trade ownership mismatch trade={trade_id} order_id={order_id}"
                         ));
                     }
+                    let produced_ns = now_ns();
+                    let mut timing = event.timing;
+                    timing.private_producer_ns = crate::types::monotonic_now_ns();
                     routed.push(FastPrivateUpdate {
                         owner: shared
                             .strategy_owner(&ownership.instance_id)
@@ -1975,7 +2011,7 @@ fn route_private_event_fast(
                             filled_quantity: quantity,
                             remaining_quantity: 0.0,
                             avg_fill_price: price,
-                            timestamp_ns: now_ns(),
+                            timestamp_ns: produced_ns,
                             exchange_event_timestamp_ns: exchange_timestamp_ns,
                             trade_id: Some(trade_id.to_string()),
                             order_audit: None,
@@ -1985,6 +2021,7 @@ fn route_private_event_fast(
                             fingerprint: private_route_fingerprint(b't', &[trade_id]),
                             rank,
                         },
+                        timing,
                     });
                 }
             }
@@ -2043,7 +2080,11 @@ fn dispatch_private_update(
     recovery_generation: Option<u64>,
     routed: RoutedOrderUpdate,
 ) -> std::result::Result<(), String> {
-    let update = routed.update;
+    let RoutedOrderUpdate {
+        owner,
+        update,
+        timing,
+    } = routed;
     if update.client_order_id.is_empty() {
         if let Some(oid) = update.exchange_order_id.as_deref() {
             let is_probe = shared.probe_order_ids.contains(oid);
@@ -2086,8 +2127,9 @@ fn dispatch_private_update(
     } else {
         update_tx
             .try_send(RoutedOrderUpdate {
-                owner: routed.owner,
+                owner,
                 update,
+                timing,
             })
             .map_err(|error| match error {
                 crossbeam_channel::TrySendError::Full(_) => {
@@ -2114,11 +2156,12 @@ fn route_private_batch(
     let mut cold_events = Vec::with_capacity(events.len());
     let mut cold_identities = Vec::with_capacity(events.len());
     let mut durable_skips = 0usize;
-    for event in events {
+    for mut event in events {
+        event.timing.private_owner_dequeued_ns = crate::types::monotonic_now_ns();
         let payload = event.payload();
         let route_started = crate::latency::Instant::now();
         let validate_started = crate::latency::Instant::now();
-        let durably_covered = matches!(event, PrivateEventDelta::Trade(_))
+        let durably_covered = event.kind == PrivateEventKind::Trade
             && trade_lifecycle_is_durably_covered(payload, shared);
         let routed = match if durably_covered {
             Ok(Vec::new())
@@ -2149,6 +2192,7 @@ fn route_private_batch(
                 RoutedOrderUpdate {
                     owner: routed.owner,
                     update: routed.update,
+                    timing: routed.timing,
                 },
             )?;
             // Delivery is the commit edge for actor-local replay suppression.
@@ -2190,7 +2234,7 @@ fn apply_private_cold_batch_owned(
     let mut applied = 0usize;
     for event in events {
         let payload = event.payload();
-        let is_trade = matches!(event, PrivateEventDelta::Trade(_));
+        let is_trade = event.kind == PrivateEventKind::Trade;
         if (is_trade && replay.lifecycle_seen(payload))
             || event
                 .terminal_trade_key()
@@ -3813,6 +3857,7 @@ async fn user_feed_loop(
             };
             match read_result {
                 Ok(Some(Ok(msg))) => {
+                    let private_ws_received_ns = crate::types::monotonic_now_ns();
                     match msg {
                         Message::Text(text) => {
                             last_transport = Instant::now();
@@ -3862,13 +3907,21 @@ async fn user_feed_loop(
                                     break;
                                 }
                             };
+                            let private_json_parsed_ns = crate::types::monotonic_now_ns();
+                            let frame_timing = LifecycleTiming {
+                                private_ws_received_ns,
+                                private_json_parsed_ns,
+                                ..LifecycleTiming::default()
+                            };
                             let events = if data.is_array() {
                                 data.as_array().cloned().unwrap_or_default()
                             } else {
                                 vec![data]
                             }
                             .into_iter()
-                            .filter_map(PrivateEventDelta::classify)
+                            .filter_map(|payload| {
+                                PrivateEventDelta::classify_with_timing(payload, frame_timing)
+                            })
                             .filter(|event| !event.is_registered_probe_order(&shared))
                             .collect();
                             let apply_enqueue_started = crate::latency::Instant::now();
@@ -4082,7 +4135,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(matches!(matched, PrivateEventDelta::Trade(_)));
+        assert_eq!(matched.kind, PrivateEventKind::Trade);
         assert_eq!(matched.dedupe_key(), duplicate.dedupe_key());
         assert_ne!(matched.dedupe_key(), confirmed.dedupe_key());
         assert!(PrivateEventDelta::classify(serde_json::json!({
@@ -4228,7 +4281,7 @@ mod tests {
             )
             .unwrap();
         shared.register_order_id("owner-1-1", "0xabc1", "TOKEN");
-        let event = PrivateEventDelta::classify(serde_json::json!({
+        let event = PrivateEventDelta::classify_with_timing(serde_json::json!({
             "event_type": "trade",
             "id": "fast-route-trade",
             "status": "MATCHED",
@@ -4238,13 +4291,20 @@ mod tests {
             "price": "0.5",
             "taker_order_id": "0xabc1",
             "maker_orders": []
-        }))
+        }), LifecycleTiming {
+            private_ws_received_ns: 10,
+            private_json_parsed_ns: 20,
+            ..LifecycleTiming::default()
+        })
         .unwrap();
 
         let before = shared.account_state.order("owner-1-1").unwrap();
         let routed = route_private_event_fast(&event, &shared).unwrap();
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].update.client_order_id, "owner-1-1");
+        assert_eq!(routed[0].timing.private_ws_received_ns, 10);
+        assert_eq!(routed[0].timing.private_json_parsed_ns, 20);
+        assert!(routed[0].timing.private_producer_ns >= 20);
         assert_eq!(
             shared
                 .account_state
@@ -5087,12 +5147,12 @@ mod tests {
     fn gap_replay_checkpoint_retains_exact_failed_record_before_cursor_commit() {
         let mut checkpoint = GapReplayCheckpoint::new(997);
         checkpoint.pending_page = VecDeque::from([
-            PrivateEventDelta::Trade(serde_json::json!({
+            PrivateEventDelta::classify(serde_json::json!({
                 "event_type": "trade", "id": "already-applied"
-            })),
-            PrivateEventDelta::Trade(serde_json::json!({
+            })).unwrap(),
+            PrivateEventDelta::classify(serde_json::json!({
                 "event_type": "trade", "id": "failed-record"
-            })),
+            })).unwrap(),
         ]);
         checkpoint.pending_page_records = 2;
         checkpoint.pending_next_cursor = Some("page-2".to_string());
