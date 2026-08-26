@@ -6,6 +6,7 @@ use log::{debug, info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use simd_json::prelude::{TypedScalarValue as _, ValueAsScalar as _};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -3325,25 +3326,23 @@ fn clob_quantile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn replay_clob_simd_json(frame: &[u8], iterations: usize) -> ClobReplayDistribution {
+fn replay_clob_resident_tape(frame: &[u8], iterations: usize) -> ClobReplayDistribution {
     let mut wall = Vec::with_capacity(iterations);
     let mut cpu = Vec::with_capacity(iterations);
-    let mut replay = frame.to_vec();
     let mut errors = 0usize;
+    let mut parser = ResidentClobParser::new();
+    let mut replay = frame.to_vec();
     for _ in 0..iterations {
+        // simd-json is an in-situ parser. Restore the captured frame outside
+        // the measured replay boundary, while keeping the Vec allocation and
+        // resident parser warm across all iterations.
         replay.copy_from_slice(frame);
-        let is_array = replay
-            .iter()
-            .copied()
-            .find(|byte| !byte.is_ascii_whitespace())
-            == Some(b'[');
         let cpu_started = clob_thread_cpu_ns();
         let started = crate::latency::Instant::now();
-        let decoded = if is_array {
-            simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut replay).map(|frames| frames.len())
-        } else {
-            simd_json::serde::from_slice::<ClobFrame>(&mut replay).map(|_| 1)
-        };
+        let decoded = parser
+            .parse(&mut replay, validate_clob_tape_root)
+            .map_err(|_| ())
+            .and_then(|(decoded, _)| decoded.map_err(|_| ()));
         let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let cpu_elapsed = clob_thread_cpu_ns().saturating_sub(cpu_started);
         match decoded {
@@ -3524,17 +3523,17 @@ impl ClobPerfRing {
                     let frame_output = format!("{output}.frame.json");
                     let summary_output = format!("{output}.summary.json");
                     let structure = clob_frame_structure_summary(&trigger.frame);
-                    let replay = replay_clob_simd_json(&trigger.frame, 1_024);
+                    let replay = replay_clob_resident_tape(&trigger.frame, 1_024);
                     let summary = serde_json::json!({
                         "triggering_tail_us": trigger.elapsed.as_micros(),
                         "phases_us": {
-                            "simd_json": trigger.phases.simd_json_ns / 1_000,
+                            "simd_json": trigger.phases.json_decode_ns / 1_000,
                             "book_apply": trigger.phases.book_apply_ns / 1_000,
                             "price_change_apply": trigger.phases.price_change_apply_ns / 1_000,
                             "event_construction": trigger.phases.event_construction_ns / 1_000,
                         },
                         "structure": structure,
-                        "same_frame_simd_json_replay": {
+                        "same_frame_resident_tape_replay": {
                             "n": replay.n,
                             "p50_us": replay.p50_ns / 1_000,
                             "p99_us": replay.p99_ns / 1_000,
@@ -3566,7 +3565,7 @@ impl ClobPerfRing {
                         status,
                         trigger.elapsed.as_micros(),
                         trigger.frame.len(),
-                        trigger.phases.simd_json_ns / 1_000,
+                        trigger.phases.json_decode_ns / 1_000,
                         trigger.phases.book_apply_ns / 1_000,
                         trigger.phases.price_change_apply_ns / 1_000,
                         trigger.phases.event_construction_ns / 1_000,
@@ -3643,7 +3642,9 @@ fn maybe_trigger_clob_perf(
 
 #[cfg(test)]
 mod clob_perf_command_tests {
-    use super::{clob_frame_structure_summary, clob_perf_record_command, replay_clob_simd_json};
+    use super::{
+        clob_frame_structure_summary, clob_perf_record_command, replay_clob_resident_tape,
+    };
 
     #[test]
     fn cpu_sampling_prewindow_uses_overwrite_without_aux_snapshot() {
@@ -3669,7 +3670,7 @@ mod clob_perf_command_tests {
         assert_eq!(summary["event_types"]["book"], 1);
         assert_eq!(summary["event_types"]["price_change"], 1);
         assert_eq!(summary["price_change_entries"], 1);
-        let replay = replay_clob_simd_json(frame, 32);
+        let replay = replay_clob_resident_tape(frame, 32);
         assert_eq!(replay.n, 32);
         assert_eq!(replay.errors, 0);
         assert!(replay.max_ns >= replay.p50_ns);
@@ -3945,6 +3946,7 @@ fn spawn_clob_seeded_candidate(
         let started = Instant::now();
         let mut lane = connect_clob_lane(&subscription.tokens, lane_id).await?;
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
+        let mut parser = ResidentClobParser::new();
         let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -3972,13 +3974,13 @@ fn spawn_clob_seeded_candidate(
                         continue;
                     }
                     let frame_len = text.len();
-                    // Consuming String into Vec transfers its allocation;
-                    // simd-json can parse it in place without a per-frame
-                    // memcpy into a second scratch buffer.
+                    // Consuming String into Vec transfers the websocket-owned
+                    // allocation without a second per-frame copy.
                     let mut frame_bytes = text.into_bytes();
                     let mut frame_phases = ClobFramePhaseTimings::default();
                     let batch = process_clob_frame_in_place(
                         &mut frame_bytes,
+                        &mut parser,
                         &mut books,
                         &subscription.tokens,
                         &subscription.tokens,
@@ -4619,6 +4621,7 @@ async fn clob_ws_task(
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
     let mut thread_resource_sampler = ClobThreadResourceSampler::default();
     let clob_perf_ring = ClobPerfRing::start();
+    let mut parser = ResidentClobParser::new();
     let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
@@ -5608,6 +5611,7 @@ async fn clob_ws_task(
                             let mut frame_phases = ClobFramePhaseTimings::default();
                             let mut batch = process_clob_frame_in_place(
                                 &mut frame_bytes,
+                                &mut parser,
                                 &mut books,
                                 &wire_subscription.tokens,
                                 &subscription.tokens,
@@ -5670,8 +5674,8 @@ async fn clob_ws_task(
                                 break 'outer;
                             }
                             // Parse + dispatch latency for the whole
-                            // CLOB WS frame (simd-json + typed deser +
-                            // all contained items + crossbeam sends).
+                            // CLOB WS frame (resident simd-json tape + bounded
+                            // typed mapping + all items + crossbeam sends).
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
                             let read_handler_elapsed = received_at.elapsed();
                             if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
@@ -5687,7 +5691,7 @@ async fn clob_ws_task(
                                         frame_len,
                                         read_handler_elapsed.as_micros(),
                                         parse_apply_elapsed.as_micros(),
-                                        frame_phases.simd_json_ns / 1_000,
+                                        frame_phases.json_decode_ns / 1_000,
                                         frame_phases.book_apply_ns / 1_000,
                                         frame_phases.price_change_apply_ns / 1_000,
                                         frame_phases.event_construction_ns / 1_000,
@@ -6063,14 +6067,12 @@ async fn rtds_connect_and_run(
                             let _ = ws_send(&mut write, Message::Text("PONG".to_string())).await;
                             continue;
                         }
-                        // simd-json drop-in — same Value output, SIMD parse.
-                        let mut buf = text.as_bytes().to_vec();
-                        let data: serde_json::Value = match simd_json::serde::from_slice(&mut buf) {
+                        let data: RtdsWireMessage<'_> = match serde_json::from_str(&text) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let topic = match data.get("topic").and_then(|v| v.as_str()) {
-                            Some(t) if !t.is_empty() => t,
+                        let topic = match data.topic {
+                            t if !t.is_empty() => t,
                             _ => continue,
                         };
                         let source = match topic {
@@ -6080,14 +6082,12 @@ async fn rtds_connect_and_run(
                             _ => continue,
                         };
                         health.record_topic_frame(received_at);
-                        let payload = match data.get("payload") { Some(p) => p, None => continue };
-                        let symbol = match payload.get("symbol").and_then(|v| v.as_str()) {
-                            Some(s) => s, None => continue,
+                        let symbol = data.payload.symbol;
+                        let price = match data.payload.value.decimal().and_then(|value| value.to_f64()) {
+                            Some(price) => price,
+                            None => continue,
                         };
-                        let price = match payload.get("value").and_then(json_f64) {
-                            Some(p) => p, None => continue,
-                        };
-                        let server_ts_ms = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let server_ts_ms = data.timestamp.as_ref().and_then(WireUnsigned::as_u64).unwrap_or(0);
                         if is_btc_symbol(symbol) {
                             health.record_btc_price(received_at);
                         }
@@ -6118,10 +6118,22 @@ async fn rtds_connect_and_run(
     }
 }
 
-fn json_f64(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+#[derive(serde::Deserialize)]
+struct RtdsWireMessage<'a> {
+    #[serde(borrow)]
+    topic: &'a str,
+    #[serde(borrow)]
+    payload: RtdsWirePayload<'a>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RtdsWirePayload<'a> {
+    #[serde(borrow)]
+    symbol: &'a str,
+    #[serde(borrow)]
+    value: WireDecimal<'a>,
 }
 
 fn is_btc_symbol(symbol: &str) -> bool {
@@ -6132,7 +6144,7 @@ fn is_btc_symbol(symbol: &str) -> bool {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Typed CLOB WS message schemas (simd-json fast path)
+// Resident, allocation-free CLOB WS tape and typed wire schemas
 // ────────────────────────────────────────────────────────────────
 //
 // Each incoming frame is either a single JSON object or a JSON array
@@ -6140,14 +6152,109 @@ fn is_btc_symbol(symbol: &str) -> bool {
 // `event_type`: book / trade / last_trade_price / tick_size_change /
 // price_change / best_bid_ask) OR an RTDS spot-price record (has `source` + `pair`,
 // no event_type) — the server multiplexes both streams on the same
-// socket. We model this with a `#[serde(untagged)]` outer enum that
-// picks tagged-vs-RTDS per message, and a `#[serde(tag = "event_type")]`
-// inner enum for the tagged flavour.
-//
-// Why typed + simd-json? Replacing `serde_json::from_str::<Value>` +
-// `.get("field")` tree walks with a single-pass typed deserialize
-// avoids per-frame HashMap construction for every object / nested
-// level — hot path wins ~3-5x in practice.
+// socket. The CLOB owner retains one prewarmed simd-json Buffers + Tape pair;
+// manual typed mapping borrows strings directly from the in-situ input. Do not
+// use simd-json's serde adapter here: it creates and drops a tape Vec for every
+// frame, and perf proved that tape growth can synchronously enter mimalloc
+// arena collection/purge/madvise on the CLOB thread. Common wire arrays remain
+// inline so typed mapping cannot turn a large book into heap growth.
+
+const CLOB_BOOK_LEVEL_CAPACITY: usize = 256;
+const CLOB_PRICE_CHANGE_CAPACITY: usize = 64;
+const CLOB_FRAME_BATCH_CAPACITY: usize = 64;
+const CLOB_MAX_FRAME_BYTES: usize = 128 * 1024;
+const CLOB_TAPE_NODE_CAPACITY: usize = CLOB_MAX_FRAME_BYTES;
+
+enum WireUnsigned<'a> {
+    String(std::borrow::Cow<'a, str>),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for WireUnsigned<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<'a>(std::marker::PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Visitor<'a> {
+            type Value = WireUnsigned<'a>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an unsigned integer or an integer string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(WireUnsigned::String(std::borrow::Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireUnsigned::String(std::borrow::Cow::Owned(
+                    value.to_owned(),
+                )))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(WireUnsigned::U64(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(WireUnsigned::I64(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(WireUnsigned::F64(value))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor(std::marker::PhantomData))
+    }
+}
+
+impl WireUnsigned<'_> {
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::String(value) => {
+                let value = value.trim();
+                if let Some(hex) = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                {
+                    u64::from_str_radix(hex, 16).ok()
+                } else {
+                    value.parse().ok()
+                }
+            }
+            Self::U64(value) => Some(*value),
+            Self::I64(value) => u64::try_from(*value).ok(),
+            Self::F64(value)
+                if value.is_finite()
+                    && *value >= 0.0
+                    && value.fract() == 0.0
+                    && *value <= u64::MAX as f64 =>
+            {
+                Some(*value as u64)
+            }
+            Self::F64(_) => None,
+        }
+    }
+
+    fn into_owned(self) -> WireUnsigned<'static> {
+        match self {
+            Self::String(value) => {
+                WireUnsigned::String(std::borrow::Cow::Owned(value.into_owned()))
+            }
+            Self::U64(value) => WireUnsigned::U64(value),
+            Self::I64(value) => WireUnsigned::I64(value),
+            Self::F64(value) => WireUnsigned::F64(value),
+        }
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct BookLevel<'a> {
@@ -6162,13 +6269,13 @@ struct BookFields<'a> {
     #[serde(borrow)]
     asset_id: std::borrow::Cow<'a, str>,
     #[serde(default)]
-    bids: Vec<BookLevel<'a>>,
+    bids: arrayvec::ArrayVec<BookLevel<'a>, CLOB_BOOK_LEVEL_CAPACITY>,
     #[serde(default)]
-    asks: Vec<BookLevel<'a>>,
+    asks: arrayvec::ArrayVec<BookLevel<'a>, CLOB_BOOK_LEVEL_CAPACITY>,
     /// Polymarket normally emits stringified milliseconds; accept JSON
     /// numbers too so server timestamps always drive event-level ordering.
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
 }
 
 impl BookFields<'_> {
@@ -6191,7 +6298,7 @@ impl BookFields<'_> {
                     size: std::borrow::Cow::Owned(level.size.into_owned()),
                 })
                 .collect(),
-            timestamp: self.timestamp,
+            timestamp: self.timestamp.map(WireUnsigned::into_owned),
         }
     }
 }
@@ -6201,13 +6308,13 @@ struct TradeFields<'a> {
     #[serde(borrow)]
     asset_id: std::borrow::Cow<'a, str>,
     #[serde(borrow)]
-    price: std::borrow::Cow<'a, str>,
+    price: WireDecimal<'a>,
     #[serde(borrow)]
-    size: std::borrow::Cow<'a, str>,
+    size: WireDecimal<'a>,
     #[serde(borrow)]
     side: std::borrow::Cow<'a, str>, // "BUY" | "SELL"
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
     /// Venue execution identity. A transaction can contain multiple fills, so
     /// its hash alone is deliberately not accepted as a trade id.
     #[serde(
@@ -6217,11 +6324,11 @@ struct TradeFields<'a> {
         alias = "tradeId",
         alias = "executionId"
     )]
-    execution_id: Option<std::borrow::Cow<'a, str>>,
+    execution_id: Option<&'a str>,
     #[serde(default, borrow, alias = "transactionHash")]
-    transaction_hash: Option<std::borrow::Cow<'a, str>>,
-    #[serde(default, alias = "logIndex")]
-    log_index: Option<serde_json::Value>,
+    transaction_hash: Option<&'a str>,
+    #[serde(default, borrow, alias = "logIndex")]
+    log_index: Option<WireUnsigned<'a>>,
     /// Only this explicit field authorizes consumers to fold complementary
     /// Up/Down public prints into one economic execution.
     #[serde(
@@ -6231,7 +6338,7 @@ struct TradeFields<'a> {
         alias = "mirror_trade_id",
         alias = "mirrorTradeId"
     )]
-    mirror_id: Option<std::borrow::Cow<'a, str>>,
+    mirror_id: Option<&'a str>,
 }
 
 #[derive(serde::Deserialize)]
@@ -6242,8 +6349,8 @@ struct TickSizeFields<'a> {
     old_tick_size: f64,
     #[serde(default, deserialize_with = "de_str_or_num_f64")]
     new_tick_size: f64,
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -6256,22 +6363,68 @@ struct BestBidAskFields<'a> {
     best_ask: Option<f64>,
     /// Polymarket emits timestamps as stringified milliseconds, but accept
     /// JSON numbers as well for wire compatibility across server versions.
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
 enum WireDecimal<'a> {
-    String(#[serde(borrow)] std::borrow::Cow<'a, str>),
-    Number(serde_json::Number),
+    String(std::borrow::Cow<'a, str>),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for WireDecimal<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<'a>(std::marker::PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Visitor<'a> {
+            type Value = WireDecimal<'a>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a decimal number or decimal string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(WireDecimal::String(std::borrow::Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireDecimal::String(std::borrow::Cow::Owned(
+                    value.to_owned(),
+                )))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(WireDecimal::U64(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(WireDecimal::I64(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(WireDecimal::F64(value))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor(std::marker::PhantomData))
+    }
 }
 
 impl WireDecimal<'_> {
     fn decimal(&self) -> Option<Decimal> {
         match self {
             Self::String(value) => Decimal::from_str(value.trim()).ok(),
-            Self::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+            Self::U64(value) => Some(Decimal::from(*value)),
+            Self::I64(value) => Some(Decimal::from(*value)),
+            Self::F64(value) => Decimal::from_f64_retain(*value),
         }
     }
 }
@@ -6286,9 +6439,8 @@ struct PriceChangeEntry<'a> {
     size: WireDecimal<'a>,
     #[serde(borrow)]
     side: std::borrow::Cow<'a, str>,
-    #[serde(default)]
-    #[serde(borrow)]
-    hash: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    hash: Option<&'a str>,
     #[serde(default, borrow)]
     best_bid: Option<WireDecimal<'a>>,
     #[serde(default, borrow)]
@@ -6298,12 +6450,12 @@ struct PriceChangeEntry<'a> {
 #[derive(serde::Deserialize)]
 struct PriceChangeFields<'a> {
     #[serde(default, borrow)]
-    market: Option<std::borrow::Cow<'a, str>>,
+    market: Option<&'a str>,
     #[serde(default)]
     #[serde(borrow)]
-    price_changes: Vec<PriceChangeEntry<'a>>,
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    price_changes: arrayvec::ArrayVec<PriceChangeEntry<'a>, CLOB_PRICE_CHANGE_CAPACITY>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6444,43 +6596,429 @@ fn bbo_tick_distance(
 #[derive(serde::Deserialize)]
 struct InlineRtdsFields<'a> {
     #[serde(borrow)]
-    source: std::borrow::Cow<'a, str>,
+    source: &'a str,
     #[serde(default, borrow)]
-    pair: Option<std::borrow::Cow<'a, str>>,
+    pair: Option<&'a str>,
     #[serde(default, borrow)]
-    symbol: Option<std::borrow::Cow<'a, str>>,
+    symbol: Option<&'a str>,
     #[serde(default, borrow)]
-    filter: Option<std::borrow::Cow<'a, str>>,
+    filter: Option<&'a str>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
     value: Option<f64>,
     #[serde(default, deserialize_with = "de_opt_str_or_num_f64")]
     price: Option<f64>,
-    #[serde(default)]
-    server_timestamp: Option<serde_json::Value>,
-    #[serde(default)]
-    timestamp: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    server_timestamp: Option<WireUnsigned<'a>>,
+    #[serde(default, borrow)]
+    timestamp: Option<WireUnsigned<'a>>,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-enum TaggedMessage<'a> {
-    Book(#[serde(borrow)] BookFields<'a>),
-    Trade(#[serde(borrow)] TradeFields<'a>),
-    LastTradePrice(#[serde(borrow)] TradeFields<'a>),
-    TickSizeChange(#[serde(borrow)] TickSizeFields<'a>),
-    PriceChange(#[serde(borrow)] PriceChangeFields<'a>),
-    BestBidAsk(#[serde(borrow)] BestBidAskFields<'a>),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClobWireKind {
+    Book,
+    Trade,
+    LastTradePrice,
+    TickSizeChange,
+    PriceChange,
+    BestBidAsk,
+    Rtds,
+    IgnoredControl,
+    Unknown,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum ClobFrame<'a> {
-    /// Matches anything with `event_type` set to a known variant.
-    Tagged(#[serde(borrow)] TaggedMessage<'a>),
-    /// Matches RTDS records inlined on the CLOB socket (no event_type).
-    Rtds(#[serde(borrow)] InlineRtdsFields<'a>),
-    /// Preserve unexpected values for rate-limited event-type sampling.
-    Unknown(serde_json::Value),
+#[derive(Clone, Copy, Debug)]
+struct ClobWireTag<'a> {
+    kind: ClobWireKind,
+    event_type: Option<&'a str>,
+}
+
+enum DecodedClobFrame<'a> {
+    Book(BookFields<'a>),
+    Trade(TradeFields<'a>),
+    LastTradePrice(TradeFields<'a>),
+    TickSizeChange(TickSizeFields<'a>),
+    PriceChange(PriceChangeFields<'a>),
+    BestBidAsk(BestBidAskFields<'a>),
+    Rtds(InlineRtdsFields<'a>),
+    Control(ClobWireTag<'a>),
+}
+
+struct ResidentClobParser {
+    buffers: simd_json::Buffers,
+    tape: Option<simd_json::Tape<'static>>,
+}
+
+impl ResidentClobParser {
+    fn new() -> Self {
+        let mut parser = Self {
+            buffers: simd_json::Buffers::new(CLOB_MAX_FRAME_BYTES),
+            tape: Some(simd_json::Tape(Vec::with_capacity(CLOB_TAPE_NODE_CAPACITY))),
+        };
+        // Grow structural indexes and every other simd-json scratch buffer on
+        // the owner thread before a websocket frame enters the measured lane.
+        // Alternating scalar/comma bytes exercise the maximum structural
+        // density of any accepted frame without growing the resident tape.
+        let mut warm = Vec::with_capacity(CLOB_MAX_FRAME_BYTES);
+        warm.push(b'[');
+        while warm.len() + 2 < CLOB_MAX_FRAME_BYTES {
+            warm.extend_from_slice(b"0,");
+        }
+        if warm.last() == Some(&b',') {
+            warm.pop();
+        }
+        warm.push(b']');
+        parser
+            .parse(&mut warm, |_| ())
+            .expect("resident CLOB parser warmup must be valid");
+        // A maximally nested accepted frame exercises simd-json's stage-two
+        // stack. Combined with the maximum-density frame above, this grows
+        // every length-dependent scratch vector to the worst case allowed by
+        // CLOB_MAX_FRAME_BYTES, without adding an O(n) depth scan per frame.
+        let depth = (CLOB_MAX_FRAME_BYTES - 1) / 2;
+        warm.clear();
+        warm.resize(depth, b'[');
+        warm.push(b'0');
+        warm.resize(depth.saturating_mul(2).saturating_add(1), b']');
+        parser
+            .parse(&mut warm, |_| ())
+            .expect("deep resident CLOB parser warmup must be valid");
+        parser
+    }
+
+    fn parse<'input, R>(
+        &mut self,
+        input: &'input mut [u8],
+        consume: impl for<'tape> FnOnce(simd_json::value::tape::Value<'tape, 'input>) -> R,
+    ) -> simd_json::Result<(R, u64)> {
+        let resident = self
+            .tape
+            .take()
+            .expect("resident CLOB tape must be returned after every parse");
+        let mut tape: simd_json::Tape<'input> = resident.reset();
+        let started = crate::latency::Instant::now();
+        let parsed = simd_json::fill_tape(input, &mut self.buffers, &mut tape);
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if let Err(error) = parsed {
+            self.tape = Some(tape.reset());
+            return Err(error);
+        }
+        let output = consume(tape.as_value());
+        self.tape = Some(tape.reset());
+        Ok((output, elapsed_ns))
+    }
+}
+
+type ClobTapeValue<'tape, 'input> = simd_json::value::tape::Value<'tape, 'input>;
+
+fn tape_input_str<'tape, 'input>(value: ClobTapeValue<'tape, 'input>) -> Option<&'input str> {
+    let value = value.as_str()?;
+    // SAFETY: tape `Node::String` stores an `&'input str` pointing into the
+    // caller-owned parse buffer. `ValueAsScalar::as_str` unnecessarily ties
+    // that reference to `&self`; extending it back to `'input` is valid while
+    // the input remains borrowed. ResidentClobParser does not release that
+    // borrow or reset the tape until the consumer callback has returned.
+    Some(unsafe { std::mem::transmute::<&str, &'input str>(value) })
+}
+
+fn tape_wire_unsigned<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<WireUnsigned<'input>> {
+    if let Some(value) = tape_input_str(value) {
+        Some(WireUnsigned::String(std::borrow::Cow::Borrowed(value)))
+    } else if let Some(value) = value.as_u64() {
+        Some(WireUnsigned::U64(value))
+    } else if let Some(value) = value.as_i64() {
+        Some(WireUnsigned::I64(value))
+    } else {
+        value.as_f64().map(WireUnsigned::F64)
+    }
+}
+
+fn tape_wire_decimal<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<WireDecimal<'input>> {
+    if let Some(value) = tape_input_str(value) {
+        Some(WireDecimal::String(std::borrow::Cow::Borrowed(value)))
+    } else if let Some(value) = value.as_u64() {
+        Some(WireDecimal::U64(value))
+    } else if let Some(value) = value.as_i64() {
+        Some(WireDecimal::I64(value))
+    } else {
+        value.as_f64().map(WireDecimal::F64)
+    }
+}
+
+fn tape_optional_f64(value: Option<ClobTapeValue<'_, '_>>) -> Option<Option<f64>> {
+    match value {
+        None => Some(None),
+        Some(value) if value.is_null() => Some(None),
+        Some(value) => {
+            let value = tape_wire_decimal(value)?;
+            Some(value.decimal().and_then(|value| value.to_f64()))
+        }
+    }
+}
+
+fn tape_optional_unsigned<'tape, 'input>(
+    value: Option<ClobTapeValue<'tape, 'input>>,
+) -> Option<Option<WireUnsigned<'input>>> {
+    match value {
+        None => Some(None),
+        Some(value) if value.is_null() => Some(None),
+        Some(value) => Some(Some(tape_wire_unsigned(value)?)),
+    }
+}
+
+fn tape_book_levels<'tape, 'input>(
+    value: Option<ClobTapeValue<'tape, 'input>>,
+) -> Option<arrayvec::ArrayVec<BookLevel<'input>, CLOB_BOOK_LEVEL_CAPACITY>> {
+    let mut levels = arrayvec::ArrayVec::new();
+    let Some(value) = value else {
+        return Some(levels);
+    };
+    for value in &value.as_array()? {
+        let object = value.as_object()?;
+        levels
+            .try_push(BookLevel {
+                price: std::borrow::Cow::Borrowed(tape_input_str(object.get("price")?)?),
+                size: std::borrow::Cow::Borrowed(tape_input_str(object.get("size")?)?),
+            })
+            .ok()?;
+    }
+    Some(levels)
+}
+
+fn tape_book<'tape, 'input>(value: ClobTapeValue<'tape, 'input>) -> Option<BookFields<'input>> {
+    let object = value.as_object()?;
+    Some(BookFields {
+        asset_id: std::borrow::Cow::Borrowed(tape_input_str(object.get("asset_id")?)?),
+        bids: tape_book_levels(object.get("bids"))?,
+        asks: tape_book_levels(object.get("asks"))?,
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+    })
+}
+
+fn tape_trade<'tape, 'input>(value: ClobTapeValue<'tape, 'input>) -> Option<TradeFields<'input>> {
+    let object = value.as_object()?;
+    let optional_str = |keys: &[&str]| -> Option<Option<&'input str>> {
+        for key in keys {
+            if let Some(value) = object.get(*key) {
+                return if value.is_null() {
+                    Some(None)
+                } else {
+                    tape_input_str(value).map(Some)
+                };
+            }
+        }
+        Some(None)
+    };
+    Some(TradeFields {
+        asset_id: std::borrow::Cow::Borrowed(tape_input_str(object.get("asset_id")?)?),
+        price: tape_wire_decimal(object.get("price")?)?,
+        size: tape_wire_decimal(object.get("size")?)?,
+        side: std::borrow::Cow::Borrowed(tape_input_str(object.get("side")?)?),
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+        execution_id: optional_str(&["execution_id", "trade_id", "tradeId", "executionId"])?,
+        transaction_hash: optional_str(&["transaction_hash", "transactionHash"])?,
+        log_index: tape_optional_unsigned(
+            object.get("log_index").or_else(|| object.get("logIndex")),
+        )?,
+        mirror_id: optional_str(&["mirror_id", "mirrorId", "mirror_trade_id", "mirrorTradeId"])?,
+    })
+}
+
+fn tape_tick_size<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<TickSizeFields<'input>> {
+    let object = value.as_object()?;
+    Some(TickSizeFields {
+        asset_id: std::borrow::Cow::Borrowed(tape_input_str(object.get("asset_id")?)?),
+        old_tick_size: tape_optional_f64(object.get("old_tick_size"))?.unwrap_or_default(),
+        new_tick_size: tape_optional_f64(object.get("new_tick_size"))?.unwrap_or_default(),
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+    })
+}
+
+fn tape_best_bid_ask<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<BestBidAskFields<'input>> {
+    let object = value.as_object()?;
+    Some(BestBidAskFields {
+        asset_id: std::borrow::Cow::Borrowed(tape_input_str(object.get("asset_id")?)?),
+        best_bid: tape_optional_f64(object.get("best_bid"))?,
+        best_ask: tape_optional_f64(object.get("best_ask"))?,
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+    })
+}
+
+fn tape_price_change_entry<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<PriceChangeEntry<'input>> {
+    let object = value.as_object()?;
+    let optional_str = |key: &str| -> Option<Option<&'input str>> {
+        match object.get(key) {
+            None => Some(None),
+            Some(value) if value.is_null() => Some(None),
+            Some(value) => tape_input_str(value).map(Some),
+        }
+    };
+    let optional_decimal = |key: &str| -> Option<Option<WireDecimal<'input>>> {
+        match object.get(key) {
+            None => Some(None),
+            Some(value) if value.is_null() => Some(None),
+            Some(value) => Some(Some(tape_wire_decimal(value)?)),
+        }
+    };
+    Some(PriceChangeEntry {
+        asset_id: std::borrow::Cow::Borrowed(tape_input_str(object.get("asset_id")?)?),
+        price: tape_wire_decimal(object.get("price")?)?,
+        size: tape_wire_decimal(object.get("size")?)?,
+        side: std::borrow::Cow::Borrowed(tape_input_str(object.get("side")?)?),
+        hash: optional_str("hash")?,
+        best_bid: optional_decimal("best_bid")?,
+        best_ask: optional_decimal("best_ask")?,
+    })
+}
+
+fn tape_price_change<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<PriceChangeFields<'input>> {
+    let object = value.as_object()?;
+    let market = match object.get("market") {
+        None => None,
+        Some(value) if value.is_null() => None,
+        Some(value) => Some(tape_input_str(value)?),
+    };
+    let mut price_changes = arrayvec::ArrayVec::new();
+    if let Some(value) = object.get("price_changes") {
+        for value in &value.as_array()? {
+            price_changes
+                .try_push(tape_price_change_entry(value)?)
+                .ok()?;
+        }
+    }
+    Some(PriceChangeFields {
+        market,
+        price_changes,
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+    })
+}
+
+fn tape_inline_rtds<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<InlineRtdsFields<'input>> {
+    let object = value.as_object()?;
+    let optional_str = |key: &str| -> Option<Option<&'input str>> {
+        match object.get(key) {
+            None => Some(None),
+            Some(value) if value.is_null() => Some(None),
+            Some(value) => tape_input_str(value).map(Some),
+        }
+    };
+    Some(InlineRtdsFields {
+        source: tape_input_str(object.get("source")?)?,
+        pair: optional_str("pair")?,
+        symbol: optional_str("symbol")?,
+        filter: optional_str("filter")?,
+        value: tape_optional_f64(object.get("value"))?,
+        price: tape_optional_f64(object.get("price"))?,
+        server_timestamp: tape_optional_unsigned(object.get("server_timestamp"))?,
+        timestamp: tape_optional_unsigned(object.get("timestamp"))?,
+    })
+}
+
+fn tape_clob_wire_tag<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> Option<ClobWireTag<'input>> {
+    let object = value.as_object()?;
+    if let Some(value) = object.get("event_type") {
+        let event_type = tape_input_str(value)?;
+        let kind = match event_type {
+            "book" => ClobWireKind::Book,
+            "trade" => ClobWireKind::Trade,
+            "last_trade_price" => ClobWireKind::LastTradePrice,
+            "tick_size_change" => ClobWireKind::TickSizeChange,
+            "price_change" => ClobWireKind::PriceChange,
+            "best_bid_ask" => ClobWireKind::BestBidAsk,
+            "new_market" | "market_resolved" => ClobWireKind::IgnoredControl,
+            _ => ClobWireKind::Unknown,
+        };
+        return Some(ClobWireTag {
+            kind,
+            event_type: Some(event_type),
+        });
+    }
+    Some(ClobWireTag {
+        kind: if object.get("source").is_some() {
+            ClobWireKind::Rtds
+        } else {
+            ClobWireKind::Unknown
+        },
+        event_type: None,
+    })
+}
+
+fn decode_clob_tape_value<'tape, 'input>(
+    value: ClobTapeValue<'tape, 'input>,
+) -> std::result::Result<DecodedClobFrame<'input>, &'static str> {
+    let tag = tape_clob_wire_tag(value).ok_or("CLOB item must be an object")?;
+    match tag.kind {
+        ClobWireKind::Book => tape_book(value)
+            .map(DecodedClobFrame::Book)
+            .ok_or("invalid book fields"),
+        ClobWireKind::Trade => tape_trade(value)
+            .map(DecodedClobFrame::Trade)
+            .ok_or("invalid trade fields"),
+        ClobWireKind::LastTradePrice => tape_trade(value)
+            .map(DecodedClobFrame::LastTradePrice)
+            .ok_or("invalid last_trade_price fields"),
+        ClobWireKind::TickSizeChange => tape_tick_size(value)
+            .map(DecodedClobFrame::TickSizeChange)
+            .ok_or("invalid tick_size_change fields"),
+        ClobWireKind::PriceChange => tape_price_change(value)
+            .map(DecodedClobFrame::PriceChange)
+            .ok_or("invalid price_change fields"),
+        ClobWireKind::BestBidAsk => tape_best_bid_ask(value)
+            .map(DecodedClobFrame::BestBidAsk)
+            .ok_or("invalid best_bid_ask fields"),
+        ClobWireKind::Rtds => tape_inline_rtds(value)
+            .map(DecodedClobFrame::Rtds)
+            .ok_or("invalid inline RTDS fields"),
+        ClobWireKind::IgnoredControl | ClobWireKind::Unknown => Ok(DecodedClobFrame::Control(tag)),
+    }
+}
+
+fn validate_clob_tape_root(
+    root: ClobTapeValue<'_, '_>,
+) -> std::result::Result<usize, &'static str> {
+    if let Some(array) = root.as_array() {
+        if array.len() > CLOB_FRAME_BATCH_CAPACITY {
+            return Err("CLOB frame array exceeds bounded capacity");
+        }
+        for value in &array {
+            decode_clob_tape_value(value)?;
+        }
+        Ok(array.len())
+    } else {
+        decode_clob_tape_value(root)?;
+        Ok(1)
+    }
+}
+
+#[cfg(test)]
+impl DecodedClobFrame<'_> {
+    fn kind(&self) -> ClobWireKind {
+        match self {
+            Self::Book(_) => ClobWireKind::Book,
+            Self::Trade(_) => ClobWireKind::Trade,
+            Self::LastTradePrice(_) => ClobWireKind::LastTradePrice,
+            Self::TickSizeChange(_) => ClobWireKind::TickSizeChange,
+            Self::PriceChange(_) => ClobWireKind::PriceChange,
+            Self::BestBidAsk(_) => ClobWireKind::BestBidAsk,
+            Self::Rtds(_) => ClobWireKind::Rtds,
+            Self::Control(tag) => tag.kind,
+        }
+    }
 }
 
 /// Deserialize a field that may arrive as a number or a string-encoded
@@ -6489,24 +7027,19 @@ fn de_str_or_num_f64<'de, D>(d: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let v = serde_json::Value::deserialize(d)?;
-    Ok(match v {
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
-        _ => 0.0,
-    })
+    Ok(WireDecimal::deserialize(d)?
+        .decimal()
+        .and_then(|value| value.to_f64())
+        .unwrap_or(0.0))
 }
 
 fn de_opt_str_or_num_f64<'de, D>(d: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let v = Option::<serde_json::Value>::deserialize(d)?;
-    Ok(match v {
-        Some(serde_json::Value::Number(n)) => n.as_f64(),
-        Some(serde_json::Value::String(s)) => s.parse().ok(),
-        _ => None,
-    })
+    Ok(Option::<WireDecimal<'de>>::deserialize(d)?
+        .and_then(|value| value.decimal())
+        .and_then(|value| value.to_f64()))
 }
 
 #[derive(Debug, Default)]
@@ -6523,7 +7056,7 @@ struct ClobParsedBatch {
 /// histograms are additionally recorded at their exact inner boundaries.
 #[derive(Clone, Copy, Debug, Default)]
 struct ClobFramePhaseTimings {
-    simd_json_ns: u64,
+    json_decode_ns: u64,
     book_apply_ns: u64,
     price_change_apply_ns: u64,
     event_construction_ns: u64,
@@ -6553,7 +7086,7 @@ impl Drop for ClobLatencyScope {
 
 impl ClobFramePhaseTimings {
     fn record(self) {
-        crate::latency::record_ns("polymarket.ws.clob_simd_json", self.simd_json_ns);
+        crate::latency::record_ns("polymarket.ws.clob_simd_json", self.json_decode_ns);
         if self.book_apply_ns != 0 {
             crate::latency::record_ns("polymarket.ws.clob_book_apply", self.book_apply_ns);
         }
@@ -7048,7 +7581,7 @@ impl ClobLocalBooks {
                 });
             }
         }
-        let parse_levels = |levels: Vec<BookLevel<'_>>| {
+        let parse_levels = |levels: arrayvec::ArrayVec<BookLevel<'_>, CLOB_BOOK_LEVEL_CAPACITY>| {
             let mut parsed = BTreeMap::new();
             for level in levels {
                 let price = Decimal::from_str(level.price.trim())
@@ -7776,10 +8309,6 @@ fn subscribed_token(tokens: &[String], token: &str) -> bool {
     tokens.iter().any(|subscribed| subscribed == token)
 }
 
-fn diagnostic_preview(value: &serde_json::Value) -> String {
-    value.to_string().chars().take(300).collect()
-}
-
 #[cfg(test)]
 fn process_clob_frame(
     text: &str,
@@ -7790,8 +8319,10 @@ fn process_clob_frame(
 ) -> ClobParsedBatch {
     let mut parse_buffer = text.as_bytes().to_vec();
     let mut phases = ClobFramePhaseTimings::default();
+    let mut parser = ResidentClobParser::new();
     process_clob_frame_in_place(
         &mut parse_buffer,
+        &mut parser,
         books,
         tokens,
         tokens,
@@ -7803,6 +8334,7 @@ fn process_clob_frame(
 
 fn process_clob_frame_in_place(
     parse_buffer: &mut [u8],
+    parser: &mut ResidentClobParser,
     books: &mut ClobLocalBooks,
     _tokens: &[String],
     active_tokens: &[String],
@@ -7814,43 +8346,49 @@ fn process_clob_frame_in_place(
     if parse_buffer.is_empty() {
         return batch;
     }
-    let is_array = parse_buffer
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'[');
-    let decode_started = crate::latency::Instant::now();
-    let frames = if is_array {
-        simd_json::serde::from_slice::<Vec<ClobFrame>>(&mut *parse_buffer)
-    } else {
-        simd_json::serde::from_slice::<ClobFrame>(&mut *parse_buffer).map(|frame| vec![frame])
-    };
-    phases.simd_json_ns = decode_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-    let frames = match frames {
-        Ok(frames) => frames,
-        Err(error) => {
-            batch.wire.parse_errors = 1;
-            batch.diagnostics.push(ClobDiagnostic {
-                key: "parse_error",
-                detail: format!(
-                    "error={} raw={}",
-                    error,
-                    String::from_utf8_lossy(parse_buffer)
-                        .chars()
-                        .take(300)
-                        .collect::<String>(),
-                ),
-            });
-            return batch;
-        }
-    };
+    if parse_buffer.len() > CLOB_MAX_FRAME_BYTES {
+        batch.wire.parse_errors = 1;
+        batch.diagnostics.push(ClobDiagnostic {
+            key: "parse_error",
+            detail: format!(
+                "error=CLOB frame exceeds resident parser capacity bytes={} capacity={}",
+                parse_buffer.len(),
+                CLOB_MAX_FRAME_BYTES,
+            ),
+        });
+        return batch;
+    }
 
+    let decode_ns_before_construction = phases.json_decode_ns;
     let construction_started = crate::latency::Instant::now();
-    for frame in frames {
+    let parsed = parser.parse(parse_buffer, |root| -> std::result::Result<(), &'static str> {
+        let array = root.as_array();
+        if array.is_some() {
+            // Only arrays need a validation pass before mutation to preserve
+            // all-or-nothing semantics. A single object cannot have a later
+            // malformed sibling, so decoding it twice would add pure CPU to
+            // the overwhelmingly common CLOB path.
+            let validation_started = crate::latency::Instant::now();
+            validate_clob_tape_root(root)?;
+            phases.json_decode_ns = phases.json_decode_ns.saturating_add(
+                validation_started
+                    .elapsed()
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            );
+        }
+
+        let mut apply_value = |value: ClobTapeValue<'_, '_>| -> std::result::Result<(), &'static str> {
+        let decode_started = crate::latency::Instant::now();
+        let frame = decode_clob_tape_value(value)?;
+        phases.json_decode_ns = phases.json_decode_ns.saturating_add(
+            decode_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
         match frame {
-            ClobFrame::Tagged(TaggedMessage::Book(fields)) => {
+            DecodedClobFrame::Book(fields) => {
                 batch.wire.books = batch.wire.books.saturating_add(1);
-                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
+                    || subscribed_token(active_tokens, &fields.asset_id);
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let apply_started = crate::latency::Instant::now();
@@ -7901,12 +8439,12 @@ fn process_clob_frame_in_place(
                     }
                 }
             }
-            ClobFrame::Tagged(TaggedMessage::PriceChange(fields)) => {
+            DecodedClobFrame::PriceChange(fields) => {
                 batch.wire.price_changes = batch.wire.price_changes.saturating_add(1);
-                batch.recognized_topic |= fields
-                    .price_changes
-                    .iter()
-                    .any(|change| books.token_index(&change.asset_id).is_some());
+                batch.recognized_topic |= fields.price_changes.iter().any(|change| {
+                    books.token_index(&change.asset_id).is_some()
+                        || subscribed_token(active_tokens, &change.asset_id)
+                });
                 let apply_started = crate::latency::Instant::now();
                 let (events, bbo_snapshots, repair_tokens) = books.apply_price_change(
                     fields,
@@ -7927,9 +8465,10 @@ fn process_clob_frame_in_place(
                     push_latest_order_book(&mut batch.events, event);
                 }
             }
-            ClobFrame::Tagged(TaggedMessage::BestBidAsk(fields)) => {
+            DecodedClobFrame::BestBidAsk(fields) => {
                 batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);
-                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
+                    || subscribed_token(active_tokens, &fields.asset_id);
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let exchange_timestamp_ns =
@@ -7940,7 +8479,7 @@ fn process_clob_frame_in_place(
                     // QuoteTick requires two prices strictly inside (0,1), so
                     // consume this frame without emitting a false warning.
                     batch.wire.ignored = batch.wire.ignored.saturating_add(1);
-                    continue;
+                    return Ok(());
                 }
                 match make_quote_event(
                     fields.asset_id.into_owned(),
@@ -7968,25 +8507,28 @@ fn process_clob_frame_in_place(
                     }
                 }
             }
-            ClobFrame::Tagged(TaggedMessage::Trade(fields)) => {
+            DecodedClobFrame::Trade(fields) => {
                 batch.wire.trades = batch.wire.trades.saturating_add(1);
-                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
+                    || subscribed_token(active_tokens, &fields.asset_id);
                 match make_trade_event(fields, local_now) {
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
                 }
             }
-            ClobFrame::Tagged(TaggedMessage::LastTradePrice(fields)) => {
+            DecodedClobFrame::LastTradePrice(fields) => {
                 batch.wire.last_trade_prices = batch.wire.last_trade_prices.saturating_add(1);
-                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
+                    || subscribed_token(active_tokens, &fields.asset_id);
                 match make_trade_event(fields, local_now) {
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
                 }
             }
-            ClobFrame::Tagged(TaggedMessage::TickSizeChange(fields)) => {
+            DecodedClobFrame::TickSizeChange(fields) => {
                 batch.wire.tick_size_changes = batch.wire.tick_size_changes.saturating_add(1);
-                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some();
+                batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
+                    || subscribed_token(active_tokens, &fields.asset_id);
                 match make_tick_size_event(fields, local_now) {
                     Some(MarketEvent::TickSizeChange(change)) => {
                         let released = books.apply_tick_size_change(
@@ -8006,47 +8548,76 @@ fn process_clob_frame_in_place(
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
                 }
             }
-            ClobFrame::Rtds(fields) => {
+            DecodedClobFrame::Rtds(fields) => {
                 batch.wire.inline_rtds = batch.wire.inline_rtds.saturating_add(1);
                 match make_inline_rtds_event(fields, local_now) {
                     Some(event) => batch.events.push(event),
                     None => batch.wire.ignored = batch.wire.ignored.saturating_add(1),
                 }
             }
-            ClobFrame::Unknown(value) => {
-                let event_type = value
-                    .get("event_type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("missing");
-                let known_ignored = matches!(event_type, "new_market" | "market_resolved");
-                if known_ignored {
-                    batch.wire.ignored = batch.wire.ignored.saturating_add(1);
-                } else {
-                    batch.wire.unknown = batch.wire.unknown.saturating_add(1);
-                }
+            DecodedClobFrame::Control(ClobWireTag {
+                kind: ClobWireKind::IgnoredControl,
+                ..
+            }) => {
+                batch.wire.ignored = batch.wire.ignored.saturating_add(1);
+            }
+            DecodedClobFrame::Control(tag) => {
+                let event_type = tag.event_type.unwrap_or("missing");
+                batch.wire.unknown = batch.wire.unknown.saturating_add(1);
                 // `new_market` and `market_resolved` are expected control
                 // frames. They were previously formatted into diagnostic
                 // strings even when the sampler suppressed them; count them
                 // without allocating. Truly unknown frames share one static
-                // key and format a bounded preview only on the anomaly path.
-                if !known_ignored {
-                    batch.diagnostics.push(ClobDiagnostic {
-                        key: "unknown_event",
-                        detail: format!(
-                            "event_type={} raw={}",
-                            event_type,
-                            diagnostic_preview(&value),
-                        ),
-                    });
-                }
+                // key and format only the borrowed event type on the anomaly
+                // path; the trigger recorder already retains the full frame.
+                batch.diagnostics.push(ClobDiagnostic {
+                    key: "unknown_event",
+                    detail: format!("event_type={event_type}"),
+                });
             }
         }
+        Ok(())
+        };
+
+        if let Some(array) = array {
+            for value in &array {
+                apply_value(value)?;
+            }
+        } else {
+            apply_value(root)?;
+        }
+        Ok(())
+    });
+    let (processing, simd_json_ns) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            batch.wire.parse_errors = 1;
+            batch.diagnostics.push(ClobDiagnostic {
+                key: "parse_error",
+                detail: format!("error={error}"),
+            });
+            return batch;
+        }
+    };
+    phases.json_decode_ns = phases.json_decode_ns.saturating_add(simd_json_ns);
+    if let Err(error) = processing {
+        batch.wire.parse_errors = 1;
+        batch.diagnostics.push(ClobDiagnostic {
+            key: "parse_error",
+            detail: format!("error={error}"),
+        });
+        return batch;
     }
     let construction_total_ns = construction_started
         .elapsed()
         .as_nanos()
         .min(u64::MAX as u128) as u64;
     phases.event_construction_ns = construction_total_ns
+        .saturating_sub(
+            phases
+                .json_decode_ns
+                .saturating_sub(decode_ns_before_construction),
+        )
         .saturating_sub(phases.book_apply_ns)
         .saturating_sub(phases.price_change_apply_ns);
     batch
@@ -8068,15 +8639,12 @@ fn parse_clob_frame(text: &str) -> Vec<MarketEvent> {
     .events
 }
 
-fn timestamp_value_to_ns(timestamp: Option<&serde_json::Value>, fallback_ns: u64) -> u64 {
+fn timestamp_value_to_ns(timestamp: Option<&WireUnsigned<'_>>, fallback_ns: u64) -> u64 {
     normalized_timestamp_ns(timestamp).unwrap_or(fallback_ns)
 }
 
-fn normalized_timestamp_ns(timestamp: Option<&serde_json::Value>) -> Option<u64> {
-    let raw = timestamp.and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-    });
+fn normalized_timestamp_ns(timestamp: Option<&WireUnsigned<'_>>) -> Option<u64> {
+    let raw = timestamp.and_then(WireUnsigned::as_u64);
     match raw {
         // The CLOB protocol defines timestamps as Unix milliseconds. Accept
         // already-normalized nanoseconds too, which is useful for internal
@@ -8140,8 +8708,8 @@ fn make_quote_event(
 }
 
 fn make_trade_event(t: TradeFields<'_>, now: u64) -> Option<MarketEvent> {
-    let price: f64 = t.price.parse().ok()?;
-    let quantity: f64 = t.size.parse().ok()?;
+    let price = t.price.decimal()?.to_f64()?;
+    let quantity = t.size.decimal()?.to_f64()?;
     if t.asset_id.trim().is_empty()
         || !price.is_finite()
         || price <= 0.0
@@ -8163,28 +8731,16 @@ fn make_trade_event(t: TradeFields<'_>, now: u64) -> Option<MarketEvent> {
     if exchange_timestamp_ns > now.saturating_add(MAX_PUBLIC_EVENT_FUTURE_SKEW_NS) {
         return None;
     }
-    let clean_id = |value: Option<std::borrow::Cow<'_, str>>| {
+    let clean_id = |value: Option<&str>| {
         value
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let log_index = t.log_index.as_ref().and_then(|value| match value {
-        serde_json::Value::Number(value) => value.as_u64().map(|value| value.to_string()),
-        serde_json::Value::String(value) => {
-            let value = value.trim();
-            if let Some(hex) = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-            {
-                u64::from_str_radix(hex, 16)
-                    .ok()
-                    .map(|value| value.to_string())
-            } else {
-                value.parse::<u64>().ok().map(|value| value.to_string())
-            }
-        }
-        _ => None,
-    });
+    let log_index = t
+        .log_index
+        .as_ref()
+        .and_then(WireUnsigned::as_u64)
+        .map(|value| value.to_string());
     let mirror_id = clean_id(t.mirror_id);
     let execution_id = clean_id(t.execution_id).or_else(|| {
         clean_id(t.transaction_hash)
@@ -8235,13 +8791,13 @@ fn make_tick_size_event(t: TickSizeFields<'_>, now: u64) -> Option<MarketEvent> 
 }
 
 fn make_inline_rtds_event(r: InlineRtdsFields<'_>, local_now: u64) -> Option<MarketEvent> {
-    let symbol = r.pair.or(r.symbol).or(r.filter)?.into_owned();
+    let symbol = r.pair.or(r.symbol).or(r.filter)?.to_string();
     let price = r.value.or(r.price)?;
     // Normalize timestamp (sec / ms / ns) to ns.
-    let ts_raw = r.server_timestamp.or(r.timestamp).and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-    });
+    let ts_raw = r
+        .server_timestamp
+        .or(r.timestamp)
+        .and_then(|value| value.as_u64());
     let ts_ns = match ts_raw {
         Some(ts) if ts < 1_000_000_000_000 => ts * 1_000_000_000,
         Some(ts) if ts < 1_000_000_000_000_000 => ts * 1_000_000,
@@ -8573,26 +9129,360 @@ impl ExchangeMarket for PolymarketMarket {
 }
 
 #[cfg(test)]
+mod clob_test_allocator {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) struct CountingAllocator;
+
+    static TRACKED_THREAD: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    fn tracks_current_thread() -> bool {
+        let tracked = TRACKED_THREAD.load(Ordering::Relaxed);
+        tracked != 0 && tracked == unsafe { libc::pthread_self() as usize }
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if tracks_current_thread() {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if tracks_current_thread() {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub(super) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        TRACKED_THREAD.store(unsafe { libc::pthread_self() as usize }, Ordering::Release);
+        let result = operation();
+        TRACKED_THREAD.store(0, Ordering::Release);
+        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+        let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        (result, allocations, allocated_bytes)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
+    clob_test_allocator::CountingAllocator;
+
+#[cfg(test)]
 mod clob_event_lane_tests {
     use super::*;
 
     #[test]
-    fn simd_clob_schema_borrows_wire_token_and_decimal_strings() {
-        let mut bytes = br#"{"event_type":"price_change","price_changes":[{"asset_id":"resident-token","price":"0.41","size":"2","side":"BUY"}]}"#.to_vec();
-        let frame: ClobFrame<'_> = simd_json::serde::from_slice(&mut bytes).unwrap();
-        let ClobFrame::Tagged(TaggedMessage::PriceChange(fields)) = frame else {
-            panic!("price-change frame expected");
-        };
-        let change = &fields.price_changes[0];
-        assert!(matches!(change.asset_id, std::borrow::Cow::Borrowed(_)));
-        assert!(matches!(
-            change.price,
-            WireDecimal::String(std::borrow::Cow::Borrowed(_))
-        ));
-        assert!(matches!(
-            change.size,
-            WireDecimal::String(std::borrow::Cow::Borrowed(_))
-        ));
+    fn typed_clob_schema_borrows_wire_token_and_decimal_strings() {
+        let bytes = br#"{"event_type":"price_change","price_changes":[{"asset_id":"resident-token","price":"0.41","size":"2","side":"BUY"}]}"#;
+        let mut parser = ResidentClobParser::new();
+        let mut input = bytes.to_vec();
+        parser
+            .parse(&mut input, |root| {
+                let frame = decode_clob_tape_value(root).unwrap();
+                assert_eq!(frame.kind(), ClobWireKind::PriceChange);
+                let DecodedClobFrame::PriceChange(fields) = frame else {
+                    panic!("price-change frame expected");
+                };
+                let change = &fields.price_changes[0];
+                assert!(matches!(change.asset_id, std::borrow::Cow::Borrowed(_)));
+                assert!(matches!(
+                    change.price,
+                    WireDecimal::String(std::borrow::Cow::Borrowed(_))
+                ));
+                assert!(matches!(
+                    change.size,
+                    WireDecimal::String(std::borrow::Cow::Borrowed(_))
+                ));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn common_clob_wire_decode_does_not_allocate() {
+        let price_change = br#"{"event_type":"price_change","price_changes":[{"asset_id":"resident-token","price":"0.41","size":"2","side":"BUY","best_bid":"0.41","best_ask":"0.42"}],"timestamp":"1757908892351"}"#;
+        let book = br#"{"event_type":"book","asset_id":"resident-token","bids":[{"price":"0.40","size":"10"},{"price":"0.39","size":"9"}],"asks":[{"price":"0.42","size":"11"}],"timestamp":"1757908892351"}"#;
+        let batch = br#"[{"event_type":"best_bid_ask","asset_id":"resident-token","best_bid":"0.41","best_ask":"0.42","timestamp":"1757908892351"},{"event_type":"trade","asset_id":"resident-token","price":"0.41","size":"2","side":"BUY","timestamp":"1757908892351","trade_id":"fill-1"}]"#;
+        let mut deep_book =
+            String::from(r#"{"event_type":"book","asset_id":"resident-token","bids":["#);
+        for level in 0..100 {
+            if level != 0 {
+                deep_book.push(',');
+            }
+            use std::fmt::Write as _;
+            write!(
+                deep_book,
+                r#"{{"price":"0.{:03}","size":"10"}}"#,
+                400 - level,
+            )
+            .unwrap();
+        }
+        deep_book
+            .push_str(r#"],"asks":[{"price":"0.501","size":"11"}],"timestamp":"1757908892351"}"#);
+
+        for frame in [
+            price_change.as_slice(),
+            book.as_slice(),
+            deep_book.as_bytes(),
+            batch.as_slice(),
+        ] {
+            let mut parser = ResidentClobParser::new();
+            let mut input = frame.to_vec();
+            let (decoded, allocations, allocated_bytes) = super::clob_test_allocator::count(|| {
+                let mut decoded = 0usize;
+                for _ in 0..256 {
+                    input.copy_from_slice(frame);
+                    decoded = parser
+                        .parse(&mut input, validate_clob_tape_root)
+                        .unwrap()
+                        .0
+                        .unwrap();
+                }
+                decoded
+            });
+            assert!(decoded > 0);
+            assert_eq!(
+                allocations, 0,
+                "wire decode allocated {allocated_bytes} bytes for {frame:?}",
+            );
+        }
+
+        let rtds = br#"{"topic":"crypto_prices","payload":{"symbol":"btcusdt","value":"61234.5"},"timestamp":"1757908892351"}"#;
+        let (decoded, allocations, allocated_bytes) = super::clob_test_allocator::count(|| {
+            let decoded: RtdsWireMessage<'_> = serde_json::from_slice(rtds).unwrap();
+            (decoded.topic, decoded.payload.symbol)
+        });
+        assert_eq!(decoded, ("crypto_prices", "btcusdt"));
+        assert_eq!((allocations, allocated_bytes), (0, 0));
+    }
+
+    #[test]
+    fn resident_clob_parser_prewarms_worst_case_scratch_without_steady_allocations() {
+        let mut dense = Vec::with_capacity(CLOB_MAX_FRAME_BYTES);
+        dense.push(b'[');
+        while dense.len() + 2 < CLOB_MAX_FRAME_BYTES {
+            dense.extend_from_slice(b"0,");
+        }
+        if dense.last() == Some(&b',') {
+            dense.pop();
+        }
+        dense.push(b']');
+
+        let depth = (CLOB_MAX_FRAME_BYTES - 1) / 2;
+        let mut deep = Vec::with_capacity(CLOB_MAX_FRAME_BYTES);
+        deep.resize(depth, b'[');
+        deep.push(b'0');
+        deep.resize(depth.saturating_mul(2).saturating_add(1), b']');
+
+        let mut parser = ResidentClobParser::new();
+        for original in [&dense, &deep] {
+            let mut input = original.clone();
+            let (_, allocations, allocated_bytes) = super::clob_test_allocator::count(|| {
+                for _ in 0..4 {
+                    input.copy_from_slice(original);
+                    parser.parse(&mut input, |_| ()).unwrap();
+                }
+            });
+            assert_eq!(
+                (allocations, allocated_bytes),
+                (0, 0),
+                "prewarmed resident parser grew scratch for {}-byte worst-case frame",
+                original.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn resident_clob_parser_recovers_after_error_and_instances_are_isolated() {
+        let mut first = ResidentClobParser::new();
+        let mut second = ResidentClobParser::new();
+        let mut malformed = br#"{"event_type":"book","asset_id":"broken""#.to_vec();
+        assert!(first
+            .parse(&mut malformed, validate_clob_tape_root)
+            .is_err());
+
+        let first_wire = br#"{"event_type":"book","asset_id":"first"}"#;
+        let second_wire = br#"{"event_type":"book","asset_id":"second"}"#;
+        for _ in 0..2 {
+            let mut input = first_wire.to_vec();
+            first
+                .parse(&mut input, |root| {
+                    let DecodedClobFrame::Book(fields) = decode_clob_tape_value(root).unwrap()
+                    else {
+                        panic!("book expected");
+                    };
+                    assert_eq!(fields.asset_id, "first");
+                })
+                .unwrap();
+        }
+        let mut input = second_wire.to_vec();
+        second
+            .parse(&mut input, |root| {
+                let DecodedClobFrame::Book(fields) = decode_clob_tape_value(root).unwrap() else {
+                    panic!("book expected");
+                };
+                assert_eq!(fields.asset_id, "second");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn clob_array_split_preserves_order_and_fails_closed_at_capacity() {
+        let ordered = br#"[{"event_type":"book","asset_id":"first"},{"event_type":"book","asset_id":"second"}]"#;
+        let mut parser = ResidentClobParser::new();
+        let mut input = ordered.to_vec();
+        parser
+            .parse(&mut input, |root| {
+                let array = root.as_array().unwrap();
+                assert_eq!(array.len(), 2);
+                let mut values = (&array).into_iter();
+                let DecodedClobFrame::Book(first) =
+                    decode_clob_tape_value(values.next().unwrap()).unwrap()
+                else {
+                    panic!("first book expected");
+                };
+                let DecodedClobFrame::Book(second) =
+                    decode_clob_tape_value(values.next().unwrap()).unwrap()
+                else {
+                    panic!("second book expected");
+                };
+                assert_eq!(first.asset_id, "first");
+                assert_eq!(second.asset_id, "second");
+            })
+            .unwrap();
+
+        for (frame, expected) in [
+            (
+                br#"{"bids":[{"price":"0.4","size":"1"}],"asset_id":"late","event_type":"book"}"#
+                    .as_slice(),
+                ClobWireKind::Book,
+            ),
+            (
+                br#"{"payload":{"source":"nested"},"value":1}"#.as_slice(),
+                ClobWireKind::Unknown,
+            ),
+        ] {
+            input.clear();
+            input.extend_from_slice(frame);
+            parser
+                .parse(&mut input, |root| {
+                    assert_eq!(decode_clob_tape_value(root).unwrap().kind(), expected);
+                })
+                .unwrap();
+        }
+
+        let mut oversized = String::from("[");
+        for index in 0..=CLOB_FRAME_BATCH_CAPACITY {
+            if index != 0 {
+                oversized.push(',');
+            }
+            oversized.push_str("{\"event_type\":\"new_market\"}");
+        }
+        oversized.push(']');
+        input.clear();
+        input.extend_from_slice(oversized.as_bytes());
+        assert_eq!(
+            parser
+                .parse(&mut input, validate_clob_tape_root)
+                .unwrap()
+                .0
+                .unwrap_err(),
+            "CLOB frame array exceeds bounded capacity",
+        );
+        input.clear();
+        input.extend_from_slice(br#"[{"event_type":"new_market"},]"#);
+        assert!(parser.parse(&mut input, validate_clob_tape_root).is_err());
+    }
+
+    #[test]
+    fn clob_batch_schema_error_is_atomic() {
+        let mut books = ClobLocalBooks::default();
+        let batch = process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"11"}],"timestamp":"2000"},{"event_type":"book","bids":[],"asks":[],"timestamp":"2001"}]"#,
+            &mut books,
+            &["up".to_string()],
+            Instant::now(),
+            2_100_000_000,
+        );
+        assert_eq!(batch.wire.parse_errors, 1);
+        assert!(batch.events.is_empty());
+        assert!(
+            books.token_books.is_empty(),
+            "the valid prefix must not be applied",
+        );
+    }
+
+    #[test]
+    #[ignore = "focused allocation-free resident simd-json tape benchmark"]
+    fn benchmark_typed_clob_wire_decode() {
+        fn run(label: &str, frame: &[u8], iterations: usize) {
+            let mut parser = ResidentClobParser::new();
+            let mut input = frame.to_vec();
+            let (_, allocations, allocated_bytes) = super::clob_test_allocator::count(|| {
+                for _ in 0..256 {
+                    input.copy_from_slice(frame);
+                    let count = parser
+                        .parse(&mut input, validate_clob_tape_root)
+                        .unwrap()
+                        .0
+                        .unwrap();
+                    std::hint::black_box(count);
+                }
+            });
+            assert_eq!((allocations, allocated_bytes), (0, 0));
+
+            let mut samples = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                input.copy_from_slice(frame);
+                let started = Instant::now();
+                let count = parser
+                    .parse(&mut input, validate_clob_tape_root)
+                    .unwrap()
+                    .0
+                    .unwrap();
+                std::hint::black_box(count);
+                samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            }
+            let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+            eprintln!(
+                "resident simd-json CLOB tape boundary (prewarmed owner-local Buffers+Tape + typed mapping, label={label}, n={iterations}, allocations=0, allocated_bytes=0, queue_hwm=0, overflow=0) ns: P50/P99/P999/max={p50}/{p99}/{p999}/{max}",
+            );
+        }
+
+        let price_change = br#"{"event_type":"price_change","price_changes":[{"asset_id":"resident-token","price":"0.41","size":"2","side":"BUY","hash":"0xabc","best_bid":"0.41","best_ask":"0.42"}],"timestamp":"1757908892351"}"#;
+        let mut deep_book =
+            String::from(r#"{"event_type":"book","asset_id":"resident-token","bids":["#);
+        for level in 0..100 {
+            if level != 0 {
+                deep_book.push(',');
+            }
+            use std::fmt::Write as _;
+            write!(
+                deep_book,
+                r#"{{"price":"0.{:03}","size":"10"}}"#,
+                400 - level,
+            )
+            .unwrap();
+        }
+        deep_book
+            .push_str(r#"],"asks":[{"price":"0.501","size":"11"}],"timestamp":"1757908892351"}"#);
+        run("price_change", price_change, 200_000);
+        run("book_100x1", deep_book.as_bytes(), 20_000);
     }
 
     fn latency_summary_ns(samples: &mut [u64]) -> (u64, u64, u64, u64) {
@@ -10618,10 +11508,12 @@ mod pick_current_event_tests {
         let wire_tokens = vec!["current".to_string(), "retired".to_string()];
         let active_tokens = vec!["current".to_string()];
         let mut books = ClobLocalBooks::default();
+        let mut parser = ResidentClobParser::new();
         let mut retired = br#"{"event_type":"price_change","price_changes":[{"asset_id":"retired","price":"0.40","size":"-1","side":"BUY"}],"timestamp":"1000"}"#.to_vec();
         let mut retired_phases = ClobFramePhaseTimings::default();
         let retired_batch = process_clob_frame_in_place(
             &mut retired,
+            &mut parser,
             &mut books,
             &wire_tokens,
             &active_tokens,
@@ -10635,6 +11527,7 @@ mod pick_current_event_tests {
         let mut current_phases = ClobFramePhaseTimings::default();
         let current_batch = process_clob_frame_in_place(
             &mut current,
+            &mut parser,
             &mut books,
             &wire_tokens,
             &active_tokens,
