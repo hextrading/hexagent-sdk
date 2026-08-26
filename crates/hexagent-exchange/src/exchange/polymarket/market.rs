@@ -3287,6 +3287,28 @@ struct ClobPerfRing {
     tx: crossbeam_channel::Sender<ClobPerfTrigger>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn clob_perf_record_command(tid: i64, frequency: u32, output: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("perf");
+    command
+        .arg("record")
+        // `--snapshot` is only valid for AUX tracing events on current perf
+        // releases. A normal CPU sampling event retains its pre-trigger
+        // window by using the backward overwrite ring and flushing on stop.
+        .arg("--overwrite")
+        .arg("-m")
+        .arg("32")
+        .arg("--freq")
+        .arg(frequency.to_string())
+        .arg("--call-graph")
+        .arg("fp")
+        .arg("--tid")
+        .arg(tid.to_string())
+        .arg("--output")
+        .arg(output);
+    command
+}
+
 #[cfg(target_os = "linux")]
 impl ClobPerfRing {
     fn start() -> Option<Self> {
@@ -3322,22 +3344,7 @@ impl ClobPerfRing {
                         .unwrap_or_default()
                         .as_secs();
                     let output = format!("{output_dir}/clob-prewindow-tid-{tid}-{epoch}.data");
-                    let mut child = match std::process::Command::new("perf")
-                        .arg("record")
-                        .arg("--snapshot")
-                        .arg("--overwrite")
-                        .arg("-m")
-                        .arg("32")
-                        .arg("--freq")
-                        .arg(frequency.to_string())
-                        .arg("--call-graph")
-                        .arg("fp")
-                        .arg("--tid")
-                        .arg(tid.to_string())
-                        .arg("--output")
-                        .arg(&output)
-                        .spawn()
-                    {
+                    let mut child = match clob_perf_record_command(tid, frequency, &output).spawn() {
                         Ok(child) => child,
                         Err(error) => {
                             warn!(
@@ -3355,9 +3362,9 @@ impl ClobPerfRing {
                             return;
                         }
                     };
-                    // perf uses SIGUSR2 for snapshot/switch-output control.
-                    let _ = unsafe { libc::kill(child.id() as i32, libc::SIGUSR2) };
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Stopping an overwrite-mode recording flushes the current
+                    // backward ring, which is the bounded window immediately
+                    // preceding the trigger.
                     let _ = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
                     let status = child.wait();
                     warn!(
@@ -3432,6 +3439,26 @@ fn maybe_trigger_clob_perf(
         frame_len,
         phases,
     });
+}
+
+#[cfg(test)]
+mod clob_perf_command_tests {
+    use super::clob_perf_record_command;
+
+    #[test]
+    fn cpu_sampling_prewindow_uses_overwrite_without_aux_snapshot() {
+        let command = clob_perf_record_command(123, 19, "/tmp/clob-perf-test.data");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--overwrite"));
+        assert!(!args.iter().any(|arg| arg == "--snapshot"));
+        assert!(args.windows(2).any(|pair| pair == ["--tid", "123"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--output", "/tmp/clob-perf-test.data"]));
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
