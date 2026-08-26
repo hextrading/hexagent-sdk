@@ -4274,12 +4274,15 @@ fn economic_effects_match(left: &AccountEconomicState, right: &AccountEconomicSt
     })
 }
 
-/// Detect the old full-account snapshot race from durable WAL evidence. A
-/// lifecycle-only trade advance (for example MATCHED -> MINED) has identical
-/// immutable virtual economics. Therefore a typed virtual-trade frame that
-/// changes its owner's cash or token balance while making only such trade
-/// advances proves that a stale cold snapshot was published over the owner
-/// shard before this frame was captured.
+/// Detect an absolute virtual-account publication that was captured from an
+/// owner shard which had not yet consumed an earlier cold economic delta. The
+/// immutable trade/compaction roots prove the expected economic transition in
+/// the same checksummed WAL frame. Direct cash/position changes beyond that
+/// transition are therefore WAL-scoped stale-publication evidence.
+///
+/// External adjustments, allocation migrations and confirmed maintenance
+/// transitions remain outside this recovery path: those roots intentionally
+/// change economic authority and retain their dedicated reconciliation logic.
 fn stale_virtual_trade_snapshot_wal_evidence(
     record: &PersistenceWalRecord,
     state_before: &serde_json::Value,
@@ -4293,116 +4296,272 @@ fn stale_virtual_trade_snapshot_wal_evidence(
         };
         matches!(
             path.first().map(String::as_str),
-            Some(
-                "maintenance_ops"
-                    | "external_adjustments"
-                    | "compacted_economic_effects"
-                    | "cash_allocation_migrations"
-            )
+            Some("external_adjustments" | "cash_allocation_migrations")
         )
     }) {
         return Ok(Vec::new());
     }
 
-    let mut lifecycle_only_scopes = BTreeSet::<(String, String)>::new();
-    let mut saw_trade_change = false;
+    // A newly reserved maintenance operation has no immutable economic effect,
+    // but its cold owner used to publish an absolute virtual snapshot and is
+    // one of the observed stale-publication shapes. Anything involving a
+    // confirmed operation remains fail-closed in the maintenance recovery.
     for change in &record.changes {
-        let PersistenceWalChange::Set { path, value } = change else {
-            if matches!(change, PersistenceWalChange::Remove { path } if path.first().is_some_and(|component| component == "trades"))
-            {
-                return Ok(Vec::new());
-            }
-            continue;
+        let path = match change {
+            PersistenceWalChange::Set { path, .. }
+            | PersistenceWalChange::Remove { path }
+            | PersistenceWalChange::SetInsert { path, .. }
+            | PersistenceWalChange::SetRemove { path, .. } => path,
         };
-        if path.len() != 2 || path[0] != "trades" {
+        if path.first().map(String::as_str) != Some("maintenance_ops") {
             continue;
         }
-        saw_trade_change = true;
-        let Some(previous_value) = json_value_at_path(state_before, path) else {
-            // A newly booked or restored trade is an economic mutation, not
-            // proof of the lifecycle-only stale-snapshot failure.
+        if path.len() != 2 {
             return Ok(Vec::new());
-        };
-        let previous: AppliedTrade =
-            serde_json::from_value(previous_value.clone()).map_err(|error| {
+        }
+        let previous = json_value_at_path(state_before, path)
+            .map(|value| serde_json::from_value::<MaintenanceOperation>(value.clone()))
+            .transpose()
+            .map_err(|error| {
                 format!(
-                    "decode prior trade `{}` before WAL generation {}: {error}",
+                    "decode prior maintenance operation `{}` before WAL generation {}: {error}",
                     path[1], record.generation,
                 )
             })?;
-        let next: AppliedTrade = serde_json::from_value(value.clone()).map_err(|error| {
-            format!(
-                "decode trade `{}` in WAL generation {}: {error}",
-                path[1], record.generation,
-            )
-        })?;
-        if previous.ownership.instance_id != next.ownership.instance_id
-            || previous.ownership.token_id != next.ownership.token_id
-            || !economic_effects_match(
-                &trade_economic_effect(&previous),
-                &trade_economic_effect(&next),
-            )
+        let next = match change {
+            PersistenceWalChange::Set { value, .. } => Some(
+                serde_json::from_value::<MaintenanceOperation>(value.clone()).map_err(|error| {
+                    format!(
+                        "decode maintenance operation `{}` in WAL generation {}: {error}",
+                        path[1], record.generation,
+                    )
+                })?,
+            ),
+            PersistenceWalChange::Remove { .. } => None,
+            PersistenceWalChange::SetInsert { .. } | PersistenceWalChange::SetRemove { .. } => {
+                return Ok(Vec::new());
+            }
+        };
+        if previous
+            .as_ref()
+            .is_some_and(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
+            || next
+                .as_ref()
+                .is_some_and(|operation| operation.status == MaintenanceOperationStatus::Confirmed)
         {
             return Ok(Vec::new());
         }
-        lifecycle_only_scopes.insert((
-            next.ownership.instance_id.clone(),
-            next.ownership.token_id.clone(),
-        ));
     }
-    if !saw_trade_change {
+
+    let mut expected = AccountEconomicState::default();
+    let mut trade_updates = BTreeMap::<String, Option<serde_json::Value>>::new();
+    for change in &record.changes {
+        match change {
+            PersistenceWalChange::Set { path, value } if path.len() == 2 && path[0] == "trades" => {
+                trade_updates.insert(path[1].clone(), Some(value.clone()));
+            }
+            PersistenceWalChange::Remove { path } if path.len() == 2 && path[0] == "trades" => {
+                trade_updates.insert(path[1].clone(), None);
+            }
+            PersistenceWalChange::Set { path, .. }
+            | PersistenceWalChange::Remove { path }
+            | PersistenceWalChange::SetInsert { path, .. }
+            | PersistenceWalChange::SetRemove { path, .. }
+                if path.first().map(String::as_str) == Some("trades") =>
+            {
+                return Ok(Vec::new());
+            }
+            _ => {}
+        }
+    }
+    for (trade_key, next_value) in trade_updates {
+        let trade_path = vec!["trades".to_string(), trade_key.clone()];
+        let previous = if let Some(previous_value) = json_value_at_path(state_before, &trade_path) {
+            let previous: AppliedTrade =
+                serde_json::from_value(previous_value.clone()).map_err(|error| {
+                    format!(
+                        "decode prior trade `{}` before WAL generation {}: {error}",
+                        trade_key, record.generation,
+                    )
+                })?;
+            add_economic_state(&mut expected, &trade_economic_effect(&previous), -1.0);
+            Some(previous)
+        } else {
+            None
+        };
+        if let Some(next_value) = next_value {
+            let next: AppliedTrade = serde_json::from_value(next_value).map_err(|error| {
+                format!(
+                    "decode trade `{trade_key}` in WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?;
+            if next.ownership.trade_key != trade_key
+                || previous.as_ref().is_some_and(|previous| {
+                    previous.ownership.instance_id != next.ownership.instance_id
+                        || previous.ownership.token_id != next.ownership.token_id
+                })
+            {
+                return Ok(Vec::new());
+            }
+            add_economic_state(&mut expected, &trade_economic_effect(&next), 1.0);
+        }
+    }
+
+    let compacted_changes: Vec<PersistenceWalChange> = record
+        .changes
+        .iter()
+        .filter(|change| {
+            let path = match change {
+                PersistenceWalChange::Set { path, .. }
+                | PersistenceWalChange::Remove { path }
+                | PersistenceWalChange::SetInsert { path, .. }
+                | PersistenceWalChange::SetRemove { path, .. } => path,
+            };
+            path.first().map(String::as_str) == Some("compacted_economic_effects")
+        })
+        .cloned()
+        .collect();
+    if !compacted_changes.is_empty() {
+        let default_compacted = serde_json::to_value(AccountEconomicState::default())
+            .map_err(|error| format!("encode empty compacted economic state: {error}"))?;
+        let before_value =
+            json_value_at_path(state_before, &["compacted_economic_effects".to_string()])
+                .cloned()
+                .unwrap_or(default_compacted.clone());
+        let before: AccountEconomicState =
+            serde_json::from_value(before_value.clone()).map_err(|error| {
+                format!(
+                    "decode compacted economics before WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?;
+        let mut wrapper = serde_json::json!({ "compacted_economic_effects": before_value });
+        for change in compacted_changes {
+            apply_persistence_wal_change(&mut wrapper, change).map_err(|error| {
+                format!(
+                    "apply compacted economics in WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?;
+        }
+        let after: AccountEconomicState = wrapper
+            .get("compacted_economic_effects")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "decode compacted economics after WAL generation {}: {error}",
+                    record.generation,
+                )
+            })?
+            .unwrap_or_default();
+        add_economic_state(&mut expected, &before, -1.0);
+        add_economic_state(&mut expected, &after, 1.0);
+    }
+
+    let mut direct = BTreeMap::<Vec<String>, Option<f64>>::new();
+    for change in &record.changes {
+        let path = match change {
+            PersistenceWalChange::Set { path, .. }
+            | PersistenceWalChange::Remove { path }
+            | PersistenceWalChange::SetInsert { path, .. }
+            | PersistenceWalChange::SetRemove { path, .. } => path,
+        };
+        let is_cash = path.len() == 3 && path[0] == "instances" && path[2] == "cash";
+        let is_position = path.len() == 4 && path[0] == "instances" && path[2] == "positions";
+        if !is_cash && !is_position {
+            continue;
+        }
+        match change {
+            PersistenceWalChange::Set { value, .. } => {
+                let Some(value) = value.as_f64() else {
+                    return Ok(Vec::new());
+                };
+                direct.insert(path.clone(), Some(value));
+            }
+            PersistenceWalChange::Remove { .. } if is_position => {
+                direct.insert(path.clone(), None);
+            }
+            PersistenceWalChange::Remove { .. }
+            | PersistenceWalChange::SetInsert { .. }
+            | PersistenceWalChange::SetRemove { .. } => return Ok(Vec::new()),
+        }
+    }
+    if direct.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut evidence = Vec::new();
-    for (instance_id, token_id) in lifecycle_only_scopes {
+    // A durable trade/compaction delta without its corresponding direct
+    // publication is not this historical race shape. Leave it to normal
+    // validation instead of inventing a missing write.
+    for (instance_id, balance) in &expected.instances {
         let cash_path = vec![
             "instances".to_string(),
             instance_id.clone(),
             "cash".to_string(),
         ];
-        let position_path = vec![
-            "instances".to_string(),
-            instance_id.clone(),
-            "positions".to_string(),
-            token_id.clone(),
-        ];
-        let last_set_number = |expected_path: &[String]| {
-            record.changes.iter().rev().find_map(|change| match change {
-                PersistenceWalChange::Set { path, value } if path == expected_path => {
-                    value.as_f64()
-                }
-                _ => None,
-            })
-        };
-        let correction = |path: &[String]| -> Result<f64, String> {
-            let Some(next) = last_set_number(path) else {
-                return Ok(0.0);
-            };
-            let previous = json_value_at_path(state_before, path)
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| {
-                    format!(
+        if balance.cash.abs() > EPS && !direct.contains_key(&cash_path) {
+            return Ok(Vec::new());
+        }
+        for (token, delta) in &balance.positions {
+            let position_path = vec![
+                "instances".to_string(),
+                instance_id.clone(),
+                "positions".to_string(),
+                token.clone(),
+            ];
+            if delta.abs() > EPS && !direct.contains_key(&position_path) {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    let mut evidence = BTreeMap::<String, StaleVirtualTradeSnapshotWalEvidence>::new();
+    for (path, next) in direct {
+        let previous =
+            match json_value_at_path(state_before, &path).and_then(serde_json::Value::as_f64) {
+                Some(previous) => previous,
+                None if path.len() == 4 => 0.0,
+                None => {
+                    return Err(format!(
                         "WAL generation {} has no prior numeric value for `{}`",
                         record.generation,
                         path.join("/"),
-                    )
-                })?;
-            Ok(previous - next)
-        };
-        let cash_correction = correction(&cash_path)?;
-        let position_correction = correction(&position_path)?;
-        if cash_correction.abs() <= EPS && position_correction.abs() <= EPS {
-            continue;
-        }
-        evidence.push(StaleVirtualTradeSnapshotWalEvidence {
-            generation: record.generation,
-            instance_id,
-            cash_correction,
-            position_corrections: BTreeMap::from([(token_id, position_correction)]),
+                    ));
+                }
+            };
+        let observed_delta = next.unwrap_or(0.0) - previous;
+        let instance_id = path[1].clone();
+        let expected_balance = expected.instances.get(&instance_id);
+        let item = evidence.entry(instance_id.clone()).or_insert_with(|| {
+            StaleVirtualTradeSnapshotWalEvidence {
+                generation: record.generation,
+                instance_id,
+                cash_correction: 0.0,
+                position_corrections: BTreeMap::new(),
+            }
         });
+        if path.len() == 3 {
+            let expected_delta = expected_balance.map_or(0.0, |balance| balance.cash);
+            item.cash_correction = expected_delta - observed_delta;
+        } else {
+            let token = path[3].clone();
+            let expected_delta = expected_balance
+                .and_then(|balance| balance.positions.get(&token))
+                .copied()
+                .unwrap_or(0.0);
+            let correction = expected_delta - observed_delta;
+            if correction.abs() > EPS {
+                item.position_corrections.insert(token, correction);
+            }
+        };
     }
-    Ok(evidence)
+    Ok(evidence
+        .into_values()
+        .filter(|item| item.cash_correction.abs() > EPS || !item.position_corrections.is_empty())
+        .collect())
 }
 
 fn incomplete_maintenance_cash_wal_evidence(
@@ -4669,14 +4828,27 @@ fn repair_stale_virtual_trade_snapshots_from_wal(
         }
     }
     recompute_reconciliation(state, "stale virtual trade WAL snapshot recovery");
-    let recovered: Vec<String> = evidence
+    let first_generation = evidence
         .iter()
-        .map(|item| format!("{}@{}", item.instance_id, item.generation))
+        .map(|item| item.generation)
+        .min()
+        .unwrap_or(0);
+    let last_generation = evidence
+        .iter()
+        .map(|item| item.generation)
+        .max()
+        .unwrap_or(0);
+    let instances: BTreeSet<&str> = evidence
+        .iter()
+        .map(|item| item.instance_id.as_str())
         .collect();
     log::warn!(
-        "[shared_account] account={} repaired stale virtual-trade WAL snapshot(s) evidence={:?}",
+        "[shared_account] account={} repaired stale virtual-account WAL snapshots frames={} generations={}..={} instances={:?}",
         account_id,
-        recovered,
+        evidence.len(),
+        first_generation,
+        last_generation,
+        instances,
     );
     true
 }
@@ -5313,6 +5485,8 @@ struct EconomicStateGuard<'a> {
     state: MutexGuard<'a, SharedAccountState>,
     pending: PendingPhysicalDeltas,
     instance_baseline: BTreeMap<String, EconomicBalance>,
+    maintenance_reserved_cash_baseline: BTreeMap<String, f64>,
+    maintenance_reserved_positions_baseline: BTreeMap<String, HashMap<String, f64>>,
     scoped_tokens: Vec<String>,
     acquired_at: Instant,
 }
@@ -5355,6 +5529,37 @@ impl Drop for EconomicStateGuard<'_> {
                 let delta = after - before;
                 if delta.abs() > EPS {
                     account.position(token).balance.add(delta);
+                }
+            }
+            let maintenance_cash_before = self
+                .maintenance_reserved_cash_baseline
+                .get(instance_id)
+                .copied()
+                .unwrap_or(0.0);
+            let maintenance_cash_delta = ledger.maintenance_reserved_cash - maintenance_cash_before;
+            if maintenance_cash_delta.abs() > EPS {
+                account
+                    .maintenance_reserved_cash
+                    .add(maintenance_cash_delta);
+            }
+            let maintenance_positions_before = self
+                .maintenance_reserved_positions_baseline
+                .get(instance_id);
+            let mut maintenance_positions = account.maintenance_reserved_positions.write().unwrap();
+            for token in &self.scoped_tokens {
+                let before = maintenance_positions_before
+                    .and_then(|positions| positions.get(token))
+                    .copied()
+                    .unwrap_or(0.0);
+                let after = ledger
+                    .maintenance_reserved_positions
+                    .get(token)
+                    .copied()
+                    .unwrap_or(0.0);
+                let delta = after - before;
+                if delta.abs() > EPS {
+                    let entry = maintenance_positions.entry(token.clone()).or_insert(0.0);
+                    *entry = (*entry + delta).max(0.0);
                 }
             }
         }
@@ -6860,12 +7065,15 @@ impl SharedAccount {
         let accounts = self.virtual_accounts.read().unwrap();
         let mut pending = PendingPhysicalDeltas::default();
         let mut instance_baseline = BTreeMap::new();
+        let mut maintenance_reserved_cash_baseline = BTreeMap::new();
+        let mut maintenance_reserved_positions_baseline = BTreeMap::new();
         for (instance_id, account) in accounts.iter() {
             // The lifecycle owner publishes physical-booking deltas after
             // every mutation. Calibration consumes that immutable projection;
             // it never borrows orders/trades or waits for the lifecycle mutex.
             let instance_pending = account.pending_physical_fast.load_full();
             let cash = account.cash.load();
+            let maintenance_reserved_cash = account.maintenance_reserved_cash.load();
             let positions = account.positions.read().unwrap();
             let mut scoped_positions = HashMap::with_capacity(scoped_tokens.len());
             for token in &scoped_tokens {
@@ -6876,6 +7084,17 @@ impl SharedAccount {
                 scoped_positions.insert(token.clone(), quantity);
             }
             drop(positions);
+            let maintenance_positions = account.maintenance_reserved_positions.read().unwrap();
+            let scoped_maintenance_positions: HashMap<String, f64> = scoped_tokens
+                .iter()
+                .map(|token| {
+                    (
+                        token.clone(),
+                        maintenance_positions.get(token).copied().unwrap_or(0.0),
+                    )
+                })
+                .collect();
+            drop(maintenance_positions);
             pending.cash += instance_pending.cash;
             pending.unsettled |= instance_pending.unsettled;
             for (token, quantity) in &instance_pending.positions {
@@ -6885,8 +7104,14 @@ impl SharedAccount {
                 continue;
             };
             ledger.cash = cash;
+            ledger.maintenance_reserved_cash = maintenance_reserved_cash;
             for (token, quantity) in &scoped_positions {
                 ledger.positions.insert(token.clone(), *quantity);
+            }
+            for (token, quantity) in &scoped_maintenance_positions {
+                ledger
+                    .maintenance_reserved_positions
+                    .insert(token.clone(), *quantity);
             }
             instance_baseline.insert(
                 instance_id.clone(),
@@ -6895,6 +7120,10 @@ impl SharedAccount {
                     positions: scoped_positions,
                 },
             );
+            maintenance_reserved_cash_baseline
+                .insert(instance_id.clone(), maintenance_reserved_cash);
+            maintenance_reserved_positions_baseline
+                .insert(instance_id.clone(), scoped_maintenance_positions);
         }
         drop(accounts);
         recompute_reconciliation_with_pending(
@@ -6908,6 +7137,8 @@ impl SharedAccount {
             state,
             pending,
             instance_baseline,
+            maintenance_reserved_cash_baseline,
+            maintenance_reserved_positions_baseline,
             scoped_tokens,
             acquired_at,
         }
@@ -10704,7 +10935,8 @@ impl SharedAccount {
                 "external adjustment requires an operation_id and finite deltas".into(),
             ));
         }
-        let mut state = self.lock_state();
+        let authoritative_tokens: HashSet<String> = position_deltas.keys().cloned().collect();
+        let mut state = self.lock_economic_state(&authoritative_tokens);
         if let Some(existing) = state.external_adjustments.get(operation_id) {
             if existing.instance_id == instance_id
                 && (existing.cash_delta - cash_delta).abs() <= EPS
@@ -13038,7 +13270,9 @@ impl SharedAccount {
                 })
                 .map_err(ReservationError::InvalidOrder)?;
         }
-        let mut state = self.lock_state();
+        let authoritative_tokens: HashSet<String> =
+            legs.iter().map(|(token, _, _)| token.clone()).collect();
+        let mut state = self.lock_economic_state(&authoritative_tokens);
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
         }
@@ -13368,7 +13602,9 @@ impl SharedAccount {
                 "invalid maintenance operation identity/tokens/allocations".to_string(),
             ));
         }
-        let mut state = self.lock_state();
+        let authoritative_tokens =
+            HashSet::from([up_token_id.to_string(), down_token_id.to_string()]);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
         if let Some(existing) = state.maintenance_ops.get(operation_id) {
             let expected_allocations: BTreeMap<String, f64> = allocations
                 .iter()
@@ -13717,7 +13953,16 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state();
+        let Some(operation_scope) =
+            self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
+        else {
+            return;
+        };
+        let authoritative_tokens = HashSet::from([
+            operation_scope.up_token_id.clone(),
+            operation_scope.down_token_id.clone(),
+        ]);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return;
         };
@@ -13770,7 +14015,18 @@ impl SharedAccount {
                 })
                 .map_err(ReservationError::InvalidOrder)?;
         }
-        let mut state = self.lock_state();
+        let Some(operation_scope) =
+            self.read_cold_state(|state| state.maintenance_ops.get(operation_id).cloned())
+        else {
+            return Err(ReservationError::InvalidOrder(format!(
+                "unknown maintenance operation `{operation_id}`"
+            )));
+        };
+        let authoritative_tokens = HashSet::from([
+            operation_scope.up_token_id.clone(),
+            operation_scope.down_token_id.clone(),
+        ]);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return Err(ReservationError::InvalidOrder(format!(
                 "unknown maintenance operation `{operation_id}`"
@@ -23625,6 +23881,43 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn cold_maintenance_owner_publishes_condition_scoped_virtual_deltas() {
+        let account = Arc::new(seeded_account());
+        let (_handle, cold_owner) = account.bind_account_owner().unwrap();
+        cold_owner.mark_current_thread().unwrap();
+        let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
+        let allocations = HashMap::from([("a".to_string(), 10.0)]);
+
+        account
+            .reserve_maintenance_operation(
+                "split-owner-delta",
+                MaintenanceOperationKind::Split,
+                "condition-owner-delta",
+                "OWNER-UP",
+                "OWNER-DOWN",
+                &allocations,
+            )
+            .unwrap();
+        let virtual_account = account.virtual_account("a").unwrap();
+        assert_eq!(virtual_account.maintenance_reserved_cash.load(), 10.0);
+        account
+            .mark_maintenance_operation_submitted("split-owner-delta", "0xowner-delta")
+            .unwrap();
+        account
+            .confirm_maintenance_operation("split-owner-delta")
+            .unwrap();
+
+        assert_eq!(virtual_account.cash.load(), 90.0);
+        assert_eq!(virtual_account.maintenance_reserved_cash.load(), 0.0);
+        assert_eq!(virtual_account.position("OWNER-UP").balance.load(), 10.0);
+        assert_eq!(virtual_account.position("OWNER-DOWN").balance.load(), 10.0);
+        let cold = account.read_cold_state(|state| state.instances["a"].clone());
+        assert_eq!(cold.cash, 90.0);
+        assert_eq!(cold.maintenance_reserved_cash, 0.0);
+        assert_eq!(cold.positions["OWNER-UP"], 10.0);
+    }
+
+    #[test]
     fn concurrent_owner_trade_delta_does_not_overwrite_cold_economics() {
         let mut baseline_ledger = InstanceLedger::new(1.0);
         baseline_ledger.cash = 100.0;
@@ -25709,6 +26002,150 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             restored.trade_ownership("maker-trade").unwrap().status,
             "MINED",
         );
+        assert!(!restored.is_uncertain());
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn restart_repairs_wal_proven_cold_delta_missing_from_new_trade_snapshot() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-cold-delta-new-trade-recovery-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let account_id = "cold-delta-new-trade-recovery";
+        let account = SharedAccount::new(account_id);
+        account.register_instance("maker", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .reserve_order(
+                "maker",
+                "maker-order",
+                "maker-oid",
+                "TRADE-UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        account
+            .reserve_maintenance_operation(
+                "split-before-trade",
+                MaintenanceOperationKind::Split,
+                "condition-before-trade",
+                "SPLIT-UP",
+                "SPLIT-DOWN",
+                &HashMap::from([("maker".to_string(), 10.0)]),
+            )
+            .unwrap();
+        account
+            .mark_maintenance_operation_submitted("split-before-trade", "0xsplit")
+            .unwrap();
+        account
+            .confirm_maintenance_operation("split-before-trade")
+            .unwrap();
+        let before_trade = account.lock_state().clone();
+        assert_eq!(before_trade.instances["maker"].cash, 90.0);
+
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "maker-trade",
+                "MATCHED",
+                "maker-order",
+                "maker-oid",
+                "TRADE-UP",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1,
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        let after_trade = account.lock_state().clone();
+        assert_eq!(after_trade.instances["maker"].cash, 89.0);
+
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_VERSION,
+                account_id: account_id.into(),
+                persistence_generation: 0,
+                state: before_trade,
+            },
+        )
+        .unwrap();
+        reset_persistence_wal(&path).unwrap();
+        let stale_ledger = &after_trade.instances["maker"];
+        let mut changes = materialize_persistence_job(&PersistenceJob {
+            generation: 1,
+            payload: PersistenceJobPayload::VirtualTrade(VirtualTradePersistenceDelta {
+                instance_id: "maker".into(),
+                // Reproduce the stale owner shard: the new trade is booked,
+                // but the preceding ten-dollar split delta is absent.
+                cash: stale_ledger.cash + 10.0,
+                reserved_cash: stale_ledger.reserved_cash,
+                token_id: "TRADE-UP".into(),
+                position: stale_ledger.positions["TRADE-UP"],
+                reserved_position: stale_ledger.reserved_positions["TRADE-UP"],
+                client_order_id: "maker-order".into(),
+                order: Some(after_trade.orders["maker-order"].clone()),
+                trade_key: "maker-trade".into(),
+                trade: Some(after_trade.trades["maker-trade"].clone()),
+                fee_attribution_pending: after_trade
+                    .fee_attribution_pending
+                    .contains("maker-trade"),
+                recovery_pending: after_trade.recovery_pending_orders.contains("maker-order"),
+                routine_cancel_audit: after_trade.routine_cancel_audits.contains("maker-order"),
+                ledger_generation: after_trade.ledger_generation,
+            }),
+        })
+        .unwrap();
+        // Some cold/control publications also carried condition positions
+        // beside the stale cash value. They have no trade delta in this frame
+        // and must be restored from the same immutable-WAL residual proof.
+        changes.push(PersistenceWalChange::Set {
+            path: vec![
+                "instances".into(),
+                "maker".into(),
+                "positions".into(),
+                "SPLIT-UP".into(),
+            ],
+            value: serde_json::json!(0.0),
+        });
+        changes.push(PersistenceWalChange::Set {
+            path: vec![
+                "instances".into(),
+                "maker".into(),
+                "positions".into(),
+                "SPLIT-DOWN".into(),
+            ],
+            value: serde_json::json!(0.0),
+        });
+        let mut wal_len = 0;
+        append_persistence_wal(
+            &path,
+            &PersistenceWalRecord {
+                version: PERSISTENCE_WAL_VERSION,
+                account_id: account_id.into(),
+                generation: 1,
+                changes,
+            },
+            &mut wal_len,
+        )
+        .unwrap();
+
+        let restored = SharedAccount::new_persistent(account_id, &path).unwrap();
+        let maker = restored.instance_snapshot("maker").unwrap();
+        assert_eq!(maker.cash, 89.0);
+        assert_eq!(maker.positions["SPLIT-UP"], 10.0);
+        assert_eq!(maker.positions["SPLIT-DOWN"], 10.0);
+        assert_eq!(maker.positions["TRADE-UP"], 2.0);
         assert!(!restored.is_uncertain());
         drop(restored);
         remove_persistence_test_files(&path);
