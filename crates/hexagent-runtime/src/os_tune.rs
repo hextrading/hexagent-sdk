@@ -119,6 +119,9 @@ pub struct CorePlan {
     /// place those workers on dedicated cores. Instances absent from this map
     /// fall back to `strategy`.
     pub strategy_cores: HashMap<String, usize>,
+    /// Per-account authenticated private-ingress routing cores. In strict
+    /// mode these are dedicated and disjoint from lifecycle/account apply.
+    pub private_route_cores: HashMap<String, usize>,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
     /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
@@ -157,6 +160,7 @@ impl CorePlan {
             async_ord: None,
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
+            private_route_cores: HashMap::new(),
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -205,6 +209,7 @@ impl CorePlan {
             async_ord: cfg.async_ord_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
+            private_route_cores: cfg.private_route_cores.clone(),
             private_apply_cores: cfg.private_apply_cores.clone(),
             private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -428,6 +433,16 @@ impl CorePlan {
         let mut private_apply: Vec<_> = self.private_apply_cores.iter().collect();
         private_apply.sort_by(|left, right| left.0.cmp(right.0));
         for (account_id, &core) in private_apply {
+            let route_core = self.private_route_cores.get(account_id).copied().ok_or_else(|| {
+                format!(
+                    "strict_core_isolation requires private_route_cores entry for account `{account_id}`"
+                )
+            })?;
+            claim(
+                route_core,
+                format!("private_account_route:{account_id}"),
+                &mut exclusive,
+            )?;
             claim(
                 core,
                 format!("private_account_apply:{account_id}"),
@@ -448,6 +463,13 @@ impl CorePlan {
             if !self.private_apply_cores.contains_key(account_id) {
                 return Err(format!(
                     "private_cold_cores account `{account_id}` has no private_apply_cores entry"
+                ));
+            }
+        }
+        for account_id in self.private_route_cores.keys() {
+            if !self.private_apply_cores.contains_key(account_id) {
+                return Err(format!(
+                    "private_route_cores account `{account_id}` has no private_apply_cores entry"
                 ));
             }
         }
@@ -585,9 +607,9 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     // Emit a one-shot summary so operators can grep for "core plan" and
     // cross-check against `/proc/cmdline` isolcpus.
     info!(
-        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={} private_apply={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={} allow_strategy_router_on_execution={} allow_private_apply_on_completion={}",
+        "[os_tune] core plan: async_rt={} async_clob={:?} async_ord={:?} strategy={} execution={} feeds={:?} private_route={:?} private_apply={:?} private_cold={:?} hex_workers={:?} poly_exec={:?} poly_cancel={:?} poly_completion={:?} background={:?} fifo(async={} strat={} exec={} poly_feed={} completion={} private_apply={}) enable_pin={} enable_fifo={} strict_isolation={} allow_background_on_execution={} allow_strategy_router_on_execution={} allow_private_apply_on_completion={}",
         plan.async_rt, plan.async_clob, plan.async_ord, plan.strategy, plan.execution,
-        plan.feed_cores, plan.private_apply_cores, plan.private_cold_cores,
+        plan.feed_cores, plan.private_route_cores, plan.private_apply_cores, plan.private_cold_cores,
         plan.hex_worker_cores,
         plan.poly_exec_cores, plan.poly_cancel_cores, plan.poly_completion_cores,
         plan.background_cores,
@@ -680,7 +702,9 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
     let p = plan();
     let skip = if core_id == p.async_rt || p.async_clob == Some(core_id) {
         "HEXBOT_NO_PIN_ASYNC_RT"
-    } else if p.private_apply_cores.values().any(|&c| c == core_id) {
+    } else if p.private_route_cores.values().any(|&c| c == core_id)
+        || p.private_apply_cores.values().any(|&c| c == core_id)
+    {
         // A disabled strategy may leave its configured core available for a
         // live account-apply worker.  Classify that worker by its active role,
         // not by the dormant strategy_cores entry for the same CPU.
@@ -1061,6 +1085,25 @@ pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
     }
 }
 
+/// Pin the lossless authenticated private-ingress router. In production this
+/// worker owns a CPU distinct from the lifecycle/account apply owner so an
+/// equal-priority FIFO burst on either lane cannot head-of-line-block the
+/// other. Non-strict legacy configurations fall back to `private_apply_cores`.
+pub fn pin_private_route(thread_name: &str, account_id: &str) {
+    let p = plan();
+    let core = p
+        .private_route_cores
+        .get(account_id)
+        .copied()
+        .or_else(|| p.private_apply_cores.get(account_id).copied());
+    if let Some(core) = core {
+        pin_current(core, thread_name);
+        set_fifo(p.fifo_private_apply, thread_name);
+    } else {
+        pin_background(thread_name);
+    }
+}
+
 /// Shared-ledger/audit/persistence half of the private feed. Keep it
 /// SCHED_OTHER on an account-specific cold CPU that is disjoint from the FIFO
 /// owner-fast worker. Co-locating them lets a private-event microburst preempt
@@ -1320,6 +1363,8 @@ mod tests {
     fn strict_plan_allows_private_apply_on_dormant_strategy_cores_only() {
         let mut cfg = five_instance_config();
         cfg.async_clob_core = Some(16);
+        cfg.private_route_cores =
+            HashMap::from([("zhu02".into(), 19), ("zhu03".into(), 20)]);
         cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11), ("zhu03".into(), 12)]);
         cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17), ("zhu03".into(), 18)]);
         let plan = CorePlan::from_config(&cfg);
@@ -1339,6 +1384,7 @@ mod tests {
     fn strict_plan_requires_disjoint_private_cold_core() {
         let mut cfg = five_instance_config();
         cfg.async_clob_core = Some(16);
+        cfg.private_route_cores = HashMap::from([("zhu02".into(), 19)]);
         cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11)]);
         let enabled = vec!["btc01".to_string(), "btc02".to_string()];
 
@@ -1358,6 +1404,36 @@ mod tests {
         );
 
         cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17)]);
+        assert_eq!(
+            CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn strict_plan_requires_private_route_core_disjoint_from_apply() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.private_apply_cores = HashMap::from([("zhu02".into(), 11)]);
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17)]);
+        let enabled = vec!["btc01".to_string(), "btc02".to_string()];
+
+        let missing = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .unwrap_err();
+        assert!(missing.contains("private_route_cores entry"));
+
+        cfg.private_route_cores = HashMap::from([("zhu02".into(), 11)]);
+        let overlap = CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .unwrap_err();
+        assert!(
+            overlap.contains("private_account_route:zhu02")
+                && overlap.contains("private_account_apply:zhu02"),
+            "unexpected validation error: {overlap}",
+        );
+
+        cfg.private_route_cores = HashMap::from([("zhu02".into(), 19)]);
         assert_eq!(
             CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled),
             Ok(())
@@ -1387,6 +1463,7 @@ mod tests {
     fn strict_plan_allows_private_apply_only_on_opted_in_completion_core() {
         let mut cfg = five_instance_config();
         cfg.async_clob_core = Some(16);
+        cfg.private_route_cores = HashMap::from([("zhu02".into(), 18)]);
         cfg.private_apply_cores = HashMap::from([("zhu02".into(), 15)]);
         cfg.private_cold_cores = HashMap::from([("zhu02".into(), 17)]);
         let instances = five_instances();

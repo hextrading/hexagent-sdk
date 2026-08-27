@@ -2424,10 +2424,7 @@ fn spawn_private_apply_worker(
     let worker = std::thread::Builder::new()
         .name(format!("poly-private-owner-{}", account_id))
         .spawn(move || {
-            crate::os_tune::pin_private_account_apply(
-                "polymarket-private-owner",
-                &account_id,
-            );
+            crate::os_tune::pin_private_route("polymarket-private-owner", &account_id);
             crate::latency::prepare_polymarket_private_stages();
             let mut route_dedupe = PrivateRouteDedupe::new();
             let mut cold_committed = PrivateRouteDedupe::new();
