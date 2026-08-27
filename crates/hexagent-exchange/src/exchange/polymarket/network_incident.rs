@@ -12,6 +12,11 @@ const CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS: u64 = 5_000_000_000;
 const PLACE_GATE_REJECTION_LOG_INTERVAL_NS: u64 = 1_000_000_000;
 pub(crate) const HTTP_SLOW_SUCCESS_THRESHOLD: Duration = Duration::from_millis(500);
 
+#[inline]
+fn http_success_requires_retirement(elapsed: Duration) -> bool {
+    elapsed >= HTTP_SLOW_SUCCESS_THRESHOLD
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionFailureKind {
     Timeout,
@@ -107,20 +112,28 @@ pub(crate) fn note_http_connection_failure(
 }
 
 /// A response can prove that its connection is alive and still be unsafe for
-/// fresh placement admission. Correlate slow *successful* requests through
-/// the same role/slot window as hard failures: two independent connections
-/// above the threshold briefly stop new place requests, while cancel and
-/// reconcile continue to run on their isolated, idempotent lanes.
+/// reuse. Every slow-success retires the exact measured logical-slot
+/// generation; correlation across two independent connections additionally
+/// pauses fresh placements while cancel and reconcile continue on their
+/// isolated, idempotent lanes.
 pub(crate) fn note_http_slow_success(
     role: crate::http1_pool::Role,
     slot: usize,
     elapsed: Duration,
 ) -> bool {
-    if elapsed < HTTP_SLOW_SUCCESS_THRESHOLD {
+    if !http_success_requires_retirement(elapsed) {
         return false;
     }
     let now_ns = crate::types::now_ns();
     let (connections, entered) = connection_failure_gate().note(now_ns, role, slot);
+    warn!(
+        "[connection_health_slow_success] action=retire_connection_generation trigger_role={:?} trigger_slot={} elapsed_ms={} cluster_connections={} placement_gate_active={}",
+        role,
+        slot,
+        elapsed.as_millis(),
+        connections,
+        connections >= CONNECTION_FAILURE_CLUSTER_CONNECTIONS,
+    );
     if entered {
         warn!(
             "[connection_health_cluster] connections={} window_ms={} place_block_ms={} action=pause_new_place_allow_cancel_reconcile trigger_kind=slow_success trigger_role={:?} trigger_slot={} elapsed_ms={}",
@@ -132,7 +145,7 @@ pub(crate) fn note_http_slow_success(
             elapsed.as_millis(),
         );
     }
-    connections >= CONNECTION_FAILURE_CLUSTER_CONNECTIONS
+    true
 }
 
 #[inline]
@@ -373,6 +386,16 @@ mod tests {
             (2, true)
         );
         assert!(gate.place_blocked(4));
+    }
+
+    #[test]
+    fn every_slow_success_requests_exact_generation_retirement() {
+        assert!(!http_success_requires_retirement(
+            HTTP_SLOW_SUCCESS_THRESHOLD - Duration::from_nanos(1),
+        ));
+        assert!(http_success_requires_retirement(
+            HTTP_SLOW_SUCCESS_THRESHOLD,
+        ));
     }
 
     #[test]

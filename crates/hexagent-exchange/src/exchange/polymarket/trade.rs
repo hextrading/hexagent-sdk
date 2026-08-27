@@ -2628,10 +2628,9 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let first = execute_http_on(client.clone(), attempt_id, method, url, path, headers, body).await;
     if first.is_ok() {
         if super::network_incident::note_http_slow_success(role, slot, first_started.elapsed()) {
-            // The slow-success cluster has proven that this is not an
-            // isolated exchange response. Retire the exact measured
-            // generation in this logical slot; replacement does not increase
-            // pool cardinality.
+            // A slow successful response can leave this Cloudflare route
+            // alive but unsafe for reuse. Retire only the exact measured
+            // generation; replacement preserves logical pool cardinality.
             client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
         }
     }
