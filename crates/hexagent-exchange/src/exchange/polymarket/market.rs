@@ -47,6 +47,7 @@ const CLOB_STANDBY_SLOW_CONSUMER_MAX_BACKOFF: Duration = Duration::from_secs(30)
 const CLOB_STANDBY_HEALTHY_RESET: Duration = Duration::from_secs(60);
 const CLOB_DUAL_SILENCE_WINDOWS: u8 = 2;
 const CLOB_RARE_HANDLER_TAIL: Duration = Duration::from_millis(10);
+const CLOB_RARE_PRICE_CHANGE_APPLY_TAIL: Duration = Duration::from_millis(5);
 const CLOB_RESOURCE_BASELINE_FRAMES: u64 = 256;
 
 fn clob_standby_is_hot(observed_data: bool, last_raw_at: Instant, now: Instant) -> bool {
@@ -3293,10 +3294,12 @@ fn clob_thread_cpu_ns() -> u64 {
 
 #[cfg(target_os = "linux")]
 struct ClobPerfTrigger {
-    elapsed: Duration,
+    price_change_apply_elapsed: Duration,
+    total_handler_elapsed: Duration,
     /// The same in-place parser buffer that produced the tail. Ownership is
-    /// transferred only after a >10 ms tail, so ordinary frames retain the
-    /// zero-copy String -> Vec path and perform no capture allocation.
+    /// transferred only after a >=5 ms price-change apply tail, so ordinary
+    /// frames retain the zero-copy String -> Vec path and perform no capture
+    /// allocation.
     frame: Vec<u8>,
     phases: ClobFramePhaseTimings,
 }
@@ -3430,7 +3433,7 @@ fn clob_frame_structure_summary(frame: &[u8]) -> serde_json::Value {
     }
 }
 
-/// A dedicated housekeeping owner continuously runs a low-frequency,
+/// A dedicated housekeeping owner continuously runs a bounded-frequency,
 /// overwrite-mode perf ring for the CLOB TID. The hot CLOB owner only performs
 /// a bounded try_send. On a tail the worker freezes the ring, so the artifact
 /// contains the lead-up to the spike instead of 34-39 samples collected after
@@ -3476,7 +3479,7 @@ impl ClobPerfRing {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| (9..=99).contains(value))
-            .unwrap_or(19);
+            .unwrap_or(99);
         let output_dir = std::env::var("HEXBOT_CLOB_PERF_DIR")
             .unwrap_or_else(|_| "/tmp/hexbot-clob-perf".to_string());
         let (tx, rx) = crossbeam_channel::bounded::<ClobPerfTrigger>(2);
@@ -3496,7 +3499,9 @@ impl ClobPerfRing {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    let output = format!("{output_dir}/clob-prewindow-tid-{tid}-{epoch}.data");
+                    let output = format!(
+                        "{output_dir}/clob-price-change-prewindow-tid-{tid}-{epoch}.data"
+                    );
                     let mut child = match clob_perf_record_command(tid, frequency, &output).spawn() {
                         Ok(child) => child,
                         Err(error) => {
@@ -3525,7 +3530,9 @@ impl ClobPerfRing {
                     let structure = clob_frame_structure_summary(&trigger.frame);
                     let replay = replay_clob_resident_tape(&trigger.frame, 1_024);
                     let summary = serde_json::json!({
-                        "triggering_tail_us": trigger.elapsed.as_micros(),
+                        "trigger_stage": "price_change_apply",
+                        "triggering_stage_us": trigger.price_change_apply_elapsed.as_micros(),
+                        "total_handler_us": trigger.total_handler_elapsed.as_micros(),
                         "phases_us": {
                             "simd_json": trigger.phases.json_decode_ns / 1_000,
                             "book_apply": trigger.phases.book_apply_ns / 1_000,
@@ -3533,7 +3540,7 @@ impl ClobPerfRing {
                             "event_construction": trigger.phases.event_construction_ns / 1_000,
                         },
                         "structure": structure,
-                        "same_frame_resident_tape_replay": {
+                        "same_frame_parse_only_replay": {
                             "n": replay.n,
                             "p50_us": replay.p50_ns / 1_000,
                             "p99_us": replay.p99_ns / 1_000,
@@ -3556,14 +3563,15 @@ impl ClobPerfRing {
                         warn!("[clob_perf_frame] action=write_summary_failed output={} error={}", summary_output, error);
                     }
                     warn!(
-                        "[clob_perf_ring] action=frozen tid={} frequency_hz={} output={} frame_output={} summary_output={} status={:?} triggering_tail_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} replay_n={} replay_p50_us={} replay_p99_us={} replay_p999_us={} replay_max_us={} replay_cpu_p50_us={} replay_cpu_p99_us={} replay_cpu_p999_us={} replay_cpu_max_us={} replay_errors={}",
+                        "[clob_perf_ring] action=frozen trigger_stage=price_change_apply tid={} frequency_hz={} output={} frame_output={} summary_output={} status={:?} triggering_stage_us={} total_handler_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} parse_only_replay_n={} parse_only_replay_p50_us={} parse_only_replay_p99_us={} parse_only_replay_p999_us={} parse_only_replay_max_us={} parse_only_replay_cpu_p50_us={} parse_only_replay_cpu_p99_us={} parse_only_replay_cpu_p999_us={} parse_only_replay_cpu_max_us={} parse_only_replay_errors={}",
                         tid,
                         frequency,
                         output,
                         frame_output,
                         summary_output,
                         status,
-                        trigger.elapsed.as_micros(),
+                        trigger.price_change_apply_elapsed.as_micros(),
+                        trigger.total_handler_elapsed.as_micros(),
                         trigger.frame.len(),
                         trigger.phases.json_decode_ns / 1_000,
                         trigger.phases.book_apply_ns / 1_000,
@@ -3608,13 +3616,14 @@ impl ClobPerfRing {
 #[cfg(target_os = "linux")]
 fn maybe_trigger_clob_perf(
     ring: Option<&ClobPerfRing>,
-    elapsed: Duration,
+    total_handler_elapsed: Duration,
     frame: Vec<u8>,
     phases: ClobFramePhaseTimings,
 ) {
     static LAST_TRIGGER_NS: AtomicU64 = AtomicU64::new(0);
     const COOLDOWN_NS: u64 = 300_000_000_000;
-    if elapsed < CLOB_RARE_HANDLER_TAIL {
+    let price_change_apply_elapsed = Duration::from_nanos(phases.price_change_apply_ns);
+    if price_change_apply_elapsed < CLOB_RARE_PRICE_CHANGE_APPLY_TAIL {
         return;
     }
     let Some(ring) = ring else {
@@ -3634,7 +3643,8 @@ fn maybe_trigger_clob_perf(
         }
     }
     ring.trigger(ClobPerfTrigger {
-        elapsed,
+        price_change_apply_elapsed,
+        total_handler_elapsed,
         frame,
         phases,
     });
@@ -3693,7 +3703,7 @@ impl ClobPerfRing {
 #[cfg(not(target_os = "linux"))]
 fn maybe_trigger_clob_perf(
     _ring: Option<&ClobPerfRing>,
-    _elapsed: Duration,
+    _total_handler_elapsed: Duration,
     _frame: Vec<u8>,
     _phases: ClobFramePhaseTimings,
 ) {
@@ -4349,12 +4359,14 @@ fn request_clob_book_repair_after(
     });
 }
 
-fn can_inherit_seeded_clob_generation(
-    active_generation: u64,
+fn can_promote_seeded_clob_generation(
     standby_generation: u64,
+    expected_generation: u64,
     all_tokens_seeded: bool,
 ) -> bool {
-    active_generation != 0 && active_generation == standby_generation && all_tokens_seeded
+    standby_generation != 0
+        && standby_generation == expected_generation
+        && all_tokens_seeded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4507,9 +4519,9 @@ fn promote_clob_standby(
     }
     let expected_generation = clob_token_generation(&subscription.tokens);
     let all_tokens_seeded = books.has_all_seeded(&subscription.tokens);
-    if !can_inherit_seeded_clob_generation(
-        active.token_generation,
+    if !can_promote_seeded_clob_generation(
         promoted.token_generation,
+        expected_generation,
         all_tokens_seeded,
     ) {
         warn!(
@@ -4535,12 +4547,13 @@ fn promote_clob_standby(
     active.burst = ClobBurstMetrics::new(now);
     *health = WsHealth::new(now);
 
-    // Both sockets were subscribed to the same token generation, and the
-    // active owner already has complete L2 seeds. The standby has been drained
-    // continuously, so inherit that condition-scoped state and its in-flight
-    // repair generation. A later BBO mismatch still schedules its ordinary
-    // condition-scoped REST repair, but promotion itself never emits
-    // NOT_READY or performs an all-token cold reset.
+    // The promoted socket is subscribed to the current expected token
+    // generation, and the active owner already has complete L2 seeds for that
+    // generation. The retired physical active may still carry a preceding
+    // superset generation after a logical subset transition; it must not veto
+    // a current, continuously drained standby. A later BBO mismatch still
+    // schedules its ordinary condition-scoped REST repair, but promotion
+    // itself never emits NOT_READY or performs an all-token cold reset.
     let _ = (
         repair_tx,
         repair_rx,
@@ -5678,15 +5691,21 @@ async fn clob_ws_task(
                             // typed mapping + all items + crossbeam sends).
                             crate::latency::record("polymarket.ws.clob_parse", t_parse);
                             let read_handler_elapsed = received_at.elapsed();
-                            if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
+                            let price_change_apply_elapsed =
+                                Duration::from_nanos(frame_phases.price_change_apply_ns);
+                            if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL
+                                || price_change_apply_elapsed
+                                    >= CLOB_RARE_PRICE_CHANGE_APPLY_TAIL
+                            {
                                 let (cpu_ns, preempted_ns, resources, resource_span_frames) =
                                     thread_resource_sampler.tail_delta(
                                         resource_start,
                                         parse_apply_elapsed,
                                     );
-                                diagnostic_sampler.observe(received_at, ClobDiagnostic {
-                                    key: "clob_read_handler_tail",
-                                    detail: format!(
+                                if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
+                                    diagnostic_sampler.observe(received_at, ClobDiagnostic {
+                                        key: "clob_read_handler_tail",
+                                        detail: format!(
                                         "frame_bytes={} total_us={} parse_apply_us={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} parse_cpu_us={} preempted_us={} non_parse_us={} voluntary_cs_delta={} involuntary_cs_delta={} minor_fault_delta={} major_fault_delta={} resource_span_frames={} runtime_scheduler_max_us={}",
                                         frame_len,
                                         read_handler_elapsed.as_micros(),
@@ -5706,11 +5725,32 @@ async fn clob_ws_task(
                                         resources.major_faults,
                                         resource_span_frames,
                                         runtime_scheduler_max_us.load(Ordering::Relaxed),
-                                    ),
-                                });
+                                        ),
+                                    });
+                                }
+                                if price_change_apply_elapsed
+                                    >= CLOB_RARE_PRICE_CHANGE_APPLY_TAIL
+                                {
+                                    diagnostic_sampler.observe(received_at, ClobDiagnostic {
+                                        key: "clob_price_change_apply_tail",
+                                        detail: format!(
+                                            "frame_bytes={} price_change_apply_us={} total_us={} parse_apply_us={} simd_json_us={} book_apply_us={} event_construction_us={} parse_cpu_us={} preempted_us={} resource_span_frames={}",
+                                            frame_len,
+                                            price_change_apply_elapsed.as_micros(),
+                                            read_handler_elapsed.as_micros(),
+                                            parse_apply_elapsed.as_micros(),
+                                            frame_phases.json_decode_ns / 1_000,
+                                            frame_phases.book_apply_ns / 1_000,
+                                            frame_phases.event_construction_ns / 1_000,
+                                            cpu_ns / 1_000,
+                                            preempted_ns / 1_000,
+                                            resource_span_frames,
+                                        ),
+                                    });
+                                }
                                 maybe_trigger_clob_perf(
                                     clob_perf_ring.as_ref(),
-                                    parse_apply_elapsed,
+                                    read_handler_elapsed,
                                     frame_bytes,
                                     frame_phases,
                                 );
@@ -9656,18 +9696,23 @@ mod pick_current_event_tests {
     }
 
     #[test]
-    fn failover_inherits_only_the_same_fully_seeded_token_generation() {
+    fn failover_promotes_the_expected_fully_seeded_token_generation() {
         let tokens = vec!["up".to_string(), "down".to_string()];
         let generation = clob_token_generation(&tokens);
-        assert!(can_inherit_seeded_clob_generation(
+        let obsolete_physical_active_generation = generation.wrapping_add(1);
+        assert_ne!(obsolete_physical_active_generation, generation);
+        // A preceding physical active generation is deliberately irrelevant:
+        // the candidate matches the logical wire subscription and every
+        // requested token already has an authoritative seed.
+        assert!(can_promote_seeded_clob_generation(
             generation, generation, true,
         ));
-        assert!(!can_inherit_seeded_clob_generation(
+        assert!(!can_promote_seeded_clob_generation(
             generation,
             generation.wrapping_add(1),
             true,
         ));
-        assert!(!can_inherit_seeded_clob_generation(
+        assert!(!can_promote_seeded_clob_generation(
             generation, generation, false,
         ));
     }
