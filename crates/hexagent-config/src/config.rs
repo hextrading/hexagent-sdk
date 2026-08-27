@@ -79,10 +79,18 @@ pub struct OsTuneConfig {
     /// fall back to `strategy_core`. Example: `{ btc = 10, eth = 11 }`.
     #[serde(default)]
     pub strategy_cores: HashMap<String, usize>,
+    /// Shared-account id -> dedicated authenticated private-ingress routing
+    /// core. This owner performs the lossless WS dequeue and routes compact
+    /// lifecycle messages; it must not share a FIFO CPU with the account
+    /// lifecycle writer because a settlement-boundary microburst can otherwise
+    /// starve both lanes for the duration of the burst.
+    #[serde(default)]
+    pub private_route_cores: HashMap<String, usize>,
     /// Shared-account id -> dedicated private event application core.  These
-    /// workers parse authenticated order/trade updates and mutate only their
-    /// instance shards; keeping them off the housekeeping core prevents WAL,
-    /// settlement and recorder work from delaying private fills.
+    /// lifecycle owners apply authenticated order/trade updates to their
+    /// account-local state. Keeping them off the ingress and housekeeping
+    /// cores prevents routing bursts, WAL, settlement, and recorder work from
+    /// delaying private fills.
     #[serde(default)]
     pub private_apply_cores: HashMap<String, usize>,
     /// Shared-account id -> dedicated private cold-account core. The
@@ -155,6 +163,7 @@ impl Default for OsTuneConfig {
             async_ord_core: None,
             strategy_core: None,
             strategy_cores: HashMap::new(),
+            private_route_cores: HashMap::new(),
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution_core: None,
@@ -186,6 +195,7 @@ mod os_tune_config_tests {
              allow_strategy_router_on_execution_core = true\n\
              allow_private_apply_on_completion_core = true\n\
              async_clob_core = 11\n\
+             private_route_cores = { zhu02 = 10, zhu03 = 11 }\n\
              private_apply_cores = { zhu02 = 12, zhu03 = 13 }\n\
              private_cold_cores = { zhu02 = 14, zhu03 = 15 }\n\
              execution_core = 4\n\
@@ -200,6 +210,7 @@ mod os_tune_config_tests {
         assert!(cfg.allow_strategy_router_on_execution_core);
         assert!(cfg.allow_private_apply_on_completion_core);
         assert_eq!(cfg.async_clob_core, Some(11));
+        assert_eq!(cfg.private_route_cores.get("zhu02"), Some(&10));
         assert_eq!(cfg.private_apply_cores.get("zhu02"), Some(&12));
         assert_eq!(cfg.private_cold_cores.get("zhu02"), Some(&14));
         assert_eq!(cfg.background_cores, vec![4]);
