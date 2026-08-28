@@ -1096,12 +1096,11 @@ fn parse_order_event(
         error: None,
     };
     let log_started = crate::latency::Instant::now();
-    shared.log_order_lifecycle(
+    shared.log_authoritative_order_lifecycle(
         &update.client_order_id,
-        "private_order",
         update.exchange_order_id.as_deref(),
-        Some(update.status),
-        None,
+        update.status,
+        size_matched,
     );
     crate::latency::record("polymarket.user.account_order_log", log_started);
     Ok(vec![update])
@@ -2923,6 +2922,8 @@ fn parse_user_event_validated(
                     } else {
                         transition
                     };
+                    let fill_delta = transition.fill_delta().unwrap_or(0.0);
+                    let matched_size = transition.matched_size().unwrap_or(0.0);
                     let Some(ownership) = transition.ownership().cloned() else {
                         // Never broadcast an unowned private trade. The account
                         // ledger has already entered uncertain with the exact
@@ -3005,12 +3006,13 @@ fn parse_user_event_validated(
                         order_audit: None,
                         error: failure_reason.clone(),
                     };
-                    shared.log_order_lifecycle(
+                    shared.log_order_fill_lifecycle(
                         &update.client_order_id,
-                        "private_trade",
                         update.exchange_order_id.as_deref(),
-                        Some(update.status),
-                        update.trade_id.as_deref(),
+                        update.status,
+                        Some(trade_id),
+                        fill_delta,
+                        matched_size,
                     );
                     updates.push(update);
                 }
@@ -3063,6 +3065,8 @@ fn parse_user_event_validated(
                 } else {
                     transition
                 };
+                let fill_delta = transition.fill_delta().unwrap_or(0.0);
+                let matched_size = transition.matched_size().unwrap_or(0.0);
                 let Some(ownership) = transition.ownership().cloned() else {
                     shared.account_state.mark_unresolved_trade_match_time(
                         trade_id,
@@ -3138,12 +3142,13 @@ fn parse_user_event_validated(
                     order_audit: None,
                     error: failure_reason.clone(),
                 };
-                shared.log_order_lifecycle(
+                shared.log_order_fill_lifecycle(
                     &update.client_order_id,
-                    "private_trade",
                     update.exchange_order_id.as_deref(),
-                    Some(update.status),
-                    update.trade_id.as_deref(),
+                    update.status,
+                    Some(trade_id),
+                    fill_delta,
+                    matched_size,
                 );
                 updates.push(update);
             }

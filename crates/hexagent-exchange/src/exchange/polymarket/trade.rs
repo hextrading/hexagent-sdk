@@ -1844,6 +1844,8 @@ enum LifecycleTraceJob {
         exchange_order_id: Option<String>,
         status: Option<OrderStatus>,
         trade_id: Option<String>,
+        fill_delta: Option<f64>,
+        matched_size: Option<f64>,
         reason_code: &'static str,
         reason: String,
         stage_ns: u64,
@@ -4169,6 +4171,56 @@ impl SharedState {
             exchange_order_id,
             status,
             trade_id,
+            None,
+            None,
+            "",
+            "",
+        );
+    }
+
+    /// Record one private-trade lifecycle edge with the exact economic delta
+    /// returned by the account owner and the resulting order-level cumulative
+    /// match. Formatting and file I/O stay on the bounded audit worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn log_order_fill_lifecycle(
+        &self,
+        client_order_id: &str,
+        exchange_order_id: Option<&str>,
+        status: OrderStatus,
+        trade_id: Option<&str>,
+        fill_delta: f64,
+        matched_size: f64,
+    ) {
+        self.log_order_lifecycle_detail(
+            client_order_id,
+            "private_trade",
+            exchange_order_id,
+            Some(status),
+            trade_id,
+            Some(fill_delta),
+            Some(matched_size),
+            "",
+            "",
+        );
+    }
+
+    /// Record the authoritative cumulative match carried by an order push.
+    /// It does not itself book inventory, so `fill_delta` remains null.
+    pub(crate) fn log_authoritative_order_lifecycle(
+        &self,
+        client_order_id: &str,
+        exchange_order_id: Option<&str>,
+        status: OrderStatus,
+        matched_size: f64,
+    ) {
+        self.log_order_lifecycle_detail(
+            client_order_id,
+            "private_order",
+            exchange_order_id,
+            Some(status),
+            None,
+            None,
+            Some(matched_size),
             "",
             "",
         );
@@ -4352,6 +4404,8 @@ impl SharedState {
             exchange_order_id,
             Some(update.status),
             None,
+            None,
+            None,
             preflight_rejection_reason_code(reason),
             reason,
         );
@@ -4364,24 +4418,19 @@ impl SharedState {
         exchange_order_id: Option<&str>,
         status: Option<OrderStatus>,
         trade_id: Option<&str>,
+        fill_delta: Option<f64>,
+        matched_size: Option<f64>,
         reason_code: &'static str,
         reason: &str,
     ) {
-        // A private fill has no quote/HTTP segment to update. Avoid the trace
-        // map lock, trace clone and INFO formatting on every normal lifecycle
-        // edge; failures remain WARN and DEBUG retains the full audit line.
-        if stage == "private_trade"
-            && status != Some(OrderStatus::Failed)
-            && !log::log_enabled!(log::Level::Debug)
-        {
-            return;
-        }
         self.enqueue_lifecycle_trace(LifecycleTraceJob::Stage {
             client_order_id: client_order_id.to_string(),
             stage,
             exchange_order_id: exchange_order_id.map(str::to_string),
             status,
             trade_id: trade_id.map(str::to_string),
+            fill_delta,
+            matched_size,
             reason_code,
             reason: reason.to_string(),
             stage_ns: now_ns(),
@@ -4421,6 +4470,8 @@ impl SharedState {
                 exchange_order_id,
                 status,
                 trade_id,
+                fill_delta,
+                matched_size,
                 reason_code,
                 reason,
                 stage_ns,
@@ -4432,6 +4483,8 @@ impl SharedState {
                 exchange_order_id.as_deref(),
                 status,
                 trade_id.as_deref(),
+                fill_delta,
+                matched_size,
                 reason_code,
                 &reason,
                 stage_ns,
@@ -4449,6 +4502,8 @@ impl SharedState {
         exchange_order_id: Option<&str>,
         status: Option<OrderStatus>,
         trade_id: Option<&str>,
+        fill_delta: Option<f64>,
+        matched_size: Option<f64>,
         reason_code: &str,
         reason: &str,
         stage_ns: u64,
@@ -4592,6 +4647,8 @@ impl SharedState {
             "coid": client_order_id,
             "oid": exchange_order_id,
             "trade_id": trade_id,
+            "fill_delta": fill_delta,
+            "matched_size": matched_size,
             "status": status_name,
             "iid": iid,
             "event": event,
@@ -12706,6 +12763,62 @@ mod tests {
         shutdown.finish();
         assert_eq!(shared.join_background_workers(), 3);
         assert_eq!(shared.join_background_workers(), 0);
+    }
+
+    #[test]
+    fn lifecycle_audit_serializes_trade_fill_delta_and_cumulative_match() {
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        let shared = trade.shared_state();
+        let directory = std::env::temp_dir().join(format!(
+            "hexagent-order-audit-{}-{}",
+            std::process::id(),
+            now_ns(),
+        ));
+        let mut recorder = OrderAttemptRecorder {
+            directory: directory.clone(),
+            hour: -1,
+            writer: None,
+        };
+
+        shared.write_order_lifecycle_detail(
+            &mut HashMap::new(),
+            &mut recorder,
+            "owner-1",
+            "private_trade",
+            Some("order-1"),
+            Some(OrderStatus::PartiallyFilled),
+            Some("trade-1"),
+            Some(2.5),
+            Some(7.5),
+            "",
+            "",
+            now_ns(),
+        );
+        recorder
+            .writer
+            .as_mut()
+            .expect("audit writer opened")
+            .flush()
+            .unwrap();
+        let hour = recorder.hour;
+        drop(recorder);
+
+        let record: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(directory.join(format!("order-audit-{hour}.jsonl")))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(record["trade_id"], "trade-1");
+        assert_eq!(record["fill_delta"], 2.5);
+        assert_eq!(record["matched_size"], 7.5);
+
+        std::fs::remove_file(directory.join(format!("order-audit-{hour}.jsonl"))).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        shutdown.request();
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 3);
     }
 
     #[test]
