@@ -1,10 +1,11 @@
-//! Unified wall-clock event scheduler for sim_v2.
+//! Single-lane event scheduler for sim_v2.
 //!
 //! A min-heap keyed by `(when, seq)`. `when` is wall-clock ns; `seq` is a
 //! monotonic insertion counter giving a deterministic FIFO tiebreak at equal
 //! `when` (so a v2 run is byte-reproducible given the same RNG seed). The
-//! event payload rides inside the heap item; `Ord` compares only `(when, seq)`
-//! so `SimEvent` itself need not be `Ord`.
+//! The simulator owns one instance for the server lane and one for the
+//! strategy-delivery lane. Event payload rides inside the heap item; `Ord`
+//! compares only `(when, seq)` so `SimEvent` itself need not be `Ord`.
 
 use std::collections::BinaryHeap;
 

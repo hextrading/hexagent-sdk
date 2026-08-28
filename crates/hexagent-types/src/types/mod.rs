@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Global simulated clock for backtest mode (0 = not set / live mode).
+/// Strategy-local simulated clock for backtest mode (0 = not set / live mode).
+/// Server-lane replay must never write this clock.
 static SIM_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Set the simulated clock (call with `local_timestamp_ns` from market events in backtest).
+/// Set the strategy-local simulated clock. Backtest engines call this only at
+/// strategy callbacks or private order/trade delivery boundaries.
 #[inline]
 pub fn set_sim_clock(ns: u64) {
     SIM_CLOCK_NS.store(ns, Ordering::Relaxed);
@@ -62,9 +64,9 @@ pub fn monotonic_now_ns() -> u64 {
 /// **Live / Paper**: sim_clock_ns() returns None → always wall-clock →
 /// behaviour unchanged from a direct `now_ns()` call.
 ///
-/// **Backtest**: sim_clock_ns() returns the parquet-replay timestamp →
-/// all readers see the same value within an event tick → BT becomes
-/// fully reproducible across runs (assuming all RNGs are seeded too).
+/// **Backtest**: sim_clock_ns() returns the monotonic strategy-local replay or
+/// private-delivery timestamp. Exchange/server-lane progress is intentionally
+/// invisible to strategy code.
 #[inline]
 pub fn sim_or_wall_ns() -> u64 {
     sim_clock_ns().unwrap_or_else(now_ns)

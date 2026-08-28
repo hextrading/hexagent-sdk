@@ -59,6 +59,15 @@ fn reconstruct_trade_srv(
     (floored, anchored)
 }
 
+/// Keep one replay stream's server lane monotonic without borrowing the
+/// strategy/local clock. Venue timestamps occasionally move backwards by a
+/// few milliseconds in an otherwise ordered websocket stream; replay must
+/// preserve native stream order instead of rewinding the matching engine.
+#[inline]
+fn monotonic_server_time(last_ns: u64, raw_ns: u64) -> (u64, u64) {
+    (last_ns.max(raw_ns), last_ns.saturating_sub(raw_ns))
+}
+
 pub struct ServerFeed {
     replayers: Vec<MarketReplayer>,
     /// One reconstructed lookahead per replayer.
@@ -70,6 +79,11 @@ pub struct ServerFeed {
     token_order: VecDeque<String>,
     anchored_trades: u64,
     fallback_trades: u64,
+    /// Last effective server-lane timestamp per native replay stream. This is
+    /// deliberately independent of every recorded local/strategy timestamp.
+    last_replayer_srv: Vec<u64>,
+    server_time_regressions: u64,
+    max_server_time_regression_ns: u64,
 }
 
 impl ServerFeed {
@@ -91,6 +105,7 @@ impl ServerFeed {
                 replayers.push(r);
             }
         }
+        let replayer_count = replayers.len();
         let mut feed = Self {
             peeked: vec![None; replayers.len()],
             replayers,
@@ -99,6 +114,9 @@ impl ServerFeed {
             token_order: VecDeque::new(),
             anchored_trades: 0,
             fallback_trades: 0,
+            last_replayer_srv: vec![0; replayer_count],
+            server_time_regressions: 0,
+            max_server_time_regression_ns: 0,
         };
         for i in 0..feed.replayers.len() {
             feed.refill(i);
@@ -133,7 +151,15 @@ impl ServerFeed {
                 return;
             };
             match event {
-                MarketEvent::OrderBook(ob) => {
+                MarketEvent::OrderBook(mut ob) => {
+                    let raw_srv = ob.exchange_timestamp_ns;
+                    let (effective_srv, regression_ns) =
+                        monotonic_server_time(self.last_replayer_srv[i], raw_srv);
+                    self.observe_server_time(i, effective_srv, regression_ns);
+                    // This is the server-lane copy only. The independent
+                    // strategy replayer retains the recorded raw exchange and
+                    // local timestamps.
+                    ob.exchange_timestamp_ns = effective_srv;
                     let token = ob.symbol.clone();
                     self.track_token(&token);
                     self.anchors
@@ -145,7 +171,7 @@ impl ServerFeed {
                         .unwrap_or(0)
                         .max(ob.exchange_timestamp_ns);
                     self.last_srv.insert(token, floor);
-                    self.peeked[i] = Some((ob.exchange_timestamp_ns, SimEvent::ServerBook(ob)));
+                    self.peeked[i] = Some((effective_srv, SimEvent::ServerBook(ob)));
                     return;
                 }
                 MarketEvent::Trade(mut t) => {
@@ -162,23 +188,44 @@ impl ServerFeed {
                     } else {
                         self.fallback_trades += 1;
                     }
-                    self.last_srv.insert(token, t_srv);
-                    t.exchange_timestamp_ns = t_srv;
-                    self.peeked[i] = Some((t_srv, SimEvent::ServerTrade(t)));
+                    let (effective_srv, regression_ns) =
+                        monotonic_server_time(self.last_replayer_srv[i], t_srv);
+                    self.observe_server_time(i, effective_srv, regression_ns);
+                    self.last_srv.insert(token, effective_srv);
+                    t.exchange_timestamp_ns = effective_srv;
+                    self.peeked[i] = Some((effective_srv, SimEvent::ServerTrade(t)));
                     return;
                 }
                 MarketEvent::Instrument(inst) => {
-                    self.peeked[i] = Some((local_ts, SimEvent::ServerInstrument(inst)));
+                    let (effective_srv, regression_ns) =
+                        monotonic_server_time(self.last_replayer_srv[i], local_ts);
+                    self.observe_server_time(i, effective_srv, regression_ns);
+                    self.peeked[i] = Some((effective_srv, SimEvent::ServerInstrument(inst)));
                     return;
                 }
                 MarketEvent::TickSizeChange(tsc) => {
-                    self.peeked[i] = Some((tsc.local_timestamp_ns, SimEvent::ServerTickSize(tsc)));
+                    let (effective_srv, regression_ns) = monotonic_server_time(
+                        self.last_replayer_srv[i],
+                        tsc.local_timestamp_ns,
+                    );
+                    self.observe_server_time(i, effective_srv, regression_ns);
+                    self.peeked[i] = Some((effective_srv, SimEvent::ServerTickSize(tsc)));
                     return;
                 }
                 // Quote / SpotPrice / Connected / Disconnected / EventStart /
                 // Bar / Exit — not consumed by the matching core; skip.
                 _ => continue,
             }
+        }
+    }
+
+    #[inline]
+    fn observe_server_time(&mut self, i: usize, effective_ns: u64, regression_ns: u64) {
+        self.last_replayer_srv[i] = effective_ns;
+        if regression_ns > 0 {
+            self.server_time_regressions = self.server_time_regressions.saturating_add(1);
+            self.max_server_time_regression_ns =
+                self.max_server_time_regression_ns.max(regression_ns);
         }
     }
 
@@ -211,6 +258,15 @@ impl ServerFeed {
     /// (anchored, fallback) trade counts — fallback flags anchor staleness.
     pub fn trade_anchor_stats(&self) -> (u64, u64) {
         (self.anchored_trades, self.fallback_trades)
+    }
+
+    /// `(regression_count, max_regression_ns)` for raw venue timestamps that
+    /// were clamped on the independent monotonic server lane.
+    pub fn server_time_regression_stats(&self) -> (u64, u64) {
+        (
+            self.server_time_regressions,
+            self.max_server_time_regression_ns,
+        )
     }
 
     /// One-step lookahead for the sim_v2 "race" model: the next book snapshot
@@ -332,5 +388,20 @@ mod tests {
         let (tb, b_anchored) = reconstruct_trade_srv(None, None, 1100, 1100);
         assert_eq!(tb, 1100);
         assert!(!b_anchored);
+    }
+
+    #[test]
+    fn server_lane_clamps_regression_without_using_local_time() {
+        let (first, first_regression) = monotonic_server_time(0, 1_000);
+        assert_eq!((first, first_regression), (1_000, 0));
+
+        // A later locally-received frame may carry an older venue timestamp.
+        // Server processing preserves native order at its prior logical time;
+        // no local timestamp participates in this decision.
+        let (second, second_regression) = monotonic_server_time(first, 975);
+        assert_eq!((second, second_regression), (1_000, 25));
+
+        let (third, third_regression) = monotonic_server_time(second, 1_025);
+        assert_eq!((third, third_regression), (1_025, 0));
     }
 }

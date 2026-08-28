@@ -78,6 +78,51 @@ const POLY_REPLACEMENT_READY_TIMEOUT: std::time::Duration = std::time::Duration:
 const POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS: u32 = 3;
 const MEMORY_TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Independent logical clocks for the sim_v2 replay coordinator. Both use
+/// Unix-epoch nanoseconds so causal messages can carry explicit arrival times,
+/// but neither lane is advanced from the other's market-data stream.
+#[derive(Debug, Default, Clone, Copy)]
+struct SimV2ReplayClocks {
+    server_ns: u64,
+    strategy_ns: u64,
+}
+
+impl SimV2ReplayClocks {
+    #[inline]
+    fn advance_server(&mut self, timestamp_ns: u64) -> u64 {
+        self.server_ns = self.server_ns.max(timestamp_ns);
+        self.server_ns
+    }
+
+    #[inline]
+    fn advance_strategy(&mut self, timestamp_ns: u64) -> u64 {
+        self.strategy_ns = self.strategy_ns.max(timestamp_ns);
+        self.strategy_ns
+    }
+}
+
+#[cfg(test)]
+mod sim_v2_replay_clock_tests {
+    use super::SimV2ReplayClocks;
+
+    #[test]
+    fn server_and_strategy_clocks_are_independent_and_monotonic() {
+        let mut clocks = SimV2ReplayClocks::default();
+        assert_eq!(clocks.advance_strategy(1_000), 1_000);
+        assert_eq!(clocks.advance_server(900), 900);
+        assert_eq!(clocks.strategy_ns, 1_000);
+
+        // A venue timestamp regression cannot rewind either lane.
+        assert_eq!(clocks.advance_server(875), 900);
+        assert_eq!(clocks.strategy_ns, 1_000);
+
+        // Local replay progresses independently and cannot move server time.
+        assert_eq!(clocks.advance_strategy(1_100), 1_100);
+        assert_eq!(clocks.server_ns, 900);
+        assert_eq!(clocks.advance_strategy(1_050), 1_100);
+    }
+}
+
 #[derive(Debug)]
 enum ExecutionDiagnostic {
     VenueFailure {
@@ -4241,15 +4286,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Backtest driver — the sim_v2 first-principles DES (feed + clock +
-    /// unified-wall-clock scheduler + bidirectional RTT latency + matching).
+    /// Backtest driver — the sim_v2 first-principles DES (independent server
+    /// and strategy clocks + bidirectional RTT latency + matching).
     ///
     /// Hybrid architecture (see `docs/sim_v2_design.md`): the engine keeps the
     /// strat-lane setup + dispatch (so bars/RTDS/chainlink/multi-instance behave
     /// as in live), while the server-axis DES + order lifecycle + RTT latency
-    /// live inside `sim_v2::Simulator`. The driver loop merges the strat lane
-    /// (local_ts) against `sim.peek_when()` (unified wall clock: server market
-    /// events + my-order arrivals + ack deliveries).
+    /// live inside `sim_v2::Simulator`. The coordinator compares epoch arrival
+    /// timestamps only to choose the next causal message; server market events,
+    /// strategy-local replay, and private deliveries advance their own clocks.
     fn run_backtest(&self) -> Result<()> {
         use crate::exchange::sim_v2::{SimV2Config, Simulator};
         use std::collections::BinaryHeap;
@@ -5370,8 +5415,7 @@ impl Engine {
             }
         }
 
-        let mut strat_clock_ns: u64 = 0;
-        let mut sim_clock_ns: u64 = 0;
+        let mut replay_clocks = SimV2ReplayClocks::default();
 
         loop {
             let strat_ts = strat_heap.peek().map(|e| e.ts).unwrap_or(u64::MAX);
@@ -5380,26 +5424,31 @@ impl Engine {
                 .map(|(_, r)| r.close_time_ns)
                 .unwrap_or(u64::MAX);
             let strat_min = strat_ts.min(bar_ts);
-            let sim_ts = sim.peek_when().unwrap_or(u64::MAX);
+            let server_ts = sim.peek_server_when().unwrap_or(u64::MAX);
+            let strategy_delivery_ts = sim.peek_strategy_when().unwrap_or(u64::MAX);
+            let sim_ts = server_ts.min(strategy_delivery_ts);
             let min_ts = strat_min.min(sim_ts);
             if min_ts == u64::MAX {
                 break;
             }
 
             if min_ts == sim_ts {
-                // Server market event OR my-order lifecycle event (unified wall
-                // clock). Acks/fills due now come back as `updates`.
-                sim_clock_ns = sim_ts;
-                set_sim_clock(sim_clock_ns);
+                // Pure server work advances only the server lane. Acks/fills
+                // cross back as explicit inbound messages below.
+                if server_ts <= strategy_delivery_ts {
+                    replay_clocks.advance_server(server_ts);
+                }
                 let updates = sim.step();
-                for update in updates {
-                    strat_clock_ns = strat_clock_ns.max(update.timestamp_ns);
-                    set_sim_clock(update.timestamp_ns);
+                for mut update in updates {
+                    let strategy_now = replay_clocks.advance_strategy(update.timestamp_ns);
+                    update.timestamp_ns = strategy_now;
+                    sim.observe_strategy_clock(strategy_now);
+                    set_sim_clock(strategy_now);
                     for strategy in strategies.iter_mut() {
                         match strategy.on_order_update(&update) {
                             Ok(signals) => {
                                 for sig in signals {
-                                    sim.submit(&sig, update.timestamp_ns);
+                                    sim.submit(&sig, strategy_now);
                                 }
                             }
                             Err(overflow) => {
@@ -5408,7 +5457,7 @@ impl Engine {
                                     strategy.instance_id(),
                                     "fixed lifecycle signal batch overflow",
                                 );
-                                sim.submit(&emergency, update.timestamp_ns);
+                                sim.submit(&emergency, strategy_now);
                             }
                         }
                     }
@@ -5437,12 +5486,13 @@ impl Engine {
                     }
                     pair
                 };
-                strat_clock_ns = ts;
-                set_sim_clock(strat_clock_ns);
+                let strategy_now = replay_clocks.advance_strategy(ts);
+                sim.observe_strategy_clock(strategy_now);
+                set_sim_clock(strategy_now);
 
                 if let MarketEvent::OrderBook(ob) = &event {
-                    sim.observe_local_orderbook(ob, ts);
-                    sim.observe_dynamic_markout_spot_book(ob, ts);
+                    sim.observe_local_orderbook(ob, strategy_now);
+                    sim.observe_dynamic_markout_spot_book(ob, strategy_now);
                 }
 
                 for (i, strategy) in strategies.iter_mut().enumerate() {
@@ -5472,7 +5522,7 @@ impl Engine {
                         }
                         MarketEvent::Instrument(inst) => {
                             // Hist gap-fill BEFORE on_instrument (matches v1).
-                            let hist_reqs = strategy.load_hist_data(ts);
+                            let hist_reqs = strategy.load_hist_data(strategy_now);
                             for req in &hist_reqs {
                                 // Streamed (2026-07-26): identical bar sequence to
                                 // the former collect-then-feed, but a 29d 1s
@@ -5490,7 +5540,7 @@ impl Engine {
                                 }
                             }
                             if !hist_reqs.is_empty() {
-                                strategy.on_hist_data_loaded(ts);
+                                strategy.on_hist_data_loaded(strategy_now);
                             }
                             // Per-event prev_p RTT-gate override (sim_rtt_mode=exact):
                             // forward live's prev_event place-p60 (× overhead factor)
@@ -5544,13 +5594,13 @@ impl Engine {
                                 let frac = strategy.quote_interval_tolerance_frac().clamp(0.0, 1.0);
                                 let threshold_ns =
                                     ((interval as f64) * 1_000_000.0 * (1.0 - frac)) as u64;
-                                ts.saturating_sub(last_quote_ns[i]) >= threshold_ns
+                                strategy_now.saturating_sub(last_quote_ns[i]) >= threshold_ns
                             };
                             if fire {
-                                last_quote_ns[i] = ts;
+                                last_quote_ns[i] = strategy_now;
                                 quote_signal_batch.clear();
-                                if let Err(overflow) =
-                                    strategy.on_quote_into(ts, &mut quote_signal_batch)
+                                if let Err(overflow) = strategy
+                                    .on_quote_into(strategy_now, &mut quote_signal_batch)
                                 {
                                     quote_signal_batch.clear();
                                     let emergency = emergency_cancel_for_signal(
@@ -5558,24 +5608,24 @@ impl Engine {
                                         strategy.instance_id(),
                                         "fixed callback signal batch overflow",
                                     );
-                                    sim.submit(&emergency, strat_clock_ns);
+                                    sim.submit(&emergency, strategy_now);
                                     continue;
                                 }
                                 stamp_quote_trigger(&mut quote_signal_batch, ob, false);
                                 for sig in quote_signal_batch.drain(..) {
-                                    sim.submit(&sig, strat_clock_ns);
+                                    sim.submit(&sig, strategy_now);
                                 }
                             }
                         }
                     }
                     for sig in signals {
-                        sim.submit(&sig, strat_clock_ns);
+                        sim.submit(&sig, strategy_now);
                     }
                 }
             }
 
             // Synthetic RTT-probe emit (PROBE recovery), carried over from the removed v1 sim engine.
-            let now_for_probe = sim_clock_ns.max(strat_clock_ns);
+            let now_for_probe = replay_clocks.strategy_ns;
             if bt_probe_enable.load(std::sync::atomic::Ordering::Relaxed)
                 && now_for_probe >= last_bt_probe_emit_sim_ns.saturating_add(bt_probe_interval_ns)
             {
@@ -5595,6 +5645,15 @@ impl Engine {
             "  Sim v2:   trade-ts reconstruction: {} anchored, {} fallback (no prior book)",
             anchored, fallback
         );
+        let (server_ts_regressions, max_server_ts_regression_ns) =
+            sim.server_time_regression_stats();
+        if server_ts_regressions > 0 {
+            warn!(
+                "  Sim v2:   server timestamp regressions normalized: count={} max_ms={:.3}",
+                server_ts_regressions,
+                max_server_ts_regression_ns as f64 / 1_000_000.0,
+            );
+        }
         let (taker_fills, maker_fills, rejects) = sim.core_stats();
         info!(
             "  Sim v2:   taker_fills={}  maker_fills={}  rejects={}",
@@ -5983,7 +6042,7 @@ impl Engine {
         info!("══════════════════════════════════════");
         info!("  BACKTEST complete (sim_v2)");
         info!("══════════════════════════════════════");
-        let _ = (start_ns, end_ns, sim_clock_ns, strat_clock_ns);
+        let _ = (start_ns, end_ns, replay_clocks);
         Ok(())
     }
 
