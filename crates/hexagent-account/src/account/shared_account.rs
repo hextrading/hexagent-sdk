@@ -1648,23 +1648,59 @@ fn validate_owned_trade_replay(
 /// fill, but admission remains risk-off until the scheduled generation lands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TradeTransitionResult {
-    Applied(TradeOwnership),
-    AppliedButPersistencePending(TradeOwnership),
+    Applied(TradeTransitionAccounting),
+    AppliedButPersistencePending(TradeTransitionAccounting),
     /// The trade is durably owned and its economic/lifecycle edge was already
     /// applied. Callers must treat this as a valid business event without
     /// broadcasting another fill downstream.
-    OwnedNoop(TradeOwnership),
-    OwnedNoopButPersistencePending(TradeOwnership),
+    OwnedNoop(TradeTransitionAccounting),
+    OwnedNoopButPersistencePending(TradeTransitionAccounting),
     Rejected,
+}
+
+/// Economic effect of one accepted private-trade lifecycle edge.
+///
+/// `fill_delta` is positive when this edge first books a fill, zero for later
+/// MINED/CONFIRMED finality advances of the same trade id, and negative when a
+/// FAILED edge reverses a previously booked fill. `matched_size` is the
+/// order's cumulative booked quantity after applying the edge. Keeping these
+/// values on the account-owner result lets asynchronous audit consumers record
+/// exact economics without taking another account lock or reconstructing state
+/// from eventually-consistent order lifecycle messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeTransitionAccounting {
+    pub ownership: TradeOwnership,
+    pub fill_delta: f64,
+    pub matched_size: f64,
 }
 
 impl TradeTransitionResult {
     pub fn ownership(&self) -> Option<&TradeOwnership> {
         match self {
-            Self::Applied(ownership)
-            | Self::AppliedButPersistencePending(ownership)
-            | Self::OwnedNoop(ownership)
-            | Self::OwnedNoopButPersistencePending(ownership) => Some(ownership),
+            Self::Applied(accounting)
+            | Self::AppliedButPersistencePending(accounting)
+            | Self::OwnedNoop(accounting)
+            | Self::OwnedNoopButPersistencePending(accounting) => Some(&accounting.ownership),
+            Self::Rejected => None,
+        }
+    }
+
+    pub fn fill_delta(&self) -> Option<f64> {
+        match self {
+            Self::Applied(accounting)
+            | Self::AppliedButPersistencePending(accounting)
+            | Self::OwnedNoop(accounting)
+            | Self::OwnedNoopButPersistencePending(accounting) => Some(accounting.fill_delta),
+            Self::Rejected => None,
+        }
+    }
+
+    pub fn matched_size(&self) -> Option<f64> {
+        match self {
+            Self::Applied(accounting)
+            | Self::AppliedButPersistencePending(accounting)
+            | Self::OwnedNoop(accounting)
+            | Self::OwnedNoopButPersistencePending(accounting) => Some(accounting.matched_size),
             Self::Rejected => None,
         }
     }
@@ -1685,8 +1721,8 @@ impl TradeTransitionResult {
 }
 
 enum VirtualTradeAttempt {
-    Applied(TradeOwnership),
-    OwnedNoop(TradeOwnership),
+    Applied(TradeTransitionAccounting),
+    OwnedNoop(TradeTransitionAccounting),
     /// Unknown/conflicting ownership and retired-history recovery remain cold
     /// control-plane operations so they can install durable anomalies.
     Fallback,
@@ -14771,6 +14807,7 @@ impl SharedAccount {
             &mut persistence_required,
             &mut owned_noop,
         )
+        .map(|accounting| accounting.ownership)
     }
 
     pub fn apply_trade_transition_with_context(
@@ -14820,16 +14857,16 @@ impl SharedAccount {
             &mut persistence_required,
             &mut owned_noop,
         );
-        let Some(ownership) = applied else {
+        let Some(accounting) = applied else {
             return TradeTransitionResult::Rejected;
         };
         if persistence_required {
             self.track_trade_persistence_generation();
         }
         if owned_noop {
-            TradeTransitionResult::OwnedNoop(ownership)
+            TradeTransitionResult::OwnedNoop(accounting)
         } else {
-            TradeTransitionResult::Applied(ownership)
+            TradeTransitionResult::Applied(accounting)
         }
     }
 
@@ -14994,7 +15031,11 @@ impl SharedAccount {
         self.schedule_persist(&state);
         drop(state);
         self.track_trade_persistence_generation();
-        TradeTransitionResult::OwnedNoop(ownership)
+        TradeTransitionResult::OwnedNoop(TradeTransitionAccounting {
+            ownership,
+            fill_delta: 0.0,
+            matched_size: 0.0,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15110,7 +15151,15 @@ impl SharedAccount {
                         token_id,
                     );
                 }
-                return VirtualTradeAttempt::OwnedNoop(applied.ownership.clone());
+                let matched_size = lifecycle
+                    .orders
+                    .get(&applied.ownership.client_order_id)
+                    .map_or(0.0, |order| order.filled_quantity);
+                return VirtualTradeAttempt::OwnedNoop(TradeTransitionAccounting {
+                    ownership: applied.ownership.clone(),
+                    fill_delta: 0.0,
+                    matched_size,
+                });
             }
         }
 
@@ -15257,7 +15306,11 @@ impl SharedAccount {
                 &resolved_coid,
                 token_id,
             );
-            return VirtualTradeAttempt::Applied(ownership);
+            return VirtualTradeAttempt::Applied(TradeTransitionAccounting {
+                ownership,
+                fill_delta: 0.0,
+                matched_size: order.filled_quantity,
+            });
         }
 
         if should_book || should_reverse {
@@ -15477,7 +15530,15 @@ impl SharedAccount {
             &resolved_coid,
             token_id,
         );
-        VirtualTradeAttempt::Applied(ownership)
+        let matched_size = lifecycle
+            .orders
+            .get(&resolved_coid)
+            .map_or(order.filled_quantity, |order| order.filled_quantity);
+        VirtualTradeAttempt::Applied(TradeTransitionAccounting {
+            ownership,
+            fill_delta: matched_size - order.filled_quantity,
+            matched_size,
+        })
     }
 
     fn apply_trade_transition_inner(
@@ -15493,7 +15554,7 @@ impl SharedAccount {
         trade_context: Option<(bool, u64)>,
         persistence_required: &mut bool,
         owned_noop: &mut bool,
-    ) -> Option<TradeOwnership> {
+    ) -> Option<TradeTransitionAccounting> {
         let mut normalized = status
             .trim_start_matches("TRADE_STATUS_")
             .to_ascii_uppercase();
@@ -15543,13 +15604,13 @@ impl SharedAccount {
                 trade_context,
                 instance_id,
             ) {
-                VirtualTradeAttempt::Applied(ownership) => {
+                VirtualTradeAttempt::Applied(accounting) => {
                     *persistence_required = true;
-                    return Some(ownership);
+                    return Some(accounting);
                 }
-                VirtualTradeAttempt::OwnedNoop(ownership) => {
+                VirtualTradeAttempt::OwnedNoop(accounting) => {
                     *owned_noop = true;
-                    return Some(ownership);
+                    return Some(accounting);
                 }
                 VirtualTradeAttempt::Fallback => {}
             }
@@ -15666,7 +15727,15 @@ impl SharedAccount {
                     *persistence_required = true;
                 }
                 *owned_noop = true;
-                return Some(applied.ownership.clone());
+                let matched_size = state
+                    .orders
+                    .get(&applied.ownership.client_order_id)
+                    .map_or(0.0, |order| order.filled_quantity);
+                return Some(TradeTransitionAccounting {
+                    ownership: applied.ownership.clone(),
+                    fill_delta: 0.0,
+                    matched_size,
+                });
             }
         }
 
@@ -15715,7 +15784,15 @@ impl SharedAccount {
                     *persistence_required = true;
                 }
                 *owned_noop = true;
-                return Some(tombstone.ownership);
+                let matched_size = state
+                    .orders
+                    .get(&tombstone.ownership.client_order_id)
+                    .map_or(0.0, |order| order.filled_quantity);
+                return Some(TradeTransitionAccounting {
+                    ownership: tombstone.ownership,
+                    fill_delta: 0.0,
+                    matched_size,
+                });
             }
             // A bounded tombstone can expire while its process-local route
             // entry remains. Once the cold durable map proves absence, remove
@@ -15862,7 +15939,15 @@ impl SharedAccount {
                 }
                 schedule_trade_persist(&state);
                 *persistence_required = true;
-                return Some(ownership);
+                let matched_size = state
+                    .orders
+                    .get(&ownership.client_order_id)
+                    .map_or(0.0, |order| order.filled_quantity);
+                return Some(TradeTransitionAccounting {
+                    ownership,
+                    fill_delta: 0.0,
+                    matched_size,
+                });
             }
         }
 
@@ -16080,7 +16165,15 @@ impl SharedAccount {
         recompute_reconciliation(&mut state, "trade lifecycle transition");
         schedule_trade_persist(&state);
         *persistence_required = true;
-        Some(ownership)
+        let matched_size = state
+            .orders
+            .get(&resolved_coid)
+            .map_or(order.filled_quantity, |order| order.filled_quantity);
+        Some(TradeTransitionAccounting {
+            ownership,
+            fill_delta: matched_size - order.filled_quantity,
+            matched_size,
+        })
     }
 
     /// Apply a private trade's fee from the durable token curve. Maker fills
@@ -22813,8 +22906,9 @@ mod tests {
             true,
             0,
         );
-        let first = first.ownership().unwrap();
-        assert_eq!(first.instance_id, "a");
+        assert_eq!(first.fill_delta(), Some(10.0));
+        assert_eq!(first.matched_size(), Some(10.0));
+        assert_eq!(first.ownership().unwrap().instance_id, "a");
         let cash = account.instance_snapshot("a").unwrap().cash;
         let matched = account.monitoring_snapshot();
         assert_eq!(
@@ -22827,7 +22921,7 @@ mod tests {
             "pending settlement is a known reconciliation delta"
         );
         assert!(matched.unallocated_cash.abs() < EPS);
-        account.apply_trade_transition_with_context(
+        let mined_transition = account.apply_trade_transition_with_context(
             "trade:oid-a",
             "MINED",
             "a-1",
@@ -22839,12 +22933,14 @@ mod tests {
             true,
             0,
         );
+        assert_eq!(mined_transition.fill_delta(), Some(0.0));
+        assert_eq!(mined_transition.matched_size(), Some(10.0));
         assert_eq!(account.instance_snapshot("a").unwrap().cash, cash);
         let mined = account.monitoring_snapshot();
         assert_eq!(mined.physical_cash, 400.0);
         assert_eq!(mined.physical_positions["UP"], 40.0);
         assert!(!mined.uncertain);
-        account.apply_trade_transition_with_context(
+        let failed_transition = account.apply_trade_transition_with_context(
             "trade:oid-a",
             "FAILED",
             "a-1",
@@ -22856,6 +22952,8 @@ mod tests {
             true,
             0,
         );
+        assert_eq!(failed_transition.fill_delta(), Some(-10.0));
+        assert_eq!(failed_transition.matched_size(), Some(0.0));
         assert_eq!(account.instance_snapshot("a").unwrap().cash, 100.0);
         let failed = account.monitoring_snapshot();
         assert_eq!(failed.physical_cash, 400.0);
@@ -22865,7 +22963,7 @@ mod tests {
             "FAILED is terminal and needs no wallet audit"
         );
         assert!(!account.is_uncertain());
-        account.apply_trade_transition_with_context(
+        let stale_transition = account.apply_trade_transition_with_context(
             "trade:oid-a",
             "MATCHED",
             "a-1",
@@ -22877,11 +22975,90 @@ mod tests {
             true,
             0,
         );
+        assert_eq!(stale_transition.fill_delta(), Some(0.0));
+        assert_eq!(stale_transition.matched_size(), Some(0.0));
         assert_eq!(
             account.instance_snapshot("a").unwrap().cash,
             100.0,
             "late MATCHED cannot resurrect a FAILED tombstone"
         );
+    }
+
+    #[test]
+    fn partial_trade_audit_economics_track_delta_and_cumulative_match() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-partial",
+                "oid-partial",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+
+        let first = account.apply_trade_transition_with_context(
+            "trade-partial-1",
+            "MATCHED",
+            "a-partial",
+            "oid-partial",
+            "UP",
+            Side::Buy,
+            3.0,
+            0.5,
+            true,
+            0,
+        );
+        assert_eq!(first.fill_delta(), Some(3.0));
+        assert_eq!(first.matched_size(), Some(3.0));
+
+        let second = account.apply_trade_transition_with_context(
+            "trade-partial-2",
+            "MATCHED",
+            "a-partial",
+            "oid-partial",
+            "UP",
+            Side::Buy,
+            2.0,
+            0.5,
+            true,
+            0,
+        );
+        assert_eq!(second.fill_delta(), Some(2.0));
+        assert_eq!(second.matched_size(), Some(5.0));
+
+        let replay = account.apply_trade_transition_with_context(
+            "trade-partial-1",
+            "MINED",
+            "a-partial",
+            "oid-partial",
+            "UP",
+            Side::Buy,
+            3.0,
+            0.5,
+            true,
+            0,
+        );
+        assert_eq!(replay.fill_delta(), Some(0.0));
+        assert_eq!(replay.matched_size(), Some(5.0));
+
+        let reversed = account.apply_trade_transition_with_context(
+            "trade-partial-1",
+            "FAILED",
+            "a-partial",
+            "oid-partial",
+            "UP",
+            Side::Buy,
+            3.0,
+            0.5,
+            true,
+            0,
+        );
+        assert_eq!(reversed.fill_delta(), Some(-3.0));
+        assert_eq!(reversed.matched_size(), Some(2.0));
     }
 
     #[test]
