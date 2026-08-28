@@ -435,6 +435,7 @@ enum AccountOwnerOperation {
     MarkOrderStatusEffective {
         client_order_id: String,
         status: OrderStatus,
+        allow_terminal_resurrection: bool,
         reply: crossbeam_channel::Sender<Option<OrderStatus>>,
     },
     MarkFilledPendingAudit {
@@ -728,9 +729,14 @@ impl AccountOwnerCommand {
             MarkOrderStatusEffective {
                 client_order_id,
                 status,
+                allow_terminal_resurrection,
                 reply,
             } => {
-                let _ = reply.send(account.mark_order_status_effective(&client_order_id, status));
+                let _ = reply.send(account.mark_order_status_effective_with_policy(
+                    &client_order_id,
+                    status,
+                    allow_terminal_resurrection,
+                ));
             }
             MarkFilledPendingAudit {
                 client_order_id,
@@ -13160,13 +13166,35 @@ impl SharedAccount {
         let _ = self.mark_order_status_effective(client_order_id, status);
     }
 
-    /// Apply a local lifecycle update and return the state that actually won.
-    /// Callers that emit an OrderUpdate can use this to avoid forwarding a
-    /// stale HTTP acknowledgement after a sticky terminal status.
+    /// Apply authoritative lifecycle evidence and return the state that won.
+    /// An explicit LIVE edge may resurrect a preceding cancellation because
+    /// exchange lifecycle messages are not ordered.
     pub fn mark_order_status_effective(
         &self,
         client_order_id: &str,
         status: OrderStatus,
+    ) -> Option<OrderStatus> {
+        self.mark_order_status_effective_with_policy(client_order_id, status, true)
+    }
+
+    /// Apply a weak HTTP placement acknowledgement without allowing it to
+    /// resurrect an order already finalized by stronger lifecycle evidence.
+    /// In particular, a late `Accepted` response must not restore collateral
+    /// after a concurrent cancel/reject/fill released the reservation.
+    pub fn mark_place_ack_status_effective(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+    ) -> Option<OrderStatus> {
+        debug_assert_eq!(status, OrderStatus::Accepted);
+        self.mark_order_status_effective_with_policy(client_order_id, status, false)
+    }
+
+    fn mark_order_status_effective_with_policy(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+        allow_terminal_resurrection: bool,
     ) -> Option<OrderStatus> {
         if self.must_dispatch_lifecycle_to_owner() {
             let client_order_id = client_order_id.to_string();
@@ -13176,6 +13204,7 @@ impl SharedAccount {
                     AccountOwnerCommand(AccountOwnerOperation::MarkOrderStatusEffective {
                         client_order_id,
                         status,
+                        allow_terminal_resurrection,
                         reply,
                     })
                 })
@@ -13200,12 +13229,23 @@ impl SharedAccount {
             .get(client_order_id)
             .map(|order| order.status)
         {
-            // REST placement acknowledgements can arrive after the private
-            // feed has already advanced the order. FAILED/FILLED are sticky;
-            // PartiallyFilled is also monotonic against the weaker Accepted
-            // state because an observed match cannot be undone by a late ACK.
-            if (matches!(current_status, OrderStatus::Failed | OrderStatus::Filled)
-                && status != current_status)
+            // HTTP placement acknowledgement is weaker than private lifecycle
+            // or an explicit exchange lookup. It may arrive after a successful
+            // cancel and must never reopen the order or restore reservation.
+            // PartiallyFilled is also monotonic because an observed match
+            // cannot be undone by a late Accepted ACK.
+            if (!allow_terminal_resurrection
+                && status == OrderStatus::Accepted
+                && matches!(
+                    current_status,
+                    OrderStatus::Cancelled
+                        | OrderStatus::Rejected
+                        | OrderStatus::Filled
+                        | OrderStatus::Failed
+                        | OrderStatus::PartiallyFilled
+                ))
+                || (matches!(current_status, OrderStatus::Failed | OrderStatus::Filled)
+                    && status != current_status)
                 || (current_status == OrderStatus::PartiallyFilled
                     && status == OrderStatus::Accepted)
                 || (matches!(
@@ -13228,7 +13268,8 @@ impl SharedAccount {
             // reservation from the durable order economics before exposing
             // Accepted to callers. Merely changing `status` would leave the
             // account with released collateral while the order is live.
-            if current_status == OrderStatus::Cancelled
+            if allow_terminal_resurrection
+                && current_status == OrderStatus::Cancelled
                 && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled)
             {
                 let (token_id, old_cash, old_qty, desired_cash, desired_qty) = {
@@ -22576,6 +22617,50 @@ mod tests {
         assert_eq!(
             account.order("a-partial").unwrap().status,
             OrderStatus::PartiallyFilled
+        );
+    }
+
+    #[test]
+    fn late_place_ack_cannot_resurrect_cancelled_sell_or_restore_reservation() {
+        let account = seeded_account();
+        account
+            .reserve_order(
+                "a",
+                "a-late-place-ack",
+                "oid-late-place-ack",
+                "UP",
+                Side::Sell,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            account.instance_snapshot("a").unwrap().reserved_positions["UP"],
+            10.0,
+        );
+
+        account.release_order("a-late-place-ack", OrderStatus::Cancelled);
+        assert_eq!(
+            account.instance_snapshot("a").unwrap().reserved_positions["UP"],
+            0.0,
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                account.mark_place_ack_status_effective(
+                    "a-late-place-ack",
+                    OrderStatus::Accepted,
+                ),
+                Some(OrderStatus::Cancelled),
+            );
+        }
+
+        let order = account.order("a-late-place-ack").unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.reserved_quantity, 0.0);
+        assert_eq!(
+            account.instance_snapshot("a").unwrap().reserved_positions["UP"],
+            0.0,
         );
     }
 

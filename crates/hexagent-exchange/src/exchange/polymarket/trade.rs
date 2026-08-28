@@ -1781,9 +1781,16 @@ struct FilledCleanupJob {
 struct DeferredLifecycleJob {
     client_order_id: String,
     status: OrderStatus,
+    evidence: LifecycleEvidence,
     enqueued_ns: u64,
     #[cfg(test)]
     completion: Option<crossbeam_channel::Sender<u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleEvidence {
+    Authoritative,
+    WeakPlaceAck,
 }
 
 #[derive(Debug)]
@@ -3825,11 +3832,15 @@ impl SharedState {
             now_ns().saturating_sub(job.enqueued_ns),
         );
         let apply_started = crate::latency::Instant::now();
-        let branch_stage = match job.status {
-            OrderStatus::Filled => "polymarket.account.lifecycle_apply.filled",
-            OrderStatus::Cancelled => "polymarket.account.lifecycle_apply.cancelled",
-            OrderStatus::Rejected => "polymarket.account.lifecycle_apply.rejected",
-            _ => "polymarket.account.lifecycle_apply.status_update",
+        let branch_stage = if job.evidence == LifecycleEvidence::WeakPlaceAck {
+            "polymarket.account.lifecycle_apply.place_ack"
+        } else {
+            match job.status {
+                OrderStatus::Filled => "polymarket.account.lifecycle_apply.filled",
+                OrderStatus::Cancelled => "polymarket.account.lifecycle_apply.cancelled",
+                OrderStatus::Rejected => "polymarket.account.lifecycle_apply.rejected",
+                _ => "polymarket.account.lifecycle_apply.status_update",
+            }
         };
         let ((), timing) = measure_deferred_lifecycle_stages(|| match job.status {
             OrderStatus::Filled => {
@@ -3847,8 +3858,22 @@ impl SharedState {
                 self.remove_order_resolved_as(&job.client_order_id, OrderStatus::Rejected);
             }
             status => {
-                self.account_state
-                    .mark_order_status_effective(&job.client_order_id, status);
+                if job.evidence == LifecycleEvidence::WeakPlaceAck {
+                    let effective = self
+                        .account_state
+                        .mark_place_ack_status_effective(&job.client_order_id, status);
+                    if effective.is_some_and(|effective| effective != status) {
+                        warn!(
+                            "[PolymarketTrade] ignored late place ACK coid={} ack={:?} stronger_status={:?}; reservation unchanged",
+                            job.client_order_id,
+                            status,
+                            effective,
+                        );
+                    }
+                } else {
+                    self.account_state
+                        .mark_order_status_effective(&job.client_order_id, status);
+                }
             }
         });
         let total_ns = apply_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -3892,9 +3917,31 @@ impl SharedState {
     }
 
     fn defer_lifecycle_account_apply(&self, client_order_id: &str, status: OrderStatus) {
+        self.defer_lifecycle_account_apply_with_evidence(
+            client_order_id,
+            status,
+            LifecycleEvidence::Authoritative,
+        );
+    }
+
+    fn defer_place_ack_account_apply(&self, client_order_id: &str) {
+        self.defer_lifecycle_account_apply_with_evidence(
+            client_order_id,
+            OrderStatus::Accepted,
+            LifecycleEvidence::WeakPlaceAck,
+        );
+    }
+
+    fn defer_lifecycle_account_apply_with_evidence(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+        evidence: LifecycleEvidence,
+    ) {
         let job = DeferredLifecycleJob {
             client_order_id: client_order_id.to_string(),
             status,
+            evidence,
             enqueued_ns: now_ns(),
             #[cfg(test)]
             completion: None,
@@ -3908,9 +3955,10 @@ impl SharedState {
             // reconnect/reconcile rather than blocking the completion lane.
             self.user_feed_health.set_inventory_uncertain(true);
             log::error!(
-                "[PolymarketTrade] deferred lifecycle queue unavailable coid={} status={:?}: {}; shared account forced uncertain",
+                "[PolymarketTrade] deferred lifecycle queue unavailable coid={} status={:?} evidence={:?}: {}; shared account forced uncertain",
                 client_order_id,
                 status,
+                evidence,
                 error,
             );
         }
@@ -4906,6 +4954,15 @@ impl SharedState {
         // monitoring ledger applies the same edge asynchronously on its sole
         // owner and may retain a stronger terminal state there.
         Some(status)
+    }
+
+    /// Record a successful HTTP placement response as weak evidence. The
+    /// order was already published to `open_orders` before dispatch, so the ACK
+    /// only advances the durable monitoring ledger when no stronger terminal
+    /// lifecycle edge has won in the meantime.
+    fn mark_place_ack(&self, client_order_id: &str) -> Option<OrderStatus> {
+        self.defer_place_ack_account_apply(client_order_id);
+        Some(OrderStatus::Accepted)
     }
 
     /// Apply the weak outcome of one cancel attempt without allowing a late
@@ -10443,23 +10500,11 @@ impl PolymarketTrade {
             // invalid-token strikes/backoff for it.
             self.shared.clear_invalid_token(&order.symbol);
             let account_apply_started = crate::latency::Instant::now();
-            let effective_ack_status = if legacy_trace {
-                self.shared.mark_order_live(
-                    &order.client_order_id,
-                    order.order_slot,
-                    &order.symbol,
-                    order.side,
-                    &self.instance_id,
-                    OrderStatus::Accepted,
-                )
-            } else {
-                // Runtime ownership/open-order publication happened before HTTP
-                // dispatch. StrategyAccount is the lifecycle authority; durable
-                // shared monitoring follows on its cold single-writer lane.
-                self.shared
-                    .defer_lifecycle_account_apply(&order.client_order_id, OrderStatus::Accepted);
-                Some(OrderStatus::Accepted)
-            };
+            // Runtime ownership/open-order publication happened before HTTP
+            // dispatch. StrategyAccount is the lifecycle authority; durable
+            // shared monitoring follows on its cold single-writer lane. A
+            // concurrent terminal edge must win over this weaker HTTP ACK.
+            let effective_ack_status = self.shared.mark_place_ack(&order.client_order_id);
             crate::latency::record(
                 "polymarket.order.response_account_apply",
                 account_apply_started,
@@ -10473,9 +10518,6 @@ impl PolymarketTrade {
                 self.shared
                     .register_order_id(&order.client_order_id, &order_id, &order.symbol);
             }
-
-            // `mark_order_live` idempotently restores `open_orders` and account
-            // collateral if an out-of-order cancellation arrived first.
 
             // Map HTTP `status` → local OrderStatus and book-keeping fields.
             //
@@ -11370,14 +11412,8 @@ impl ExchangeTrade for PolymarketTrade {
                         let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            effective_ack_status = self.shared.mark_order_live(
-                                &order.client_order_id,
-                                order.order_slot,
-                                &order.symbol,
-                                order.side,
-                                &self.instance_id,
-                                OrderStatus::Accepted,
-                            );
+                            effective_ack_status =
+                                self.shared.mark_place_ack(&order.client_order_id);
                             // Cross-check vs our pre-computed hash — if the
                             // server's orderID disagrees, our local hash
                             // algorithm has drifted; re-register under the
@@ -12492,14 +12528,8 @@ impl ExchangeTrade for PolymarketTrade {
                         let mut effective_ack_status = None;
                         if success {
                             accepted_coids.push(order.client_order_id.clone());
-                            effective_ack_status = self.shared.mark_order_live(
-                                &order.client_order_id,
-                                order.order_slot,
-                                &order.symbol,
-                                order.side,
-                                &self.instance_id,
-                                OrderStatus::Accepted,
-                            );
+                            effective_ack_status =
+                                self.shared.mark_place_ack(&order.client_order_id);
                             if !Self::oid_eq(&order_id, local_oid) {
                                 warn!(
                                     "[PolymarketTrade] orderID MISMATCH coid={} local={} server={}",
@@ -12822,6 +12852,76 @@ mod tests {
     }
 
     #[test]
+    fn owner_lane_keeps_terminal_state_when_place_ack_arrives_late_and_repeats() {
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        let shared = trade.shared_state();
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-late-place-ack",
+                "oid-late-place-ack",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            5.0,
+        );
+
+        // Model the live ordering on the same bounded owner lane: definitive
+        // terminal evidence wins first, followed by a delayed HTTP place ACK
+        // and its duplicate replay.
+        shared.defer_lifecycle_account_apply(
+            "owner-late-place-ack",
+            OrderStatus::Rejected,
+        );
+        shared.defer_place_ack_account_apply("owner-late-place-ack");
+        shared.defer_place_ack_account_apply("owner-late-place-ack");
+        let (barrier_tx, barrier_rx) = crossbeam_channel::bounded(1);
+        shared
+            .account_lifecycle_tx
+            .send(AccountLifecycleJob::StartupBarrier(barrier_tx))
+            .unwrap();
+        barrier_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("account lifecycle owner stalled");
+
+        let order = shared
+            .account_state
+            .order("owner-late-place-ack")
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert_eq!(order.reserved_cash, 0.0);
+        assert_eq!(
+            shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .reserved_cash,
+            0.0,
+        );
+
+        shutdown.request();
+        shutdown.finish();
+        assert_eq!(shared.join_background_workers(), 3);
+    }
+
+    #[test]
     fn single_writer_lifecycle_queue_has_bounded_tail_and_no_overflow() {
         // One full private-owner scheduling burst. Production ingress applies
         // backpressure/replay long before an account accumulates thousands of
@@ -12877,6 +12977,7 @@ mod tests {
             let job = DeferredLifecycleJob {
                 client_order_id: format!("owner-{index}"),
                 status: OrderStatus::Accepted,
+                evidence: LifecycleEvidence::Authoritative,
                 enqueued_ns: now_ns(),
                 completion: Some(completion_tx.clone()),
             };
