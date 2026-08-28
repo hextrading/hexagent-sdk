@@ -1,10 +1,9 @@
-//! Discrete-event types for the sim_v2 unified wall-clock scheduler.
+//! Discrete-event messages crossing sim_v2's server and strategy schedulers.
 //!
-//! All events live on a single wall-clock time axis (see module docs in
-//! `mod.rs`). Market events carry their server timestamp (`exchange_ts`,
-//! trades reconstructed in `feed.rs`); my-order lifecycle events carry the
-//! wall-clock time at which the order reaches the engine (`emit + L1`) or the
-//! ack/fill reaches the strategy (`reach + L2`).
+//! Both lanes use epoch timestamps for causal coordination, but retain
+//! independent monotonic clocks. Market events and request arrivals belong to
+//! the server lane; acknowledgements and private fills belong to the strategy
+//! lane after their modeled inbound latency.
 
 use crate::types::{
     Exchange, Instrument, OrderBookSnapshot, OrderRequest, OrderUpdate, TickSizeChange, TradeTick,

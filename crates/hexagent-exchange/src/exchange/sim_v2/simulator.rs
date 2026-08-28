@@ -1,11 +1,11 @@
 //! The sim_v2 driver the engine's thin loop calls.
 //!
-//! Owns the unified wall-clock `Scheduler`, the `ServerFeed` (server-axis
-//! market replay), the stub matching `core`, and the `LatencyModel`. The
-//! engine merges `peek_when()` against its own strat-lane market feed; when the
-//! sim wins it calls `step()` (which advances one internal event and returns
-//! any acks/fills now due for strategy delivery) and `submit()` (which schedules
-//! a strategy signal's outbound effect with L1 latency).
+//! Owns two independent schedulers plus the `ServerFeed` and matching core:
+//! `server_sched` contains requests after outbound L1 transit and server-side
+//! lifecycle work; `strategy_sched` contains acks/fills after inbound L2 or
+//! private-push transit. The engine coordinates their epoch timestamps with
+//! the recorded local market feed, but advancing one lane never rewrites the
+//! other lane's logical clock.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -183,7 +183,12 @@ struct PendingTakerRace {
 }
 
 pub struct Simulator {
-    sched: Scheduler,
+    /// Matching-engine lane: client requests after L1 plus server lifecycle.
+    server_sched: Scheduler,
+    /// Client lane: acknowledgements/fills after L2/private-push latency.
+    strategy_sched: Scheduler,
+    server_clock_ns: u64,
+    strategy_clock_ns: u64,
     feed: ServerFeed,
     core: SimExchangeV2,
     latency: LatencyModel,
@@ -408,7 +413,10 @@ impl Simulator {
         );
         let race_enabled = core.race_enabled();
         Ok(Self {
-            sched: Scheduler::new(),
+            server_sched: Scheduler::new(),
+            strategy_sched: Scheduler::new(),
+            server_clock_ns: 0,
+            strategy_clock_ns: 0,
             feed,
             core,
             latency,
@@ -565,6 +573,12 @@ impl Simulator {
     /// (anchored, fallback) trade counts for the end-of-run summary.
     pub fn trade_anchor_stats(&self) -> (u64, u64) {
         self.feed.trade_anchor_stats()
+    }
+
+    /// Raw venue timestamp regressions normalized inside the independent
+    /// server lane: `(count, max_regression_ns)`.
+    pub fn server_time_regression_stats(&self) -> (u64, u64) {
+        self.feed.server_time_regression_stats()
     }
 
     /// (taker_fills, maker_fills, rejects) from the matching core.
@@ -899,9 +913,10 @@ impl Simulator {
         (l1 + l2) as f64 / 1_000_000.0
     }
 
-    /// Wall-clock time of the next internal event (server feed or scheduler).
-    pub fn peek_when(&self) -> Option<u64> {
-        match (self.feed.peek_when(), self.sched.peek_when()) {
+    /// Next event on the independent server lane (public feed or a client
+    /// request/lifecycle action after outbound latency).
+    pub fn peek_server_when(&self) -> Option<u64> {
+        match (self.feed.peek_when(), self.server_sched.peek_when()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -909,25 +924,57 @@ impl Simulator {
         }
     }
 
-    /// Advance one internal event. Returns acks/fills now due for delivery to
-    /// the strategy (empty for market events; non-empty when an `AckToStrategy`
-    /// fires). The caller must have already confirmed the sim is the earliest
-    /// source (i.e. `peek_when()` ≤ its strat-lane time).
+    /// Next ack/fill delivery on the strategy-local lane after inbound
+    /// response or private websocket latency.
+    pub fn peek_strategy_when(&self) -> Option<u64> {
+        self.strategy_sched.peek_when()
+    }
+
+    /// Earliest causal event across the two independent lanes. This is only a
+    /// coordinator view; neither lane's logical clock is derived from it.
+    pub fn peek_when(&self) -> Option<u64> {
+        match (self.peek_server_when(), self.peek_strategy_when()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Advance one causal event while preserving independent lane clocks.
+    /// Server events win ties so a same-nanosecond strategy delivery observes
+    /// all server work causally due at that timestamp.
     pub fn step(&mut self) -> Vec<OrderUpdate> {
         let feed_when = self.feed.peek_when();
-        let sched_when = self.sched.peek_when();
-        let take_feed = match (feed_when, sched_when) {
-            // Tie → market event first, so an order reaching at the same ns
-            // matches against the freshly-applied book.
-            (Some(f), Some(s)) => f <= s,
+        let server_when = self.server_sched.peek_when();
+        let strategy_when = self.strategy_sched.peek_when();
+        let next_server = match (feed_when, server_when) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let take_server = match (next_server, strategy_when) {
+            (Some(server), Some(strategy)) => server <= strategy,
             (Some(_), None) => true,
             _ => false,
         };
-        if take_feed {
+        if !take_server {
+            return self.step_strategy_sched();
+        }
+        if feed_when.is_some_and(|feed| server_when.is_none_or(|server| feed <= server)) {
             self.step_feed()
         } else {
-            self.step_sched()
+            self.step_server_sched()
         }
+    }
+
+    /// Publish the engine's independently replayed local clock. This never
+    /// advances the server lane; it only prevents a subsequently-created
+    /// private delivery from being scheduled in the client's past.
+    #[inline]
+    pub fn observe_strategy_clock(&mut self, now_ns: u64) {
+        self.strategy_clock_ns = self.strategy_clock_ns.max(now_ns);
     }
 
     /// On each binary-option instrument (event start), in "exact" mode swap the
@@ -1333,6 +1380,7 @@ impl Simulator {
 
     fn step_feed(&mut self) -> Vec<OrderUpdate> {
         if let Some((when, ev)) = self.feed.next_server_event() {
+            self.server_clock_ns = self.server_clock_ns.max(when);
             match ev {
                 SimEvent::ServerBook(ob) => {
                     // Book-through adverse fills (a resting order the contra just
@@ -1355,7 +1403,10 @@ impl Simulator {
                         self.core
                             .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
-                        self.sched.push(deliver, SimEvent::FillToStrategy(fill));
+                        self.strategy_sched.push(
+                            deliver.max(self.strategy_clock_ns),
+                            SimEvent::FillToStrategy(fill),
+                        );
                     }
                 }
                 SimEvent::ServerTrade(t) => {
@@ -1380,7 +1431,10 @@ impl Simulator {
                         self.core
                             .record_fill_delivery(&fill.client_order_id, deliver);
                         fill.timestamp_ns = deliver;
-                        self.sched.push(deliver, SimEvent::FillToStrategy(fill));
+                        self.strategy_sched.push(
+                            deliver.max(self.strategy_clock_ns),
+                            SimEvent::FillToStrategy(fill),
+                        );
                     }
                 }
                 SimEvent::ServerInstrument(i) => {
@@ -1403,15 +1457,19 @@ impl Simulator {
     fn deliver_ack(&mut self, mut u: OrderUpdate, deliver: u64, suppress_ack: bool) {
         let is_fill = matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
         if !suppress_ack || is_fill {
-            u.timestamp_ns = deliver;
-            self.sched.push(deliver, SimEvent::AckToStrategy(u));
+            let strategy_deliver = deliver.max(self.strategy_clock_ns);
+            u.timestamp_ns = strategy_deliver;
+            self.strategy_sched
+                .push(strategy_deliver, SimEvent::AckToStrategy(u));
         }
     }
 
-    fn step_sched(&mut self) -> Vec<OrderUpdate> {
-        let Some((when, ev)) = self.sched.pop() else {
+    fn step_server_sched(&mut self) -> Vec<OrderUpdate> {
+        let Some((when, ev)) = self.server_sched.pop() else {
             return Vec::new();
         };
+        self.server_clock_ns = self.server_clock_ns.max(when);
+        let when = self.server_clock_ns;
         match ev {
             SimEvent::OrderReachesEngine {
                 action,
@@ -1447,7 +1505,7 @@ impl Simulator {
                                     );
                                 }
                             }
-                            self.sched.push(
+                            self.server_sched.push(
                                 match_at,
                                 SimEvent::TakerMatch {
                                     order: o,
@@ -1479,7 +1537,7 @@ impl Simulator {
                             self.deliver_ack(u, ack_deliver_ns, suppress_ack);
                         } else {
                             self.cancel_finality_delayed += 1;
-                            self.sched.push(
+                            self.server_sched.push(
                                 when.saturating_add(delay_ns),
                                 SimEvent::CancelFinalizes {
                                     exchange,
@@ -1547,9 +1605,24 @@ impl Simulator {
                 self.deliver_ack(u, deliver, suppress_ack);
                 Vec::new()
             }
-            SimEvent::AckToStrategy(u) => vec![u],
-            SimEvent::FillToStrategy(u) => vec![u],
-            // Server-axis events never enter the scheduler heap.
+            // Strategy deliveries never enter the server scheduler.
+            SimEvent::AckToStrategy(_) | SimEvent::FillToStrategy(_) => Vec::new(),
+            // Server feed events never enter the server scheduler heap.
+            _ => Vec::new(),
+        }
+    }
+
+    fn step_strategy_sched(&mut self) -> Vec<OrderUpdate> {
+        let Some((when, ev)) = self.strategy_sched.pop() else {
+            return Vec::new();
+        };
+        self.strategy_clock_ns = self.strategy_clock_ns.max(when);
+        match ev {
+            SimEvent::AckToStrategy(mut u) | SimEvent::FillToStrategy(mut u) => {
+                u.timestamp_ns = self.strategy_clock_ns;
+                vec![u]
+            }
+            // Server-side events never enter the strategy scheduler.
             _ => Vec::new(),
         }
     }
@@ -1567,12 +1640,16 @@ impl Simulator {
         } = sig
         {
             let (l1, l2) = self.latency.sample_cancel_split(t_emit);
-            let deliver = t_emit.saturating_add(l1).saturating_add(l2);
+            let deliver = t_emit
+                .saturating_add(l1)
+                .saturating_add(l2)
+                .max(self.strategy_clock_ns);
             for u in self
                 .core
                 .reconcile(pending_places, pending_cancels, deliver)
             {
-                self.sched.push(deliver, SimEvent::AckToStrategy(u));
+                self.strategy_sched
+                    .push(deliver, SimEvent::AckToStrategy(u));
             }
             return;
         }
@@ -1622,15 +1699,21 @@ impl Simulator {
         }
         let rtt = l1 + l2;
         let timed_out = rtt > self.client_timeout_ns;
-        let reach = t_emit.saturating_add(l1);
+        // This explicit cross-lane message is the only way a local request can
+        // affect the matching engine. Never rewind an already-advanced server
+        // lane even if the two recorded wall clocks have transient skew.
+        let reach = t_emit.saturating_add(l1).max(self.server_clock_ns);
         if timed_out {
             self.timeouts += 1;
-            let timeout_deliver = t_emit.saturating_add(self.client_timeout_ns);
+            let timeout_deliver = t_emit
+                .saturating_add(self.client_timeout_ns)
+                .max(self.strategy_clock_ns);
             if let Some(u) = self.timeout_update(&action, timeout_deliver) {
-                self.sched.push(timeout_deliver, SimEvent::AckToStrategy(u));
+                self.strategy_sched
+                    .push(timeout_deliver, SimEvent::AckToStrategy(u));
             }
         }
-        self.sched.push(
+        self.server_sched.push(
             reach,
             SimEvent::OrderReachesEngine {
                 action,
@@ -1827,7 +1910,10 @@ mod tests {
             1,
         );
         Simulator {
-            sched: Scheduler::new(),
+            server_sched: Scheduler::new(),
+            strategy_sched: Scheduler::new(),
+            server_clock_ns: 0,
+            strategy_clock_ns: 0,
             feed,
             core: SimExchangeV2::new(
                 500_000_000,
@@ -1909,7 +1995,10 @@ mod tests {
             1,
         );
         Simulator {
-            sched: Scheduler::new(),
+            server_sched: Scheduler::new(),
+            strategy_sched: Scheduler::new(),
+            server_clock_ns: 0,
+            strategy_clock_ns: 0,
             feed,
             core: SimExchangeV2::new(
                 500_000_000,
@@ -2195,6 +2284,50 @@ mod tests {
         assert_eq!(r2[0].status, OrderStatus::Accepted);
         assert_eq!(r2[0].timestamp_ns, emit + 100_000_000);
         assert!(sim.peek_when().is_none());
+    }
+
+    #[test]
+    fn place_and_cancel_cross_independent_lanes_with_l1_and_l2() {
+        let mut sim = sim_with_fixed_rtt(100); // L1=50ms, L2=50ms.
+        let place_emit = 1_000_000_000u64;
+        sim.observe_strategy_clock(place_emit);
+        sim.submit(&place_signal("lane-order"), place_emit);
+
+        assert_eq!(sim.strategy_clock_ns, place_emit);
+        assert_eq!(sim.server_clock_ns, 0);
+        assert_eq!(sim.peek_server_when(), Some(place_emit + 50_000_000));
+        assert_eq!(sim.peek_strategy_when(), None);
+
+        // Outbound request crosses into the server lane only after L1.
+        assert!(sim.step().is_empty());
+        assert_eq!(sim.server_clock_ns, place_emit + 50_000_000);
+        assert_eq!(sim.strategy_clock_ns, place_emit);
+        assert_eq!(sim.peek_strategy_when(), Some(place_emit + 100_000_000));
+
+        // Accepted crosses back only after L2.
+        let accepted = sim.step();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].status, OrderStatus::Accepted);
+        assert_eq!(accepted[0].timestamp_ns, place_emit + 100_000_000);
+        assert_eq!(sim.strategy_clock_ns, place_emit + 100_000_000);
+        assert_eq!(sim.server_clock_ns, place_emit + 50_000_000);
+
+        let cancel_emit = 2_000_000_000u64;
+        sim.observe_strategy_clock(cancel_emit);
+        sim.submit(&cancel_signal("lane-order", cancel_emit), cancel_emit);
+        assert_eq!(sim.peek_server_when(), Some(cancel_emit + 50_000_000));
+        assert_eq!(sim.peek_strategy_when(), None);
+
+        assert!(sim.step().is_empty());
+        assert_eq!(sim.server_clock_ns, cancel_emit + 50_000_000);
+        assert_eq!(sim.strategy_clock_ns, cancel_emit);
+        assert_eq!(sim.peek_strategy_when(), Some(cancel_emit + 100_000_000));
+
+        let cancelled = sim.step();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].status, OrderStatus::Cancelled);
+        assert_eq!(cancelled[0].timestamp_ns, cancel_emit + 100_000_000);
+        assert_eq!(sim.strategy_clock_ns, cancel_emit + 100_000_000);
     }
 
     fn seed_front_order(sim: &mut Simulator, coid: &str) {

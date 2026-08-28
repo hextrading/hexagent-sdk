@@ -1,10 +1,10 @@
-//! Sim Exchange v2 — first-principles backtest simulator (P1: feed + clock +
-//! unified-wall-clock DES + bidirectional RTT latency; matching stubbed).
+//! Sim Exchange v2 — first-principles backtest simulator with independent
+//! server and strategy-local lanes plus bidirectional RTT latency.
 //!
 //! Design: `docs/sim_v2_design.md`. P1 plan:
 //! `~/.claude/plans/misty-squishing-galaxy.md`.
 //!
-//! # Two axes, one wall clock
+//! # Two independent logical clocks
 //! - **Strat lane** (`local_timestamp_ns`): engine-owned; drives strategy
 //!   callbacks at the recorded receive time (faithful inbound — the recording
 //!   already bakes in that day's real L2 market-data latency).
@@ -12,17 +12,16 @@
 //!   core. Books carry a real server ts; trades are reconstructed by anchoring
 //!   to the adjacent book (`feed.rs`).
 //!
-//! Because `local_ts` and `exchange_ts` share the same wall clock (the offset
-//! is the network latency), the `Scheduler` holds ALL internal events on one
-//! wall-clock axis: server market events, my-order arrivals (`emit + L1`), and
-//! ack/fill deliveries (`reach + L2`). The engine merges `Simulator::peek_when`
-//! against its strat-lane feed.
+//! Both timestamps use the Unix epoch, which lets the coordinator order causal
+//! arrivals, but the lanes never advance each other's logical clock. Separate
+//! schedulers carry outbound requests to the server (`emit + L1`) and inbound
+//! acks/fills to the strategy (`server_event + L2/private_push`).
 //!
 //! # RTT (P1)
-//! `submit()` samples one RTT per signal, schedules `OrderReachesEngine` at
-//! `emit + L1`; processing it produces an ack scheduled at `reach + L2`. So my
-//! orders' acks reach the strategy after a full sampled RTT. Matching is a stub
-//! (no fills); only ack/cancel paths carry latency (PnL = 0).
+//! `submit()` samples one RTT per signal, schedules `OrderReachesEngine` on the
+//! server lane at `emit + L1`; processing it produces an ack scheduled on the
+//! strategy lane at `reach + L2`. Private fills similarly cross via a sampled
+//! push latency.
 //!
 //! # Deferred
 //! P2: real book + cross-outcome synthetic book + taker. P3: resting queue
