@@ -22,6 +22,7 @@ use super::exchange::{FillAuditRow, MakerOrderAuditRow, SimExchangeV2};
 use super::feed::ServerFeed;
 use super::latency::LatencyModel;
 use crate::exchange::sim::latency::LatencyProfile;
+use crate::recorder::ReplayOptions;
 
 pub struct SimV2Config {
     pub data_dir: String,
@@ -29,6 +30,9 @@ pub struct SimV2Config {
     pub end: DateTime<Utc>,
     /// Polymarket `(exchange, symbol)` sources; non-polymarket ignored.
     pub sources: Vec<(String, String)>,
+    pub bootstrap_binary_open: bool,
+    pub binary_open_delay_ns: u64,
+    pub binary_open_max_backfill_ns: u64,
     pub place_p50_ms: f64,
     pub place_p95_ms: f64,
     pub place_p99_ms: f64,
@@ -58,6 +62,11 @@ pub struct SimV2Config {
     /// Maximum fraction of adverse, unexplained same-level depletion treated as
     /// hidden execution volume. 0 keeps cancel-only attribution result-neutral.
     pub unexplained_depletion_exec_rate: f64,
+    /// Per-level public-trade evidence cap for inferred hidden execution.
+    /// Zero keeps the historical uncapped depletion split.
+    pub depletion_trade_evidence_mult: f64,
+    pub depletion_no_evidence_exec_frac: f64,
+    pub depletion_evidence_min_shrink_frac: f64,
     /// Deterministic fraction of orders whose maker executions retain
     /// an exchange-side residual small enough for 99%-coverage release.
     pub inferred_maker_residual_rate: f64,
@@ -351,7 +360,17 @@ fn dynamic_markout_strength(
 
 impl Simulator {
     pub fn new(cfg: SimV2Config) -> Result<Self> {
-        let feed = ServerFeed::new(Path::new(&cfg.data_dir), &cfg.sources, cfg.start, cfg.end)?;
+        let feed = ServerFeed::new_with_replay_options(
+            Path::new(&cfg.data_dir),
+            &cfg.sources,
+            cfg.start,
+            cfg.end,
+            ReplayOptions {
+                bootstrap_binary_open: cfg.bootstrap_binary_open,
+                binary_open_delay_ns: cfg.binary_open_delay_ns,
+                binary_open_max_backfill_ns: cfg.binary_open_max_backfill_ns,
+            },
+        )?;
         // Record-replay (or any pre-built) profile wins; otherwise build the
         // legacy scalar Empirical from the calibrated p50/p95/p99 anchors.
         let place = cfg.place_profile.clone().unwrap_or_else(|| {
@@ -395,6 +414,11 @@ impl Simulator {
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
+        core.configure_depletion_trade_evidence(cfg.depletion_trade_evidence_mult);
+        core.configure_depletion_no_evidence_prior(cfg.depletion_no_evidence_exec_frac);
+        core.configure_depletion_evidence_min_shrink(
+            cfg.depletion_evidence_min_shrink_frac,
+        );
         core.configure_inferred_maker_residual(
             cfg.inferred_maker_residual_rate,
             cfg.inferred_maker_residual_fraction,
@@ -758,6 +782,13 @@ impl Simulator {
     /// # maker fill fragments produced by unexplained L2 depletion.
     pub fn unexplained_depletion_fills(&self) -> u64 {
         self.core.unexplained_depletion_fills_n
+    }
+
+    pub fn depletion_trade_evidence_stats(&self) -> (u64, f64) {
+        (
+            self.core.depletion_evidence_capped_n,
+            self.core.depletion_evidence_capped_qty,
+        )
     }
 
     /// Orders where a maker fill stopped at the configured inferred residual,

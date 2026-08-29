@@ -14,12 +14,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::types::*;
 
 /// A single row from a Parquet market data file, ready for replay.
+#[derive(Clone)]
 struct ReplayRow {
     local_timestamp_ns: u64,
     event: MarketEvent,
 }
 
+/// Optional, explicitly bounded repairs for legacy rotating-event tapes.
+///
+/// Older Polymarket recordings sometimes registered an event only after the
+/// event had opened, so the first instrument/book rows are 1--4 seconds late.
+/// For those tapes we can move the instrument to the scheduled open and seed a
+/// synthetic opening snapshot from the first recorded full book.  This is
+/// deliberately opt-in: complete tapes replay byte-for-byte as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayOptions {
+    pub bootstrap_binary_open: bool,
+    pub binary_open_delay_ns: u64,
+    pub binary_open_max_backfill_ns: u64,
+}
+
 const REPLAYER_BATCH_ROWS: usize = 8_192;
+const REPLAYER_BOOTSTRAP_MAX_ROWS: usize = REPLAYER_BATCH_ROWS * 2;
 
 static REPLAYER_BUFFERED_ROWS: AtomicU64 = AtomicU64::new(0);
 static REPLAYER_BUFFER_CAPACITY: AtomicU64 = AtomicU64::new(0);
@@ -63,7 +79,8 @@ impl Drop for ReplayBatch {
 }
 
 /// Reads Parquet market data files and replays events in order. The producer
-/// hands Arrow-sized batches directly to a two-batch consumer window; an hour
+/// normally hands Arrow-sized batches directly to a two-batch consumer window;
+/// the optional opening repair may combine at most two row groups, but an hour
 /// is never materialised as one `Vec<ReplayRow>`.
 pub struct MarketReplayer {
     batch_rx: Option<crossbeam_channel::Receiver<ReplayBatch>>,
@@ -84,6 +101,18 @@ impl MarketReplayer {
         symbol: &str,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+    ) -> Result<Self> {
+        Self::new_with_options(data_dir, exchange, symbol, start, end, ReplayOptions::default())
+    }
+
+    /// Create a replayer with bounded legacy-tape repairs.
+    pub fn new_with_options(
+        data_dir: &Path,
+        exchange: &str,
+        symbol: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        options: ReplayOptions,
     ) -> Result<Self> {
         let start_ns = start.timestamp_nanos_opt().unwrap_or(0) as u64;
         let end_ns = end.timestamp_nanos_opt().unwrap_or(0) as u64;
@@ -122,13 +151,21 @@ impl MarketReplayer {
         let worker_source = source.clone();
         // Rendezvous handoff: at steady state the replayer owns current +
         // lookahead and the loader can hold at most one decoded batch while
-        // blocked on send. This is a hard three-batch memory bound.
+        // blocked on send. Opening repair may temporarily merge two row groups;
+        // that separate startup bound is REPLAYER_BOOTSTRAP_MAX_ROWS.
         let (batch_tx, batch_rx) = crossbeam_channel::bounded(0);
         let loader_handle = std::thread::Builder::new()
             .name("market-replay-loader".to_string())
             .spawn(move || {
                 hexagent_runtime::os_tune::pin_background("market-replay-loader");
-                stream_replay_files(files, start_ns, end_ns, &worker_source, batch_tx);
+                stream_replay_files(
+                    files,
+                    start_ns,
+                    end_ns,
+                    &worker_source,
+                    options,
+                    batch_tx,
+                );
             })?;
         REPLAYER_ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
@@ -444,6 +481,7 @@ fn stream_replay_files(
     start_ns: u64,
     end_ns: u64,
     source: &str,
+    options: ReplayOptions,
     batch_tx: crossbeam_channel::Sender<ReplayBatch>,
 ) {
     let candidate_files = files.len();
@@ -451,18 +489,39 @@ fn stream_replay_files(
     let mut loaded_rows = 0_u64;
     for path in files {
         let mut consumer_open = true;
+        let mut bootstrap_done = !options.bootstrap_binary_open;
+        let mut bootstrap_rows = Vec::new();
         let result = stream_parquet_event_batches(&path, start_ns, end_ns, |mut rows| {
             if rows.is_empty() {
                 return true;
             }
-            rows.sort_by_key(|row| row.local_timestamp_ns);
-            let count = rows.len() as u64;
-            REPLAYER_LOADED_ROWS.fetch_add(count, Ordering::AcqRel);
-            loaded_rows = loaded_rows.saturating_add(count);
-            log::debug!("[Replayer] Decoded {} rows from {}", count, path.display());
-            consumer_open = batch_tx.send(ReplayBatch::new(rows)).is_ok();
+            if !bootstrap_done {
+                bootstrap_rows.append(&mut rows);
+                if binary_open_bootstrap_ready(&bootstrap_rows)
+                    || bootstrap_rows.len() >= REPLAYER_BOOTSTRAP_MAX_ROWS
+                {
+                    let mut combined = std::mem::take(&mut bootstrap_rows);
+                    let repair = bootstrap_binary_event_open(&mut combined, options);
+                    log_binary_open_repair(source, &path, repair);
+                    bootstrap_done = true;
+                    consumer_open = send_replay_rows(
+                        &batch_tx,
+                        &path,
+                        &mut loaded_rows,
+                        combined,
+                    );
+                }
+                return consumer_open;
+            }
+            consumer_open = send_replay_rows(&batch_tx, &path, &mut loaded_rows, rows);
             consumer_open
         });
+        if consumer_open && !bootstrap_rows.is_empty() {
+            let mut combined = std::mem::take(&mut bootstrap_rows);
+            let repair = bootstrap_binary_event_open(&mut combined, options);
+            log_binary_open_repair(source, &path, repair);
+            consumer_open = send_replay_rows(&batch_tx, &path, &mut loaded_rows, combined);
+        }
         match result {
             Ok(file_rows) => {
                 if file_rows > 0 {
@@ -486,6 +545,129 @@ fn stream_replay_files(
         "[Replayer] Replay source summary source={} candidate_files={} loaded_files={} loaded_rows={}",
         source, candidate_files, loaded_files, loaded_rows,
     );
+}
+
+fn send_replay_rows(
+    batch_tx: &crossbeam_channel::Sender<ReplayBatch>,
+    path: &Path,
+    loaded_rows: &mut u64,
+    mut rows: Vec<ReplayRow>,
+) -> bool {
+    rows.sort_by_key(|row| row.local_timestamp_ns);
+    let count = rows.len() as u64;
+    REPLAYER_LOADED_ROWS.fetch_add(count, Ordering::AcqRel);
+    *loaded_rows = loaded_rows.saturating_add(count);
+    log::debug!("[Replayer] Decoded {} rows from {}", count, path.display());
+    batch_tx.send(ReplayBatch::new(rows)).is_ok()
+}
+
+fn log_binary_open_repair(source: &str, path: &Path, repair: BinaryOpenRepair) {
+    if repair.seeded_books > 0 || repair.instrument_retimed {
+        info!(
+            "[Replayer] binary-open bootstrap source={} file={} event_start_ns={} instrument_retimed={} seeded_books={} max_original_gap_ms={:.3}",
+            source,
+            path.display(),
+            repair.event_start_ns,
+            repair.instrument_retimed,
+            repair.seeded_books,
+            repair.max_original_gap_ns as f64 / 1_000_000.0,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BinaryOpenRepair {
+    event_start_ns: u64,
+    instrument_retimed: bool,
+    seeded_books: usize,
+    max_original_gap_ns: u64,
+}
+
+fn binary_open_bootstrap_ready(rows: &[ReplayRow]) -> bool {
+    let Some(tokens) = rows.iter().find_map(|row| match &row.event {
+        MarketEvent::Instrument(Instrument::BinaryOption(option)) => {
+            Some(&option.clob_token_ids)
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            rows.iter().any(|row| {
+                matches!(&row.event, MarketEvent::OrderBook(book) if &book.symbol == token)
+            })
+        })
+}
+
+/// Repair the bounded opening window of one event parquet. Most events fit in
+/// one row group; high-activity events may span two. Runtime never buffers more
+/// than [`REPLAYER_BOOTSTRAP_MAX_ROWS`] for this startup-only repair.
+fn bootstrap_binary_event_open(
+    rows: &mut Vec<ReplayRow>,
+    options: ReplayOptions,
+) -> BinaryOpenRepair {
+    if !options.bootstrap_binary_open || options.binary_open_max_backfill_ns == 0 {
+        return BinaryOpenRepair::default();
+    }
+
+    let Some((instrument_index, event_start_ns, tokens)) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(index, row)| match &row.event {
+            MarketEvent::Instrument(Instrument::BinaryOption(option)) => {
+                let start: u64 = chrono::DateTime::parse_from_rfc3339(&option.event_start_time)
+                    .ok()?
+                    .timestamp_nanos_opt()?
+                    .try_into()
+                    .ok()?;
+                Some((index, start, option.clob_token_ids.clone()))
+            }
+            _ => None,
+        })
+    else {
+        return BinaryOpenRepair::default();
+    };
+    let bootstrap_ns = event_start_ns.saturating_add(options.binary_open_delay_ns);
+    let mut repair = BinaryOpenRepair {
+        event_start_ns,
+        ..BinaryOpenRepair::default()
+    };
+
+    let instrument_ts = rows[instrument_index].local_timestamp_ns;
+    let instrument_gap = instrument_ts.saturating_sub(bootstrap_ns);
+    if instrument_ts > bootstrap_ns && instrument_gap <= options.binary_open_max_backfill_ns {
+        rows[instrument_index].local_timestamp_ns = bootstrap_ns;
+        repair.instrument_retimed = true;
+        repair.max_original_gap_ns = instrument_gap;
+    }
+
+    let mut synthetic = Vec::with_capacity(tokens.len());
+    for (token_index, token) in tokens.iter().enumerate() {
+        let Some(book) = rows.iter().find_map(|row| match &row.event {
+            MarketEvent::OrderBook(book) if &book.symbol == token => Some(book),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let original_ns = book.local_timestamp_ns.max(book.exchange_timestamp_ns);
+        let book_ns = bootstrap_ns.saturating_add(1 + token_index as u64);
+        let gap_ns = original_ns.saturating_sub(book_ns);
+        if original_ns <= book_ns || gap_ns > options.binary_open_max_backfill_ns {
+            continue;
+        }
+        let mut seeded = book.clone();
+        seeded.exchange_timestamp_ns = book_ns;
+        seeded.local_timestamp_ns = book_ns;
+        synthetic.push(ReplayRow {
+            local_timestamp_ns: book_ns,
+            event: MarketEvent::OrderBook(seeded),
+        });
+        repair.seeded_books += 1;
+        repair.max_original_gap_ns = repair.max_original_gap_ns.max(gap_ns);
+    }
+    rows.extend(synthetic);
+    repair
 }
 
 /// Extract a Unix timestamp (seconds) and duration (seconds) from a parquet filename.
@@ -1066,6 +1248,132 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn binary_option(start: &str) -> Instrument {
+        Instrument::BinaryOption(BinaryOption {
+            exchange: Exchange::Polymarket,
+            id: "event-1".to_string(),
+            question: String::new(),
+            condition_id: "condition-1".to_string(),
+            series_slug: "btc-up-or-down-5m".to_string(),
+            slug: "btc-updown-5m-1774868400".to_string(),
+            clob_token_ids: vec!["up".to_string(), "down".to_string()],
+            outcomes: vec!["Up".to_string(), "Down".to_string()],
+            outcome_prices: Vec::new(),
+            active: true,
+            closed: false,
+            volume: 0.0,
+            liquidity: 0.0,
+            tick_size: 0.01,
+            order_min_size: 5.0,
+            group_item_title: String::new(),
+            event_start_time: start.to_string(),
+            base_fee: 0,
+            fee_exponent: 0.0,
+            fee_rate: 0.0,
+        })
+    }
+
+    fn book(symbol: &str, timestamp_ns: u64) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: symbol.to_string(),
+            bids: vec![PriceLevel { price: 0.49, quantity: 100.0 }],
+            asks: vec![PriceLevel { price: 0.51, quantity: 100.0 }],
+            exchange_timestamp_ns: timestamp_ns,
+            local_timestamp_ns: timestamp_ns,
+        }
+    }
+
+    #[test]
+    fn binary_open_bootstrap_retimes_instrument_and_seeds_each_token_book() {
+        let event_start_ns = 1_774_868_400_u64 * 1_000_000_000;
+        let mut rows = vec![
+            ReplayRow {
+                local_timestamp_ns: event_start_ns + 1_700_000_000,
+                event: MarketEvent::Instrument(binary_option("2026-03-30T11:00:00Z")),
+            },
+            ReplayRow {
+                local_timestamp_ns: event_start_ns + 2_300_000_000,
+                event: MarketEvent::OrderBook(book("up", event_start_ns + 2_300_000_000)),
+            },
+            ReplayRow {
+                local_timestamp_ns: event_start_ns + 2_500_000_000,
+                event: MarketEvent::OrderBook(book("down", event_start_ns + 2_500_000_000)),
+            },
+        ];
+        let options = ReplayOptions {
+            bootstrap_binary_open: true,
+            binary_open_delay_ns: 20_000_000,
+            binary_open_max_backfill_ns: 5_000_000_000,
+        };
+
+        let repair = bootstrap_binary_event_open(&mut rows, options);
+        rows.sort_by_key(|row| row.local_timestamp_ns);
+
+        assert!(repair.instrument_retimed);
+        assert_eq!(repair.seeded_books, 2);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].local_timestamp_ns, event_start_ns + 20_000_000);
+        assert!(matches!(rows[0].event, MarketEvent::Instrument(_)));
+        for (index, token) in ["up", "down"].iter().enumerate() {
+            let expected = event_start_ns + 20_000_001 + index as u64;
+            let seeded = rows.iter().find_map(|row| match &row.event {
+                MarketEvent::OrderBook(book)
+                    if book.symbol == *token && row.local_timestamp_ns == expected => Some(book),
+                _ => None,
+            });
+            let seeded = seeded.expect("seeded book");
+            assert_eq!(seeded.exchange_timestamp_ns, expected);
+            assert_eq!(seeded.local_timestamp_ns, expected);
+        }
+    }
+
+    #[test]
+    fn binary_open_bootstrap_refuses_unbounded_future_book() {
+        let event_start_ns = 1_774_868_400_u64 * 1_000_000_000;
+        let mut rows = vec![
+            ReplayRow {
+                local_timestamp_ns: event_start_ns + 9_000_000_000,
+                event: MarketEvent::Instrument(binary_option("2026-03-30T11:00:00Z")),
+            },
+            ReplayRow {
+                local_timestamp_ns: event_start_ns + 9_000_000_000,
+                event: MarketEvent::OrderBook(book("up", event_start_ns + 9_000_000_000)),
+            },
+        ];
+        let repair = bootstrap_binary_event_open(
+            &mut rows,
+            ReplayOptions {
+                bootstrap_binary_open: true,
+                binary_open_delay_ns: 20_000_000,
+                binary_open_max_backfill_ns: 5_000_000_000,
+            },
+        );
+        assert!(!repair.instrument_retimed);
+        assert_eq!(repair.seeded_books, 0);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn binary_open_bootstrap_waits_for_both_token_books_across_batches() {
+        let event_start_ns = 1_774_868_400_u64 * 1_000_000_000;
+        let mut rows = vec![ReplayRow {
+            local_timestamp_ns: event_start_ns + 1_700_000_000,
+            event: MarketEvent::Instrument(binary_option("2026-03-30T11:00:00Z")),
+        }];
+        assert!(!binary_open_bootstrap_ready(&rows));
+        rows.push(ReplayRow {
+            local_timestamp_ns: event_start_ns + 2_300_000_000,
+            event: MarketEvent::OrderBook(book("up", event_start_ns + 2_300_000_000)),
+        });
+        assert!(!binary_open_bootstrap_ready(&rows));
+        rows.push(ReplayRow {
+            local_timestamp_ns: event_start_ns + 2_500_000_000,
+            event: MarketEvent::OrderBook(book("down", event_start_ns + 2_500_000_000)),
+        });
+        assert!(binary_open_bootstrap_ready(&rows));
+    }
 
     #[test]
     fn shard_suffix_keeps_base_time_window() {

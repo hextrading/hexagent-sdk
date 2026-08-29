@@ -464,6 +464,15 @@ pub struct SimExchangeV2 {
     /// unlike a fill-probability scalar, the resulting volume must drain queue
     /// ahead before its overflow can fill.
     unexplained_depletion_exec_rate: f64,
+    /// Optional exact-level public-trade evidence cap for the inferred hidden
+    /// execution slice.  Positive values make execution a per-level budget:
+    /// `min(raw_hidden_execution, exact_trade_qty * multiplier)`.
+    depletion_trade_evidence_mult: f64,
+    depletion_no_evidence_exec_frac: f64,
+    depletion_evidence_min_shrink_frac: f64,
+    pending_level_trade_evidence: HashMap<String, HashMap<(u8, i64, u64), f64>>,
+    pub depletion_evidence_capped_n: u64,
+    pub depletion_evidence_capped_qty: f64,
     /// # maker fill fragments produced by unexplained depletion. Diagnostic.
     pub unexplained_depletion_fills_n: u64,
     /// Deterministic share of orders whose inferred fills retain exchange-side
@@ -685,6 +694,12 @@ impl SimExchangeV2 {
             book_through_rate: 0.0,
             book_through_fills_n: 0,
             unexplained_depletion_exec_rate: 0.0,
+            depletion_trade_evidence_mult: 0.0,
+            depletion_no_evidence_exec_frac: 0.0,
+            depletion_evidence_min_shrink_frac: 0.0,
+            pending_level_trade_evidence: HashMap::new(),
+            depletion_evidence_capped_n: 0,
+            depletion_evidence_capped_qty: 0.0,
             unexplained_depletion_fills_n: 0,
             inferred_maker_residual_rate: 0.0,
             inferred_maker_residual_fraction: 0.0006,
@@ -1122,6 +1137,26 @@ impl SimExchangeV2 {
         self.unexplained_depletion_exec_rate = rate.clamp(0.0, 1.0);
     }
 
+    /// Require exact-price public flow to corroborate inferred hidden
+    /// execution. The evidence is accumulated once per public level between
+    /// full-book snapshots, then shared by every simulated order at that level.
+    /// A zero multiplier retains the legacy uncapped model.
+    pub fn configure_depletion_trade_evidence(&mut self, multiplier: f64) {
+        self.depletion_trade_evidence_mult = multiplier.max(0.0);
+    }
+
+    /// Retain a bounded expected hidden-execution prior for intervals without
+    /// exact-level prints. This is an expectation over otherwise unobservable
+    /// queue-tail cancellation vs hidden execution, not an assertion that one
+    /// particular order was filled.
+    pub fn configure_depletion_no_evidence_prior(&mut self, fraction: f64) {
+        self.depletion_no_evidence_exec_frac = fraction.clamp(0.0, 1.0);
+    }
+
+    pub fn configure_depletion_evidence_min_shrink(&mut self, fraction: f64) {
+        self.depletion_evidence_min_shrink_frac = fraction.clamp(0.0, 1.0);
+    }
+
     /// Model the exchange/live-order split exposed by near-complete maker
     /// matches: the strategy order manager releases at 99% cumulative coverage,
     /// while a tiny residual can remain physically executable on the CLOB.
@@ -1504,6 +1539,9 @@ impl SimExchangeV2 {
         let adv_rate = self.adverse_sel_rate;
         let adv_scale = self.adverse_scale_ticks;
         let depletion_rate = self.unexplained_depletion_exec_rate;
+        let evidence_mult = self.depletion_trade_evidence_mult;
+        let no_evidence_prior = self.depletion_no_evidence_exec_frac;
+        let evidence_min_shrink = self.depletion_evidence_min_shrink_frac;
         let markout_vn = self.book_fill_markout_vn;
         let own_fifo_strength = self.order_queue_position_strength;
         let audit_enabled = self.maker_order_audit_enabled;
@@ -1521,6 +1559,8 @@ impl SimExchangeV2 {
         let mut haircut_cost = 0.0;
         let mut residual_orders_n = 0u64;
         let mut residual_qty = 0.0;
+        let mut evidence_capped_n = 0u64;
+        let mut evidence_capped_qty = 0.0;
         for (coid, o) in self.orders.iter_mut() {
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
@@ -1572,11 +1612,45 @@ impl SimExchangeV2 {
             // A zero rate deliberately takes the original cancel-only
             // arithmetic path. This makes the feature result-neutral when it
             // is absent from config or explicitly disabled.
-            let execution = if depletion_rate > 0.0 && o.match_symbol == changed_token {
+            let raw_execution = if depletion_rate > 0.0 && o.match_symbol == changed_token {
                 let adverse_gate = (adverse / (adv_scale * o.tick)).clamp(0.0, 1.0);
                 unexplained * depletion_rate * adverse_gate
             } else {
                 0.0
+            };
+            let shrink_frac = if l_prev > EPS {
+                (unexplained / l_prev).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let execution = if raw_execution > 0.0
+                && evidence_mult > 0.0
+                && shrink_frac + EPS >= evidence_min_shrink
+            {
+                let side_rank = match o.match_side {
+                    Side::Buy => 0,
+                    Side::Sell => 1,
+                };
+                let key = (
+                    side_rank,
+                    price_to_ticks(o.match_price, o.tick),
+                    o.tick.to_bits(),
+                );
+                let exact_trade_qty = self
+                    .pending_level_trade_evidence
+                    .get(&o.match_symbol)
+                    .and_then(|levels| levels.get(&key))
+                    .copied()
+                    .unwrap_or(0.0);
+                let prior_budget = raw_execution * no_evidence_prior;
+                let capped = raw_execution.min(prior_budget + exact_trade_qty * evidence_mult);
+                if capped + EPS < raw_execution {
+                    evidence_capped_n += 1;
+                    evidence_capped_qty += raw_execution - capped;
+                }
+                capped
+            } else {
+                raw_execution
             };
             let cancels = unexplained - execution;
             let raw_cancel_advance = cancels * ahead_frac;
@@ -1783,6 +1857,9 @@ impl SimExchangeV2 {
         self.dynamic_ahead_frac_min = self.dynamic_ahead_frac_min.min(dynamic_min);
         self.dynamic_ahead_frac_max = self.dynamic_ahead_frac_max.max(dynamic_max);
         self.unexplained_depletion_fills_n += mfills.len() as u64;
+        self.depletion_evidence_capped_n += evidence_capped_n;
+        self.depletion_evidence_capped_qty += evidence_capped_qty;
+        self.pending_level_trade_evidence.remove(changed_token);
         self.book_fill_haircut_n += haircut_n;
         self.book_fill_haircut_qty += haircut_qty;
         self.book_fill_haircut_cost_usdc += haircut_cost;
@@ -1941,6 +2018,18 @@ impl SimExchangeV2 {
         }
         let tick = self.tick_of(symbol);
         let trade_ticks = price_to_ticks(price, tick);
+        if self.depletion_trade_evidence_mult > 0.0 && qty > 0.0 {
+            let maker_side_rank = match aggressor_side {
+                Side::Sell => 0, // a sell aggressor executes the bid queue
+                Side::Buy => 1,  // a buy aggressor executes the ask queue
+            };
+            *self
+                .pending_level_trade_evidence
+                .entry(symbol.to_string())
+                .or_default()
+                .entry((maker_side_rank, trade_ticks, tick.to_bits()))
+                .or_default() += qty;
+        }
         let vn = self.fill_markout_vn;
         let toxicity_strength = self.maker_toxicity_strength;
         let toxicity_scale_ticks = self.maker_toxicity_scale_ticks;
@@ -2379,6 +2468,7 @@ impl SimExchangeV2 {
             self.last_book_ts.remove(t);
             self.last_book_local_ts.remove(t);
             self.recent_trades.remove(t);
+            self.pending_level_trade_evidence.remove(t);
             self.books.retire_token(t);
             self.wallets.retire_token(t);
         }
@@ -5254,6 +5344,135 @@ mod tests {
         assert_eq!(row.depletion_candidate_qty, 2.5);
         assert_eq!(row.depletion_fill_qty, 2.5);
         assert_eq!(row.fill_qty, 2.5);
+    }
+
+    #[test]
+    fn depletion_execution_requires_exact_level_trade_evidence_when_enabled() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.configure_depletion_trade_evidence(0.5);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // Two public shares at the exact bid corroborate at most one inferred
+        // hidden share. The print drains q_ahead 5→3 but does not itself fill.
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.55, 2.0))
+            .is_empty());
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert!((fills[0].filled_quantity - 1.0).abs() < EPS);
+        assert_eq!(c.orders["a"].remaining, 4.0);
+        assert!(c.depletion_evidence_capped_n > 0);
+        assert!(c.depletion_evidence_capped_qty > 0.0);
+    }
+
+    #[test]
+    fn depletion_execution_rejects_trade_evidence_from_another_price_level() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.configure_depletion_trade_evidence(1.0);
+        c.configure_exact_maker_trade_level(true);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // The 0.54 print is not evidence for shrinkage at the 0.55 queue.
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.54, 20.0))
+            .is_empty());
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert!(fills.is_empty());
+        assert_eq!(c.orders["a"].remaining, 5.0);
+        assert_eq!(c.orders["a"].q_ahead, 0.0);
+    }
+
+    #[test]
+    fn depletion_no_evidence_prior_retains_only_expected_execution_share() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.configure_depletion_trade_evidence(1.0);
+        c.configure_depletion_no_evidence_prior(0.25);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.54, 10.0)],
+            vec![(0.56, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert!((fills[0].filled_quantity - 2.5).abs() < EPS);
+        assert_eq!(c.orders["a"].remaining, 2.5);
+    }
+
+    #[test]
+    fn depletion_evidence_threshold_leaves_small_shrink_on_calibrated_path() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_replay_self_depth(1.0);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.configure_depletion_trade_evidence(1.0);
+        c.configure_depletion_no_evidence_prior(0.0);
+        c.configure_depletion_evidence_min_shrink(0.8);
+        c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 8.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(c.orders["a"].q_ahead, 2.0);
+
+        // Only 40% of the level disappears. The high-confidence evidence gate
+        // stays off, so the calibrated hidden-execution path supplies four
+        // shares, two drain q_ahead and two partially fill the order.
+        let fills = c.on_orderbook(&book(
+            "up",
+            vec![(0.55, 6.0)],
+            vec![(0.55, 100.0)],
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        assert!((fills[0].filled_quantity - 2.0).abs() < EPS);
     }
 
     #[test]

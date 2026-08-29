@@ -4356,6 +4356,15 @@ impl Engine {
         info!("══════════════════════════════════════");
 
         // ── Strat-lane replayers (local_ts order) — verbatim from v1 ──
+        let replay_options = crate::recorder::ReplayOptions {
+            bootstrap_binary_open: bt.sim_v2_bootstrap_binary_open,
+            binary_open_delay_ns: bt
+                .sim_v2_binary_open_delay_ms
+                .saturating_mul(1_000_000),
+            binary_open_max_backfill_ns: bt
+                .sim_v2_binary_open_max_backfill_ms
+                .saturating_mul(1_000_000),
+        };
         let mut strat_replayers: Vec<MarketReplayer> = Vec::new();
         for (exchange, symbol) in &replay_sources {
             if symbol.starts_with("rtds:")
@@ -4365,7 +4374,14 @@ impl Engine {
             {
                 continue;
             }
-            if let Ok(r) = MarketReplayer::new(&data_path, exchange, symbol, start_dt, end_dt) {
+            if let Ok(r) = MarketReplayer::new_with_options(
+                &data_path,
+                exchange,
+                symbol,
+                start_dt,
+                end_dt,
+                replay_options,
+            ) {
                 strat_replayers.push(r);
             }
         }
@@ -5299,6 +5315,13 @@ impl Engine {
             start: start_dt,
             end: end_dt,
             sources: replay_sources.clone(),
+            bootstrap_binary_open: bt.sim_v2_bootstrap_binary_open,
+            binary_open_delay_ns: bt
+                .sim_v2_binary_open_delay_ms
+                .saturating_mul(1_000_000),
+            binary_open_max_backfill_ns: bt
+                .sim_v2_binary_open_max_backfill_ms
+                .saturating_mul(1_000_000),
             place_p50_ms: place_p.0,
             place_p95_ms: place_p.1,
             place_p99_ms: place_p.2,
@@ -5317,6 +5340,9 @@ impl Engine {
             adverse_scale_ticks: bt.sim_v2_adverse_scale_ticks,
             book_through_rate: bt.sim_v2_book_through_rate,
             unexplained_depletion_exec_rate: bt.sim_v2_unexplained_depletion_exec_rate,
+            depletion_trade_evidence_mult: bt.sim_v2_depletion_trade_evidence_mult,
+            depletion_no_evidence_exec_frac: bt.sim_v2_depletion_no_evidence_exec_frac,
+            depletion_evidence_min_shrink_frac: bt.sim_v2_depletion_evidence_min_shrink_frac,
             inferred_maker_residual_rate: bt.sim_v2_inferred_maker_residual_rate,
             inferred_maker_residual_fraction: bt.sim_v2_inferred_maker_residual_fraction,
             replay_self_depth_rate: bt.sim_v2_replay_self_depth_rate,
@@ -5812,6 +5838,14 @@ impl Engine {
             info!(
                 "  Sim v2:   unexplained-depletion maker fills: {} (residual L2 shrinkage treated as hidden execution)",
                 depletion_fills
+            );
+        }
+        let (evidence_capped_n, evidence_capped_qty) =
+            sim.depletion_trade_evidence_stats();
+        if evidence_capped_n > 0 {
+            info!(
+                "  Sim v2:   depletion evidence capped_resyncs={} suppressed_hidden_qty={:.4} (exact-level public-trade budget)",
+                evidence_capped_n, evidence_capped_qty
             );
         }
         let (residual_orders, residual_qty) = sim.inferred_maker_residual_stats();
