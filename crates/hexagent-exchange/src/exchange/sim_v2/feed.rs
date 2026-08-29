@@ -28,7 +28,7 @@ const FEED_TOKEN_CAP: usize = 128;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::recorder::MarketReplayer;
+use crate::recorder::{MarketReplayer, ReplayOptions};
 use crate::types::MarketEvent;
 
 use super::event::SimEvent;
@@ -96,12 +96,29 @@ impl ServerFeed {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Self> {
+        Self::new_with_replay_options(data_dir, sources, start, end, ReplayOptions::default())
+    }
+
+    pub fn new_with_replay_options(
+        data_dir: &Path,
+        sources: &[(String, String)],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        replay_options: ReplayOptions,
+    ) -> Result<Self> {
         let mut replayers = Vec::new();
         for (exchange, symbol) in sources {
             if exchange != "polymarket" {
                 continue;
             }
-            if let Ok(r) = MarketReplayer::new(data_dir, exchange, symbol, start, end) {
+            if let Ok(r) = MarketReplayer::new_with_options(
+                data_dir,
+                exchange,
+                symbol,
+                start,
+                end,
+                replay_options,
+            ) {
                 replayers.push(r);
             }
         }

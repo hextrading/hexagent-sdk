@@ -365,6 +365,20 @@ pub struct BacktestConfig {
     /// parquet continue to replay independently.
     #[serde(default)]
     pub market_data_health_replay_path: String,
+    /// sim_v2 only — repair legacy rotating-event tapes whose Instrument and
+    /// first full books were recorded a few seconds after the scheduled open.
+    /// The first observed book is held backward as an opening seed; the
+    /// original row is retained at its recorded time. Disabled by default.
+    #[serde(default)]
+    pub sim_v2_bootstrap_binary_open: bool,
+    /// Offset after the scheduled event open at which the repaired Instrument
+    /// and seed books become visible. 20 ms mirrors the live activation lane.
+    #[serde(default = "default_sim_v2_binary_open_delay_ms")]
+    pub sim_v2_binary_open_delay_ms: u64,
+    /// Hard maximum distance the first Instrument/book may be moved backward.
+    /// Rows beyond this bound are left untouched to avoid unbounded lookahead.
+    #[serde(default = "default_sim_v2_binary_open_max_backfill_ms")]
+    pub sim_v2_binary_open_max_backfill_ms: u64,
     /// sim_v2 only — cancel-attribution ahead-fraction (the single
     /// microstructure knob, design §5). `< 0` (default) = proportional model
     /// `q_ahead/level`; `[0,1]` pins the fraction of attributed cancels that
@@ -474,6 +488,23 @@ pub struct BacktestConfig {
     /// the historical model exactly.
     #[serde(default)]
     pub sim_v2_unexplained_depletion_exec_rate: f64,
+    /// sim_v2 only — when positive, hidden/aggregated execution inferred from
+    /// L2 shrinkage is capped per canonical price level by this multiple of
+    /// exact-level public trade volume observed since the preceding book.
+    /// Zero preserves the legacy uncapped model.
+    #[serde(default)]
+    pub sim_v2_depletion_trade_evidence_mult: f64,
+    /// Fraction of the legacy hidden-execution estimate retained as a prior
+    /// when an interval has no exact-level public trade evidence. This models
+    /// the irreducible L2 attribution ambiguity instead of hard-classifying all
+    /// unsupported shrinkage as either execution or cancellation.
+    #[serde(default)]
+    pub sim_v2_depletion_no_evidence_exec_frac: f64,
+    /// Minimum unexplained-shrink / previous-level-depth ratio at which the
+    /// evidence/prior mixture is applied. Zero applies it to every shrink;
+    /// higher values focus the correction on near-total level disappearance.
+    #[serde(default)]
+    pub sim_v2_depletion_evidence_min_shrink_frac: f64,
     /// sim_v2 only — deterministic share of maker orders for which matching
     /// retains a tiny inferred exchange-side residual instead of manufacturing
     /// an exact full fill. The private order manager can release
@@ -1080,6 +1111,12 @@ fn default_sim_latency_p95_ms() -> u64 {
 fn default_sim_latency_p99_ms() -> u64 {
     700
 }
+fn default_sim_v2_binary_open_delay_ms() -> u64 {
+    20
+}
+fn default_sim_v2_binary_open_max_backfill_ms() -> u64 {
+    5_000
+}
 fn default_sim_latency_seed() -> u64 {
     42
 }
@@ -1127,6 +1164,10 @@ impl Default for BacktestConfig {
         Self {
             data_dir: default_output_dir(),
             market_data_health_replay_path: String::new(),
+            sim_v2_bootstrap_binary_open: false,
+            sim_v2_binary_open_delay_ms: default_sim_v2_binary_open_delay_ms(),
+            sim_v2_binary_open_max_backfill_ms:
+                default_sim_v2_binary_open_max_backfill_ms(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
             sim_v2_dynamic_ahead_frac_strength: 0.0,
             sim_v2_fill_push_mult: default_sim_v2_fill_push_mult(),
@@ -1153,6 +1194,9 @@ impl Default for BacktestConfig {
             sim_v2_maker_toxicity_scale_ticks: default_sim_v2_maker_toxicity_scale_ticks(),
             sim_v2_book_through_rate: default_sim_v2_book_through_rate(),
             sim_v2_unexplained_depletion_exec_rate: 0.0,
+            sim_v2_depletion_trade_evidence_mult: 0.0,
+            sim_v2_depletion_no_evidence_exec_frac: 0.0,
+            sim_v2_depletion_evidence_min_shrink_frac: 0.0,
             sim_v2_inferred_maker_residual_rate: 0.0,
             sim_v2_inferred_maker_residual_fraction:
                 default_sim_v2_inferred_maker_residual_fraction(),
