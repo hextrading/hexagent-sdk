@@ -355,6 +355,12 @@ pub struct SimExchangeV2 {
     /// Fraction of earlier simulated same-level remaining quantity included in
     /// a new resting order's queue ahead. 0 = exact historical behaviour.
     order_queue_position_strength: f64,
+    /// A public trade print belongs to one canonical execution price. When
+    /// enabled, it drains only that exact maker queue rather than every
+    /// crossing price-level queue.
+    exact_maker_trade_level: bool,
+    pub exact_cross_level_order_skips: u64,
+    pub exact_cross_level_qty_skipped: f64,
     pub own_queue_positioned_orders: u64,
     pub own_queue_initial_qty: f64,
     pub own_queue_cancel_advances_n: u64,
@@ -371,6 +377,11 @@ pub struct SimExchangeV2 {
     /// produced when both tokens carried the same liquidity. `fold_to[down] =
     /// canon`; canonical token (clob_token_ids[0]) is absent from the map.
     fold_outcomes: bool,
+    /// Once a canonical-token book is available, do not let asynchronous
+    /// sibling mirrors oscillate the shared queue. Sibling trades still fold.
+    fold_canonical_book_only: bool,
+    canonical_book_seen: HashSet<String>,
+    pub folded_sibling_books_ignored: u64,
     fold_to: HashMap<String, String>,
     /// Token → event slug, retained only while the token is live. Audit rows
     /// themselves are retained for the complete replay and emitted at exit.
@@ -465,6 +476,9 @@ pub struct SimExchangeV2 {
     /// strategy's original live order at the same level. 0 = ordinary clean
     /// tape; positive values subtract up to rate·remaining from queue-ahead.
     replay_self_depth_rate: f64,
+    /// Replace aggregate estimated live self-depth once for overlapping
+    /// same-level simulated orders, then rebuild their own FIFO explicitly.
+    replay_self_depth_fifo_replacement: bool,
     /// Leave-one-out fraction for taker sweeps on a tape recorded while this
     /// same strategy instance was live. Opposite-side simulated resting orders
     /// are removed from their exact canonical levels before marketability,
@@ -624,6 +638,9 @@ impl SimExchangeV2 {
             orders: BTreeMap::new(),
             next_queue_seq: 0,
             order_queue_position_strength: 0.0,
+            exact_maker_trade_level: false,
+            exact_cross_level_order_skips: 0,
+            exact_cross_level_qty_skipped: 0.0,
             own_queue_positioned_orders: 0,
             own_queue_initial_qty: 0.0,
             own_queue_cancel_advances_n: 0,
@@ -633,6 +650,9 @@ impl SimExchangeV2 {
             split_by_iid,
             seeded_conditions: HashSet::new(),
             fold_outcomes: false,
+            fold_canonical_book_only: false,
+            canonical_book_seen: HashSet::new(),
+            folded_sibling_books_ignored: 0,
             fold_to: HashMap::new(),
             event_slug_by_token: HashMap::new(),
             fill_audit: BTreeMap::new(),
@@ -671,6 +691,7 @@ impl SimExchangeV2 {
             inferred_maker_residual_orders_n: 0,
             inferred_maker_residual_qty: 0.0,
             replay_self_depth_rate: 0.0,
+            replay_self_depth_fifo_replacement: false,
             replay_self_taker_depth_rate: 0.0,
             taker_replay_self_sweeps_n: 0,
             taker_replay_self_depth_qty: 0.0,
@@ -820,6 +841,16 @@ impl SimExchangeV2 {
     /// mutable state or cross-thread synchronization.
     pub fn configure_order_queue_position(&mut self, strength: f64) {
         self.order_queue_position_strength = strength.clamp(0.0, 1.0);
+    }
+
+    pub fn configure_exact_maker_trade_level(&mut self, enabled: bool) {
+        self.exact_maker_trade_level = enabled;
+        if enabled {
+            // Exact-level public flow must be conserved across our own orders
+            // too; partial FIFO would let one print execute more simulated
+            // quantity than crossed the level.
+            self.order_queue_position_strength = 1.0;
+        }
     }
 
     fn audit_key(&self, token: &str, iid: &str) -> Option<(String, String)> {
@@ -977,9 +1008,17 @@ impl SimExchangeV2 {
                 continue;
             }
             let order_ticks = price_to_ticks(o.match_price, tick);
+            let price_matches = if self.exact_maker_trade_level {
+                trade_ticks == order_ticks
+            } else {
+                match o.match_side {
+                    Side::Buy => trade_ticks <= order_ticks,
+                    Side::Sell => trade_ticks >= order_ticks,
+                }
+            };
             let matches = match o.match_side {
-                Side::Buy => side == Side::Sell && trade_ticks <= order_ticks,
-                Side::Sell => side == Side::Buy && trade_ticks >= order_ticks,
+                Side::Buy => side == Side::Sell && price_matches,
+                Side::Sell => side == Side::Buy && price_matches,
             };
             if !matches {
                 continue;
@@ -1098,6 +1137,15 @@ impl SimExchangeV2 {
         self.replay_self_depth_rate = rate.clamp(0.0, 1.0);
     }
 
+    pub fn configure_replay_self_depth_fifo_replacement(&mut self, enabled: bool) {
+        self.replay_self_depth_fifo_replacement = enabled;
+        if enabled {
+            // Replacement removes the aggregate recorded own contribution and
+            // therefore must add every simulated predecessor back in full.
+            self.order_queue_position_strength = 1.0;
+        }
+    }
+
     /// Configure exact-level leave-one-out cleaning for taker sweeps. Enable
     /// only when the replay tape contains this strategy instance's live quotes.
     pub fn configure_replay_self_taker_depth(&mut self, rate: f64) {
@@ -1123,6 +1171,10 @@ impl SimExchangeV2 {
         // Mirror the flag into the book set so the cross-outcome merge chokepoint
         // (`comp_book`) can debug_assert it stays inert under folding.
         self.books.set_folded(on);
+    }
+
+    pub fn configure_fold_canonical_book_only(&mut self, enabled: bool) {
+        self.fold_canonical_book_only = enabled;
     }
 
     /// Deep-queue model for resting prices beyond the recorded window (0 = legacy
@@ -1233,6 +1285,13 @@ impl SimExchangeV2 {
             // outcome streams interleave; an older snapshot would regress the
             // shared book).
             let canon = self.canonical_of(&ob.symbol).to_string();
+            if self.fold_canonical_book_only
+                && ob.symbol != canon
+                && self.canonical_book_seen.contains(&canon)
+            {
+                self.folded_sibling_books_ignored += 1;
+                return Vec::new();
+            }
             if let Some(&last) = self.last_book_ts.get(&canon) {
                 if ob.exchange_timestamp_ns < last {
                     return Vec::new();
@@ -1240,6 +1299,7 @@ impl SimExchangeV2 {
             }
             self.last_book_ts.insert(canon.clone(), ob.exchange_timestamp_ns);
             if ob.symbol == canon {
+                self.canonical_book_seen.insert(canon.clone());
                 self.books.update(&canon, ob.bids.clone(), ob.asks.clone());
             } else {
                 let (b, a) = Self::mirror_levels(&ob.bids, &ob.asks);
@@ -1894,6 +1954,8 @@ impl SimExchangeV2 {
         let mut toxicity_suppressed_qty = 0.0;
         let mut residual_orders_n = 0u64;
         let mut residual_qty = 0.0;
+        let mut exact_cross_level_order_skips = 0u64;
+        let mut exact_cross_level_qty_skipped = 0.0;
         let audit_slug = self.event_slug_by_token.get(symbol).cloned();
         let audits = &mut self.fill_audit;
         let order_audits = &mut self.maker_order_audit;
@@ -1905,9 +1967,34 @@ impl SimExchangeV2 {
                 continue;
             }
             let order_ticks = price_to_ticks(o.match_price, tick);
+            let side_matches = match o.match_side {
+                Side::Buy => aggressor_side == Side::Sell,
+                Side::Sell => aggressor_side == Side::Buy,
+            };
+            let legacy_price_matches = match o.match_side {
+                Side::Buy => trade_ticks <= order_ticks,
+                Side::Sell => trade_ticks >= order_ticks,
+            };
+            if self.exact_maker_trade_level
+                && side_matches
+                && legacy_price_matches
+                && trade_ticks != order_ticks
+            {
+                exact_cross_level_order_skips += 1;
+                exact_cross_level_qty_skipped += qty;
+                continue;
+            }
+            let price_matches = if self.exact_maker_trade_level {
+                trade_ticks == order_ticks
+            } else {
+                match o.match_side {
+                    Side::Buy => trade_ticks <= order_ticks,
+                    Side::Sell => trade_ticks >= order_ticks,
+                }
+            };
             let matches = match o.match_side {
-                Side::Buy => aggressor_side == Side::Sell && trade_ticks <= order_ticks,
-                Side::Sell => aggressor_side == Side::Buy && trade_ticks >= order_ticks,
+                Side::Buy => aggressor_side == Side::Sell && price_matches,
+                Side::Sell => aggressor_side == Side::Buy && price_matches,
             };
             if !matches {
                 continue;
@@ -2047,6 +2134,8 @@ impl SimExchangeV2 {
         self.maker_toxicity_suppressed_qty += toxicity_suppressed_qty;
         self.inferred_maker_residual_orders_n += residual_orders_n;
         self.inferred_maker_residual_qty += residual_qty;
+        self.exact_cross_level_order_skips += exact_cross_level_order_skips;
+        self.exact_cross_level_qty_skipped += exact_cross_level_qty_skipped;
     }
 
     fn apply_maker_fills(&mut self, mut fills: Vec<MakerFill>, now_ns: u64) -> Vec<OrderUpdate> {
@@ -2285,6 +2374,7 @@ impl SimExchangeV2 {
             self.tick.remove(t);
             self.fold_to.remove(t);
             self.fold_sibling.remove(t);
+            self.canonical_book_seen.remove(t);
             self.event_slug_by_token.remove(t);
             self.last_book_ts.remove(t);
             self.last_book_local_ts.remove(t);
@@ -2903,8 +2993,27 @@ impl SimExchangeV2 {
         // transiently differ if only one outcome stream emitted a tick-size change.
         let tick = self.tick_of(&msym);
         let now_depth = self.books.level_depth(&msym, mside, match_price, tick);
+        let same_level_own_remaining = self
+            .orders
+            .values()
+            .filter(|prior| {
+                prior.request.instance_id == o.instance_id
+                    && Self::same_queue_level(prior, &msym, mside, match_price, tick)
+            })
+            .map(|prior| prior.remaining.max(0.0))
+            .sum::<f64>();
+        // A self-contaminated replay level may contain several overlapping
+        // live orders. In replacement mode remove their estimated aggregate
+        // contribution once, then add the simulated predecessors back through
+        // the explicit FIFO below. This keeps public and own queue components
+        // disjoint instead of granting every replacement the same depth.
+        let replay_self_depth_basis = if self.replay_self_depth_fifo_replacement {
+            remaining + same_level_own_remaining
+        } else {
+            remaining
+        };
         let replay_self_depth_credit = if now_depth > EPS {
-            (self.replay_self_depth_rate * remaining).min(now_depth)
+            (self.replay_self_depth_rate * replay_self_depth_basis).min(now_depth)
         } else {
             0.0
         };
@@ -2993,16 +3102,7 @@ impl SimExchangeV2 {
         // budget: the print must consume public depth, then earlier own size,
         // before it can reach the later order.
         let simulated_own_ahead_qty = if self.order_queue_position_strength > 0.0 {
-            self.order_queue_position_strength
-                * self
-                    .orders
-                    .values()
-                    .filter(|prior| {
-                        prior.request.instance_id == o.instance_id
-                            && Self::same_queue_level(prior, &msym, mside, match_price, tick)
-                    })
-                    .map(|prior| prior.remaining.max(0.0))
-                    .sum::<f64>()
+            self.order_queue_position_strength * same_level_own_remaining
         } else {
             0.0
         };
@@ -3911,6 +4011,86 @@ mod tests {
     }
 
     #[test]
+    fn exact_trade_level_does_not_reuse_one_print_across_price_queues() {
+        let mut c = core();
+        c.configure_order_queue_position(1.0);
+        c.configure_exact_maker_trade_level(true);
+        c.on_orderbook(&book(
+            "up",
+            vec![(0.60, 10.0), (0.59, 20.0)],
+            vec![(0.62, 80.0)],
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("best", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("printed", "up", Side::Buy, 0.59, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // The public print belongs to the 0.59 execution level. It consumes
+        // that level's twenty public shares and fills five simulated shares,
+        // but cannot also drain the independent 0.60 queue.
+        let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.59, 25.0));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].client_order_id, "printed");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert_eq!(c.orders["best"].q_ahead, 10.0);
+        assert_eq!(c.orders["best"].remaining, 5.0);
+    }
+
+    #[test]
+    fn self_depth_replacement_deduplicates_overlapping_live_depth_credit() {
+        let mut c = core();
+        c.configure_replay_self_depth(1.0);
+        c.configure_replay_self_depth_fifo_replacement(true);
+        c.configure_order_queue_position(1.0);
+        c.on_orderbook(&book("up", vec![(0.60, 20.0)], vec![(0.62, 80.0)]));
+
+        assert_eq!(
+            c.submit_order(
+                &order("older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("newer", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+
+        // The first order replaces five recorded self shares: public queue 15.
+        // The second replaces the aggregate ten recorded self shares, then puts
+        // the older five simulated shares back ahead: public 10 + own FIFO 5.
+        assert_eq!(c.orders["older"].replay_self_depth_credit, 5.0);
+        assert_eq!(c.orders["older"].q_ahead, 15.0);
+        assert_eq!(c.orders["newer"].replay_self_depth_credit, 10.0);
+        assert_eq!(c.orders["newer"].own_q_ahead, 5.0);
+        assert_eq!(c.orders["newer"].q_ahead, 15.0);
+
+        assert_eq!(
+            c.cancel_order(Exchange::Polymarket, "older", 3).status,
+            OrderStatus::Cancelled
+        );
+        assert_eq!(c.orders["newer"].q_ahead, 10.0);
+        assert_eq!(c.orders["newer"].own_q_ahead, 0.0);
+    }
+
+    #[test]
     fn cancelling_older_own_order_advances_only_later_same_instance_order() {
         let mut c = core();
         c.configure_order_queue_position(1.0);
@@ -4705,6 +4885,49 @@ mod tests {
     }
 
     #[test]
+    fn canonical_book_only_uses_sibling_for_cold_start_then_stops_oscillation() {
+        let mut c = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
+        c.set_fold_outcomes(true);
+        c.configure_fold_canonical_book_only(true);
+        c.on_instrument(&binary_instrument());
+
+        // Before the first canonical snapshot, the mirrored sibling is a valid
+        // cold-start source: down ask 0.40 maps to up bid 0.60.
+        c.on_orderbook(&book_ts(
+            "down",
+            vec![(0.38, 20.0)],
+            vec![(0.40, 30.0)],
+            100,
+        ));
+        assert_eq!(c.books.level_depth("up", Side::Buy, 0.60, 0.01), 30.0);
+
+        // Canonical Up becomes authoritative. A newer but slightly different
+        // sibling mirror must not replace it and manufacture a queue depletion.
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 50.0)],
+            vec![(0.62, 80.0)],
+            200,
+        ));
+        c.on_orderbook(&book_ts(
+            "down",
+            vec![(0.38, 20.0)],
+            vec![(0.40, 5.0)],
+            300,
+        ));
+        assert_eq!(c.books.level_depth("up", Side::Buy, 0.60, 0.01), 50.0);
+        assert_eq!(c.folded_sibling_books_ignored, 1);
+
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.60, 40.0)],
+            vec![(0.62, 80.0)],
+            400,
+        ));
+        assert_eq!(c.books.level_depth("up", Side::Buy, 0.60, 0.01), 40.0);
+    }
+
+    #[test]
     fn fold_book_staleness_drops_older_snapshot() {
         let mut c = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
         c.set_fold_outcomes(true);
@@ -5387,9 +5610,10 @@ mod tests {
             );
         }
 
-        fn sample_trade(toxicity: f64, n: usize) -> Vec<u64> {
+        fn sample_trade(toxicity: f64, exact_level: bool, n: usize) -> Vec<u64> {
             let mut c = core();
             c.configure_maker_toxicity(toxicity, 1.0);
+            c.configure_exact_maker_trade_level(exact_level);
             c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
             assert_eq!(
                 c.submit_order(
@@ -5420,9 +5644,17 @@ mod tests {
             samples
         }
 
-        fn sample_queue_lifecycle(strength: f64, n: usize) -> Vec<u64> {
+        fn sample_queue_lifecycle(
+            strength: f64,
+            self_depth_replacement: bool,
+            n: usize,
+        ) -> Vec<u64> {
             let mut c = core();
             c.configure_order_queue_position(strength);
+            if self_depth_replacement {
+                c.configure_replay_self_depth(1.0);
+                c.configure_replay_self_depth_fifo_replacement(true);
+            }
             c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
             let older = order("older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
             let later = order("later", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit);
@@ -5515,10 +5747,24 @@ mod tests {
         }
 
         const N: usize = 50_000;
-        describe("trade_disabled", sample_trade(0.0, N), 1);
-        describe("trade_toxicity_0p5", sample_trade(0.5, N), 1);
-        describe("queue_disabled", sample_queue_lifecycle(0.0, N), 2);
-        describe("queue_fifo_1p0", sample_queue_lifecycle(1.0, N), 2);
+        describe("trade_disabled", sample_trade(0.0, false, N), 1);
+        describe("trade_toxicity_0p5", sample_trade(0.5, false, N), 1);
+        describe("trade_exact_level", sample_trade(0.0, true, N), 1);
+        describe(
+            "queue_disabled",
+            sample_queue_lifecycle(0.0, false, N),
+            2,
+        );
+        describe(
+            "queue_fifo_1p0",
+            sample_queue_lifecycle(1.0, false, N),
+            2,
+        );
+        describe(
+            "queue_self_depth_replacement",
+            sample_queue_lifecycle(1.0, true, N),
+            2,
+        );
         describe("book_markout_disabled", sample_book_markout(0.0, N), 1);
         describe("book_markout_0p78", sample_book_markout(0.78, N), 1);
         describe("taker_self_clean_disabled", sample_taker_self_clean(0.0, N), 1);

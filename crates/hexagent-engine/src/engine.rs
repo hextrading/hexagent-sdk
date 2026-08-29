@@ -5320,6 +5320,7 @@ impl Engine {
             inferred_maker_residual_rate: bt.sim_v2_inferred_maker_residual_rate,
             inferred_maker_residual_fraction: bt.sim_v2_inferred_maker_residual_fraction,
             replay_self_depth_rate: bt.sim_v2_replay_self_depth_rate,
+            replay_self_depth_fifo_replacement: bt.sim_v2_replay_self_depth_fifo_replacement,
             replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
             fill_markout_vn: bt.sim_v2_fill_markout_vn,
@@ -5349,11 +5350,13 @@ impl Engine {
             maker_race_rate: bt.sim_v2_maker_race_rate,
             taker_race_rate: bt.sim_v2_taker_race_rate,
             order_queue_position_strength: bt.sim_v2_order_queue_position_strength,
+            exact_maker_trade_level: bt.sim_v2_exact_maker_trade_level,
             maker_toxicity_strength: bt.sim_v2_maker_toxicity_strength,
             maker_toxicity_scale_ticks: bt.sim_v2_maker_toxicity_scale_ticks,
             maker_race_horizon_ns: bt.sim_v2_maker_race_horizon_ms.saturating_mul(1_000_000),
             taker_race_horizon_ns: bt.sim_v2_taker_race_horizon_ms.saturating_mul(1_000_000),
             fold_outcomes: bt.sim_v2_fold_outcomes,
+            fold_canonical_book_only: bt.sim_v2_fold_canonical_book_only,
             book_stale_after_ns: bt.sim_v2_book_stale_after_ms.saturating_mul(1_000_000),
             causal_matching: bt.sim_v2_causal_matching,
             stale_resting_exchange_only: bt.sim_v2_stale_resting_exchange_only,
@@ -5774,6 +5777,14 @@ impl Engine {
             info!(
                 "  Sim v2:   own FIFO positioned_orders={} initial_ahead_qty={:.4} cancel_advances={} cancel_advance_qty={:.4}",
                 own_positioned, own_initial, own_cancel_n, own_cancel_qty
+            );
+        }
+        let (cross_level_skips, cross_level_qty, sibling_books_ignored) =
+            sim.queue_integrity_stats();
+        if cross_level_skips > 0 || sibling_books_ignored > 0 {
+            info!(
+                "  Sim v2:   queue integrity exact_cross_level_order_skips={} duplicated_order_qty_suppressed={:.4} folded_sibling_books_ignored={}",
+                cross_level_skips, cross_level_qty, sibling_books_ignored
             );
         }
         let (toxicity_n, toxicity_qty) = sim.maker_toxicity_stats();
