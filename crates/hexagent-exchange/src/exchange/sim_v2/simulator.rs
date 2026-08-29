@@ -65,6 +65,9 @@ pub struct SimV2Config {
     /// Approximate leave-one-out correction for tapes containing this
     /// strategy's original live resting order.
     pub replay_self_depth_rate: f64,
+    /// Replace aggregate same-level replayed self depth once, then rebuild the
+    /// simulated orders' own exchange-arrival FIFO.
+    pub replay_self_depth_fifo_replacement: bool,
     /// Leave-one-out correction for taker sweeps on a self-contaminated tape.
     pub replay_self_taker_depth_rate: f64,
     /// Multiplier of sampled cancel L2 reserved for exchange-side matching
@@ -111,6 +114,8 @@ pub struct SimV2Config {
     /// Earlier same-level simulated orders included in a new order's FIFO
     /// queue position (0 = legacy independent orders, 1 = full own FIFO).
     pub order_queue_position_strength: f64,
+    /// Public maker trade prints drain only their exact canonical price level.
+    pub exact_maker_trade_level: bool,
     /// Causal suppression of favorable maker fills at the real limit.
     pub maker_toxicity_strength: f64,
     pub maker_toxicity_scale_ticks: f64,
@@ -122,6 +127,9 @@ pub struct SimV2Config {
     /// book (down mapped p↔1−p, bid↔ask / buy↔sell). Removes the cross-outcome
     /// double-count. See `exchange.rs`.
     pub fold_outcomes: bool,
+    /// Prefer canonical-token books after their first accepted snapshot while
+    /// continuing to fold sibling trades.
+    pub fold_canonical_book_only: bool,
     /// Fail-closed max age for both full-book clocks. 0 disables the gate.
     pub book_stale_after_ns: u64,
     /// Disable book lookahead after an order reaches the simulated engine.
@@ -397,11 +405,11 @@ impl Simulator {
         core.configure_book_fill_markout_vn(cfg.book_fill_markout_vn);
         core.configure_race(cfg.maker_race_rate, cfg.taker_race_rate);
         core.configure_order_queue_position(cfg.order_queue_position_strength);
-        core.configure_maker_toxicity(
-            cfg.maker_toxicity_strength,
-            cfg.maker_toxicity_scale_ticks,
-        );
+        core.configure_replay_self_depth_fifo_replacement(cfg.replay_self_depth_fifo_replacement);
+        core.configure_exact_maker_trade_level(cfg.exact_maker_trade_level);
+        core.configure_maker_toxicity(cfg.maker_toxicity_strength, cfg.maker_toxicity_scale_ticks);
         core.set_fold_outcomes(cfg.fold_outcomes);
+        core.configure_fold_canonical_book_only(cfg.fold_canonical_book_only);
         core.configure_book_stale_gate(cfg.book_stale_after_ns);
         core.configure_stale_resting_exchange_only(cfg.stale_resting_exchange_only);
         core.configure_taker_comp(cfg.taker_comp_rate, cfg.taker_comp_window_ns);
@@ -707,6 +715,17 @@ impl Simulator {
             c.own_queue_initial_qty,
             c.own_queue_cancel_advances_n,
             c.own_queue_cancel_advance_qty,
+        )
+    }
+
+    /// Queue-integrity diagnostics: legacy cross-price order matches suppressed
+    /// by exact-level trade attribution, their duplicated per-order quantity,
+    /// and sibling books ignored after canonical-book activation.
+    pub fn queue_integrity_stats(&self) -> (u64, f64, u64) {
+        (
+            self.core.exact_cross_level_order_skips,
+            self.core.exact_cross_level_qty_skipped,
+            self.core.folded_sibling_books_ignored,
         )
     }
 

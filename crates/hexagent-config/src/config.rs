@@ -433,6 +433,11 @@ pub struct BacktestConfig {
     /// exchange-arrival FIFO. Earlier cancellations advance later orders.
     #[serde(default)]
     pub sim_v2_order_queue_position_strength: f64,
+    /// sim_v2 only — require a public maker trade print to match the resting
+    /// order's exact canonical price level. The legacy crossing comparison can
+    /// apply one print's full quantity to more than one price-level queue.
+    #[serde(default)]
+    pub sim_v2_exact_maker_trade_level: bool,
     /// sim_v2 only — ADVERSE-SELECTION conditioning of the cancel attribution
     /// (`ahead_frac`) ∈ [0,∞) (0 = off → pure proportional). Cancellations are
     /// informed: when the mid moves AGAINST a resting order between snapshots,
@@ -488,6 +493,12 @@ pub struct BacktestConfig {
     /// bounded approximation once full live order tuples are available.
     #[serde(default)]
     pub sim_v2_replay_self_depth_rate: f64,
+    /// sim_v2 only — replace estimated aggregate same-level live self-depth
+    /// once, then rebuild simulated exchange-arrival FIFO. This prevents
+    /// overlapping simulated orders from independently claiming the same
+    /// replayed depth credit.
+    #[serde(default)]
+    pub sim_v2_replay_self_depth_fifo_replacement: bool,
     /// sim_v2 only — leave-one-out correction for TAKER sweeps replayed on a
     /// tape recorded while the same strategy was live. At each canonical price
     /// level, subtract this fraction of the replay instance's currently resting
@@ -563,6 +574,13 @@ pub struct BacktestConfig {
     /// Removes the cross-outcome double-count of the old complement-merge.
     #[serde(default = "default_sim_v2_fold_outcomes")]
     pub sim_v2_fold_outcomes: bool,
+    /// sim_v2 only — under outcome folding, use mirrored sibling books only
+    /// until the canonical token's first accepted snapshot. Afterwards only
+    /// canonical snapshots may replace the shared book; sibling trades remain
+    /// folded. This avoids treating small asynchronous mirror discrepancies as
+    /// queue depletion. Disabled by default for replay compatibility.
+    #[serde(default)]
+    pub sim_v2_fold_canonical_book_only: bool,
     /// sim_v2 only — fail-closed matching guard for a cached full orderbook.
     /// An order/trade cannot fill when either the last accepted book's local
     /// receive timestamp or its exchange timestamp is older than this many ms.
@@ -1128,6 +1146,7 @@ impl Default for BacktestConfig {
             sim_v2_dynamic_taker_overhead_blend: default_sim_v2_dynamic_taker_overhead_blend(),
             sim_v2_maker_race_rate: default_sim_v2_maker_race_rate(),
             sim_v2_order_queue_position_strength: 0.0,
+            sim_v2_exact_maker_trade_level: false,
             sim_v2_adverse_sel_rate: default_sim_v2_adverse_sel_rate(),
             sim_v2_adverse_scale_ticks: default_sim_v2_adverse_scale_ticks(),
             sim_v2_maker_toxicity_strength: 0.0,
@@ -1138,6 +1157,7 @@ impl Default for BacktestConfig {
             sim_v2_inferred_maker_residual_fraction:
                 default_sim_v2_inferred_maker_residual_fraction(),
             sim_v2_replay_self_depth_rate: 0.0,
+            sim_v2_replay_self_depth_fifo_replacement: false,
             sim_v2_replay_self_taker_depth_rate: 0.0,
             sim_v2_cancel_finality_delay_frac: 0.0,
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
@@ -1154,6 +1174,7 @@ impl Default for BacktestConfig {
             sim_v2_maker_race_horizon_ms: default_sim_v2_maker_race_horizon_ms(),
             sim_v2_taker_race_horizon_ms: default_sim_v2_taker_race_horizon_ms(),
             sim_v2_fold_outcomes: default_sim_v2_fold_outcomes(),
+            sim_v2_fold_canonical_book_only: false,
             sim_v2_book_stale_after_ms: 0,
             sim_v2_fill_audit: false,
             sim_v2_causal_matching: false,
