@@ -390,6 +390,14 @@ pub struct BacktestConfig {
     /// resync. 0 (default) is the historical fixed model; 1 is fully dynamic.
     #[serde(default)]
     pub sim_v2_dynamic_ahead_frac_strength: f64,
+    /// sim_v2 only — additional order-local queue-position attribution for
+    /// partial L2 shrinkage.  A small shrink is more likely to be cancellation
+    /// spread through the queue, while a near-total level disappearance keeps
+    /// the configured adverse/fixed attribution. 0 preserves the historical
+    /// model; 1 fully uses `q_ahead / previous_level_depth` for an infinitesimal
+    /// shrink, with a linear fade as the whole level disappears.
+    #[serde(default)]
+    pub sim_v2_partial_depletion_queue_strength: f64,
     /// sim_v2 only — ws fill-push latency multiplier applied to the half-RTT
     /// when delivering fills back to the strategy (v1 calibrated ≈ 1.5).
     #[serde(default = "default_sim_v2_fill_push_mult")]
@@ -544,6 +552,26 @@ pub struct BacktestConfig {
     /// until finality. 0 preserves immediate cancellation at engine arrival.
     #[serde(default)]
     pub sim_v2_cancel_finality_delay_frac: f64,
+    /// Include exchange-side cancel finality in the client deadline. This can
+    /// turn an otherwise fast DELETE response into CancelOrderTimeout while
+    /// the cancellation still resolves later through the orphan reconciler.
+    #[serde(default)]
+    pub sim_v2_cancel_finality_counts_toward_timeout: bool,
+    /// Deterministic fractions of ordinary place/cancel calls whose HTTP
+    /// acknowledgement is lost or ambiguous despite a sub-timeout sampled
+    /// RTT. The request still reaches the exchange; the client receives a
+    /// timeout and must use account reconciliation to recover its state.
+    #[serde(default)]
+    pub sim_v2_place_ack_uncertainty_rate: f64,
+    #[serde(default)]
+    pub sim_v2_cancel_ack_uncertainty_rate: f64,
+    /// Fraction of private maker fills whose primary private-feed delivery is
+    /// missed and recovered by the account-reconciliation/backfill lane.
+    #[serde(default)]
+    pub sim_v2_private_fill_reconcile_rate: f64,
+    /// Additional delay for a selected reconciliation-recovered fill.
+    #[serde(default)]
+    pub sim_v2_private_fill_reconcile_delay_ms: u64,
     /// sim_v2 only — VOLUME-NEUTRAL forward-markout adverse reprice ∈ [0,∞) (0 =
     /// off). The sim fills makers symmetrically (markout ≈ 0); live makers are
     /// adversely selected (markout ≈ −0.75c at 1-5s). Keeps the full favorable
@@ -1170,6 +1198,7 @@ impl Default for BacktestConfig {
                 default_sim_v2_binary_open_max_backfill_ms(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
             sim_v2_dynamic_ahead_frac_strength: 0.0,
+            sim_v2_partial_depletion_queue_strength: 0.0,
             sim_v2_fill_push_mult: default_sim_v2_fill_push_mult(),
             sim_v2_private_fill_p50_ms: 0.0,
             sim_v2_private_fill_p95_ms: 0.0,
@@ -1204,6 +1233,11 @@ impl Default for BacktestConfig {
             sim_v2_replay_self_depth_fifo_replacement: false,
             sim_v2_replay_self_taker_depth_rate: 0.0,
             sim_v2_cancel_finality_delay_frac: 0.0,
+            sim_v2_cancel_finality_counts_toward_timeout: false,
+            sim_v2_place_ack_uncertainty_rate: 0.0,
+            sim_v2_cancel_ack_uncertainty_rate: 0.0,
+            sim_v2_private_fill_reconcile_rate: 0.0,
+            sim_v2_private_fill_reconcile_delay_ms: 0,
             sim_v2_fill_markout_vn: default_sim_v2_fill_markout_vn(),
             sim_v2_book_fill_markout_vn: 0.0,
             sim_v2_fill_markout_horizon_ms: default_sim_v2_fill_markout_horizon_ms(),

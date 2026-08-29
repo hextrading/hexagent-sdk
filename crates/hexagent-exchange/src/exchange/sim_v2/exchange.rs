@@ -421,6 +421,11 @@ pub struct SimExchangeV2 {
     /// Blend from the configured fixed override toward the causal queue-position
     /// fraction (`q_ahead / level depth`) on every queue resync.
     dynamic_ahead_frac_strength: f64,
+    /// Extra proportional queue-position weight for partial level shrinkage.
+    /// This is evaluated per concrete canonical symbol, maker side and price
+    /// level in `resync_queues`; near-total disappearance fades back to the
+    /// configured fixed/adverse model.
+    partial_depletion_queue_strength: f64,
     pub dynamic_ahead_frac_n: u64,
     pub dynamic_ahead_frac_sum: f64,
     pub dynamic_ahead_frac_min: f64,
@@ -680,6 +685,7 @@ impl SimExchangeV2 {
             book_stale_rebases: 0,
             ahead_frac_override: None,
             dynamic_ahead_frac_strength: 0.0,
+            partial_depletion_queue_strength: 0.0,
             dynamic_ahead_frac_n: 0,
             dynamic_ahead_frac_sum: 0.0,
             dynamic_ahead_frac_min: f64::INFINITY,
@@ -848,6 +854,10 @@ impl SimExchangeV2 {
 
     pub fn configure_dynamic_ahead_frac(&mut self, strength: f64) {
         self.dynamic_ahead_frac_strength = strength.clamp(0.0, 1.0);
+    }
+
+    pub fn configure_partial_depletion_queue(&mut self, strength: f64) {
+        self.partial_depletion_queue_strength = strength.clamp(0.0, 1.0);
     }
 
     /// Include earlier simulated orders at the same canonical price level in
@@ -1536,6 +1546,7 @@ impl SimExchangeV2 {
         let books = &self.books;
         let af_override = self.ahead_frac_override;
         let dynamic_af_strength = self.dynamic_ahead_frac_strength;
+        let partial_queue_strength = self.partial_depletion_queue_strength;
         let adv_rate = self.adverse_sel_rate;
         let adv_scale = self.adverse_scale_ticks;
         let depletion_rate = self.unexplained_depletion_exec_rate;
@@ -1566,6 +1577,11 @@ impl SimExchangeV2 {
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
             let unexplained = (l_prev - o.traded_since_sync - l_now).max(0.0);
+            let shrink_frac = if l_prev > EPS {
+                (unexplained / l_prev).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             // Baseline (neutral) ahead-fraction: pinned override or proportional.
             let proportional = if l_prev > EPS {
                 (o.q_ahead / l_prev).clamp(0.0, 1.0)
@@ -1573,8 +1589,17 @@ impl SimExchangeV2 {
                 0.0
             };
             let fixed = af_override.unwrap_or(proportional).clamp(0.0, 1.0);
-            let base = (fixed + dynamic_af_strength * (proportional - fixed)).clamp(0.0, 1.0);
-            if dynamic_af_strength > 0.0 && unexplained > EPS {
+            // Partial shrinkage gives stronger evidence about this order's
+            // actual location within its exact side/price queue than a whole
+            // level disappearing. Blend toward the order-local proportional
+            // estimate for small changes, then fade the extra evidence to zero
+            // as shrink_frac approaches one.
+            let effective_dynamic_strength = (dynamic_af_strength
+                + partial_queue_strength * (1.0 - shrink_frac))
+                .clamp(0.0, 1.0);
+            let base =
+                (fixed + effective_dynamic_strength * (proportional - fixed)).clamp(0.0, 1.0);
+            if effective_dynamic_strength > 0.0 && unexplained > EPS {
                 dynamic_n += 1;
                 dynamic_sum += base;
                 dynamic_min = dynamic_min.min(base);
@@ -1615,11 +1640,6 @@ impl SimExchangeV2 {
             let raw_execution = if depletion_rate > 0.0 && o.match_symbol == changed_token {
                 let adverse_gate = (adverse / (adv_scale * o.tick)).clamp(0.0, 1.0);
                 unexplained * depletion_rate * adverse_gate
-            } else {
-                0.0
-            };
-            let shrink_frac = if l_prev > EPS {
-                (unexplained / l_prev).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -5199,6 +5219,42 @@ mod tests {
         assert!((remaining(0.0) - 30.0).abs() < 1e-9, "fixed af=1");
         assert!((remaining(0.5) - 35.0).abs() < 1e-9, "half blend af=.75");
         assert!((remaining(1.0) - 40.0).abs() < 1e-9, "dynamic af=.50");
+    }
+
+    #[test]
+    fn partial_depletion_uses_exact_side_and_order_local_queue_position() {
+        let mut c = core();
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_partial_depletion_queue(1.0);
+        c.on_orderbook(&book("up", vec![(0.60, 100.0)], vec![(0.62, 100.0)]));
+        assert_eq!(
+            c.submit_order(
+                &order("bid", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert_eq!(
+            c.submit_order(
+                &order("ask", "up", Side::Sell, 0.62, 5.0, true, OrderType::Limit),
+                2,
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        // A sell print drains only the bid queue from 100 to 50. The next bid
+        // snapshot leaves 30, so the unexplained shrink is 20/100. With full
+        // partial-shrink attribution the fixed af=1 is blended 80% toward the
+        // bid order's local position 50/100: af=.6, q_ahead 50 -> 38.
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.60, 50.0))
+            .is_empty());
+        c.on_orderbook(&book("up", vec![(0.60, 30.0)], vec![(0.62, 100.0)]));
+        assert!((c.orders["bid"].q_ahead - 38.0).abs() < 1e-9);
+        // The ask is a distinct maker side at a distinct price-level key and
+        // must not inherit the bid depletion.
+        assert!((c.orders["ask"].q_ahead - 100.0).abs() < 1e-9);
     }
 
     #[test]

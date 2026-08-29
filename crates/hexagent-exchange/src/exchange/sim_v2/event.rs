@@ -45,7 +45,11 @@ pub enum SimEvent {
     /// Rejected/Cancelled ack is suppressed — the strategy already received a
     /// NewOrder/CancelOrderTimeout and will reconcile. Fills are always
     /// delivered (the strategy must learn of them).
-    OrderReachesEngine { action: ReachAction, l2_ns: u64, suppress_ack: bool },
+    OrderReachesEngine {
+        action: ReachAction,
+        l2_ns: u64,
+        suppress_ack: bool,
+    },
     /// A cancel accepted by the API lane but not yet final in the matching
     /// engine. `ack_deliver_ns` remains the original reach+L2 response time;
     /// market events at the same timestamp win the scheduler tie.
@@ -72,4 +76,8 @@ pub enum SimEvent {
     /// in P1 (matching is stubbed); the variant exists so P2 drops in cleanly.
     #[allow(dead_code)]
     FillToStrategy(OrderUpdate),
+    /// A private fill whose primary push was missed. The payload remains in
+    /// the simulator-owned account recovery map and is delivered exactly once
+    /// when this fallback fires or an earlier trade-id reconciliation finds it.
+    PrivateFillRecovery { trade_id: String },
 }
