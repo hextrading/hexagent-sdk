@@ -51,6 +51,7 @@ pub struct SimV2Config {
     /// Cancel-attribution ahead-fraction override; `None` = proportional (§5).
     pub ahead_frac: Option<f64>,
     pub dynamic_ahead_frac_strength: f64,
+    pub partial_depletion_queue_strength: f64,
     /// Adverse-selection conditioning of the cancel attribution: `rate` (0 = off)
     /// + `scale_ticks` (adverse mid-move mapping to full tilt). See `exchange.rs`.
     pub adverse_sel_rate: f64,
@@ -83,6 +84,11 @@ pub struct SimV2Config {
     /// finality before cancellation becomes effective. Values above 1 model
     /// processing tails beyond the nominal response boundary.
     pub cancel_finality_delay_frac: f64,
+    pub cancel_finality_counts_toward_timeout: bool,
+    pub place_ack_uncertainty_rate: f64,
+    pub cancel_ack_uncertainty_rate: f64,
+    pub private_fill_reconcile_rate: f64,
+    pub private_fill_reconcile_delay_ns: u64,
     /// Volume-neutral forward-markout adverse-reprice strength (0 = off). Keeps the
     /// full fill, settles it adverse toward the forward mid (peeked `horizon` ns
     /// ahead) → edge drops at preserved maker volume → the sim's maker-fill markout
@@ -212,8 +218,22 @@ pub struct Simulator {
     client_timeout_ns: u64,
     timeouts: u64,
     cancel_finality_delay_frac: f64,
+    cancel_finality_counts_toward_timeout: bool,
     cancel_finality_delayed: u64,
     cancel_finality_matched: u64,
+    uncertainty_seed: u64,
+    place_ack_uncertainty_rate: f64,
+    cancel_ack_uncertainty_rate: f64,
+    private_fill_reconcile_rate: f64,
+    private_fill_reconcile_delay_ns: u64,
+    place_ack_uncertain: u64,
+    cancel_ack_uncertain: u64,
+    private_fills_recovered: u64,
+    reconcile_requests: u64,
+    reconcile_updates: u64,
+    /// Trade-id keyed private fills missed on the primary lane. Single-writer
+    /// simulator ownership makes recovery lossless without a shared account.
+    pending_private_fills: HashMap<String, OrderUpdate>,
     per_event_rtt: Option<HashMap<u64, EventRttOverride>>,
     dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
     last_dynamic_overhead_event: Option<u64>,
@@ -287,6 +307,23 @@ fn parse_event_start_ts_secs(iso: &str) -> Option<u64> {
         return None;
     }
     Some(((secs as u64) / 300) * 300)
+}
+
+/// Stable seeded [0,1) cohort selector. Keeping lifecycle uncertainty out of
+/// the latency RNG means enabling one model never changes subsequent RTT or
+/// private-push draws, which is required for interpretable A/B replay.
+fn stable_lifecycle_sample(identity: &str, seed: u64, lane: u64) -> f64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed.rotate_left(17) ^ lane;
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    ((hash >> 11) as f64) / ((1_u64 << 53) as f64)
 }
 
 /// Scale a fixed execution window with a power-law RTT elasticity.  A power
@@ -411,6 +448,7 @@ impl Simulator {
         );
         core.configure(cfg.ahead_frac, cfg.matched_cant_cancel_window_ns);
         core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
+        core.configure_partial_depletion_queue(cfg.partial_depletion_queue_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
@@ -459,8 +497,20 @@ impl Simulator {
             } else {
                 0.0
             },
+            cancel_finality_counts_toward_timeout: cfg.cancel_finality_counts_toward_timeout,
             cancel_finality_delayed: 0,
             cancel_finality_matched: 0,
+            uncertainty_seed: cfg.seed,
+            place_ack_uncertainty_rate: cfg.place_ack_uncertainty_rate.clamp(0.0, 1.0),
+            cancel_ack_uncertainty_rate: cfg.cancel_ack_uncertainty_rate.clamp(0.0, 1.0),
+            private_fill_reconcile_rate: cfg.private_fill_reconcile_rate.clamp(0.0, 1.0),
+            private_fill_reconcile_delay_ns: cfg.private_fill_reconcile_delay_ns,
+            place_ack_uncertain: 0,
+            cancel_ack_uncertain: 0,
+            private_fills_recovered: 0,
+            reconcile_requests: 0,
+            reconcile_updates: 0,
+            pending_private_fills: HashMap::new(),
             per_event_rtt: cfg.per_event_rtt,
             dynamic_taker_overhead_by_event: cfg.dynamic_taker_overhead_by_event,
             last_dynamic_overhead_event: None,
@@ -650,6 +700,18 @@ impl Simulator {
     /// the delayed finalization) for end-of-run calibration diagnostics.
     pub fn cancel_finality_stats(&self) -> (u64, u64) {
         (self.cancel_finality_delayed, self.cancel_finality_matched)
+    }
+
+    /// (place ack-loss, cancel ack-loss, private fills recovered later,
+    /// reconcile requests, updates returned by reconciliation).
+    pub fn lifecycle_uncertainty_stats(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.place_ack_uncertain,
+            self.cancel_ack_uncertain,
+            self.private_fills_recovered,
+            self.reconcile_requests,
+            self.reconcile_updates,
+        )
     }
 
     /// (post_only_rejects, post_only_seen) for the summary.
@@ -1447,16 +1509,8 @@ impl Simulator {
                     let fills = self.core.on_orderbook_fwd(&ob, fwd_mid);
                     self.observe_causal_taker_races(when);
                     self.observe_markout_book(&ob);
-                    for mut fill in fills {
-                        let push = self.latency.sample_fill_push(when);
-                        let deliver = when.saturating_add(push);
-                        self.core
-                            .record_fill_delivery(&fill.client_order_id, deliver);
-                        fill.timestamp_ns = deliver;
-                        self.strategy_sched.push(
-                            deliver.max(self.strategy_clock_ns),
-                            SimEvent::FillToStrategy(fill),
-                        );
+                    for fill in fills {
+                        self.schedule_private_fill(fill, when);
                     }
                 }
                 SimEvent::ServerTrade(t) => {
@@ -1475,16 +1529,8 @@ impl Simulator {
                         None
                     };
                     let fills = self.core.on_trade_tick_fwd(&t, fwd_mid);
-                    for mut fill in fills {
-                        let push = self.latency.sample_fill_push(when);
-                        let deliver = when.saturating_add(push);
-                        self.core
-                            .record_fill_delivery(&fill.client_order_id, deliver);
-                        fill.timestamp_ns = deliver;
-                        self.strategy_sched.push(
-                            deliver.max(self.strategy_clock_ns),
-                            SimEvent::FillToStrategy(fill),
-                        );
+                    for fill in fills {
+                        self.schedule_private_fill(fill, when);
                     }
                 }
                 SimEvent::ServerInstrument(i) => {
@@ -1499,6 +1545,45 @@ impl Simulator {
             }
         }
         Vec::new()
+    }
+
+    /// Deliver one maker execution over the private lane. Selected fills model
+    /// a missed primary WebSocket notification followed by lossless account
+    /// reconciliation/trade backfill. The trade id and economics are unchanged,
+    /// so the strategy's normal idempotent private-fill path remains authoritative.
+    fn schedule_private_fill(&mut self, mut fill: OrderUpdate, exchange_when: u64) {
+        let push = self.latency.sample_fill_push(exchange_when);
+        let primary_deliver = exchange_when.saturating_add(push);
+        let identity = fill
+            .trade_id
+            .as_deref()
+            .unwrap_or(fill.client_order_id.as_str());
+        let recovered = self.private_fill_reconcile_delay_ns > 0
+            && self.private_fill_reconcile_rate > 0.0
+            && stable_lifecycle_sample(identity, self.uncertainty_seed, 0x5052_4956_4649_4c4c)
+                < self.private_fill_reconcile_rate;
+        let deliver = if recovered {
+            self.private_fills_recovered += 1;
+            primary_deliver.saturating_add(self.private_fill_reconcile_delay_ns)
+        } else {
+            primary_deliver
+        };
+        fill.timestamp_ns = deliver;
+        let strategy_deliver = deliver.max(self.strategy_clock_ns);
+        if recovered {
+            let trade_id = fill
+                .trade_id
+                .clone()
+                .expect("simulated maker fill must have a trade id");
+            self.pending_private_fills.insert(trade_id.clone(), fill);
+            self.strategy_sched
+                .push(strategy_deliver, SimEvent::PrivateFillRecovery { trade_id });
+        } else {
+            self.core
+                .record_fill_delivery(&fill.client_order_id, strategy_deliver);
+            self.strategy_sched
+                .push(strategy_deliver, SimEvent::FillToStrategy(fill));
+        }
     }
 
     /// Schedule an ack for strategy delivery at `deliver`. Under timeout
@@ -1656,7 +1741,9 @@ impl Simulator {
                 Vec::new()
             }
             // Strategy deliveries never enter the server scheduler.
-            SimEvent::AckToStrategy(_) | SimEvent::FillToStrategy(_) => Vec::new(),
+            SimEvent::AckToStrategy(_)
+            | SimEvent::FillToStrategy(_)
+            | SimEvent::PrivateFillRecovery { .. } => Vec::new(),
             // Server feed events never enter the server scheduler heap.
             _ => Vec::new(),
         }
@@ -1672,6 +1759,19 @@ impl Simulator {
                 u.timestamp_ns = self.strategy_clock_ns;
                 vec![u]
             }
+            SimEvent::PrivateFillRecovery { trade_id } => {
+                self.pending_private_fills.remove(&trade_id).map_or_else(
+                    Vec::new,
+                    |mut update| {
+                        self.core.record_fill_delivery(
+                            &update.client_order_id,
+                            self.strategy_clock_ns,
+                        );
+                        update.timestamp_ns = self.strategy_clock_ns;
+                        vec![update]
+                    },
+                )
+            }
             // Server-side events never enter the strategy scheduler.
             _ => Vec::new(),
         }
@@ -1686,20 +1786,33 @@ impl Simulator {
         if let Signal::ReconcilePolymarket {
             pending_places,
             pending_cancels,
+            pending_trade_ids,
             ..
         } = sig
         {
+            self.reconcile_requests += 1;
             let (l1, l2) = self.latency.sample_cancel_split(t_emit);
             let deliver = t_emit
                 .saturating_add(l1)
                 .saturating_add(l2)
                 .max(self.strategy_clock_ns);
-            for u in self
+            let updates = self
                 .core
-                .reconcile(pending_places, pending_cancels, deliver)
-            {
+                .reconcile(pending_places, pending_cancels, deliver);
+            self.reconcile_updates += updates.len() as u64;
+            for u in updates {
                 self.strategy_sched
                     .push(deliver, SimEvent::AckToStrategy(u));
+            }
+            for trade_id in pending_trade_ids {
+                if let Some(mut fill) = self.pending_private_fills.remove(trade_id) {
+                    fill.timestamp_ns = deliver;
+                    self.core
+                        .record_fill_delivery(&fill.client_order_id, deliver);
+                    self.reconcile_updates += 1;
+                    self.strategy_sched
+                        .push(deliver, SimEvent::FillToStrategy(fill));
+                }
             }
             return;
         }
@@ -1747,8 +1860,48 @@ impl Simulator {
         if let ReachAction::Place(order) = &action {
             self.begin_causal_taker_race(order, t_emit);
         }
-        let rtt = l1 + l2;
-        let timed_out = rtt > self.client_timeout_ns;
+        let response_l2 = if self.cancel_finality_counts_toward_timeout
+            && matches!(&action, ReachAction::Cancel { .. })
+        {
+            let finality = ((l2 as f64) * self.cancel_finality_delay_frac)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64;
+            l2.max(finality)
+        } else {
+            l2
+        };
+        let rtt = l1.saturating_add(response_l2);
+        let forced_uncertain = if rtt <= self.client_timeout_ns {
+            match &action {
+                ReachAction::Place(order)
+                    if self.place_ack_uncertainty_rate > 0.0
+                        && stable_lifecycle_sample(
+                            &order.client_order_id,
+                            self.uncertainty_seed,
+                            0x504c_4143_455f_4143,
+                        ) < self.place_ack_uncertainty_rate =>
+                {
+                    self.place_ack_uncertain += 1;
+                    true
+                }
+                ReachAction::Cancel {
+                    client_order_id, ..
+                } if self.cancel_ack_uncertainty_rate > 0.0
+                    && stable_lifecycle_sample(
+                        client_order_id,
+                        self.uncertainty_seed,
+                        0x4341_4e43_454c_4143,
+                    ) < self.cancel_ack_uncertainty_rate =>
+                {
+                    self.cancel_ack_uncertain += 1;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let timed_out = rtt > self.client_timeout_ns || forced_uncertain;
         // This explicit cross-lane message is the only way a local request can
         // affect the matching engine. Never rewind an already-advanced server
         // lane even if the two recorded wall clocks have transient skew.
@@ -1974,8 +2127,20 @@ mod tests {
             client_timeout_ns: 500_000_000,
             timeouts: 0,
             cancel_finality_delay_frac: 0.0,
+            cancel_finality_counts_toward_timeout: false,
             cancel_finality_delayed: 0,
             cancel_finality_matched: 0,
+            uncertainty_seed: 1,
+            place_ack_uncertainty_rate: 0.0,
+            cancel_ack_uncertainty_rate: 0.0,
+            private_fill_reconcile_rate: 0.0,
+            private_fill_reconcile_delay_ns: 0,
+            place_ack_uncertain: 0,
+            cancel_ack_uncertain: 0,
+            private_fills_recovered: 0,
+            reconcile_requests: 0,
+            reconcile_updates: 0,
+            pending_private_fills: HashMap::new(),
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -2059,8 +2224,20 @@ mod tests {
             client_timeout_ns: 500_000_000,
             timeouts: 0,
             cancel_finality_delay_frac: 0.0,
+            cancel_finality_counts_toward_timeout: false,
             cancel_finality_delayed: 0,
             cancel_finality_matched: 0,
+            uncertainty_seed: 1,
+            place_ack_uncertainty_rate: 0.0,
+            cancel_ack_uncertainty_rate: 0.0,
+            private_fill_reconcile_rate: 0.0,
+            private_fill_reconcile_delay_ns: 0,
+            place_ack_uncertain: 0,
+            cancel_ack_uncertain: 0,
+            private_fills_recovered: 0,
+            reconcile_requests: 0,
+            reconcile_updates: 0,
+            pending_private_fills: HashMap::new(),
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -2535,6 +2712,170 @@ mod tests {
             }
         }
         assert_eq!(recon_status, Some(OrderStatus::Accepted));
+    }
+
+    #[test]
+    fn lost_place_ack_forces_orphan_then_account_reconciliation() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.place_ack_uncertainty_rate = 1.0;
+        let emit = 1_000_000_000;
+        sim.submit(&place_signal("lost-place"), emit);
+        let mut statuses = Vec::new();
+        while sim.peek_when().is_some() {
+            statuses.extend(sim.step().into_iter().map(|update| update.status));
+        }
+        assert_eq!(statuses, vec![OrderStatus::NewOrderTimeout]);
+        assert_eq!(sim.lifecycle_uncertainty_stats(), (1, 0, 0, 0, 0));
+
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![(
+                    "lost-place".into(),
+                    "tok".into(),
+                    Side::Buy,
+                    0.6,
+                    None,
+                )],
+                pending_cancels: vec![],
+                pending_trade_ids: vec![],
+                instance_id: String::new(),
+            },
+            2_000_000_000,
+        );
+        let mut reconciled = Vec::new();
+        while sim.peek_when().is_some() {
+            reconciled.extend(sim.step().into_iter().map(|update| update.status));
+        }
+        assert_eq!(reconciled, vec![OrderStatus::Accepted]);
+        assert_eq!(sim.lifecycle_uncertainty_stats(), (1, 0, 0, 1, 1));
+    }
+
+    #[test]
+    fn cancel_finality_can_cross_deadline_and_reconcile_cancelled() {
+        let mut sim = sim_with_fixed_rtt(100);
+        seed_front_order(&mut sim, "late-cancel");
+        sim.cancel_finality_delay_frac = 10.0;
+        sim.cancel_finality_counts_toward_timeout = true;
+        let emit = 1_000_000_000;
+        sim.submit(&cancel_signal("late-cancel", emit), emit);
+        let mut statuses = Vec::new();
+        while sim.peek_when().is_some() {
+            statuses.extend(sim.step().into_iter().map(|update| update.status));
+        }
+        assert_eq!(statuses, vec![OrderStatus::CancelOrderTimeout]);
+        assert_eq!(sim.cancel_finality_stats(), (1, 0));
+
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![("late-cancel".into(), "simv2-late-cancel".into())],
+                pending_trade_ids: vec![],
+                instance_id: String::new(),
+            },
+            2_000_000_000,
+        );
+        let mut reconciled = Vec::new();
+        while sim.peek_when().is_some() {
+            reconciled.extend(sim.step().into_iter().map(|update| update.status));
+        }
+        assert_eq!(reconciled, vec![OrderStatus::Cancelled]);
+    }
+
+    #[test]
+    fn missed_private_fill_is_delivered_losslessly_after_reconcile_delay() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        let exchange_when = 1_000_000_000;
+        let fill = OrderUpdate {
+            client_order_id: "maker".into(),
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            side: Side::Buy,
+            exchange_order_id: Some("simv2-maker".into()),
+            status: OrderStatus::Filled,
+            liquidity: Some(crate::types::Liquidity::Maker),
+            filled_quantity: 5.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.6,
+            timestamp_ns: exchange_when,
+            exchange_event_timestamp_ns: None,
+            trade_id: Some("trade-1".into()),
+            order_audit: None,
+            error: None,
+            order_slot: Default::default(),
+        };
+        sim.schedule_private_fill(fill, exchange_when);
+        // Fixed 100ms RTT and the legacy 1.5 half-RTT multiplier give a 75ms
+        // private push; recovery adds 750ms.
+        assert_eq!(sim.peek_strategy_when(), Some(exchange_when + 825_000_000));
+        let updates = sim.step_strategy_sched();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].trade_id.as_deref(), Some("trade-1"));
+        assert_eq!(updates[0].filled_quantity, 5.0);
+        assert_eq!(sim.lifecycle_uncertainty_stats(), (0, 0, 1, 0, 0));
+    }
+
+    #[test]
+    fn trade_id_reconciliation_delivers_missed_private_fill_early_once() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        let exchange_when = 1_000_000_000;
+        sim.schedule_private_fill(
+            OrderUpdate {
+                client_order_id: "maker".into(),
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                side: Side::Buy,
+                exchange_order_id: Some("simv2-maker".into()),
+                status: OrderStatus::Filled,
+                liquidity: Some(crate::types::Liquidity::Maker),
+                filled_quantity: 5.0,
+                remaining_quantity: 0.0,
+                avg_fill_price: 0.6,
+                timestamp_ns: exchange_when,
+                exchange_event_timestamp_ns: None,
+                trade_id: Some("trade-early".into()),
+                order_audit: None,
+                error: None,
+                order_slot: Default::default(),
+            },
+            exchange_when,
+        );
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![],
+                pending_trade_ids: vec!["trade-early".into()],
+                instance_id: String::new(),
+            },
+            exchange_when + 100_000_000,
+        );
+        let mut delivered = Vec::new();
+        while sim.peek_when().is_some() {
+            delivered.extend(sim.step());
+        }
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].trade_id.as_deref(), Some("trade-early"));
+        assert_eq!(delivered[0].timestamp_ns, exchange_when + 200_000_000);
+        assert_eq!(sim.lifecycle_uncertainty_stats(), (0, 0, 1, 1, 1));
+    }
+
+    #[test]
+    fn lost_cancel_ack_forces_cancel_uncertainty_without_losing_cancel() {
+        let mut sim = sim_with_fixed_rtt(100);
+        seed_front_order(&mut sim, "lost-cancel");
+        sim.cancel_ack_uncertainty_rate = 1.0;
+        let emit = 1_000_000_000;
+        sim.submit(&cancel_signal("lost-cancel", emit), emit);
+        let mut statuses = Vec::new();
+        while sim.peek_when().is_some() {
+            statuses.extend(sim.step().into_iter().map(|update| update.status));
+        }
+        assert_eq!(statuses, vec![OrderStatus::CancelOrderTimeout]);
+        assert!(sim.core.order_symbol_side("lost-cancel").is_none());
+        assert_eq!(sim.lifecycle_uncertainty_stats(), (0, 1, 0, 0, 0));
     }
 
     #[test]

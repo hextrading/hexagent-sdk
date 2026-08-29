@@ -5336,6 +5336,7 @@ impl Engine {
             split_by_iid: sim_split_by_iid,
             ahead_frac,
             dynamic_ahead_frac_strength: bt.sim_v2_dynamic_ahead_frac_strength,
+            partial_depletion_queue_strength: bt.sim_v2_partial_depletion_queue_strength,
             adverse_sel_rate: bt.sim_v2_adverse_sel_rate,
             adverse_scale_ticks: bt.sim_v2_adverse_scale_ticks,
             book_through_rate: bt.sim_v2_book_through_rate,
@@ -5349,6 +5350,14 @@ impl Engine {
             replay_self_depth_fifo_replacement: bt.sim_v2_replay_self_depth_fifo_replacement,
             replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
+            cancel_finality_counts_toward_timeout: bt
+                .sim_v2_cancel_finality_counts_toward_timeout,
+            place_ack_uncertainty_rate: bt.sim_v2_place_ack_uncertainty_rate,
+            cancel_ack_uncertainty_rate: bt.sim_v2_cancel_ack_uncertainty_rate,
+            private_fill_reconcile_rate: bt.sim_v2_private_fill_reconcile_rate,
+            private_fill_reconcile_delay_ns: bt
+                .sim_v2_private_fill_reconcile_delay_ms
+                .saturating_mul(1_000_000),
             fill_markout_vn: bt.sim_v2_fill_markout_vn,
             book_fill_markout_vn: bt.sim_v2_book_fill_markout_vn,
             fill_markout_horizon_ns: bt.sim_v2_fill_markout_horizon_ms.saturating_mul(1_000_000),
@@ -5738,6 +5747,22 @@ impl Engine {
             info!(
                 "  Sim v2:   cancel_finality delayed={} matched_before_finality={}",
                 finality_delayed, finality_matched
+            );
+        }
+        let (place_uncertain, cancel_uncertain, recovered_fills, reconcile_n, reconcile_updates) =
+            sim.lifecycle_uncertainty_stats();
+        if place_uncertain > 0
+            || cancel_uncertain > 0
+            || recovered_fills > 0
+            || reconcile_n > 0
+        {
+            info!(
+                "  Sim v2:   lifecycle uncertainty place_ack={} cancel_ack={} private_fill_recovered={} reconcile_requests={} reconcile_updates={}",
+                place_uncertain,
+                cancel_uncertain,
+                recovered_fills,
+                reconcile_n,
+                reconcile_updates,
             );
         }
         let (po_rejects, po_seen) = sim.post_only_stats();
