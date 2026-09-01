@@ -28,7 +28,7 @@ use crate::exchange::polymarket::{
     PolymarketTrade,
 };
 use crate::exchange::{ExchangeMarket, ExchangeTrade, PublicMarketPublisher, PublicMarketReceiver};
-use crate::recorder::{MarketRecorder, MarketReplayer};
+use crate::recorder::{configure_replay_cache, MarketRecorder, MarketReplayer, ReplayCacheMode};
 use crate::strategy::{LifecycleEnvelope, LifecycleSource, Strategy};
 use crate::types::*;
 use hexagent_runtime::shutdown::ShutdownToken;
@@ -77,6 +77,11 @@ const POLY_ROTATION_GRACE_NS: u64 = 3_000_000_000;
 const POLY_REPLACEMENT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const POLY_MAX_CONSECUTIVE_FAILED_REPLACEMENTS: u32 = 3;
 const MEMORY_TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[inline]
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 /// Independent logical clocks for the sim_v2 replay coordinator. Both use
 /// Unix-epoch nanoseconds so causal messages can carry explicit arrival times,
@@ -182,7 +187,7 @@ fn spawn_memory_telemetry(shutdown_token: ShutdownToken) -> Result<thread::JoinH
                         let recorder = crate::recorder::recorder_stats();
                         let replayer = crate::recorder::replayer_stats();
                         info!(
-                            "[Memory] VmRSS={} VmHWM={} VmLck={} VmSize={} Threads={} Private_Dirty={} Locked={} recorder_rows={} recorder_bytes={} recorder_written_rows={} recorder_written_bytes={} recorder_streams={} replayer_rows={} replayer_capacity={} replayer_loaded_rows={} replayer_streams={} mimalloc_reserved={} mimalloc_committed={}",
+                            "[Memory] VmRSS={} VmHWM={} VmLck={} VmSize={} Threads={} Private_Dirty={} Locked={} recorder_rows={} recorder_bytes={} recorder_written_rows={} recorder_written_bytes={} recorder_streams={} replayer_rows={} replayer_capacity={} replayer_loaded_rows={} replayer_streams={} replay_cache_hits={} replay_cache_misses={} replay_cache_writes={} replay_cache_rows={} replay_cache_read_ms={:.3} replay_parquet_decode_ms={:.3} mimalloc_reserved={} mimalloc_committed={}",
                             process.vm_rss_bytes,
                             process.vm_hwm_bytes,
                             process.vm_lck_bytes,
@@ -199,6 +204,12 @@ fn spawn_memory_telemetry(shutdown_token: ShutdownToken) -> Result<thread::JoinH
                             replayer.buffer_capacity,
                             replayer.loaded_rows,
                             replayer.active_streams,
+                            replayer.cache_hits,
+                            replayer.cache_misses,
+                            replayer.cache_writes,
+                            replayer.cache_rows,
+                            replayer.cache_read_ns as f64 / 1e6,
+                            replayer.parquet_decode_ns as f64 / 1e6,
                             allocator.reserved_bytes,
                             allocator.committed_bytes,
                         );
@@ -3171,6 +3182,28 @@ pub struct Engine {
 impl Engine {
     pub fn new(mut config: Config, registry: StrategyRegistry) -> Self {
         crate::account::order_manager::init_global_order_id();
+        if config.general.mode == RunMode::Backtest {
+            let cache_mode = ReplayCacheMode::parse(&config.backtest.replay_cache_mode)
+                .unwrap_or_else(|error| panic!("invalid replay-cache configuration: {error}"));
+            if cache_mode != ReplayCacheMode::Off {
+                let cache_dir = if config.backtest.replay_cache_dir.trim().is_empty() {
+                    PathBuf::from(&config.backtest.data_dir).join(".replay-cache")
+                } else {
+                    PathBuf::from(config.backtest.replay_cache_dir.trim())
+                };
+                configure_replay_cache(cache_mode, cache_dir.clone()).unwrap_or_else(|error| {
+                    panic!(
+                        "cannot configure replay cache mode={cache_mode:?} dir={}: {error}",
+                        cache_dir.display()
+                    )
+                });
+                info!(
+                    "[ReplayerCache] configured mode={:?} dir={}",
+                    cache_mode,
+                    cache_dir.display(),
+                );
+            }
+        }
         // Each registered strategy injects its own required market-data symbols
         // (replaces the engine's old per-strategy-name inject_*_symbols).
         registry.inject_all_config(&mut config);
@@ -4299,6 +4332,8 @@ impl Engine {
         use crate::exchange::sim_v2::{SimV2Config, Simulator};
         use std::collections::BinaryHeap;
 
+        let perf_total_started = Instant::now();
+        let perf_replay_open_started = Instant::now();
         let bt = &self.config.backtest;
 
         // Determinism: `Engine::new` seeded the global order-id counter from
@@ -4358,9 +4393,7 @@ impl Engine {
         // ── Strat-lane replayers (local_ts order) — verbatim from v1 ──
         let replay_options = crate::recorder::ReplayOptions {
             bootstrap_binary_open: bt.sim_v2_bootstrap_binary_open,
-            binary_open_delay_ns: bt
-                .sim_v2_binary_open_delay_ms
-                .saturating_mul(1_000_000),
+            binary_open_delay_ns: bt.sim_v2_binary_open_delay_ms.saturating_mul(1_000_000),
             binary_open_max_backfill_ns: bt
                 .sim_v2_binary_open_max_backfill_ms
                 .saturating_mul(1_000_000),
@@ -4456,8 +4489,9 @@ impl Engine {
 
         let mut strat_peeked: Vec<Option<(u64, MarketEvent)>> = Vec::new();
         for r in &mut strat_replayers {
-            strat_peeked.push(r.next_event().ok().flatten());
+            strat_peeked.push(r.next_event()?);
         }
+        let perf_replay_open_ns = elapsed_nanos(perf_replay_open_started);
 
         // ── Synthetic RTT-probe wiring — carried over from the removed v1 sim engine: while
         // the strat gate is in Probe mode it sets `bt_probe_enable`; we feed one
@@ -4511,11 +4545,14 @@ impl Engine {
             })
             .unwrap_or_else(HashMap::new);
 
+        let perf_strategy_init_started = Instant::now();
         let mut strategies = self.build_strategies(bt_probe_map, HashMap::new(), &HashMap::new());
         let hist_data_dir = PathBuf::from(&data_dir);
         for s in &mut strategies {
             s.on_init();
         }
+        let perf_strategy_init_ns = elapsed_nanos(perf_strategy_init_started);
+        let perf_sim_setup_started = Instant::now();
 
         // ── Hist bars (binance) — the lookback comes from the strategies
         // themselves via `load_hist_data(start_ns)`, the SAME path live uses
@@ -4755,9 +4792,9 @@ impl Engine {
                         symbol,
                         warmup_start_dt,
                         warmup_end_dt,
-                    ) {
+                        ) {
                         Ok(mut replayer) => {
-                            while let Ok(Some((_ts, event))) = replayer.next_event() {
+                            while let Some((_ts, event)) = replayer.next_event()? {
                                 for strategy in &mut strategies {
                                     match &event {
                                         MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
@@ -4835,10 +4872,11 @@ impl Engine {
                 // minimum-timestamp event (merge by local_ts, same key the
                 // main replay uses) so apv2's wall-clock buckets see venues
                 // interleaved chronologically.
-                let mut peeked: Vec<Option<(u64, MarketEvent)>> = replayers
-                    .iter_mut()
-                    .map(|r| r.next_event().ok().flatten())
-                    .collect();
+                let mut peeked: Vec<Option<(u64, MarketEvent)>> =
+                    Vec::with_capacity(replayers.len());
+                for replayer in &mut replayers {
+                    peeked.push(replayer.next_event()?);
+                }
                 let mut fed: u64 = 0;
                 loop {
                     let best = peeked
@@ -4864,7 +4902,7 @@ impl Engine {
                         _ => {}
                     }
                     fed += 1;
-                    peeked[idx] = replayers[idx].next_event().ok().flatten();
+                    peeked[idx] = replayers[idx].next_event()?;
                 }
                 info!(
                     "[Backtest v2] apv2 warm-up complete: {} spot events fed",
@@ -5316,9 +5354,7 @@ impl Engine {
             end: end_dt,
             sources: replay_sources.clone(),
             bootstrap_binary_open: bt.sim_v2_bootstrap_binary_open,
-            binary_open_delay_ns: bt
-                .sim_v2_binary_open_delay_ms
-                .saturating_mul(1_000_000),
+            binary_open_delay_ns: bt.sim_v2_binary_open_delay_ms.saturating_mul(1_000_000),
             binary_open_max_backfill_ns: bt
                 .sim_v2_binary_open_max_backfill_ms
                 .saturating_mul(1_000_000),
@@ -5350,8 +5386,7 @@ impl Engine {
             replay_self_depth_fifo_replacement: bt.sim_v2_replay_self_depth_fifo_replacement,
             replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
-            cancel_finality_counts_toward_timeout: bt
-                .sim_v2_cancel_finality_counts_toward_timeout,
+            cancel_finality_counts_toward_timeout: bt.sim_v2_cancel_finality_counts_toward_timeout,
             place_ack_uncertainty_rate: bt.sim_v2_place_ack_uncertainty_rate,
             cancel_ack_uncertainty_rate: bt.sim_v2_cancel_ack_uncertainty_rate,
             private_fill_reconcile_rate: bt.sim_v2_private_fill_reconcile_rate,
@@ -5455,6 +5490,8 @@ impl Engine {
 
         let mut replay_clocks = SimV2ReplayClocks::default();
 
+        let perf_sim_setup_ns = elapsed_nanos(perf_sim_setup_started);
+        let perf_event_loop_started = Instant::now();
         loop {
             let strat_ts = strat_heap.peek().map(|e| e.ts).unwrap_or(u64::MAX);
             let bar_ts = bar_rows
@@ -5515,7 +5552,7 @@ impl Engine {
                     let entry = strat_heap.pop().unwrap();
                     let best_idx = entry.idx;
                     let pair = strat_peeked[best_idx].take().unwrap();
-                    strat_peeked[best_idx] = strat_replayers[best_idx].next_event().ok().flatten();
+                    strat_peeked[best_idx] = strat_replayers[best_idx].next_event()?;
                     if let Some((ts, _)) = &strat_peeked[best_idx] {
                         strat_heap.push(HeapEntry {
                             ts: *ts,
@@ -5637,8 +5674,8 @@ impl Engine {
                             if fire {
                                 last_quote_ns[i] = strategy_now;
                                 quote_signal_batch.clear();
-                                if let Err(overflow) = strategy
-                                    .on_quote_into(strategy_now, &mut quote_signal_batch)
+                                if let Err(overflow) =
+                                    strategy.on_quote_into(strategy_now, &mut quote_signal_batch)
                                 {
                                     quote_signal_batch.clear();
                                     let emergency = emergency_cancel_for_signal(
@@ -5672,6 +5709,8 @@ impl Engine {
                 last_bt_probe_emit_sim_ns = now_for_probe;
             }
         }
+        let perf_event_loop_ns = elapsed_nanos(perf_event_loop_started);
+        let perf_reporting_started = Instant::now();
 
         for s in &mut strategies {
             s.on_exit();
@@ -5751,11 +5790,7 @@ impl Engine {
         }
         let (place_uncertain, cancel_uncertain, recovered_fills, reconcile_n, reconcile_updates) =
             sim.lifecycle_uncertainty_stats();
-        if place_uncertain > 0
-            || cancel_uncertain > 0
-            || recovered_fills > 0
-            || reconcile_n > 0
-        {
+        if place_uncertain > 0 || cancel_uncertain > 0 || recovered_fills > 0 || reconcile_n > 0 {
             info!(
                 "  Sim v2:   lifecycle uncertainty place_ack={} cancel_ack={} private_fill_recovered={} reconcile_requests={} reconcile_updates={}",
                 place_uncertain,
@@ -5865,8 +5900,7 @@ impl Engine {
                 depletion_fills
             );
         }
-        let (evidence_capped_n, evidence_capped_qty) =
-            sim.depletion_trade_evidence_stats();
+        let (evidence_capped_n, evidence_capped_qty) = sim.depletion_trade_evidence_stats();
         if evidence_capped_n > 0 {
             info!(
                 "  Sim v2:   depletion evidence capped_resyncs={} suppressed_hidden_qty={:.4} (exact-level public-trade budget)",
@@ -6109,6 +6143,28 @@ impl Engine {
                 );
             }
         }
+        let replay_perf = crate::recorder::replayer_stats();
+        let perf_reporting_ns = elapsed_nanos(perf_reporting_started);
+        let perf_total_ns = elapsed_nanos(perf_total_started);
+        info!(
+            "[BacktestPerf] stages replay_open_ms={:.3} strategy_init_prewarm_ms={:.3} sim_setup_ms={:.3} event_loop_ms={:.3} reporting_shutdown_ms={:.3} total_ms={:.3}",
+            perf_replay_open_ns as f64 / 1e6,
+            perf_strategy_init_ns as f64 / 1e6,
+            perf_sim_setup_ns as f64 / 1e6,
+            perf_event_loop_ns as f64 / 1e6,
+            perf_reporting_ns as f64 / 1e6,
+            perf_total_ns as f64 / 1e6,
+        );
+        info!(
+            "[BacktestPerf] replay cache_hits={} cache_misses={} cache_writes={} cache_rows={} cache_read_ms={:.3} parquet_decode_ms={:.3} loaded_rows={}",
+            replay_perf.cache_hits,
+            replay_perf.cache_misses,
+            replay_perf.cache_writes,
+            replay_perf.cache_rows,
+            replay_perf.cache_read_ns as f64 / 1e6,
+            replay_perf.parquet_decode_ns as f64 / 1e6,
+            replay_perf.loaded_rows,
+        );
         info!("══════════════════════════════════════");
         info!("  BACKTEST complete (sim_v2)");
         info!("══════════════════════════════════════");

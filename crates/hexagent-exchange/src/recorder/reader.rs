@@ -8,8 +8,13 @@ use arrow::array::*;
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::types::*;
 
@@ -36,11 +41,79 @@ pub struct ReplayOptions {
 
 const REPLAYER_BATCH_ROWS: usize = 8_192;
 const REPLAYER_BOOTSTRAP_MAX_ROWS: usize = REPLAYER_BATCH_ROWS * 2;
+// The bootstrap accumulator checks its bound after appending one decoded Arrow
+// batch, so the emitted repaired batch can contain the prior 2-batch window
+// plus one final batch (observed 22,792 rows on legacy Polymarket tapes).
+const REPLAY_CACHE_MAX_BATCH_ROWS: usize = REPLAYER_BOOTSTRAP_MAX_ROWS + REPLAYER_BATCH_ROWS;
+const REPLAY_CACHE_MAGIC: [u8; 8] = *b"HXRPLY01";
+const REPLAY_CACHE_VERSION: u32 = 2;
+const REPLAY_CACHE_HEADER_BYTES: usize = 48;
+const REPLAY_CACHE_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 static REPLAYER_BUFFERED_ROWS: AtomicU64 = AtomicU64::new(0);
 static REPLAYER_BUFFER_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static REPLAYER_LOADED_ROWS: AtomicU64 = AtomicU64::new(0);
 static REPLAYER_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+static REPLAY_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static REPLAY_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static REPLAY_CACHE_WRITES: AtomicU64 = AtomicU64::new(0);
+static REPLAY_CACHE_ROWS: AtomicU64 = AtomicU64::new(0);
+static REPLAY_CACHE_READ_NS: AtomicU64 = AtomicU64::new(0);
+static REPLAY_PARQUET_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplayCacheMode {
+    #[default]
+    Off,
+    ReadWrite,
+    Refresh,
+}
+
+impl ReplayCacheMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "off" => Ok(Self::Off),
+            "read_write" | "read-write" | "rw" => Ok(Self::ReadWrite),
+            "refresh" => Ok(Self::Refresh),
+            other => Err(anyhow!(
+                "invalid backtest replay_cache_mode={other}; expected off, read_write, or refresh"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayCacheConfig {
+    mode: ReplayCacheMode,
+    directory: PathBuf,
+}
+
+static REPLAY_CACHE_CONFIG: OnceLock<ReplayCacheConfig> = OnceLock::new();
+
+/// Install immutable process-wide replay-cache settings before any replayer is
+/// constructed. The cache is consumed exclusively by background loader
+/// threads; strategies and execution lanes never access it.
+pub fn configure_replay_cache(mode: ReplayCacheMode, directory: PathBuf) -> Result<()> {
+    let requested = ReplayCacheConfig { mode, directory };
+    if let Some(existing) = REPLAY_CACHE_CONFIG.get() {
+        return if existing == &requested {
+            Ok(())
+        } else {
+            Err(anyhow!("replay cache already configured as {:?}", existing))
+        };
+    }
+    if mode != ReplayCacheMode::Off {
+        std::fs::create_dir_all(&requested.directory).map_err(|error| {
+            anyhow!(
+                "create replay cache directory {}: {error}",
+                requested.directory.display()
+            )
+        })?;
+    }
+    REPLAY_CACHE_CONFIG
+        .set(requested)
+        .map_err(|_| anyhow!("replay cache was configured more than once"))
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplayerStats {
@@ -48,6 +121,12 @@ pub struct ReplayerStats {
     pub buffer_capacity: u64,
     pub loaded_rows: u64,
     pub active_streams: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_writes: u64,
+    pub cache_rows: u64,
+    pub cache_read_ns: u64,
+    pub parquet_decode_ns: u64,
 }
 
 pub fn replayer_stats() -> ReplayerStats {
@@ -56,6 +135,12 @@ pub fn replayer_stats() -> ReplayerStats {
         buffer_capacity: REPLAYER_BUFFER_CAPACITY.load(Ordering::Acquire),
         loaded_rows: REPLAYER_LOADED_ROWS.load(Ordering::Acquire),
         active_streams: REPLAYER_ACTIVE_STREAMS.load(Ordering::Acquire),
+        cache_hits: REPLAY_CACHE_HITS.load(Ordering::Acquire),
+        cache_misses: REPLAY_CACHE_MISSES.load(Ordering::Acquire),
+        cache_writes: REPLAY_CACHE_WRITES.load(Ordering::Acquire),
+        cache_rows: REPLAY_CACHE_ROWS.load(Ordering::Acquire),
+        cache_read_ns: REPLAY_CACHE_READ_NS.load(Ordering::Acquire),
+        parquet_decode_ns: REPLAY_PARQUET_DECODE_NS.load(Ordering::Acquire),
     }
 }
 
@@ -78,12 +163,251 @@ impl Drop for ReplayBatch {
     }
 }
 
+enum ReplayCacheSource {
+    Hit {
+        path: PathBuf,
+        fingerprint: [u8; 32],
+    },
+    Parquet {
+        writer: Option<ReplayCacheWriter>,
+    },
+}
+
+struct ReplayCacheWriter {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    writer: Option<BufWriter<File>>,
+    records: u64,
+}
+
+impl ReplayCacheWriter {
+    fn create(final_path: PathBuf, fingerprint: [u8; 32]) -> Result<Self> {
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path =
+            final_path.with_extension(format!("bin.{}.{}.tmp", std::process::id(), sequence,));
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        writer.write_all(&REPLAY_CACHE_MAGIC)?;
+        writer.write_all(&REPLAY_CACHE_VERSION.to_le_bytes())?;
+        writer.write_all(&0_u32.to_le_bytes())?;
+        writer.write_all(&fingerprint)?;
+        Ok(Self {
+            final_path,
+            temp_path,
+            writer: Some(writer),
+            records: 0,
+        })
+    }
+
+    fn write_rows(&mut self, rows: &[ReplayRow]) -> Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("replay cache writer is closed"))?;
+        if rows.is_empty() || rows.len() > REPLAY_CACHE_MAX_BATCH_ROWS {
+            return Err(anyhow!("invalid replay cache batch length {}", rows.len()));
+        }
+        writer.write_all(&(rows.len() as u32).to_le_bytes())?;
+        for row in rows {
+            let payload = rmp_serde::to_vec(&row.event)?;
+            if payload.len() > REPLAY_CACHE_MAX_EVENT_BYTES {
+                return Err(anyhow!(
+                    "replay event payload too large: {} bytes",
+                    payload.len()
+                ));
+            }
+            writer.write_all(&row.local_timestamp_ns.to_le_bytes())?;
+            writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+            writer.write_all(&payload)?;
+            self.records = self.records.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<u64> {
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| anyhow!("replay cache writer is closed"))?;
+        writer.flush()?;
+        drop(writer);
+        std::fs::rename(&self.temp_path, &self.final_path)?;
+        REPLAY_CACHE_WRITES.fetch_add(1, Ordering::AcqRel);
+        Ok(self.records)
+    }
+}
+
+impl Drop for ReplayCacheWriter {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            self.writer = None;
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+fn replay_cache_source(
+    files: &[PathBuf],
+    source: &str,
+    start_ns: u64,
+    end_ns: u64,
+    options: ReplayOptions,
+) -> ReplayCacheSource {
+    let Some(config) = REPLAY_CACHE_CONFIG.get() else {
+        return ReplayCacheSource::Parquet { writer: None };
+    };
+    if config.mode == ReplayCacheMode::Off {
+        return ReplayCacheSource::Parquet { writer: None };
+    }
+    let fingerprint = replay_cache_fingerprint(files, source, start_ns, end_ns, options);
+    let final_path = config
+        .directory
+        .join(format!("{}.replay.bin", hex::encode(fingerprint)));
+    if config.mode == ReplayCacheMode::ReadWrite
+        && replay_cache_header_matches(&final_path, fingerprint)
+    {
+        return ReplayCacheSource::Hit {
+            path: final_path,
+            fingerprint,
+        };
+    }
+    REPLAY_CACHE_MISSES.fetch_add(1, Ordering::AcqRel);
+    let writer = match ReplayCacheWriter::create(final_path.clone(), fingerprint) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            warn!(
+                "[ReplayerCache] cannot create {}: {}; replaying parquet without cache",
+                final_path.display(),
+                error,
+            );
+            None
+        }
+    };
+    ReplayCacheSource::Parquet { writer }
+}
+
+fn replay_cache_fingerprint(
+    files: &[PathBuf],
+    source: &str,
+    start_ns: u64,
+    end_ns: u64,
+    options: ReplayOptions,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"hexagent-replay-cache-v2-batched-market-event-rmp");
+    hash.update(source.as_bytes());
+    hash.update(start_ns.to_le_bytes());
+    hash.update(end_ns.to_le_bytes());
+    hash.update([options.bootstrap_binary_open as u8, 0, 0, 0, 0, 0, 0, 0]);
+    hash.update(options.binary_open_delay_ns.to_le_bytes());
+    hash.update(options.binary_open_max_backfill_ns.to_le_bytes());
+    for path in files {
+        hash.update(path.as_os_str().as_encoded_bytes());
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                hash.update(metadata.len().to_le_bytes());
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hash.update(duration.as_secs().to_le_bytes());
+                        hash.update(duration.subsec_nanos().to_le_bytes());
+                    }
+                }
+            }
+            Err(error) => hash.update(error.to_string().as_bytes()),
+        }
+    }
+    hash.finalize().into()
+}
+
+fn replay_cache_header_matches(path: &Path, fingerprint: [u8; 32]) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    if file.metadata().map_or(true, |metadata| {
+        metadata.len() < REPLAY_CACHE_HEADER_BYTES as u64
+    }) {
+        return false;
+    }
+    let mut reader = BufReader::new(file);
+    let mut header = [0_u8; REPLAY_CACHE_HEADER_BYTES];
+    reader.read_exact(&mut header).is_ok()
+        && header[0..8] == REPLAY_CACHE_MAGIC
+        && u32::from_le_bytes(header[8..12].try_into().expect("fixed cache header"))
+            == REPLAY_CACHE_VERSION
+        && header[12..16] == [0; 4]
+        && header[16..48] == fingerprint
+}
+
+fn stream_replay_cache(
+    path: &Path,
+    fingerprint: [u8; 32],
+    batch_tx: &crossbeam_channel::Sender<std::result::Result<ReplayBatch, String>>,
+) -> Result<u64> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut header = [0_u8; REPLAY_CACHE_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    if header[0..8] != REPLAY_CACHE_MAGIC
+        || u32::from_le_bytes(header[8..12].try_into().expect("fixed cache header"))
+            != REPLAY_CACHE_VERSION
+        || header[16..48] != fingerprint
+    {
+        return Err(anyhow!("replay cache header mismatch"));
+    }
+    let mut payload = Vec::with_capacity(1024);
+    let mut total = 0_u64;
+    loop {
+        let mut batch_bytes = [0_u8; 4];
+        match reader.read(&mut batch_bytes[..1]) {
+            Ok(0) => break,
+            Ok(1) => reader.read_exact(&mut batch_bytes[1..])?,
+            Ok(_) => unreachable!("single-byte read returned more than one byte"),
+            Err(error) => return Err(error.into()),
+        }
+        let batch_len = u32::from_le_bytes(batch_bytes) as usize;
+        if batch_len == 0 || batch_len > REPLAY_CACHE_MAX_BATCH_ROWS {
+            return Err(anyhow!("invalid replay cache batch length {batch_len}"));
+        }
+        let mut rows = Vec::with_capacity(batch_len);
+        for _ in 0..batch_len {
+            let mut prefix = [0_u8; 12];
+            reader.read_exact(&mut prefix)?;
+            let local_timestamp_ns = u64::from_le_bytes(prefix[0..8].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
+            if payload_len == 0 || payload_len > REPLAY_CACHE_MAX_EVENT_BYTES {
+                return Err(anyhow!("invalid replay cache event length {payload_len}"));
+            }
+            payload.clear();
+            payload.resize(payload_len, 0);
+            reader.read_exact(&mut payload)?;
+            let event = rmp_serde::from_slice::<MarketEvent>(&payload)?;
+            rows.push(ReplayRow {
+                local_timestamp_ns,
+                event,
+            });
+        }
+        let count = rows.len() as u64;
+        REPLAYER_LOADED_ROWS.fetch_add(count, Ordering::AcqRel);
+        total = total.saturating_add(count);
+        if batch_tx.send(Ok(ReplayBatch::new(rows))).is_err() {
+            return Ok(total);
+        }
+    }
+    Ok(total)
+}
+
+#[inline]
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 /// Reads Parquet market data files and replays events in order. The producer
 /// normally hands Arrow-sized batches directly to a two-batch consumer window;
 /// the optional opening repair may combine at most two row groups, but an hour
 /// is never materialised as one `Vec<ReplayRow>`.
 pub struct MarketReplayer {
-    batch_rx: Option<crossbeam_channel::Receiver<ReplayBatch>>,
+    batch_rx: Option<crossbeam_channel::Receiver<std::result::Result<ReplayBatch, String>>>,
     loader_handle: Option<std::thread::JoinHandle<()>>,
     current_batch: Option<ReplayBatch>,
     lookahead_batch: Option<ReplayBatch>,
@@ -102,7 +426,14 @@ impl MarketReplayer {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Self> {
-        Self::new_with_options(data_dir, exchange, symbol, start, end, ReplayOptions::default())
+        Self::new_with_options(
+            data_dir,
+            exchange,
+            symbol,
+            start,
+            end,
+            ReplayOptions::default(),
+        )
     }
 
     /// Create a replayer with bounded legacy-tape repairs.
@@ -148,6 +479,7 @@ impl MarketReplayer {
         );
 
         let source = format!("{exchange}/{symbol}");
+        let cache_source = replay_cache_source(&files, &source, start_ns, end_ns, options);
         let worker_source = source.clone();
         // Rendezvous handoff: at steady state the replayer owns current +
         // lookahead and the loader can hold at most one decoded batch while
@@ -158,14 +490,51 @@ impl MarketReplayer {
             .name("market-replay-loader".to_string())
             .spawn(move || {
                 hexagent_runtime::os_tune::pin_background("market-replay-loader");
-                stream_replay_files(
-                    files,
-                    start_ns,
-                    end_ns,
-                    &worker_source,
-                    options,
-                    batch_tx,
-                );
+                match cache_source {
+                    ReplayCacheSource::Hit { path, fingerprint } => {
+                        let started = Instant::now();
+                        match stream_replay_cache(&path, fingerprint, &batch_tx) {
+                            Ok(rows) => {
+                                REPLAY_CACHE_HITS.fetch_add(1, Ordering::AcqRel);
+                                REPLAY_CACHE_ROWS.fetch_add(rows, Ordering::AcqRel);
+                                REPLAY_CACHE_READ_NS
+                                    .fetch_add(elapsed_nanos(started), Ordering::AcqRel);
+                                info!(
+                                    "[ReplayerCache] hit source={} rows={} path={}",
+                                    worker_source,
+                                    rows,
+                                    path.display(),
+                                );
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "replay cache read failed source={} path={}: {}",
+                                    worker_source,
+                                    path.display(),
+                                    error,
+                                );
+                                warn!("[ReplayerCache] {message}");
+                                // Cache corruption must not masquerade as a
+                                // clean end-of-stream after a partial replay.
+                                let _ = batch_tx.send(Err(message));
+                            }
+                        }
+                    }
+                    ReplayCacheSource::Parquet { writer } => {
+                        let started = Instant::now();
+                        stream_replay_files(
+                            files,
+                            start_ns,
+                            end_ns,
+                            &worker_source,
+                            options,
+                            batch_tx,
+                            writer,
+                        );
+                        REPLAY_PARQUET_DECODE_NS
+                            .fetch_add(elapsed_nanos(started), Ordering::AcqRel);
+                    }
+                }
             })?;
         REPLAYER_ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
@@ -293,22 +662,30 @@ impl MarketReplayer {
         })
     }
 
-    fn load_next_batch(&mut self) -> bool {
+    fn load_next_batch(&mut self) -> Result<bool> {
         self.current_batch = None;
         self.row_cursor = 0;
         if let Some(batch) = self.lookahead_batch.take() {
             self.current_batch = Some(batch);
         }
         let Some(rx) = self.batch_rx.as_ref() else {
-            return self.current_batch.is_some();
+            return Ok(self.current_batch.is_some());
         };
         if self.current_batch.is_none() {
-            self.current_batch = rx.recv().ok();
+            self.current_batch = match rx.recv() {
+                Ok(Ok(batch)) => Some(batch),
+                Ok(Err(message)) => return Err(anyhow!(message)),
+                Err(_) => None,
+            };
         }
         if self.current_batch.is_some() && self.lookahead_batch.is_none() {
-            self.lookahead_batch = rx.recv().ok();
+            self.lookahead_batch = match rx.recv() {
+                Ok(Ok(batch)) => Some(batch),
+                Ok(Err(message)) => return Err(anyhow!(message)),
+                Err(_) => None,
+            };
         }
-        self.current_batch.is_some()
+        Ok(self.current_batch.is_some())
     }
 
     fn unconsumed_rows(&self) -> impl Iterator<Item = &ReplayRow> {
@@ -329,7 +706,7 @@ impl MarketReplayer {
             .as_ref()
             .is_none_or(|batch| self.row_cursor >= batch.rows.len());
         if exhausted {
-            if !self.load_next_batch() {
+            if !self.load_next_batch()? {
                 return Ok(None);
             }
         }
@@ -482,7 +859,8 @@ fn stream_replay_files(
     end_ns: u64,
     source: &str,
     options: ReplayOptions,
-    batch_tx: crossbeam_channel::Sender<ReplayBatch>,
+    batch_tx: crossbeam_channel::Sender<std::result::Result<ReplayBatch, String>>,
+    mut cache_writer: Option<ReplayCacheWriter>,
 ) {
     let candidate_files = files.len();
     let mut loaded_files = 0_usize;
@@ -509,18 +887,26 @@ fn stream_replay_files(
                         &path,
                         &mut loaded_rows,
                         combined,
+                        &mut cache_writer,
                     );
                 }
                 return consumer_open;
             }
-            consumer_open = send_replay_rows(&batch_tx, &path, &mut loaded_rows, rows);
+            consumer_open =
+                send_replay_rows(&batch_tx, &path, &mut loaded_rows, rows, &mut cache_writer);
             consumer_open
         });
         if consumer_open && !bootstrap_rows.is_empty() {
             let mut combined = std::mem::take(&mut bootstrap_rows);
             let repair = bootstrap_binary_event_open(&mut combined, options);
             log_binary_open_repair(source, &path, repair);
-            consumer_open = send_replay_rows(&batch_tx, &path, &mut loaded_rows, combined);
+            consumer_open = send_replay_rows(
+                &batch_tx,
+                &path,
+                &mut loaded_rows,
+                combined,
+                &mut cache_writer,
+            );
         }
         match result {
             Ok(file_rows) => {
@@ -545,20 +931,48 @@ fn stream_replay_files(
         "[Replayer] Replay source summary source={} candidate_files={} loaded_files={} loaded_rows={}",
         source, candidate_files, loaded_files, loaded_rows,
     );
+    if let Some(writer) = cache_writer {
+        let path = writer.final_path.clone();
+        match writer.finish() {
+            Ok(records) => info!(
+                "[ReplayerCache] wrote source={} rows={} path={}",
+                source,
+                records,
+                path.display(),
+            ),
+            Err(error) => warn!(
+                "[ReplayerCache] finalize failed source={} path={}: {}",
+                source,
+                path.display(),
+                error,
+            ),
+        }
+    }
 }
 
 fn send_replay_rows(
-    batch_tx: &crossbeam_channel::Sender<ReplayBatch>,
+    batch_tx: &crossbeam_channel::Sender<std::result::Result<ReplayBatch, String>>,
     path: &Path,
     loaded_rows: &mut u64,
     mut rows: Vec<ReplayRow>,
+    cache_writer: &mut Option<ReplayCacheWriter>,
 ) -> bool {
     rows.sort_by_key(|row| row.local_timestamp_ns);
+    if let Some(writer) = cache_writer.as_mut() {
+        if let Err(error) = writer.write_rows(&rows) {
+            warn!(
+                "[ReplayerCache] write failed path={}: {}; disabling cache for this source",
+                writer.final_path.display(),
+                error,
+            );
+            *cache_writer = None;
+        }
+    }
     let count = rows.len() as u64;
     REPLAYER_LOADED_ROWS.fetch_add(count, Ordering::AcqRel);
     *loaded_rows = loaded_rows.saturating_add(count);
     log::debug!("[Replayer] Decoded {} rows from {}", count, path.display());
-    batch_tx.send(ReplayBatch::new(rows)).is_ok()
+    batch_tx.send(Ok(ReplayBatch::new(rows))).is_ok()
 }
 
 fn log_binary_open_repair(source: &str, path: &Path, repair: BinaryOpenRepair) {
@@ -585,18 +999,16 @@ struct BinaryOpenRepair {
 
 fn binary_open_bootstrap_ready(rows: &[ReplayRow]) -> bool {
     let Some(tokens) = rows.iter().find_map(|row| match &row.event {
-        MarketEvent::Instrument(Instrument::BinaryOption(option)) => {
-            Some(&option.clob_token_ids)
-        }
+        MarketEvent::Instrument(Instrument::BinaryOption(option)) => Some(&option.clob_token_ids),
         _ => None,
     }) else {
         return false;
     };
     !tokens.is_empty()
         && tokens.iter().all(|token| {
-            rows.iter().any(|row| {
-                matches!(&row.event, MarketEvent::OrderBook(book) if &book.symbol == token)
-            })
+            rows.iter().any(
+                |row| matches!(&row.event, MarketEvent::OrderBook(book) if &book.symbol == token),
+            )
         })
 }
 
@@ -611,20 +1023,20 @@ fn bootstrap_binary_event_open(
         return BinaryOpenRepair::default();
     }
 
-    let Some((instrument_index, event_start_ns, tokens)) = rows
-        .iter()
-        .enumerate()
-        .find_map(|(index, row)| match &row.event {
-            MarketEvent::Instrument(Instrument::BinaryOption(option)) => {
-                let start: u64 = chrono::DateTime::parse_from_rfc3339(&option.event_start_time)
-                    .ok()?
-                    .timestamp_nanos_opt()?
-                    .try_into()
-                    .ok()?;
-                Some((index, start, option.clob_token_ids.clone()))
-            }
-            _ => None,
-        })
+    let Some((instrument_index, event_start_ns, tokens)) =
+        rows.iter()
+            .enumerate()
+            .find_map(|(index, row)| match &row.event {
+                MarketEvent::Instrument(Instrument::BinaryOption(option)) => {
+                    let start: u64 = chrono::DateTime::parse_from_rfc3339(&option.event_start_time)
+                        .ok()?
+                        .timestamp_nanos_opt()?
+                        .try_into()
+                        .ok()?;
+                    Some((index, start, option.clob_token_ids.clone()))
+                }
+                _ => None,
+            })
     else {
         return BinaryOpenRepair::default();
     };
@@ -1278,8 +1690,14 @@ mod tests {
         OrderBookSnapshot {
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
-            bids: vec![PriceLevel { price: 0.49, quantity: 100.0 }],
-            asks: vec![PriceLevel { price: 0.51, quantity: 100.0 }],
+            bids: vec![PriceLevel {
+                price: 0.49,
+                quantity: 100.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 0.51,
+                quantity: 100.0,
+            }],
             exchange_timestamp_ns: timestamp_ns,
             local_timestamp_ns: timestamp_ns,
         }
@@ -1320,7 +1738,10 @@ mod tests {
             let expected = event_start_ns + 20_000_001 + index as u64;
             let seeded = rows.iter().find_map(|row| match &row.event {
                 MarketEvent::OrderBook(book)
-                    if book.symbol == *token && row.local_timestamp_ns == expected => Some(book),
+                    if book.symbol == *token && row.local_timestamp_ns == expected =>
+                {
+                    Some(book)
+                }
                 _ => None,
             });
             let seeded = seeded.expect("seeded book");
@@ -1623,5 +2044,174 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn binary_replay_cache_roundtrips_events_and_rejects_foreign_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.replay.bin");
+        let fingerprint = [0x4d; 32];
+        let rows = vec![
+            ReplayRow {
+                local_timestamp_ns: 101,
+                event: MarketEvent::Quote(QuoteTick {
+                    exchange: Exchange::Binance,
+                    symbol: "BTCUSDT".to_string(),
+                    bid_price: 70_000.25,
+                    bid_qty: 1.5,
+                    ask_price: 70_000.5,
+                    ask_qty: 2.5,
+                    exchange_timestamp_ns: 99,
+                    local_timestamp_ns: 101,
+                }),
+            },
+            ReplayRow {
+                local_timestamp_ns: 205,
+                event: MarketEvent::SpotPrice(SpotPrice {
+                    source: "chainlink".to_string(),
+                    symbol: "BTC/USD".to_string(),
+                    price: 70_001.125,
+                    timestamp_ns: 200,
+                    local_timestamp_ns: 205,
+                }),
+            },
+        ];
+        let expected: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| rmp_serde::to_vec(&row.event).unwrap())
+            .collect();
+        let mut writer = ReplayCacheWriter::create(path.clone(), fingerprint).unwrap();
+        writer.write_rows(&rows).unwrap();
+        assert_eq!(writer.finish().unwrap(), 2);
+        assert!(replay_cache_header_matches(&path, fingerprint));
+        assert!(!replay_cache_header_matches(&path, [0x5e; 32]));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(stream_replay_cache(&path, fingerprint, &tx).unwrap(), 2);
+        drop(tx);
+        let batches: Vec<ReplayBatch> = rx.into_iter().map(|batch| batch.unwrap()).collect();
+        let decoded: Vec<&ReplayRow> = batches.iter().flat_map(|batch| batch.rows.iter()).collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].local_timestamp_ns, 101);
+        assert_eq!(decoded[1].local_timestamp_ns, 205);
+        for (actual, expected) in decoded.into_iter().zip(expected) {
+            assert_eq!(rmp_serde::to_vec(&actual.event).unwrap(), expected);
+        }
+        assert!(stream_replay_cache(&path, [0x5e; 32], &crossbeam_channel::unbounded().0).is_err());
+    }
+
+    #[test]
+    fn binary_replay_cache_accepts_maximum_repaired_bootstrap_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maximum.replay.bin");
+        let fingerprint = [0x6a; 32];
+        let rows: Vec<ReplayRow> = (0..REPLAY_CACHE_MAX_BATCH_ROWS)
+            .map(|index| ReplayRow {
+                local_timestamp_ns: index as u64,
+                event: MarketEvent::Quote(QuoteTick {
+                    exchange: Exchange::Binance,
+                    symbol: "BTCUSDT".to_string(),
+                    bid_price: 70_000.25,
+                    bid_qty: 1.5,
+                    ask_price: 70_000.5,
+                    ask_qty: 2.5,
+                    exchange_timestamp_ns: index as u64,
+                    local_timestamp_ns: index as u64,
+                }),
+            })
+            .collect();
+        let mut writer = ReplayCacheWriter::create(path.clone(), fingerprint).unwrap();
+        writer.write_rows(&rows).unwrap();
+        assert_eq!(writer.finish().unwrap(), REPLAY_CACHE_MAX_BATCH_ROWS as u64);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            stream_replay_cache(&path, fingerprint, &tx).unwrap(),
+            REPLAY_CACHE_MAX_BATCH_ROWS as u64
+        );
+        drop(tx);
+        let batch = rx.recv().unwrap().unwrap();
+        assert_eq!(batch.rows.len(), REPLAY_CACHE_MAX_BATCH_ROWS);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn binary_replay_cache_fingerprint_tracks_source_metadata_and_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.parquet");
+        std::fs::write(&path, b"first").unwrap();
+        let files = vec![path.clone()];
+        let baseline = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            200,
+            ReplayOptions::default(),
+        );
+        let different_window = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            201,
+            ReplayOptions::default(),
+        );
+        assert_ne!(baseline, different_window);
+        std::fs::write(&path, b"second-longer").unwrap();
+        let changed_file = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            200,
+            ReplayOptions::default(),
+        );
+        assert_ne!(baseline, changed_file);
+        let changed_repair = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            200,
+            ReplayOptions {
+                bootstrap_binary_open: true,
+                binary_open_delay_ns: 20_000_000,
+                binary_open_max_backfill_ns: 5_000_000_000,
+            },
+        );
+        assert_ne!(changed_file, changed_repair);
+    }
+
+    #[test]
+    fn unfinished_binary_replay_cache_is_not_installed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.replay.bin");
+        let temp_path = {
+            let writer = ReplayCacheWriter::create(path.clone(), [0x7f; 32]).unwrap();
+            let temp = writer.temp_path.clone();
+            assert!(temp.exists());
+            temp
+        };
+        assert!(!temp_path.exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replay_cache_loader_error_is_not_reported_as_clean_eof() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Err("synthetic corrupt replay cache".to_string()))
+            .unwrap();
+        drop(tx);
+        REPLAYER_ACTIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
+        let mut replayer = MarketReplayer {
+            batch_rx: Some(rx),
+            loader_handle: None,
+            current_batch: None,
+            lookahead_batch: None,
+            row_cursor: 0,
+            event_count: 0,
+            source: "cache-error-test".to_string(),
+        };
+        let error = replayer.next_event().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("synthetic corrupt replay cache"));
     }
 }

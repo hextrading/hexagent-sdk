@@ -358,6 +358,14 @@ pub struct BacktestConfig {
     /// Root directory containing recorded data (same as recording.output_dir).
     #[serde(default = "default_output_dir")]
     pub data_dir: String,
+    /// Decoded-event binary cache: `off`, `read_write`, or `refresh`.
+    /// It is used only by archive replay workers, never by live market data.
+    #[serde(default)]
+    pub replay_cache_mode: String,
+    /// Directory for versioned replay cache files. Empty selects
+    /// `<data_dir>/.replay-cache`.
+    #[serde(default)]
+    pub replay_cache_dir: String,
     /// Optional CSV sidecar containing condition-scoped `MarketDataHealth`
     /// events reconstructed outside the normal parquet tape.  The backtest
     /// driver merges these rows into the strategy lane by local timestamp.
@@ -1191,11 +1199,12 @@ impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             data_dir: default_output_dir(),
+            replay_cache_mode: String::new(),
+            replay_cache_dir: String::new(),
             market_data_health_replay_path: String::new(),
             sim_v2_bootstrap_binary_open: false,
             sim_v2_binary_open_delay_ms: default_sim_v2_binary_open_delay_ms(),
-            sim_v2_binary_open_max_backfill_ms:
-                default_sim_v2_binary_open_max_backfill_ms(),
+            sim_v2_binary_open_max_backfill_ms: default_sim_v2_binary_open_max_backfill_ms(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
             sim_v2_dynamic_ahead_frac_strength: 0.0,
             sim_v2_partial_depletion_queue_strength: 0.0,
@@ -1272,8 +1281,7 @@ impl Default for BacktestConfig {
             sim_v2_dynamic_window_max_mult: default_sim_v2_dynamic_window_max_mult(),
             sim_v2_deep_queue_decay: default_sim_v2_deep_queue_decay(),
             sim_v2_dynamic_deep_queue_strength: 0.0,
-            sim_v2_dynamic_deep_queue_min_decay:
-                default_sim_v2_dynamic_deep_queue_min_decay(),
+            sim_v2_dynamic_deep_queue_min_decay: default_sim_v2_dynamic_deep_queue_min_decay(),
             start_date: String::new(),
             end_date: String::new(),
             simulate_config: String::new(),
@@ -1590,10 +1598,7 @@ impl ExchangeConfig {
     }
 }
 
-pub fn settlement_twap_label(
-    spot_symbol: &str,
-    settlement_twap_secs: u64,
-) -> Option<String> {
+pub fn settlement_twap_label(spot_symbol: &str, settlement_twap_secs: u64) -> Option<String> {
     let spot_symbol = spot_symbol.trim().trim_end_matches('/');
     if spot_symbol.is_empty() || settlement_twap_secs == 0 {
         return None;
@@ -2321,9 +2326,8 @@ mod settlement_twap_config_tests {
 
     #[test]
     fn settlement_label_uses_the_configured_window_and_rejects_zero() {
-        let exchange: ExchangeConfig = toml::from_str(
-            "name = 'chainlink'\nsettlement_twap_secs = 90",
-        ).unwrap();
+        let exchange: ExchangeConfig =
+            toml::from_str("name = 'chainlink'\nsettlement_twap_secs = 90").unwrap();
         assert_eq!(
             exchange.settlement_twap_label("eth/usd/"),
             Some("eth/usd/twap/90s".to_string()),
@@ -2365,9 +2369,8 @@ mod account_id_tests {
 
     #[test]
     fn account_allocation_weight_defaults_to_equal() {
-        let config: StrategyConfig = toml::from_str(
-            "name = 'polymaker'\ninstance_id = 'btc'\naccount_id = 'main'",
-        ).unwrap();
+        let config: StrategyConfig =
+            toml::from_str("name = 'polymaker'\ninstance_id = 'btc'\naccount_id = 'main'").unwrap();
         assert_eq!(config.account_allocation_weight, 1.0);
         assert!(config.account_allocation_migration_id.is_empty());
     }
