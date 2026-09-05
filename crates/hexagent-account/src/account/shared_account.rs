@@ -5751,6 +5751,7 @@ struct EconomicStateGuard<'a> {
     maintenance_reserved_cash_baseline: BTreeMap<String, f64>,
     maintenance_reserved_positions_baseline: BTreeMap<String, HashMap<String, f64>>,
     scoped_tokens: Vec<String>,
+    token_interest_retirement: Option<(String, String)>,
     acquired_at: Instant,
 }
 
@@ -5824,6 +5825,26 @@ impl Drop for EconomicStateGuard<'_> {
                     let entry = maintenance_positions.entry(token.clone()).or_insert(0.0);
                     *entry = (*entry + delta).max(0.0);
                 }
+            }
+        }
+        if let Some((instance_id, condition_id)) = self.token_interest_retirement.as_ref() {
+            if let (Some(account), Some(interest)) = (
+                accounts.get(instance_id),
+                self.state
+                    .instances
+                    .get(instance_id)
+                    .and_then(|instance| instance.token_interests.get(condition_id)),
+            ) {
+                // Settlement is a cold account-owner transaction, but a later
+                // aggregate refresh may rebuild instance control state from
+                // this owner-local projection. Publish the retirement marker
+                // before releasing the control gate so that refresh cannot
+                // resurrect an active token interest.
+                account
+                    .token_interests
+                    .lock()
+                    .unwrap()
+                    .insert(condition_id.clone(), interest.clone());
             }
         }
         drop(accounts);
@@ -7404,6 +7425,7 @@ impl SharedAccount {
             maintenance_reserved_cash_baseline,
             maintenance_reserved_positions_baseline,
             scoped_tokens,
+            token_interest_retirement: None,
             acquired_at,
         }
     }
@@ -10515,6 +10537,10 @@ impl SharedAccount {
             interest.retire_after_ms = Some(wall_clock_ms().saturating_add(10 * 60 * 1000));
             changed = true;
             retired_interest = true;
+        }
+        if retired_interest {
+            state.token_interest_retirement =
+                Some((instance_id.to_string(), condition_id.to_string()));
         }
         if changed {
             self.publish_control_snapshots(&state);
@@ -20969,6 +20995,57 @@ mod tests {
         assert_eq!(thread_rx.recv().unwrap(), owner_thread);
         assert_ne!(owner_thread, std::thread::current().id());
         assert_eq!(account.account_owner_task_queue_depth(), 0);
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn bound_settlement_retirement_survives_owner_local_projection_refresh() {
+        let account = Arc::new(SharedAccount::new("owner-settlement-retirement"));
+        account.register_instance("maker-1", 1.0);
+        let (handle, owner_state) = account.bind_account_owner().unwrap();
+        let owner = std::thread::spawn(move || {
+            owner_state.mark_current_thread().unwrap();
+            for _ in 0..3 {
+                let command = owner_state
+                    .receiver()
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap();
+                owner_state.execute(command);
+            }
+        });
+
+        handle
+            .submit_register_token_interest(
+                "maker-1".to_string(),
+                "condition-1".to_string(),
+                "UP".to_string(),
+                "DOWN".to_string(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        handle
+            .submit_settlement_and_retire(
+                "maker-1".to_string(),
+                "condition-1".to_string(),
+                HashMap::from([("UP".to_string(), 1.0), ("DOWN".to_string(), 0.0)]),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        // This read is intentionally dispatched through the owner. Its cold
+        // state refresh must not replace the retirement with the older active
+        // value from the instance projection.
+        let interest = account
+            .try_token_interests()
+            .unwrap()
+            .into_iter()
+            .find(|interest| interest.condition_id == "condition-1")
+            .unwrap();
+        assert!(interest.retire_after_ms.is_some());
         owner.join().unwrap();
     }
 
