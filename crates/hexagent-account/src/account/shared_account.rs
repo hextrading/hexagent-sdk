@@ -9567,17 +9567,24 @@ impl SharedAccount {
         } else {
             requested_scope
         };
-        instance.token_interests.insert(
-            condition_id.to_string(),
-            TokenInterest {
-                instance_id: instance_id.to_string(),
-                condition_id: condition_id.to_string(),
-                up_token_id: up_token_id.to_string(),
-                down_token_id: down_token_id.to_string(),
-                scope_key,
-                retire_after_ms: None,
-            },
-        );
+        let interest = TokenInterest {
+            instance_id: instance_id.to_string(),
+            condition_id: condition_id.to_string(),
+            up_token_id: up_token_id.to_string(),
+            down_token_id: down_token_id.to_string(),
+            scope_key,
+            retire_after_ms: None,
+        };
+        instance
+            .token_interests
+            .insert(condition_id.to_string(), interest.clone());
+        if let Some(account) = self.virtual_account(instance_id) {
+            account
+                .token_interests
+                .lock()
+                .unwrap()
+                .insert(condition_id.to_string(), interest);
+        }
         // Never redistribute an already-seeded ledger here. Live startup
         // registers every configured instance before the first fetch; a scope
         // added later must not rewrite cash, PnL, or trade-owned inventory.
@@ -9747,10 +9754,22 @@ impl SharedAccount {
             return;
         }
         let mut state = self.lock_state();
-        if let Some(instance) = state.instances.get_mut(instance_id) {
-            if let Some(interest) = instance.token_interests.get_mut(condition_id) {
+        let retired_interest = state
+            .instances
+            .get_mut(instance_id)
+            .and_then(|instance| instance.token_interests.get_mut(condition_id))
+            .map(|interest| {
                 interest.retire_after_ms = Some(wall_clock_ms().saturating_add(10 * 60 * 1000));
-            }
+                interest.clone()
+            });
+        if let (Some(account), Some(interest)) =
+            (self.virtual_account(instance_id), retired_interest)
+        {
+            account
+                .token_interests
+                .lock()
+                .unwrap()
+                .insert(condition_id.to_string(), interest);
         }
         self.schedule_persist(&state);
     }
@@ -21003,6 +21022,7 @@ mod tests {
         let account = Arc::new(SharedAccount::new("owner-settlement-retirement"));
         account.register_instance("maker-1", 1.0);
         let (handle, owner_state) = account.bind_account_owner().unwrap();
+        let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
         let owner = std::thread::spawn(move || {
             owner_state.mark_current_thread().unwrap();
             for _ in 0..3 {
