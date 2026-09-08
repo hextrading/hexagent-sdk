@@ -5964,7 +5964,10 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .record_settled_token_values(&HashMap::from([("TOKEN".to_string(), 1.0)]));
+            .submit_settled_token_values(HashMap::from([("TOKEN".to_string(), 1.0)]))
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         let payload = serde_json::json!({
             "event_type": "trade",
             "id": "unknown-historical-maker",
