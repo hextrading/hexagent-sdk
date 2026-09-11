@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::types::{
-    Exchange, Instrument, Liquidity, OrderBookSnapshot, OrderRequest, OrderStatus, OrderType,
+    AuthoritativeOrderAudit, Exchange, Instrument, Liquidity, OrderBookSnapshot, OrderRequest, OrderStatus, OrderType,
     OrderUpdate, PriceLevel, Side, TickSizeChange, TradeTick,
 };
 
@@ -29,6 +29,45 @@ const EPS: f64 = 1e-9;
 /// 16 events is a generous grace (≈80 min for 5-min series) while bounding the
 /// token-keyed maps to ≈32 live tokens regardless of run length.
 const RETAIN_EVENTS: usize = 16;
+
+// Simulation-core-owned protocol evidence, separate from optional diagnostics.
+// Retired events release their entries. Hard bounds also cover malformed feeds
+// without event retirement; saturation omits evidence (fail closed), never
+// fabricates a zero-fill terminal and never changes matching/RNG/latency.
+const MAX_ORDER_EVIDENCE: usize = 65_536;
+const MAX_ORDER_TRADE_IDS: usize = 256;
+
+/// End-of-replay counters for bounded, simulator-owned order evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderEvidenceStats {
+    pub current_orders: usize,
+    pub high_water_orders: usize,
+    pub order_capacity: usize,
+    pub high_water_trade_ids: usize,
+    pub trade_id_capacity_per_order: usize,
+    pub overflows: u64,
+}
+
+struct SimOrderEvidence {
+    instance_id: String,
+    symbol: String,
+    side: Side,
+    original_quantity: f64,
+    matched_quantity: f64,
+    trade_ids: Vec<String>,
+    complete: bool,
+}
+
+impl SimOrderEvidence {
+    fn audit(&self) -> Option<AuthoritativeOrderAudit> {
+        self.complete.then(|| AuthoritativeOrderAudit {
+            original_size: Some(self.original_quantity.to_string()),
+            size_matched: Some(self.matched_quantity.to_string()),
+            associate_trades: self.trade_ids.clone(),
+        })
+    }
+}
+
 
 struct RestingOrder {
     request: OrderRequest,
@@ -391,6 +430,11 @@ pub struct SimExchangeV2 {
     /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
     maker_order_audit_enabled: bool,
     maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
+    // Sole writer: the backtest matching core. This is not live account state.
+    order_evidence: BTreeMap<String, SimOrderEvidence>,
+    order_evidence_overflows: u64,
+    order_evidence_high_water: usize,
+    order_trade_ids_high_water: usize,
     /// Latest causal exchange timestamp observed by the matching core. Used
     /// only to snapshot still-open exposure at the end of an audit run.
     audit_clock_ns: u64,
@@ -672,6 +716,10 @@ impl SimExchangeV2 {
             fill_audit: BTreeMap::new(),
             maker_order_audit_enabled: false,
             maker_order_audit: BTreeMap::new(),
+            order_evidence: BTreeMap::new(),
+            order_evidence_overflows: 0,
+            order_evidence_high_water: 0,
+            order_trade_ids_high_water: 0,
             audit_clock_ns: 0,
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
@@ -779,6 +827,68 @@ impl SimExchangeV2 {
         self.maker_life_n += 1;
     }
 
+    fn register_order_evidence(&mut self, order: &OrderRequest) {
+        if let Some(existing) = self.order_evidence.get_mut(&order.client_order_id) {
+            if existing.instance_id != order.instance_id || existing.symbol != order.symbol
+                || existing.side != order.side || existing.original_quantity != order.quantity
+            {
+                existing.complete = false;
+            }
+            return;
+        }
+        if self.order_evidence.len() >= MAX_ORDER_EVIDENCE {
+            self.order_evidence_overflows += 1;
+            return;
+        }
+        self.order_evidence.insert(order.client_order_id.clone(), SimOrderEvidence {
+            instance_id: order.instance_id.clone(),
+            symbol: order.symbol.clone(),
+            side: order.side,
+            original_quantity: order.quantity,
+            matched_quantity: 0.0,
+            trade_ids: Vec::new(),
+            complete: order.quantity.is_finite() && order.quantity > 0.0,
+        });
+        self.order_evidence_high_water = self.order_evidence_high_water.max(self.order_evidence.len());
+    }
+
+    /// Read once for end-of-replay reporting; this is not a queue or live
+    /// strategy/account observer. Counters remain monotonic after retirement.
+    pub fn order_evidence_stats(&self) -> OrderEvidenceStats {
+        OrderEvidenceStats {
+            current_orders: self.order_evidence.len(),
+            high_water_orders: self.order_evidence_high_water,
+            order_capacity: MAX_ORDER_EVIDENCE,
+            high_water_trade_ids: self.order_trade_ids_high_water,
+            trade_id_capacity_per_order: MAX_ORDER_TRADE_IDS,
+            overflows: self.order_evidence_overflows,
+        }
+    }
+
+    fn record_order_execution(&mut self, coid: &str, trade_id: &str, quantity: f64) {
+        let Some(evidence) = self.order_evidence.get_mut(coid) else { return; };
+        if evidence.trade_ids.iter().any(|known| known == trade_id) { return; }
+        evidence.matched_quantity += quantity;
+        if !quantity.is_finite() || quantity <= 0.0
+            || !evidence.matched_quantity.is_finite()
+            || evidence.matched_quantity > evidence.original_quantity + EPS
+            || evidence.trade_ids.len() == MAX_ORDER_TRADE_IDS
+        {
+            evidence.complete = false;
+            self.order_evidence_overflows += 1;
+            return;
+        }
+        evidence.trade_ids.push(trade_id.to_string());
+        self.order_trade_ids_high_water = self.order_trade_ids_high_water.max(evidence.trade_ids.len());
+    }
+
+    fn terminal_order_audit(&self, coid: &str) -> Option<AuthoritativeOrderAudit> {
+        // A recovery probe must not label an order with live residual as a
+        // completed quantity audit, even if an older cancel result was lost.
+        if self.orders.contains_key(coid) { return None; }
+        self.order_evidence.get(coid).and_then(SimOrderEvidence::audit)
+    }
+
     /// Record a fill so a cancel arriving within the window returns Filled.
     fn record_recent_fill(
         &mut self,
@@ -791,6 +901,10 @@ impl SimExchangeV2 {
         liquidity: Liquidity,
         ts: u64,
     ) {
+        // Gross executed quantity, before BUY share fees, is the exchange
+        // order's matched amount. Wallet economics and private fill payloads
+        // remain unchanged; the consumer accounts fees exactly once.
+        self.record_order_execution(coid, &trade_id, add_qty);
         let e = self.recent_fills.entry(coid.to_string()).or_insert(RecentFill {
             ts,
             trade_id: trade_id.clone(),
@@ -2492,6 +2606,7 @@ impl SimExchangeV2 {
             self.books.retire_token(t);
             self.wallets.retire_token(t);
         }
+        self.order_evidence.retain(|_, evidence| !tokens.contains(&evidence.symbol));
         self.seeded_conditions.remove(condition);
     }
 
@@ -2714,6 +2829,7 @@ impl SimExchangeV2 {
         causal_race_cap: Option<f64>,
     ) -> OrderUpdate {
         self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
+        self.register_order_evidence(o);
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.place_orders += 1;
             a.place_qty += o.quantity;
@@ -3452,7 +3568,7 @@ impl SimExchangeV2 {
             exchange: o.exchange,
             symbol: o.symbol.clone(),
             side: o.side,
-            exchange_order_id: None,
+            exchange_order_id: Some(format!("simv2-{}", o.client_order_id)),
             status: OrderStatus::Cancelled,
             liquidity: None,
             filled_quantity: 0.0,
@@ -3461,7 +3577,7 @@ impl SimExchangeV2 {
             timestamp_ns: now_ns,
             exchange_event_timestamp_ns: None,
             trade_id: None,
-            order_audit: None,
+            order_audit: self.terminal_order_audit(&o.client_order_id),
             error: None,
             order_slot: Default::default(),
         }
@@ -3531,12 +3647,13 @@ impl SimExchangeV2 {
                 a.q_ahead_final = o.q_ahead;
                 a.remaining_final = o.remaining;
             }
+            let order_audit = self.terminal_order_audit(coid);
             return OrderUpdate {
                 client_order_id: coid.to_string(),
                 exchange,
                 symbol: o.request.symbol,
                 side: o.request.side,
-                exchange_order_id: None,
+                exchange_order_id: Some(format!("simv2-{}", coid)),
                 status: OrderStatus::Cancelled,
                 liquidity: None,
                 filled_quantity: 0.0,
@@ -3545,7 +3662,7 @@ impl SimExchangeV2 {
                 timestamp_ns: now_ns,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
-                order_audit: None,
+                order_audit,
                 error: None,
                 order_slot: Default::default(),
             };
@@ -3610,9 +3727,9 @@ impl SimExchangeV2 {
         OrderUpdate {
             client_order_id: coid.to_string(),
             exchange,
-            symbol: String::new(),
-            side: Side::Buy,
-            exchange_order_id: None,
+            symbol: self.order_evidence.get(coid).map(|e| e.symbol.clone()).unwrap_or_default(),
+            side: self.order_evidence.get(coid).map(|e| e.side).unwrap_or(Side::Buy),
+            exchange_order_id: self.order_evidence.contains_key(coid).then(|| format!("simv2-{}", coid)),
             status: OrderStatus::Cancelled,
             liquidity: None,
             filled_quantity: 0.0,
@@ -3621,7 +3738,7 @@ impl SimExchangeV2 {
             timestamp_ns: now_ns,
             exchange_event_timestamp_ns: None,
             trade_id: None,
-            order_audit: None,
+            order_audit: self.terminal_order_audit(coid),
             error: None,
             order_slot: Default::default(),
         }
@@ -3658,7 +3775,7 @@ impl SimExchangeV2 {
                 timestamp_ns: now_ns,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
-                order_audit: None,
+                order_audit: if status == OrderStatus::Cancelled { self.terminal_order_audit(coid) } else { None },
                 error: None,
                 order_slot: Default::default(),
             });
@@ -3667,9 +3784,9 @@ impl SimExchangeV2 {
             out.push(OrderUpdate {
                 client_order_id: coid.clone(),
                 exchange: Exchange::Polymarket,
-                symbol: String::new(),
-                side: Side::Buy,
-                exchange_order_id: None,
+                symbol: self.order_evidence.get(coid).map(|e| e.symbol.clone()).unwrap_or_default(),
+                side: self.order_evidence.get(coid).map(|e| e.side).unwrap_or(Side::Buy),
+                exchange_order_id: self.order_evidence.contains_key(coid).then(|| format!("simv2-{}", coid)),
                 status: OrderStatus::Cancelled,
                 liquidity: None,
                 filled_quantity: 0.0,
@@ -3678,7 +3795,7 @@ impl SimExchangeV2 {
                 timestamp_ns: now_ns,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
-                order_audit: None,
+                order_audit: self.terminal_order_audit(coid),
                 error: None,
                 order_slot: Default::default(),
             });
@@ -3804,6 +3921,161 @@ mod tests {
         let mut c = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
         c.on_instrument(&binary_instrument());
         c
+    }
+
+    fn assert_terminal_audit(update: &OrderUpdate, original: f64, matched: f64, ids: &[String]) {
+        let audit = update.order_audit.as_ref().expect("complete terminal evidence");
+        assert_eq!(update.exchange_order_id.as_deref(), Some(format!("simv2-{}", update.client_order_id).as_str()));
+        assert_eq!(audit.original_size.as_deref().unwrap().parse::<f64>().unwrap(), original);
+        assert!((audit.size_matched.as_deref().unwrap().parse::<f64>().unwrap() - matched).abs() < EPS);
+        assert_eq!(audit.associate_trades, ids);
+    }
+
+    #[test]
+    fn terminal_audit_retains_all_fragments_across_cancel_and_recovery() {
+        let mut c = core();
+        c.configure_replay_self_depth(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        c.submit_order(&order("audit", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 1);
+        let first = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 5.0, 100));
+        let second = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 6.9928, 110));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        let ids = vec![first[0].trade_id.clone().unwrap(), second[0].trade_id.clone().unwrap()];
+        let cancelled = c.cancel_order(Exchange::Polymarket, "audit", 120);
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(cancelled.filled_quantity, 0.0, "audit never creates a private fill");
+        assert_terminal_audit(&cancelled, 12.0, 11.9928, &ids);
+        let replay = c.cancel_order(Exchange::Polymarket, "audit", 3_000_000_000);
+        assert_terminal_audit(&replay, 12.0, 11.9928, &ids);
+        let recovered = c.reconcile(&[], &[("audit".into(), "simv2-audit".into())], 4_000_000_000);
+        assert_terminal_audit(&recovered[0], 12.0, 11.9928, &ids);
+        assert!((c.order_evidence["audit"].matched_quantity - 11.9928).abs() < EPS);
+    }
+
+    #[test]
+    fn terminal_audit_zero_fill_cancel_and_cancel_before_place_are_explicit() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        c.submit_order(&order("zero", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 1);
+        assert_terminal_audit(&c.cancel_order(Exchange::Polymarket, "zero", 2), 12.0, 0.0, &[]);
+        let unknown = c.cancel_order(Exchange::Polymarket, "race", 3);
+        assert!(unknown.order_audit.is_none(), "unknown original quantity is not zero-fill proof");
+        let arrival = c.submit_order(&order("race", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 4);
+        assert_eq!(arrival.status, OrderStatus::Cancelled);
+        assert_terminal_audit(&arrival, 12.0, 0.0, &[]);
+    }
+
+    #[test]
+    fn terminal_audit_partial_taker_uses_gross_quantity_and_original_identity() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 5.0)]));
+        let fill = c.submit_order(&order("taker-audit", "up", Side::Buy, 0.57, 12.0, false, OrderType::Fak), 1);
+        assert_eq!(fill.filled_quantity, 5.0);
+        assert_eq!(fill.status, OrderStatus::PartiallyFilled);
+        assert!(fill.order_audit.is_none(), "private trade payload remains unchanged");
+        let ids = vec![fill.trade_id.clone().unwrap()];
+        let recovered = c.reconcile(&[("taker-audit".into(), "up".into(), Side::Buy, 0.57, None)], &[], 2_000_000_000);
+        assert_terminal_audit(&recovered[0], 12.0, 5.0, &ids);
+        assert_eq!(recovered[0].symbol, "up");
+        assert_eq!(recovered[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn terminal_audit_live_residual_and_trade_id_overflow_fail_closed() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+        let request = order("full", "up", Side::Buy, 0.55, 1000.0, true, OrderType::Limit);
+        c.submit_order(&request, 1);
+        assert!(c.terminal_order_audit("full").is_none(), "live residual cannot be terminal evidence");
+        for index in 0..=MAX_ORDER_TRADE_IDS {
+            c.record_order_execution("full", &format!("fragment-{index}"), 1.0);
+        }
+        let cancelled = c.cancel_order(Exchange::Polymarket, "full", 2);
+        assert!(cancelled.order_audit.is_none());
+        assert_eq!(c.order_evidence["full"].trade_ids.len(), MAX_ORDER_TRADE_IDS);
+        assert_eq!(c.order_evidence_overflows, 1);
+        let stats = c.order_evidence_stats();
+        assert_eq!(stats.high_water_trade_ids, MAX_ORDER_TRADE_IDS);
+        assert_eq!(stats.trade_id_capacity_per_order, MAX_ORDER_TRADE_IDS);
+        assert_eq!(stats.overflows, 1);
+    }
+
+    #[test]
+    fn terminal_audit_order_bound_and_event_retirement_are_explicit() {
+        let mut c = core();
+        let mut request = order("", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        for index in 0..MAX_ORDER_EVIDENCE {
+            request.client_order_id = format!("evidence-{index}");
+            c.register_order_evidence(&request);
+        }
+        request.client_order_id = "overflow".into();
+        c.register_order_evidence(&request);
+        assert_eq!(c.order_evidence.len(), MAX_ORDER_EVIDENCE);
+        assert_eq!(c.order_evidence_overflows, 1);
+        assert!(c.terminal_order_audit("overflow").is_none());
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert!(c.order_evidence.is_empty());
+        let stats = c.order_evidence_stats();
+        assert_eq!(stats.current_orders, 0);
+        assert_eq!(stats.high_water_orders, MAX_ORDER_EVIDENCE);
+        assert_eq!(stats.order_capacity, MAX_ORDER_EVIDENCE);
+        assert_eq!(stats.overflows, 1);
+        c.register_order_evidence(&request);
+        assert_terminal_audit(&c.cancelled(&request, 2, 12.0), 12.0, 0.0, &[]);
+    }
+
+    #[test]
+    fn terminal_audit_instances_keep_distinct_original_orders_and_trades() {
+        let mut c = core();
+        let mut a = order("instance-a", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        let mut b = a.clone();
+        a.instance_id = "a".into();
+        b.client_order_id = "instance-b".into();
+        b.instance_id = "b".into();
+        b.symbol = "down".into();
+        b.side = Side::Sell;
+        c.register_order_evidence(&a);
+        c.register_order_evidence(&b);
+        c.record_order_execution(&a.client_order_id, "a-fill", 11.9928);
+        c.record_order_execution(&a.client_order_id, "a-fill", 11.9928);
+        c.record_order_execution(&b.client_order_id, "b-fill", 2.0);
+        let ca = c.cancel_order(Exchange::Polymarket, &a.client_order_id, 100);
+        let cb = c.cancel_order(Exchange::Polymarket, &b.client_order_id, 100);
+        assert_terminal_audit(&ca, 12.0, 11.9928, &["a-fill".into()]);
+        assert_terminal_audit(&cb, 12.0, 2.0, &["b-fill".into()]);
+        assert_eq!((ca.symbol.as_str(), ca.side), ("up", Side::Buy));
+        assert_eq!((cb.symbol.as_str(), cb.side), ("down", Side::Sell));
+        let mut collision = a.clone();
+        collision.instance_id = "b".into();
+        c.register_order_evidence(&collision);
+        assert!(c.terminal_order_audit(&a.client_order_id).is_none(), "ambiguous owner fails closed");
+    }
+
+    #[test]
+    fn terminal_audit_cancel_all_preserves_each_order_and_unknown_reconcile_stays_unknown() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        c.submit_order(&order("all-a", "up", Side::Buy, 0.54, 12.0, true, OrderType::Limit), 1);
+        c.submit_order(&order("all-b", "up", Side::Sell, 0.58, 7.0, true, OrderType::Limit), 2);
+        let updates = c.cancel_all(Exchange::Polymarket, "up", 3);
+        assert_eq!(updates.len(), 2);
+        for update in &updates {
+            let original = if update.client_order_id == "all-a" { 12.0 } else { 7.0 };
+            assert_terminal_audit(update, original, 0.0, &[]);
+        }
+        let unknown = c.reconcile(
+            &[("unknown-place".into(), "up".into(), Side::Buy, 0.54, None)],
+            &[("unknown-cancel".into(), "unknown-oid".into())],
+            4,
+        );
+        assert_eq!(unknown.len(), 2);
+        assert!(unknown.iter().all(|update| update.order_audit.is_none()));
+        let stats = c.order_evidence_stats();
+        assert_eq!(stats.current_orders, 2);
+        assert_eq!(stats.high_water_orders, 2);
+        assert_eq!(stats.high_water_trade_ids, 0);
+        assert_eq!(stats.overflows, 0);
     }
 
     // ── P2 taker tests (unchanged behaviour) ──

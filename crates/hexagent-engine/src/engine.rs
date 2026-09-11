@@ -5857,6 +5857,16 @@ impl Engine {
                 adv_adv
             );
         }
+        let evidence = sim.order_evidence_stats();
+        info!(
+            "  Sim v2:   order evidence current_orders={} high_water_orders={} order_capacity={} high_water_trade_ids={} trade_id_capacity_per_order={} overflows={}",
+            evidence.current_orders,
+            evidence.high_water_orders,
+            evidence.order_capacity,
+            evidence.high_water_trade_ids,
+            evidence.trade_id_capacity_per_order,
+            evidence.overflows,
+        );
         let (own_positioned, own_initial, own_cancel_n, own_cancel_qty) =
             sim.own_queue_position_stats();
         if own_positioned > 0 || own_cancel_n > 0 {
