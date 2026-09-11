@@ -731,6 +731,10 @@ impl Simulator {
         self.core.maker_order_audit_rows()
     }
 
+    pub fn order_evidence_stats(&self) -> super::exchange::OrderEvidenceStats {
+        self.core.order_evidence_stats()
+    }
+
     /// Double-clock full-book stale gate diagnostics:
     /// `(order blocks, trade blocks, exchange-clock hits, local-clock hits,
     /// queue rebases on recovery)`.
@@ -2590,6 +2594,47 @@ mod tests {
             instance_id: String::new(),
             timestamp_ns,
         }
+    }
+
+    #[test]
+    fn cancelled_residual_reports_matched_audit_before_delayed_private_fill() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.latency.set_fill_push_mult(10.0);
+        seed_front_order(&mut sim, "audit-race");
+        let filled_at = 1_000_000_000u64;
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 9.994,
+            side: Side::Sell,
+            exchange_timestamp_ns: filled_at,
+            local_timestamp_ns: filled_at,
+        });
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
+        let trade_id = fills[0].trade_id.clone().unwrap();
+        sim.schedule_private_fill(fills[0].clone(), filled_at);
+        let cancel_emit = filled_at + 10_000_000;
+        sim.submit(&cancel_signal("audit-race", cancel_emit), cancel_emit);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(updates[1].status, OrderStatus::PartiallyFilled);
+        assert!(updates[0].timestamp_ns < updates[1].timestamp_ns);
+        let audit = updates[0].order_audit.as_ref().expect("cancel preserves unseen matched risk");
+        assert_eq!(audit.original_size.as_deref(), Some("10"));
+        assert_eq!(audit.size_matched.as_deref(), Some("9.994"));
+        assert_eq!(audit.associate_trades, vec![trade_id]);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        assert_eq!(updates[1].filled_quantity, 9.994);
+        assert!(updates[1].order_audit.is_none(), "private fill semantics are unchanged");
+        assert_eq!(updates[0].timestamp_ns, cancel_emit + 100_000_000);
+        assert_eq!(updates[1].timestamp_ns, filled_at + 500_000_000);
     }
 
     #[test]
