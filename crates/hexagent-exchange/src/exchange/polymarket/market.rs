@@ -2330,6 +2330,7 @@ struct ClobWireCounters {
     tick_size_changes: u64,
     inline_rtds: u64,
     price_change_entries: u64,
+    quantity_only_frames: u64,
     level_upserts: u64,
     level_deletes: u64,
     bbo_transient_recoveries: u64,
@@ -2367,6 +2368,9 @@ impl ClobWireCounters {
         self.price_change_entries = self
             .price_change_entries
             .saturating_add(rhs.price_change_entries);
+        self.quantity_only_frames = self
+            .quantity_only_frames
+            .saturating_add(rhs.quantity_only_frames);
         self.level_upserts = self.level_upserts.saturating_add(rhs.level_upserts);
         self.level_deletes = self.level_deletes.saturating_add(rhs.level_deletes);
         self.bbo_transient_recoveries = self
@@ -7308,25 +7312,27 @@ impl ClobLocalBooks {
         Some(index)
     }
 
-    fn market_key(&self, token: &str) -> String {
+    fn market_key_ref<'a>(&'a self, token: &'a str) -> &'a str {
         self.roles
             .get(token)
-            .map(|role| role.condition_id.clone())
-            .unwrap_or_else(|| token.to_string())
+            .map_or(token, |role| role.condition_id.as_str())
+    }
+
+    fn market_key(&self, token: &str) -> String {
+        self.market_key_ref(token).to_owned()
     }
 
     fn condition_is_seeded(&self, condition_id: &str) -> bool {
-        let tokens: Vec<_> = self
-            .roles
-            .iter()
-            .filter_map(|(token, role)| {
-                (role.condition_id == condition_id).then_some(token.as_str())
-            })
-            .collect();
-        !tokens.is_empty()
-            && tokens
-                .iter()
-                .all(|token| self.token_books.contains_key(*token))
+        let mut any = false;
+        for (token, role) in &self.roles {
+            if role.condition_id == condition_id {
+                any = true;
+                if !self.token_books.contains_key(token) {
+                    return false;
+                }
+            }
+        }
+        any
     }
 
     fn desired_health_state(&self, condition_id: &str) -> Option<MarketDataHealthState> {
@@ -7336,21 +7342,21 @@ impl ClobLocalBooks {
         if self
             .degraded_tokens
             .iter()
-            .any(|token| self.market_key(token) == condition_id)
+            .any(|token| self.market_key_ref(token) == condition_id)
         {
             return Some(MarketDataHealthState::Degraded);
         }
         if self
             .quarantined_tokens
             .iter()
-            .any(|token| self.market_key(token) == condition_id)
+            .any(|token| self.market_key_ref(token) == condition_id)
         {
             return Some(MarketDataHealthState::Repairing);
         }
         if self
             .pending_bbo
             .keys()
-            .any(|token| self.market_key(token) == condition_id)
+            .any(|token| self.market_key_ref(token) == condition_id)
         {
             return Some(MarketDataHealthState::Settling);
         }
@@ -7364,8 +7370,15 @@ impl ClobLocalBooks {
         observed_at: Instant,
         local_now: u64,
     ) -> Option<MarketEvent> {
-        let condition_id = self.market_key(token);
-        let state = self.desired_health_state(&condition_id)?;
+        let key = self.market_key_ref(token);
+        let state = self.desired_health_state(key)?;
+        // Stable health has no event to publish and needs no owned strings.
+        if self.health_states.get(key) == Some(&state)
+            && !self.pending_health_recoveries.contains_key(key)
+        {
+            return None;
+        }
+        let condition_id = key.to_owned();
         let reason = reason.into();
         let previous = self.health_states.get(&condition_id).copied();
 
@@ -7474,18 +7487,18 @@ impl ClobLocalBooks {
     }
 
     fn price_is_on_current_tick(&self, token: &str, price: Decimal) -> bool {
-        let key = self.market_key(token);
+        let key = self.market_key_ref(token);
         self.current_ticks
-            .get(&key)
+            .get(key)
             .filter(|tick| **tick > Decimal::ZERO)
             .map_or(true, |tick| price % *tick == Decimal::ZERO)
     }
 
     fn market_is_quarantined(&self, token: &str) -> bool {
-        let key = self.market_key(token);
+        let key = self.market_key_ref(token);
         self.quarantined_tokens
             .iter()
-            .any(|candidate| candidate == token || self.market_key(candidate) == key)
+            .any(|candidate| candidate == token || self.market_key_ref(candidate) == key)
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -8002,6 +8015,110 @@ impl ClobLocalBooks {
         batch
     }
 
+    /// Common live frames only revise quantities at already-present prices.
+    /// Preflight the entire bounded frame before the first write: if any entry
+    /// needs BBO/tick/replay/repair handling, the original path sees it intact.
+    /// All state belongs to this CLOB owner. No queues, allocations, formatting,
+    /// global state or callbacks occur in this lane. Changed prices, insertions,
+    /// deletions and recovery events retain the existing authoritative path.
+    fn try_apply_quantity_only(
+        &mut self,
+        fields: &PriceChangeFields<'_>,
+        received_at: Instant,
+        exchange_timestamp_ns: u64,
+        counters: &mut ClobWireCounters,
+    ) -> bool {
+        struct Update<'a> {
+            token: &'a str,
+            price: Decimal,
+            size: Decimal,
+            bid: bool,
+        }
+        if fields.price_changes.is_empty() {
+            return false;
+        }
+        let mut updates = arrayvec::ArrayVec::<Update<'_>, CLOB_PRICE_CHANGE_CAPACITY>::new();
+        for change in &fields.price_changes {
+            let token = change.asset_id.as_ref();
+            let Some(role) = self.roles.get(token) else {
+                return false;
+            };
+            if self.health_states.get(&role.condition_id) != Some(&MarketDataHealthState::Healthy)
+                || self.pending_bbo.contains_key(token)
+                || self
+                    .pending_health_recoveries
+                    .contains_key(&role.condition_id)
+                || self.pending_quotes.contains_key(&role.condition_id)
+                || self.market_is_quarantined(token)
+            {
+                return false;
+            }
+            let Some(book) = self.token_books.get(token) else {
+                return false;
+            };
+            if exchange_timestamp_ns < book.exchange_timestamp_ns || !book.is_semantically_valid() {
+                return false;
+            }
+            let (Some(price), Some(size)) = (change.price.decimal(), change.size.decimal()) else {
+                return false;
+            };
+            if price <= Decimal::ZERO
+                || price >= Decimal::ONE
+                || size <= Decimal::ZERO
+                || !self.price_is_on_current_tick(token, price)
+            {
+                return false;
+            }
+            let bid = if change.side.trim().eq_ignore_ascii_case("BUY") {
+                true
+            } else if change.side.trim().eq_ignore_ascii_case("SELL") {
+                false
+            } else {
+                return false;
+            };
+            if !(if bid { &book.bids } else { &book.asks }).contains_key(&price) {
+                return false;
+            }
+            let actual = book.top();
+            for (reported, expected) in [(&change.best_bid, actual.0), (&change.best_ask, actual.1)]
+            {
+                if let Some(reported) = reported {
+                    if reported.decimal().map(normalize_reported_bbo) != Some(expected) {
+                        return false;
+                    }
+                }
+            }
+            updates.push(Update {
+                token,
+                price,
+                size,
+                bid,
+            });
+        }
+        for update in updates {
+            let sequence = self.next_sequence();
+            let book = self
+                .token_books
+                .get_mut(update.token)
+                .expect("quantity frame preflighted");
+            let levels = if update.bid {
+                &mut book.bids
+            } else {
+                &mut book.asks
+            };
+            *levels
+                .get_mut(&update.price)
+                .expect("existing price preflighted") = update.size;
+            book.exchange_timestamp_ns = exchange_timestamp_ns;
+            book.wire_sequence = sequence;
+            book.dirty_since.get_or_insert(received_at);
+            counters.price_change_entries = counters.price_change_entries.saturating_add(1);
+            counters.level_upserts = counters.level_upserts.saturating_add(1);
+        }
+        counters.quantity_only_frames = counters.quantity_only_frames.saturating_add(1);
+        true
+    }
+
     fn apply_price_change(
         &mut self,
         fields: PriceChangeFields<'_>,
@@ -8012,6 +8129,9 @@ impl ClobLocalBooks {
         active_tokens: &[String],
     ) -> (Vec<MarketEvent>, usize, Vec<String>) {
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
+        if self.try_apply_quantity_only(&fields, received_at, exchange_timestamp_ns, counters) {
+            return (Vec::new(), 0, Vec::new());
+        }
         let mut immediate = Vec::new();
         let entry_counts: HashMap<String, usize> =
             fields
@@ -9222,6 +9342,10 @@ mod clob_test_allocator {
 #[global_allocator]
 static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
     clob_test_allocator::CountingAllocator;
+
+#[cfg(test)]
+#[path = "clob_quantity_path_tests.rs"]
+mod clob_quantity_path_tests;
 
 #[cfg(test)]
 mod clob_event_lane_tests {
