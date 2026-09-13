@@ -86,7 +86,7 @@ fn route_batch_preserves_old_readers_ownership_and_idempotence() {
         &["a".into(), "b".into()],
         &[("c".into(), "owner".into())],
     );
-    assert_eq!(old.get("a").unwrap(), "owner");
+    assert_eq!(old.get("a").unwrap().as_ref(), "owner");
     assert_eq!(routes.get("a"), None);
     assert_eq!(routes.get("b").as_deref(), Some("sibling"));
     assert_eq!(routes.get("c").as_deref(), Some("owner"));

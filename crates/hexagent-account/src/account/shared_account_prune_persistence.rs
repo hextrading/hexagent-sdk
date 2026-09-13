@@ -1,4 +1,4 @@
-//! Immutable GC delta captured by the cold account owner. JSON paths and
+//! Immutable GC delta captured by the account mutation owner. JSON paths and
 //! serialization belong exclusively to the existing bounded WAL writer.
 use super::*;
 
