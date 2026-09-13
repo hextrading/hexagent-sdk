@@ -1447,6 +1447,42 @@ struct ClobSubscription {
     canonical_events: Vec<CanonicalEventSpec>,
 }
 
+/// Commit routing against the books actually carried by the connected lanes.
+/// A logical subset does not send a websocket subscription command: keep the
+/// physical generation unchanged until a seeded socket replaces it. This also
+/// preserves a hot standby during the interval before the next union refresh.
+fn commit_preseeded_clob_subscription(
+    logical: &mut ClobSubscription,
+    wire: &ClobSubscription,
+    reconnect: &mut ClobSubscription,
+    books: &ClobLocalBooks,
+    target: &ClobSubscription,
+    activate: bool,
+) -> bool {
+    // A future cold connection uses the requested set, not expired tokens
+    // retained solely to keep the current physical standby promotable.
+    *reconnect = target.clone();
+    let seeded = target
+        .tokens
+        .iter()
+        .all(|token| wire.tokens.contains(token))
+        && books.has_all_seeded(&target.tokens);
+    if seeded && activate {
+        *logical = target.clone();
+    }
+    seeded
+}
+
+fn cancel_clob_cutover(
+    pending: &mut Option<(ClobSubscription, bool)>,
+    connect: &mut Option<tokio::task::JoinHandle<std::result::Result<ClobSeededCandidate, String>>>,
+) {
+    *pending = None;
+    if let Some(connect) = connect.take() {
+        connect.abort();
+    }
+}
+
 /// A single symbol (CLOB token) within a Polymarket event/market.
 struct SymbolState {
     token_id: String,
@@ -4729,6 +4765,7 @@ async fn clob_ws_task(
             Duration::ZERO,
         ));
         let mut pending_cutover: Option<(ClobSubscription, bool)> = None;
+        let mut reconnect_subscription = wire_subscription.clone();
         let mut candidate_connect: Option<
             tokio::task::JoinHandle<std::result::Result<ClobSeededCandidate, String>>,
         > = None;
@@ -4794,19 +4831,23 @@ async fn clob_ws_task(
                                 WsCtrl::Prepare(subscription) => (subscription, false),
                                 WsCtrl::Shutdown => break 'outer,
                             };
-                            let already_seeded = new_subscription.tokens.iter().all(|token| {
-                                wire_subscription.tokens.iter().any(|active_token| active_token == token)
-                            }) && books.has_all_seeded(&new_subscription.tokens);
+                            // Every newer command supersedes the previous
+                            // candidate, including an immediate subset commit.
+                            cancel_clob_cutover(&mut pending_cutover, &mut candidate_connect);
+                            let already_seeded = commit_preseeded_clob_subscription(
+                                &mut subscription,
+                                &wire_subscription,
+                                &mut reconnect_subscription,
+                                &books,
+                                &new_subscription,
+                                activate,
+                            );
                             if already_seeded {
                                 // Boundary commit after an ahead-of-time union
                                 // subscription: the target tokens already have
                                 // L2 state, so only the logical routing set
                                 // changes. The next candidate refresh drops the
                                 // now-stale socket tokens.
-                                wire_subscription = new_subscription.clone();
-                                if activate {
-                                    subscription = new_subscription;
-                                }
                                 repair_generation = advance_clob_repair_generation(
                                     repair_generation_epoch.as_ref(),
                                 );
@@ -4819,9 +4860,6 @@ async fn clob_ws_task(
                                     activate,
                                 );
                                 continue;
-                            }
-                            if let Some(connect) = candidate_connect.take() {
-                                connect.abort();
                             }
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
@@ -4943,6 +4981,17 @@ async fn clob_ws_task(
                 }, if standby_connect.is_some() => {
                     standby_connect = None;
                     match standby_result {
+                        Ok(Ok(lane)) if lane.token_generation != clob_token_generation(&wire_subscription.tokens) => {
+                            warn!(
+                                "[clob_standby_generation_rejected] lane_id={} candidate_token_generation={} expected_token_generation={} action=reconnect_standby",
+                                lane.lane_id, lane.token_generation, clob_token_generation(&wire_subscription.tokens),
+                            );
+                            let lane_id = next_lane_id;
+                            next_lane_id = next_lane_id.saturating_add(1);
+                            standby_connect = Some(spawn_clob_standby_connect(
+                                wire_subscription.tokens.clone(), lane_id, CLOB_STANDBY_RECONNECT_DELAY,
+                            ));
+                        }
                         Ok(Ok(lane)) if clob_peers_are_anti_affine(active.peer_addr, lane.peer_addr) => {
                             info!(
                                 "[clob_standby_ready] lane_id={} peer={:?} active_lane_id={} active_peer={:?}",
@@ -5890,6 +5939,7 @@ async fn clob_ws_task(
         if let Some(connect) = candidate_connect.take() {
             connect.abort();
         }
+        wire_subscription = reconnect_subscription;
         if let Some((target, activate)) = pending_cutover.take() {
             wire_subscription = target.clone();
             if activate {
@@ -6502,12 +6552,49 @@ struct PriceChangeFields<'a> {
     timestamp: Option<WireUnsigned<'a>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReportedBbo {
     /// Outer Option means the field was present; inner Option is the
     /// tradeable price after mapping terminal 0/1 sentinels to no level.
     bid: Option<Option<Decimal>>,
     ask: Option<Option<Decimal>>,
+}
+
+/// Numeric history owned by the CLOB lane. Recording and eviction never
+/// allocate or format; only a finalized mismatch renders these samples.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BboFrameSample {
+    exchange_timestamp_ns: u64,
+    entries: usize,
+    expected: ReportedBbo,
+    actual: (Option<Decimal>, Option<Decimal>),
+}
+
+impl std::fmt::Debug for BboFrameSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ts={} entries={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
+            self.exchange_timestamp_ns,
+            self.entries,
+            self.expected.bid,
+            self.expected.ask,
+            self.actual.0,
+            self.actual.1
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct BboFrameHistory(arrayvec::ArrayVec<BboFrameSample, CLOB_BBO_DIAGNOSTIC_FRAMES>);
+
+impl BboFrameHistory {
+    fn push(&mut self, sample: BboFrameSample) {
+        if self.0.is_full() {
+            self.0.remove(0);
+        }
+        self.0.push(sample);
+    }
 }
 
 impl ReportedBbo {
@@ -6534,9 +6621,7 @@ struct PendingBboCheck {
     last_update_at: Instant,
     saw_mismatch: bool,
     saw_newer_checkpoint: bool,
-    /// Bounded, sanitized summaries only.  Raw public frames can be large and
-    /// may contain fields unrelated to the failing condition.
-    frame_summaries: VecDeque<String>,
+    frame_summaries: BboFrameHistory,
     /// An off-grid price is evidence that a narrowing tick_size_change is in
     /// the same logical market batch but may be delivered in a sibling frame.
     /// Keep publication behind the tick event for the same quiet window.
@@ -8286,16 +8371,11 @@ impl ClobLocalBooks {
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
             let off_tick = off_tick_tokens.contains(&token);
-            let summary = subscribed_token(active_tokens, &token).then(|| {
-                format!(
-                    "ts={} entries={} expected_bid={:?} expected_ask={:?} actual_bid={:?} actual_ask={:?}",
-                    exchange_timestamp_ns,
-                    entry_counts.get(&token).copied().unwrap_or(0),
-                    newer_expected.bid,
-                    newer_expected.ask,
-                    actual.0,
-                    actual.1,
-                )
+            let summary = subscribed_token(active_tokens, &token).then(|| BboFrameSample {
+                exchange_timestamp_ns,
+                entries: entry_counts.get(&token).copied().unwrap_or(0),
+                expected: newer_expected,
+                actual,
             });
             let pending =
                 self.pending_bbo
@@ -8307,7 +8387,7 @@ impl ClobLocalBooks {
                         last_update_at: received_at,
                         saw_mismatch: false,
                         saw_newer_checkpoint: false,
-                        frame_summaries: VecDeque::new(),
+                        frame_summaries: BboFrameHistory::default(),
                         awaiting_tick_change: false,
                     });
             if exchange_timestamp_ns > pending.exchange_timestamp_ns {
@@ -8327,10 +8407,7 @@ impl ClobLocalBooks {
                 pending.saw_mismatch |= !pending.expected.matches(actual);
             }
             if let Some(summary) = summary {
-                pending.frame_summaries.push_back(summary);
-                while pending.frame_summaries.len() > CLOB_BBO_DIAGNOSTIC_FRAMES {
-                    pending.frame_summaries.pop_front();
-                }
+                pending.frame_summaries.push(summary);
             }
             let advertised_l1 = if !pending.expected.matches(actual) {
                 match (
@@ -9346,6 +9423,10 @@ static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
 #[cfg(test)]
 #[path = "clob_quantity_path_tests.rs"]
 mod clob_quantity_path_tests;
+
+#[cfg(test)]
+#[path = "clob_recovery_tests.rs"]
+mod clob_recovery_tests;
 
 #[cfg(test)]
 mod clob_event_lane_tests {

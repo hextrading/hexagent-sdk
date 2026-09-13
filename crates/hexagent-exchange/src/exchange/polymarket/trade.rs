@@ -331,12 +331,29 @@ fn canonical_l2_auth_path(path: &str) -> &str {
 }
 
 fn terminal_trade_lookup_path(trade_id: &str) -> String {
-    format!("{}?id={}", AUTHENTICATED_TRADES_PATH, trade_id)
+    terminal_trade_page_path(trade_id, None)
+}
+
+fn terminal_trade_page_path(trade_id: &str, cursor: Option<&str>) -> String {
+    let mut url = reqwest::Url::parse("https://clob.polymarket.com/data/trades")
+        .expect("constant authenticated trade URL");
+    url.query_pairs_mut().append_pair("id", trade_id);
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut().append_pair("next_cursor", cursor);
+    }
+    format!(
+        "{}?{}",
+        AUTHENTICATED_TRADES_PATH,
+        url.query().unwrap_or_default()
+    )
 }
 
 /// Normalize the terminal trade endpoint while preserving the distinction
 /// between an absent record and a record rejected later by parsing/invariants.
-fn terminal_trade_records(json: serde_json::Value, trade_id: &str) -> Vec<serde_json::Value> {
+fn terminal_trade_records(
+    json: serde_json::Value,
+    trade_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     let records = if let Some(records) = json.as_array() {
         records.clone()
     } else if let Some(records) = json.get("data").and_then(|value| value.as_array()) {
@@ -344,12 +361,59 @@ fn terminal_trade_records(json: serde_json::Value, trade_id: &str) -> Vec<serde_
     } else if json.get("id").and_then(|value| value.as_str()).is_some() {
         vec![json]
     } else {
-        Vec::new()
+        return Err(
+            "invalid terminal trade response: expected array, data array or trade object".into(),
+        );
     };
-    records
+    if records
+        .iter()
+        .any(|record| record.get("id").and_then(|id| id.as_str()).is_none())
+    {
+        return Err("invalid terminal trade response: record has no string id".into());
+    }
+    Ok(records
         .into_iter()
         .filter(|record| record.get("id").and_then(|value| value.as_str()) == Some(trade_id))
-        .collect()
+        .collect())
+}
+
+/// Bounded GET pagination on the existing reconciliation worker. An empty
+/// first page, malformed response or repeated cursor never proves absence.
+/// HTTP errors are returned immediately; the existing background recovery
+/// schedule owns retries, so this adds no sleeps, worker or shared retry map.
+fn fetch_terminal_trade_records(
+    trade_id: &str,
+    mut get: impl FnMut(&str) -> Result<serde_json::Value, String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    const MAX_PAGES: usize = 4;
+    let mut cursor: Option<String> = None;
+    let mut seen = Vec::with_capacity(MAX_PAGES);
+    for _ in 0..MAX_PAGES {
+        let path = cursor.as_deref().map_or_else(
+            || terminal_trade_lookup_path(trade_id),
+            |cursor| terminal_trade_page_path(trade_id, Some(cursor)),
+        );
+        let json = get(&path)?;
+        let next = match json.get("next_cursor") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if value.is_empty() || value == "LTE=" => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err("invalid terminal trade response: next_cursor is not a string".into())
+            }
+        };
+        let records = terminal_trade_records(json, trade_id)?;
+        if !records.is_empty() || next.is_none() {
+            return Ok(records);
+        }
+        let next = next.unwrap();
+        if seen.contains(&next) {
+            return Err("incomplete terminal trade lookup: repeated cursor".into());
+        }
+        seen.push(next.clone());
+        cursor = Some(next);
+    }
+    Err("incomplete terminal trade lookup: page limit reached".into())
 }
 
 /// One bounded market-expiry cancel attempt. `confirmed` is true only after
@@ -9608,16 +9672,23 @@ impl PolymarketTrade {
         // Replay missing IDs through the same parser used by WS/gap recovery,
         // leaving PositionManager as the sole dedup/accounting authority.
         for trade_id in pending_trade_ids {
-            let path = terminal_trade_lookup_path(&trade_id);
-            let reply = permit.map_or_else(
-                || self.shared.http_call_sync("GET", &path, ""),
-                |permit| {
-                    self.shared
-                        .http_call_sync_on(permit.current_pooled_client(), "GET", &path, "")
-                },
-            );
-            let json = match reply {
-                Ok(json) => json,
+            let reply = fetch_terminal_trade_records(trade_id, |path| {
+                permit
+                    .map_or_else(
+                        || self.shared.http_call_sync("GET", path, ""),
+                        |permit| {
+                            self.shared.http_call_sync_on(
+                                permit.current_pooled_client(),
+                                "GET",
+                                path,
+                                "",
+                            )
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            });
+            let records = match reply {
+                Ok(records) => records,
                 Err(error) => {
                     warn!(
                         "[orphan_metric] terminal_trade_backfill_failed=1 trade_id={} error={} lock_release=forbidden",
@@ -9626,17 +9697,23 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let records = terminal_trade_records(json, &trade_id);
             if records.is_empty() {
                 match self
                     .shared
                     .account_state
-                    .durable_terminal_trade_source_count(&trade_id)
+                    .terminal_trade_backfill_sources(trade_id)
                 {
-                    Ok(source_count) if source_count > 0 => {
+                    Ok((source_count, 0)) if source_count > 0 => {
                         info!(
                             "[orphan_metric] terminal_trade_backfill_durable_source={} trade_id={} authority=live_or_retired_ledger lock_release=subject_to_order_audit",
                             source_count, trade_id,
+                        );
+                        continue;
+                    }
+                    Ok((terminal_sources, pending_sources)) if pending_sources > 0 => {
+                        info!(
+                            "[orphan_metric] terminal_trade_backfill_pending=1 account_id={} trade_id={} booked_pending_sources={} terminal_sources={} reason=rest_not_indexed_terminal_lifecycle_pending action=await_private_or_scheduled_reconcile lock_release=subject_to_order_audit",
+                            self.shared.account_state.account_id(), trade_id, pending_sources, terminal_sources,
                         );
                         continue;
                     }
@@ -9649,6 +9726,13 @@ impl PolymarketTrade {
                     }
                     Ok(_) => {}
                 }
+                // Keep exact IDs even when the aggregate WARN is sampled.
+                // A later received/durable-source record closes this lookup;
+                // only the independent order audit can release reservations.
+                info!(
+                    "[orphan_metric] terminal_trade_backfill_pending=1 account_id={} trade_id={} booked_pending_sources=0 reason=no_rest_or_ledger_source action=await_private_or_scheduled_reconcile lock_release=forbidden",
+                    self.shared.account_state.account_id(), trade_id,
+                );
                 let total = self
                     .shared
                     .terminal_trade_backfill_missing_total
@@ -9708,6 +9792,12 @@ impl PolymarketTrade {
                     "[orphan_metric] terminal_trade_backfill_parser_rejected={} trade_id={} records={} validated_no_update={} reasons={:?} ownership_anomalies={} lock_release=forbidden",
                     rejection_reasons.len(), trade_id, record_count, validated_no_update,
                     rejection_reasons, self.shared.account_state.ownership_anomalies().len(),
+                );
+            }
+            if rejection_reasons.is_empty() {
+                info!(
+                    "[orphan_metric] terminal_trade_backfill_received=1 account_id={} trade_id={} records={} updates={} validated_no_update={} lock_release=subject_to_order_audit",
+                    self.shared.account_state.account_id(), trade_id, record_count, matched, validated_no_update,
                 );
             }
             if matched > 0 {
@@ -13404,11 +13494,14 @@ mod tests {
     #[test]
     fn terminal_trade_lookup_distinguishes_absent_from_present_record() {
         let trade_id = "43535f84-454f-4302-b4cd-23b4510d9723";
-        assert!(terminal_trade_records(serde_json::json!([]), trade_id).is_empty());
+        assert!(terminal_trade_records(serde_json::json!([]), trade_id)
+            .unwrap()
+            .is_empty());
         assert!(terminal_trade_records(
             serde_json::json!({"data": [{"id": "different"}]}),
             trade_id,
         )
+        .unwrap()
         .is_empty());
 
         let present = terminal_trade_records(
@@ -13416,7 +13509,8 @@ mod tests {
                 "data": [{"id": trade_id, "status": "MATCHED", "malformed": true}]
             }),
             trade_id,
-        );
+        )
+        .unwrap();
         assert_eq!(present.len(), 1);
         assert_eq!(present[0]["id"], trade_id);
     }
@@ -13430,6 +13524,59 @@ mod tests {
             canonical_l2_auth_path("/data/order/oid-123"),
             "/data/order/oid-123"
         );
+    }
+
+    #[test]
+    fn terminal_trade_lookup_rejects_invalid_responses_and_bounds_pagination() {
+        for body in [
+            serde_json::json!({"error":"unavailable"}),
+            serde_json::json!({"data":null}),
+            serde_json::json!({"data":[{"status":"CONFIRMED"}]}),
+            serde_json::json!({"data":[],"next_cursor":123}),
+        ] {
+            assert!(fetch_terminal_trade_records("wanted", |_| Ok(body.clone())).is_err());
+        }
+        let mut calls = 0;
+        let result = fetch_terminal_trade_records("wanted", |_| {
+            calls += 1;
+            Ok(serde_json::json!({"data":[],"next_cursor":format!("cursor-{calls}")}))
+        });
+        assert!(result.unwrap_err().contains("page limit"));
+        assert_eq!(calls, 4);
+        let mut calls = 0;
+        let result = fetch_terminal_trade_records("wanted", |_| {
+            calls += 1;
+            Ok(serde_json::json!({"data":[],"next_cursor":"repeated"}))
+        });
+        assert!(result.unwrap_err().contains("repeated cursor"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn terminal_trade_lookup_continues_empty_pages_and_keeps_exact_identity() {
+        let mut calls = 0;
+        let records = fetch_terminal_trade_records("wanted", |path| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(path, "/data/trades?id=wanted");
+                Ok(serde_json::json!({"data":[],"next_cursor":"abc+/="}))
+            } else {
+                assert_eq!(path, "/data/trades?id=wanted&next_cursor=abc%2B%2F%3D");
+                assert_eq!(canonical_l2_auth_path(path), "/data/trades");
+                Ok(serde_json::json!({"data":[{"id":"unrelated"},{"id":"wanted","status":"CONFIRMED"}],"next_cursor":"LTE="}))
+            }
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "wanted");
+        // A completed empty sweep remains pending; a later scheduled replay
+        // can recover it. HTTP failures do not become authoritative absence.
+        assert!(fetch_terminal_trade_records("wanted", |_| Ok(
+            serde_json::json!({"data":[],"next_cursor":"LTE="})
+        ))
+        .unwrap()
+        .is_empty());
+        assert!(fetch_terminal_trade_records("wanted", |_| Err("HTTP 425".into())).is_err());
     }
 
     #[test]
