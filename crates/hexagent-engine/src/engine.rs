@@ -11041,6 +11041,22 @@ impl Engine {
                                     }
                                     for account in &monitoring_accounts {
                                         let snapshot = account.monitoring_snapshot_fast();
+                                        let lifecycle_queue = account.account_lifecycle_queue_metrics();
+                                        info!(
+                                            "[account_queue_metric] account={} lifecycle_commands(depth/high/overflow)={}/{}/{} mirror(depth/high/overflow)={}/{}/{} mirror_watermark(published/applied/lag)={}/{}/{} persistence(depth/high/overflow)={}/{}/{} wallet_calibration_coalesced={}",
+                                            snapshot.account_id,
+                                            lifecycle_queue.0, lifecycle_queue.1, lifecycle_queue.2,
+                                            snapshot.lifecycle_mirror_queue_depth,
+                                            snapshot.lifecycle_mirror_queue_high_water,
+                                            snapshot.lifecycle_mirror_queue_overflows,
+                                            snapshot.lifecycle_mirror_published_watermark,
+                                            snapshot.lifecycle_mirror_applied_watermark,
+                                            snapshot.lifecycle_mirror_published_watermark.saturating_sub(snapshot.lifecycle_mirror_applied_watermark),
+                                            snapshot.persistence_pending_jobs,
+                                            snapshot.persistence_pending_high_water,
+                                            snapshot.persistence_queue_overflows,
+                                            account.wallet_calibration_coalesced(),
+                                        );
                                         let reservation_acquisitions = snapshot
                                             .reservation_control_lock
                                             .acquisitions

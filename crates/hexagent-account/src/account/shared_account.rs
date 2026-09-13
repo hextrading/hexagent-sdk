@@ -117,6 +117,9 @@ struct WalletCalibrationRequest {
     authoritative_tokens: HashSet<String>,
     lifecycle_watermark: u64,
     submitted_ms: u64,
+    /// Age of the selected payload, including lifecycle/grace waiting. Kept
+    /// when an older generation merely joins the current completion waiters.
+    submitted_at: Instant,
     include_token_interests: bool,
     replies: Vec<crossbeam_channel::Sender<Result<WalletCalibrationResult, String>>>,
 }
@@ -1010,6 +1013,10 @@ impl Drop for HeldLockMetric<'_> {
 struct ShardedRouteMap {
     shards: Box<[RouteShard]>,
 }
+
+#[cfg(test)]
+#[path = "shared_account_queue_tests.rs"]
+mod queue_tests;
 
 #[derive(Debug)]
 struct RouteShard {
@@ -6443,6 +6450,7 @@ impl SharedAccount {
                 next_authoritative_tokens,
                 lifecycle_watermark,
                 submitted_ms,
+                submitted_at,
             ) = current
                 .as_ref()
                 .filter(|request| request.generation > generation)
@@ -6454,6 +6462,7 @@ impl SharedAccount {
                         request.authoritative_tokens.clone(),
                         request.lifecycle_watermark,
                         request.submitted_ms,
+                        request.submitted_at,
                     )
                 })
                 .unwrap_or_else(|| {
@@ -6465,6 +6474,7 @@ impl SharedAccount {
                         self.lifecycle_mirror_published_watermark
                             .load(Ordering::Acquire),
                         wall_clock_ms(),
+                        Instant::now(),
                     )
                 });
             let next = Some(Arc::new(WalletCalibrationRequest {
@@ -6474,6 +6484,7 @@ impl SharedAccount {
                 authoritative_tokens: next_authoritative_tokens,
                 lifecycle_watermark,
                 submitted_ms,
+                submitted_at,
                 include_token_interests: include_token_interests
                     || current
                         .as_ref()
@@ -6559,6 +6570,11 @@ impl SharedAccount {
             return;
         }
         let request = Arc::clone(request);
+        crate::latency::record_ns(
+            "polymarket.account.wallet_calibration.wait_including_grace",
+            request.submitted_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        let apply_started = crate::latency::Instant::now();
         let result = self
             .apply_scoped_physical_snapshot_versioned(
                 request.generation,
@@ -6585,6 +6601,7 @@ impl SharedAccount {
                         .then(|| self.token_interests()),
                 })
             });
+        crate::latency::record("polymarket.account.wallet_calibration.apply", apply_started);
         for reply in &request.replies {
             let _ = reply.send(result.clone());
         }
@@ -10051,11 +10068,34 @@ impl SharedAccount {
             // Confirm the ephemeral worklist still matches a durable empty
             // reference before any owner is asked to delete history.
             let eligible = {
-                let _control = self.control_gate.read().unwrap();
-                let state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // This coordinator runs on the private lifecycle owner. Cold
+                // checkpoint/calibration publication can hold these locks for
+                // hundreds of milliseconds. Keep the candidate and yield so
+                // queued trades/status updates run before the next GC turn.
+                let _control = match self.control_gate.try_read() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        crate::latency::record_ns(
+                            "polymarket.account.settled_gc_coordinator_control_busy",
+                            1,
+                        );
+                        return Vec::new();
+                    }
+                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                        panic!("settled GC control gate poisoned: {error}");
+                    }
+                };
+                let state = match self.state.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        crate::latency::record_ns(
+                            "polymarket.account.settled_gc_coordinator_state_busy",
+                            1,
+                        );
+                        return Vec::new();
+                    }
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                };
                 state
                     .settled_audit_references
                     .get(&condition_id)
@@ -10218,11 +10258,32 @@ impl SharedAccount {
         }
 
         let committed = {
-            let _control = self.control_gate.write().unwrap();
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Retain the certified inflight generation when the cold owner is
+            // busy. The next turn revalidates every epoch before committing.
+            let _control = match self.control_gate.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    crate::latency::record_ns(
+                        "polymarket.account.settled_gc_coordinator_control_busy",
+                        1,
+                    );
+                    return Vec::new();
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("settled GC control gate poisoned: {error}");
+                }
+            };
+            let mut state = match self.state.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    crate::latency::record_ns(
+                        "polymarket.account.settled_gc_coordinator_state_busy",
+                        1,
+                    );
+                    return Vec::new();
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            };
             let eligible = state
                 .settled_audit_references
                 .get(&condition_id)
