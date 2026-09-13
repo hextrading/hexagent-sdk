@@ -1014,9 +1014,20 @@ struct ShardedRouteMap {
     shards: Box<[RouteShard]>,
 }
 
+struct RouteOwnerSnapshot<'a> {
+    owner: &'a str,
+    keys: &'a HashSet<String>,
+    // Recheck inside RCU on every retry before destructive trade pruning.
+    epoch: Option<(&'a AtomicU64, u64)>,
+}
+
 #[cfg(test)]
 #[path = "shared_account_queue_tests.rs"]
 mod queue_tests;
+
+#[cfg(test)]
+#[path = "shared_account_batch_tests.rs"]
+mod batch_tests;
 
 #[derive(Debug)]
 struct RouteShard {
@@ -1026,6 +1037,82 @@ struct RouteShard {
 }
 
 impl ShardedRouteMap {
+    /// Cold publication: combine all owners' changes before cloning a shard.
+    /// Existing immutable readers keep their snapshot; no intermediate route
+    /// hole is published, and unrelated concurrent owners survive RCU retries.
+    fn publish_owners(&self, owners: &[RouteOwnerSnapshot<'_>], live: Option<&HashSet<String>>) {
+        let mut additions: [Vec<(&str, &str)>; ROUTE_SHARD_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        for owner in owners {
+            for key in owner.keys {
+                additions[Self::shard_index(key)].push((key, owner.owner));
+            }
+        }
+        for (index, shard) in self.shards.iter().enumerate() {
+            shard.published.rcu(|current| {
+                let remove = |key: &String, route_owner: &String| {
+                    live.is_some_and(|live| !live.contains(route_owner))
+                        || owners.iter().any(|owner| {
+                            route_owner == owner.owner
+                                && !owner.keys.contains(key)
+                                && owner.epoch.is_none_or(|(epoch, expected)| {
+                                    epoch.load(Ordering::Acquire) == expected
+                                })
+                        })
+                };
+                if additions[index]
+                    .iter()
+                    .all(|(key, owner)| current.get(*key).is_some_and(|v| v == owner))
+                    && !current.iter().any(|(key, owner)| remove(key, owner))
+                {
+                    return Arc::clone(current);
+                }
+                let mut next = (**current).clone();
+                next.retain(|key, owner| !remove(key, owner));
+                for (key, owner) in &additions[index] {
+                    next.insert((*key).to_owned(), (*owner).to_owned());
+                }
+                Arc::new(next)
+            });
+        }
+    }
+
+    /// Bounded GC delta. Removal is conditional on ownership, including on
+    /// CAS retry, so a newly rebound key cannot be removed by an old batch.
+    fn apply_batch(&self, owner: &str, removals: &[String], additions: &[(String, String)]) {
+        let mut grouped: [Vec<(&str, Option<&str>)>; ROUTE_SHARD_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+        for key in removals {
+            grouped[Self::shard_index(key)].push((key, None));
+        }
+        for (key, route_owner) in additions {
+            grouped[Self::shard_index(key)].push((key, Some(route_owner)));
+        }
+        for (index, changes) in grouped
+            .iter()
+            .enumerate()
+            .filter(|(_, changes)| !changes.is_empty())
+        {
+            self.shards[index].published.rcu(|current| {
+                if changes.iter().all(|(key, value)| match value {
+                    Some(value) => current.get(*key).is_some_and(|v| v == value),
+                    None => current.get(*key).is_none_or(|v| v != owner),
+                }) {
+                    return Arc::clone(current);
+                }
+                let mut next = (**current).clone();
+                for (key, value) in changes {
+                    if let Some(value) = value {
+                        next.insert((*key).to_owned(), (*value).to_owned());
+                    } else if next.get(*key).is_some_and(|v| v == owner) {
+                        next.remove(*key);
+                    }
+                }
+                Arc::new(next)
+            });
+        }
+    }
+
     fn new() -> Self {
         let shards = (0..ROUTE_SHARD_COUNT)
             .map(|_| RouteShard {
@@ -1103,6 +1190,7 @@ impl ShardedRouteMap {
             .is_some_and(|current| current == owner)
     }
 
+    #[cfg(test)]
     fn retain_owner_keys(&self, owner: &str, desired: &HashSet<String>) {
         for shard in &self.shards {
             shard.published.rcu(|current| {
@@ -1113,6 +1201,7 @@ impl ShardedRouteMap {
         }
     }
 
+    #[cfg(test)]
     fn retain_owners(&self, owners: &HashSet<String>) {
         for shard in &self.shards {
             shard.published.rcu(|current| {
@@ -1341,6 +1430,8 @@ pub struct SettledGcCompletionCertificate {
     pub retired_orders: usize,
     pub retired_trades: usize,
     pub remaining_rows: bool,
+    /// Yielded before a complete index sweep; continue even with zero deletions.
+    pub scan_incomplete: bool,
     pub eligible: bool,
     pub reservation_epoch: u64,
     pub trade_epoch: u64,
@@ -2083,10 +2174,14 @@ impl VirtualPositionQuota {
     }
 }
 
+#[path = "shared_account_gc_index.rs"]
+mod gc_index;
+use gc_index::TokenIndexedRows;
+
 #[derive(Debug, Default)]
 struct VirtualLifecycle {
-    orders: HashMap<String, OrderOwnership>,
-    trades: HashMap<String, AppliedTrade>,
+    orders: TokenIndexedRows<OrderOwnership>,
+    trades: TokenIndexedRows<AppliedTrade>,
     recovery_pending_orders: HashSet<String>,
     startup_query_repair_orders: HashSet<String>,
     routine_cancel_audits: HashSet<String>,
@@ -2668,6 +2763,10 @@ struct PersistenceJob {
     payload: PersistenceJobPayload,
 }
 
+#[path = "shared_account_prune_persistence.rs"]
+mod prune_persistence;
+use prune_persistence::SettledPrunePersistenceDelta;
+
 #[derive(Debug, Clone)]
 enum PersistenceJobPayload {
     /// Owned compatibility fallback for cold/complex mutations. The cold
@@ -2675,6 +2774,7 @@ enum PersistenceJobPayload {
     /// never reaches back into live account state.
     FullSnapshot(Box<SharedAccountState>),
     Changes(Vec<PersistenceWalChange>),
+    SettledPrune(SettledPrunePersistenceDelta),
     /// Raw reservation data is converted to JSON only on the WAL writer. This
     /// keeps path allocation and serde work off the signed-to-dispatch lane.
     Reservation(ReservationPersistenceDelta),
@@ -3468,6 +3568,7 @@ fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWa
             Err("full snapshot persistence job cannot be materialized as a typed delta".to_string())
         }
         PersistenceJobPayload::Changes(changes) => Ok(changes.clone()),
+        PersistenceJobPayload::SettledPrune(delta) => delta.materialize(),
         PersistenceJobPayload::Reservation(delta) => {
             let mut changes = Vec::with_capacity(7);
             persistence_wal_set(
@@ -3676,6 +3777,15 @@ fn coalesce_persistence_jobs(jobs: Vec<PersistenceJob>) -> Vec<PersistenceJob> {
             PersistenceJobPayload::VirtualTrade(delta) => trades.insert(delta.trade_key.clone()),
             PersistenceJobPayload::UnresolvedTradeMatchTime { trade_key, .. } => {
                 unresolved.insert(trade_key.clone())
+            }
+            PersistenceJobPayload::SettledPrune(_) => {
+                // A prune deletes rows and compacts their economics. Never
+                // coalesce an update across that replay/retirement boundary.
+                reservations.clear();
+                lifecycles.clear();
+                trades.clear();
+                unresolved.clear();
+                true
             }
             PersistenceJobPayload::FullSnapshot(_) | PersistenceJobPayload::Changes(_) => true,
         };
@@ -7962,18 +8072,20 @@ impl SharedAccount {
             if let Some(ledger) = state.instances.get(instance_id) {
                 account.replace_ledger(ledger);
             }
-            lifecycle.orders = state
-                .orders
-                .iter()
-                .filter(|(_, order)| order.instance_id == *instance_id)
-                .map(|(coid, order)| (coid.clone(), order.clone()))
-                .collect();
-            lifecycle.trades = state
-                .trades
-                .iter()
-                .filter(|(_, trade)| trade.ownership.instance_id == *instance_id)
-                .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
-                .collect();
+            lifecycle.orders.replace_rows(
+                state
+                    .orders
+                    .iter()
+                    .filter(|(_, order)| order.instance_id == *instance_id)
+                    .map(|(coid, order)| (coid.clone(), order.clone())),
+            );
+            lifecycle.trades.replace_rows(
+                state
+                    .trades
+                    .iter()
+                    .filter(|(_, trade)| trade.ownership.instance_id == *instance_id)
+                    .map(|(trade_key, trade)| (trade_key.clone(), trade.clone())),
+            );
             {
                 let VirtualLifecycle {
                     trades,
@@ -8045,36 +8157,37 @@ impl SharedAccount {
             .iter()
             .map(|(instance_id, _, _, _, _)| instance_id.clone())
             .collect();
-        for (instance_id, coids, oids, trade_keys, trade_epoch) in route_snapshots {
-            for coid in &coids {
-                self.coid_routes.insert(coid.clone(), instance_id.clone());
-            }
-            for oid in &oids {
-                self.oid_routes.insert(oid.clone(), instance_id.clone());
-            }
-            for trade_key in &trade_keys {
-                self.trade_routes
-                    .insert(trade_key.clone(), instance_id.clone());
-            }
-            // Publish desired keys first, then prune keys no longer present in
-            // this owner's shard. Readers therefore never observe a valid
-            // order without a route while settled GC still removes tombstones.
-            self.coid_routes.retain_owner_keys(&instance_id, &coids);
-            self.oid_routes.retain_owner_keys(&instance_id, &oids);
-            if accounts
+        let route_started = crate::latency::Instant::now();
+        let snapshots = |lane: usize| {
+            route_snapshots
                 .iter()
-                .find(|(candidate, _)| candidate == &instance_id)
-                .is_some_and(|(_, account)| {
-                    account.trade_epoch.load(Ordering::Acquire) == trade_epoch
-                })
-            {
-                self.trade_routes
-                    .retain_owner_keys(&instance_id, &trade_keys);
-            }
-        }
-        self.coid_routes.retain_owners(&live_owners);
-        self.oid_routes.retain_owners(&live_owners);
-        self.trade_routes.retain_owners(&live_owners);
+                .map(
+                    |(instance_id, coids, oids, trades, trade_epoch)| RouteOwnerSnapshot {
+                        owner: instance_id,
+                        keys: match lane {
+                            0 => coids,
+                            1 => oids,
+                            _ => trades,
+                        },
+                        epoch: if lane == 2 {
+                            accounts
+                                .iter()
+                                .find(|(id, _)| id == instance_id)
+                                .map(|(_, account)| (&account.trade_epoch, *trade_epoch))
+                        } else {
+                            None
+                        },
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        self.coid_routes
+            .publish_owners(&snapshots(0), Some(&live_owners));
+        self.oid_routes
+            .publish_owners(&snapshots(1), Some(&live_owners));
+        self.trade_routes
+            .publish_owners(&snapshots(2), Some(&live_owners));
+        crate::latency::record("polymarket.account.route_publish", route_started);
         self.anomalous_trade_keys.store(Arc::new(
             state
                 .ownership_anomalies
@@ -8140,18 +8253,20 @@ impl SharedAccount {
         if let Some(ledger) = state.instances.get(instance_id) {
             account.replace_ledger(ledger);
         }
-        lifecycle.orders = state
-            .orders
-            .iter()
-            .filter(|(_, order)| order.instance_id == instance_id)
-            .map(|(coid, order)| (coid.clone(), order.clone()))
-            .collect();
-        lifecycle.trades = state
-            .trades
-            .iter()
-            .filter(|(_, trade)| trade.ownership.instance_id == instance_id)
-            .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
-            .collect();
+        lifecycle.orders.replace_rows(
+            state
+                .orders
+                .iter()
+                .filter(|(_, order)| order.instance_id == instance_id)
+                .map(|(coid, order)| (coid.clone(), order.clone())),
+        );
+        lifecycle.trades.replace_rows(
+            state
+                .trades
+                .iter()
+                .filter(|(_, trade)| trade.ownership.instance_id == instance_id)
+                .map(|(trade_key, trade)| (trade_key.clone(), trade.clone())),
+        );
         {
             let VirtualLifecycle {
                 trades,
@@ -8205,26 +8320,32 @@ impl SharedAccount {
         let trade_keys: HashSet<String> = lifecycle.trades.keys().cloned().collect();
         let trade_epoch = account.trade_epoch.load(Ordering::Acquire);
 
-        // Route retirement is explicit and event-scoped. Destructively
-        // removing every route for an instance makes lock-free private reads
-        // observe a transient hole while this snapshot is republished.
-        for coid in &coids {
-            self.coid_routes
-                .insert(coid.clone(), instance_id.to_string());
-        }
-        for oid in &oids {
-            self.oid_routes.insert(oid.clone(), instance_id.to_string());
-        }
-        for trade_key in &trade_keys {
-            self.trade_routes
-                .insert(trade_key.clone(), instance_id.to_string());
-        }
-        self.coid_routes.retain_owner_keys(instance_id, &coids);
-        self.oid_routes.retain_owner_keys(instance_id, &oids);
-        if account.trade_epoch.load(Ordering::Acquire) == trade_epoch {
-            self.trade_routes
-                .retain_owner_keys(instance_id, &trade_keys);
-        }
+        let route_started = crate::latency::Instant::now();
+        self.coid_routes.publish_owners(
+            &[RouteOwnerSnapshot {
+                owner: instance_id,
+                keys: &coids,
+                epoch: None,
+            }],
+            None,
+        );
+        self.oid_routes.publish_owners(
+            &[RouteOwnerSnapshot {
+                owner: instance_id,
+                keys: &oids,
+                epoch: None,
+            }],
+            None,
+        );
+        self.trade_routes.publish_owners(
+            &[RouteOwnerSnapshot {
+                owner: instance_id,
+                keys: &trade_keys,
+                epoch: Some((&account.trade_epoch, trade_epoch)),
+            }],
+            None,
+        );
+        crate::latency::record("polymarket.account.route_publish", route_started);
         self.anomalous_trade_keys.store(Arc::new(
             state
                 .ownership_anomalies
@@ -8828,100 +8949,16 @@ impl SharedAccount {
         outcomes: &[SettledPruneOutcome],
         retired_conditions: &[String],
     ) {
-        if self.persistence.is_none() {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        if outcomes.iter().all(SettledPruneOutcome::is_empty) && retired_conditions.is_empty() {
             return;
         }
-        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
-            let mut changes = Vec::new();
-            for outcome in outcomes {
-                for (coid, order_id) in &outcome.orders {
-                    persistence_wal_map_entry(
-                        &mut changes,
-                        "orders",
-                        coid,
-                        state.orders.get(coid),
-                    )?;
-                    let normalized = normalize_order_id(order_id);
-                    persistence_wal_map_entry(
-                        &mut changes,
-                        "oid_to_coid",
-                        &normalized,
-                        state.oid_to_coid.get(&normalized),
-                    )?;
-                    persistence_wal_set_membership(
-                        &mut changes,
-                        "recovery_pending_orders",
-                        coid,
-                        state.recovery_pending_orders.contains(coid),
-                    )?;
-                    persistence_wal_set_membership(
-                        &mut changes,
-                        "startup_query_repair_orders",
-                        coid,
-                        state.startup_query_repair_orders.contains(coid),
-                    )?;
-                    persistence_wal_set_membership(
-                        &mut changes,
-                        "routine_cancel_audits",
-                        coid,
-                        state.routine_cancel_audits.contains(coid),
-                    )?;
-                }
-                for trade_key in &outcome.trades {
-                    persistence_wal_map_entry(
-                        &mut changes,
-                        "trades",
-                        trade_key,
-                        state.trades.get(trade_key),
-                    )?;
-                    persistence_wal_map_entry(
-                        &mut changes,
-                        "retired_trade_ownership_tombstones",
-                        trade_key,
-                        state.retired_trade_ownership_tombstones.get(trade_key),
-                    )?;
-                    persistence_wal_set_membership(
-                        &mut changes,
-                        "fee_attribution_pending",
-                        trade_key,
-                        state.fee_attribution_pending.contains(trade_key),
-                    )?;
-                }
-                for trade_key in &outcome.expired_tombstones {
-                    persistence_wal_map_entry::<RetiredTradeOwnershipTombstone>(
-                        &mut changes,
-                        "retired_trade_ownership_tombstones",
-                        trade_key,
-                        None,
-                    )?;
-                }
-                for token in &outcome.fee_tokens {
-                    persistence_wal_map_entry(
-                        &mut changes,
-                        "token_fee_configs",
-                        token,
-                        state.token_fee_configs.get(token),
-                    )?;
-                }
-            }
-            if outcomes.iter().any(|outcome| !outcome.trades.is_empty()) {
-                persistence_wal_set(
-                    &mut changes,
-                    ["compacted_economic_effects".to_string()],
-                    &state.compacted_economic_effects,
-                )?;
-            }
-            for condition_id in retired_conditions {
-                persistence_wal_map_entry(
-                    &mut changes,
-                    "settled_audit_references",
-                    condition_id,
-                    state.settled_audit_references.get(condition_id),
-                )?;
-            }
-            Ok(changes)
-        })();
-        self.schedule_typed_persist(state, changes);
+        let started = crate::latency::Instant::now();
+        let delta = SettledPrunePersistenceDelta::capture(state, outcomes, retired_conditions);
+        persistence.enqueue(PersistenceJobPayload::SettledPrune(delta));
+        crate::latency::record("polymarket.account.settled_gc_persist_capture", started);
     }
 
     fn clear_cancel_audit_anomaly(&self, client_order_id: &str) {
@@ -10020,7 +10057,10 @@ impl SharedAccount {
                         .retired_trades
                         .saturating_add(certificate.retired_trades);
                     if certificate.remaining_rows {
-                        if certificate.retired_orders > 0 || certificate.retired_trades > 0 {
+                        if certificate.retired_orders > 0
+                            || certificate.retired_trades > 0
+                            || certificate.scan_incomplete
+                        {
                             *progress = SettledGcOwnerProgress::NeedsDispatch;
                         } else {
                             block_condition = Some(inflight.condition_id.clone());
@@ -16998,6 +17038,7 @@ impl SharedAccount {
                     retired_orders: 0,
                     retired_trades: 0,
                     remaining_rows: false,
+                    scan_incomplete: false,
                     eligible: false,
                     reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
                     trade_epoch: account.trade_epoch.load(Ordering::Acquire),
@@ -17005,27 +17046,37 @@ impl SharedAccount {
             ));
         }
 
-        let protected_coids: HashSet<String> = lifecycle
-            .trades
+        // Candidate selection is bounded and independent of unrelated history.
+        // Identity indexes are derived instance state maintained on every insert,
+        // replace/remove and rebuilt on startup/cold snapshot publication.
+        const SCAN_BUDGET: usize = 128;
+        let scan_started = crate::latency::Instant::now();
+        let order_keys = lifecycle.orders.scan_keys(&tokens, SCAN_BUDGET);
+        let mut protection_budget = SCAN_BUDGET;
+        let stale_orders: Vec<(String, String)> = order_keys
             .iter()
-            .filter(|(trade_key, trade)| {
-                tokens.contains(&trade.ownership.token_id)
-                    && !trade.failed
-                    && (trade.ownership.status != "CONFIRMED"
-                        || lifecycle.fee_attribution_pending.contains(*trade_key))
-            })
-            .map(|(_, trade)| trade.ownership.client_order_id.clone())
-            .collect();
-        let stale_orders: Vec<(String, String)> = lifecycle
-            .orders
-            .iter()
-            .filter(|(coid, order)| {
-                tokens.contains(&order.token_id)
-                    && !protected_coids.contains(*coid)
-                    && !lifecycle.recovery_pending_orders.contains(*coid)
-                    && !lifecycle.startup_query_repair_orders.contains(*coid)
-                    && !lifecycle.routine_cancel_audits.contains(*coid)
-                    && !lifecycle.cancel_audit_anomalies.contains(*coid)
+            .filter_map(|coid| {
+                let order = lifecycle.orders.get(coid.as_ref())?;
+                let protected = lifecycle
+                    .trades
+                    .rows_for_order(coid)
+                    .any(|(trade_key, trade)| {
+                        if protection_budget == 0 {
+                            return true;
+                        }
+                        protection_budget -= 1;
+                        tokens.contains(&trade.ownership.token_id)
+                            && !trade.failed
+                            && (trade.ownership.status != "CONFIRMED"
+                                || lifecycle.fee_attribution_pending.contains(trade_key))
+                    });
+                (!protected
+                    && !lifecycle.recovery_pending_orders.contains(coid.as_ref())
+                    && !lifecycle
+                        .startup_query_repair_orders
+                        .contains(coid.as_ref())
+                    && !lifecycle.routine_cancel_audits.contains(coid.as_ref())
+                    && !lifecycle.cancel_audit_anomalies.contains(coid.as_ref())
                     && order.reserved_cash <= EPS
                     && order.reserved_quantity <= EPS
                     && matches!(
@@ -17034,22 +17085,23 @@ impl SharedAccount {
                             | OrderStatus::Rejected
                             | OrderStatus::Filled
                             | OrderStatus::Failed
-                    )
+                    ))
+                .then(|| (coid.to_string(), order.order_id.clone()))
             })
             .take(SETTLED_GC_ORDERS_PER_OWNER_TURN)
-            .map(|(coid, order)| (coid.clone(), order.order_id.clone()))
             .collect();
-        let stale_trades: Vec<String> = lifecycle
-            .trades
+        let trade_keys = lifecycle.trades.scan_keys(&tokens, SCAN_BUDGET);
+        let stale_trades: Vec<String> = trade_keys
             .iter()
-            .filter(|(trade_key, trade)| {
-                tokens.contains(&trade.ownership.token_id)
-                    && !lifecycle.fee_attribution_pending.contains(*trade_key)
-                    && (trade.failed || trade.ownership.status == "CONFIRMED")
+            .filter_map(|key| {
+                let trade = lifecycle.trades.get(key.as_ref())?;
+                (!lifecycle.fee_attribution_pending.contains(key.as_ref())
+                    && (trade.failed || trade.ownership.status == "CONFIRMED"))
+                    .then(|| key.to_string())
             })
             .take(SETTLED_GC_TRADES_PER_OWNER_TURN)
-            .map(|(trade_key, _)| trade_key.clone())
             .collect();
+        crate::latency::record("polymarket.account.settled_gc_owner_select", scan_started);
 
         for (coid, order_id) in &stale_orders {
             lifecycle.orders.remove(coid);
@@ -17071,6 +17123,7 @@ impl SharedAccount {
             }
         }
 
+        let mut retired_routes = Vec::with_capacity(stale_trades.len());
         let retired_at_ms = wall_clock_ms();
         for trade_key in &stale_trades {
             let removed = lifecycle.trades.remove(trade_key);
@@ -17081,8 +17134,7 @@ impl SharedAccount {
             state.trades.remove(trade_key);
             state.fee_attribution_pending.remove(trade_key);
             if let Some(trade) = removed {
-                self.retired_trade_routes
-                    .insert(trade_key.clone(), trade.ownership.instance_id.clone());
+                retired_routes.push((trade_key.clone(), trade.ownership.instance_id.clone()));
                 state.retired_trade_ownership_tombstones.insert(
                     trade_key.clone(),
                     RetiredTradeOwnershipTombstone {
@@ -17121,21 +17173,24 @@ impl SharedAccount {
         // Keep route teardown inside the owner lifecycle critical section. A
         // late private insertion must happen either wholly before this proof or
         // after it and advance the epoch observed by the coordinator.
-        for (coid, order_id) in &stale_orders {
-            self.coid_routes.remove(coid);
-            self.oid_routes.remove(&normalize_order_id(order_id));
-        }
-        for trade_key in &stale_trades {
-            self.trade_routes.remove(trade_key);
-        }
-        let remaining_rows = lifecycle
-            .orders
-            .values()
-            .any(|order| tokens.contains(&order.token_id))
-            || lifecycle
-                .trades
-                .values()
-                .any(|trade| tokens.contains(&trade.ownership.token_id));
+        let route_started = crate::latency::Instant::now();
+        let coids = stale_orders
+            .iter()
+            .map(|(coid, _)| coid.clone())
+            .collect::<Vec<_>>();
+        let oids = stale_orders
+            .iter()
+            .map(|(_, oid)| normalize_order_id(oid))
+            .collect::<Vec<_>>();
+        self.retired_trade_routes
+            .apply_batch(&instance_id, &[], &retired_routes);
+        self.coid_routes.apply_batch(&instance_id, &coids, &[]);
+        self.oid_routes.apply_batch(&instance_id, &oids, &[]);
+        self.trade_routes
+            .apply_batch(&instance_id, &stale_trades, &[]);
+        crate::latency::record("polymarket.account.settled_gc_owner_routes", route_started);
+        let remaining_rows =
+            lifecycle.orders.has_tokens(&tokens) || lifecycle.trades.has_tokens(&tokens);
         let certificate = SettledGcCompletionCertificate {
             request_id,
             registration_id,
@@ -17144,6 +17199,8 @@ impl SharedAccount {
             retired_orders: stale_orders.len(),
             retired_trades: stale_trades.len(),
             remaining_rows,
+            scan_incomplete: lifecycle.orders.scan_incomplete(&tokens)
+                || lifecycle.trades.scan_incomplete(&tokens),
             eligible: true,
             reservation_epoch: account.reservation_epoch.load(Ordering::Acquire),
             trade_epoch: account.trade_epoch.load(Ordering::Acquire),
@@ -21631,7 +21688,7 @@ mod tests {
         account
     }
 
-    fn applied_trade_with_generation(generation: u64) -> AppliedTrade {
+    pub(super) fn applied_trade_with_generation(generation: u64) -> AppliedTrade {
         AppliedTrade {
             ownership: TradeOwnership {
                 order_slot: Default::default(),
@@ -21793,7 +21850,7 @@ mod tests {
         )
     }
 
-    fn settled_gc_benchmark_account() -> SharedAccount {
+    pub(super) fn settled_gc_benchmark_account() -> SharedAccount {
         const INSTANCE_COUNT: usize = 4;
         const UNRELATED_ROWS_PER_INSTANCE: usize = 128;
         const TARGET_ROWS: usize = 70;
@@ -21885,7 +21942,7 @@ mod tests {
         account
     }
 
-    fn install_test_settled_gc_candidate(
+    pub(super) fn install_test_settled_gc_candidate(
         account: &SharedAccount,
         condition_id: &str,
         tokens: &HashSet<String>,
@@ -24819,6 +24876,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                     retired_orders: 0,
                     retired_trades: 0,
                     remaining_rows: false,
+                    scan_incomplete: false,
                     eligible: false,
                     reservation_epoch: 0,
                     trade_epoch: 0,

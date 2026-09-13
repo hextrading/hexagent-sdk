@@ -854,7 +854,22 @@ impl ConnectionHealth {
                 break;
             }
         }
-        self.quarantined.store(true, Ordering::Release);
+        // Exactly one repair task owns a quarantined slot, including retries.
+        // Other failures from the retiring generation cannot launch a second
+        // repair after the cooldown while the first still warms its candidate.
+        if self
+            .quarantined
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        if !self.is_current() {
+            // We won the false→true transition after an older repair finished.
+            // No other repair can own this quarantine; return this stale claim.
+            self.release_quarantine();
+            return None;
+        }
         Some(failures)
     }
 
@@ -904,116 +919,102 @@ impl ConnectionHealth {
         );
     }
 
+    /// Run on the existing order runtime. One task per quarantined slot,
+    /// bounded request timeout and capped exponential retry delay; no new lane.
     async fn rebuild_and_prewarm(self, prewarm_url: String, failures: usize) {
-        let candidate = match self.build_replacement() {
-            Ok(client) => client,
-            Err(error) => {
-                self.release_quarantine();
-                log::warn!(
-                    "[http1_pool] role={:?} slot={} client rebuild failed after {} transport failures: {}",
-                    self.role, self.slot, failures, error,
-                );
-                return;
-            }
-        };
-        let prewarm_result = async {
-            let response = candidate
-                .get(&prewarm_url)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(format!("HTTP {}", status));
-            }
-            response.bytes().await.map_err(|error| error.to_string())?;
-            Ok::<(), String>(())
-        }
-        .await;
-        match prewarm_result {
-            Ok(()) => {
-                if let Some(generation) = self.install_replacement(candidate, failures) {
-                    log::info!(
-                        "[http1_pool] role={:?} slot={} rebuilt and prewarmed generation={} url={}",
-                        self.role,
-                        self.slot,
-                        generation,
-                        prewarm_url,
-                    );
+        let mut delay = Duration::from_millis(100);
+        let mut attempt = 0_u64;
+        while self.is_current() {
+            attempt += 1;
+            let outcome = async {
+                let candidate = self.build_replacement().map_err(|e| e.to_string())?;
+                let response = candidate
+                    .get(&prewarm_url)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let status = response.status();
+                response.bytes().await.map_err(|e| e.to_string())?;
+                if !status.is_success() {
+                    return Err(format!("HTTP {}", status));
+                }
+                Ok(candidate)
+            };
+            let outcome = match tokio::time::timeout(KEEP_WARM_TIMEOUT, outcome).await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            };
+            match outcome {
+                Ok(candidate) => {
+                    self.install_replacement(candidate, failures);
+                    return;
+                }
+                Err(error) => {
+                    if !self.is_current() {
+                        return;
+                    }
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        log::warn!("[http1_pool] role={:?} slot={} generation={} prewarm retry={} retained_quarantine=true retry_ms={} error={}", self.role, self.slot, self.generation_at_pick, attempt, delay.as_millis(), error);
+                    }
                 }
             }
-            Err(error) => {
-                self.release_quarantine();
-                log::warn!(
-                    "[http1_pool] role={:?} slot={} replacement prewarm failed: {}; keeping generation={} url={}",
-                    self.role, self.slot, error, self.generation_at_pick, prewarm_url,
-                );
-            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
         }
+        // A stale repair must never release another generation's quarantine.
     }
 
     async fn repair_instrumented(self, prewarm_url: String, failures: usize) {
-        let candidate = match crate::instrumented_http1::InstrumentedHttp1Client::new(
-            Duration::from_millis(2000),
-        ) {
-            Ok(client) => Arc::new(client),
-            Err(error) => {
-                self.release_quarantine();
-                log::warn!(
-                    "[http1_pool] role={:?} slot={} instrumented generation rebuild failed after {} failures: {}",
-                    self.role, self.slot, failures, error,
+        let mut owner = self;
+        let mut delay = Duration::from_millis(100);
+        let mut attempt = 0_u64;
+        while owner.is_current() {
+            attempt += 1;
+            let outcome = async {
+                let candidate = Arc::new(
+                    crate::instrumented_http1::InstrumentedHttp1Client::new(Duration::from_millis(
+                        2000,
+                    ))
+                    .map_err(|e| e.to_string())?,
                 );
-                return;
+                let response = candidate
+                    .request(
+                        reqwest::Method::GET,
+                        &prewarm_url,
+                        reqwest::header::HeaderMap::new(),
+                        bytes::Bytes::new(),
+                        KEEP_WARM_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| e.message)?;
+                if !response.status.is_success() {
+                    return Err(format!("HTTP {}", response.status));
+                }
+                Ok((candidate, response.timings.connect_generation_after))
             }
-        };
-        if !self.is_current() {
-            self.release_quarantine();
-            return;
-        }
-        // Retire the affected Hyper pool in this exact logical slot before
-        // prewarming. Quarantine prevents business admission until the fresh
-        // generation has completed its probe; no slot or connection lane is
-        // added and late repair completions are fenced by `generation`.
-        let Some(generation) = self.install_instrumented_replacement(Arc::clone(&candidate)) else {
-            self.release_quarantine();
-            return;
-        };
-        let outcome = candidate
-            .request(
-                reqwest::Method::GET,
-                &prewarm_url,
-                reqwest::header::HeaderMap::new(),
-                bytes::Bytes::new(),
-                KEEP_WARM_TIMEOUT,
-            )
             .await;
-        match outcome {
-            Ok(response) if response.status.is_success() => {
-                self.release_quarantine();
-                log::info!(
-                    "[http1_pool] role={:?} slot={} retired instrumented generation={} replacement_generation={} connect_generation={} url={}",
-                    self.role,
-                    self.slot,
-                    self.generation_at_pick,
-                    generation,
-                    response.timings.connect_generation_after,
-                    prewarm_url,
-                );
+            match outcome {
+                Ok((candidate, connect_generation)) => {
+                    // Publish only after successful probe AND complete body.
+                    // Quarantine grants exclusive replacement ownership.
+                    if let Some(generation) = owner.install_instrumented_replacement(candidate) {
+                        owner.generation_at_pick = generation;
+                        owner.release_quarantine();
+                        log::info!("[http1_pool] role={:?} slot={} replacement_generation={} connect_generation={} prewarm_attempts={} prior_failures={} ready=true", owner.role, owner.slot, generation, connect_generation, attempt, failures);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if !owner.is_current() {
+                        return;
+                    }
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        log::warn!("[http1_pool] role={:?} slot={} generation={} prewarm retry={} retained_quarantine=true retry_ms={} error={}", owner.role, owner.slot, owner.generation_at_pick, attempt, delay.as_millis(), error);
+                    }
+                }
             }
-            Ok(response) => {
-                self.release_quarantine();
-                log::warn!(
-                    "[http1_pool] role={:?} slot={} replacement generation={} prewarm HTTP {} after {} failures url={}",
-                    self.role, self.slot, generation, response.status, failures, prewarm_url,
-                );
-            }
-            Err(error) => {
-                self.release_quarantine();
-                log::warn!(
-                    "[http1_pool] role={:?} slot={} replacement generation={} prewarm failed after {} failures: {} url={}",
-                    self.role, self.slot, generation, failures, error.message, prewarm_url,
-                );
-            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
         }
     }
 }
@@ -1971,6 +1972,10 @@ pub fn total_account_cancel_capacity() -> usize {
 }
 
 #[cfg(test)]
+#[path = "http1_pool_repair_tests.rs"]
+mod repair_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2293,6 +2298,12 @@ mod tests {
             activity_now_ns().saturating_sub(Duration::from_secs(31).as_nanos() as u64),
             Ordering::Release,
         );
+        assert!(
+            health.claim_rebuild(2, Duration::from_secs(30)).is_none(),
+            "an existing repair keeps exclusive ownership even after cooldown"
+        );
+        health.release_quarantine();
+        permit.last_rebuild_ns.store(0, Ordering::Release);
         assert!(health.claim_rebuild(2, Duration::from_secs(30)).is_some());
     }
 
