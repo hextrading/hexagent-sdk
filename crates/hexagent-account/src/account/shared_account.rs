@@ -1029,11 +1029,18 @@ mod queue_tests;
 #[path = "shared_account_batch_tests.rs"]
 mod batch_tests;
 
+#[cfg(test)]
+#[path = "shared_account_route_bytes_tests.rs"]
+mod route_bytes_tests;
+
 #[derive(Debug)]
 struct RouteShard {
     /// Readers consume an immutable ownership snapshot. Route mutation uses
     /// ArcSwap RCU, so neither readers nor account-owner writes take a lock.
-    published: ArcSwap<HashMap<String, String>>,
+    // Shard snapshots share immutable key/owner bytes. Cloning a shard
+    // increments references instead of allocating/freeing every historical
+    // string in that shard on each GC batch.
+    published: ArcSwap<HashMap<Arc<str>, Arc<str>>>,
 }
 
 impl ShardedRouteMap {
@@ -1050,11 +1057,11 @@ impl ShardedRouteMap {
         }
         for (index, shard) in self.shards.iter().enumerate() {
             shard.published.rcu(|current| {
-                let remove = |key: &String, route_owner: &String| {
-                    live.is_some_and(|live| !live.contains(route_owner))
+                let remove = |key: &Arc<str>, route_owner: &Arc<str>| {
+                    live.is_some_and(|live| !live.contains(route_owner.as_ref()))
                         || owners.iter().any(|owner| {
-                            route_owner == owner.owner
-                                && !owner.keys.contains(key)
+                            route_owner.as_ref() == owner.owner
+                                && !owner.keys.contains(key.as_ref())
                                 && owner.epoch.is_none_or(|(epoch, expected)| {
                                     epoch.load(Ordering::Acquire) == expected
                                 })
@@ -1062,7 +1069,7 @@ impl ShardedRouteMap {
                 };
                 if additions[index]
                     .iter()
-                    .all(|(key, owner)| current.get(*key).is_some_and(|v| v == owner))
+                    .all(|(key, owner)| current.get(*key).is_some_and(|v| v.as_ref() == *owner))
                     && !current.iter().any(|(key, owner)| remove(key, owner))
                 {
                     return Arc::clone(current);
@@ -1070,7 +1077,9 @@ impl ShardedRouteMap {
                 let mut next = (**current).clone();
                 next.retain(|key, owner| !remove(key, owner));
                 for (key, owner) in &additions[index] {
-                    next.insert((*key).to_owned(), (*owner).to_owned());
+                    if next.get(*key).is_none_or(|current| current.as_ref() != *owner) {
+                        next.insert(Arc::from(*key), Arc::from(*owner));
+                    }
                 }
                 Arc::new(next)
             });
@@ -1095,16 +1104,18 @@ impl ShardedRouteMap {
         {
             self.shards[index].published.rcu(|current| {
                 if changes.iter().all(|(key, value)| match value {
-                    Some(value) => current.get(*key).is_some_and(|v| v == value),
-                    None => current.get(*key).is_none_or(|v| v != owner),
+                    Some(value) => current.get(*key).is_some_and(|v| v.as_ref() == *value),
+                    None => current.get(*key).is_none_or(|v| v.as_ref() != owner),
                 }) {
                     return Arc::clone(current);
                 }
                 let mut next = (**current).clone();
                 for (key, value) in changes {
                     if let Some(value) = value {
-                        next.insert((*key).to_owned(), (*value).to_owned());
-                    } else if next.get(*key).is_some_and(|v| v == owner) {
+                        if next.get(*key).is_none_or(|current| current.as_ref() != *value) {
+                            next.insert(Arc::from(*key), Arc::from(*value));
+                        }
+                    } else if next.get(*key).is_some_and(|v| v.as_ref() == owner) {
                         next.remove(*key);
                     }
                 }
@@ -1134,7 +1145,7 @@ impl ShardedRouteMap {
             .published
             .load()
             .get(key)
-            .cloned()
+            .map(|owner| owner.to_string())
     }
 
     fn try_get(&self, key: &str) -> Result<Option<String>, ()> {
@@ -1143,6 +1154,8 @@ impl ShardedRouteMap {
 
     fn insert(&self, key: String, owner: String) {
         let shard = &self.shards[Self::shard_index(&key)];
+        let key: Arc<str> = Arc::from(key);
+        let owner: Arc<str> = Arc::from(owner);
         shard.published.rcu(|current| {
             let mut next = (**current).clone();
             next.insert(key.clone(), owner.clone());
@@ -1152,7 +1165,7 @@ impl ShardedRouteMap {
 
     fn remove(&self, key: &str) -> Option<String> {
         let shard = &self.shards[Self::shard_index(key)];
-        let previous = shard.published.load().get(key).cloned();
+        let previous = shard.published.load().get(key).map(|owner| owner.to_string());
         if previous.is_some() {
             shard.published.rcu(|current| {
                 let mut next = (**current).clone();
@@ -1170,7 +1183,7 @@ impl ShardedRouteMap {
             .published
             .load()
             .get(key)
-            .is_some_and(|current| current != owner)
+            .is_some_and(|current| current.as_ref() != owner)
         {
             return false;
         }
@@ -1179,7 +1192,7 @@ impl ShardedRouteMap {
                 Arc::clone(current)
             } else {
                 let mut next = (**current).clone();
-                next.insert(key.to_string(), owner.to_string());
+                next.insert(Arc::from(key), Arc::from(owner));
                 Arc::new(next)
             }
         });
@@ -1187,7 +1200,7 @@ impl ShardedRouteMap {
             .published
             .load()
             .get(key)
-            .is_some_and(|current| current == owner)
+            .is_some_and(|current| current.as_ref() == owner)
     }
 
     #[cfg(test)]
@@ -1195,7 +1208,9 @@ impl ShardedRouteMap {
         for shard in &self.shards {
             shard.published.rcu(|current| {
                 let mut next = (**current).clone();
-                next.retain(|key, route_owner| route_owner != owner || desired.contains(key));
+                next.retain(|key, route_owner| {
+                    route_owner.as_ref() != owner || desired.contains(key.as_ref())
+                });
                 Arc::new(next)
             });
         }
@@ -1206,7 +1221,7 @@ impl ShardedRouteMap {
         for shard in &self.shards {
             shard.published.rcu(|current| {
                 let mut next = (**current).clone();
-                next.retain(|_, route_owner| owners.contains(route_owner));
+                next.retain(|_, route_owner| owners.contains(route_owner.as_ref()));
                 Arc::new(next)
             });
         }
@@ -1215,7 +1230,14 @@ impl ShardedRouteMap {
     fn keys(&self) -> Vec<String> {
         self.shards
             .iter()
-            .flat_map(|shard| shard.published.load().keys().cloned().collect::<Vec<_>>())
+            .flat_map(|shard| {
+                shard
+                    .published
+                    .load()
+                    .keys()
+                    .map(|key| key.to_string())
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 }
@@ -16916,9 +16938,9 @@ impl SharedAccount {
             .collect()
     }
 
-    /// Execute exactly one bounded deletion request. This private entry point
-    /// is reachable only through [`SettledGcOwnerMailbox::poll_once`], making
-    /// the caller the instance cold owner instead of the GC coordinator.
+    /// Execute one bounded deletion on the existing lifecycle owner. The cold
+    /// mailbox initiates the request; once bound, mutation is dispatched to
+    /// the private lifecycle actor and must not allocate per historical row.
     fn process_settled_gc_delete_request(
         &self,
         request: SettledGcDeleteRequest,
